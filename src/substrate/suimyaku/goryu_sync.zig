@@ -143,22 +143,43 @@ pub const GoryuSync = struct {
     }
 
     pub fn applyVerified(self: *GoryuSync, verify_fn: VerifyFn) Error!usize {
-        var applied: usize = 0;
+        // Snapshot the pending CIDs in a read-only pass, THEN mutate — the same
+        // collect-then-remove pattern as dropTombstonesBelow. Mutating
+        // self.pending (remove/putOwned) DURING iteration is unsound: Zig's
+        // AutoHashMap.remove uses backward-shift deletion, so iterate-while-
+        // remove skips unvisited entries, leaving deltas unapplied and
+        // convergence never reaching pending.count() == 0.
+        var cids: std.ArrayList(Cid) = .empty;
+        defer cids.deinit(self.allocator);
         var it = self.pending.iterator();
-        while (it.next()) |entry| {
-            const cid = entry.key_ptr.*;
-            var owned = entry.value_ptr.*;
+        while (it.next()) |entry| try cids.append(self.allocator, entry.key_ptr.*);
+
+        var applied: usize = 0;
+        var verify_failed = false;
+        for (cids.items) |cid| {
+            // A concurrent putPending could already own this CID; skip if gone.
+            var owned = (self.pending.fetchRemove(cid) orelse continue).value;
             if (!verify_fn(owned.signed)) {
-                _ = self.pending.remove(cid);
+                // A bad delta is dropped but MUST NOT abort the batch — every
+                // other pending delta is still processed. The error is raised
+                // once at the end so the caller still learns a delta was
+                // rejected without losing the good ones.
                 owned.deinit(self.allocator);
-                return error.VerificationFailed;
+                verify_failed = true;
+                continue;
             }
 
-            try self.applySignedChannelDelta(owned.signed);
-            _ = self.pending.remove(cid);
-            try self.putOwned(owned);
+            // On a decode/apply error the delta is already out of pending, so
+            // free it here before propagating (a malformed-but-signed delta is
+            // permanently undecodable; retaining it would only loop).
+            self.applySignedChannelDelta(owned.signed) catch |err| {
+                owned.deinit(self.allocator);
+                return err;
+            };
+            try self.putOwned(owned); // takes ownership; frees owned on error
             applied += 1;
         }
+        if (verify_failed) return error.VerificationFailed;
         return applied;
     }
 
@@ -187,8 +208,10 @@ pub const GoryuSync = struct {
 
     fn putVerified(self: *GoryuSync, signed: SignedDelta) Error!void {
         if (self.store.contains(signed.cid)) return;
-        var owned = try OwnedDelta.clone(self.allocator, signed);
-        errdefer owned.deinit(self.allocator);
+        const owned = try OwnedDelta.clone(self.allocator, signed);
+        // `putOwned` takes ownership and frees `owned` on EVERY error path via
+        // its own errdefer, so no errdefer here — a second one would double-free
+        // `owned.scope`/`op_bytes` if index.insert/store.put fails under OOM.
         try self.putOwned(owned);
     }
 
@@ -782,6 +805,48 @@ test "invalid signed delta is rejected and not applied" {
     try std.testing.expectError(error.VerificationFailed, sync.applyVerified(verifyTest));
     try std.testing.expect(!sync.channel.containsMember(42));
     try std.testing.expectEqual(@as(usize, 0), sync.store.count());
+}
+
+test "applyVerified processes every good pending delta even when one fails verify" {
+    const allocator = std.testing.allocator;
+    const kp = try signed_delta.KeyPair.generateDeterministic(@as([signed_delta.seed_len]u8, @splat(0x63)));
+    test_pubkey = kp.public_key.toBytes();
+
+    var sync = GoryuSync.init(allocator);
+    defer sync.deinit();
+
+    // Three deltas that verify, queued as pending.
+    const good_members = [_]channel_crdt.MemberId{ 50, 51, 52 };
+    for (good_members) |m| {
+        var src = channel_crdt.ChannelCrdt.init(allocator, 1);
+        defer src.deinit();
+        var delta = try src.localJoin(m, .{ .voice = true }, 100 + m);
+        defer delta.deinit();
+        var buf: [1024]u8 = undefined;
+        const good = try signChannelDelta(&kp, try encodeMemberDelta(&buf, &delta, m), delta.hlc.toU64());
+        try sync.putPending(good);
+    }
+
+    // A fourth delta whose signature is corrupt — it fails verify.
+    var bad_src = channel_crdt.ChannelCrdt.init(allocator, 1);
+    defer bad_src.deinit();
+    var bad_delta = try bad_src.localJoin(53, .{ .op = true }, 200);
+    defer bad_delta.deinit();
+    var bad_buf: [1024]u8 = undefined;
+    var bad = try signChannelDelta(&kp, try encodeMemberDelta(&bad_buf, &bad_delta, 53), bad_delta.hlc.toU64());
+    bad.signature[0] ^= 0xff;
+    try sync.putPending(bad);
+
+    // The one bad delta signals VerificationFailed, but every good delta is
+    // still applied and pending is fully drained (no iterate-while-remove skip,
+    // no early abort leaving the rest unprocessed).
+    try std.testing.expectError(error.VerificationFailed, sync.applyVerified(verifyTest));
+    try std.testing.expect(sync.channel.containsMember(50));
+    try std.testing.expect(sync.channel.containsMember(51));
+    try std.testing.expect(sync.channel.containsMember(52));
+    try std.testing.expect(!sync.channel.containsMember(53));
+    try std.testing.expectEqual(@as(usize, 0), sync.pending.count());
+    try std.testing.expectEqual(@as(usize, 3), sync.store.count());
 }
 
 test "signed channel delta survives a wire crossing and applies on the peer" {

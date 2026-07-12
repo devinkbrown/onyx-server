@@ -155,6 +155,18 @@ pub const VersionVector = struct {
         }
     }
 
+    /// Number of distinct replicas that would remain after merging `other`,
+    /// computed WITHOUT mutating either vector. Lets a caller reject an
+    /// over-capacity merge up front and stay all-or-nothing, since a partial
+    /// `merge` that hit `max_entries` would leave the vector half-updated.
+    pub fn mergedLen(self: *const VersionVector, other: *const VersionVector) usize {
+        var total = self.len;
+        for (other.entries[0..other.len]) |entry| {
+            if (self.findIndex(entry.replica) == null) total += 1;
+        }
+        return total;
+    }
+
     /// True when this vector causally covers every dot in `other`.
     pub fn dominates(self: *const VersionVector, other: *const VersionVector) bool {
         for (other.entries[0..other.len]) |entry| {
@@ -298,6 +310,30 @@ test "version vector detects concurrency after divergent dots" {
     try a.merge(&b);
     try std.testing.expect(a.dominates(&b));
     try std.testing.expect(a.contains(b_dot));
+}
+
+test "version vector mergedLen predicts merge capacity without mutating" {
+    var left = VersionVector.init();
+    _ = try left.increment(1);
+    _ = try left.increment(2);
+
+    var right = VersionVector.init();
+    _ = try right.increment(2); // overlaps
+    _ = try right.increment(3); // disjoint
+
+    // Union of {1,2} and {2,3} is {1,2,3} = 3 distinct replicas.
+    try std.testing.expectEqual(@as(usize, 3), left.mergedLen(&right));
+    // Predicate is read-only: neither operand changed.
+    try std.testing.expectEqual(@as(usize, 2), left.len);
+    try std.testing.expectEqual(@as(usize, 2), right.len);
+
+    // A merge that would exceed the cap is detectable up front.
+    var full = VersionVector.init();
+    for (0..VersionVector.max_entries) |replica| _ = try full.increment(@intCast(replica));
+    var one_more = VersionVector.init();
+    _ = try one_more.increment(VersionVector.max_entries); // a fresh replica
+    try std.testing.expect(full.mergedLen(&one_more) > VersionVector.max_entries);
+    try std.testing.expectEqual(@as(usize, VersionVector.max_entries), full.mergedLen(&full));
 }
 
 test "version vector reports capacity and counter overflow explicitly" {
