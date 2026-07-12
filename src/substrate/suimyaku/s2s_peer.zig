@@ -40,6 +40,20 @@ pub const LocalNickResolver = route_table.LocalNickResolver;
 /// hold a forced-rename fallback nick.
 const nick_collision_uid_len = @import("uid_alloc.zig").encoded_len;
 
+/// Whether the `account` field carried on an inbound MEMBERSHIP/NICKCHANGE event is
+/// cryptographically attributable to its `origin_node`, and may therefore SUPPRESS
+/// UID-disambiguation and home the claimed nick's delivery to that node (the
+/// `resolveIncomingNick` same-account short-circuits). It is NOT: frame signing
+/// proves WHICH node authored the frame, never that the node authenticated a user
+/// under that account, and the account block is not covered by the signed origin
+/// transcript. A Byzantine admitted peer can thus forge `account="<victim>"` to
+/// shadow a real nick and siphon its cross-node delivery. Until an account claim is
+/// bound to `origin_node` by a verifiable authority (a signed account grant — see
+/// the F1 follow-up), the wire account stays UNTRUSTED here, exactly mirroring the
+/// delivery-path guard in `server.relaySenderHomeMismatch`. Flipping this to a
+/// per-event trust computation is the seam the crypto-attribution follow-up fills.
+const wire_account_trusted = false;
+
 const handshake_magic = [_]u8{ 'S', '2', 'P', 'H' };
 /// Wire version of the S2S handshake. v1 carried no capability byte; v2 appends a
 /// single forward-compatible capability bitfield after the description so a mixed
@@ -1369,7 +1383,7 @@ pub const S2sPeer = struct {
         var skip_displace = false;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
         if (ev.present) {
-            switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc, ev.account)) {
+            switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc, ev.account, wire_account_trusted)) {
                 .keep => {},
                 .rename_to_uid => |uid| {
                     // Newcomer lost: store + surface this member under its UID.
@@ -1957,7 +1971,7 @@ pub const S2sPeer = struct {
         };
         var target_nick: []const u8 = ev.new_nick;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
-        switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc, ev.account)) {
+        switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc, ev.account, wire_account_trusted)) {
             .keep => self.displaceIncumbentForRename(ev.new_nick, ev.origin_node),
             .rename_to_uid => |uid| {
                 @memcpy(uid_buf[0..uid.len], uid[0..]);
@@ -3251,8 +3265,9 @@ const ReclaimResolverStub = struct {
     }
 };
 
-test "a strictly-newer same-account MEMBERSHIP surfaces a ghost_reclaim for the stale local session" {
+test "F1: a forged strictly-newer same-account MEMBERSHIP does NOT retire the live local session" {
     const allocator = std.testing.allocator;
+    const uid_alloc = @import("uid_alloc.zig");
     var tc = TestClock{ .now_ms = 10 };
     var a_state = ChannelCrdt.init(allocator, 1);
     defer a_state.deinit();
@@ -3277,11 +3292,15 @@ test "a strictly-newer same-account MEMBERSHIP surfaces a ghost_reclaim for the 
     try b.startHandshake(b_to_a.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5EE);
 
-    // b holds "kain" locally, logged in to account "kain", with a STALE claim (50).
+    // b holds "kain" locally, logged in to account "kain".
     var stub = ReclaimResolverStub{ .held_nick = "kain", .acct = "kain", .hlc = 50 };
     b.routes.setLocalNickResolver(stub.resolver());
 
-    // a (the live node) announces kain on the SAME account with a NEWER claim (200).
+    // A validly-SIGNED frame from node a (frame signing only proves a authored it)
+    // forges account="kain" with a strictly-newer claim (200) to impersonate the
+    // same logged-in identity. The wire account is NOT cryptographically attributable
+    // to a, so it MUST NOT drive a ghost_reclaim of b's live local session (that was
+    // the pre-fix takeover) — the forged member is UID-disambiguated instead.
     try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5EF);
 
@@ -3291,13 +3310,16 @@ test "a strictly-newer same-account MEMBERSHIP surfaces a ghost_reclaim for the 
         allocator.free(changes);
     }
     try std.testing.expectEqual(@as(usize, 1), changes.len);
-    try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.ghost_reclaim, changes[0].kind);
-    try std.testing.expectEqualStrings("kain", changes[0].nick);
-    try std.testing.expectEqualStrings("kain", changes[0].account); // carried for the daemon's re-check
+    // Not a ghost_reclaim: the local session is untouched.
+    try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.joined, changes[0].kind);
+    // Homed under a UID, never the real nick "kain".
+    try std.testing.expect(!std.ascii.eqlIgnoreCase("kain", changes[0].nick));
+    try std.testing.expect(uid_alloc.validate(changes[0].nick));
 }
 
-test "a same-account MEMBERSHIP that is NOT newer keeps the live local session (no reclaim)" {
+test "F1: a same-account MEMBERSHIP under a live local nick is UID-disambiguated, never homed under the real nick" {
     const allocator = std.testing.allocator;
+    const uid_alloc = @import("uid_alloc.zig");
     var tc = TestClock{ .now_ms = 10 };
     var a_state = ChannelCrdt.init(allocator, 1);
     defer a_state.deinit();
@@ -3322,18 +3344,19 @@ test "a same-account MEMBERSHIP that is NOT newer keeps the live local session (
     try b.startHandshake(b_to_a.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6EE);
 
-    // b's local "kain" is the LIVE one (newer claim, 300) than a's claim (200).
+    // b's local "kain" is live (claim 300).
     var stub = ReclaimResolverStub{ .held_nick = "kain", .acct = "kain", .hlc = 300 };
     b.routes.setLocalNickResolver(stub.resolver());
 
+    // Because the wire account is not cryptographically attributable to node a, the
+    // same-account short-circuit stays disabled: the remote member is applied under a
+    // UID, NEVER homed under the real nick "kain" (which would draw "kain"'s cross-node
+    // delivery to node a). This is the conservative delivery-safe F1 stance; the
+    // legitimate multi-device coexistence it forgoes is restored once account claims
+    // are cryptographically bound to their origin node.
     try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6EF);
 
-    // local_same_account APPLIES the membership under the REAL nick (no UID, no
-    // reclaim): the channel→node relay gate is `channelMembers > 0`, so dropping it
-    // would isolate a user who is the only channel member on their node from
-    // cross-node messages. The daemon's nickIsLiveLocal suppression hides the
-    // duplicate JOIN display for the locally-homed nick.
     const changes = try b.takeMembershipChanges();
     defer {
         for (changes) |*c| c.deinit(allocator);
@@ -3341,7 +3364,67 @@ test "a same-account MEMBERSHIP that is NOT newer keeps the live local session (
     }
     try std.testing.expectEqual(@as(usize, 1), changes.len);
     try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.joined, changes[0].kind);
-    try std.testing.expectEqualStrings("kain", changes[0].nick); // real nick, NOT a UID
+    try std.testing.expect(!std.ascii.eqlIgnoreCase("kain", changes[0].nick)); // UID, NOT the real nick
+    try std.testing.expect(uid_alloc.validate(changes[0].nick));
+}
+
+test "F1: a forged same-account NICKCHANGE into a live local nick renames the renamer to a UID, victim untouched" {
+    const allocator = std.testing.allocator;
+    const uid_alloc = @import("uid_alloc.zig");
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x71);
+    const kp_b = try signingKeyFor(0x72);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7EE);
+
+    // b holds "kain" locally, logged in to account "kain".
+    var stub = ReclaimResolverStub{ .held_nick = "kain", .acct = "kain", .hlc = 300 };
+    b.routes.setLocalNickResolver(stub.resolver());
+
+    // a first homes a member "mallory" on its node, then forges a NICKCHANGE that
+    // renames it INTO the victim's nick "kain" carrying account="kain". Because the
+    // wire account is not cryptographically attributable to a, the same-account
+    // short-circuit stays disabled: the RENAMER loses and is redirected to its mesh
+    // UID — it never clobbers or re-homes the live local "kain".
+    try a.sendMembership(a_to_b.sink(), "#room", "mallory", 0, 100, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7EF);
+    const seed = try b.takeMembershipChanges();
+    for (seed) |*c| c.deinit(allocator);
+    allocator.free(seed);
+
+    try a.sendNickChange(a_to_b.sink(), "mallory", "kain", .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, 400);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7F0);
+
+    const changes = try b.takeNickChanges();
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("mallory", changes[0].old_nick);
+    // Renamed to a UID, NOT the victim's real nick "kain".
+    try std.testing.expect(!std.ascii.eqlIgnoreCase("kain", changes[0].new_nick));
+    try std.testing.expect(uid_alloc.validate(changes[0].new_nick));
+    // The live local "kain" is not homed on the mesh route table at all.
+    try std.testing.expectEqual(@as(?NodeId, null), b.routes.nickNode("kain"));
 }
 
 test "signing peers round-trip a signed KILL frame" {

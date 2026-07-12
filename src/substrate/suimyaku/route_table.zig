@@ -476,7 +476,22 @@ pub const RouteTable = struct {
     /// `account` is the incoming claim's authenticated account ("" = none/unknown,
     /// which disables every same-identity short-circuit and preserves the prior
     /// account-blind behaviour for legacy peers).
-    pub fn resolveIncomingNick(self: *const Self, nick: []const u8, node: NodeId, hlc: u64, account: []const u8) NickDecision {
+    ///
+    /// `account_trusted` is the load-bearing safety gate. The same-account
+    /// short-circuits (`local_same_account` / `reclaim_local` / `remote_same_account`)
+    /// SUPPRESS UID-disambiguation and let the claim be applied under the REAL nick —
+    /// which HOMES that nick's cross-node delivery to the claiming node. A raw
+    /// byte-compare of the wire `account` is NOT proof the claiming node authenticated
+    /// a user under it: frame signing proves WHICH node authored the frame, never that
+    /// the node authenticated the account. A Byzantine admitted peer can therefore
+    /// forge `account="<victim>"` to shadow a real nick and siphon its delivery. So a
+    /// same-account claim collapses to its coexist/reclaim outcome ONLY when the caller
+    /// asserts `account_trusted` — i.e. the account is cryptographically attributable
+    /// to `node`. When it is not (today's unsigned wire account), every same-account
+    /// claim under an existing nick falls back to UID-disambiguation, mirroring the
+    /// delivery-path stance in `server.relaySenderHomeMismatch` ("account is
+    /// origin-controlled/unsigned and must never wave a mismatched sender through").
+    pub fn resolveIncomingNick(self: *const Self, nick: []const u8, node: NodeId, hlc: u64, account: []const u8, account_trusted: bool) NickDecision {
         // Cross-namespace: local world wins. A remote member can never take a nick
         // a local client currently holds — but if the remote bears the SAME
         // authenticated account as the local holder, it is the same logged-in
@@ -484,7 +499,7 @@ pub const RouteTable = struct {
         // the daemon rather than minting a UID for a real user.
         if (self.local_nicks) |resolver| {
             if (resolver.held(nick)) {
-                if (sameAccount(account, resolver.account(nick))) {
+                if (account_trusted and sameAccount(account, resolver.account(nick))) {
                     // Same identity. If the local holder's claim is KNOWN and
                     // strictly older than this one, the local session is the stale
                     // ghost → ask the daemon to retire it. Otherwise (newer, equal,
@@ -507,7 +522,7 @@ pub const RouteTable = struct {
             // nick and let `applyMembership`'s hlc LWW collapse the two claims onto
             // the newer one — and signal the caller NOT to displace the incumbent
             // (a UID phantom for a logged-in user is exactly what we avoid).
-            if (sameAccount(account, if (incumbent.account.len != 0) incumbent.account else null)) return .remote_same_account;
+            if (account_trusted and sameAccount(account, if (incumbent.account.len != 0) incumbent.account else null)) return .remote_same_account;
             const newcomer = nick_collision.Claim{ .node_id = node, .hlc = hlc, .account = account };
             if (!nick_collision.candidateWins(newcomer, incumbent)) {
                 return .{ .rename_to_uid = nick_collision.loserUid(node, nick) };
@@ -1699,7 +1714,7 @@ const LocalNickStub = struct {
 test "resolveIncomingNick keeps an uncontested nick" {
     var table = try RouteTable.init(std.testing.allocator, .{});
     defer table.deinit();
-    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100, ""));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100, "", true));
 }
 
 test "resolveIncomingNick renames a remote nick that collides with a LOCAL one" {
@@ -1710,14 +1725,14 @@ test "resolveIncomingNick renames a remote nick that collides with a LOCAL one" 
 
     // Local world is authoritative (case-insensitive) — the incoming remote
     // member loses and is forced to its mesh UID.
-    const uid = try expectRename(table.resolveIncomingNick("alice", 10, 100, ""));
+    const uid = try expectRename(table.resolveIncomingNick("alice", 10, 100, "", true));
     try std.testing.expect(uid_alloc.validate(uid[0..]));
     const parts = try uid_alloc.parse(uid[0..]);
     try std.testing.expectEqual(@as(u16, 10), parts.node); // owner-node scoped
 
     // Clearing the resolver removes the cross-namespace contest.
     table.setLocalNickResolver(null);
-    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100, ""));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100, "", true));
 }
 
 test "resolveIncomingNick reconciles a same-account remote collision with a LOCAL holder" {
@@ -1729,12 +1744,12 @@ test "resolveIncomingNick reconciles a same-account remote collision with a LOCA
     var stub = LocalNickStub{ .held = "kain", .acct = "kain" };
     table.setLocalNickResolver(stub.resolver());
     // Unknown local holder HLC (0) → fail-safe: keep local, never reclaim.
-    try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 10, 100, "kain"));
+    try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 10, 100, "kain", true));
 
     // A DIFFERENT account on the incoming claim is a genuine collision → UID.
-    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "mallory"));
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "mallory", true));
     // An empty incoming account falls back to the account-blind path → UID.
-    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, ""));
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "", true));
 }
 
 test "resolveIncomingNick retires a STALE local session for a strictly-newer same-account claim" {
@@ -1744,12 +1759,12 @@ test "resolveIncomingNick retires a STALE local session for a strictly-newer sam
     // strictly-newer HLC means the local session is the stale ghost → reclaim it.
     var stub = LocalNickStub{ .held = "kain", .acct = "kain", .hlc = 100 };
     table.setLocalNickResolver(stub.resolver());
-    try std.testing.expectEqual(NickDecision.reclaim_local, table.resolveIncomingNick("kain", 10, 200, "kain"));
+    try std.testing.expectEqual(NickDecision.reclaim_local, table.resolveIncomingNick("kain", 10, 200, "kain", true));
     // An EQUAL or OLDER incoming HLC keeps the live local session (no reclaim).
-    try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 10, 100, "kain"));
-    try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 10, 50, "kain"));
+    try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 10, 100, "kain", true));
+    try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 10, 50, "kain", true));
     // A different account is still a genuine collision regardless of HLC → UID.
-    _ = try expectRename(table.resolveIncomingNick("kain", 10, 999, "mallory"));
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 999, "mallory", true));
 }
 
 test "resolveIncomingNick renames a newcomer that loses a cross-node remote contest" {
@@ -1759,12 +1774,12 @@ test "resolveIncomingNick renames a newcomer that loses a cross-node remote cont
     // Node 20 holds "kain" with a high HLC. A newcomer from node 10 with a lower
     // HLC must lose and rename to its UID; the SAME node re-asserting keeps it.
     _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{}, 0);
-    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, ""));
-    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 20, 999, ""));
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "", true));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 20, 999, "", true));
 
     // A higher-HLC newcomer from node 10 WINS: the table reports keep (the caller
     // then displaces the incumbent to its UID).
-    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 10, 600, ""));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 10, 600, "", true));
 }
 
 test "resolveIncomingNick collapses a same-account cross-node collision via keep (no UID)" {
@@ -1776,9 +1791,55 @@ test "resolveIncomingNick collapses a same-account cross-node collision via keep
     // it is the same identity, the table reports `remote_same_account` (no UID, no
     // incumbent displacement) and lets hlc LWW in applyMembership converge.
     _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain" }, 0);
-    try std.testing.expectEqual(NickDecision.remote_same_account, table.resolveIncomingNick("kain", 10, 100, "kain"));
+    try std.testing.expectEqual(NickDecision.remote_same_account, table.resolveIncomingNick("kain", 10, 100, "kain", true));
     // A different account still contests normally (lower hlc loser → UID).
-    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "mallory"));
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "mallory", true));
+}
+
+test "resolveIncomingNick UID-disambiguates a same-account cross-node claim when the account is UNTRUSTED (F1)" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    // Real "kain" is homed on node 20 under account "kain". A Byzantine peer on node
+    // 10 forges a MEMBERSHIP with account="kain" for a claim that would LOSE the
+    // deterministic tiebreak (a lower hlc) — the same-account bypass was what let such
+    // a losing claim SKIP UID-disambiguation and shadow the real nick's delivery
+    // (skip_displace in s2s_peer). Because the wire account is NOT cryptographically
+    // attributable to node 10, that short-circuit stays disabled: the losing forged
+    // claim is UID-disambiguated instead of returning `remote_same_account`.
+    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain" }, 0);
+    const uid = try expectRename(table.resolveIncomingNick("kain", 10, 100, "kain", false));
+    const parts = try uid_alloc.parse(uid[0..]);
+    try std.testing.expectEqual(@as(u16, 10), parts.node); // renamed under the CLAIMANT's node, not the victim's nick
+
+    // Scope boundary: a forged HIGHER-hlc cross-node claim still wins the nick via the
+    // ordinary CRDT LWW tiebreak (returns `.keep`, caller displaces the incumbent) —
+    // that is a DISTINCT, broader nick-LWW-theft class this F1 slice does NOT close
+    // (it needs an authenticated hlc / nick-ownership proof, reported as residual).
+    // What F1 fixes is that the same-account bypass no longer lets a LOSING claim
+    // shadow; the untrusted higher-hlc path is byte-identical to the account-blind one.
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 10, 9000, "kain", false));
+
+    // Trusted attribution (the future signed-account-grant path) still coexists.
+    try std.testing.expectEqual(NickDecision.remote_same_account, table.resolveIncomingNick("kain", 10, 100, "kain", true));
+}
+
+test "resolveIncomingNick will NOT reclaim or shadow a LOCAL holder on an UNTRUSTED same-account claim (F1)" {
+    var table = try RouteTable.init(std.testing.allocator, .{});
+    defer table.deinit();
+    // A live LOCAL "kain" logged in to account "kain" with a known claim HLC. A forged
+    // remote claim bearing account="kain" and a strictly-newer HLC would, if trusted,
+    // return `reclaim_local` (retire the local session) and, at any HLC, home the real
+    // nick to the claiming node. Untrusted, it must UID-disambiguate — never reclaim,
+    // never shadow the real nick's delivery.
+    var stub = LocalNickStub{ .held = "kain", .acct = "kain", .hlc = 100 };
+    table.setLocalNickResolver(stub.resolver());
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 200, "kain", false)); // no reclaim_local
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "kain", false)); // no local_same_account shadow
+
+    // Trusted attribution preserves the legitimate multi-device reconcile.
+    try std.testing.expectEqual(NickDecision.reclaim_local, table.resolveIncomingNick("kain", 10, 200, "kain", true));
+    try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 10, 100, "kain", true));
 }
 
 test "resolveIncomingNick breaks an HLC tie by higher node id" {
@@ -1787,9 +1848,9 @@ test "resolveIncomingNick breaks an HLC tie by higher node id" {
 
     _ = try table.applyMembership("#chat", "kain", 20, 0, 300, true, .{}, 0);
     // Same HLC, lower node id => newcomer loses.
-    _ = try expectRename(table.resolveIncomingNick("kain", 5, 300, ""));
+    _ = try expectRename(table.resolveIncomingNick("kain", 5, 300, "", true));
     // Same HLC, higher node id => newcomer wins (keep; caller displaces).
-    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 99, 300, ""));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 99, 300, "", true));
 }
 
 test "incumbentLoserUid derives a stable, owner-scoped fallback" {
