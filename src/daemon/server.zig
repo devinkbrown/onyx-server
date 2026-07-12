@@ -176,6 +176,7 @@ const suimyaku_media = @import("../substrate/suimyaku/media.zig");
 const simulcast_select = @import("../substrate/simulcast_select.zig");
 const helix_live = @import("helix/live.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
+const session_capsule = @import("helix/session_capsule.zig");
 const tls_snapshot = @import("helix/tls_snapshot.zig");
 const ws_snapshot = @import("helix/ws_snapshot.zig");
 const ticket_key_capsule = @import("helix/ticket_key_capsule.zig");
@@ -16592,6 +16593,73 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// Seal the account-level multi-session/bouncer registry into `.sessions`
+    /// capsules (one per account) so SESSION reclaim tokens, detached restore
+    /// snapshots, and attached-session identity survive the USR2 swap. Without
+    /// this every upgrade silently WIPED the registry: post-upgrade SESSION
+    /// RESUME answered FAIL NO_SESSION and every pre-upgrade mesh MTOKEN pointed
+    /// at a session the origin no longer held. Best-effort: an account that
+    /// cannot be sealed is skipped (its sessions die with the predecessor — the
+    /// pre-fix behavior), never fatal to the upgrade. Returns accounts sealed.
+    fn sealSessionRegistry(
+        self: *LinuxServer,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+        blobs: *std.ArrayList([]u8),
+    ) usize {
+        // Join-key map: session client id -> live socket fd. The fd is the
+        // Helix join key back to the carried `.clients` snapshot (the same key
+        // the TLS/WS capsules use); an attached session whose connection ends
+        // up not carried simply finds no successor match and degrades to a
+        // detached (reclaimable) ghost — fail-safe, never a wrong re-join.
+        var fd_by_cid = std.AutoHashMap(u64, i32).init(self.allocator);
+        defer fd_by_cid.deinit();
+        var cit = self.rx().clients.iterator();
+        while (cit.next()) |e| {
+            if (e.value.s2s != null or e.value.s2s_secured != null) continue;
+            if (!e.value.session.registered()) continue;
+            fd_by_cid.put(monitorIdFromClient(e.id), e.value.fd) catch continue;
+        }
+
+        var sealed: usize = 0;
+        self.sessions.lock.lockShared();
+        defer self.sessions.lock.unlockShared();
+        var entries_buf: [sessions_mod.snapshot_capacity]session_capsule.SessionEntry = undefined;
+        var it = self.sessions.accounts.iterator();
+        while (it.next()) |entry| {
+            const acct_sessions = entry.value_ptr.items.items;
+            if (acct_sessions.len == 0) continue;
+            const n = @min(acct_sessions.len, entries_buf.len);
+            // Entries borrow store-owned token/snapshot bytes; the shared lock
+            // held above keeps them stable until encode() copies them below.
+            for (acct_sessions[0..n], entries_buf[0..n]) |*s, *out| {
+                out.* = .{
+                    .token = s.token[0..],
+                    .signon_unix = s.signon_ms,
+                    .detached = !s.attached,
+                    .client = s.client,
+                    .fd = if (s.attached) (fd_by_cid.get(s.client) orelse -1) else -1,
+                    .snapshot = if (!s.attached) (s.snapshot orelse &.{}) else &.{},
+                };
+            }
+            const cap = session_capsule.SessionCapsule{
+                .account = entry.key_ptr.*,
+                .sessions = entries_buf[0..n],
+            };
+            const buf = self.allocator.alloc(u8, cap.encodedLen()) catch continue;
+            _ = cap.encode(buf) catch {
+                self.allocator.free(buf);
+                continue;
+            };
+            blobs.append(self.allocator, buf) catch {
+                self.allocator.free(buf);
+                continue;
+            };
+            pieces.append(self.allocator, .{ .kind = .sessions, .bytes = buf }) catch continue;
+            sealed += 1;
+        }
+        return sealed;
+    }
+
     fn performUpgrade(self: *LinuxServer, requester: ?*ConnState) !void {
         if (comptime builtin.os.tag != .linux) {
             self.upgradeNotice(requester, "UPGRADE is Linux-only");
@@ -16627,6 +16695,11 @@ pub const LinuxServer = struct {
             };
             pieces.append(self.allocator, .{ .kind = .tls_ticket_keys, .bytes = tk }) catch break :ticket;
         }
+        // Seal the multi-session/bouncer registry (one `.sessions` capsule per
+        // account) so SESSION tokens + detached restore snapshots survive the
+        // swap. Adopted by the successor's Pass 2c, AFTER the clients pass —
+        // an attached session re-joins its carried connection by fd.
+        const session_accounts_sealed = self.sealSessionRegistry(&pieces, &blobs);
         const carried_fds = try self.allocator.alloc(linux.fd_t, self.rx().clients.slots.items.len);
         defer self.allocator.free(carried_fds);
         var carried_fd_count: usize = 0;
@@ -16774,6 +16847,22 @@ pub const LinuxServer = struct {
             // encode() copies it below; it is sized to hold the full cap set.
             var caps_buf: [dispatch.max_cap_names_len]u8 = undefined;
             snap.caps = e.value.session.renderNegotiatedCaps(&caps_buf);
+            // Carry the client's multi-session reclaim token so the successor
+            // re-tracks the adopted connection under the SAME token. Without it
+            // every carried client became a SessionStore orphan after USR2
+            // (SESSION TOKEN answered "no token"; its eventual disconnect found
+            // no entry to detach — permanently un-reclaimable). The buffer
+            // lives until encode() copies it below.
+            var sess_tok: sessions_mod.Token = undefined;
+            if (e.value.session.account()) |acct| {
+                var tok_sessions: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+                for (self.sessions.sessionsInto(acct, &tok_sessions)) |s| {
+                    if (s.client != monitorIdFromClient(e.id)) continue;
+                    sess_tok = s.token;
+                    snap.session_token = sess_tok[0..];
+                    break;
+                }
+            }
             const blob = session_snapshot.encode(self.allocator, snap) catch {
                 if (tls_blob) |tb| self.allocator.free(tb);
                 continue;
@@ -16847,8 +16936,8 @@ pub const LinuxServer = struct {
             restoreCloexec(carried_fds[0..carried_fd_count]);
             return self.upgradeListenerOnly(requester);
         };
-        var sbuf: [160]u8 = undefined;
-        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints }) catch "UPGRADE: re-exec");
+        var sbuf: [192]u8 = undefined;
+        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed }) catch "UPGRADE: re-exec");
 
         // Preserve the listener + arena across execve (clear FD_CLOEXEC).
         _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
@@ -16983,6 +17072,27 @@ pub const LinuxServer = struct {
             }
         }
 
+        // Pass 2c: restore the account-level multi-session/bouncer registry
+        // from the carried `.sessions` capsules (one per account). Runs AFTER
+        // Pass 2 so an attached session can re-join its adopted connection by
+        // inherited fd — the same join key the TLS/WS capsules use. Undecodable
+        // capsules are skipped (that account's sessions die, the pre-fix
+        // behavior); each account applies atomically (all-or-nothing), so a
+        // fault never leaves a torn subset of an account's sessions.
+        var session_accounts: usize = 0;
+        var sessions_restored: usize = 0;
+        for (caps) |c| {
+            if (c.header.kind != .sessions) continue;
+            if (c.fields.len == 0) continue;
+            var entries: [sessions_mod.snapshot_capacity]session_capsule.SessionEntry = undefined;
+            const cap = session_capsule.SessionCapsule.decode(c.fields[0].bytes, &entries) catch continue;
+            const restored = self.adoptSessionRegistryAccount(cap);
+            if (restored != 0) {
+                session_accounts += 1;
+                sessions_restored += restored;
+            }
+        }
+
         // Pass 3: re-dial carried mesh peers NOW (not on the sweep timer), so a
         // hand-opened S2S link is re-established within one connect+handshake
         // round-trip of the swap. Config-managed [mesh].connect peers are not in
@@ -17032,9 +17142,64 @@ pub const LinuxServer = struct {
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
         srvLog(
-            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
-            .{ adopted, adopted_tls, adopted_ws, s2s_resumed, redialed },
+            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} session(s) across {d} account(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
+            .{ adopted, adopted_tls, adopted_ws, sessions_restored, session_accounts, s2s_resumed, redialed },
         );
+    }
+
+    /// Restore one account's carried session-registry record. An attached entry
+    /// is re-joined to its adopted connection by inherited fd, keeping the SAME
+    /// reclaim token; an attached entry whose connection did not survive the
+    /// swap — and every detached entry — is retained as a detached ghost with
+    /// its restore snapshot carried byte-identically. Per-account atomic: any
+    /// failure rolls back every entry applied so far and returns 0, so the
+    /// registry holds either the account's full pre-upgrade record or nothing
+    /// (all-old-or-all-new, never a torn subset). Returns sessions restored.
+    fn adoptSessionRegistryAccount(self: *LinuxServer, cap: session_capsule.SessionCapsule) usize {
+        if (cap.account.len == 0 or cap.sessions.len == 0) return 0;
+        if (cap.sessions.len > sessions_mod.snapshot_capacity) return 0;
+        // Validate first, apply second: one malformed entry rejects the whole
+        // account BEFORE anything is written (fail-closed).
+        for (cap.sessions) |entry| {
+            if (entry.token.len != @sizeOf(sessions_mod.Token)) return 0;
+        }
+        var applied: [sessions_mod.snapshot_capacity]u64 = undefined;
+        var applied_n: usize = 0;
+        for (cap.sessions) |entry| {
+            var token: sessions_mod.Token = undefined;
+            @memcpy(&token, entry.token);
+            // Attached entries re-join their adopted successor connection by fd.
+            const live_cid: ?u64 = if (!entry.detached and entry.fd >= 0)
+                self.adoptedClientIdByFd(entry.fd)
+            else
+                null;
+            const cid = live_cid orelse entry.client;
+            _ = self.sessions.attach(cap.account, cid, token, entry.signon_unix) catch {
+                for (applied[0..applied_n]) |rc| _ = self.sessions.remove(cap.account, rc);
+                return 0;
+            };
+            if (live_cid == null) {
+                // The connection did not survive the swap (or the session was
+                // already detached): retain a detached ghost — the token still
+                // reclaims, and the restore snapshot rides along when present.
+                const snap: ?[]const u8 = if (entry.snapshot.len != 0) entry.snapshot else null;
+                _ = self.sessions.markDetachedWithSnapshot(cap.account, cid, snap);
+            }
+            applied[applied_n] = cid;
+            applied_n += 1;
+        }
+        return applied_n;
+    }
+
+    /// Find the successor-side client id of an adopted connection by its
+    /// inherited socket fd (the Helix join key). Boot-time only — the client
+    /// table holds exactly the connections Pass 2 adopted.
+    fn adoptedClientIdByFd(self: *LinuxServer, fd: i32) ?u64 {
+        var it = self.rx().clients.iterator();
+        while (it.next()) |e| {
+            if (e.value.fd == fd) return monitorIdFromClient(e.id);
+        }
+        return null;
     }
 
     /// Re-attach one carried-over client: take ownership of its inherited socket
@@ -17137,6 +17302,23 @@ pub const LinuxServer = struct {
         _ = linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC);
         // Re-apply the connection class (the restored session carries the facets).
         self.assignConnClass(conn);
+        // Re-track the adopted client in the multi-session registry. The
+        // predecessor sealed its reclaim token in the snapshot (v3 `.clients`
+        // tail); re-attach under the SAME token so a stored TOKEN/MTOKEN still
+        // resumes after the deploy. A legacy (pre-token) capsule carries no
+        // token — mint a fresh one via the normal tracking path; never drop
+        // the client over a missing tail. Pass 2c later refreshes the entry
+        // from the sealed `.sessions` registry capsule (same token) — attach is
+        // idempotent by client id, so the two passes compose.
+        if (conn.session.account()) |acct| {
+            if (snap.session_token.len == @sizeOf(sessions_mod.Token)) {
+                var tok: sessions_mod.Token = undefined;
+                @memcpy(&tok, snap.session_token);
+                _ = self.sessions.attach(acct, monitorIdFromClient(id), tok, conn.connected_at_ms) catch {};
+            } else {
+                self.trackSession(id, conn);
+            }
+        }
         return true;
     }
 
@@ -49365,6 +49547,149 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
     const before = std.mem.indexOf(u8, plain.items, "carried-across").?;
     const after = std.mem.indexOf(u8, plain.items, "PONG orochi.local :across-upgrade").?;
     try std.testing.expect(before < after);
+}
+
+test "UPGRADE resume arena restores the multi-session registry (re-track + snapshot)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    // The carried live connection: one end transfers to the server on adopt.
+    var sp: [2]i32 = undefined;
+    const sp_rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sp);
+    if (linux.errno(sp_rc) != .SUCCESS) return error.SkipZigTest;
+    defer closeFd(sp[1]); // sp[0] ownership transfers to the server on adopt
+
+    const tok_a: sessions_mod.Token = @splat('A'); // attached, conn carried
+    const tok_b: sessions_mod.Token = @splat('B'); // detached ghost + snapshot
+    const tok_c: sessions_mod.Token = @splat('C'); // attached, conn NOT carried
+
+    // The predecessor's `.clients` snapshot for the carried connection ...
+    const sess_blob = try session_snapshot.encode(alloc, .{
+        .nick = "ALIA",
+        .realname = "Carried",
+        .account = "alice",
+        .fd = sp[0],
+    });
+    defer alloc.free(sess_blob);
+    // ... and the `.sessions` registry capsule for its account: one attached
+    // session joined by fd, one detached bouncer ghost with a restore snapshot,
+    // and one attached session whose connection did not survive the swap.
+    const entries = [_]session_capsule.SessionEntry{
+        .{ .token = &tok_a, .signon_unix = 1111, .detached = false, .client = 0xDEAD, .fd = sp[0] },
+        .{ .token = &tok_b, .signon_unix = 2222, .detached = true, .client = 777, .snapshot = "restore-blob" },
+        .{ .token = &tok_c, .signon_unix = 3333, .detached = false, .client = 888, .fd = 99_999 },
+    };
+    const cap = session_capsule.SessionCapsule{ .account = "alice", .sessions = &entries };
+    var cap_buf: [512]u8 = undefined;
+    const cap_wire = try cap.encode(&cap_buf);
+
+    const arena_pieces = [_]helix_live.StatePiece{
+        .{ .kind = .clients, .bytes = sess_blob },
+        .{ .kind = .sessions, .bytes = cap_wire },
+    };
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-sess-adopt",
+        .pieces = arena_pieces[0..],
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.config.resume_arena_fd = arena_dup;
+    server.adoptInheritedSessions();
+    current_reactor = null;
+
+    // (1) The attached session re-tracked against the adopted connection with
+    // the SAME reclaim token — not wiped, not detached, not a fresh token.
+    const attached = server.sessions.findTokenSessionInAccount("alice", tok_a) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(attached.attached);
+    try std.testing.expect(attached.client != 0xDEAD); // re-joined to the successor id
+    // (2) The detached bouncer ghost survived with token, identity, and a
+    // byte-identical restore snapshot — SESSION RESUME finds it, not NO_SESSION.
+    try std.testing.expectEqual(@as(u64, 777), server.sessions.findDetachedTokenInAccount("alice", tok_b).?);
+    const restored = (try server.sessions.copyDetachedSnapshotInAccount(alloc, "alice", tok_b)).?;
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, "restore-blob", restored);
+    // (3) The attached session whose connection was NOT carried degrades to a
+    // detached ghost (token preserved for reclaim), never a wrong re-join.
+    try std.testing.expectEqual(@as(u64, 888), server.sessions.findDetachedTokenInAccount("alice", tok_c).?);
+}
+
+test "UPGRADE resume: malformed .sessions capsules never leave a torn account" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const tok_good: sessions_mod.Token = @splat('G');
+    const tok_valid: sessions_mod.Token = @splat('V');
+
+    // A healthy account capsule ...
+    const good_entries = [_]session_capsule.SessionEntry{
+        .{ .token = &tok_good, .signon_unix = 10, .detached = true, .client = 42, .snapshot = "good-snap" },
+    };
+    var good_buf: [256]u8 = undefined;
+    const good_wire = try (session_capsule.SessionCapsule{ .account = "good", .sessions = &good_entries }).encode(&good_buf);
+
+    // ... an account with one VALID and one MALFORMED entry (8-byte token) —
+    // the whole account must be rejected, including the valid entry (all-old-
+    // or-all-new, never a torn subset) ...
+    const torn_entries = [_]session_capsule.SessionEntry{
+        .{ .token = &tok_valid, .signon_unix = 20, .detached = true, .client = 1 },
+        .{ .token = "short-8b", .signon_unix = 21, .detached = true, .client = 2 },
+    };
+    var torn_buf: [256]u8 = undefined;
+    const torn_wire = try (session_capsule.SessionCapsule{ .account = "torn", .sessions = &torn_entries }).encode(&torn_buf);
+
+    // ... and a garbage `.sessions` payload (bad inner magic) — skipped, no panic.
+    const garbage = "not-a-session-capsule-at-all";
+
+    const arena_pieces = [_]helix_live.StatePiece{
+        .{ .kind = .sessions, .bytes = good_wire },
+        .{ .kind = .sessions, .bytes = torn_wire },
+        .{ .kind = .sessions, .bytes = garbage },
+    };
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-sess-fault",
+        .pieces = arena_pieces[0..],
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.config.resume_arena_fd = arena_dup;
+    server.adoptInheritedSessions();
+    current_reactor = null;
+
+    // The healthy account restored completely.
+    try std.testing.expectEqual(@as(u64, 42), server.sessions.findDetachedTokenInAccount("good", tok_good).?);
+    const snap = (try server.sessions.copyDetachedSnapshotInAccount(alloc, "good", tok_good)).?;
+    defer alloc.free(snap);
+    try std.testing.expectEqualSlices(u8, "good-snap", snap);
+    // The account with a malformed entry restored NOTHING — even its valid
+    // entry is absent (atomic reject), and the registry never panicked.
+    try std.testing.expect(server.sessions.findTokenInAccount("torn", tok_valid) == null);
 }
 
 test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {

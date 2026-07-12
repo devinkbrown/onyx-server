@@ -28,14 +28,26 @@
 //!   account:       u16 len + bytes
 //!   session_count: u16
 //!   each session:  token(u16 len + bytes) client(u64) signon_unix(i64) detached(u8)
+//!                  [v2+] fd(i32) snapshot(u32 len + bytes)
+//!
+//! v2 (2026-07) appends, per session, the attached connection's socket fd (the
+//! Helix join key back to the carried client snapshot; -1 when detached) and
+//! the detached session's encoded restore snapshot (empty when none), so a
+//! bouncer session RESTORES across an upgrade instead of degrading to a bare
+//! reclaim token. `decode` is version-aware: a v1 body simply lacks both
+//! trailing fields and reconstructs them at their defaults (fd = -1, empty
+//! snapshot).
 
 const std = @import("std");
 
 /// File magic identifying a session capsule record.
 pub const magic = [_]u8{ 'H', 'S', 'S', 'N' };
 
-/// Wire format version. Bump on any incompatible layout change.
-pub const version: u8 = 1;
+/// Wire format version written by `encode`. Bump on any layout change.
+pub const version: u8 = 2;
+
+/// Oldest wire version `decode` still accepts.
+pub const min_version: u8 = 1;
 
 /// Maximum encodable string length (token / account).
 const max_str_len: usize = 0xFFFF;
@@ -67,6 +79,12 @@ pub const SessionEntry = struct {
     signon_unix: i64,
     detached: bool,
     client: u64 = 0,
+    /// v2: the attached connection's socket fd — the Helix join key back to the
+    /// carried `.clients` snapshot in the successor. -1 when detached (or v1).
+    fd: i32 = -1,
+    /// v2: the detached session's encoded restore snapshot; empty when none
+    /// (attached sessions never carry one). Borrows the decode input buffer.
+    snapshot: []const u8 = &.{},
 };
 
 /// One account's full session record, ready to migrate across an upgrade.
@@ -104,9 +122,23 @@ pub const SessionCapsule = struct {
             try writeI64(out, &pos, entry.signon_unix);
             // detached(u8)
             try writeByte(out, &pos, @intFromBool(entry.detached));
+            // v2: fd(i32 BE)
+            try writeI32(out, &pos, entry.fd);
+            // v2: snapshot(u32 len + bytes)
+            try writeLongStr(out, &pos, entry.snapshot);
         }
 
         return out[0..pos];
+    }
+
+    /// Exact encoded byte length of `self` (v2 layout), for sizing `encode`'s
+    /// output buffer.
+    pub fn encodedLen(self: SessionCapsule) usize {
+        var n: usize = magic.len + 1 + 2 + self.account.len + 2;
+        for (self.sessions) |entry| {
+            n += 2 + entry.token.len + 8 + 8 + 1 + 4 + 4 + entry.snapshot.len;
+        }
+        return n;
     }
 
     /// Parse a `SessionCapsule` from `bytes`. The decoded sessions are written
@@ -123,7 +155,7 @@ pub const SessionCapsule = struct {
         if (!std.mem.eql(u8, got_magic, &magic)) return error.BadMagic;
 
         const got_version = try readByte(bytes, &pos);
-        if (got_version != version) return error.BadVersion;
+        if (got_version < min_version or got_version > version) return error.BadVersion;
 
         const account = try readStr(bytes, &pos);
 
@@ -136,11 +168,17 @@ pub const SessionCapsule = struct {
             const client = try readU64(bytes, &pos);
             const signon_unix = try readI64(bytes, &pos);
             const detached = (try readByte(bytes, &pos)) != 0;
+            // Legacy arm: a v1 session record ends here — reconstruct the v2
+            // fields at their defaults (no join fd, no restore snapshot).
+            const fd: i32 = if (got_version >= 2) try readI32(bytes, &pos) else -1;
+            const snapshot: []const u8 = if (got_version >= 2) try readLongStr(bytes, &pos) else &.{};
             sessions_out[i] = .{
                 .token = token,
                 .signon_unix = signon_unix,
                 .detached = detached,
                 .client = client,
+                .fd = fd,
+                .snapshot = snapshot,
             };
         }
 
@@ -180,9 +218,28 @@ fn writeI64(out: []u8, pos: *usize, val: i64) Error!void {
     pos.* += 8;
 }
 
+fn writeI32(out: []u8, pos: *usize, val: i32) Error!void {
+    if (pos.* + 4 > out.len) return error.TooMany;
+    std.mem.writeInt(i32, out[pos.*..][0..4], val, .big);
+    pos.* += 4;
+}
+
+fn writeU32(out: []u8, pos: *usize, val: u32) Error!void {
+    if (pos.* + 4 > out.len) return error.TooMany;
+    std.mem.writeInt(u32, out[pos.*..][0..4], val, .big);
+    pos.* += 4;
+}
+
 fn writeStr(out: []u8, pos: *usize, str: []const u8) Error!void {
     if (str.len > max_str_len) return error.TooMany;
     try writeU16(out, pos, @intCast(str.len));
+    try writeBytes(out, pos, str);
+}
+
+/// u32-length-prefixed byte string (the restore snapshot can exceed 64 KiB).
+fn writeLongStr(out: []u8, pos: *usize, str: []const u8) Error!void {
+    if (str.len > std.math.maxInt(u32)) return error.TooMany;
+    try writeU32(out, pos, @intCast(str.len));
     try writeBytes(out, pos, str);
 }
 
@@ -223,8 +280,27 @@ fn readI64(bytes: []const u8, pos: *usize) Error!i64 {
     return val;
 }
 
+fn readI32(bytes: []const u8, pos: *usize) Error!i32 {
+    if (pos.* + 4 > bytes.len) return error.Truncated;
+    const val = std.mem.readInt(i32, bytes[pos.*..][0..4], .big);
+    pos.* += 4;
+    return val;
+}
+
+fn readU32(bytes: []const u8, pos: *usize) Error!u32 {
+    if (pos.* + 4 > bytes.len) return error.Truncated;
+    const val = std.mem.readInt(u32, bytes[pos.*..][0..4], .big);
+    pos.* += 4;
+    return val;
+}
+
 fn readStr(bytes: []const u8, pos: *usize) Error![]const u8 {
     const len = try readU16(bytes, pos);
+    return readBytes(bytes, pos, len);
+}
+
+fn readLongStr(bytes: []const u8, pos: *usize) Error![]const u8 {
+    const len = try readU32(bytes, pos);
     return readBytes(bytes, pos, len);
 }
 
@@ -315,6 +391,81 @@ test "decode returns BadVersion on a future version" {
 
     var out: [4]SessionEntry = undefined;
     try std.testing.expectError(error.BadVersion, SessionCapsule.decode(bumped[0..wire.len], &out));
+}
+
+test "v2 round-trip carries the join fd and a byte-identical restore snapshot" {
+    const restore = "\x00\x01snapshot-bytes\xffwith binary\x00tail";
+    const sessions = [_]SessionEntry{
+        .{ .token = "tok-attached-0001", .signon_unix = 111, .detached = false, .client = 7, .fd = 42 },
+        .{ .token = "tok-detached-0002", .signon_unix = 222, .detached = true, .client = 8, .fd = -1, .snapshot = restore },
+    };
+    const original = SessionCapsule{ .account = "alice", .sessions = &sessions };
+
+    var buf: [512]u8 = undefined;
+    const wire = try original.encode(&buf);
+    try std.testing.expectEqual(original.encodedLen(), wire.len);
+
+    var out: [8]SessionEntry = undefined;
+    const decoded = try SessionCapsule.decode(wire, &out);
+
+    try std.testing.expectEqual(@as(i32, 42), decoded.sessions[0].fd);
+    try std.testing.expectEqual(@as(usize, 0), decoded.sessions[0].snapshot.len);
+    try std.testing.expectEqual(@as(i32, -1), decoded.sessions[1].fd);
+    try std.testing.expectEqualSlices(u8, restore, decoded.sessions[1].snapshot);
+}
+
+/// Hand-build a v1 record (the pre-snapshot layout): a v1 session body is
+/// exactly a v2 body minus its trailing fd(i32) + snapshot(u32 len + bytes).
+fn buildV1(buf: []u8, account: []const u8, entries: []const SessionEntry) ![]const u8 {
+    var pos: usize = 0;
+    try writeBytes(buf, &pos, &magic);
+    try writeByte(buf, &pos, 1); // v1
+    try writeStr(buf, &pos, account);
+    try writeU16(buf, &pos, @intCast(entries.len));
+    for (entries) |e| {
+        try writeStr(buf, &pos, e.token);
+        try writeU64(buf, &pos, e.client);
+        try writeI64(buf, &pos, e.signon_unix);
+        try writeByte(buf, &pos, @intFromBool(e.detached));
+    }
+    return buf[0..pos];
+}
+
+test "cross-version: a v1 (pre-snapshot) record still decodes, defaults reconstructed" {
+    const sessions = [_]SessionEntry{
+        .{ .token = "legacy-tok-00001", .signon_unix = 1_700_000_123, .detached = true, .client = 55 },
+        .{ .token = "legacy-tok-00002", .signon_unix = 1_700_000_456, .detached = false, .client = 66 },
+    };
+    var buf: [256]u8 = undefined;
+    const v1_wire = try buildV1(&buf, "bob", &sessions);
+
+    var out: [4]SessionEntry = undefined;
+    const decoded = try SessionCapsule.decode(v1_wire, &out);
+
+    try std.testing.expectEqualStrings("bob", decoded.account);
+    try std.testing.expectEqual(@as(usize, 2), decoded.sessions.len);
+    try std.testing.expectEqualStrings("legacy-tok-00001", decoded.sessions[0].token);
+    try std.testing.expectEqual(@as(u64, 55), decoded.sessions[0].client);
+    try std.testing.expectEqual(true, decoded.sessions[0].detached);
+    // v2 fields reconstructed at their defaults.
+    try std.testing.expectEqual(@as(i32, -1), decoded.sessions[0].fd);
+    try std.testing.expectEqual(@as(usize, 0), decoded.sessions[0].snapshot.len);
+    try std.testing.expectEqual(@as(i32, -1), decoded.sessions[1].fd);
+    try std.testing.expectEqual(@as(usize, 0), decoded.sessions[1].snapshot.len);
+}
+
+test "cross-version: a truncated v2 snapshot field is Truncated, never a panic" {
+    const sessions = [_]SessionEntry{
+        .{ .token = "tok", .signon_unix = 1, .detached = true, .client = 1, .snapshot = "restore-me" },
+    };
+    const original = SessionCapsule{ .account = "eve", .sessions = &sessions };
+    var buf: [128]u8 = undefined;
+    const wire = try original.encode(&buf);
+
+    var out: [2]SessionEntry = undefined;
+    // Cut inside the snapshot bytes and inside its length prefix.
+    try std.testing.expectError(error.Truncated, SessionCapsule.decode(wire[0 .. wire.len - 4], &out));
+    try std.testing.expectError(error.Truncated, SessionCapsule.decode(wire[0 .. wire.len - "restore-me".len - 2], &out));
 }
 
 test "decode returns TooMany when sessions_out is too small" {

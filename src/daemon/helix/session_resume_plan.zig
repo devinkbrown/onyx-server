@@ -43,6 +43,10 @@ pub const SessionState = struct {
     token: []const u8,
     signon_unix: i64,
     attached: bool,
+    /// The detached session's encoded restore snapshot (v2 capsules; empty when
+    /// none). Passed through verbatim so a resumed bouncer session restores
+    /// byte-identically instead of degrading to a bare reclaim token.
+    snapshot: []const u8 = &.{},
 };
 
 /// Reconstruct the multi-session registry's attach/detach state after a Helix
@@ -83,6 +87,7 @@ pub fn plan(
                 .token = entry.token,
                 .signon_unix = entry.signon_unix,
                 .attached = containsClient(live_client_ids, entry.client),
+                .snapshot = entry.snapshot,
             };
             n += 1;
         }
@@ -125,7 +130,7 @@ const SessionCapsule = session_capsule.SessionCapsule;
 test "plan attaches sessions whose client migrated and detaches the rest" {
     const alice_sessions = [_]SessionEntry{
         .{ .token = "alice-tok-1", .signon_unix = 1_700_000_001, .detached = false, .client = 10 },
-        .{ .token = "alice-tok-2", .signon_unix = 1_700_000_002, .detached = true, .client = 20 },
+        .{ .token = "alice-tok-2", .signon_unix = 1_700_000_002, .detached = true, .client = 20, .snapshot = "alice-restore-blob" },
     };
     const bob_sessions = [_]SessionEntry{
         .{ .token = "bob-tok-1", .signon_unix = 1_700_000_003, .detached = false, .client = 30 },
@@ -152,9 +157,10 @@ test "plan attaches sessions whose client migrated and detaches the rest" {
     try std.testing.expectEqual(@as(i64, 1_700_000_001), states[0].signon_unix);
     try std.testing.expectEqual(true, states[0].attached);
 
-    // alice-tok-2 (client 20) -> detached
+    // alice-tok-2 (client 20) -> detached; restore snapshot passes through verbatim.
     try std.testing.expectEqualStrings("alice-tok-2", states[1].token);
     try std.testing.expectEqual(false, states[1].attached);
+    try std.testing.expectEqualSlices(u8, "alice-restore-blob", states[1].snapshot);
 
     // bob-tok-1 (client 30) -> attached
     try std.testing.expectEqualStrings("bob", states[2].account);

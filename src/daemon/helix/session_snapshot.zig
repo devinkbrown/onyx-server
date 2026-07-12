@@ -23,6 +23,7 @@
 //!   [u64 oper_priv_bits][u16 len][oper_class][u16 len][oper_title]  OPTIONAL
 //!   [u16 len][username]   OPTIONAL trailing USER ident (past the oper grant)
 //!   [u8 was_secured]      OPTIONAL trailing secured-flag (past the username)
+//!   [u8 tlen][token]      OPTIONAL trailing session reclaim token (past the flag)
 //!
 //! The oper-grant block (OPTIONAL, written after the caps block) carries the
 //! operator's privilege bits (OperPrivileges.toBits — append-only ordinals) plus
@@ -56,6 +57,19 @@
 //! Because this grows the `.clients` payload, the `.clients` capsule descriptor is
 //! bumped to `current_version = 2` (`min_supported = 1` still adopts old capsules;
 //! see helix/capsule.zig) and `decode` reads the byte tolerantly.
+//!
+//! The session-token block (OPTIONAL, `[u8 tlen][tlen bytes]`, written last — past
+//! the secured flag) carries the client's 16-byte multi-session reclaim token so a
+//! carried connection re-attaches into the SessionStore with the SAME token. It
+//! fixes the carried-client-becomes-a-registry-orphan bug: without it every USR2
+//! left adopted clients untracked — `SESSION TOKEN` answered "no token", and their
+//! eventual disconnect found no registry entry to detach, so the session was
+//! permanently un-reclaimable (every deploy invalidated a web client's stored
+//! TOKEN/MTOKEN resume). `tlen = 0` means no token was tracked (not logged in);
+//! omitting the block entirely (a pre-token v2 build) decodes to an empty token and
+//! the successor mints a fresh one via the normal tracking path — a legacy capsule
+//! NEVER drops the client. Growing the payload again is why the `.clients`
+//! descriptor is at version 3 (capsule.zig).
 const std = @import("std");
 
 pub const Error = error{ Truncated, TooLong };
@@ -89,6 +103,12 @@ pub const Snapshot = struct {
     /// rather than adopted as plaintext — a secured socket never falls back to
     /// cleartext.
     was_secured: bool = false,
+    /// The client's 16-byte multi-session reclaim token (sessions.zig `Token`),
+    /// carried as an OPTIONAL trailing block so the successor re-tracks the
+    /// adopted connection in the SessionStore under the SAME token. Empty = no
+    /// token carried (not logged in, or a pre-token capsule) → the successor
+    /// mints a fresh token via the normal tracking path.
+    session_token: []const u8 = &.{},
     /// The client's socket fd, preserved across execve (CLOEXEC cleared by the
     /// predecessor) so the successor re-attaches the live connection. -1 = none.
     fd: i32 = -1,
@@ -190,6 +210,13 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     // pre-flag build omits it and decodes to `was_secured = false`. Growing the
     // payload is why the `.clients` descriptor is at version 2 (capsule.zig).
     try out.append(allocator, @intFromBool(snap.was_secured));
+    // Trailing session-token block (see header): `[u8 tlen][tlen bytes]`, the
+    // client's multi-session reclaim token. APPEND-ONLY past the secured flag; a
+    // pre-token (v2) capsule omits it and the successor mints a fresh token.
+    // Growing the payload is why the `.clients` descriptor is at version 3.
+    if (snap.session_token.len > std.math.maxInt(u8)) return error.TooLong;
+    try out.append(allocator, @intCast(snap.session_token.len));
+    try out.appendSlice(allocator, snap.session_token);
     return out.toOwnedSlice(allocator);
 }
 
@@ -219,6 +246,7 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     var oper_title: []const u8 = "";
     var username: []const u8 = "";
     var was_secured: bool = false;
+    var session_token: []const u8 = &.{};
     // Walk the optional trailing blocks with a running cursor `p`: signon (16) →
     // caps ([u16][bytes]) → oper grant ([u64][u16][class][u16][title]) → username
     // ([u16][bytes]). Each is gated on enough bytes remaining, so a capsule from a
@@ -265,6 +293,18 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
                 if (r.buf.len - p >= 1) {
                     was_secured = r.buf[p] != 0;
                     p += 1;
+                    // Trailing session-token block (past the secured flag):
+                    // [u8 tlen][tlen bytes]. Gated on bytes remaining so a
+                    // pre-token (v2) capsule defaults it to empty — the
+                    // successor then mints a fresh token, never drops the client.
+                    if (r.buf.len - p >= 1) {
+                        const tl: usize = r.buf[p];
+                        p += 1;
+                        if (r.buf.len - p >= tl) {
+                            session_token = r.buf[p .. p + tl];
+                            p += tl;
+                        }
+                    }
                 }
             }
         }
@@ -289,6 +329,7 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
         .oper_title = oper_title,
         .username = username,
         .was_secured = was_secured,
+        .session_token = session_token,
     };
 }
 
@@ -483,7 +524,9 @@ test "decode tolerates a pre-signon snapshot (no trailing blocks)" {
         .last_message_ms = 5678,
     });
     defer allocator.free(bytes);
-    const old = bytes[0 .. bytes.len - 18];
+    // Strip every trailing block: signon(16) + empty caps(2) + oper(12) +
+    // empty username(2) + secured(1) + empty token(1) = 34 bytes.
+    const old = bytes[0 .. bytes.len - 34];
 
     const got = try decode(old);
     try testing.expectEqualStrings("bob", got.nick);
@@ -516,7 +559,8 @@ test "decode tolerates a pre-caps snapshot (signon present, caps absent)" {
     const oper_block = 8 + 2 + 2; // priv bits + empty class + empty title
     const username_block = 2; // empty username len prefix
     const secured_block = 1; // trailing was_secured flag byte
-    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block - secured_block];
+    const token_block = 1; // empty session-token len prefix
+    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block - secured_block - token_block];
 
     const got = try decode(old);
     try testing.expectEqualStrings("carol", got.nick);
@@ -596,7 +640,9 @@ test "session_snapshot decode tolerates a pre-was_secured capsule (legacy upgrad
         .was_secured = true,
     });
     defer allocator.free(bytes);
-    const old = bytes[0 .. bytes.len - 1]; // strip the trailing was_secured byte
+    // Strip the trailing session-token block (1 empty len byte) AND the
+    // was_secured byte to emulate the pre-flag (v1) layout.
+    const old = bytes[0 .. bytes.len - 2];
 
     const got = try decode(old);
     try testing.expect(!got.was_secured); // legacy blob → defaults false
@@ -607,6 +653,58 @@ test "session_snapshot decode tolerates a pre-was_secured capsule (legacy upgrad
     try testing.expect(got.is_oper and got.logged_in);
     try testing.expectEqualStrings("sasl", got.caps);
     try testing.expectEqual(@as(i32, 33), got.fd);
+}
+
+test "session-token tail round-trips (present and absent)" {
+    const allocator = testing.allocator;
+    const tok: [16]u8 = @splat(0x5A);
+    const bytes = try encode(allocator, .{
+        .nick = "heidi",
+        .account = "heidi",
+        .logged_in = true,
+        .fd = 21,
+        .was_secured = true,
+        .session_token = &tok,
+    });
+    defer allocator.free(bytes);
+    const got = try decode(bytes);
+    try testing.expectEqualSlices(u8, &tok, got.session_token);
+    try testing.expect(got.was_secured); // the flag before the token is intact
+    try testing.expectEqual(@as(i32, 21), got.fd);
+
+    // No token tracked (not logged in): the block encodes tlen=0 and decodes empty.
+    const none = try encode(allocator, .{ .nick = "guest", .fd = 22 });
+    defer allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), (try decode(none)).session_token.len);
+}
+
+test "cross-version: a v2 (pre-token) capsule decodes with an empty token (v2→v3)" {
+    const allocator = testing.allocator;
+    const tok: [16]u8 = @splat(0x77);
+    const bytes = try encode(allocator, .{
+        .nick = "ivan",
+        .account = "ivan",
+        .logged_in = true,
+        .fd = 44,
+        .was_secured = true,
+        .caps = "sasl",
+        .username = "ivanusr",
+        .session_token = &tok,
+    });
+    defer allocator.free(bytes);
+    // A v2 build's blob is exactly this one minus the trailing token block
+    // ([u8 tlen=16][16 bytes]) — strip it to emulate the pre-token layout.
+    const v2 = bytes[0 .. bytes.len - 17];
+
+    const got = try decode(v2);
+    try testing.expectEqual(@as(usize, 0), got.session_token.len); // defaults empty
+    // Every earlier field — including the v2 was_secured flag — still decodes.
+    try testing.expect(got.was_secured);
+    try testing.expectEqualStrings("ivan", got.nick);
+    try testing.expectEqualStrings("ivanusr", got.username);
+    try testing.expectEqualStrings("sasl", got.caps);
+    try testing.expectEqual(@as(i32, 44), got.fd);
+    try testing.expect(got.logged_in);
 }
 
 test "session_snapshot peekFd recovers the fd for a decode-failure drop on resume" {

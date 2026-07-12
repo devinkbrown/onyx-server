@@ -79,11 +79,19 @@ pub const Descriptor = struct {
 pub const registry = [_]Descriptor{
     // v2 appends a trailing `was_secured` byte to the session snapshot so the
     // successor drops a secured client that arrives without its TLS engine rather
-    // than adopting it as plaintext. `min_supported = 1` keeps accepting v1 capsules
-    // sealed by pre-bump binaries; `session_snapshot.decode` reads the byte tolerantly.
-    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 2, .min_supported = 1, .max_supported = 2 },
+    // than adopting it as plaintext. v3 (2026-07) appends a trailing session-token
+    // block ([u8 tlen][bytes]) so a carried client re-tracks in the SessionStore
+    // under the SAME reclaim token instead of becoming a registry orphan.
+    // `min_supported = 1` keeps accepting v1/v2 capsules sealed by pre-bump
+    // binaries; `session_snapshot.decode` reads both tails tolerantly.
+    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 3, .min_supported = 1, .max_supported = 3 },
     .{ .kind = .channels, .schema_id = 0x4843_484e, .current_version = 1, .min_supported = 1, .max_supported = 1 },
-    .{ .kind = .sessions, .schema_id = 0x4853_4553, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // v2 (2026-07): each session record appends the attached connection's join
+    // fd (i32) and the detached restore snapshot (u32 len + bytes), so bouncer
+    // sessions restore byte-identically across USR2 instead of degrading to a
+    // bare reclaim token. `min_supported = 1` keeps accepting v1 capsules sealed
+    // by pre-bump binaries; `session_capsule.decode` is version-aware.
+    .{ .kind = .sessions, .schema_id = 0x4853_4553, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .tsumugi_ratchet, .schema_id = 0x4856_4549, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .mesh_checkpoint, .schema_id = 0x484d_4553, .current_version = 1, .min_supported = 1, .max_supported = 1 },
