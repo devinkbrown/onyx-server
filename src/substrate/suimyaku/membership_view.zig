@@ -4,7 +4,7 @@
 //! SUIMYAKU bounded partial membership view.
 //!
 //! This is the LARGE-mesh companion to SAZANAMI: SAZANAMI tracks liveness
-//! evidence, while this module bounds overlay fanout with a HyParView-shaped
+//! evidence, while this module bounds overlay fanout with a partial-view-shaped
 //! active view plus a larger passive view. All time and randomness are supplied
 //! by the caller, so simulation, replay, and production actors share the same
 //! deterministic state machine.
@@ -42,7 +42,7 @@ pub const Rng = struct {
 
 /// Tuning for the bounded view. Capacities are allocated once at init.
 pub const Config = struct {
-    /// Connected peers. HyParView's active view; every active peer may receive
+    /// Connected peers. The active view; every active peer may receive
     /// direct protocol traffic, so this should remain small.
     active_capacity: usize = 8,
     /// Backup candidates. This should be larger than the active view.
@@ -101,7 +101,7 @@ pub const ShufflePlan = struct {
     sample_len: usize,
 };
 
-/// HyParView-style partial membership view.
+/// Bounded partial membership view (active + passive).
 pub const MembershipView = struct {
     allocator: std.mem.Allocator,
     self_id: NodeId,

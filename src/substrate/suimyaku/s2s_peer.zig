@@ -113,18 +113,18 @@ pub const Config = struct {
     require_signed_frames: bool = true,
 
     /// Consolidated applier for the EFFECTIVE production path
-    /// (`s2s_peer` → `link_session` → peer-link/gossip/swim/burst). Overlays
+    /// (`s2s_peer` → `link_session` → peer-link/gossip/sazanami/burst). Overlays
     /// every `[mesh.*]` section this driver owns. Missing keys leave fields at
     /// their defaults, so behavior is unchanged until the orchestrator supplies
-    /// a parsed config. The aggregate `[mesh.gossip]`/`[mesh.swim]` sections are
+    /// a parsed config. The aggregate `[mesh.gossip]`/`[mesh.sazanami]` sections are
     /// applied to the embedded session sub-configs here (link.applyToml only
     /// handles the `[mesh.link]` per-session overrides + transport + burst).
     pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
-        // Apply the broad `[mesh.gossip]`/`[mesh.swim]` sections to the embedded
+        // Apply the broad `[mesh.gossip]`/`[mesh.sazanami]` sections to the embedded
         // session sub-configs first, then the narrower `[mesh.link]` per-session
         // overrides last so an explicit per-session override always wins.
         cfg.link.gossip_config.applyToml(doc);
-        cfg.link.swim_config.applyToml(doc);
+        cfg.link.sazanami_config.applyToml(doc);
         cfg.link.view_config.applyToml(doc);
         cfg.link.applyToml(doc);
         cfg.registry.applyToml(doc);
@@ -2935,8 +2935,8 @@ test "Config.applyToml consolidated EFFECTIVE prod path overlay" {
     var doc = try toml.parse(allocator,
         \\[mesh.gossip]
         \\round_fanout = 5
-        \\[mesh.swim]
-        \\sazanami_witness_quorum = 3
+        \\[mesh.sazanami]
+        \\witness_quorum = 3
         \\[mesh.link]
         \\gossip_interval_ms = 1750
         \\idle_timeout_ms = 90000
@@ -2950,9 +2950,9 @@ test "Config.applyToml consolidated EFFECTIVE prod path overlay" {
 
     var cfg = Config{};
     cfg.applyToml(&doc);
-    // [mesh.gossip]/[mesh.swim] flow into the session sub-configs.
+    // [mesh.gossip]/[mesh.sazanami] flow into the session sub-configs.
     try std.testing.expectEqual(@as(usize, 5), cfg.link.gossip_config.fanout);
-    try std.testing.expectEqual(@as(u8, 3), cfg.link.swim_config.witness_quorum);
+    try std.testing.expectEqual(@as(u8, 3), cfg.link.sazanami_config.witness_quorum);
     // [mesh.link] session cadence + transport.
     try std.testing.expectEqual(@as(u64, 1750), cfg.link.gossip_interval_ms);
     try std.testing.expectEqual(@as(u64, 90000), cfg.link.peer_link_config.idle_timeout_ms);

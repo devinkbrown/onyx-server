@@ -169,7 +169,7 @@ Live Suimyaku route-table and server-registry capacities. These keys are parsed 
 | `max_server_name_len` | integer | `63` | `16..255` | Max server-name bytes accepted by the registry. |
 | `max_server_desc_len` | integer | `255` | `32..1024` | Max server-description bytes accepted by the registry. |
 
-### `[mesh.gossip]`, `[mesh.swim]`, `[mesh.link]`
+### `[mesh.gossip]`, `[mesh.sazanami]`, `[mesh.link]`
 
 Live S2S peer-driver tuning. `[mesh.link]` per-link `gossip_fanout` and view-capacity overrides are applied after `[mesh.gossip]` defaults.
 
@@ -182,8 +182,8 @@ Live S2S peer-driver tuning. `[mesh.link]` per-link `gossip_fanout` and view-cap
 | `mesh.gossip.view_passive_capacity` | integer | `64` | `active+1..4096` | Bounded membership-view passive capacity. |
 | `mesh.gossip.view_shuffle_active` | integer | `2` | `0..active` | Active entries sampled per shuffle. |
 | `mesh.gossip.view_shuffle_passive` | integer | `4` | `0..passive` | Passive entries sampled per shuffle. |
-| `mesh.swim.sazanami_suspicion_timeout_ms` | integer | `3000` | `0..120000` | Gossip-side suspect to dead reaping timeout. |
-| `mesh.swim.sazanami_witness_quorum` | integer | `2` | `1..16` | Witness quorum for Sazanami dead declaration. |
+| `mesh.sazanami.suspicion_timeout_ms` | integer | `3000` | `0..120000` | Gossip-side suspect to dead reaping timeout. |
+| `mesh.sazanami.witness_quorum` | integer | `2` | `2..16` | Witness quorum for Sazanami dead declaration. |
 | `mesh.link.send_credit_bytes` | integer | `65536` | `4096..16777216` | Initial peer-link flow-control send credit. |
 | `mesh.link.replay_window` | integer | `64` | `8..4096` | Anti-replay sequence window. |
 | `mesh.link.handshake_timeout_ms` | integer | `10000` | `1000..120000` | Peer-link handshake completion timeout. |

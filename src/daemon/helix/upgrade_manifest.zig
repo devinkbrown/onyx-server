@@ -209,7 +209,7 @@ fn readU64(bytes: []const u8, pos: *usize) Error!u64 {
 const kind_clients: u16 = 1;
 const kind_channels: u16 = 2;
 const kind_sessions: u16 = 3;
-const kind_veil_ratchet: u16 = 5;
+const kind_tsumugi_ratchet: u16 = 5;
 const kind_send_queue: u16 = 7;
 
 test "round-trip a three-entry manifest with epoch" {
@@ -274,7 +274,7 @@ test "find locates by kind and returns null for an absent kind" {
     try std.testing.expect(clients != null);
     try std.testing.expectEqual(@as(u32, 0), clients.?.offset);
 
-    try std.testing.expect(find(m, kind_veil_ratchet) == null);
+    try std.testing.expect(find(m, kind_tsumugi_ratchet) == null);
 }
 
 test "decode returns Truncated on a cut buffer" {

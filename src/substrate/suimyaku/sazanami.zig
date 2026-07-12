@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pure witnessed SWIM failure detector.
+//! Pure witnessed Sazanami failure detector.
 //!
 //! This module has no sockets, timers, or daemon coupling. The caller supplies
 //! the clock and deterministic RNG, then transports the returned actions.
@@ -38,13 +38,13 @@ pub const Config = struct {
         return c;
     }
 
-    /// Overlay `[mesh.swim]` TOML keys onto this config. Missing keys leave the
+    /// Overlay `[mesh.sazanami]` TOML keys onto this config. Missing keys leave the
     /// field at its current (default) value, preserving behavior.
     pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
-        if (doc.getInt("mesh.swim.probe_period_ms")) |v| cfg.period_ms = v;
-        if (doc.getUint("mesh.swim.indirect_probes")) |v| cfg.k = @intCast(v);
-        if (doc.getUint("mesh.swim.witness_quorum")) |v| cfg.quorum = @intCast(v);
-        if (doc.getInt("mesh.swim.suspect_timeout_ms")) |v| cfg.suspect_timeout_ms = v;
+        if (doc.getInt("mesh.sazanami.probe_period_ms")) |v| cfg.period_ms = v;
+        if (doc.getUint("mesh.sazanami.indirect_probes")) |v| cfg.k = @intCast(v);
+        if (doc.getUint("mesh.sazanami.witness_quorum")) |v| cfg.quorum = @intCast(v);
+        if (doc.getInt("mesh.sazanami.suspect_timeout_ms")) |v| cfg.suspect_timeout_ms = v;
     }
 };
 
@@ -130,7 +130,7 @@ const Member = struct {
     dirty: bool = true,
 };
 
-pub const Swim = struct {
+pub const Sazanami = struct {
     allocator: std.mem.Allocator,
     self_id: NodeId,
     cfg: Config,
@@ -139,7 +139,7 @@ pub const Swim = struct {
     next_probe_ms: i64 = 0,
     members: std.ArrayList(Member) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, self_id: NodeId, cfg: Config) Error!Swim {
+    pub fn init(allocator: std.mem.Allocator, self_id: NodeId, cfg: Config) Error!Sazanami {
         if (!validNode(self_id)) return error.InvalidNode;
         return .{
             .allocator = allocator,
@@ -148,7 +148,7 @@ pub const Swim = struct {
         };
     }
 
-    pub fn deinit(self: *Swim) void {
+    pub fn deinit(self: *Sazanami) void {
         self.members.deinit(self.allocator);
         self.* = .{
             .allocator = self.allocator,
@@ -158,12 +158,12 @@ pub const Swim = struct {
         };
     }
 
-    pub fn freeActions(self: *Swim, actions: []Action) void {
+    pub fn freeActions(self: *Sazanami, actions: []Action) void {
         self.allocator.free(actions);
     }
 
-    /// Advance SWIM state and return caller-owned actions.
-    pub fn tick(self: *Swim, now_ms: i64, rng: *Rng) Error![]Action {
+    /// Advance Sazanami state and return caller-owned actions.
+    pub fn tick(self: *Sazanami, now_ms: i64, rng: *Rng) Error![]Action {
         var actions: std.ArrayList(Action) = .empty;
         errdefer actions.deinit(self.allocator);
 
@@ -181,7 +181,7 @@ pub const Swim = struct {
         return actions.toOwnedSlice(self.allocator);
     }
 
-    pub fn onAck(self: *Swim, from: NodeId) Error!void {
+    pub fn onAck(self: *Sazanami, from: NodeId) Error!void {
         try self.validatePeer(from);
         const idx = try self.ensureMember(from);
         var m = &self.members.items[idx];
@@ -197,7 +197,7 @@ pub const Swim = struct {
 
     /// Handle an inbound PING_REQ by asking the caller to ping `target`.
     pub fn onPingReq(
-        self: *Swim,
+        self: *Sazanami,
         from: NodeId,
         target: NodeId,
         now_ms: i64,
@@ -214,7 +214,7 @@ pub const Swim = struct {
         return actions.toOwnedSlice(self.allocator);
     }
 
-    pub fn onMembershipDelta(self: *Swim, delta: MembershipDelta, now_ms: i64) Error!void {
+    pub fn onMembershipDelta(self: *Sazanami, delta: MembershipDelta, now_ms: i64) Error!void {
         if (!validNode(delta.node)) return error.InvalidNode;
 
         if (delta.node == self.self_id) {
@@ -229,20 +229,20 @@ pub const Swim = struct {
         }
     }
 
-    pub fn status(self: *const Swim, node: NodeId) State {
+    pub fn status(self: *const Sazanami, node: NodeId) State {
         if (node == self.self_id) return .alive;
         if (self.findMember(node)) |idx| return self.members.items[idx].state;
         return .dead;
     }
 
-    /// Whether SWIM already tracks `node`. Distinguishes a genuinely-dead
+    /// Whether Sazanami already tracks `node`. Distinguishes a genuinely-dead
     /// member from an unknown one (both report `.dead` via `status`), so callers
     /// can register a peer once without resurrecting suspects on every tick.
-    pub fn isMember(self: *const Swim, node: NodeId) bool {
+    pub fn isMember(self: *const Sazanami, node: NodeId) bool {
         return node == self.self_id or self.findMember(node) != null;
     }
 
-    fn applyDeltaAboutSelf(self: *Swim, delta: MembershipDelta) Error!void {
+    fn applyDeltaAboutSelf(self: *Sazanami, delta: MembershipDelta) Error!void {
         switch (delta.state) {
             .alive => {
                 if (delta.incarnation > self.self_incarnation) {
@@ -259,7 +259,7 @@ pub const Swim = struct {
         }
     }
 
-    fn applyAlive(self: *Swim, node: NodeId, incarnation: Incarnation) Error!void {
+    fn applyAlive(self: *Sazanami, node: NodeId, incarnation: Incarnation) Error!void {
         const idx = try self.ensureMember(node);
         var m = &self.members.items[idx];
         if (m.state == .dead and incarnation <= m.incarnation) return;
@@ -274,7 +274,7 @@ pub const Swim = struct {
     }
 
     fn applySuspect(
-        self: *Swim,
+        self: *Sazanami,
         node: NodeId,
         incarnation: Incarnation,
         witnesses: []const NodeId,
@@ -300,7 +300,7 @@ pub const Swim = struct {
     }
 
     fn applyDead(
-        self: *Swim,
+        self: *Sazanami,
         node: NodeId,
         incarnation: Incarnation,
         witnesses: []const NodeId,
@@ -318,7 +318,7 @@ pub const Swim = struct {
     }
 
     fn handleProbeTimeouts(
-        self: *Swim,
+        self: *Sazanami,
         now_ms: i64,
         rng: *Rng,
         actions: *std.ArrayList(Action),
@@ -339,7 +339,7 @@ pub const Swim = struct {
     }
 
     fn promoteTimedOutSuspects(
-        self: *Swim,
+        self: *Sazanami,
         now_ms: i64,
         actions: *std.ArrayList(Action),
     ) Error!void {
@@ -359,7 +359,7 @@ pub const Swim = struct {
     /// this node accrue its own first-hand witness (a remote suspicion alone
     /// stops nothing) so a quorum can actually form, and detects recovery when a
     /// falsely-suspected node answers. Dead members are never re-probed.
-    fn chooseProbeTarget(self: *Swim, rng: *Rng) ?usize {
+    fn chooseProbeTarget(self: *Sazanami, rng: *Rng) ?usize {
         var count: usize = 0;
         for (self.members.items) |m| {
             if (m.state != .dead) count += 1;
@@ -376,7 +376,7 @@ pub const Swim = struct {
     }
 
     fn appendPingReqs(
-        self: *Swim,
+        self: *Sazanami,
         target: NodeId,
         rng: *Rng,
         actions: *std.ArrayList(Action),
@@ -403,7 +403,7 @@ pub const Swim = struct {
         }
     }
 
-    fn appendDirtyDeclares(self: *Swim, actions: *std.ArrayList(Action)) Error!void {
+    fn appendDirtyDeclares(self: *Sazanami, actions: *std.ArrayList(Action)) Error!void {
         if (self.self_dirty) {
             try actions.append(self.allocator, .{ .Declare = .{
                 .node = self.self_id,
@@ -420,7 +420,7 @@ pub const Swim = struct {
         }
     }
 
-    fn declareFor(_: *Swim, m: Member) Declare {
+    fn declareFor(_: *Sazanami, m: Member) Declare {
         return .{
             .node = m.id,
             .state = m.state,
@@ -429,7 +429,7 @@ pub const Swim = struct {
         };
     }
 
-    fn ensureMember(self: *Swim, node: NodeId) Error!usize {
+    fn ensureMember(self: *Sazanami, node: NodeId) Error!usize {
         try self.validatePeer(node);
         if (self.findMember(node)) |idx| return idx;
         try self.members.append(self.allocator, .{ .id = node });
@@ -437,11 +437,11 @@ pub const Swim = struct {
         return self.findMember(node).?;
     }
 
-    fn validatePeer(self: *const Swim, node: NodeId) Error!void {
+    fn validatePeer(self: *const Sazanami, node: NodeId) Error!void {
         if (!validNode(node) or node == self.self_id) return error.InvalidNode;
     }
 
-    fn findMember(self: *const Swim, node: NodeId) ?usize {
+    fn findMember(self: *const Sazanami, node: NodeId) ?usize {
         for (self.members.items, 0..) |m, idx| {
             if (m.id == node) return idx;
         }
@@ -469,102 +469,102 @@ fn hasAction(actions: []const Action, comptime tag: std.meta.Tag(Action), node: 
 const testing = std.testing;
 
 test "healthy node stays alive" {
-    var swim = try Swim.init(testing.allocator, 1, .{ .period_ms = 100 });
-    defer swim.deinit();
+    var det = try Sazanami.init(testing.allocator, 1, .{ .period_ms = 100 });
+    defer det.deinit();
     var rng = Rng.init(7);
 
-    try swim.onMembershipDelta(.{ .node = 2, .state = .alive }, 0);
-    var actions = try swim.tick(0, &rng);
+    try det.onMembershipDelta(.{ .node = 2, .state = .alive }, 0);
+    var actions = try det.tick(0, &rng);
     try testing.expect(hasAction(actions, .Ping, 2));
-    swim.freeActions(actions);
+    det.freeActions(actions);
 
-    try swim.onAck(2);
-    actions = try swim.tick(100, &rng);
-    defer swim.freeActions(actions);
-    try testing.expectEqual(State.alive, swim.status(2));
+    try det.onAck(2);
+    actions = try det.tick(100, &rng);
+    defer det.freeActions(actions);
+    try testing.expectEqual(State.alive, det.status(2));
 }
 
 test "missed acks transition alive to suspect and request witnesses" {
-    var swim = try Swim.init(testing.allocator, 1, .{ .period_ms = 100, .k = 2 });
-    defer swim.deinit();
+    var det = try Sazanami.init(testing.allocator, 1, .{ .period_ms = 100, .k = 2 });
+    defer det.deinit();
     var rng = Rng.init(11);
 
     for ([_]NodeId{ 2, 3, 4 }) |node| {
-        try swim.onMembershipDelta(.{ .node = node, .state = .alive }, 0);
+        try det.onMembershipDelta(.{ .node = node, .state = .alive }, 0);
     }
 
-    var actions = try swim.tick(0, &rng);
+    var actions = try det.tick(0, &rng);
     var target: NodeId = 0;
     for (actions) |action| switch (action) {
         .Ping => |p| target = p.target,
         else => {},
     };
-    swim.freeActions(actions);
+    det.freeActions(actions);
 
-    actions = try swim.tick(100, &rng);
-    defer swim.freeActions(actions);
-    try testing.expectEqual(State.suspect, swim.status(target));
+    actions = try det.tick(100, &rng);
+    defer det.freeActions(actions);
+    try testing.expectEqual(State.suspect, det.status(target));
     try testing.expect(hasAction(actions, .PingReq, target));
     try testing.expect(hasAction(actions, .Declare, target));
 }
 
 test "quorum of witnesses transitions suspect to dead" {
-    var swim = try Swim.init(testing.allocator, 1, .{
+    var det = try Sazanami.init(testing.allocator, 1, .{
         .period_ms = 100,
         .quorum = 2,
         .suspect_timeout_ms = 50,
     });
-    defer swim.deinit();
+    defer det.deinit();
     var rng = Rng.init(19);
 
-    try swim.onMembershipDelta(.{ .node = 9, .state = .suspect, .witnesses = &.{ 2, 3 } }, 0);
-    try testing.expectEqual(State.suspect, swim.status(9));
+    try det.onMembershipDelta(.{ .node = 9, .state = .suspect, .witnesses = &.{ 2, 3 } }, 0);
+    try testing.expectEqual(State.suspect, det.status(9));
 
-    const actions = try swim.tick(50, &rng);
-    defer swim.freeActions(actions);
-    try testing.expectEqual(State.dead, swim.status(9));
+    const actions = try det.tick(50, &rng);
+    defer det.freeActions(actions);
+    try testing.expectEqual(State.dead, det.status(9));
     try testing.expect(hasAction(actions, .Declare, 9));
 }
 
 test "single accuser cannot force dead" {
-    var swim = try Swim.init(testing.allocator, 1, .{
+    var det = try Sazanami.init(testing.allocator, 1, .{
         .period_ms = 100,
         .quorum = 2,
         .suspect_timeout_ms = 0,
     });
-    defer swim.deinit();
+    defer det.deinit();
     var rng = Rng.init(23);
 
-    try swim.onMembershipDelta(.{
+    try det.onMembershipDelta(.{
         .node = 5,
         .state = .dead,
         .incarnation = 0,
         .witnesses = &.{2},
     }, 0);
 
-    const actions = try swim.tick(10, &rng);
-    defer swim.freeActions(actions);
-    try testing.expectEqual(State.suspect, swim.status(5));
+    const actions = try det.tick(10, &rng);
+    defer det.freeActions(actions);
+    try testing.expectEqual(State.suspect, det.status(5));
 }
 
 test "newer incarnation refutes stale suspicion" {
-    var swim = try Swim.init(testing.allocator, 1, .{ .period_ms = 100 });
-    defer swim.deinit();
+    var det = try Sazanami.init(testing.allocator, 1, .{ .period_ms = 100 });
+    defer det.deinit();
 
-    try swim.onMembershipDelta(.{ .node = 6, .state = .suspect, .witnesses = &.{2} }, 0);
-    try testing.expectEqual(State.suspect, swim.status(6));
+    try det.onMembershipDelta(.{ .node = 6, .state = .suspect, .witnesses = &.{2} }, 0);
+    try testing.expectEqual(State.suspect, det.status(6));
 
-    try swim.onMembershipDelta(.{ .node = 6, .state = .alive, .incarnation = 1 }, 10);
-    try testing.expectEqual(State.alive, swim.status(6));
+    try det.onMembershipDelta(.{ .node = 6, .state = .alive, .incarnation = 1 }, 10);
+    try testing.expectEqual(State.alive, det.status(6));
 
-    try swim.onMembershipDelta(.{ .node = 6, .state = .suspect, .incarnation = 0, .witnesses = &.{3} }, 20);
-    try testing.expectEqual(State.alive, swim.status(6));
+    try det.onMembershipDelta(.{ .node = 6, .state = .suspect, .incarnation = 0, .witnesses = &.{3} }, 20);
+    try testing.expectEqual(State.alive, det.status(6));
 }
 
-test "Config.applyToml overlays mesh.swim keys and leaves missing at defaults" {
+test "Config.applyToml overlays mesh.sazanami keys and leaves missing at defaults" {
     const allocator = std.testing.allocator;
     var doc = try toml.parse(allocator,
-        \\[mesh.swim]
+        \\[mesh.sazanami]
         \\probe_period_ms = 2500
         \\indirect_probes = 5
         \\witness_quorum = 4

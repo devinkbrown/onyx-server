@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! VeilSafe secret wrappers for byte material that should not leak through logs.
+//! Zeroizing secret wrappers for byte material that should not leak through logs.
 //!
 //! `Secret(N)` keeps fixed-size sensitive bytes behind an explicit `expose`
 //! method, compares them without data-dependent early exits, and always formats

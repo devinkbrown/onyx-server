@@ -1,25 +1,26 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Suimyaku mesh coordinator: HyParView overlay + Plumtree broadcast + witnessed
-//! SWIM failure detection, composed into one transport-agnostic state machine.
+//! Suimyaku mesh coordinator: partial-view membership + eager/lazy broadcast +
+//! witnessed Sazanami failure detection, composed into one transport-agnostic
+//! state machine.
 //!
 //! Each of the three pieces is an independently-tested pure driver
-//! (`gossip_views.Views`, `gossip_views.Plumtree`, `swim.Swim`). This module is
+//! (`gossip_views.Views`, `gossip_views.Broadcast`, `sazanami.Sazanami`). This module is
 //! the missing glue that makes them a working mesh:
 //!
 //!   * the overlay decides *who* a node keeps links to (active view);
-//!   * Plumtree disseminates application payloads epidemically over those links,
+//!   * Broadcast disseminates application payloads epidemically over those links,
 //!     repairing gaps lazily with GRAFT;
-//!   * witnessed SWIM decides *which* peers are alive, and a quorum of witnesses
+//!   * witnessed Sazanami decides *which* peers are alive, and a quorum of witnesses
 //!     is required before any node is declared dead (no single accuser).
 //!
 //! The feedback loop is the real work here:
-//!   - when the overlay adds an active peer, SWIM is told to start probing it;
-//!   - when SWIM declares a peer dead, the overlay disconnects it, and Plumtree
+//!   - when the overlay adds an active peer, Sazanami is told to start probing it;
+//!   - when Sazanami declares a peer dead, the overlay disconnects it, and Broadcast
 //!     prunes it from its eager/lazy sets on the next `syncActive`.
 //!
-//! Like `S2sLink`, this is initialized *in place*: `Plumtree` borrows
+//! Like `S2sLink`, this is initialized *in place*: `Broadcast` borrows
 //! `&self.views`, so the struct must already live at its final address before
 //! `init` runs. The reactor/daemon drives it by handing inbound `Wire` messages
 //! to `recv` and flushing the returned `Envelope`s to the matching peer links;
@@ -29,20 +30,20 @@
 const std = @import("std");
 
 const gossip = @import("gossip_views.zig");
-const swim = @import("swim.zig");
+const sazanami = @import("sazanami.zig");
 const membership_view = @import("membership_view.zig");
 const toml = @import("../../proto/toml.zig");
 
 pub const NodeId = membership_view.NodeId;
 pub const Rng = membership_view.Rng;
-pub const State = swim.State;
+pub const State = sazanami.State;
 
-pub const Error = gossip.Error || swim.Error || std.mem.Allocator.Error;
+pub const Error = gossip.Error || sazanami.Error || std.mem.Allocator.Error;
 
 pub const Config = struct {
     views: gossip.Config = .{},
-    plumtree: gossip.PlumtreeConfig = .{},
-    swim: swim.Config = .{},
+    broadcaster: gossip.BroadcastConfig = .{},
+    sazanami: sazanami.Config = .{},
     /// Deterministic seed for this node's overlay/probe randomness.
     rng_seed: u64 = 0,
 
@@ -51,8 +52,8 @@ pub const Config = struct {
     /// so the mesh behaves identically until the orchestrator wires real values.
     pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
         cfg.views.applyToml(doc);
-        cfg.plumtree.applyToml(doc);
-        cfg.swim.applyToml(doc);
+        cfg.broadcaster.applyToml(doc);
+        cfg.sazanami.applyToml(doc);
         if (doc.getUint("mesh.rng_seed")) |v| cfg.rng_seed = v;
     }
 };
@@ -79,7 +80,7 @@ pub const Wire = union(enum) {
         node: NodeId,
         state: State,
         incarnation: u64,
-        witnesses: swim.WitnessSnapshot,
+        witnesses: sazanami.WitnessSnapshot,
     },
 };
 
@@ -98,33 +99,33 @@ pub const Mesh = struct {
     self_id: NodeId,
     cfg: Config,
     views: gossip.Views,
-    plumtree: gossip.Plumtree,
-    swim: swim.Swim,
+    broadcaster: gossip.Broadcast,
+    sazanami: sazanami.Sazanami,
     rng: Rng,
     bcast_seq: u64 = 0,
 
     /// Initialize in place. `self` must already be at its final address because
-    /// `plumtree` captures `&self.views`.
+    /// `broadcaster` captures `&self.views`.
     pub fn init(self: *Mesh, allocator: std.mem.Allocator, self_id: NodeId, cfg: Config) Error!void {
         self.* = .{
             .allocator = allocator,
             .self_id = self_id,
             .cfg = cfg,
             .views = undefined,
-            .plumtree = undefined,
-            .swim = undefined,
+            .broadcaster = undefined,
+            .sazanami = undefined,
             .rng = Rng.init(cfg.rng_seed),
         };
         self.views = try gossip.Views.init(allocator, self_id, cfg.views);
         errdefer self.views.deinit();
-        self.swim = try swim.Swim.init(allocator, self_id, cfg.swim);
-        errdefer self.swim.deinit();
-        self.plumtree = gossip.Plumtree.init(allocator, &self.views, cfg.plumtree);
+        self.sazanami = try sazanami.Sazanami.init(allocator, self_id, cfg.sazanami);
+        errdefer self.sazanami.deinit();
+        self.broadcaster = gossip.Broadcast.init(allocator, &self.views, cfg.broadcaster);
     }
 
     pub fn deinit(self: *Mesh) void {
-        self.plumtree.deinit();
-        self.swim.deinit();
+        self.broadcaster.deinit();
+        self.sazanami.deinit();
         self.views.deinit();
         self.* = undefined;
     }
@@ -138,7 +139,7 @@ pub const Mesh = struct {
     }
 
     pub fn status(self: *const Mesh, node: NodeId) State {
-        return self.swim.status(node);
+        return self.sazanami.status(node);
     }
 
     pub fn isActive(self: *const Mesh, node: NodeId) bool {
@@ -146,7 +147,7 @@ pub const Mesh = struct {
     }
 
     pub fn hasMessage(self: *const Mesh, msg_id: u64) bool {
-        return self.plumtree.hasMessage(msg_id);
+        return self.broadcaster.hasMessage(msg_id);
     }
 
     /// Free the envelope slice returned by `join`/`broadcast`/`tick`.
@@ -175,23 +176,23 @@ pub const Mesh = struct {
         const msg_id = self.nextMsgId();
         var out: std.ArrayList(Envelope) = .empty;
         errdefer self.freeEnvelopeList(&out);
-        const actions = try self.plumtree.broadcast(msg_id, payload);
+        const actions = try self.broadcaster.broadcast(msg_id, payload);
         defer self.allocator.free(actions);
         try self.translateGossip(&out, actions);
         return out.toOwnedSlice(self.allocator);
     }
 
-    /// Advance time-based behaviour: SWIM probing/suspicion, Plumtree GRAFT
+    /// Advance time-based behaviour: Sazanami probing/suspicion, Broadcast GRAFT
     /// retries, and death-driven overlay eviction.
     pub fn tick(self: *Mesh, now_ms: i64) Error![]Envelope {
         var out: std.ArrayList(Envelope) = .empty;
         errdefer self.freeEnvelopeList(&out);
 
-        const swim_actions = try self.swim.tick(now_ms, &self.rng);
-        defer self.swim.freeActions(swim_actions);
-        try self.translateSwim(&out, swim_actions);
+        const saz_actions = try self.sazanami.tick(now_ms, &self.rng);
+        defer self.sazanami.freeActions(saz_actions);
+        try self.translateSazanami(&out, saz_actions);
 
-        const graft = try self.plumtree.missingTimer(now_ms);
+        const graft = try self.broadcaster.missingTimer(now_ms);
         defer self.allocator.free(graft);
         try self.translateGossip(&out, graft);
 
@@ -228,25 +229,25 @@ pub const Mesh = struct {
             // here (the coordinator never initiates shuffles yet).
             .shuffle_reply => {},
             .eager => |e| {
-                const had = self.plumtree.hasMessage(e.msg_id);
-                const actions = try self.plumtree.onEager(e.msg_id, e.payload, from);
+                const had = self.broadcaster.hasMessage(e.msg_id);
+                const actions = try self.broadcaster.onEager(e.msg_id, e.payload, from);
                 defer self.allocator.free(actions);
                 try self.translateGossip(&out, actions);
-                if (!had and self.plumtree.hasMessage(e.msg_id)) {
+                if (!had and self.broadcaster.hasMessage(e.msg_id)) {
                     delivered = try self.allocator.dupe(u8, e.payload);
                 }
             },
-            .lazy => |l| try self.dispatchGossip(&out, try self.plumtree.onLazy(l.msg_id, from)),
-            .graft => |g| try self.dispatchGossip(&out, try self.plumtree.onGraft(g.msg_id, from)),
-            .prune => |p| try self.dispatchGossip(&out, try self.plumtree.onPrune(p.msg_id, from)),
+            .lazy => |l| try self.dispatchGossip(&out, try self.broadcaster.onLazy(l.msg_id, from)),
+            .graft => |g| try self.dispatchGossip(&out, try self.broadcaster.onGraft(g.msg_id, from)),
+            .prune => |p| try self.dispatchGossip(&out, try self.broadcaster.onPrune(p.msg_id, from)),
             .ping => try out.append(self.allocator, .{ .to = from, .msg = .ack }),
-            .ack => try self.swim.onAck(from),
+            .ack => try self.sazanami.onAck(from),
             .ping_req => |pr| {
-                const actions = try self.swim.onPingReq(from, pr.target, now_ms);
-                defer self.swim.freeActions(actions);
-                try self.translateSwim(&out, actions);
+                const actions = try self.sazanami.onPingReq(from, pr.target, now_ms);
+                defer self.sazanami.freeActions(actions);
+                try self.translateSazanami(&out, actions);
             },
-            .membership => |m| try self.swim.onMembershipDelta(.{
+            .membership => |m| try self.sazanami.onMembershipDelta(.{
                 .node = m.node,
                 .state = m.state,
                 .incarnation = m.incarnation,
@@ -261,14 +262,14 @@ pub const Mesh = struct {
     // --- internal -----------------------------------------------------------
 
     /// Keep the overlay and the failure detector in agreement:
-    ///   1. register every active-view peer as a SWIM member so it gets probed
-    ///      (SWIM treats *unknown* nodes as dead, so this must run before any
+    ///   1. register every active-view peer as a Sazanami member so it gets probed
+    ///      (Sazanami treats *unknown* nodes as dead, so this must run before any
     ///      death check, and it cannot resurrect a genuinely-dead member);
-    ///   2. evict any active peer SWIM now reports dead, so Plumtree drops it.
+    ///   2. evict any active peer Sazanami now reports dead, so Broadcast drops it.
     /// Only the active view is reconciled: passive entries are an unprobed
     /// reserve, and an unknown passive node must not be mistaken for dead.
     fn reconcile(self: *Mesh, out: *std.ArrayList(Envelope), now_ms: i64) Error!void {
-        // Snapshot the active view before touching SWIM/views; overflow simply
+        // Snapshot the active view before touching Sazanami/views; overflow simply
         // defers the rest to the next tick.
         var live_buf: [256]NodeId = undefined;
         var live_len: usize = 0;
@@ -280,15 +281,15 @@ pub const Mesh = struct {
         for (live_buf[0..live_len]) |peer| {
             // Register first contact only — re-asserting alive every tick would
             // resurrect a suspect/dead member and stall failure detection.
-            if (!self.swim.isMember(peer)) {
-                try self.swim.onMembershipDelta(.{ .node = peer, .state = .alive }, now_ms);
+            if (!self.sazanami.isMember(peer)) {
+                try self.sazanami.onMembershipDelta(.{ .node = peer, .state = .alive }, now_ms);
             }
         }
 
         var dead_buf: [256]NodeId = undefined;
         var dead_len: usize = 0;
         for (live_buf[0..live_len]) |peer| {
-            if (self.swim.status(peer) == .dead and dead_len < dead_buf.len) {
+            if (self.sazanami.status(peer) == .dead and dead_len < dead_buf.len) {
                 dead_buf[dead_len] = peer;
                 dead_len += 1;
             }
@@ -323,9 +324,9 @@ pub const Mesh = struct {
         }
     }
 
-    /// SWIM `Declare`s are membership gossip with no fixed recipient; fan them
+    /// Sazanami `Declare`s are membership gossip with no fixed recipient; fan them
     /// out over the active view so the epidemic spreads.
-    fn translateSwim(self: *Mesh, out: *std.ArrayList(Envelope), actions: []const swim.Action) Error!void {
+    fn translateSazanami(self: *Mesh, out: *std.ArrayList(Envelope), actions: []const sazanami.Action) Error!void {
         for (actions) |a| {
             switch (a) {
                 .Ping => |x| try out.append(self.allocator, .{ .to = x.target, .msg = .ping }),
@@ -363,7 +364,7 @@ pub const Mesh = struct {
 // Deterministic multi-node simulation (DST): a fixed set of in-process meshes,
 // a single FIFO of in-flight envelopes, and a logical clock. Used to prove the
 // three composed machines actually form an overlay, disseminate a broadcast to
-// every node, and converge on a peer's death through witnessed SWIM.
+// every node, and converge on a peer's death through witnessed Sazanami.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -395,7 +396,7 @@ fn Sim(comptime n: usize) type {
             return @intCast(id - 1);
         }
 
-        /// Initialize in place: each Mesh's Plumtree captures `&self.nodes[i].views`,
+        /// Initialize in place: each Mesh's Broadcast captures `&self.nodes[i].views`,
         /// so the Sim (and thus the nodes array) must already be at its final
         /// address before the meshes are built.
         fn init(self: *Self, allocator: std.mem.Allocator) !void {
@@ -403,7 +404,7 @@ fn Sim(comptime n: usize) type {
             for (&self.nodes, 0..) |*node, i| {
                 try node.init(allocator, @intCast(i + 1), .{
                     .views = .{ .active_max = n, .passive_max = n + 4 },
-                    .swim = .{ .period_ms = 100, .suspect_timeout_ms = 300, .quorum = 2 },
+                    .sazanami = .{ .period_ms = 100, .suspect_timeout_ms = 300, .quorum = 2 },
                     .rng_seed = @intCast(0xC0FFEE + i),
                 });
             }
@@ -499,7 +500,7 @@ test "join bootstrap forms a connected overlay and floods a broadcast to all" {
     for (sim.nodes) |node| try testing.expect(node.activeView().len >= 1);
 
     // Broadcast from node 1 reaches every other node exactly once via the
-    // Plumtree flood over the overlay (multi-hop eager fan-out).
+    // Broadcast flood over the overlay (multi-hop eager fan-out).
     {
         const envs = try sim.nodes[0].broadcast("orochi-rises");
         defer sim.nodes[0].freeEnvelopes(envs);
@@ -513,7 +514,7 @@ test "join bootstrap forms a connected overlay and floods a broadcast to all" {
     while (d < N) : (d += 1) try testing.expectEqual(@as(usize, 1), sim.delivered[d]);
 }
 
-test "witnessed SWIM converges on a dead peer and evicts it from the overlay" {
+test "witnessed Sazanami converges on a dead peer and evicts it from the overlay" {
     const allocator = testing.allocator;
     const N = 4;
     var sim: Sim(N) = undefined;
@@ -601,7 +602,7 @@ test "GRAFT repair delivers a lazily-announced broadcast" {
     try testing.expect(b.hasMessage(msg_id));
 }
 
-test "Config.applyToml composite delegates to views/plumtree/swim and rng_seed" {
+test "Config.applyToml composite delegates to views/broadcaster/sazanami and rng_seed" {
     const allocator = std.testing.allocator;
     var doc = try toml.parse(allocator,
         \\rng_seed = 12345
@@ -610,7 +611,7 @@ test "Config.applyToml composite delegates to views/plumtree/swim and rng_seed" 
         \\[mesh.gossip]
         \\active_view_max = 12
         \\graft_retry_ms = 500
-        \\[mesh.swim]
+        \\[mesh.sazanami]
         \\indirect_probes = 7
     );
     defer doc.deinit(allocator);
@@ -618,7 +619,7 @@ test "Config.applyToml composite delegates to views/plumtree/swim and rng_seed" 
     var cfg = Config{};
     cfg.applyToml(&doc);
     try std.testing.expectEqual(@as(usize, 12), cfg.views.active_max);
-    try std.testing.expectEqual(@as(i64, 500), cfg.plumtree.graft_retry_ms);
-    try std.testing.expectEqual(@as(usize, 7), cfg.swim.k);
+    try std.testing.expectEqual(@as(i64, 500), cfg.broadcaster.graft_retry_ms);
+    try std.testing.expectEqual(@as(usize, 7), cfg.sazanami.k);
     try std.testing.expectEqual(@as(u64, 12345), cfg.rng_seed);
 }

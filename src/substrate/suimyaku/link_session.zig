@@ -40,13 +40,13 @@ pub const Config = struct {
     gossip_interval_ms: u64 = 1_000,
     repair_interval_ms: u64 = 2_000,
     view_config: membership_view.Config = .{ .active_capacity = 4, .passive_capacity = 8 },
-    swim_config: gossip_round.SazanamiConfig = .{},
+    sazanami_config: gossip_round.SazanamiConfig = .{},
     peer_link_config: peer_link.Config = .{},
 
     /// Overlay `[mesh.link]` keys (session cadence + per-session view/gossip
     /// overrides) and delegate to the embedded sub-configs (peer-link transport,
     /// burst limits). Sub-configs that draw from other `[mesh.*]` sections
-    /// (gossip_config, swim_config) are applied by the orchestrator separately.
+    /// (gossip_config, sazanami_config) are applied by the orchestrator separately.
     pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
         if (doc.getUint("mesh.link.gossip_interval_ms")) |v| cfg.gossip_interval_ms = v;
         if (doc.getUint("mesh.link.repair_interval_ms")) |v| cfg.repair_interval_ms = v;
@@ -93,7 +93,7 @@ pub const LinkSession = struct {
             allocator,
             options.local_node_id,
             options.config.view_config,
-            options.config.swim_config,
+            options.config.sazanami_config,
         );
         errdefer gossip.deinit();
 
@@ -142,7 +142,7 @@ pub const LinkSession = struct {
 
     /// Rebuild a session directly in the established state from a resume header,
     /// bypassing the handshake+burst. The peer is marked as a live gossip member so
-    /// SWIM/repair immediately target it. `state` is a FRESH empty replica — the
+    /// Sazanami/repair immediately target it. `state` is a FRESH empty replica — the
     /// caller relies on repair (and an explicit local re-burst) to reconverge.
     pub fn resumeEstablished(
         allocator: Allocator,
@@ -156,7 +156,7 @@ pub const LinkSession = struct {
             allocator,
             options.local_node_id,
             options.config.view_config,
-            options.config.swim_config,
+            options.config.sazanami_config,
         );
         errdefer gossip.deinit();
         try gossip.observeJoin(options.remote_node_id, try i64Ms(now_ms), rng_seed);

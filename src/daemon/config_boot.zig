@@ -544,8 +544,8 @@ test "config text overlays the server config" {
         \\gossip_interval_ms = 1500
         \\[mesh.gossip]
         \\round_fanout = 5
-        \\[mesh.swim]
-        \\sazanami_witness_quorum = 4
+        \\[mesh.sazanami]
+        \\witness_quorum = 4
         \\[history.search]
         \\max_words = 4096
         \\max_ids_per_word = 128
@@ -627,7 +627,7 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(u32, 131072), loaded.config.s2s_config.link.peer_link_config.send_credit);
     try testing.expectEqual(@as(u64, 1500), loaded.config.s2s_config.link.gossip_interval_ms);
     try testing.expectEqual(@as(usize, 5), loaded.config.s2s_config.link.gossip_config.fanout);
-    try testing.expectEqual(@as(u8, 4), loaded.config.s2s_config.link.swim_config.witness_quorum);
+    try testing.expectEqual(@as(u8, 4), loaded.config.s2s_config.link.sazanami_config.witness_quorum);
     try testing.expect(loaded.config.media_enabled);
     try testing.expectEqual(@as(u64, 12345), loaded.config.media_max_upload_bytes);
     try testing.expectEqual(@as(u64, 1200), loaded.config.media_max_frame_bytes);

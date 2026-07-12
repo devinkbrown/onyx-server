@@ -3,7 +3,7 @@
 
 //! Deterministic Ocean simulation for SAZANAMI witnessed failure detection.
 //!
-//! A multi-node cluster of `swim.Swim` detectors is driven over a seeded, virtual
+//! A multi-node cluster of `sazanami.Sazanami` detectors is driven over a seeded, virtual
 //! transport with configurable loss and partitions. No sockets, no wall time, no
 //! OS entropy: one master seed derives every per-node protocol RNG and the single
 //! network RNG, so a failure replays byte-for-byte from `0x...`.
@@ -15,12 +15,12 @@
 //! campaign and under both a lossy link and a hard partition.
 const std = @import("std");
 
-const swim = @import("swim.zig");
+const sazanami = @import("sazanami.zig");
 
-const NodeId = swim.NodeId;
-const Rng = swim.Rng;
-const Action = swim.Action;
-const State = swim.State;
+const NodeId = sazanami.NodeId;
+const Rng = sazanami.Rng;
+const Action = sazanami.Action;
+const State = sazanami.State;
 
 /// Independent sub-stream derivation from one master seed (mirrors the
 /// convergence harness so both DST suites share the same replay discipline).
@@ -42,7 +42,7 @@ const Wire = struct {
     subject: NodeId = 0, // ack: the node vouched alive
     target: NodeId = 0, // ping_req / indirect_ping subject
     origin: NodeId = 0, // indirect_ping: relay the ack back here
-    declare: swim.Declare = undefined,
+    declare: sazanami.Declare = undefined,
 };
 
 fn compareWire(_: void, a: Wire, b: Wire) std.math.Order {
@@ -71,7 +71,7 @@ const Cluster = struct {
     seed: u64,
     cfg: Config,
     ids: std.ArrayList(NodeId) = .empty,
-    nodes: std.ArrayList(swim.Swim) = .empty,
+    nodes: std.ArrayList(sazanami.Sazanami) = .empty,
     rngs: std.ArrayList(Rng) = .empty,
     net_rng: Rng,
     queue: WireQueue,
@@ -93,7 +93,7 @@ const Cluster = struct {
         };
         errdefer self.deinit();
 
-        const swim_cfg = swim.Config{
+        const saz_cfg = sazanami.Config{
             .period_ms = cfg.period_ms,
             .quorum = cfg.quorum,
             .suspect_timeout_ms = cfg.suspect_timeout_ms,
@@ -101,9 +101,9 @@ const Cluster = struct {
 
         var i: usize = 0;
         while (i < cfg.node_count) : (i += 1) {
-            const id: NodeId = @intCast(i + 1); // NodeId 0 is invalid in swim.
+            const id: NodeId = @intCast(i + 1); // NodeId 0 is invalid in sazanami.
             try self.ids.append(allocator, id);
-            try self.nodes.append(allocator, try swim.Swim.init(allocator, id, swim_cfg));
+            try self.nodes.append(allocator, try sazanami.Sazanami.init(allocator, id, saz_cfg));
             try self.rngs.append(allocator, Rng.init(deriveSeed(seed, id)));
         }
 
@@ -158,7 +158,7 @@ const Cluster = struct {
         try self.queue.push(self.allocator, out);
     }
 
-    /// The quorum the detector actually enforces. `swim.Config.sanitized` floors
+    /// The quorum the detector actually enforces. `sazanami.Config.sanitized` floors
     /// the quorum at 2, so a lone accuser can never kill a peer; mirror that here so
     /// the harness check is never looser than the detector it audits.
     fn effectiveQuorum(self: *const Cluster) usize {
@@ -167,10 +167,10 @@ const Cluster = struct {
 
     /// Single chokepoint for the DEAD-needs-quorum safety invariant. EVERY emitted
     /// `Declare` — whether flushed from a `tick` (via `dispatch`) or from an
-    /// `onPingReq` reply relay — is funneled through here, so a future `swim.zig`
+    /// `onPingReq` reply relay — is funneled through here, so a future `sazanami.zig`
     /// regression that shipped a dead verdict without a witness quorum cannot slip
     /// past on the ping-req path.
-    fn noteDeclare(self: *Cluster, from: NodeId, d: swim.Declare) void {
+    fn noteDeclare(self: *Cluster, from: NodeId, d: sazanami.Declare) void {
         switch (d.state) {
             .dead => {
                 self.dead_declares += 1;

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pure renderer for the NETHEALTH SWIM failure-detector view.
+//! Pure renderer for the NETHEALTH Sazanami failure-detector view.
 //!
 //! The caller owns all live daemon state. This module only formats a plain
 //! snapshot into text through a supplied writer.

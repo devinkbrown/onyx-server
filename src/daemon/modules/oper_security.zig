@@ -180,6 +180,6 @@ pub const module = registry.Module{
         .{ .name = "MESH", .access = .oper, .handler = mesh, .summary = "mesh peer/link health (NETSTAT)" },
         .{ .name = "NETSTAT", .access = .oper, .handler = mesh, .summary = "alias of MESH" },
         .{ .name = "ROUTE", .access = .oper, .handler = route, .summary = "mesh routing table" },
-        .{ .name = "NETHEALTH", .access = .oper, .handler = nethealth, .summary = "mesh node liveness (SWIM view)" },
+        .{ .name = "NETHEALTH", .access = .oper, .handler = nethealth, .summary = "mesh node liveness (Sazanami view)" },
     },
 };

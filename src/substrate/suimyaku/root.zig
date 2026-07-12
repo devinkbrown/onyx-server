@@ -44,7 +44,7 @@ pub const server_registry = @import("server_registry.zig");
 pub const signed_frame = @import("signed_frame.zig");
 pub const state_props = @import("state_props.zig");
 pub const state = @import("state.zig");
-pub const swim = @import("swim.zig");
+pub const sazanami = @import("sazanami.zig");
 pub const uid_alloc = @import("uid_alloc.zig");
 // gen:mods:end
 
@@ -89,7 +89,7 @@ test {
     _ = signed_frame;
     _ = state_props;
     _ = state;
-    _ = swim;
+    _ = sazanami;
     _ = uid_alloc;
     // gen:tests:end
 }

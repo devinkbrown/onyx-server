@@ -318,7 +318,7 @@ pub const Config = struct {
         admission_roots: []const []const u8 = &.{},
         admission_min_revocation_epoch: u64 = 0,
         /// Runtime Suimyaku peer-driver limits/timers/capacities projected from
-        /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.swim]`.
+        /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.sazanami]`.
         s2s: s2s_peer_mod.Config = .{},
         /// Peers this node dials automatically at boot (and re-dials while the
         /// link is down), each a "host:port" string (IPv6 hosts bracketed,
@@ -1754,8 +1754,10 @@ fn parseMeshS2sConfig(doc: toml.Document, cfg: *s2s_peer_mod.Config) TomlError!v
     cfg.link.view_config.shuffle_active_count = @intCast(try uintField(doc, "mesh.gossip.view_shuffle_active", cfg.link.view_config.shuffle_active_count, 0, cfg.link.view_config.active_capacity));
     cfg.link.view_config.shuffle_passive_count = @intCast(try uintField(doc, "mesh.gossip.view_shuffle_passive", cfg.link.view_config.shuffle_passive_count, 0, cfg.link.view_config.passive_capacity));
 
-    cfg.link.swim_config.suspicion_timeout_ms = @intCast(try uintField(doc, "mesh.swim.sazanami_suspicion_timeout_ms", @as(u64, @intCast(cfg.link.swim_config.suspicion_timeout_ms)), 0, 120_000));
-    cfg.link.swim_config.witness_quorum = @intCast(try uintField(doc, "mesh.swim.sazanami_witness_quorum", cfg.link.swim_config.witness_quorum, 1, 16));
+    cfg.link.sazanami_config.suspicion_timeout_ms = @intCast(try uintField(doc, "mesh.sazanami.suspicion_timeout_ms", @as(u64, @intCast(cfg.link.sazanami_config.suspicion_timeout_ms)), 0, 120_000));
+    // Floor of 2: a single accuser must never bury a peer (see gossip_round.zig
+    // SazanamiConfig.sanitized). Reject a configured quorum of 0/1 at parse time.
+    cfg.link.sazanami_config.witness_quorum = @intCast(try uintField(doc, "mesh.sazanami.witness_quorum", cfg.link.sazanami_config.witness_quorum, 2, 16));
 
     cfg.link.peer_link_config.send_credit = @intCast(try uintField(doc, "mesh.link.send_credit_bytes", cfg.link.peer_link_config.send_credit, 4096, 16_777_216));
     cfg.link.peer_link_config.replay_window = try uintField(doc, "mesh.link.replay_window", cfg.link.peer_link_config.replay_window, 8, 4096);
@@ -2568,9 +2570,9 @@ test "parseToml: live mesh S2S sub-sections project onto peer driver config" {
         \\view_passive_capacity = 80
         \\view_shuffle_active = 3
         \\view_shuffle_passive = 6
-        \\[mesh.swim]
-        \\sazanami_suspicion_timeout_ms = 9000
-        \\sazanami_witness_quorum = 4
+        \\[mesh.sazanami]
+        \\suspicion_timeout_ms = 9000
+        \\witness_quorum = 4
         \\[mesh.link]
         \\send_credit_bytes = 131072
         \\replay_window = 128
@@ -2612,8 +2614,8 @@ test "parseToml: live mesh S2S sub-sections project onto peer driver config" {
     try testing.expectEqual(@as(usize, 12), cfg.mesh.s2s.link.view_config.passive_capacity);
     try testing.expectEqual(@as(usize, 3), cfg.mesh.s2s.link.view_config.shuffle_active_count);
     try testing.expectEqual(@as(usize, 6), cfg.mesh.s2s.link.view_config.shuffle_passive_count);
-    try testing.expectEqual(@as(i64, 9000), cfg.mesh.s2s.link.swim_config.suspicion_timeout_ms);
-    try testing.expectEqual(@as(u8, 4), cfg.mesh.s2s.link.swim_config.witness_quorum);
+    try testing.expectEqual(@as(i64, 9000), cfg.mesh.s2s.link.sazanami_config.suspicion_timeout_ms);
+    try testing.expectEqual(@as(u8, 4), cfg.mesh.s2s.link.sazanami_config.witness_quorum);
     try testing.expectEqual(@as(usize, 262144), cfg.mesh.s2s.link.burst_limits.max_burst_bytes);
     try testing.expectEqual(@as(usize, 1024), cfg.mesh.s2s.link.burst_limits.max_records);
 

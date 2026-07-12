@@ -40,7 +40,7 @@ The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `
 ## NETHEALTH
 
 - Syntax: `NETHEALTH`
-- Description: Renders SWIM-style liveness for this node and each established peer, including link RTT and idle time when known.
+- Description: Renders Sazanami-style liveness for this node and each established peer, including link RTT and idle time when known.
 - Privileges: Oper (`.access = .oper`).
 - Parameters: None.
 - Replies: Server notices containing health report lines.

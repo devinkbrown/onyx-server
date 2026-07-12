@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Deterministic HyParView + Plumtree overlay state.
+//! Deterministic partial-view membership + eager/lazy broadcast overlay state.
 //!
-//! HyParView keeps a small active view and larger passive reserve. Plumtree
-//! sends full payloads eagerly and digest/GRAFT repair lazily.
+//! The partial view keeps a small active set and a larger passive reserve. The
+//! broadcast driver sends full payloads eagerly and repairs gaps lazily with
+//! digest/GRAFT.
 const std = @import("std");
 const membership_view = @import("membership_view.zig");
 const toml = @import("../../proto/toml.zig");
@@ -35,7 +36,7 @@ pub const Config = struct {
         if (self.prwl > self.arwl) return error.InvalidConfig;
     }
 
-    /// Overlay `[mesh.gossip]` HyParView keys onto this config.
+    /// Overlay `[mesh.gossip]` partial-view keys onto this config.
     pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
         if (doc.getUint("mesh.gossip.active_view_max")) |v| cfg.active_max = @intCast(v);
         if (doc.getUint("mesh.gossip.passive_view_max")) |v| cfg.passive_max = @intCast(v);
@@ -364,11 +365,11 @@ pub const Views = struct {
     }
 };
 
-pub const PlumtreeConfig = struct {
+pub const BroadcastConfig = struct {
     graft_retry_ms: i64 = 1000,
 
-    /// Overlay `[mesh.gossip]` Plumtree keys onto this config.
-    pub fn applyToml(cfg: *PlumtreeConfig, doc: *const toml.Document) void {
+    /// Overlay `[mesh.gossip]` Broadcast keys onto this config.
+    pub fn applyToml(cfg: *BroadcastConfig, doc: *const toml.Document) void {
         if (doc.getInt("mesh.gossip.graft_retry_ms")) |v| cfg.graft_retry_ms = v;
     }
 };
@@ -383,16 +384,16 @@ const Missing = struct {
     next_graft_ms: i64,
 };
 
-pub const Plumtree = struct {
+pub const Broadcast = struct {
     allocator: std.mem.Allocator,
     views: *const Views,
-    cfg: PlumtreeConfig,
+    cfg: BroadcastConfig,
     messages: std.AutoHashMap(u64, StoredMessage),
     eager: std.AutoHashMap(NodeId, void),
     lazy: std.AutoHashMap(NodeId, void),
     missing: std.ArrayList(Missing) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, views: *const Views, cfg: PlumtreeConfig) Plumtree {
+    pub fn init(allocator: std.mem.Allocator, views: *const Views, cfg: BroadcastConfig) Broadcast {
         return .{
             .allocator = allocator,
             .views = views,
@@ -403,7 +404,7 @@ pub const Plumtree = struct {
         };
     }
 
-    pub fn deinit(self: *Plumtree) void {
+    pub fn deinit(self: *Broadcast) void {
         var it = self.messages.valueIterator();
         while (it.next()) |msg| self.allocator.free(msg.payload);
         self.messages.deinit();
@@ -412,7 +413,7 @@ pub const Plumtree = struct {
         self.missing.deinit(self.allocator);
     }
 
-    pub fn broadcast(self: *Plumtree, msg_id: u64, payload: []const u8) ![]Action {
+    pub fn broadcast(self: *Broadcast, msg_id: u64, payload: []const u8) ![]Action {
         try self.syncActive();
         const stored = try self.storeMessage(msg_id, payload);
         var out: std.ArrayList(Action) = .empty;
@@ -421,7 +422,7 @@ pub const Plumtree = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    pub fn onEager(self: *Plumtree, msg_id: u64, payload: []const u8, from: NodeId) ![]Action {
+    pub fn onEager(self: *Broadcast, msg_id: u64, payload: []const u8, from: NodeId) ![]Action {
         try self.syncActive();
         var out: std.ArrayList(Action) = .empty;
         errdefer out.deinit(self.allocator);
@@ -445,7 +446,7 @@ pub const Plumtree = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    pub fn onLazy(self: *Plumtree, msg_id: u64, from: NodeId) ![]Action {
+    pub fn onLazy(self: *Broadcast, msg_id: u64, from: NodeId) ![]Action {
         try self.syncActive();
         var out: std.ArrayList(Action) = .empty;
         errdefer out.deinit(self.allocator);
@@ -464,7 +465,7 @@ pub const Plumtree = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    pub fn onGraft(self: *Plumtree, msg_id: u64, from: NodeId) ![]Action {
+    pub fn onGraft(self: *Broadcast, msg_id: u64, from: NodeId) ![]Action {
         try self.syncActive();
         var out: std.ArrayList(Action) = .empty;
         errdefer out.deinit(self.allocator);
@@ -481,7 +482,7 @@ pub const Plumtree = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    pub fn onPrune(self: *Plumtree, msg_id: u64, from: NodeId) ![]Action {
+    pub fn onPrune(self: *Broadcast, msg_id: u64, from: NodeId) ![]Action {
         _ = msg_id;
         try self.syncActive();
         var out: std.ArrayList(Action) = .empty;
@@ -493,7 +494,7 @@ pub const Plumtree = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    pub fn missingTimer(self: *Plumtree, now_ms: i64) ![]Action {
+    pub fn missingTimer(self: *Broadcast, now_ms: i64) ![]Action {
         try self.syncActive();
         var out: std.ArrayList(Action) = .empty;
         errdefer out.deinit(self.allocator);
@@ -516,19 +517,19 @@ pub const Plumtree = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    pub fn hasMessage(self: *const Plumtree, msg_id: u64) bool {
+    pub fn hasMessage(self: *const Broadcast, msg_id: u64) bool {
         return self.messages.contains(msg_id);
     }
 
-    pub fn isEager(self: *const Plumtree, peer: NodeId) bool {
+    pub fn isEager(self: *const Broadcast, peer: NodeId) bool {
         return self.eager.contains(peer);
     }
 
-    pub fn isLazy(self: *const Plumtree, peer: NodeId) bool {
+    pub fn isLazy(self: *const Broadcast, peer: NodeId) bool {
         return self.lazy.contains(peer);
     }
 
-    fn storeMessage(self: *Plumtree, msg_id: u64, payload: []const u8) !StoredMessage {
+    fn storeMessage(self: *Broadcast, msg_id: u64, payload: []const u8) !StoredMessage {
         if (self.messages.get(msg_id)) |stored| return stored;
         const copy = try self.allocator.dupe(u8, payload);
         errdefer self.allocator.free(copy);
@@ -538,7 +539,7 @@ pub const Plumtree = struct {
     }
 
     fn appendFanout(
-        self: *Plumtree,
+        self: *Broadcast,
         out: *std.ArrayList(Action),
         msg_id: u64,
         payload: []const u8,
@@ -559,7 +560,7 @@ pub const Plumtree = struct {
         }
     }
 
-    fn syncActive(self: *Plumtree) !void {
+    fn syncActive(self: *Broadcast) !void {
         var eager_it = self.eager.keyIterator();
         while (eager_it.next()) |peer| {
             if (!self.views.isActive(peer.*)) _ = self.eager.remove(peer.*);
@@ -575,7 +576,7 @@ pub const Plumtree = struct {
         }
     }
 
-    fn removeMissing(self: *Plumtree, msg_id: u64) void {
+    fn removeMissing(self: *Broadcast, msg_id: u64) void {
         var i: usize = 0;
         while (i < self.missing.items.len) {
             if (self.missing.items[i].msg_id == msg_id) {
@@ -586,7 +587,7 @@ pub const Plumtree = struct {
         }
     }
 
-    fn swapRemoveMissingAt(self: *Plumtree, idx: usize) Missing {
+    fn swapRemoveMissingAt(self: *Broadcast, idx: usize) Missing {
         const item = self.missing.items[idx];
         _ = self.missing.swapRemove(idx);
         return item;
@@ -666,7 +667,7 @@ test "active view caps and passive promotion on failure" {
     try expectActionTo(actions, .Neighbor, views.activeView()[1]);
 }
 
-test "plumtree eager builds tree lazy graft recovers and prune sheds duplicate" {
+test "broadcast eager builds tree lazy graft recovers and prune sheds duplicate" {
     var rng = Rng.init(13);
     var va = try Views.init(std.testing.allocator, 1, .{ .active_max = 4, .passive_max = 8 });
     var vb = try Views.init(std.testing.allocator, 2, .{ .active_max = 4, .passive_max = 8 });
@@ -688,9 +689,9 @@ test "plumtree eager builds tree lazy graft recovers and prune sheds duplicate" 
     actions = try vc.onNeighbor(2, true, 0, &rng);
     freeActions(std.testing.allocator, actions);
 
-    var pa = Plumtree.init(std.testing.allocator, &va, .{ .graft_retry_ms = 10 });
-    var pb = Plumtree.init(std.testing.allocator, &vb, .{ .graft_retry_ms = 10 });
-    var pc = Plumtree.init(std.testing.allocator, &vc, .{ .graft_retry_ms = 10 });
+    var pa = Broadcast.init(std.testing.allocator, &va, .{ .graft_retry_ms = 10 });
+    var pb = Broadcast.init(std.testing.allocator, &vb, .{ .graft_retry_ms = 10 });
+    var pc = Broadcast.init(std.testing.allocator, &vc, .{ .graft_retry_ms = 10 });
     defer pa.deinit();
     defer pb.deinit();
     defer pc.deinit();
@@ -766,7 +767,7 @@ test "plumtree eager builds tree lazy graft recovers and prune sheds duplicate" 
     try std.testing.expect(pc.hasMessage(101));
 }
 
-test "Config/PlumtreeConfig applyToml overlay mesh.gossip keys" {
+test "Config/BroadcastConfig applyToml overlay mesh.gossip keys" {
     const allocator = std.testing.allocator;
     var doc = try toml.parse(allocator,
         \\[mesh.gossip]
@@ -785,7 +786,7 @@ test "Config/PlumtreeConfig applyToml overlay mesh.gossip keys" {
     // Untouched.
     try std.testing.expectEqual(@as(u8, 3), cfg.prwl);
 
-    var pc = PlumtreeConfig{};
+    var pc = BroadcastConfig{};
     pc.applyToml(&doc);
     try std.testing.expectEqual(@as(i64, 750), pc.graft_retry_ms);
 }

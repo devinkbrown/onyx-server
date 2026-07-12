@@ -301,11 +301,12 @@ view_passive_capacity = 64
 view_shuffle_active = 2
 view_shuffle_passive = 4
 
-[mesh.swim]
-# Sazanami gossip-side suspect reaping. The standalone swim.zig probe driver is
-# not on the daemon S2S path; these are the live failure-detector knobs.
-sazanami_suspicion_timeout_ms = 3000
-sazanami_witness_quorum = 2
+[mesh.sazanami]
+# Sazanami witnessed failure detection: gossip-side suspect reaping and the
+# witness quorum required before a peer is declared dead.
+suspicion_timeout_ms = 3000
+# Minimum 2 — a single accuser must never bury a peer.
+witness_quorum = 2
 
 [mesh.link]
 # Peer-link transport timers/credit plus S2S session cadence.

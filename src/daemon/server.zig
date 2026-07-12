@@ -79,7 +79,7 @@ const mesh_event_log = @import("../proto/mesh_event_log.zig");
 const event_history_mod = @import("event_history.zig");
 const event_collapse_mod = @import("event_collapse.zig");
 const route_report = @import("../proto/route_report.zig");
-const swim_report = @import("../proto/swim_report.zig");
+const sazanami_report = @import("../proto/sazanami_report.zig");
 const link_health_mod = @import("link_health.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
 const migration_relay = @import("helix/migration_relay.zig");
@@ -1833,7 +1833,7 @@ pub const Config = struct {
     crypto_io: ?std.Io = null,
     /// Runtime Suimyaku peer-driver limits/timers/capacities for plaintext and
     /// secured inner S2S links. Configurable via `[mesh.routing]`,
-    /// `[mesh.link]`, `[mesh.gossip]`, and `[mesh.swim]` Sazanami keys.
+    /// `[mesh.link]`, `[mesh.gossip]`, and `[mesh.sazanami]` Sazanami keys.
     s2s_config: s2s_link.PeerConfig = .{},
     mesh_realm: []const u8 = "local",
     mesh_pass: []const u8 = "",
@@ -29484,14 +29484,14 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// NETHEALTH — oper view of mesh node liveness (SWIM-style): this node plus
+    /// NETHEALTH — oper view of mesh node liveness (Sazanami-style): this node plus
     /// each established peer, with link RTT and idle time from the health table.
-    /// Rendered by the pure swim_report renderer.
+    /// Rendered by the pure sazanami_report renderer.
     pub fn handleNethealth(self: *LinuxServer, conn: *ConnState) !void {
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         var names: [63][]const u8 = undefined;
         const np = self.collectPeers(&names);
-        var nodes: [64]swim_report.NodeStatus = undefined;
+        var nodes: [64]sazanami_report.NodeStatus = undefined;
         nodes[0] = .{ .node = protocol_inventory.currentServerName(), .health = .alive, .last_ack_ms_ago = 0 };
         for (names[0..np], 0..) |name, i| {
             var rtt: u32 = 0;
@@ -29502,10 +29502,10 @@ pub const LinuxServer = struct {
             }
             nodes[i + 1] = .{ .node = name, .health = .alive, .last_ack_ms_ago = idle, .rtt_ms = rtt };
         }
-        const snap = swim_report.HealthSnapshot{ .local_node = protocol_inventory.currentServerName(), .nodes = nodes[0 .. np + 1] };
+        const snap = sazanami_report.HealthSnapshot{ .local_node = protocol_inventory.currentServerName(), .nodes = nodes[0 .. np + 1] };
         var body_buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&body_buf);
-        swim_report.renderHealth(snap, &w) catch {};
+        sazanami_report.renderHealth(snap, &w) catch {};
         var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;

@@ -61,7 +61,7 @@ pub fn renderInfo(info: AboutInfo, writer: anytype) !void {
     try writer.writeAll("100% Zig, zero C interop - substrate, crypto, and daemon are all native.\n");
     try writer.writeAll("\n");
     try writer.writeAll("Mesh:     Suimyaku CRDT world state | Sazanami gossip | Goryu membership\n");
-    try writer.writeAll("Security: Tsumugi PQ-hybrid handshake | MeshPass admission | VeilSafe key hygiene\n");
+    try writer.writeAll("Security: Tsumugi PQ-hybrid handshake | MeshPass admission | zeroize-on-free key hygiene\n");
     try writer.writeAll("Crypto:   Yoroi - a from-scratch pure-Zig TLS and primitive library\n");
     try writer.writeAll("Media:    Kakehashi SFU | KaguraVox/KaguraVis codecs | QUIC/WebTransport transport\n");
     try writer.writeAll("History:  Lotus event-DAG with verified-streaming backfill\n");

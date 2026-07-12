@@ -21,14 +21,18 @@ pub const SazanamiConfig = struct {
     fn sanitized(self: SazanamiConfig) SazanamiConfig {
         var c = self;
         if (c.suspicion_timeout_ms < 0) c.suspicion_timeout_ms = 0;
-        if (c.witness_quorum < 1) c.witness_quorum = 1;
+        // A single accuser must never bury a peer: require at least two distinct
+        // witnesses before a node can be declared dead. This closes a
+        // config-reachable solo-DEAD on the live S2S path (e.g. a link-flap on a
+        // 2-node mesh where the sole peer is the accuser).
+        if (c.witness_quorum < 2) c.witness_quorum = 2;
         return c;
     }
 
-    /// Overlay `[mesh.swim]` Sazanami keys onto this config.
+    /// Overlay `[mesh.sazanami]` keys onto this config.
     pub fn applyToml(cfg: *SazanamiConfig, doc: *const toml.Document) void {
-        if (doc.getInt("mesh.swim.sazanami_suspicion_timeout_ms")) |v| cfg.suspicion_timeout_ms = v;
-        if (doc.getUint("mesh.swim.sazanami_witness_quorum")) |v| cfg.witness_quorum = @intCast(v);
+        if (doc.getInt("mesh.sazanami.suspicion_timeout_ms")) |v| cfg.suspicion_timeout_ms = v;
+        if (doc.getUint("mesh.sazanami.witness_quorum")) |v| cfg.witness_quorum = @intCast(v);
     }
 };
 
@@ -279,7 +283,7 @@ pub const GossipRound = struct {
         allocator: std.mem.Allocator,
         self_id: NodeId,
         view_cfg: membership_view.Config,
-        swim_cfg: SazanamiConfig,
+        sazanami_cfg: SazanamiConfig,
     ) !GossipRound {
         var view = try membership_view.MembershipView.init(allocator, self_id, view_cfg);
         errdefer view.deinit();
@@ -288,7 +292,7 @@ pub const GossipRound = struct {
             .allocator = allocator,
             .self_id = self_id,
             .view = view,
-            .membership = Membership.init(allocator, self_id, swim_cfg),
+            .membership = Membership.init(allocator, self_id, sazanami_cfg),
         };
     }
 
@@ -748,15 +752,15 @@ test "rounds are deterministic with the same seed" {
     try testing.expectEqualSlices(Suspicion, ra.payload.suspicions.items, rb.payload.suspicions.items);
 }
 
-test "Config/SazanamiConfig applyToml overlay mesh.gossip + mesh.swim keys" {
+test "Config/SazanamiConfig applyToml overlay mesh.gossip + mesh.sazanami keys" {
     const allocator = std.testing.allocator;
     var doc = try toml.parse(allocator,
         \\[mesh.gossip]
         \\round_fanout = 7
         \\max_suspicions = 99
-        \\[mesh.swim]
-        \\sazanami_suspicion_timeout_ms = 4000
-        \\sazanami_witness_quorum = 5
+        \\[mesh.sazanami]
+        \\suspicion_timeout_ms = 4000
+        \\witness_quorum = 5
     );
     defer doc.deinit(allocator);
 
@@ -770,4 +774,23 @@ test "Config/SazanamiConfig applyToml overlay mesh.gossip + mesh.swim keys" {
     sz.applyToml(&doc);
     try testing.expectEqual(@as(i64, 4000), sz.suspicion_timeout_ms);
     try testing.expectEqual(@as(u8, 5), sz.witness_quorum);
+}
+
+test "witness_quorum floors to 2 so a single witness never buries a peer" {
+    // A config asking for quorum 1 must be clamped to 2 (no solo accuser).
+    try testing.expectEqual(@as(u8, 2), (SazanamiConfig{ .witness_quorum = 1 }).sanitized().witness_quorum);
+    try testing.expectEqual(@as(u8, 2), (SazanamiConfig{ .witness_quorum = 0 }).sanitized().witness_quorum);
+
+    // Behaviorally: even with a requested quorum of 1 and immediate burial
+    // (suspicion_timeout_ms == 0), one witness must leave the peer merely
+    // suspect; the second distinct witness reaches quorum and buries it.
+    var m = Membership.init(testing.allocator, 3, .{ .witness_quorum = 1, .suspicion_timeout_ms = 0 });
+    defer m.deinit();
+    try testing.expectEqual(@as(u8, 2), m.cfg.witness_quorum);
+
+    _ = try m.applyDead(4, 0, 1, 0); // witness 1 accuses node 4
+    try testing.expectEqual(MemberState.suspect, (m.get(4) orelse return error.TestExpectedEqual).state);
+
+    _ = try m.applyDead(4, 0, 2, 0); // second distinct witness reaches quorum
+    try testing.expectEqual(MemberState.dead, (m.get(4) orelse return error.TestExpectedEqual).state);
 }
