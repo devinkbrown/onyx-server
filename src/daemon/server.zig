@@ -7923,6 +7923,23 @@ pub const LinuxServer = struct {
                 if (recipient_account) |acct| {
                     self.deliverSessionSyncSiblingsNick(acct, relay_tags, line, recipient_id, null, clean_msg.target);
                 }
+                // Sender sent-copy mirror: the AUTHOR's same-account sessions
+                // homed on THIS node (multi-device across the mesh) receive the
+                // outbound copy, mirroring the origin node's sender-sibling
+                // fan-out. Same-nick sessions of the sender need no cap;
+                // different-nick siblings still opt in via orochi/session-sync.
+                // Skipped when sender and recipient share the account (the
+                // recipient fan-out above already covered every session), and
+                // guarded by the same-account + home-binding spoof checks that
+                // ran before this branch — a frame that reaches here rendering a
+                // locally-live sender nick was already vetted against the local
+                // holder's account and the nick's gossiped home node.
+                if (clean_msg.account.len != 0) {
+                    const sender_is_recipient_account = if (recipient_account) |acct| std.mem.eql(u8, clean_msg.account, acct) else false;
+                    if (!sender_is_recipient_account) {
+                        self.deliverSessionSyncSiblingsNick(clean_msg.account, relay_tags, line, recipient_id, null, clean_msg.source_nick);
+                    }
+                }
             }
         }
         // Multi-hop re-forward, scoped via route_table (global seen-set already
@@ -30473,7 +30490,48 @@ pub const LinuxServer = struct {
         if (echo) try self.deliverTagged(id, dtags, msg);
         if (conn.session.account()) |sender_account| {
             const same_account = if (recipient_account) |acct| std.mem.eql(u8, sender_account, acct) else false;
-            if (!same_account) self.deliverSessionSyncSiblings(sender_account, dtags, msg, id, recipient_id);
+            // Pass the SENDER's nick as `same_nick`: a sibling session on the
+            // sender's own nick (the same identity's other device) receives the
+            // sent-copy WITHOUT the session-sync cap — the same rule the
+            // recipient-side fan-out above applies to the target nick.
+            // Different-nick siblings still opt in via the cap.
+            if (!same_account) self.deliverSessionSyncSiblingsNick(sender_account, dtags, msg, id, recipient_id, conn.session.displayName());
+        }
+        // Cross-node multi-client relay: the target nick resolved LOCALLY, but
+        // the same identity may hold live sessions on other mesh nodes (one nick
+        // on many devices — by design), so a local-only short-circuit here
+        // split-brains the DM. Forward it: the peer's `deliverRelay` DM branch +
+        // same-nick sibling fan-out complete delivery to the remote devices, and
+        // its sender mirror hands the sent-copy to the author's remote sessions.
+        // Loop-guarded via `relay_seen`; scoped via route_table, so a
+        // single-homed nick matches zero links (per-link route tables only hold
+        // the direct peer's members) and this is a cheap no-op in the common
+        // single-device case. Best-effort, like the channel relay above.
+        if (self.hasEstablishedPeer()) {
+            var rp_buf: [320]u8 = undefined;
+            if (clientPrefix(conn, &rp_buf)) |prefix| {
+                // Route by the recipient's CANONICAL nick (the per-link nick
+                // index is an exact-key map); fall back to the typed target.
+                const route_nick = if (recipient_conn) |rconn| rconn.session.displayName() else target;
+                const hlc = self.nextMeshHlc();
+                _ = self.relay_seen.observe(self.config.node_id, hlc); // drop an echo back
+                var relay_tag_buf: [256]u8 = undefined;
+                var relay_msg = s2s_link.RelayMessage{
+                    .verb = if (is_notice) .notice else .privmsg,
+                    .target = route_nick,
+                    .source_nick = conn.session.displayName(),
+                    .source_prefix = prefix,
+                    .account = conn.session.account() orelse "",
+                    .tags = clientOnlyTags(clean_client_tags orelse "", &relay_tag_buf),
+                    .text = text,
+                    .origin_node = self.config.node_id,
+                    .hlc = hlc,
+                };
+                var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+                var sig_buf: [message_relay.sig_len]u8 = undefined;
+                self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
+                _ = self.relayToPeers(relay_msg, .{ .nick = route_nick });
+            } else |_| {}
         }
         if (!is_notice) {
             var dm_key_buf: [320]u8 = undefined;
@@ -34478,6 +34536,93 @@ test "SILENCE ACCESS control is case-insensitive: nick-case cannot bypass the ig
         .hlc = 2,
     });
     try expectContains(target.send_buf[0..target.send_len], ":Friend!f@elsewhere PRIVMSG target :delivered\r\n");
+}
+
+test "session-sync: sender same-account same-nick sibling gets the DM sent-copy without the cap" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const sender_id = try addTestLocalClient(&server, "Kazu", "kazuacct");
+    const sibling_id = try addTestLocalClient(&server, "KazuTmp", "kazuacct");
+    const recipient_id = try addTestLocalClient(&server, "Ruri", "ruriacct");
+    const sender = server.connFor(sender_id).?;
+    const sibling = server.connFor(sibling_id).?;
+    const recipient = server.connFor(recipient_id).?;
+    // The sibling is the SAME identity signed in on the SENDER's nick from a
+    // second device (routine across the mesh; modeled locally here). It holds NO
+    // orochi/session-sync cap — a same-nick sibling of the SENDER must receive
+    // the sent-copy capless, exactly as a same-nick sibling of the RECIPIENT
+    // receives the inbound copy capless.
+    try sibling.session.setNick("Kazu");
+
+    try server.messageOne(sender_id, sender, "PRIVMSG", "Ruri", "hello there", null);
+
+    try expectContains(recipient.send_buf[0..recipient.send_len], "PRIVMSG Ruri :hello there\r\n");
+    try expectContains(sibling.send_buf[0..sibling.send_len], "PRIVMSG Ruri :hello there\r\n");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sibling.send_buf[0..sibling.send_len], "PRIVMSG Ruri :hello there"));
+    // No echo-message cap: the sending session itself gets nothing back.
+    try std.testing.expectEqual(@as(usize, 0), sender.send_len);
+}
+
+test "relay DM mirrors the sender sent-copy to the sender's same-account mesh-device sessions" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const recipient_id = try addTestLocalClient(&server, "Ruri", "ruriacct");
+    const sender_local_id = try addTestLocalClient(&server, "Kazu", "kazuacct");
+    const bystander_id = try addTestLocalClient(&server, "Mira", "miraacct");
+    const recipient = server.connFor(recipient_id).?;
+    const sender_local = server.connFor(sender_local_id).?;
+    const bystander = server.connFor(bystander_id).?;
+
+    // A DM authored by "Kazu" on a PEER node arrives; Kazu is ALSO live on THIS
+    // node under the same account (multi-device, one nick — by design). The
+    // local recipient gets the message, and the local Kazu session gets the
+    // sent-copy without needing the session-sync cap (same-nick rule). An
+    // unrelated account sees nothing.
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "Ruri",
+        .source_nick = "Kazu",
+        .source_prefix = "Kazu!k@peer",
+        .account = "kazuacct",
+        .tags = "",
+        .text = "from my other device",
+        .origin_node = 99,
+        .hlc = 1,
+    });
+    try expectContains(recipient.send_buf[0..recipient.send_len], ":Kazu!k@peer PRIVMSG Ruri :from my other device\r\n");
+    try expectContains(sender_local.send_buf[0..sender_local.send_len], ":Kazu!k@peer PRIVMSG Ruri :from my other device\r\n");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sender_local.send_buf[0..sender_local.send_len], "PRIVMSG Ruri :from my other device"));
+    try std.testing.expectEqual(@as(usize, 0), bystander.send_len);
+
+    // A recipient-side policy block (SILENCE) suppresses the sender mirror too —
+    // matching the origin node, where SILENCE returns before the sender-sibling
+    // fan-out ever runs.
+    _ = try server.silence.add("Ruri", "Kazu!*@peer");
+    const recipient_len_before = recipient.send_len;
+    const sender_len_before = sender_local.send_len;
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "Ruri",
+        .source_nick = "Kazu",
+        .source_prefix = "Kazu!k@peer",
+        .account = "kazuacct",
+        .tags = "",
+        .text = "silenced",
+        .origin_node = 99,
+        .hlc = 2,
+    });
+    try std.testing.expectEqual(recipient_len_before, recipient.send_len);
+    try std.testing.expectEqual(sender_len_before, sender_local.send_len);
 }
 
 test "relay direct messages honor local +C and +g callerid policy" {
@@ -48892,6 +49037,164 @@ test "threaded server: reciprocal [mesh].connect survives redial sweeps" {
     // not a runtime flap. Lock in that the asymmetric mesh holds.
     try runReciprocalMeshDurabilityTest(4, 1);
     try runReciprocalMeshDurabilityTest(1, 4);
+}
+
+// SASL fixture for the cross-node multi-device DM test: two ordinary (non-oper)
+// accounts, "ruri" (recipient identity) and "kazu" (sender identity), password
+// "pw", accepted by BOTH nodes so the same account can sign in on each.
+fn testDmRelayVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
+    return (std.mem.eql(u8, creds.authcid, "ruri") or std.mem.eql(u8, creds.authcid, "kazu")) and
+        std.mem.eql(u8, creds.password, "pw");
+}
+var test_dm_relay_anchor: u8 = 0;
+const test_dm_relay_checker = sasl.PlainChecker{ .ptr = &test_dm_relay_anchor, .verifyFn = testDmRelayVerify };
+
+// A DM whose target nick resolves LOCALLY on the origin node must STILL relay to
+// mesh peers that also home that nick: multi-device one-nick accounts hold live
+// sessions on several nodes at once, and the pre-fix short-circuit (deliver
+// locally, return) split every such DM — the device on the other node received
+// nothing. Two live meshed nodes; account "ruri" is signed in as nick Ruri on
+// BOTH, account "kazu" as nick Kazu on BOTH. Kazu@node1 DMs Ruri: BOTH Ruri
+// sockets must receive the line, and Kazu's own second device on node2 must
+// receive the sent-copy (the inbound-relay sender mirror).
+test "threaded server: cross-node DM to a locally-held nick relays to mesh sibling sessions on the peer node" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+    var spec1_buf: [32]u8 = undefined;
+    var spec2_buf: [32]u8 = undefined;
+    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
+    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const node1_peers = [_][]const u8{node2_spec};
+    const node2_peers = [_][]const u8{node1_spec};
+
+    // Keyless plaintext links: a keyless node fails CLOSED on unsigned in-scope
+    // frames when require_signed_frames is the default (true), which would drop
+    // the PRESENCE MEMBERSHIP gossip this test depends on. Opt into unsigned
+    // interop as a plaintext operator would; signing enforcement is proven
+    // separately.
+    var node1_cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[0],
+        .node_id = 1,
+        .server_name = "node1.test",
+        .mesh_connect = &node1_peers,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+        .sasl_checker = test_dm_relay_checker,
+    };
+    node1_cfg.s2s_config.require_signed_frames = false;
+    var node1 = Server.init(alloc, node1_cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node1.deinit();
+    var node2_cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[1],
+        .node_id = 2,
+        .server_name = "node2.test",
+        .mesh_connect = &node2_peers,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+        .sasl_checker = test_dm_relay_checker,
+    };
+    node2_cfg.s2s_config.require_signed_frames = false;
+    var node2 = Server.init(alloc, node2_cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node2.deinit();
+    const port1 = node1.boundPort() catch return error.SkipZigTest;
+    const port2 = node2.boundPort() catch return error.SkipZigTest;
+
+    var run1 = std.atomic.Value(bool).init(true);
+    var run2 = std.atomic.Value(bool).init(true);
+    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+    defer {
+        node1.requestStop(&run1);
+        node2.requestStop(&run2);
+        thr1.join();
+        thr2.join();
+    }
+
+    // Establish the mesh BEFORE any account nick registers, so presence claims
+    // flow forward over an up link and same-account same-nick reconciliation is
+    // the steady-state path.
+    const probe_fd = connectLoopback(port1) catch return error.SkipZigTest;
+    var probe = LiveClient{ .fd = probe_fd };
+    try writeAllFd(probe_fd, "NICK P\r\nUSER p 0 * :Probe\r\n");
+    try recvUntil(&probe, " 001 P ", 200);
+    try expectMeshPeerVisible(&probe, "node2.test", 200);
+    closeFd(probe_fd);
+
+    // Heap-allocate the four live clients (8 KiB buffers each): recipient
+    // devices R1@node1 + R2@node2 (account "ruri", nick Ruri on both) and sender
+    // devices S1@node1 + S2@node2 (account "kazu", nick Kazu on both).
+    const clients = try alloc.alloc(LiveClient, 4);
+    defer alloc.free(clients);
+    const fd_r1 = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd_r1);
+    const fd_r2 = connectLoopback(port2) catch return error.SkipZigTest;
+    defer closeFd(fd_r2);
+    const fd_s1 = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd_s1);
+    const fd_s2 = connectLoopback(port2) catch return error.SkipZigTest;
+    defer closeFd(fd_s2);
+    clients[0] = LiveClient{ .fd = fd_r1 };
+    clients[1] = LiveClient{ .fd = fd_r2 };
+    clients[2] = LiveClient{ .fd = fd_s1 };
+    clients[3] = LiveClient{ .fd = fd_s2 };
+    const r1 = &clients[0];
+    const r2 = &clients[1];
+    const s1 = &clients[2];
+    const s2 = &clients[3];
+
+    try saslPlainPrelude(fd_r1, "ruri", "pw");
+    try writeAllFd(fd_r1, "NICK Ruri\r\nUSER ruri 0 * :Ruri One\r\n");
+    try recvUntil(r1, " 001 Ruri ", 200);
+    try saslPlainPrelude(fd_r2, "ruri", "pw");
+    try writeAllFd(fd_r2, "NICK Ruri\r\nUSER ruri 0 * :Ruri Two\r\n");
+    try recvUntil(r2, " 001 Ruri ", 200);
+    try saslPlainPrelude(fd_s1, "kazu", "pw");
+    try writeAllFd(fd_s1, "NICK Kazu\r\nUSER kazu 0 * :Kazu One\r\n");
+    try recvUntil(s1, " 001 Kazu ", 200);
+    try saslPlainPrelude(fd_s2, "kazu", "pw");
+    try writeAllFd(fd_s2, "NICK Kazu\r\nUSER kazu 0 * :Kazu Two\r\n");
+    try recvUntil(s2, " 001 Kazu ", 200);
+    r1.reset();
+    r2.reset();
+    s2.reset();
+
+    // Probe until node1's per-link route table has learned Ruri@node2 (presence
+    // gossip) and one relayed copy lands on R2. Bounded manual polling — NOT
+    // recvUntil — so a miss cycles in ~250ms instead of the 20s budget.
+    var got_remote = false;
+    var probes: usize = 0;
+    while (probes < 160 and !got_remote) : (probes += 1) {
+        try writeAllFd(fd_s1, "PRIVMSG Ruri :ping-mesh\r\n");
+        const deadline = platform.monotonicMillis() + 250;
+        while (platform.monotonicMillis() < deadline and !got_remote) {
+            var fds = [_]posix.pollfd{.{ .fd = fd_r2, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&fds, 20) catch return error.Unexpected;
+            if (ready != 0 and (fds[0].revents & linux.POLL.IN) != 0) try r2.readAvailable();
+            if (std.mem.indexOf(u8, r2.written(), "PRIVMSG Ruri :ping-mesh") != null) got_remote = true;
+        }
+    }
+    // The recipient's session on the OTHER node received the DM (pre-fix: never).
+    try std.testing.expect(got_remote);
+    try expectContains(r2.written(), ":Kazu!");
+
+    // The local holder on the origin node received it directly.
+    try recvUntil(r1, "PRIVMSG Ruri :ping-mesh", 200);
+    try expectContains(r1.written(), ":Kazu!");
+
+    // The sender's own second device on the far node received the sent-copy.
+    try recvUntil(s2, "PRIVMSG Ruri :ping-mesh", 200);
+    try expectContains(s2.written(), ":Kazu!");
 }
 
 // FIX 1: the RECEIVING node re-enforces ITS OWN channel policy against a remote
