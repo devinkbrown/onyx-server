@@ -7542,12 +7542,20 @@ pub const LinuxServer = struct {
     /// Resolve which mesh node a nick is homed on, from THIS receiver's routing
     /// view (the per-link `route_table` fed by MEMBERSHIP/PRESENCE gossip). Returns
     /// the home `NodeId` when any established peer link routes the nick, or `null`
-    /// when this node has not yet learned where the nick lives. Both the route
-    /// table's node id and a relay frame's `origin_node` are stamped from the
-    /// ORIGIN's `config.node_id` (membership gossip and the relay codec agree on
-    /// that id space — see `sendMembership`/`origin_node = self.config.node_id`), so
-    /// the two are directly comparable. First established link that knows the nick
-    /// wins; a converged mesh agrees across links.
+    /// when this node has not yet learned where the nick lives. First established
+    /// link that knows the nick wins; a converged mesh agrees across links.
+    ///
+    /// ID-SPACE WARNING: the returned home is stamped from the ORIGIN's mesh SHORT
+    /// ID on a secured link (`sendMembership` uses the link `local_node_id`, which
+    /// for a secured link is `shortId(identity)` — s2s_peer.zig / secured_s2s_link.zig).
+    /// A relay frame's `origin_node`, by contrast, is `config.node_id`, which an
+    /// operator sets independently of the key short id (config_boot.zig:187, default
+    /// 1). These two spaces coincide ONLY for a VERIFIED-SIGNED frame — signing
+    /// requires `shortId == origin_node` (`signRelayOrigin`) — so a home returned
+    /// here may be compared against `origin_node` ONLY when the frame is verified-
+    /// signed (`origin_pubkey.len != 0`). Comparing it against an UNSIGNED frame's
+    /// `origin_node` would false-drop legitimate cross-node traffic on a keyed node.
+    /// Every caller MUST enforce that gate (see `deliverRelay`/`deliverRelayWhisper`).
     fn meshNickHomeNode(self: *LinuxServer, nick: []const u8) ?s2s_link.NodeId {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
@@ -7573,13 +7581,16 @@ pub const LinuxServer = struct {
     /// node's user's prefix. The receiver's route table homes that user elsewhere,
     /// so the claim is rejected here. Deliberately account-INDEPENDENT: `account` is
     /// origin-controlled/unsigned and must never wave a mismatched sender through.
-    /// An UNKNOWN nick (route not yet learned) returns false — the message follows
-    /// the existing deliver+re-forward path so cross-node delivery is not stranded
-    /// by convergence lag. See the TODO in `deliverRelay` for the stricter
-    /// fail-closed-on-unknown + transcript-signing hardening left as follow-up.
-    fn relaySenderHomeMismatch(self: *LinuxServer, source_nick: []const u8, origin_node: u64) bool {
-        const home = self.meshNickHomeNode(source_nick) orelse return false;
-        return home != origin_node;
+    /// An UNKNOWN nick (route not yet learned) returns `null` (no mismatch) — the
+    /// message follows the existing deliver+re-forward path so cross-node delivery
+    /// is not stranded by convergence lag. See the TODO in `deliverRelay` for the
+    /// stricter fail-closed-on-unknown + transcript-signing hardening left as
+    /// follow-up. On a mismatch it returns the offending KNOWN home node (so the
+    /// caller can audit it without re-scanning). Caller MUST gate on a verified-
+    /// signed frame — see the id-space warning on `meshNickHomeNode`.
+    fn relaySenderHomeMismatch(self: *LinuxServer, source_nick: []const u8, origin_node: u64) ?s2s_link.NodeId {
+        const home = self.meshNickHomeNode(source_nick) orelse return null;
+        return if (home != origin_node) home else null;
     }
 
     /// Account + audit a relayed message dropped locally because its sender nick is
@@ -7826,16 +7837,16 @@ pub const LinuxServer = struct {
         // keep a legacy-decode arm) so a signed frame cannot even AUTHOR a mismatched
         // prefix, and so the unsigned path can be tightened without the id-space
         // ambiguity. Backlogged to avoid a wire break in this change.
-        if (clean_msg.origin_pubkey.len != 0 and
-            self.relaySenderHomeMismatch(clean_msg.source_nick, clean_msg.origin_node))
-        {
-            self.recordRelayHomeMismatch(clean_msg, self.meshNickHomeNode(clean_msg.source_nick) orelse clean_msg.origin_node);
-            const drop_scope: RelayScope = if (world_model.isChannelName(clean_msg.target))
-                .{ .channel = clean_msg.target }
-            else
-                .{ .nick = clean_msg.target };
-            _ = self.relayToPeers(clean_msg, drop_scope);
-            return;
+        if (clean_msg.origin_pubkey.len != 0) {
+            if (self.relaySenderHomeMismatch(clean_msg.source_nick, clean_msg.origin_node)) |home_node| {
+                self.recordRelayHomeMismatch(clean_msg, home_node);
+                const drop_scope: RelayScope = if (world_model.isChannelName(clean_msg.target))
+                    .{ .channel = clean_msg.target }
+                else
+                    .{ .nick = clean_msg.target };
+                _ = self.relayToPeers(clean_msg, drop_scope);
+                return;
+            }
         }
 
         if (world_model.isChannelName(clean_msg.target)) {
@@ -7965,12 +7976,12 @@ pub const LinuxServer = struct {
         // local WHISPER (never render it to the recipient) but still re-forward.
         // Gated to verified-signed frames (origin_pubkey non-empty) so the id-space
         // comparison is safe (see deliverRelay's note).
-        if (msg.origin_pubkey.len != 0 and
-            self.relaySenderHomeMismatch(msg.source_nick, msg.origin_node))
-        {
-            self.recordRelayHomeMismatch(msg, self.meshNickHomeNode(msg.source_nick) orelse msg.origin_node);
-            _ = self.relayToPeers(msg, reforward);
-            return;
+        if (msg.origin_pubkey.len != 0) {
+            if (self.relaySenderHomeMismatch(msg.source_nick, msg.origin_node)) |home_node| {
+                self.recordRelayHomeMismatch(msg, home_node);
+                _ = self.relayToPeers(msg, reforward);
+                return;
+            }
         }
         // Re-enforce +w NOWHISPER against the remote sender (receiver-side
         // defense-in-depth; a desynced flag must not let a remote bypass policy).
@@ -35863,6 +35874,99 @@ test "deliverRelay binds sender nick to its home node: signed cross-node imperso
     server.deliverRelay(unknown);
     try expectContains(target.send_buf[0..target.send_len], ":ghostly!g@elsewhere PRIVMSG Target :unknown sender still flows\r\n");
     try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch); // unchanged
+}
+
+/// Sign a relay WHISPER in place with `kp` at its self-certified origin, with a
+/// caller-chosen sender + channel + recipient. WHISPER folds `verb`, `target`
+/// (channel), `text`, and `recipient` into the transcript (source_nick excluded),
+/// so an attacker can sign a valid frame that still renders a victim's prefix.
+fn buildSignedWhisperFrom(
+    kp: *const sign_mod.KeyPair,
+    source_nick: []const u8,
+    source_prefix: []const u8,
+    channel: []const u8,
+    recipient: []const u8,
+    text: []const u8,
+    hlc: u64,
+    pk_buf: *[message_relay.pubkey_len]u8,
+    sig_buf: *[message_relay.sig_len]u8,
+) !message_relay.RelayMessage {
+    var msg = message_relay.RelayMessage{
+        .verb = .whisper,
+        .target = channel,
+        .source_nick = source_nick,
+        .source_prefix = source_prefix,
+        .account = "",
+        .tags = "",
+        .text = text,
+        .recipient = recipient,
+        .origin_node = message_relay.originShortId(kp.public_key),
+        .hlc = hlc,
+    };
+    const transcript = try message_relay.originTranscript(std.testing.allocator, msg);
+    defer std.testing.allocator.free(transcript);
+    try message_relay.signInPlace(&msg, kp, transcript, pk_buf, sig_buf);
+    return msg;
+}
+
+test "deliverRelayWhisper binds sender nick to its home node: signed impersonation dropped, legit delivered" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .node_id = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // Local recipient Bob, a member of the shared channel #room (WHISPER requires
+    // the recipient to be on the channel).
+    const bob_id = try addTestLocalClient(&server, "Bob", null);
+    const bob = server.connFor(bob_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(bob_id));
+
+    var victim_kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x31)));
+    defer victim_kp.deinit();
+    var attacker_kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x88)));
+    defer attacker_kp.deinit();
+    const victim_node = message_relay.originShortId(victim_kp.public_key);
+    try std.testing.expect(victim_node != message_relay.originShortId(attacker_kp.public_key));
+
+    // Home "ricky" on the victim node (member of #room), same id space signed
+    // frames use.
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{ .allocator = alloc, .local_node_id = victim_node, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "victim.orochi", .config = .{ .require_signed_frames = false } });
+    defer peer.deinit();
+    const link = try alloc.create(s2s_link.S2sLink);
+    try link.init(.{ .allocator = alloc, .local_node_id = 2, .remote_node_id = victim_node, .local_epoch_ms = 1001, .server_name = "self.orochi", .config = .{ .require_signed_frames = false } });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+
+    try peer.start(50);
+    try peer.sendMembership("#room", "ricky", 0, 100, true, .{ .username = "ricky", .host = "h" }, "");
+    try pumpLinkPair(&peer, link, alloc);
+    try std.testing.expect(link.established());
+    try std.testing.expectEqual(@as(?s2s_link.NodeId, victim_node), server.meshNickHomeNode("ricky"));
+
+    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+    var sig_buf: [message_relay.sig_len]u8 = undefined;
+
+    // (1) Legit: victim-signed WHISPER from "ricky" to Bob on #room => delivered.
+    const legit = try buildSignedWhisperFrom(&victim_kp, "ricky", "ricky!ricky@h", "#room", "Bob", "psst legit", 2001, &pk_buf, &sig_buf);
+    server.deliverRelay(legit);
+    try expectContains(bob.send_buf[0..bob.send_len], ":ricky!ricky@h WHISPER #room Bob :psst legit\r\n");
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_home_mismatch);
+
+    // (2) Impersonation: attacker-signed (valid) WHISPER rendering "ricky" => the
+    // home binding drops it; Bob never sees it; counted, no signature reject.
+    var pk_buf2: [message_relay.pubkey_len]u8 = undefined;
+    var sig_buf2: [message_relay.sig_len]u8 = undefined;
+    bob.send_len = 0;
+    const spoof = try buildSignedWhisperFrom(&attacker_kp, "ricky", "ricky!ricky@h", "#room", "Bob", "IMPERSONATED whisper", 2002, &pk_buf2, &sig_buf2);
+    try std.testing.expectEqual(message_relay.VerifyOutcome.verified, try message_relay.verifyOrigin(alloc, spoof));
+    server.deliverRelay(spoof);
+    try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch);
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
 }
 
 // ---------------------------------------------------------------------------
