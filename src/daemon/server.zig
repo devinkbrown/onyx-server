@@ -28386,8 +28386,18 @@ pub const LinuxServer = struct {
         };
         defer self.allocator.free(text);
 
-        var parsed = config_format.parseToml(self.allocator, text, self.config.config_resolver) catch {
-            try self.noticeTo(conn, "REHASH: config parse error; keeping current config");
+        var parsed = config_format.parseToml(self.allocator, text, self.config.config_resolver) catch |err| {
+            // Report the specific parse failure (InvalidSyntax/DuplicateKey/...)
+            // so the operator can fix the file rather than guess — a common
+            // deploy-friction point. Falls back to a bare notice if formatting
+            // the reason somehow fails.
+            var reason_buf: [96]u8 = undefined;
+            const notice = std.fmt.bufPrint(
+                &reason_buf,
+                "REHASH: config parse error ({s}); keeping current config",
+                .{@errorName(err)},
+            ) catch "REHASH: config parse error; keeping current config";
+            try self.noticeTo(conn, notice);
             return;
         };
         // Build the new oper bindings (strings borrow `parsed`, kept alive below).

@@ -549,7 +549,10 @@ pub fn main(init: std.process.Init) !void {
     // Background forward-confirmed reverse-DNS resolver: client IPs are resolved
     // off the accept path so hosts present a cloaked hostname rather than a
     // cloaked IP. Inert (no thread) when /etc/resolv.conf yields no nameservers.
-    var rdns_resolver = orochi.daemon.rdns.Resolver.init(allocator) catch null;
+    var rdns_resolver = orochi.daemon.rdns.Resolver.init(allocator) catch |err| blk: {
+        std.debug.print("orochi: rdns resolver init failed ({s}); reverse-DNS host resolution disabled\n", .{@errorName(err)});
+        break :blk null;
+    };
     defer if (rdns_resolver) |*r| r.deinit();
     if (rdns_resolver) |*r| {
         r.start();
@@ -563,12 +566,19 @@ pub fn main(init: std.process.Init) !void {
     defer if (dnsbl_res) |*r| r.deinit();
     if (held) |h| {
         if (h.parsed.dnsbl.enabled and h.parsed.dnsbl.zones.len != 0) {
-            dnsbl_res = orochi.daemon.dnsbl_resolver.Resolver.init(allocator, h.parsed.dnsbl.zones) catch null;
+            dnsbl_res = orochi.daemon.dnsbl_resolver.Resolver.init(allocator, h.parsed.dnsbl.zones) catch |err| blk: {
+                std.debug.print("orochi: [dnsbl] enabled but resolver init failed ({s}); blocklist is INERT\n", .{@errorName(err)});
+                break :blk null;
+            };
             if (dnsbl_res) |*r| {
                 r.start();
                 srv_cfg.dnsbl = r;
                 srv_cfg.dnsbl_ward = h.parsed.dnsbl.ward;
             }
+        } else if (h.parsed.dnsbl.enabled) {
+            // enabled with an empty zone list: nothing to probe, so the feature
+            // silently does nothing. Make that misconfiguration visible.
+            std.debug.print("orochi: [dnsbl] enabled but no zones configured; blocklist is INERT\n", .{});
         }
     }
 
@@ -590,12 +600,19 @@ pub fn main(init: std.process.Init) !void {
                     .from = from,
                     .user = m.user,
                     .pass = m.pass,
-                }) catch null;
+                }) catch |err| blk: {
+                    std.debug.print("orochi: [mail] enabled but sender init failed ({s}); verification emails recorded unverified\n", .{@errorName(err)});
+                    break :blk null;
+                };
                 if (mail_send) |*s| {
                     s.start();
                     srv_cfg.mail_sender = s;
                 }
             };
+            // enabled but missing relay_host and/or from: the sender is never
+            // constructed and emails stay unverified — surface the gap.
+            if (m.relay_host == null or m.from == null)
+                std.debug.print("orochi: [mail] enabled but relay_host/from not set; verification emails recorded unverified\n", .{});
         }
     }
 

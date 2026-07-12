@@ -16,6 +16,7 @@ const std = @import("std");
 const dns = @import("../proto/dns.zig");
 const dnsbl = @import("dnsbl.zig");
 const platform = @import("../substrate/platform.zig");
+const dlog = @import("dlog.zig");
 
 /// Maximum number of blocklist zones probed per client IP.
 pub const max_zones: usize = 8;
@@ -94,7 +95,13 @@ pub const Resolver = struct {
         if (self.thread != null) return;
         if (self.cfg.nameserver_count == 0 or self.zone_count == 0) return;
         self.stop_flag.store(false, .release);
-        self.thread = std.Thread.spawn(.{}, worker, .{self}) catch null;
+        // A spawn failure here (past the nameserver/zone guards above) leaves the
+        // blocklist fully inert — every client is then treated as clean with no
+        // other signal. Surface it rather than silently degrading.
+        self.thread = std.Thread.spawn(.{}, worker, .{self}) catch |err| blk: {
+            dlog.log("orochi: dnsbl resolver worker thread spawn failed ({s}); blocklist is INERT\n", .{@errorName(err)});
+            break :blk null;
+        };
     }
 
     pub fn stop(self: *Resolver) void {

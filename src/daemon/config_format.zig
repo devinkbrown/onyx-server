@@ -980,11 +980,19 @@ pub const Config = struct {
     }
 };
 
-pub const TomlError = error{ParseError} || std.mem.Allocator.Error;
+// `ParseError` is the daemon's own semantic-projection failure (a value out of
+// range, a bad enum, ...); the `toml.ParseError` variants
+// (InvalidSyntax/UnexpectedEof/DuplicateKey/...) are threaded through UNCHANGED
+// so `--check-config` and the REHASH notice can report the actionable reason a
+// TOML file was rejected rather than a single opaque `ParseError`.
+pub const TomlError = toml.ParseError || error{ParseError} || std.mem.Allocator.Error;
 
 /// Parse standard TOML and project it onto a defaulted `Config`.
 pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Resolver) TomlError!Config {
-    var doc = toml.parse(allocator, source) catch return error.ParseError;
+    // Preserve the underlying toml.ParseError variant instead of collapsing it
+    // to a generic `error.ParseError` — the specific reason is surfaced to the
+    // operator (see TomlError above).
+    var doc = try toml.parse(allocator, source);
     defer doc.deinit(allocator);
 
     var cfg = try Config.initDefaults(allocator);
@@ -2744,8 +2752,9 @@ test "parseToml: required fields and ranges are enforced" {
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=70000\n", .{}));
     // Bad duration.
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[limits]\nping_interval=\"5x\"\n", .{}));
-    // Malformed TOML.
-    try testing.expectError(error.ParseError, parseToml(allocator, "[node\nid=1\n", .{}));
+    // Malformed TOML: the underlying toml.ParseError variant is threaded through
+    // verbatim (not collapsed to error.ParseError) so operators see the reason.
+    try testing.expectError(error.InvalidSyntax, parseToml(allocator, "[node\nid=1\n", .{}));
 }
 
 test "parseToml: [io] / [reputation] / sweep_interval lift" {

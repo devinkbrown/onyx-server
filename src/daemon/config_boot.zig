@@ -442,7 +442,13 @@ pub fn loadFromText(
                 }
             }
         }
-        groups.add(allocator, g.name, oper_mod.OperPrivileges.initMany(pbuf[0..pn]), if (g.inherits.len > 0) g.inherits else null) catch {};
+        // Keep the first definition of a name and drop later collisions/invalid
+        // blocks (unchanged behavior), but LOG the specific reason so an admin
+        // who edited an oper privilege set while leaving the old block in place
+        // sees why the stale definition is still winning — instead of a silent
+        // no-op at boot/REHASH. `DuplicateGroup` carries the offending name.
+        groups.add(allocator, g.name, oper_mod.OperPrivileges.initMany(pbuf[0..pn]), if (g.inherits.len > 0) g.inherits else null) catch |err|
+            dlog.log("orochi: dropping oper group '{s}': {s}\n", .{ g.name, @errorName(err) });
     }
 
     // Build the SASL-only operator registry from `[[opers]]` blocks.
@@ -1044,6 +1050,51 @@ test "oper groups project configured privileges and titles" {
     try testing.expect(grant.privileges.has(.audit_read));
     try testing.expect(!grant.privileges.has(.server_admin));
     try testing.expectEqualStrings("Network Guardian", grant.title);
+}
+
+test "malformed TOML surfaces the specific parse variant, not an opaque ParseError" {
+    const allocator = testing.allocator;
+    // A duplicate key is a distinct, actionable toml.ParseError variant. The
+    // loader must thread it through verbatim so --check-config and the REHASH
+    // notice can name the reason (this used to collapse to error.ParseError).
+    const text =
+        \\[node]
+        \\id = 1
+        \\id = 2
+        \\
+    ;
+    try testing.expectError(error.DuplicateKey, loadFromText(allocator, text, .{ .port = 6680 }, .{}));
+}
+
+test "duplicate [[oper_groups]] name keeps the first definition and still boots" {
+    const allocator = testing.allocator;
+    // Two blocks named "admin": the first (server_rehash) wins, the duplicate
+    // (server_admin) is dropped with a logged reason. Behavior is unchanged —
+    // the load must still succeed and resolve to the FIRST definition.
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[[oper_groups]]
+        \\name = "admin"
+        \\privileges = ["server_rehash"]
+        \\[[oper_groups]]
+        \\name = "admin"
+        \\privileges = ["server_admin"]
+        \\[[opers]]
+        \\account = "alice"
+        \\class = "admin"
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+
+    const registry = loaded.config.oper_registry.?;
+    const grant = try registry.elevateAuthenticated(.{ .name = "alice" });
+    // First definition wins: has server_rehash, NOT the duplicate's server_admin.
+    try testing.expect(grant.privileges.has(.server_rehash));
+    try testing.expect(!grant.privileges.has(.server_admin));
 }
 
 test "oper certfp seeds the bind store at boot (string + array, normalized, malformed skipped)" {
