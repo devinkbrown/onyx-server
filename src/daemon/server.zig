@@ -2945,6 +2945,12 @@ pub const LinuxServer = struct {
     /// Last time the periodic membership anti-entropy re-burst ran (ms). Gates
     /// `resyncMeshStateToPeers` so it fires on a coarse cadence, not every tick.
     last_membership_resync_ms: i64 = 0,
+    /// Last time live opered sessions' cross-mesh grants were re-minted (ms).
+    /// Gates the periodic `rebroadcastLocalOpers` refresh so a grant is renewed
+    /// well inside `oper_grant_ttl_ms` — without it, a link that stays up past
+    /// the TTL watches every still-logged-in oper's grant lapse (remote
+    /// `Registry.lookup` → null, the `*` prefix silently decays).
+    last_oper_grant_refresh_ms: i64 = 0,
     /// Web-stats publishing throttle + running peak client count.
     stats_last_write_ms: i64 = 0,
     stats_peak_clients: u64 = 0,
@@ -4646,6 +4652,19 @@ pub const LinuxServer = struct {
         // cadence honest — mirroring the reactor-0-only sweeps above.
         if (self.rx() == &self.reactors[0]) {
             const now = self.nowMs();
+            // Cross-mesh oper-grant refresh: minted grants expire after
+            // `oper_grant_ttl_ms`, so on a link that stays up longer than the
+            // TTL a still-logged-in oper's grant lapses on every peer (remote
+            // lookup → null, the `*` prefix decays) unless it is re-minted.
+            // Re-mint + re-broadcast every live opered session's grant on a
+            // dedicated cadence well inside the TTL. Same reactor-0 discipline
+            // as the membership resync below: BOTH the work and the cadence
+            // guard live behind the reactors[0] gate, so a link-less sibling
+            // reactor can never consume the guard while doing nothing.
+            if (now - self.last_oper_grant_refresh_ms >= oper_grant_refresh_interval_ms) {
+                self.last_oper_grant_refresh_ms = now;
+                self.rebroadcastLocalOpers();
+            }
             if (now - self.last_membership_resync_ms >= membership_resync_interval_ms) {
                 self.last_membership_resync_ms = now;
                 self.resyncMeshStateToPeers();
@@ -6486,14 +6505,23 @@ pub const LinuxServer = struct {
     /// Re-mint + broadcast every locally-opered session's grant, so a freshly
     /// established secured peer learns this node's current operators without
     /// waiting for them to re-elevate. Grants ride only the secured mesh.
+    /// Scans EVERY reactor's client table — a connection is pinned to its shard
+    /// for life, so an oper homed on a sibling reactor would otherwise never be
+    /// re-propagated on relink/RESYNC/repair and a peer that restarted (or
+    /// USR2'd) would never learn the grant (its `*` silently missing). The scan
+    /// is read-only and runs on the reactor-0 drive path under the
+    /// completion-wide world lock, same as `isOverrideOper` and the presence
+    /// burst; the mint/broadcast stays on this (reactor-0) thread.
     fn rebroadcastLocalOpers(self: *LinuxServer) void {
-        var it = self.rx().clients.iterator();
-        while (it.next()) |entry| {
-            const c = entry.value;
-            if (c.s2s != null or c.s2s_secured != null) continue;
-            if (!c.session.registered() or !c.session.isOper()) continue;
-            const account = c.session.account() orelse continue;
-            self.mintOperGrant(account, c.session.oper_priv, c.session.operClass(), c.session.operTitle());
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const c = entry.value;
+                if (c.s2s != null or c.s2s_secured != null) continue;
+                if (!c.session.registered() or !c.session.isOper()) continue;
+                const account = c.session.account() orelse continue;
+                self.mintOperGrant(account, c.session.oper_priv, c.session.operClass(), c.session.operTitle());
+            }
         }
     }
 
@@ -22723,6 +22751,12 @@ pub const LinuxServer = struct {
     /// Lifetime of a minted cross-mesh operator grant.
     const oper_grant_ttl_ms: u64 = 24 * 60 * 60 * 1000;
 
+    /// Cadence of the periodic grant refresh (`onTimerTick`, reactor 0):
+    /// re-mint live opered sessions' grants every quarter-TTL so a grant is
+    /// always renewed with ≥3/4 of its lifetime remaining — a peer's copy never
+    /// lapses while the oper stays logged in, even across long-lived links.
+    const oper_grant_refresh_interval_ms: i64 = @intCast(oper_grant_ttl_ms / 4);
+
     /// Derive this node's Ed25519 signing keypair (for minting oper grants) from
     /// the sovereign node identity seed. Null when no node identity is configured
     /// (cross-mesh oper grants then unsigned/disabled).
@@ -32698,6 +32732,77 @@ test "remoteGrantWhoisStatus maps grant privilege bits to WHOIS 313 flags" {
     // Unrelated privileges (no override/admin) stay silent in WHOIS.
     const plain = remoteGrantWhoisStatus(oper_mod.OperPrivileges.initMany(&.{.client_kill}).toBits());
     try std.testing.expect(!plain.is_oper and !plain.is_admin);
+}
+
+test "rebroadcastLocalOpers re-mints an oper homed on a non-zero shard" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
+
+        // Home an opered, registered, logged-in session on reactor 1 — NOT the
+        // reactor-0 table the relink re-propagation scan was once limited to.
+        // A connection is pinned to its shard for life, so a shard-1 oper that
+        // the scan misses is never re-propagated on relink/RESYNC/repair and a
+        // restarted peer never learns the grant (its `*` silently missing).
+        const id = try server.reactors[1].clients.alloc(ConnState.init(-1));
+        const conn = server.reactors[1].clients.get(id).?;
+        try conn.session.setNick("kain");
+        conn.session.loginAs("kain");
+        conn.session.registration.registered = true;
+        conn.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+
+        // The read-only scan must cover every reactor; the re-mint lands in the
+        // local grant registry (and best-effort broadcasts to secured peers).
+        server.rebroadcastLocalOpers();
+        const g = server.oper_grants.lookup("kain", server.grantNowU64()) orelse return error.TestExpectedGrant;
+        try std.testing.expect(oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override));
+    } else return error.SkipZigTest;
+}
+
+test "periodic timer tick re-mints live oper grants inside the TTL" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        const id = try addTestLocalClient(&server, "kain", "kain");
+        const conn = server.connFor(id).?;
+        conn.session.registration.registered = true;
+        conn.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+
+        // Seed a nearly-lapsed grant, as if minted almost a full TTL ago. With
+        // no periodic re-mint, lookup starts returning null the moment it
+        // lapses on a long-lived link — every remote viewer's `*` decays even
+        // though the oper never logged out.
+        const now = server.grantNowU64();
+        _ = server.oper_grants.upsert(.{
+            .account = "kain",
+            .privilege_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits(),
+            .class = "netadmin",
+            .title = "",
+            .issuer_node = "test.node",
+            .incarnation = 1,
+            .issued_ms = now,
+            .expiry_ms = now + 1_000,
+        });
+
+        // Drive the periodic tick. Tests run without a reactor thread, so
+        // rx() IS reactors[0]: the singleton reactor-0 guard passes and the
+        // grant-refresh cadence guard (starting at 0) is due immediately.
+        server.onTimerTick();
+
+        // The re-mint superseded the seeded grant with a fresh full-TTL
+        // expiry: lookup still resolves well past the seeded grant's lapse.
+        const g = server.oper_grants.lookup("kain", now + 2_000) orelse return error.TestExpectedGrant;
+        try std.testing.expect(g.expiry_ms > now + 1_000);
+        try std.testing.expect(oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override));
+    } else return error.SkipZigTest;
 }
 
 test "REHASH oper binding builder preserves configured group privileges" {

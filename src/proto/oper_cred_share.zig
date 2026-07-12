@@ -355,10 +355,15 @@ pub fn Sized(comptime cap: usize) type {
             return self.len;
         }
 
+        /// Account comparison is case-INSENSITIVE: the `*` pipeline resolves
+        /// grants by roster nick (the account == nick convention) and nicks
+        /// compare case-insensitively everywhere else — a case-sensitive match
+        /// here made a grant unfindable whenever the viewer's roster carried a
+        /// different capitalization than the minted account.
         fn findIndex(self: *const Self, account: []const u8) ?usize {
             var i: usize = 0;
             while (i < cap) : (i += 1) {
-                if (self.used[i] and std.mem.eql(u8, self.slots[i].accountSlice(), account))
+                if (self.used[i] and std.ascii.eqlIgnoreCase(self.slots[i].accountSlice(), account))
                     return i;
             }
             return null;
@@ -808,4 +813,28 @@ test "verified grant feeds straight into the registry" {
     try testing.expectEqualStrings("oper_alice", found.account);
     try testing.expectEqualStrings("netadmin", found.class);
     try testing.expectEqual(@as(u64, 0xDEAD_BEEF_0000_0001), found.privilege_bits);
+}
+
+test "registry matches accounts case-insensitively (account == nick convention)" {
+    // The `*` pipeline resolves grants by roster NICK (account == nick), and
+    // nicks compare case-insensitively everywhere else (eqlIgnoreCase). A
+    // case-sensitive registry made a remote oper's `*` decay whenever the
+    // viewer's roster carried a different capitalization (e.g. `Kain` vs the
+    // minted account `kain`).
+    var reg = Registry.init();
+    _ = reg.upsert(sampleFields()); // account "oper_alice"
+
+    // Arrange/Act/Assert: every capitalization resolves to the stored grant.
+    try testing.expect(reg.lookup("oper_alice", 5_000) != null);
+    try testing.expect(reg.lookup("Oper_Alice", 5_000) != null);
+    try testing.expect(reg.lookup("OPER_ALICE", 5_000) != null);
+    try testing.expect(reg.lookup("oper_bob", 5_000) == null); // no false positive
+
+    // A mixed-case re-grant merges into the SAME slot (supersede), never a
+    // duplicate account entry.
+    var regrant = sampleFields();
+    regrant.account = "OPER_ALICE";
+    regrant.incarnation = 8;
+    try testing.expectEqual(UpsertResult.superseded, reg.upsert(regrant));
+    try testing.expectEqual(@as(usize, 1), reg.count());
 }
