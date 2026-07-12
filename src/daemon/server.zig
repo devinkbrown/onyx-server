@@ -6059,7 +6059,18 @@ pub const LinuxServer = struct {
             if (conn.peer_addr) |addr| {
                 var ipbuf: [64]u8 = undefined;
                 if (addrText(addr, &ipbuf)) |ip| {
-                    const decision = self.conn_throttle.?.classifyConnect(self.nowMs(), ip) catch .allow;
+                    const decision = self.conn_throttle.?.classifyConnect(self.nowMs(), ip) catch |err| switch (err) {
+                        // `ip` is a bounded, non-empty rendered address, so
+                        // EmptyIp/IpTooLong are unreachable here — treat them as
+                        // allow so an internal quirk never wrongly refuses a real
+                        // client. A saturated table is already reported as
+                        // `.connect_throttled` by the engine (fail-closed); an
+                        // allocation failure while recording a NEW source IP is
+                        // memory pressure, so it too fails TOWARD refuse. Never a
+                        // blanket fail-OPEN `catch .allow`.
+                        error.EmptyIp, error.IpTooLong => .allow,
+                        else => .connect_throttled,
+                    };
                     switch (decision) {
                         .allow => conn.throttle_counted = true,
                         .connect_throttled, .clone_limited => {
@@ -6081,7 +6092,16 @@ pub const LinuxServer = struct {
                         self.publishSecurityAdmissionRefusal(conn, "CLONE_LIMIT", if (err == error.TooManyPerIp) "per-IP cap exceeded" else "per-network cap exceeded");
                         refuse = true;
                     },
-                    error.NoSpaceLeft => {},
+                    // The limiter's maps could not grow: the clone cap has gone
+                    // inert. Under memory pressure is exactly when a clone flood is
+                    // most dangerous, so fail CLOSED (refuse) and surface it as a
+                    // security event rather than silently admitting an uncounted
+                    // connection.
+                    error.NoSpaceLeft => {
+                        self.penalizePeer(conn, self.config.clone_refuse_penalty);
+                        self.publishSecurityAdmissionRefusal(conn, "CLONE_LIMIT", "limiter exhausted (fail-closed)");
+                        refuse = true;
+                    },
                 }
             }
         }
@@ -16051,6 +16071,14 @@ pub const LinuxServer = struct {
         reason: []const u8,
         audit_action: svc_operaudit.Action,
     ) !void {
+        // Validate an address CIDR at CREATE time. A malformed network (e.g.
+        // 192.0.2.0/99) would otherwise be stored, list, and look live, yet fail
+        // closed at match time so it never fires — a ban that protects nothing.
+        // A bare address pattern (no '/') globs and is accepted.
+        if (!warden.addressPatternValid(match, pattern)) {
+            try self.noticeTo(conn, "WARD: invalid address CIDR (use e.g. 192.0.2.0/24 or 2001:db8::/32)");
+            return;
+        }
         const now = platform.realtimeMillis();
         const ward = warden.Ward{
             .match = match,

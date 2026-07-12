@@ -6,6 +6,14 @@
 //! Callers provide a stable IP string and monotonic-ish time in milliseconds.
 //! This module reads no clock and performs no I/O. State is bounded by
 //! `max_tracked_ips`, `max_ip_len`, and `max_connects_per_window`.
+//!
+//! When the tracking table is saturated (more distinct source IPs than
+//! `max_tracked_ips`, even after pruning window-expired empty entries) a new,
+//! untracked source IP is reported `.connect_throttled` — a full table means the
+//! node is under a distributed connect flood, exactly what this throttle exists
+//! to blunt. It fails TOWARD refuse and never admits a new IP for free once
+//! saturated (an earlier design erred here, which a caller could only swallow as
+//! a fail-OPEN admit).
 const std = @import("std");
 
 pub const Decision = enum {
@@ -25,7 +33,6 @@ pub const Params = struct {
 pub const CloneDetectError = error{
     EmptyIp,
     IpTooLong,
-    TooManyTrackedIps,
     InvalidParams,
 } || std.mem.Allocator.Error;
 
@@ -67,7 +74,10 @@ pub const CloneDetector = struct {
             return self.classifyExisting(now_ms, state);
         }
 
-        try self.ensureRoomForNewIp(now_ms);
+        // A saturated table means the node is tracking more distinct source IPs
+        // than its bound — a distributed connect flood. Fail TOWARD refuse rather
+        // than admitting the new IP untracked.
+        if (!self.hasRoomForNewIp(now_ms)) return .connect_throttled;
 
         const owned_ip = try self.allocator.dupe(u8, ip);
         errdefer self.allocator.free(owned_ip);
@@ -124,10 +134,13 @@ pub const CloneDetector = struct {
         return .allow;
     }
 
-    fn ensureRoomForNewIp(self: *CloneDetector, now_ms: i64) CloneDetectError!void {
-        if (self.ips.count() < self.params.max_tracked_ips) return;
+    /// Whether a new source IP can be tracked. At the bound, first reclaim room
+    /// by pruning window-expired empty entries; a still-full table has no room
+    /// (the caller fails toward refuse). Reads `now_ms`, never a clock.
+    fn hasRoomForNewIp(self: *CloneDetector, now_ms: i64) bool {
+        if (self.ips.count() < self.params.max_tracked_ips) return true;
         self.prune(now_ms);
-        if (self.ips.count() >= self.params.max_tracked_ips) return error.TooManyTrackedIps;
+        return self.ips.count() < self.params.max_tracked_ips;
     }
 
     fn removeOneExpiredEmptyIp(self: *CloneDetector, now_ms: i64) bool {
@@ -268,13 +281,41 @@ test "state is bounded and prunes empty expired IPs" {
 
     try std.testing.expectEqual(Decision.allow, try detector.classifyConnect(0, "10.0.0.1"));
     try std.testing.expectEqual(Decision.allow, try detector.classifyConnect(0, "10.0.0.2"));
-    try std.testing.expectError(error.TooManyTrackedIps, detector.classifyConnect(1, "10.0.0.3"));
+    // Table full with two still-active entries: a third distinct IP is throttled
+    // (fail-closed), not admitted, and not tracked.
+    try std.testing.expectEqual(Decision.connect_throttled, try detector.classifyConnect(1, "10.0.0.3"));
+    try std.testing.expectEqual(@as(usize, 2), detector.trackedIps());
 
     try std.testing.expect(detector.disconnect("10.0.0.1"));
     detector.prune(100);
     try std.testing.expectEqual(@as(usize, 1), detector.trackedIps());
     try std.testing.expectEqual(Decision.allow, try detector.classifyConnect(100, "10.0.0.3"));
     try std.testing.expect(detector.trackedIps() <= 2);
+}
+
+test "full tracking table fails toward refuse, never silent-admit" {
+    // Regression: a distributed connect flood fills the bounded table with
+    // distinct, still-active source IPs (so pruning reclaims nothing). A brand-new
+    // source IP must be throttled — the historical fail-open bug returned an error
+    // the admission caller swallowed as `.allow`, disabling the throttle for
+    // exactly the flood it exists to stop. Mirrors conn_throttle's pure-rate config
+    // (concurrent dimension owned by a separate limiter).
+    var detector = try CloneDetector.initChecked(std.testing.allocator, .{
+        .max_concurrent_per_ip = 0,
+        .max_connects_per_window = 8,
+        .window_ms = 60_000,
+        .max_tracked_ips = 2,
+    });
+    defer detector.deinit();
+
+    try std.testing.expectEqual(Decision.allow, try detector.classifyConnect(0, "2001:db8::1"));
+    try std.testing.expectEqual(Decision.allow, try detector.classifyConnect(0, "2001:db8::2"));
+    // Both entries stay active within the window → no room to reclaim → refuse.
+    try std.testing.expectEqual(Decision.connect_throttled, try detector.classifyConnect(1, "2001:db8::3"));
+    try std.testing.expectEqual(Decision.connect_throttled, try detector.classifyConnect(2, "2001:db8::4"));
+    // The refused IPs were never tracked (no unbounded growth past the cap).
+    try std.testing.expectEqual(@as(usize, 2), detector.trackedIps());
+    try std.testing.expectEqual(@as(usize, 0), detector.activeCount("2001:db8::3"));
 }
 
 test "no leak across denied connects and deinit" {
