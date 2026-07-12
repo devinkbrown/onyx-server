@@ -249,16 +249,34 @@ pub fn ReplayRing(comptime capacity: usize) type {
         used: [capacity]bool = @splat(false),
         head: usize = 0,
 
-        /// True if `nonce` is already recorded (a replay). Otherwise records it
-        /// (evicting the oldest entry if full) and returns false.
-        pub fn check(self: *Self, nonce: u64) bool {
+        /// True if `nonce` is already recorded (a replay). PURE — never mutates,
+        /// so a non-consuming outcome (grant_redirect / deny_*) can consult the
+        /// ring without burning the nonce for a later legitimate consume.
+        pub fn contains(self: *const Self, nonce: u64) bool {
             var i: usize = 0;
             while (i < capacity) : (i += 1) {
                 if (self.used[i] and self.slots[i] == nonce) return true;
             }
+            return false;
+        }
+
+        /// Record `nonce` as seen (evicting the oldest entry if full; idempotent
+        /// on an already-recorded nonce). Call ONLY on an outcome that truly
+        /// consumes the token (a grant) — redirects and denials must stay
+        /// idempotent so they never strand a still-valid token.
+        pub fn record(self: *Self, nonce: u64) void {
+            if (self.contains(nonce)) return;
             self.slots[self.head] = nonce;
             self.used[self.head] = true;
             self.head = (self.head + 1) % capacity;
+        }
+
+        /// contains-then-record in one step: true if `nonce` was already
+        /// recorded, otherwise records it and returns false. Only for callers
+        /// where every first sight IS a consume.
+        pub fn check(self: *Self, nonce: u64) bool {
+            if (self.contains(nonce)) return true;
+            self.record(nonce);
             return false;
         }
     };
@@ -532,6 +550,55 @@ test "ReplayRing detects a replayed nonce" {
     try testing.expect(!ring.check(2));
     try testing.expect(ring.check(1)); // replay
     try testing.expect(ring.check(2)); // replay
+}
+
+test "ReplayRing contains is pure: probing never records the nonce" {
+    // Arrange
+    var ring = ReplayRing(4){};
+
+    // Act: probe the same nonce repeatedly without recording.
+    try testing.expect(!ring.contains(42));
+    try testing.expect(!ring.contains(42));
+
+    // Assert: only an explicit record makes it a replay.
+    ring.record(42);
+    try testing.expect(ring.contains(42));
+}
+
+test "ReplayRing record is idempotent and does not double-fill slots" {
+    // Arrange
+    var ring = ReplayRing(2){};
+
+    // Act: record the same nonce twice, then one more distinct nonce.
+    ring.record(7);
+    ring.record(7);
+    ring.record(8);
+
+    // Assert: 7 was not stored twice, so recording 8 did not evict it.
+    try testing.expect(ring.contains(7));
+    try testing.expect(ring.contains(8));
+}
+
+test "non-consuming decisions do not burn the nonce for a later consume" {
+    // Arrange: a fresh token evaluated on a node that neither holds the
+    // session nor is the origin (grant_redirect — non-consuming).
+    const fields = sampleFields();
+    var ring = ReplayRing(8){};
+
+    // Act: two redirect evaluations, then the session arrives locally and the
+    // SAME token is consumed.
+    const d1 = decide(fields, false, false, ring.contains(fields.nonce), fields.issued_ms);
+    const d2 = decide(fields, false, false, ring.contains(fields.nonce), fields.issued_ms);
+    const d3 = decide(fields, true, false, ring.contains(fields.nonce), fields.issued_ms);
+    if (d3 == .grant_local) ring.record(fields.nonce); // consume burns it
+    const d4 = decide(fields, true, false, ring.contains(fields.nonce), fields.issued_ms);
+
+    // Assert: redirects are idempotent; the consume succeeds; only after the
+    // consume is a re-presentation a replay.
+    try testing.expect(d1 == .grant_redirect);
+    try testing.expect(d2 == .grant_redirect);
+    try testing.expectEqual(ReclaimDecision.grant_local, d3);
+    try testing.expectEqual(ReclaimDecision.deny_replay, d4);
 }
 
 test "ReplayRing evicts oldest when capacity is exceeded" {

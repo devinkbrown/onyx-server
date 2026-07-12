@@ -25395,12 +25395,24 @@ pub const LinuxServer = struct {
             std.mem.eql(u8, value, "+");
     }
 
-    /// Generate a 16-byte session reclaim token from the daemon CSPRNG (zeroed
-    /// when no crypto_io is configured — reclaim then effectively disabled).
+    /// Generate a 16-byte session reclaim token from the daemon CSPRNG. With no
+    /// crypto_io configured this yields the all-zero SENTINEL token: the session
+    /// is still tracked (SESSION LIST / session-sync fan-out keep working), but
+    /// `SESSION TOKEN` never reveals it and RESUME never honors it (see
+    /// `tokenIsNull`) — a CSPRNG-less boot disables reclaim instead of silently
+    /// minting one constant, guessable credential per account.
     fn genSessionToken(self: *LinuxServer) sessions_mod.Token {
         var t: sessions_mod.Token = @splat(0);
         if (self.config.crypto_io) |io| io.random(&t);
         return t;
+    }
+
+    /// The all-zero "no reclaim token" sentinel (crypto_io unset at issue time).
+    /// Refused everywhere a token acts as a credential — fail closed. (A real
+    /// CSPRNG token is all-zero with probability 2^-128; refusing it too is the
+    /// cheap fail-closed side of that coin.)
+    fn tokenIsNull(t: sessions_mod.Token) bool {
+        return std.mem.allEqual(u8, &t, 0);
     }
 
     /// Lifetime of a cross-server (mesh-sealed) reclaim token.
@@ -25422,6 +25434,7 @@ pub const LinuxServer = struct {
         if (hex.len != 2 * @sizeOf(sessions_mod.Token)) return null;
         var token: sessions_mod.Token = undefined;
         _ = std.fmt.hexToBytes(&token, hex) catch return null;
+        if (tokenIsNull(token)) return null; // sentinel: never a reclaim credential
         return token;
     }
 
@@ -25433,13 +25446,15 @@ pub const LinuxServer = struct {
     fn meshReclaimToken(self: *LinuxServer, account: []const u8, session_id: []const u8, out_hex: []u8) ?[]const u8 {
         const key = self.config.mesh_pass;
         if (key.len == 0) return null;
+        // No CSPRNG => no fresh single-use nonce. A constant nonce would make
+        // every issued token mutually "replay" each other (and the first consume
+        // burn all later ones), so match the unset-mesh-key behavior: reclaim
+        // disabled rather than silently degraded.
+        const io = self.config.crypto_io orelse return null;
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-        var nonce: u64 = 0;
-        if (self.config.crypto_io) |io| {
-            var nb: [8]u8 = undefined;
-            io.random(&nb);
-            nonce = std.mem.readInt(u64, &nb, .big);
-        }
+        var nb: [8]u8 = undefined;
+        io.random(&nb);
+        const nonce = std.mem.readInt(u64, &nb, .big);
         const fields = session_reclaim_mesh.ReclaimFields{
             .account = account,
             .session_id = session_id,
@@ -25465,7 +25480,14 @@ pub const LinuxServer = struct {
             if (s.client == cid) return; // already tracked
         }
         const signon: i64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-        _ = self.sessions.attach(account, cid, self.genSessionToken(), signon) catch {};
+        _ = self.sessions.attach(account, cid, self.genSessionToken(), signon) catch |err| {
+            // Surface, never swallow: at the per-account cap with every slot
+            // still attached there is nothing to evict, so this session goes
+            // UNTRACKED (no reclaim token, no session-sync fan-out, absent from
+            // SESSION LIST). Log so the condition is observable; the eviction
+            // policy itself is a separate config/warden concern.
+            srvLog("orochi: session tracking failed for account '{s}': {s}\n", .{ account, @errorName(err) });
+        };
     }
 
     /// `SESSION [LIST|TOKEN]` — list the account's live sessions, or reveal this
@@ -25487,6 +25509,7 @@ pub const LinuxServer = struct {
             const account_sessions = self.sessions.sessionsInto(account, &session_buf);
             for (account_sessions) |s| {
                 if (s.client != cid) continue;
+                if (tokenIsNull(s.token)) break; // sentinel: no CSPRNG at issue time — nothing to reveal
                 const hex = std.fmt.bytesToHex(s.token, .lower);
                 const line = std.fmt.bufPrint(&buf, "SESSION TOKEN {s}", .{hex}) catch return;
                 try self.noticeTo(conn, line);
@@ -25539,6 +25562,12 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME token is not valid hex");
             return;
         };
+        if (tokenIsNull(token)) {
+            // The all-zero sentinel marks sessions tracked without a CSPRNG; it
+            // is never a credential, so it must never match a ghost.
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
+            return;
+        }
         const matched = self.sessions.findTokenSessionInAccount(account, token) orelse {
             try self.failReply(conn, "SESSION", "NO_SESSION", "No session matches that token");
             return;
@@ -25553,8 +25582,19 @@ pub const LinuxServer = struct {
         }
         const snapshot = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, token) catch null;
         defer if (snapshot) |bytes| self.allocator.free(bytes);
-        _ = self.sessions.remove(account, matched.client); // reclaim consumes the detached ghost
+        // Restore FIRST, consume the ghost only AFTER a successful restore: a
+        // transient decode-stage failure (a corrupt/truncated snapshot rejected
+        // by Snapshot.decode BEFORE any conn mutation) must leave the detached
+        // ghost (and its snapshot) reclaimable, not irrecoverably discarded. A
+        // deterministic post-decode failure (e.g. nick re-registration) simply
+        // re-preserves the ghost until its TTL — no worse than the old
+        // unconditional discard, and self-heals once the conflict clears.
         const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, bytes) else false;
+        if (snapshot != null and !restored) {
+            try self.failReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
+            return;
+        }
+        _ = self.sessions.remove(account, matched.client); // reclaim consumes the detached ghost
         if (restored) {
             try self.noticeTo(conn, "SESSION RESUME: session restored");
         } else {
@@ -25621,7 +25661,12 @@ pub const LinuxServer = struct {
             (if (migrate_token) |mt| pm.has(mt) else false)
         else
             false;
-        const seen = self.session_reclaim_replay.check(fields.nonce);
+        // PURE probe — the nonce is recorded (burned) only on the outcomes that
+        // truly consume the token (capsule consume / grant_local below). A
+        // redirect or denial stays idempotent: burning on first sight stranded
+        // a still-valid session for the whole 12h TTL when the client probed a
+        // non-owning node first.
+        const seen = self.session_reclaim_replay.contains(fields.nonce);
         var buf: [default_reply_bytes]u8 = undefined;
         // Replay/expiry still win over a staged capsule: a replayed or expired
         // reclaim is denied and the capsule is left untouched for a legitimate
@@ -25629,6 +25674,7 @@ pub const LinuxServer = struct {
         if (have_capsule and !seen and now <= fields.expiry_ms) {
             if (self.consumeMigration(id, conn, account, migrate_token.?)) {
                 if (ghost) |g| _ = self.sessions.remove(account, g);
+                self.session_reclaim_replay.record(fields.nonce); // consumed: burn the nonce
                 try self.noticeTo(conn, "SESSION RESUME: session migrated and reclaimed (cross-server)");
                 const event = std.fmt.bufPrint(&buf, "SESSION migrated+reclaimed account={s}", .{account}) catch return;
                 self.publishOperEvent(.service, .notice, event) catch {};
@@ -25664,6 +25710,7 @@ pub const LinuxServer = struct {
                     }
                     _ = self.sessions.remove(account, g);
                 }
+                self.session_reclaim_replay.record(fields.nonce); // ghost consumed: burn the nonce
                 if (restored) {
                     try self.noticeTo(conn, "SESSION RESUME: session restored (cross-server)");
                 } else {
@@ -36910,7 +36957,7 @@ test "threaded server: mesh-token local resume restores detached snapshot" {
     defer store.deinit();
     var services = services_mod.Services.init(&store, null);
 
-    const cfg = Config{ .host = "127.0.0.1", .port = 0, .account_services = &services, .mesh_pass = "mesh-reclaim-secret" };
+    const cfg = Config{ .host = "127.0.0.1", .port = 0, .account_services = &services, .mesh_pass = "mesh-reclaim-secret", .crypto_io = std.testing.io };
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -36978,6 +37025,173 @@ test "threaded server: mesh-token local resume restores detached snapshot" {
     try writeAllFd(fd_b, "WHOIS trev\r\n");
     try recvUntil(&b, " 318 trev trev ", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "Helper") == null);
+}
+
+test "threaded server: session reclaim denial does not burn the nonce; consume does" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const mesh_key = "unit-mesh-reclaim-key";
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_pass = mesh_key,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // Ghost owner A (attached for now) and the reclaiming live client B.
+    const a_id = try addTestLocalClient(&server, "ghosta", "acct");
+    const b_id = try addTestLocalClient(&server, "liveb", "acct");
+    const b_conn = server.connFor(b_id).?;
+    const a_cid = monitorIdFromClient(a_id);
+
+    // Recover A's tracked reclaim token and seal ONE mesh token around it.
+    var sbuf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+    var a_token: ?sessions_mod.Token = null;
+    for (server.sessions.sessionsInto("acct", &sbuf)) |s| {
+        if (s.client == a_cid) a_token = s.token;
+    }
+    const token = a_token orelse return error.TestUnexpectedResult;
+    const token_hex = std.fmt.bytesToHex(token, .lower);
+    const now: u64 = @intCast(@max(@as(i64, 0), server.nowMs()));
+    const fields = session_reclaim_mesh.ReclaimFields{
+        .account = "acct",
+        .session_id = &token_hex,
+        .origin_node = server.serverName(),
+        .issued_ms = now,
+        .expiry_ms = now + 60_000,
+        .nonce = 0x1122_3344_5566_7788,
+    };
+    var raw: [512]u8 = undefined;
+    const n = try session_reclaim_mesh.seal(mesh_key, fields, &raw);
+    var hex_buf: [1024]u8 = undefined;
+    const mesh_hex = Server.toHexLower(raw[0..n], &hex_buf);
+    var line_buf: [1200]u8 = undefined;
+    const resume_txt = try std.fmt.bufPrint(&line_buf, "SESSION RESUME {s}", .{mesh_hex});
+    var parsed = try irc_line.parseLine(resume_txt);
+
+    // 1) While A is still attached there is no ghost and we are the origin:
+    //    deny_unknown. This denial must NOT burn the nonce.
+    try server.handleSessionResume(b_id, b_conn, "acct", &parsed);
+    try expectContains(b_conn.send_buf[0..b_conn.send_len], "no matching session on origin node");
+
+    // 2) A detaches; the SAME token must now be honored (regression: burning
+    //    on first sight stranded the session for the whole token TTL).
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot("acct", a_cid, null));
+    b_conn.send_len = 0;
+    try server.handleSessionResume(b_id, b_conn, "acct", &parsed);
+    try expectContains(b_conn.send_buf[0..b_conn.send_len], "session reclaimed (cross-server)");
+
+    // 3) The consume DID burn the nonce: a third presentation is a replay.
+    b_conn.send_len = 0;
+    try server.handleSessionResume(b_id, b_conn, "acct", &parsed);
+    try expectContains(b_conn.send_buf[0..b_conn.send_len], "reclaim token already used");
+}
+
+test "threaded server: session reclaim local restore failure leaves the ghost reclaimable" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const a_id = try addTestLocalClient(&server, "ghostc", "acct2");
+    const b_id = try addTestLocalClient(&server, "lived", "acct2");
+    const b_conn = server.connFor(b_id).?;
+    const a_cid = monitorIdFromClient(a_id);
+
+    var sbuf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+    var a_token: ?sessions_mod.Token = null;
+    for (server.sessions.sessionsInto("acct2", &sbuf)) |s| {
+        if (s.client == a_cid) a_token = s.token;
+    }
+    const token = a_token orelse return error.TestUnexpectedResult;
+    const token_hex = std.fmt.bytesToHex(token, .lower);
+
+    // Detach the ghost with a CORRUPT snapshot so the restore decode fails.
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot("acct2", a_cid, "not-a-migration-snapshot"));
+
+    var line_buf: [64]u8 = undefined;
+    const resume_txt = try std.fmt.bufPrint(&line_buf, "SESSION RESUME {s}", .{token_hex});
+    var parsed = try irc_line.parseLine(resume_txt);
+    try server.handleSessionResume(b_id, b_conn, "acct2", &parsed);
+
+    // The failure is reported AND the ghost (with its snapshot) survives for a
+    // later reclaim — the old order removed it before attempting the restore.
+    try expectContains(b_conn.send_buf[0..b_conn.send_len], "session restore failed");
+    try std.testing.expect(server.sessions.findTokenSessionInAccount("acct2", token) != null);
+    const snap = server.sessions.copyDetachedSnapshotInAccount(std.testing.allocator, "acct2", token) catch null;
+    defer if (snap) |bytes| std.testing.allocator.free(bytes);
+    try std.testing.expect(snap != null);
+}
+
+test "threaded server: session reclaim crypto_io-null disables reclaim not constant zero tokens" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_pass = "mesh-key-but-no-csprng",
+        // crypto_io deliberately unset
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "zed", "acct3");
+    const conn = server.connFor(id).?;
+
+    // No CSPRNG: no mesh token is minted (matches unset-mesh-key behavior).
+    var mbuf: [1024]u8 = undefined;
+    try std.testing.expect(server.meshReclaimToken("acct3", "00", &mbuf) == null);
+
+    // SESSION TOKEN never reveals the all-zero sentinel.
+    var tok_line = try irc_line.parseLine("SESSION TOKEN");
+    try server.handleSession(id, conn, &tok_line);
+    const out = conn.send_buf[0..conn.send_len];
+    try expectContains(out, "no token for this session");
+    try std.testing.expect(std.mem.indexOf(u8, out, "SESSION MTOKEN") == null);
+
+    // And RESUME refuses the sentinel outright — it can never match a ghost.
+    const g_id = try addTestLocalClient(&server, "zghost", "acct3");
+    _ = server.sessions.markDetachedWithSnapshot("acct3", monitorIdFromClient(g_id), null);
+    conn.send_len = 0;
+    var resume_line = try irc_line.parseLine("SESSION RESUME 00000000000000000000000000000000");
+    try server.handleSessionResume(id, conn, "acct3", &resume_line);
+    try expectContains(conn.send_buf[0..conn.send_len], "RESUME requires a valid session token");
+}
+
+test "threaded server: session tracking at cap with all slots attached is surfaced not fatal" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .session_max_per_account = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // Two ATTACHED sessions fill the cap; nothing detached is evictable, so the
+    // third login's attach fails with TooManySessions. trackSession must log
+    // (srvLog) and carry on — never crash, never silently mis-track.
+    _ = try addTestLocalClient(&server, "cap1", "capacct");
+    _ = try addTestLocalClient(&server, "cap2", "capacct");
+    const c_id = try addTestLocalClient(&server, "cap3", "capacct");
+
+    var sbuf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+    const sess = server.sessions.sessionsInto("capacct", &sbuf);
+    try std.testing.expectEqual(@as(usize, 2), sess.len);
+    for (sess) |s| try std.testing.expect(s.client != monitorIdFromClient(c_id));
 }
 
 test "threaded server: OAUTHBEARER login does not auto-elevate oper" {
