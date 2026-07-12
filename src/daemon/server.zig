@@ -48752,6 +48752,13 @@ test "threaded server: inbound relay re-enforces local +n / +t against a remote 
             .mesh_connect = &node1_peers,
             .num_shards = 1,
             .sweep_interval_ms = 100,
+            // Keyless plaintext mesh node: since the require_signed_frames
+            // fail-closed hardening, a keyless receiver DROPS unsigned in-scope
+            // owned/repair frames when the policy is set (the default true), so
+            // the relayed PRIVMSG/TOPIC this test asserts would never arrive.
+            // Declare it an explicit unsigned deployment, matching the sibling
+            // keyless-propagation tests already converted the same way.
+            .s2s_config = .{ .require_signed_frames = false },
         }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
             else => return err,
@@ -48766,6 +48773,13 @@ test "threaded server: inbound relay re-enforces local +n / +t against a remote 
             .mesh_connect = &node2_peers,
             .num_shards = 1,
             .sweep_interval_ms = 100,
+            // Keyless plaintext mesh node: since the require_signed_frames
+            // fail-closed hardening, a keyless receiver DROPS unsigned in-scope
+            // owned/repair frames when the policy is set (the default true), so
+            // the relayed PRIVMSG/TOPIC this test asserts would never arrive.
+            // Declare it an explicit unsigned deployment, matching the sibling
+            // keyless-propagation tests already converted the same way.
+            .s2s_config = .{ .require_signed_frames = false },
         }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
             else => return err,
@@ -48898,6 +48912,13 @@ test "threaded server: WHISPER and DATA relay to a remote-shard channel co-membe
             .mesh_connect = &node1_peers,
             .num_shards = 1,
             .sweep_interval_ms = 100,
+            // Keyless plaintext mesh node: since the require_signed_frames
+            // fail-closed hardening, a keyless receiver DROPS unsigned in-scope
+            // owned/repair frames when the policy is set (the default true), so
+            // the relayed PRIVMSG/TOPIC this test asserts would never arrive.
+            // Declare it an explicit unsigned deployment, matching the sibling
+            // keyless-propagation tests already converted the same way.
+            .s2s_config = .{ .require_signed_frames = false },
         }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
             else => return err,
@@ -48912,6 +48933,13 @@ test "threaded server: WHISPER and DATA relay to a remote-shard channel co-membe
             .mesh_connect = &node2_peers,
             .num_shards = 1,
             .sweep_interval_ms = 100,
+            // Keyless plaintext mesh node: since the require_signed_frames
+            // fail-closed hardening, a keyless receiver DROPS unsigned in-scope
+            // owned/repair frames when the policy is set (the default true), so
+            // the relayed PRIVMSG/TOPIC this test asserts would never arrive.
+            // Declare it an explicit unsigned deployment, matching the sibling
+            // keyless-propagation tests already converted the same way.
+            .s2s_config = .{ .require_signed_frames = false },
         }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
             else => return err,
