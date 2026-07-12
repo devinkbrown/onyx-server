@@ -56,8 +56,16 @@ comptime {
 /// Relay) so a stray non-migration frame fails fast instead of mis-parsing.
 pub const frame_magic: u8 = 'M';
 
-/// Frame format version. Bump when the on-wire layout changes incompatibly.
+/// Frame format version stamped on newly-encoded frames. Bump when the
+/// on-wire layout changes.
 pub const frame_version: u8 = 2;
+
+/// Oldest frame version `decodeFrame` still accepts. When `frame_version`
+/// bumps, KEEP this at the previous version for at least one deploy cycle and
+/// add a legacy decode arm (the Helix `.clients`/`.s2s_link` discipline):
+/// during a rolling deploy the mesh runs mixed versions, and a bare equality
+/// check silently drops every cross-node migration for the whole window.
+pub const min_frame_version: u8 = 2;
 
 /// Fixed frame header byte count: magic + version + fsm_state + u32 token_len.
 pub const frame_header_len: usize = 1 + 1 + 1 + 4;
@@ -579,7 +587,15 @@ pub fn decodeFrame(allocator: std.mem.Allocator, bytes: []const u8) Error!Frame 
     if (bytes.len < frame_header_len) return error.Truncated;
     if (bytes.len > max_frame_len) return error.OversizeFrame;
     if (bytes[0] != frame_magic) return error.BadMagic;
-    if (bytes[1] != frame_version) return error.UnsupportedVersion;
+    // Version-aware layout dispatch, never a bare `!= frame_version` equality:
+    // each accepted version gets its own arm so a future v3 encoder change is
+    // FORCED to add a v2 legacy arm here (rolling-deploy interop) instead of
+    // rejecting every frame from a not-yet-upgraded peer. Versions outside
+    // [min_frame_version, frame_version] fail closed.
+    switch (bytes[1]) {
+        2 => {}, // v2: the first shipped layout — decoded below.
+        else => return error.UnsupportedVersion,
+    }
 
     const fsm_state = FsmState.fromTag(bytes[2]) orelse return error.BadFsmState;
     const token_len: usize = @intCast(std.mem.readInt(u32, bytes[3..7], endian));
@@ -1205,6 +1221,35 @@ test "frame header rejects bad magic, version, and truncation" {
     }
     // Truncated below header.
     try testing.expectError(error.Truncated, decodeFrame(allocator, prepared.frame_bytes[0..3]));
+}
+
+test "decodeFrame rejects versions outside [min_frame_version, frame_version] on both sides" {
+    // The supported range is a contract: a below-range (pre-history) version and
+    // an above-range (future) version must BOTH fail closed. When frame_version
+    // bumps to 3, this test forces the author to decide the v2 legacy arm
+    // explicitly rather than letting a bare equality silently drop v2 peers.
+    const allocator = testing.allocator;
+    const kp = try testKey(0x66);
+    var origin = MigrationOrigin.init(allocator, kp);
+    defer origin.deinit();
+
+    var prepared = try origin.prepare("kain", sampleSnapshot(), 0x99, 1);
+    defer prepared.deinit(allocator);
+    try testing.expectEqual(frame_version, prepared.frame_bytes[1]);
+    try testing.expect(min_frame_version <= frame_version);
+
+    const buf = try allocator.dupe(u8, prepared.frame_bytes);
+    defer allocator.free(buf);
+
+    buf[1] = min_frame_version - 1; // below the floor
+    try testing.expectError(error.UnsupportedVersion, decodeFrame(allocator, buf));
+    buf[1] = frame_version + 1; // above the ceiling
+    try testing.expectError(error.UnsupportedVersion, decodeFrame(allocator, buf));
+
+    // Every version inside the range decodes (today that is exactly v2).
+    buf[1] = frame_version;
+    var frame = try decodeFrame(allocator, buf);
+    frame.deinit(allocator);
 }
 
 test "snapshot encode/decode round-trips an empty channel list" {
