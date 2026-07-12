@@ -1276,7 +1276,12 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
     // more for the optional NETWORKICON token when a network icon URL is set.
     const has_icon = cfg.network_icon_url.len != 0;
     const has_vapid = cfg.webpush_vapid_pub.len != 0;
-    const out = try allocator.alloc([]const u8, base.len + 3 + @as(usize, @intFromBool(has_icon)) + @as(usize, @intFromBool(has_vapid)));
+    // Residence-proof support (Design C): advertised only when this node has a
+    // mesh identity, carrying the local node shortId the client must sign into
+    // its `IDENTITY RESIDENCE` binding. Absent ⇒ 005 is byte-identical (the
+    // default-off ⇒ byte-identical gate) and clients never publish proofs.
+    const has_residence = cfg.node_identity != null;
+    const out = try allocator.alloc([]const u8, base.len + 3 + @as(usize, @intFromBool(has_icon)) + @as(usize, @intFromBool(has_vapid)) + @as(usize, @intFromBool(has_residence)));
     errdefer allocator.free(out);
     for (base, 0..) |tok, i| {
         if (std.mem.startsWith(u8, tok, "NETWORK=")) {
@@ -1324,6 +1329,13 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
     // 005 once and can subscribe immediately.
     if (has_vapid) {
         out[base.len + 3 + @as(usize, @intFromBool(has_icon))] = try std.fmt.allocPrint(allocator, "VAPID={s}", .{cfg.webpush_vapid_pub});
+    }
+    // ACCOUNTRESIDENCE=<16-hex node shortId>: "this server accepts IDENTITY
+    // RESIDENCE, and this is the node id your proof must bind" — the ISUPPORT
+    // discovery surface onyx keys off before ever signing a residence proof.
+    if (has_residence) {
+        out[base.len + 3 + @as(usize, @intFromBool(has_icon)) + @as(usize, @intFromBool(has_vapid))] =
+            try std.fmt.allocPrint(allocator, "ACCOUNTRESIDENCE={x:0>16}", .{cfg.node_identity.?.shortId()});
     }
     return out;
 }
@@ -24576,6 +24588,85 @@ pub const LinuxServer = struct {
             return self.identityReply(conn, body);
         }
 
+        if (std.ascii.eqlIgnoreCase(sub, "RESIDENCE")) {
+            // Design C (F1): publish/refresh this account's signed residence
+            // proof for THIS node as the replicated `identity.residence.<node>`
+            // user prop. The CLIENT signs (the daemon never holds account keys);
+            // the daemon verifies the binding against the caller's own enrolled
+            // identity keys before storing — fail-closed at every step, so an
+            // account with no proof simply stays on the conservative UID path.
+            const account = conn.session.account() orelse
+                return self.failReply(conn, "IDENTITY", "NOT_LOGGED_IN", "Log in before publishing a residence proof");
+            if (p.len < 5) return self.failReply(conn, "IDENTITY", "NEED_MORE_PARAMS", "Usage: IDENTITY RESIDENCE <node-shortid-hex> <epoch> <expiry-ms> <signature-hex>");
+            const ident = self.config.node_identity orelse
+                return self.failReply(conn, "IDENTITY", "TEMPORARILY_UNAVAILABLE", "This server has no mesh identity; residence proofs are unavailable");
+            const local_node = ident.shortId();
+            const node = std.fmt.parseUnsigned(u64, p[1], 16) catch
+                return self.failReply(conn, "IDENTITY", "BAD_NODE", "Node must be this server's 16-hex mesh shortId (see ISUPPORT ACCOUNTRESIDENCE)");
+            // A proof binds the node the client is actually logged in to. This
+            // node never publishes (or relays as its own) a residence claim for
+            // a DIFFERENT node — that is exactly the forgery the proof exists to
+            // prevent.
+            if (node != local_node)
+                return self.failReply(conn, "IDENTITY", "WRONG_NODE", "A residence proof must bind the server you are connected to");
+            const epoch = std.fmt.parseUnsigned(u64, p[2], 10) catch
+                return self.failReply(conn, "IDENTITY", "BAD_EPOCH", "Epoch must be an unsigned integer");
+            const expiry_ms = std.fmt.parseUnsigned(u64, p[3], 10) catch
+                return self.failReply(conn, "IDENTITY", "BAD_EXPIRY", "Expiry must be wall-clock unix milliseconds");
+            const sig = account_identity.parseSignatureHex(p[4]) orelse
+                return self.failReply(conn, "IDENTITY", "BAD_ASSERTION", "Residence signature must be 128 hex chars");
+            var wire_buf: [account_identity.max_residence_len]u8 = undefined;
+            const wire = account_identity.encodeResidence(
+                .{ .account = account, .node = node, .epoch = epoch, .expiry_ms = expiry_ms },
+                sig,
+                &wire_buf,
+            ) orelse return self.failReply(conn, "IDENTITY", "BAD_ASSERTION", "Residence binding is malformed");
+            // Verify against ANY of the caller's own enrolled identity keys —
+            // the same replicated `identity.key.*` props every mesh node holds.
+            // verifyResidence also enforces freshness and the hard max window.
+            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+            const now_ms = self.grantNowU64();
+            const verified = blk: {
+                var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+                const rows = self.props.listProps(entity, &views) catch break :blk false;
+                for (rows) |kv| {
+                    if (!account_identity.isPropKey(kv.key)) continue;
+                    const claim = account_identity.parseClaimValue(kv.value) orelse continue;
+                    _ = account_identity.verifyResidence(wire, claim.public_key, account, node, now_ms) catch continue;
+                    break :blk true;
+                }
+                break :blk false;
+            };
+            if (!verified)
+                return self.failReply(conn, "IDENTITY", "BAD_ASSERTION", "Residence proof did not verify against any enrolled identity key (check enrollment, node binding, epoch/expiry)");
+            var rkey_buf: [account_identity.residence_prop_prefix.len + account_identity.residence_node_hex_len]u8 = undefined;
+            const rkey = account_identity.residencePropKey(node, &rkey_buf) orelse
+                return self.failReply(conn, "IDENTITY", "BAD_NODE", "Residence prop key overflow");
+            // Per-(account, node) monotonic epoch floor: the CURRENTLY stored
+            // proof IS the floor (state = the replicated prop itself, so the
+            // supersede rule survives USR2 for free). A non-increasing epoch is
+            // a stale re-publish / replay and is rejected.
+            if (self.props.getProp(entity, rkey)) |prev| {
+                var prev_buf: [account_identity.max_residence_len]u8 = undefined;
+                if (decodeResidenceHex(prev.value, &prev_buf)) |prev_wire| {
+                    if (account_identity.parseResidence(prev_wire)) |prev_parsed| {
+                        if (epoch <= prev_parsed.res.epoch)
+                            return self.failReply(conn, "IDENTITY", "STALE_EPOCH", "Residence epoch must exceed the currently-published epoch");
+                    }
+                }
+            } else |_| {}
+            var value_buf: [account_identity.max_residence_hex_len]u8 = undefined;
+            const value = encodeResidenceHex(wire, &value_buf) orelse
+                return self.failReply(conn, "IDENTITY", "STORE_FAILED", "Could not encode residence proof");
+            const ev = self.props.setProp(entity, rkey, value, .{ .id = account, .access = .member }) catch
+                return self.failReply(conn, "IDENTITY", "STORE_FAILED", "Could not store residence proof");
+            self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
+            self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
+            var b: [160]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "RESIDENCE PUBLISHED node={x:0>16} epoch={d} expiry={d}", .{ node, epoch, expiry_ms }) catch return;
+            return self.identityReply(conn, body);
+        }
+
         if (std.ascii.eqlIgnoreCase(sub, "DEL") or std.ascii.eqlIgnoreCase(sub, "DELETE")) {
             const account = conn.session.account() orelse
                 return self.failReply(conn, "IDENTITY", "NOT_LOGGED_IN", "Log in before deleting portable identity keys");
@@ -24592,7 +24683,27 @@ pub const LinuxServer = struct {
             return self.identityReply(conn, body);
         }
 
-        return self.failReply(conn, "IDENTITY", "INVALID_SUBCOMMAND", "Usage: IDENTITY [STATUS|LIST [account]|ADD <label> <public-key-hex> <signature-hex>|DEL <label>|VERIFY <account> <label> <public-key-hex> <signature-hex>]");
+        return self.failReply(conn, "IDENTITY", "INVALID_SUBCOMMAND", "Usage: IDENTITY [STATUS|LIST [account]|ADD <label> <public-key-hex> <signature-hex>|DEL <label>|RESIDENCE <node-shortid-hex> <epoch> <expiry-ms> <signature-hex>|VERIFY <account> <label> <public-key-hex> <signature-hex>]");
+    }
+
+    /// Hex-decode a stored `identity.residence.*` prop value into `out`,
+    /// returning the raw wire bytes, or null on any malformation (odd length,
+    /// non-hex, oversize) — fail-closed, the caller treats null as "no proof".
+    fn decodeResidenceHex(value: []const u8, out: *[account_identity.max_residence_len]u8) ?[]const u8 {
+        if (value.len == 0 or value.len % 2 != 0 or value.len / 2 > out.len) return null;
+        return std.fmt.hexToBytes(out[0 .. value.len / 2], value) catch null;
+    }
+
+    /// Lowercase-hex encode a residence wire into `out` (the replicated prop
+    /// VALUE is text). Null when `wire` exceeds the codec's bound.
+    fn encodeResidenceHex(wire: []const u8, out: *[account_identity.max_residence_hex_len]u8) ?[]const u8 {
+        if (wire.len * 2 > out.len) return null;
+        const alphabet = "0123456789abcdef";
+        for (wire, 0..) |byte, i| {
+            out[i * 2] = alphabet[byte >> 4];
+            out[i * 2 + 1] = alphabet[byte & 0xF];
+        }
+        return out[0 .. wire.len * 2];
     }
 
     pub fn handleKeyTrans(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -34049,6 +34160,127 @@ test "IDENTITY advertises self-signed portable account keys through user props" 
     try server.handleIdentity(conn, &del);
     try expectContains(conn.send_buf[0..conn.send_len], "IDENTITY DELETED label=primary");
     try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "identity.key.primary"));
+}
+
+test "IDENTITY RESIDENCE publishes an account residence proof as a replicated user prop (fail-closed)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "local");
+    defer ident.deinit();
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(id).?;
+
+    const local_node = ident.shortId();
+    var node_hex_buf: [16]u8 = undefined;
+    const node_hex = try std.fmt.bufPrint(&node_hex_buf, "{x:0>16}", .{local_node});
+    const now_ms = @as(u64, @intCast(@max(@as(i64, 0), platform.realtimeMillis())));
+    const expiry_ms = now_ms + 10 * 60 * 1000;
+    var expiry_buf: [24]u8 = undefined;
+    const expiry_str = try std.fmt.bufPrint(&expiry_buf, "{d}", .{expiry_ms});
+
+    // Sign a genuine residence binding with the account identity key.
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x62)));
+    var wire_buf: [account_identity.max_residence_len]u8 = undefined;
+    const wire = account_identity.signResidence(
+        .{ .account = "kain", .node = local_node, .epoch = 1, .expiry_ms = expiry_ms },
+        kp,
+        &wire_buf,
+    ).?;
+    var res_sig: [account_identity.signature_len]u8 = undefined;
+    @memcpy(&res_sig, wire[wire.len - account_identity.signature_len ..]);
+    const res_sig_hex = std.fmt.bytesToHex(res_sig, .lower);
+
+    var lv = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
+    lv.params[0] = "RESIDENCE";
+    lv.params[1] = node_hex;
+    lv.params[2] = "1";
+    lv.params[3] = expiry_str;
+    lv.params[4] = &res_sig_hex;
+    lv.param_count = 5;
+
+    // Before ANY identity key is enrolled the proof cannot verify — fail-closed,
+    // nothing stored, the account stays on the conservative UID path.
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL IDENTITY BAD_ASSERTION");
+
+    // Enroll the identity key (the standard IDENTITY ADD path).
+    const public_hex = std.fmt.bytesToHex(kp.public_key.toBytes(), .lower);
+    var transcript_buf: [account_identity.max_transcript_len]u8 = undefined;
+    const msg = account_identity.transcript("kain", "primary", kp.public_key.toBytes(), &transcript_buf).?;
+    const add_sig = try kp.sign(msg, null);
+    const add_sig_hex = std.fmt.bytesToHex(add_sig.toBytes(), .lower);
+    var add = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
+    add.params[0] = "ADD";
+    add.params[1] = "primary";
+    add.params[2] = &public_hex;
+    add.params[3] = &add_sig_hex;
+    add.param_count = 4;
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &add);
+    try expectContains(conn.send_buf[0..conn.send_len], "IDENTITY ADDED label=primary");
+
+    // Now the proof verifies and is stored under identity.residence.<node-hex>.
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "IDENTITY RESIDENCE PUBLISHED node=");
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
+    var rkey_buf: [account_identity.residence_prop_prefix.len + account_identity.residence_node_hex_len]u8 = undefined;
+    const rkey = account_identity.residencePropKey(local_node, &rkey_buf).?;
+    const stored = try server.props.getProp(entity, rkey);
+    var stored_wire_buf: [account_identity.max_residence_len]u8 = undefined;
+    const stored_wire = Server.decodeResidenceHex(stored.value, &stored_wire_buf).?;
+    const parsed = account_identity.parseResidence(stored_wire).?;
+    try std.testing.expectEqualStrings("kain", parsed.res.account);
+    try std.testing.expectEqual(local_node, parsed.res.node);
+    try std.testing.expectEqual(@as(u64, 1), parsed.res.epoch);
+
+    // Epoch supersede floor: re-publishing the SAME epoch is a stale replay.
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL IDENTITY STALE_EPOCH");
+
+    // Node binding: a proof naming a DIFFERENT node is refused outright.
+    var wrong = lv;
+    wrong.params[1] = "00000000deadbeef";
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &wrong);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL IDENTITY WRONG_NODE");
+
+    // A tampered signature at a fresh epoch never verifies.
+    var bad_sig_hex = res_sig_hex;
+    bad_sig_hex[0] = if (bad_sig_hex[0] == '0') '1' else '0';
+    var tampered = lv;
+    tampered.params[2] = "2";
+    tampered.params[4] = &bad_sig_hex;
+    conn.send_len = 0;
+    try server.handleIdentity(conn, &tampered);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL IDENTITY BAD_ASSERTION");
+}
+
+test "ISUPPORT advertises ACCOUNTRESIDENCE only when the node has a mesh identity (account residence discovery)" {
+    // Without a node identity the 005 burst is byte-identical (no token).
+    const plain = try buildIsupportTokens(std.testing.allocator, .{ .port = 0 });
+    defer freeIsupportTokens(std.testing.allocator, plain);
+    for (plain) |tok| try std.testing.expect(!std.mem.startsWith(u8, tok, "ACCOUNTRESIDENCE="));
+
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x63)), "local");
+    defer ident.deinit();
+    const with_ident = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .node_identity = &ident });
+    defer freeIsupportTokens(std.testing.allocator, with_ident);
+    var expected_buf: [64]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, "ACCOUNTRESIDENCE={x:0>16}", .{ident.shortId()});
+    var found = false;
+    for (with_ident) |tok| {
+        if (std.mem.eql(u8, tok, expected)) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "WEBAUTHN register + passwordless auth (ES256), with tamper/challenge/regression rejects" {
