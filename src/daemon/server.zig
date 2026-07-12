@@ -16545,7 +16545,13 @@ pub const LinuxServer = struct {
     /// reconnect against the still-bound listener.
     pub fn handleUpgrade(self: *LinuxServer, conn: *ConnState) !void {
         if (!self.requirePriv(conn, .server_restart)) return;
-        return self.performUpgrade(conn);
+        return self.performUpgrade(conn) catch |e| switch (e) {
+            // A refusal, not a failure: the oper already got the NOTICE
+            // explaining why; swallowing it here keeps the connection alive
+            // (a propagated handler error would tear it down).
+            error.MultiShardUpgradeUnsupported => {},
+            else => e,
+        };
     }
 
     /// Emit one UPGRADE progress line: a NOTICE to the requesting oper when the
@@ -16764,6 +16770,19 @@ pub const LinuxServer = struct {
         if (comptime builtin.os.tag != .linux) {
             self.upgradeNotice(requester, "UPGRADE is Linux-only");
             return;
+        }
+        // Multi-reactor topology guard: the seal loop below walks ONLY reactor
+        // 0's client table (`self.rx().clients`), and per-connection state is
+        // single-writer by its owning reactor — sealing shards 1..N-1 from this
+        // thread would race their live reactor threads. Until a full
+        // quiesce-and-seal of every shard lands, REFUSE the upgrade outright:
+        // proceeding would keep FD_CLOEXEC on every shard-1..N-1 client socket
+        // and silently drop them all at execve (zero-drop would hold only for
+        // shard 0). Fail safe, loudly; operators restart to deploy instead.
+        if (self.reactors.len > 1) {
+            self.upgradeNotice(requester, "UPGRADE refused: [limits] num_shards > 1 — multi-shard seal not yet supported (a hot upgrade would drop every client on shards 1..N-1); restart to deploy");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: multi-shard topology (num_shards > 1) would drop non-shard-0 clients") catch {};
+            return error.MultiShardUpgradeUnsupported;
         }
         const requester_fd: ?linux.fd_t = if (requester) |c| c.fd else null;
         var nbuf: [128]u8 = undefined;
@@ -33071,6 +33090,26 @@ test "rebroadcastLocalOpers re-mints an oper homed on a non-zero shard" {
         server.rebroadcastLocalOpers();
         const g = server.oper_grants.lookup("kain", server.grantNowU64()) orelse return error.TestExpectedGrant;
         try std.testing.expect(oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override));
+    } else return error.SkipZigTest;
+}
+
+test "UPGRADE is refused on a multi-shard topology (num_shards > 1)" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
+
+        // The seal loop only walks reactor 0's client table and only clears
+        // CLOEXEC on reactor 0's sockets + listener: with num_shards > 1 every
+        // client on shards 1..N-1 would be silently dropped at execve. The
+        // upgrade must therefore refuse loudly instead of proceeding lossily.
+        try std.testing.expectError(
+            error.MultiShardUpgradeUnsupported,
+            server.performUpgrade(null),
+        );
     } else return error.SkipZigTest;
 }
 
