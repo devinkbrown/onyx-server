@@ -70,13 +70,26 @@ pub fn decode(bytes: []const u8) Error!Capsule {
 }
 
 /// Target-node holding area: migrated sessions awaiting the client's reconnect.
+/// Bounded two ways — a hard entry cap enforced in `put` and a TTL enforced by
+/// the server's periodic `sweep` — so a signed-but-hostile (or buggy) peer
+/// streaming capsules can never grow this map without bound.
 pub const PendingMigrations = struct {
     allocator: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Token, Entry) = .empty,
 
+    /// Hard ceiling on staged entries. A staged entry is one detached session
+    /// awaiting a reconnect; even a large mesh stages far fewer than this. On a
+    /// full map `put` fails closed (the client's reclaim then falls back to the
+    /// legacy redirect path) rather than evicting a legitimate pending entry.
+    pub const max_entries: usize = 4096;
+
+    pub const PutError = error{PendingFull} || std.mem.Allocator.Error;
+
     pub const Entry = struct {
         account: []u8,
         snapshot: []u8,
+        /// Monotonic-ms staging time; `sweep` evicts entries older than the TTL.
+        staged_at_ms: i64,
     };
 
     pub fn init(allocator: std.mem.Allocator) PendingMigrations {
@@ -92,9 +105,14 @@ pub const PendingMigrations = struct {
         self.map.deinit(self.allocator);
     }
 
-    /// Store a freshly-arrived capsule (copies the account + snapshot). Replaces
-    /// any existing entry for the same token (freeing the old).
-    pub fn put(self: *PendingMigrations, cap: Capsule) std.mem.Allocator.Error!void {
+    /// Store a freshly-arrived capsule (copies the account + snapshot), stamped
+    /// `now_ms` for TTL eviction. Replaces any existing entry for the same token
+    /// (freeing the old). Fails closed with `PendingFull` when inserting a NEW
+    /// token into a map already at `max_entries` (a replacement always succeeds).
+    pub fn put(self: *PendingMigrations, cap: Capsule, now_ms: i64) PutError!void {
+        if (self.map.count() >= max_entries and !self.map.contains(cap.token)) {
+            return error.PendingFull;
+        }
         const account = try self.allocator.dupe(u8, cap.account);
         errdefer self.allocator.free(account);
         const snapshot = try self.allocator.dupe(u8, cap.snapshot);
@@ -104,7 +122,29 @@ pub const PendingMigrations = struct {
             self.allocator.free(gop.value_ptr.account);
             self.allocator.free(gop.value_ptr.snapshot);
         }
-        gop.value_ptr.* = .{ .account = account, .snapshot = snapshot };
+        gop.value_ptr.* = .{ .account = account, .snapshot = snapshot, .staged_at_ms = now_ms };
+    }
+
+    /// Evict every entry staged at least `ttl_ms` before `now_ms` (freeing its
+    /// copies). Returns the count evicted. Best-effort: if the scratch key list
+    /// cannot be allocated nothing is evicted this round — the next sweep
+    /// retries. Called periodically by the server (reactor 0's timer tick).
+    pub fn sweep(self: *PendingMigrations, now_ms: i64, ttl_ms: u64) usize {
+        var expired: std.ArrayList(Token) = .empty;
+        defer expired.deinit(self.allocator);
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            const age = now_ms -| e.value_ptr.staged_at_ms;
+            if (age >= 0 and @as(u64, @intCast(age)) >= ttl_ms) {
+                expired.append(self.allocator, e.key_ptr.*) catch return 0;
+            }
+        }
+        for (expired.items) |token| {
+            const kv = self.map.fetchRemove(token) orelse continue;
+            self.allocator.free(kv.value.account);
+            self.allocator.free(kv.value.snapshot);
+        }
+        return expired.items.len;
     }
 
     /// Whether a migrated session is waiting for `token`.
@@ -164,8 +204,8 @@ test "PendingMigrations stores, finds, and consumes by token" {
 
     const t1: Token = @as([15]u8, @splat(0)) ++ .{1};
     const t2: Token = @as([15]u8, @splat(0)) ++ .{2};
-    try pm.put(.{ .token = t1, .account = "alice", .snapshot = "A" });
-    try pm.put(.{ .token = t2, .account = "bob", .snapshot = "BB" });
+    try pm.put(.{ .token = t1, .account = "alice", .snapshot = "A" }, 1000);
+    try pm.put(.{ .token = t2, .account = "bob", .snapshot = "BB" }, 1000);
     try testing.expectEqual(@as(usize, 2), pm.count());
     try testing.expect(pm.has(t1));
 
@@ -183,12 +223,73 @@ test "put replaces an existing token without leaking" {
     var pm = PendingMigrations.init(allocator);
     defer pm.deinit();
     const t: Token = @splat(9);
-    try pm.put(.{ .token = t, .account = "old", .snapshot = "x" });
-    try pm.put(.{ .token = t, .account = "new", .snapshot = "yy" });
+    try pm.put(.{ .token = t, .account = "old", .snapshot = "x" }, 1000);
+    try pm.put(.{ .token = t, .account = "new", .snapshot = "yy" }, 1000);
     try testing.expectEqual(@as(usize, 1), pm.count());
     const e = pm.take(t).?;
     defer pm.freeEntry(e);
     try testing.expectEqualStrings("new", e.account);
+}
+
+test "put fails closed at max_entries; a replacement of an existing token still succeeds" {
+    const allocator = testing.allocator;
+    var pm = PendingMigrations.init(allocator);
+    defer pm.deinit();
+
+    // Fill to the cap (distinct tokens derived from the loop index).
+    var i: usize = 0;
+    while (i < PendingMigrations.max_entries) : (i += 1) {
+        var t: Token = @splat(0);
+        std.mem.writeInt(u64, t[0..8], i, .little);
+        try pm.put(.{ .token = t, .account = "acct", .snapshot = "s" }, 1);
+    }
+    try testing.expectEqual(PendingMigrations.max_entries, pm.count());
+
+    // A NEW token is rejected — the map never grows past the cap.
+    const fresh: Token = @splat(0xFF);
+    try testing.expectError(
+        error.PendingFull,
+        pm.put(.{ .token = fresh, .account = "evil", .snapshot = "x" }, 2),
+    );
+    try testing.expectEqual(PendingMigrations.max_entries, pm.count());
+    try testing.expect(!pm.has(fresh));
+
+    // Replacing an EXISTING token at the cap succeeds (count unchanged).
+    const t0: Token = @splat(0);
+    try pm.put(.{ .token = t0, .account = "replaced", .snapshot = "zz" }, 3);
+    try testing.expectEqual(PendingMigrations.max_entries, pm.count());
+    const e = pm.take(t0).?;
+    defer pm.freeEntry(e);
+    try testing.expectEqualStrings("replaced", e.account);
+
+    // Consuming an entry frees a slot; a new token is admitted again.
+    try pm.put(.{ .token = fresh, .account = "ok", .snapshot = "y" }, 4);
+    try testing.expect(pm.has(fresh));
+}
+
+test "sweep evicts entries past the TTL and keeps fresh ones" {
+    const allocator = testing.allocator;
+    var pm = PendingMigrations.init(allocator);
+    defer pm.deinit();
+
+    const stale: Token = @as([15]u8, @splat(0)) ++ .{1};
+    const fresh: Token = @as([15]u8, @splat(0)) ++ .{2};
+    try pm.put(.{ .token = stale, .account = "old", .snapshot = "a" }, 1_000);
+    try pm.put(.{ .token = fresh, .account = "new", .snapshot = "b" }, 9_000);
+
+    // Nothing lapsed yet: age(stale)=4000 < ttl.
+    try testing.expectEqual(@as(usize, 0), pm.sweep(5_000, 5_000));
+    try testing.expectEqual(@as(usize, 2), pm.count());
+
+    // stale's age hits the TTL exactly (>= evicts); fresh survives.
+    try testing.expectEqual(@as(usize, 1), pm.sweep(6_000, 5_000));
+    try testing.expect(!pm.has(stale));
+    try testing.expect(pm.has(fresh));
+
+    // A re-staged token's clock restarts from its new staged_at.
+    try pm.put(.{ .token = stale, .account = "old2", .snapshot = "c" }, 10_000);
+    try testing.expectEqual(@as(usize, 0), pm.sweep(11_000, 5_000));
+    try testing.expect(pm.has(stale));
 }
 
 test "end-to-end: origin prepare -> session_migrate wrap -> target accept -> PendingMigrations -> reclaim consume" {
@@ -244,7 +345,7 @@ test "end-to-end: origin prepare -> session_migrate wrap -> target accept -> Pen
 
         const snap_bytes = try capsule.snapshot.encode(allocator);
         defer allocator.free(snap_bytes);
-        try pm.put(.{ .token = outer.token, .account = outer.account, .snapshot = snap_bytes });
+        try pm.put(.{ .token = outer.token, .account = outer.account, .snapshot = snap_bytes }, 1000);
     }
     try testing.expect(pm.has(session_token));
 
@@ -294,4 +395,51 @@ test "end-to-end: target rejects a capsule signed by the wrong key (no staging)"
     try testing.expectError(error.BadSignature, target.accept(outer.snapshot));
     try testing.expect(!pm.has(session_token));
     try testing.expectEqual(@as(usize, 0), pm.count());
+}
+
+test "a staged entry rides a Helix .pending_migration capsule across USR2 (round-trip)" {
+    // The seal side wraps each PendingMigrations entry as a session_migrate wire
+    // blob inside a `.pending_migration` Helix capsule (ordinal 1, exactly how
+    // helix_live.prepare frames every StatePiece); the adopt side decodes the
+    // capsule field and re-stages it. Prove the full byte path round-trips.
+    const allocator = testing.allocator;
+    const helix_capsule = @import("capsule.zig");
+
+    const token: Token = @as([15]u8, @splat(7)) ++ .{1};
+    const wire = try encode(allocator, .{ .token = token, .account = "kain", .snapshot = "verified-snapshot-bytes" });
+    defer allocator.free(wire);
+
+    var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = wire }};
+    const sealed = try helix_capsule.encode(allocator, helix_capsule.make(.pending_migration, fields[0..]));
+    defer allocator.free(sealed);
+
+    var adopted = try helix_capsule.decode(allocator, sealed);
+    defer adopted.deinit(allocator);
+    try testing.expectEqual(helix_capsule.CapsuleKind.pending_migration, adopted.header.kind);
+    try testing.expectEqual(@as(u16, 1), adopted.header.version);
+    try testing.expectEqual(@as(usize, 1), adopted.fields.len);
+
+    const got = try decode(adopted.fields[0].bytes);
+    try testing.expectEqualSlices(u8, &token, &got.token);
+    try testing.expectEqualStrings("kain", got.account);
+    try testing.expectEqualStrings("verified-snapshot-bytes", got.snapshot);
+
+    // Re-staging on the successor works and is consumable by token.
+    var pm = PendingMigrations.init(allocator);
+    defer pm.deinit();
+    try pm.put(got, 42);
+    try testing.expect(pm.has(token));
+}
+
+test "adopting a truncated .pending_migration payload fails closed (tolerant decode)" {
+    // A corrupt inner blob must be a clean skip on the successor, never a crash
+    // and never a partially-staged entry.
+    const allocator = testing.allocator;
+    const token: Token = @splat(3);
+    const wire = try encode(allocator, .{ .token = token, .account = "kain", .snapshot = "snapshot" });
+    defer allocator.free(wire);
+
+    // Truncate mid-snapshot and mid-header: both reject with Truncated.
+    try testing.expectError(error.Truncated, decode(wire[0 .. wire.len - 3]));
+    try testing.expectError(error.Truncated, decode(wire[0..10]));
 }

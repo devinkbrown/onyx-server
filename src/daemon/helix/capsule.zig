@@ -38,6 +38,7 @@ pub const CapsuleKind = enum(u8) {
     s2s_link = 8,
     ws_session = 9,
     tls_ticket_keys = 10,
+    pending_migration = 11,
 
     pub fn fromByte(byte: u8) Error!CapsuleKind {
         return switch (byte) {
@@ -51,6 +52,7 @@ pub const CapsuleKind = enum(u8) {
             8 => .s2s_link,
             9 => .ws_session,
             10 => .tls_ticket_keys,
+            11 => .pending_migration,
             else => error.UnknownKind,
         };
     }
@@ -102,6 +104,12 @@ pub const registry = [_]Descriptor{
     .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     .{ .kind = .ws_session, .schema_id = 0x4857_5353, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     .{ .kind = .tls_ticket_keys, .schema_id = 0x4854_4b59, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // One staged cross-mesh session-migration entry (a `session_migrate.encode`
+    // wire blob: token + account + verified snapshot), one capsule per entry, so
+    // migrations staged by a peer just before a USR2 survive the swap instead of
+    // dying with the predecessor (the client's reclaim would silently fall back
+    // to the legacy redirect).
+    .{ .kind = .pending_migration, .schema_id = 0x4850_4d47, .current_version = 1, .min_supported = 1, .max_supported = 1 },
 };
 
 pub fn descriptor(kind: CapsuleKind) Descriptor {
