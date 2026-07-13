@@ -9841,10 +9841,23 @@ pub const LinuxServer = struct {
     ///       cannot OVERWRITE a genuine home node's key/residence with its own,
     ///       even at a higher hlc that plain LWW would accept. Genuine key
     ///       rotation from the same home is same-origin and still applies.
-    /// The residual — a cold third node that has never seen the account, no clock
-    /// yet — fails OPEN like `meshNickHomeNode` (bounded by the R3 pre-convergence
-    /// window). A non-USER entity or a non-identity key is never gated (returns
-    /// true) so ordinary ENTITY_PROP LWW is unchanged.
+    /// A non-USER entity or a non-identity key is never gated (returns true) so
+    /// ordinary ENTITY_PROP LWW is unchanged.
+    ///
+    /// RESIDUAL (deferred, owner: orochi-mesh / stack-architect): a COLD third
+    /// node that has never seen the account — no local session, no clock — fails
+    /// OPEN, so a Byzantine peer that WINS the ENTITY_PROP burst race to that node
+    /// (delivers `identity.key.<victim>`=own-key before any honest node) binds the
+    /// clock to its own origin. This binding is then STICKY, NOT self-healing: the
+    /// gate runs BEFORE the LWW check, so the genuine home's later key (a different
+    /// origin) is rejected at every hlc and anti-entropy re-delivery cannot displace
+    /// it. Recovery is only a LOCAL write on that node (the victim SASL-logs-in
+    /// there — that bypasses this gate) or an operator clear, and the window
+    /// RE-ARMS on every USR2 (the `entity_prop_clocks` are not carried across the
+    /// upgrade, so they rebuild from bursts). This is the compromised-relink-source
+    /// class the blueprint defers (R2/R3); the fully-sound remote anchor
+    /// (SASL-home-authenticated identity replication) is the larger mesh-security
+    /// design. Home and already-converged (warm) nodes are NOT exposed.
     fn accountIdentityPropAuthorized(
         self: *LinuxServer,
         kind: entity_prop_event.EntityKind,
@@ -11417,12 +11430,16 @@ pub const LinuxServer = struct {
     ///      `remote_same_account`-merge with it on a third node. Proven by the
     ///      `residence_trust_dst` forged-incumbent (C1) invariant.
     ///
-    /// With both landed, residence trust is F1-sound: a PROVEN same-account claim
-    /// coexists (multi-device restored), an UNPROVEN/forged claim takes the
-    /// conservative UID path, and the sticky-trust rule (§4.4) never re-gates a
-    /// live established member (`route_table.zig` same-node `.keep`). The residual
-    /// cold-third-node pre-convergence window is the bounded R3 case (self-heals on
-    /// prop convergence). Owner: orochi-mesh / stack-architect.
+    /// With both landed, residence trust is F1-sound ON HOME AND WARM (already-
+    /// converged) NODES: a PROVEN same-account claim coexists (multi-device
+    /// restored), an UNPROVEN/forged claim takes the conservative UID path, and the
+    /// sticky-trust rule (§4.4) never re-gates a live established member
+    /// (`route_table.zig` same-node `.keep`). The bounded residual is a COLD node
+    /// that relinks through a Byzantine burst source before converging with an
+    /// honest peer: see `accountIdentityPropAuthorized` — that fail-open is STICKY
+    /// (not self-healing) and re-arms on USR2. It is the deferred R2/R3 class; the
+    /// fully-sound cold-node anchor is the larger mesh-security design.
+    /// Owner: orochi-mesh / stack-architect.
     fn accountKeyAuthorityGateAvailable() bool {
         return true; // F1: (1) ENTITY_PROP identity-write authority gate AND (2) store-side account blank both landed.
     }
