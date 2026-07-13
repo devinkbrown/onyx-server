@@ -307,10 +307,12 @@ pub fn main(init: std.process.Init) !void {
                 const carried_exe = srv_cfg.exe_path;
                 const carried_resume = srv_cfg.resume_arena_fd;
                 const carried_listen = srv_cfg.inherited_listener_fd;
+                const carried_listen_list = srv_cfg.inherited_listener_fds;
                 srv_cfg = loaded.config;
                 srv_cfg.exe_path = carried_exe;
                 srv_cfg.resume_arena_fd = carried_resume;
                 srv_cfg.inherited_listener_fd = carried_listen;
+                srv_cfg.inherited_listener_fds = carried_listen_list;
                 srv_cfg.num_shards = loaded.num_shards;
                 srv_cfg.config_path = path;
                 srv_cfg.config_resolver = resolver;

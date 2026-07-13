@@ -5747,7 +5747,12 @@ pub const LinuxServer = struct {
         if (self.reactors.len <= 1) return;
         const workers = self.pool.count();
         const expected: u32 = if (workers == 0) 0 else @intCast(workers - 1);
-        self.upgrade_quiesce_shard.store(self.rx().shard_id, .release);
+        // CAS-claim the quiesce: two racing UPGRADEs (SIGUSR2 on reactor 0 vs
+        // an oper /UPGRADE on another shard) must never both seal — the loser
+        // refuses (its worker then parks, letting the winner proceed).
+        if (self.upgrade_quiesce_shard.cmpxchgStrong(no_quiesce_shard, self.rx().shard_id, .acq_rel, .acquire) != null) {
+            return error.ShardQuiesceFailed;
+        }
         if (expected == 0) return;
         self.wakeAllReactors();
         var waited_ms: u64 = 0;
@@ -17422,17 +17427,32 @@ pub const LinuxServer = struct {
         // Multi-reactor topology: per-connection state is single-writer by its
         // owning reactor, so before this thread may seal shards it does not own
         // it QUIESCES every sibling worker (each parks between loop turns,
-        // touching neither its ring nor its slab). Fail-safe: a shard whose
-        // worker never parks cannot be sealed safely — the upgrade is refused
-        // rather than silently dropping (or racing) that shard's clients.
-        self.quiesceSiblingReactors() catch |e| {
-            self.upgradeNotice(requester, "UPGRADE refused: a reactor shard did not quiesce — its clients cannot be sealed safely; retry or restart to deploy");
-            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: shard quiesce failed (multi-shard seal aborted)") catch {};
-            return e;
-        };
+        // touching neither its ring nor its slab). The completion bracket
+        // (onCompletion) holds `world.lockWrite` around this whole call, and a
+        // sibling mid-completion may be BLOCKED on that lock — it can only
+        // reach its park point once the lock is released. So: drop the bracket
+        // lock for the quiesce + seal (safe — once every sibling is parked, no
+        // other thread reads or writes the world), and re-acquire it on every
+        // non-execve exit so onCompletion's paired unlock stays balanced.
+        // Fail-safe: a shard whose worker never parks cannot be sealed safely —
+        // the upgrade is refused rather than silently dropping (or racing)
+        // that shard's clients.
+        const threaded_seal = self.reactors.len > 1 and self.pool.count() != 0;
+        if (threaded_seal) {
+            self.world.unlockWrite();
+            self.quiesceSiblingReactors() catch |e| {
+                self.world.lockWrite();
+                self.upgradeNotice(requester, "UPGRADE refused: a reactor shard did not quiesce — its clients cannot be sealed safely; retry or restart to deploy");
+                self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: shard quiesce failed (multi-shard seal aborted)") catch {};
+                return e;
+            };
+        }
         // Every non-execve exit below must let the parked siblings resume; on
-        // success execve replaces the process and this defer never runs.
+        // success execve replaces the process and neither defer runs. LIFO:
+        // the bracket lock is re-acquired FIRST (uncontended — siblings are
+        // still parked), then the siblings resume.
         defer self.resumeSiblingReactors();
+        defer if (threaded_seal) self.world.lockWrite();
 
         // Serialize every registered session into encoded snapshot pieces.
         var blobs: std.ArrayList([]u8) = .empty;
