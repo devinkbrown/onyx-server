@@ -11290,16 +11290,63 @@ pub const LinuxServer = struct {
         return .{ .ctx = self, .held_fn = localNickHeld, .account_fn = localNickAccount, .hlc_fn = localNickHlc };
     }
 
+    /// The `identity.key.*` / `identity.residence.*` account-identity props are
+    /// replicated over ENTITY_PROP, whose ingest (`entityPropOriginVerified` ->
+    /// `entity_prop_event.verifyOrigin`) authenticates only that the AUTHORING
+    /// node self-certifies its OWN origin — it does NOT check that the node is
+    /// AUTHORITATIVE for the account entity. So any admitted (but Byzantine) peer
+    /// can inject `identity.key.<victim>` = its own key AND a matching
+    /// `identity.residence.<victim>` proof it signs, and `residenceTrusted` would
+    /// then verify it — defeating F1 and even enabling a `reclaim_local`
+    /// session-kill of the real user. Design C's premise (the replicated
+    /// identity pubkey is authoritative) is therefore NOT yet met.
+    ///
+    /// Residence trust MUST fail closed until TWO preconditions land, both of
+    /// which a fresh adversarial review confirmed are missing today:
+    ///
+    ///  (1) NON-FORGEABLE account-key authority on ENTITY_PROP INGEST. Accept an
+    ///      `identity.key.*`/`identity.residence.*` write for `entity=<account>`
+    ///      only from the account's authoritative home — the analog of the
+    ///      nick-path `meshNickHomeNode`/`recordRelayHomeMismatch` gate, rooted
+    ///      in SASL authentication (the only non-forgeable account anchor). A
+    ///      mesh-security design decision beyond this daemon-side change.
+    ///
+    ///  (2) STORE-SIDE account blanking on trust. `resolveIncomingNick` blanks
+    ///      the INCOMING account, but `recvMembership`/`recvNickChange` still
+    ///      store the raw wire account (see the note there). A forged incumbent
+    ///      stored under the real nick would let a later TRUSTED newcomer
+    ///      `remote_same_account`-merge with it on a third node — reopening the
+    ///      forgery. Enabling trust REQUIRES also storing `if (account_trusted)
+    ///      ev.account else ""` at the applyMembership sites, plus a DST case for
+    ///      the forged-incumbent + trusted-newcomer scenario.
+    ///
+    /// With this returning false the live behaviour is EXACTLY the conservative
+    /// UID path (`account_trusted` always false) — no F1 regression, no new
+    /// attack surface, remote WHOIS 330 unchanged. The verify logic below is
+    /// correct GIVEN an authentic key and is exercised end-to-end by the
+    /// route_table/s2s_peer unit tests and the seeded `residence_trust_dst`;
+    /// enabling it is landing (1)+(2) then flipping this gate (owner:
+    /// orochi-mesh / stack-architect).
+    fn accountKeyAuthorityGateAvailable() bool {
+        return false; // TODO(F1-authority): flip when (1) ENTITY_PROP account-key ingest is authority-gated AND (2) the store-side blank lands.
+    }
+
     /// RECEIVER-side residence-proof verify callback (Design C / F1). Verify a
     /// remote claim's `{account, origin_node}` against the RECEIVER-OWNED
     /// replicated `identity.residence.<origin>` proof and `identity.key.*`
     /// pubkey — never a wire field. Returns true iff a live proof verifies for
-    /// exactly this account+node. S2S runs reactor-0-only, so this read never
-    /// races a concurrent reactor's prop mutation the RCU store does not already
-    /// serialize. Any decode/lookup/verify miss ⇒ false (conservative UID path).
+    /// exactly this account+node AND the account-key-authority gate is in place
+    /// (see `accountKeyAuthorityGateAvailable` — currently false, fail-closed).
+    /// S2S runs reactor-0-only, so this read never races a concurrent reactor's
+    /// prop mutation the RCU store does not already serialize. Any
+    /// decode/lookup/verify miss ⇒ false (conservative UID path).
     fn residenceTrusted(ctx: *anyopaque, account: []const u8, origin_node: u64) bool {
         const self: *LinuxServer = @ptrCast(@alignCast(ctx));
         if (account.len == 0) return false;
+        // Fail closed: the replicated identity key is not yet authenticated as
+        // account-authoritative on ENTITY_PROP ingest (see the doc above), so a
+        // proof that verifies against it cannot be trusted as F1-sound.
+        if (!accountKeyAuthorityGateAvailable()) return false;
         const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
         var rkey_buf: [account_identity.residence_prop_prefix.len + account_identity.residence_node_hex_len]u8 = undefined;
         const rkey = account_identity.residencePropKey(origin_node, &rkey_buf) orelse return false;

@@ -1414,9 +1414,24 @@ pub const S2sPeer = struct {
         var skip_displace = false;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
         if (ev.present) {
-            // Design C: the plaintext wire `account` is only honored by the
-            // same-identity short-circuits when a residence proof verifies for
-            // exactly this (account, origin) — per claim, receiver-owned keys.
+            // Design C (F1): the plaintext wire `account` is only honored by the
+            // same-identity collision short-circuits when a residence proof
+            // verifies for exactly this (account, origin) — per claim, over an
+            // origin-authenticated link, against receiver-owned keys. When
+            // false, resolveIncomingNick blanks the account internally so the
+            // claim takes the conservative UID path.
+            //
+            // NOTE (F1-authority, REQUIRED before enabling trust): the STORE-side
+            // account is NOT blanked here — applyMembership below persists the
+            // raw `ev.account`. While `residenceTrusted` is gated off
+            // (server.zig `accountKeyAuthorityGateAvailable` == false), no claim
+            // is ever trusted, so a forged incumbent can never coexist with a
+            // trusted newcomer and this is inert (and remote WHOIS 330 is
+            // unchanged). But enabling trust MUST also store `if (account_trusted)
+            // ev.account else ""` here and in recvNickChange, or a forged
+            // incumbent re-unlocks `remote_same_account` for a verified newcomer
+            // on third-party nodes. Kept as raw-store today to match the
+            // conservative baseline exactly; see the server.zig gate doc.
             const account_trusted = self.accountResidenceTrusted(ev.account, ev.origin_node);
             switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc, ev.account, account_trusted)) {
                 .keep => {},
@@ -2006,6 +2021,10 @@ pub const S2sPeer = struct {
         };
         var target_nick: []const u8 = ev.new_nick;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
+        // Design C (F1): the wire account is only honored by the same-identity
+        // short-circuits when a residence proof verifies (per claim, receiver-
+        // owned keys, origin-authenticated link); else it is blanked internally
+        // and the claim takes the conservative UID path.
         switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc, ev.account, self.accountResidenceTrusted(ev.account, ev.origin_node))) {
             .keep => self.displaceIncumbentForRename(ev.new_nick, ev.origin_node),
             .rename_to_uid => |uid| {
