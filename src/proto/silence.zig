@@ -197,6 +197,23 @@ pub const Store = struct {
         return false;
     }
 
+    /// Fill `out` with `owner`'s masks, returning how many were written
+    /// (truncated to `out.len`). Slices borrow the store's storage — valid
+    /// until the store is next mutated. Used by the Helix upgrade seal to
+    /// carry the SILENCE list across a USR2.
+    pub fn masksInto(self: *const Store, owner: []const u8, out: [][]const u8) usize {
+        var owner_buf: [NORM_OWNER_MAX]u8 = undefined;
+        const key = normalizeOwner(owner, &owner_buf) orelse return 0;
+        const client = self.owners.getPtr(key) orelse return 0;
+        var n: usize = 0;
+        for (client.masks.items) |mask| {
+            if (n >= out.len) break;
+            out[n] = mask;
+            n += 1;
+        }
+        return n;
+    }
+
     /// Write `owner`'s masks as comma-separated bytes into caller storage.
     pub fn list(self: *const Store, owner: []const u8, out: []u8) SilenceError![]const u8 {
         try validateOwner(owner, self.params.max_owner_bytes);
@@ -558,4 +575,28 @@ test "no leak after owner removal" {
     try std.testing.expect(try store.add("alice", "bad!*@host"));
     try std.testing.expect(try store.remove("alice", "bad!*@host"));
     store.deinit();
+}
+
+test "masksInto enumerates an owner's masks for the Helix upgrade seal" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    try std.testing.expect(try store.add("Carrier", "bad!*@host"));
+    try std.testing.expect(try store.add("Carrier", "worse!*@*"));
+
+    var out: [8][]const u8 = undefined;
+    const n = store.masksInto("carrier", &out); // owner lookup is case-insensitive
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("bad!*@host", out[0]);
+    try std.testing.expectEqualStrings("worse!*@*", out[1]);
+
+    // Truncates to the out buffer; unknown owner enumerates empty.
+    var one: [1][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), store.masksInto("Carrier", &one));
+    try std.testing.expectEqual(@as(usize, 0), store.masksInto("nobody", &out));
+
+    // Restore into a fresh store (the successor) via the normal add path.
+    var succ = Store.init(std.testing.allocator);
+    defer succ.deinit();
+    for (out[0..n]) |m| _ = try succ.add("Carrier", m);
+    try std.testing.expect(succ.isSilenced("carrier", "bad!x@host"));
 }

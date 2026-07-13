@@ -40,6 +40,7 @@ pub const CapsuleKind = enum(u8) {
     tls_ticket_keys = 10,
     pending_migration = 11,
     monitor_list = 12,
+    silence_list = 13,
 
     pub fn fromByte(byte: u8) Error!CapsuleKind {
         return switch (byte) {
@@ -55,6 +56,7 @@ pub const CapsuleKind = enum(u8) {
             10 => .tls_ticket_keys,
             11 => .pending_migration,
             12 => .monitor_list,
+            13 => .silence_list,
             else => error.UnknownKind,
         };
     }
@@ -130,6 +132,12 @@ pub const registry = [_]Descriptor{
     // USR2: the client believed it was still monitoring, but no MONONLINE/
     // MONOFFLINE ever arrived again until it re-issued MONITOR.
     .{ .kind = .monitor_list, .schema_id = 0x484d_4f4e, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // One carried per-client SILENCE list (a `silence_capsule` wire blob; its
+    // client_id field carries the inherited socket FD — the Helix join key —
+    // exactly like `.monitor_list`). Without it every carried client silently
+    // lost its server-side ignore masks on USR2: a silenced abuser became
+    // audible again after every deploy with no indication to the victim.
+    .{ .kind = .silence_list, .schema_id = 0x4853_494c, .current_version = 1, .min_supported = 1, .max_supported = 1 },
 };
 
 pub fn descriptor(kind: CapsuleKind) Descriptor {

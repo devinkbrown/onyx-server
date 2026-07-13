@@ -181,6 +181,7 @@ const tls_snapshot = @import("helix/tls_snapshot.zig");
 const ws_snapshot = @import("helix/ws_snapshot.zig");
 const ticket_key_capsule = @import("helix/ticket_key_capsule.zig");
 const monitor_capsule = @import("helix/monitor_capsule.zig");
+const silence_capsule = @import("helix/silence_capsule.zig");
 const s2s_snapshot = @import("helix/s2s_snapshot.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
 const tls_server = @import("../crypto/tls_server.zig");
@@ -17195,6 +17196,29 @@ pub const LinuxServer = struct {
                 };
                 pieces.append(self.allocator, .{ .kind = .monitor_list, .bytes = wire }) catch break :carry_mon;
             }
+            // Carry the client's SILENCE list the same way (join key = fd in
+            // client_id). The store is keyed by owner nick; the successor
+            // resolves the adopted client's nick from the fd. Best-effort.
+            carry_sil: {
+                var sil_masks: [256][]const u8 = undefined;
+                const sil_n = self.silence.masksInto(e.value.session.displayName(), &sil_masks);
+                if (sil_n == 0) break :carry_sil;
+                var wire_len: usize = 4 + 1 + 8 + 2; // magic + version + client_id + count
+                for (sil_masks[0..sil_n]) |m| wire_len += 2 + m.len;
+                const sbuf = self.allocator.alloc(u8, wire_len) catch break :carry_sil;
+                const wire = (silence_capsule.SilenceCapsule{
+                    .client_id = @intCast(e.value.fd),
+                    .masks = sil_masks[0..sil_n],
+                }).encode(sbuf) catch {
+                    self.allocator.free(sbuf);
+                    break :carry_sil;
+                };
+                blobs.append(self.allocator, sbuf) catch {
+                    self.allocator.free(sbuf);
+                    break :carry_sil;
+                };
+                pieces.append(self.allocator, .{ .kind = .silence_list, .bytes = wire }) catch break :carry_sil;
+            }
             if (tls_blob != null) tls_carried += 1;
             if (carry_ws) ws_carried += 1;
             // Preserve the client socket across execve so the successor re-attaches it.
@@ -17384,6 +17408,21 @@ pub const LinuxServer = struct {
             if (restored_any) monitor_lists_restored += 1;
         }
 
+        // Pass 2b (cont.): restore carried SILENCE lists. Same fd join key; the
+        // silence store is keyed by owner nick, resolved from the adopted
+        // connection. Duplicates/failures are skipped (`add` is idempotent-ish:
+        // a duplicate returns false), never fatal.
+        for (caps) |c| {
+            if (c.header.kind != .silence_list) continue;
+            if (c.fields.len == 0) continue;
+            var mask_buf: [256][]const u8 = undefined;
+            const sc = silence_capsule.SilenceCapsule.decode(c.fields[0].bytes, &mask_buf) catch continue;
+            if (sc.client_id > std.math.maxInt(i32)) continue;
+            const owner_conn = self.adoptedConnByFd(@intCast(sc.client_id)) orelse continue;
+            const owner = owner_conn.session.displayName();
+            for (sc.masks) |m| _ = self.silence.add(owner, m) catch continue;
+        }
+
         // Pass 2c: restore the account-level multi-session/bouncer registry
         // from the carried `.sessions` capsules (one per account). Runs AFTER
         // Pass 2 so an attached session can re-join its adopted connection by
@@ -17522,6 +17561,16 @@ pub const LinuxServer = struct {
         var it = self.rx().clients.iterator();
         while (it.next()) |e| {
             if (e.value.fd == fd) return monitorIdFromClient(e.id);
+        }
+        return null;
+    }
+
+    /// As `adoptedClientIdByFd`, but returns the connection itself — for
+    /// adoption passes that need session state (e.g. the SILENCE owner nick).
+    fn adoptedConnByFd(self: *LinuxServer, fd: i32) ?*ConnState {
+        var it = self.rx().clients.iterator();
+        while (it.next()) |e| {
+            if (e.value.fd == fd) return e.value;
         }
         return null;
     }
