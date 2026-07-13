@@ -315,6 +315,37 @@ pub const MonitorStore = struct {
         return state.targets.count();
     }
 
+    /// Fill `out` with `client`'s monitored targets (display form), returning
+    /// how many were written (truncated to `out.len`). Slices borrow the
+    /// store's entry storage — valid until the store is next mutated. Used by
+    /// the Helix upgrade seal to carry the watch list across a USR2.
+    pub fn targetsInto(self: *MonitorStore, client: ClientId, out: [][]const u8) usize {
+        const state = self.clients.getPtr(client) orelse return 0;
+        var n: usize = 0;
+        var it = state.targets.iterator();
+        while (it.next()) |entry| {
+            if (n >= out.len) break;
+            out[n] = entry.value_ptr.slice();
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Silently re-insert one monitored target for `client` — the Helix
+    /// upgrade restore path. Identical index bookkeeping to a `MONITOR +` add
+    /// (forward + reverse) but emits NO replies and applies no per-add cap:
+    /// the entries were legally added on the predecessor, and re-announcing
+    /// an online/offline state the client already knows would be noise.
+    pub fn restoreTarget(self: *MonitorStore, client: ClientId, target: []const u8) MonitorError!void {
+        const normalized = try NickKey.init(target, true);
+        const display = try NickKey.init(target, false);
+        const state = try self.clientState(client);
+        if (state.targets.contains(normalized)) return;
+        try state.targets.put(normalized, display);
+        errdefer _ = state.targets.remove(normalized);
+        try self.addWatcher(normalized, client);
+    }
+
     fn addOne(
         self: *MonitorStore,
         client: ClientId,
@@ -673,4 +704,35 @@ test "per-class override loosens the monitor cap above the store-wide limit" {
 
     try store.handleWithLimit(4, &.{ "+", "a,b,c" }, &sink, 3);
     try std.testing.expectEqual(@as(usize, 3), store.monitorCount(4));
+}
+
+test "targetsInto enumerates and restoreTarget silently rebuilds a watch list (Helix)" {
+    var store = MonitorStore.init(std.testing.allocator, 8);
+    defer store.deinit();
+
+    var replies: [16]MonitorReply = undefined;
+    var storage: [1024]u8 = undefined;
+    var sink = MonitorReplySink{ .replies = &replies, .storage = &storage };
+    try store.handle(7, &.{ "+", "Alice,bob" }, &sink);
+
+    // Enumerate: display forms come back, truncated to the out buffer.
+    var out: [8][]const u8 = undefined;
+    const n = store.targetsInto(7, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    var one: [1][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), store.targetsInto(7, &one));
+    // Unknown client enumerates empty.
+    try std.testing.expectEqual(@as(usize, 0), store.targetsInto(99, &out));
+
+    // Restore into a fresh store (the successor): silent — no sink involved —
+    // and both forward + reverse indexes are rebuilt.
+    var succ = MonitorStore.init(std.testing.allocator, 8);
+    defer succ.deinit();
+    for (out[0..n]) |t| try succ.restoreTarget(42, t);
+    try std.testing.expectEqual(@as(usize, 2), succ.monitorCount(42));
+    try std.testing.expect(try succ.isMonitoring(42, "alice")); // case-insensitive key
+    try std.testing.expectEqual(@as(usize, 1), succ.watcherCount("BOB")); // reverse index live
+    // Idempotent: restoring an existing target is a no-op.
+    try succ.restoreTarget(42, "Alice");
+    try std.testing.expectEqual(@as(usize, 2), succ.monitorCount(42));
 }

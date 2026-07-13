@@ -39,6 +39,7 @@ pub const CapsuleKind = enum(u8) {
     ws_session = 9,
     tls_ticket_keys = 10,
     pending_migration = 11,
+    monitor_list = 12,
 
     pub fn fromByte(byte: u8) Error!CapsuleKind {
         return switch (byte) {
@@ -53,6 +54,7 @@ pub const CapsuleKind = enum(u8) {
             9 => .ws_session,
             10 => .tls_ticket_keys,
             11 => .pending_migration,
+            12 => .monitor_list,
             else => error.UnknownKind,
         };
     }
@@ -121,6 +123,13 @@ pub const registry = [_]Descriptor{
     // dying with the predecessor (the client's reclaim would silently fall back
     // to the legacy redirect).
     .{ .kind = .pending_migration, .schema_id = 0x4850_4d47, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // One carried per-client MONITOR watch list (a `monitor_capsule` wire blob;
+    // its client_id field carries the inherited socket FD — the same join key
+    // the TLS/WS capsules use — NOT a client id, which does not survive the
+    // swap). Without it every carried client silently lost its watch list on
+    // USR2: the client believed it was still monitoring, but no MONONLINE/
+    // MONOFFLINE ever arrived again until it re-issued MONITOR.
+    .{ .kind = .monitor_list, .schema_id = 0x484d_4f4e, .current_version = 1, .min_supported = 1, .max_supported = 1 },
 };
 
 pub fn descriptor(kind: CapsuleKind) Descriptor {

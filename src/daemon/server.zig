@@ -180,6 +180,7 @@ const session_capsule = @import("helix/session_capsule.zig");
 const tls_snapshot = @import("helix/tls_snapshot.zig");
 const ws_snapshot = @import("helix/ws_snapshot.zig");
 const ticket_key_capsule = @import("helix/ticket_key_capsule.zig");
+const monitor_capsule = @import("helix/monitor_capsule.zig");
 const s2s_snapshot = @import("helix/s2s_snapshot.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
 const tls_server = @import("../crypto/tls_server.zig");
@@ -17168,6 +17169,32 @@ pub const LinuxServer = struct {
                 continue;
             };
             pieces.append(self.allocator, .{ .kind = .clients, .bytes = blob }) catch continue;
+            // Carry the client's MONITOR watch list (its capsule's client_id
+            // field holds the inherited socket FD — the fd is the join key,
+            // client ids do not survive the swap). Best-effort: any failure
+            // loses only the watch list, never the client.
+            const mon_client = monitorIdFromClient(e.id);
+            const mon_n = self.monitor.monitorCount(mon_client);
+            if (mon_n != 0) carry_mon: {
+                const targets = self.allocator.alloc([]const u8, mon_n) catch break :carry_mon;
+                defer self.allocator.free(targets);
+                const got = self.monitor.targetsInto(mon_client, targets);
+                var wire_len: usize = 4 + 1 + 8 + 2; // magic + version + client_id + count
+                for (targets[0..got]) |t| wire_len += 2 + t.len;
+                const mbuf = self.allocator.alloc(u8, wire_len) catch break :carry_mon;
+                const wire = (monitor_capsule.MonitorCapsule{
+                    .client_id = @intCast(e.value.fd),
+                    .targets = targets[0..got],
+                }).encode(mbuf) catch {
+                    self.allocator.free(mbuf);
+                    break :carry_mon;
+                };
+                blobs.append(self.allocator, mbuf) catch {
+                    self.allocator.free(mbuf);
+                    break :carry_mon;
+                };
+                pieces.append(self.allocator, .{ .kind = .monitor_list, .bytes = wire }) catch break :carry_mon;
+            }
             if (tls_blob != null) tls_carried += 1;
             if (carry_ws) ws_carried += 1;
             // Preserve the client socket across execve so the successor re-attaches it.
@@ -17334,6 +17361,29 @@ pub const LinuxServer = struct {
             }
         }
 
+        // Pass 2b: restore carried MONITOR watch lists onto the adopted clients.
+        // The capsule's client_id field carries the inherited socket FD (the
+        // Helix join key); a capsule whose fd matched no adopted client is
+        // skipped (its client was dropped — the watch list dies with it, the
+        // pre-fix behavior). Restore is SILENT: the client already knows the
+        // online state of everything it watches, so no MONONLINE/MONOFFLINE
+        // is re-emitted. Undecodable capsules are skipped, never fatal.
+        var monitor_lists_restored: usize = 0;
+        for (caps) |c| {
+            if (c.header.kind != .monitor_list) continue;
+            if (c.fields.len == 0) continue;
+            var tgt_buf: [512][]const u8 = undefined;
+            const mc = monitor_capsule.MonitorCapsule.decode(c.fields[0].bytes, &tgt_buf) catch continue;
+            if (mc.client_id > std.math.maxInt(i32)) continue;
+            const watcher = self.adoptedClientIdByFd(@intCast(mc.client_id)) orelse continue;
+            var restored_any = false;
+            for (mc.targets) |t| {
+                self.monitor.restoreTarget(watcher, t) catch continue;
+                restored_any = true;
+            }
+            if (restored_any) monitor_lists_restored += 1;
+        }
+
         // Pass 2c: restore the account-level multi-session/bouncer registry
         // from the carried `.sessions` capsules (one per account). Runs AFTER
         // Pass 2 so an attached session can re-join its adopted connection by
@@ -17416,8 +17466,8 @@ pub const LinuxServer = struct {
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
         srvLog(
-            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} session(s) across {d} account(s), {d} staged migration(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
-            .{ adopted, adopted_tls, adopted_ws, sessions_restored, session_accounts, migrations_staged, s2s_resumed, redialed },
+            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS, {d} wss), {d} MONITOR list(s), {d} session(s) across {d} account(s), {d} staged migration(s), {d} mesh link(s) preserved, {d} mesh re-dial(s)\n",
+            .{ adopted, adopted_tls, adopted_ws, monitor_lists_restored, sessions_restored, session_accounts, migrations_staged, s2s_resumed, redialed },
         );
     }
 
