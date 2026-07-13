@@ -9807,6 +9807,76 @@ pub const LinuxServer = struct {
         };
     }
 
+    /// True iff THIS node holds a live SASL session for `account` — i.e. this node
+    /// is the account's authoritative home. Rooted in SASL (the only non-forgeable
+    /// account anchor): `sessionsInto` snapshots the account's local sessions and
+    /// each is re-verified still logged into `account` (a stale SessionStore entry
+    /// from an account switch is skipped, mirroring `deliverSessionSyncSiblingsNick`).
+    fn accountHasLocalSession(self: *LinuxServer, account: []const u8) bool {
+        if (account.len == 0) return false;
+        var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+        const account_sessions = self.sessions.sessionsInto(account, &session_buf);
+        for (account_sessions) |s| {
+            const conn = self.connFor(clientIdFromMonitor(s.client)) orelse continue;
+            const cur = conn.session.account() orelse continue;
+            if (std.mem.eql(u8, cur, account)) return true;
+        }
+        return false;
+    }
+
+    /// P1 (F1 account-key authority): is an inbound `identity.key.*` /
+    /// `identity.residence.*` ENTITY_PROP write for a USER entity (= account)
+    /// authoritative from `origin_node`? These props are the RECEIVER-OWNED pubkey
+    /// source residence trust verifies against, so a Byzantine admitted peer must
+    /// not be able to inject `identity.key.<victim>` = its own key. Two
+    /// complementary, non-forgeable anchors — the analog of the nick-path
+    /// `meshNickHomeNode`/`recordRelayHomeMismatch` gate, rooted in SASL:
+    ///   (a) LOCAL SASL anchor: if this node holds a live SASL session for the
+    ///       account, it IS the authoritative home — reject EVERY remote-origin
+    ///       write (the genuine key was written locally via IDENTITY ADD, never
+    ///       ingested; a remote one is a forgery, even for an account whose clock
+    ///       is absent because it has not enrolled yet).
+    ///   (b) ORIGIN BINDING: once a prop clock exists for the exact identity key,
+    ///       only the origin that established it may update it — a Byzantine peer
+    ///       cannot OVERWRITE a genuine home node's key/residence with its own,
+    ///       even at a higher hlc that plain LWW would accept. Genuine key
+    ///       rotation from the same home is same-origin and still applies.
+    /// The residual — a cold third node that has never seen the account, no clock
+    /// yet — fails OPEN like `meshNickHomeNode` (bounded by the R3 pre-convergence
+    /// window). A non-USER entity or a non-identity key is never gated (returns
+    /// true) so ordinary ENTITY_PROP LWW is unchanged.
+    fn accountIdentityPropAuthorized(
+        self: *LinuxServer,
+        kind: entity_prop_event.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        origin_node: u64,
+    ) bool {
+        if (kind.toStoreKind() != .user) return true;
+        if (!account_identity.isPropKey(key) and !account_identity.isResidencePropKey(key)) return true;
+        // (a) local SASL anchor — this node is the account's home.
+        if (self.accountHasLocalSession(entity)) return origin_node == self.config.node_id;
+        // (b) origin binding — a later different-origin write cannot overwrite.
+        if (self.entityPropClock(kind, entity, key)) |clock| {
+            if (clock.origin_node != origin_node) return false;
+        }
+        return true;
+    }
+
+    /// Account + audit an ENTITY_PROP identity write dropped because its origin is
+    /// not the account's authoritative home (P1). Reuses the home-mismatch counter
+    /// the nick-path gate uses — semantically the same rejection class.
+    fn recordEntityPropAuthorityReject(self: *LinuxServer, ch: anytype) void {
+        self.rejected_relay_home_mismatch +|= 1;
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "dropped ENTITY_PROP identity write {s}/{s} from node {d}: origin is not the account's authoritative home",
+            .{ ch.entity, ch.key, ch.origin_node },
+        ) catch "dropped ENTITY_PROP identity write: origin is not the account's home";
+        self.traceLog(.warn, .s2s, line);
+    }
+
     /// Apply an inbound ENTITY_PROP fact LWW into the local prop store + clock.
     /// The counterpart of `applyRemoteChannelProp`: verify-then-LWW, dropping a
     /// forged fact before it is applied or re-broadcast. The entity id is validated
@@ -9814,6 +9884,13 @@ pub const LinuxServer = struct {
     /// fails to apply.
     fn applyRemoteEntityProp(self: *LinuxServer, ch: anytype) bool {
         if (!self.entityPropOriginVerified(ch)) return false;
+        // P1: an identity.key.*/identity.residence.* write is only authoritative
+        // from the account's home — reject a non-home (forged) write fail-closed
+        // BEFORE it can overwrite the receiver-owned pubkey residence trust reads.
+        if (!self.accountIdentityPropAuthorized(ch.kind, ch.entity, ch.key, ch.origin_node)) {
+            self.recordEntityPropAuthorityReject(ch);
+            return false;
+        }
         if (self.entityPropClock(ch.kind, ch.entity, ch.key)) |existing| {
             if (ch.hlc <= existing.hlc) return false;
         }
@@ -11315,41 +11392,35 @@ pub const LinuxServer = struct {
     /// replicated over ENTITY_PROP, whose ingest (`entityPropOriginVerified` ->
     /// `entity_prop_event.verifyOrigin`) authenticates only that the AUTHORING
     /// node self-certifies its OWN origin — it does NOT check that the node is
-    /// AUTHORITATIVE for the account entity. So any admitted (but Byzantine) peer
-    /// can inject `identity.key.<victim>` = its own key AND a matching
-    /// `identity.residence.<victim>` proof it signs, and `residenceTrusted` would
-    /// then verify it — defeating F1 and even enabling a `reclaim_local`
-    /// session-kill of the real user. Design C's premise (the replicated
-    /// identity pubkey is authoritative) is therefore NOT yet met.
+    /// AUTHORITATIVE for the account entity. Without more, any admitted (but
+    /// Byzantine) peer could inject `identity.key.<victim>` = its own key AND a
+    /// matching `identity.residence.<victim>` proof it signs, and `residenceTrusted`
+    /// would then verify it — defeating F1. Design C's premise (the replicated
+    /// identity pubkey is authoritative) requires TWO preconditions:
     ///
-    /// Residence trust MUST fail closed until TWO preconditions land, both of
-    /// which a fresh adversarial review confirmed are missing today:
-    ///
-    ///  (1) NON-FORGEABLE account-key authority on ENTITY_PROP INGEST. Accept an
+    ///  (1) NON-FORGEABLE account-key authority on ENTITY_PROP INGEST — LANDED as
+    ///      `accountIdentityPropAuthorized` (in `applyRemoteEntityProp`). An
     ///      `identity.key.*`/`identity.residence.*` write for `entity=<account>`
-    ///      only from the account's authoritative home — the analog of the
-    ///      nick-path `meshNickHomeNode`/`recordRelayHomeMismatch` gate, rooted
-    ///      in SASL authentication (the only non-forgeable account anchor). A
-    ///      mesh-security design decision beyond this daemon-side change.
+    ///      is accepted only from the account's authoritative home, via two
+    ///      non-forgeable anchors rooted in SASL (the analog of the nick-path
+    ///      `meshNickHomeNode`/`recordRelayHomeMismatch` gate): the LOCAL-SASL
+    ///      anchor (this node owns the account ⇒ reject every remote-origin write)
+    ///      and the FIRST-origin binding (a Byzantine peer cannot overwrite the
+    ///      genuine home's key at any hlc). A Byzantine node with no SASL session
+    ///      for the victim cannot write the victim's key.
     ///
-    ///  (2) STORE-SIDE account blanking on trust. `resolveIncomingNick` blanks
-    ///      the INCOMING account, but `recvMembership`/`recvNickChange` still
-    ///      store the raw wire account (see the note there). A forged incumbent
-    ///      stored under the real nick would let a later TRUSTED newcomer
-    ///      `remote_same_account`-merge with it on a third node — reopening the
-    ///      forgery. Enabling trust REQUIRES also storing `if (account_trusted)
-    ///      ev.account else ""` at the applyMembership sites, plus a DST case for
-    ///      the forged-incumbent + trusted-newcomer scenario.
+    ///  (2) STORE-SIDE account blanking on trust — PENDING (next commit):
+    ///      `recvMembership`/`recvNickChange` must persist
+    ///      `if (account_trusted) ev.account else ""` at the applyMembership/
+    ///      renameNick sites, so a forged (untrusted) incumbent is stored
+    ///      account-less and can NEVER later let a TRUSTED newcomer
+    ///      `remote_same_account`-merge with it on a third node.
     ///
-    /// With this returning false the live behaviour is EXACTLY the conservative
-    /// UID path (`account_trusted` always false) — no F1 regression, no new
-    /// attack surface, remote WHOIS 330 unchanged. The verify logic below is
-    /// correct GIVEN an authentic key and is exercised end-to-end by the
-    /// route_table/s2s_peer unit tests and the seeded `residence_trust_dst`;
-    /// enabling it is landing (1)+(2) then flipping this gate (owner:
-    /// orochi-mesh / stack-architect).
+    /// This gate stays false — the conservative UID path — until (2) also lands,
+    /// then it is flipped true (residence trust becomes live). Owner: orochi-mesh
+    /// / stack-architect.
     fn accountKeyAuthorityGateAvailable() bool {
-        return false; // TODO(F1-authority): flip when (1) ENTITY_PROP account-key ingest is authority-gated AND (2) the store-side blank lands.
+        return false; // TODO(F1-authority): flip true once the store-side blank (2) also lands.
     }
 
     /// RECEIVER-side residence-proof verify callback (Design C / F1). Verify a
@@ -34683,6 +34754,130 @@ test "IDENTITY RESIDENCE publishes an account residence proof as a replicated us
     conn.send_len = 0;
     try server.handleIdentity(conn, &tampered);
     try expectContains(conn.send_buf[0..conn.send_len], "FAIL IDENTITY BAD_ASSERTION");
+}
+
+// P1 (F1 account-key authority): the ENTITY_PROP ingest gate that makes the
+// replicated `identity.key.*`/`identity.residence.*` pubkey source authoritative
+// enough for residence trust. A Byzantine admitted peer must not be able to
+// inject `identity.key.<victim>` = its own key; without this gate Design C's
+// premise (the replicated pubkey is authoritative) is unmet.
+fn makeEntityPropChange(
+    kind: entity_prop_event.EntityKind,
+    entity: []const u8,
+    key: []const u8,
+    value: []const u8,
+    hlc: u64,
+    origin_node: u64,
+) struct {
+    present: bool,
+    kind: entity_prop_event.EntityKind,
+    origin_node: u64,
+    hlc: u64,
+    entity: []const u8,
+    key: []const u8,
+    value: []const u8,
+    owner: []const u8,
+    origin_pubkey: []const u8,
+    origin_sig: []const u8,
+} {
+    return .{
+        .present = true,
+        .kind = kind,
+        .origin_node = origin_node,
+        .hlc = hlc,
+        .entity = entity,
+        .key = key,
+        .value = value,
+        .owner = entity,
+        .origin_pubkey = "", // unsigned path: entityPropOriginVerified ⇒ .unsigned ⇒ true
+        .origin_sig = "",
+    };
+}
+
+test "P1: identity.key ENTITY_PROP ingest rejects a REMOTE write for a LOCALLY-homed account (local SASL anchor)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "local");
+    defer ident.deinit();
+    const self_node = ident.shortId();
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = self_node, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // kain is SASL-authenticated on THIS node ⇒ this node is kain's authoritative
+    // home. Even with NO enrolled key yet (clock absent), a remote-origin write
+    // for kain's identity key is a forgery and must be rejected fail-closed.
+    _ = try addTestLocalClient(&server, "kain", "kain");
+
+    const byz_node: u64 = self_node ^ 0xABCD; // some other admitted peer
+    var forged = makeEntityPropChange(.user, "kain", "identity.key.primary", "forged-key-value", 100, byz_node);
+    try std.testing.expect(!server.applyRemoteEntityProp(&forged));
+    // Nothing was stored: the victim's key is untouched.
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "identity.key.primary"));
+
+    // A residence prop for the locally-homed account is likewise rejected from a
+    // remote origin.
+    var rkey_buf: [account_identity.residence_prop_prefix.len + account_identity.residence_node_hex_len]u8 = undefined;
+    const rkey = account_identity.residencePropKey(byz_node, &rkey_buf).?;
+    var forged_res = makeEntityPropChange(.user, "kain", rkey, "deadbeef", 100, byz_node);
+    try std.testing.expect(!server.applyRemoteEntityProp(&forged_res));
+}
+
+test "P1: identity.key ENTITY_PROP ingest binds the key to its FIRST origin (a different peer cannot overwrite it)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "local");
+    defer ident.deinit();
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // kain is NOT local here (a third node). kain's real home A writes the key
+    // first — accepted, and the origin binding is recorded.
+    const home_a: u64 = 0xA;
+    const byz_b: u64 = 0xB;
+    const key_a = "home-A-key-value";
+    var genuine = makeEntityPropChange(.user, "kain", "identity.key.primary", key_a, 100, home_a);
+    try std.testing.expect(server.applyRemoteEntityProp(&genuine));
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
+    try std.testing.expectEqualStrings(key_a, (try server.props.getProp(entity, "identity.key.primary")).value);
+
+    // A Byzantine peer B tries to OVERWRITE kain's key with its own, at a HIGHER
+    // hlc so plain LWW would accept it — the origin binding rejects it.
+    const key_b = "byzantine-B-value";
+    var forged = makeEntityPropChange(.user, "kain", "identity.key.primary", key_b, 999, byz_b);
+    try std.testing.expect(!server.applyRemoteEntityProp(&forged));
+    // A's key survives — B never gets its key trusted for kain.
+    try std.testing.expectEqualStrings(key_a, (try server.props.getProp(entity, "identity.key.primary")).value);
+
+    // The SAME origin A may still update (key rotation from the genuine home).
+    const key_a2 = "home-A-rotated-v2";
+    var rotate = makeEntityPropChange(.user, "kain", "identity.key.primary", key_a2, 200, home_a);
+    try std.testing.expect(server.applyRemoteEntityProp(&rotate));
+    try std.testing.expectEqualStrings(key_a2, (try server.props.getProp(entity, "identity.key.primary")).value);
+}
+
+test "P1: a NON-identity user prop is NOT origin-bound (regression: ordinary ENTITY_PROP LWW is unchanged)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x73)), "local");
+    defer ident.deinit();
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // An ordinary user prop is NOT an identity anchor: a later, higher-hlc write
+    // from a different node applies via plain LWW (the gate must not over-reach).
+    var first = makeEntityPropChange(.user, "bob", "display.pronouns", "they", 100, 0xA);
+    try std.testing.expect(server.applyRemoteEntityProp(&first));
+    var second = makeEntityPropChange(.user, "bob", "display.pronouns", "she", 200, 0xB);
+    try std.testing.expect(server.applyRemoteEntityProp(&second));
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "bob" };
+    try std.testing.expectEqualStrings("she", (try server.props.getProp(entity, "display.pronouns")).value);
 }
 
 test "ISUPPORT advertises ACCOUNTRESIDENCE only when the node has a mesh identity (account residence discovery)" {
