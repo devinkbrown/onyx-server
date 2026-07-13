@@ -1243,6 +1243,10 @@ pub const ClientSession = struct {
             .oper_priv_bits = self.oper_priv.toBits(),
             .oper_class = self.operClass(),
             .oper_title = self.operTitle(),
+            // Carry the user-mode bitset so client-set modes (+i/+g/+R/...)
+            // survive the upgrade; server-managed bits are re-derived on
+            // restore by the normal login/oper paths.
+            .umode_bits = self.umodes.bits,
         };
     }
 
@@ -1250,6 +1254,11 @@ pub const ClientSession = struct {
     /// restored session is registered by definition — only registered clients are
     /// snapshotted. Best-effort: a field that fails validation is left empty.
     pub fn restore(self: *ClientSession, snap: session_snapshot.Snapshot) void {
+        // Restore the carried user-mode bitset FIRST, then let the derivations
+        // below (loginAs/logout → +r, setOperGrant → +a) re-assert the
+        // server-managed bits on top. A pre-v4 snapshot carries 0 — exactly
+        // the historical start-empty behavior (client-set modes were reset).
+        self.umodes = .{ .bits = snap.umode_bits };
         self.client.identity.nick.set(snap.nick) catch {
             self.client.identity.nick.len = 0;
         };

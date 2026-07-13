@@ -17086,6 +17086,34 @@ pub const LinuxServer = struct {
                     break;
                 }
             }
+            // v4 tail: the partial inbound line pending in the RecvQ (inline
+            // line_buf or its heap overflow) — dropping it made the next
+            // recv'd bytes parse as a torn line on the successor.
+            snap.pending_in = if (e.value.recv_overflow.items.len != 0)
+                e.value.recv_overflow.items
+            else
+                e.value.line_buf[0..e.value.line_len];
+            // v4 tail: a PLAINTEXT connection's unsent SendQ tail (inline +
+            // overflow, contiguous). A TLS connection's unsent ciphertext is
+            // carried by its `.tls_session` capsule above — never both.
+            var plain_pend_tmp: ?[]u8 = null;
+            defer if (plain_pend_tmp) |p| self.allocator.free(p);
+            if (e.value.tls == null) {
+                const ptail = e.value.send_buf[e.value.send_offset..e.value.send_len];
+                const povf = e.value.send_overflow.items;
+                if (povf.len == 0) {
+                    snap.pending_out = ptail;
+                } else if (self.allocator.alloc(u8, ptail.len + povf.len)) |buf| {
+                    @memcpy(buf[0..ptail.len], ptail);
+                    @memcpy(buf[ptail.len..], povf);
+                    plain_pend_tmp = buf;
+                    snap.pending_out = buf;
+                } else |_| {
+                    // Allocation failure: carry the inline tail only (the
+                    // overflow is lost — pre-v4 behavior lost both).
+                    snap.pending_out = ptail;
+                }
+            }
             const blob = session_snapshot.encode(self.allocator, snap) catch {
                 if (tls_blob) |tb| self.allocator.free(tb);
                 continue;
@@ -17534,6 +17562,52 @@ pub const LinuxServer = struct {
                 }
             }
         }
+        // v4: restore the partial inbound line into the RecvQ (inline fast path
+        // when it fits, heap overflow otherwise) so the client's next bytes
+        // continue the SAME line instead of parsing as a torn one. An overflow
+        // allocation failure drops the client cleanly (reconnect is safe;
+        // adopting with a torn inbound stream is not).
+        if (snap.pending_in.len != 0) {
+            if (snap.pending_in.len <= conn.line_buf.len) {
+                @memcpy(conn.line_buf[0..snap.pending_in.len], snap.pending_in);
+                conn.line_len = snap.pending_in.len;
+            } else {
+                conn.recv_overflow.appendSlice(conn.overflow_allocator, snap.pending_in) catch {
+                    if (conn.tls) |t| {
+                        t.deinit();
+                        self.allocator.destroy(t);
+                        conn.tls = null;
+                        conn.is_tls = false;
+                    }
+                    if (conn.ws) |w| {
+                        self.allocator.destroy(w);
+                        conn.ws = null;
+                    }
+                    _ = self.rx().clients.free(id);
+                    closeFd(snap.fd);
+                    return false;
+                };
+            }
+        }
+        // v4: re-queue a plaintext connection's unsent SendQ tail verbatim (the
+        // bytes are already framed/formatted wire bytes — bypass every seam).
+        // A TLS connection's pending ciphertext was re-queued by adoptTlsState
+        // above; the seal path guarantees this field is empty for those.
+        if (snap.pending_out.len != 0 and tls_state == null) {
+            conn.sendq_cap = @max(conn.sendq_cap, snap.pending_out.len);
+            rawAppendToConn(conn, snap.pending_out) catch {
+                conn.recv_overflow.clearAndFree(conn.overflow_allocator);
+                conn.send_overflow.clearAndFree(conn.overflow_allocator);
+                if (conn.ws) |w| {
+                    self.allocator.destroy(w);
+                    conn.ws = null;
+                }
+                _ = self.rx().clients.free(id);
+                closeFd(snap.fd);
+                return false;
+            };
+            self.armSendIfNeeded(conn) catch {};
+        }
         // Re-populate the world nick registry so the carried client stays
         // addressable (WHOIS, PRIVMSG target). A fresh successor world has no
         // collisions; ignore NickInUse defensively. Channel membership carry-over
@@ -17548,6 +17622,8 @@ pub const LinuxServer = struct {
         }
         self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
             self.world.removeClient(worldIdFromClient(id));
+            conn.recv_overflow.clearAndFree(conn.overflow_allocator);
+            conn.send_overflow.clearAndFree(conn.overflow_allocator);
             if (conn.tls) |t| {
                 t.deinit();
                 self.allocator.destroy(t);

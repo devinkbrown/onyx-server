@@ -24,6 +24,7 @@
 //!   [u16 len][username]   OPTIONAL trailing USER ident (past the oper grant)
 //!   [u8 was_secured]      OPTIONAL trailing secured-flag (past the username)
 //!   [u8 tlen][token]      OPTIONAL trailing session reclaim token (past the flag)
+//!   [u64 umode_bits][u32 ilen][pending_in][u32 olen][pending_out]  OPTIONAL v4 tail
 //!
 //! The oper-grant block (OPTIONAL, written after the caps block) carries the
 //! operator's privilege bits (OperPrivileges.toBits — append-only ordinals) plus
@@ -70,6 +71,26 @@
 //! the successor mints a fresh one via the normal tracking path — a legacy capsule
 //! NEVER drops the client. Growing the payload again is why the `.clients`
 //! descriptor is at version 3 (capsule.zig).
+//!
+//! The v4 tail (OPTIONAL, written last — past the token block) carries three
+//! more pieces so a carried client is byte-for-byte continuous, not just
+//! identity-continuous:
+//!   * `umode_bits` — the client's user-mode bitset (usermode.UmodeSet.bits,
+//!     append-only enum ordinals). Before this, +i/+g/+R and friends silently
+//!     reset on every upgrade (an invisible user became visible). Restored
+//!     FIRST on the successor, then the server-managed bits (+r/+a/+j) are
+//!     re-derived by the normal login/oper paths on top.
+//!   * `pending_in` — the partial inbound IRC line accumulated in the RecvQ
+//!     (inline `line_buf` or its heap overflow). Dropping it made the next
+//!     recv'd bytes parse as a torn/garbage line.
+//!   * `pending_out` — the UNSENT SendQ tail (inline + overflow, contiguous)
+//!     for a PLAINTEXT connection only. A TLS connection's unsent ciphertext
+//!     rides its own `.tls_session` capsule (`pending_out` there), so this
+//!     field is empty for secured clients — never both. Dropping it could
+//!     tear a reply mid-line when `send_offset` sat inside a line.
+//! All three default to 0/empty on a pre-v4 capsule — exactly the historical
+//! behavior. Growing the payload is why the `.clients` descriptor is at
+//! version 4 (capsule.zig).
 const std = @import("std");
 
 pub const Error = error{ Truncated, TooLong };
@@ -133,6 +154,17 @@ pub const Snapshot = struct {
     oper_priv_bits: u64 = 0,
     oper_class: []const u8 = "",
     oper_title: []const u8 = "",
+    /// Client-settable user-mode bitset (usermode.UmodeSet.bits — append-only
+    /// enum ordinals). 0 = pre-v4 capsule (or genuinely no modes); the
+    /// successor restores these first, then re-derives server-managed bits.
+    umode_bits: u64 = 0,
+    /// The partial inbound IRC line pending in the RecvQ at seal time (inline
+    /// `line_buf` or its heap overflow). Empty = nothing pending / pre-v4.
+    pending_in: []const u8 = &.{},
+    /// The unsent SendQ tail (inline + overflow, contiguous) at seal time —
+    /// PLAINTEXT connections only (a TLS conn's unsent ciphertext rides its
+    /// `.tls_session` capsule instead). Empty = nothing pending / pre-v4.
+    pending_out: []const u8 = &.{},
 };
 
 const flag_logged_in: u8 = 1 << 0;
@@ -217,6 +249,20 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     if (snap.session_token.len > std.math.maxInt(u8)) return error.TooLong;
     try out.append(allocator, @intCast(snap.session_token.len));
     try out.appendSlice(allocator, snap.session_token);
+    // v4 tail (see header): umode bitset + partial inbound line + plaintext
+    // unsent SendQ tail. APPEND-ONLY past the token block; a pre-v4 capsule
+    // omits it and every field defaults to 0/empty. Growing the payload is why
+    // the `.clients` descriptor is at version 4.
+    var umode_le: [8]u8 = undefined;
+    std.mem.writeInt(u64, &umode_le, snap.umode_bits, .little);
+    try out.appendSlice(allocator, &umode_le);
+    inline for (.{ snap.pending_in, snap.pending_out }) |pend| {
+        if (pend.len > std.math.maxInt(u32)) return error.TooLong;
+        var plen_le: [4]u8 = undefined;
+        std.mem.writeInt(u32, &plen_le, @intCast(pend.len), .little);
+        try out.appendSlice(allocator, &plen_le);
+        try out.appendSlice(allocator, pend);
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -247,6 +293,9 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     var username: []const u8 = "";
     var was_secured: bool = false;
     var session_token: []const u8 = &.{};
+    var umode_bits: u64 = 0;
+    var pending_in: []const u8 = &.{};
+    var pending_out: []const u8 = &.{};
     // Walk the optional trailing blocks with a running cursor `p`: signon (16) →
     // caps ([u16][bytes]) → oper grant ([u64][u16][class][u16][title]) → username
     // ([u16][bytes]). Each is gated on enough bytes remaining, so a capsule from a
@@ -303,6 +352,24 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
                         if (r.buf.len - p >= tl) {
                             session_token = r.buf[p .. p + tl];
                             p += tl;
+                            // v4 tail (past the token block): [u64 umode_bits]
+                            // [u32 ilen][pending_in][u32 olen][pending_out].
+                            // Gated on bytes remaining so a v3 capsule — which
+                            // ends exactly at the token — defaults everything.
+                            if (r.buf.len - p >= 8) {
+                                umode_bits = std.mem.readInt(u64, r.buf[p..][0..8], .little);
+                                p += 8;
+                                inline for (.{ &pending_in, &pending_out }) |dst| {
+                                    if (r.buf.len - p >= 4) {
+                                        const n = std.mem.readInt(u32, r.buf[p..][0..4], .little);
+                                        p += 4;
+                                        if (r.buf.len - p >= n) {
+                                            dst.* = r.buf[p .. p + n];
+                                            p += n;
+                                        } else p = r.buf.len; // malformed length → stop
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -330,6 +397,9 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
         .username = username,
         .was_secured = was_secured,
         .session_token = session_token,
+        .umode_bits = umode_bits,
+        .pending_in = pending_in,
+        .pending_out = pending_out,
     };
 }
 
@@ -525,8 +595,8 @@ test "decode tolerates a pre-signon snapshot (no trailing blocks)" {
     });
     defer allocator.free(bytes);
     // Strip every trailing block: signon(16) + empty caps(2) + oper(12) +
-    // empty username(2) + secured(1) + empty token(1) = 34 bytes.
-    const old = bytes[0 .. bytes.len - 34];
+    // empty username(2) + secured(1) + empty token(1) + v4 tail(16) = 50 bytes.
+    const old = bytes[0 .. bytes.len - 50];
 
     const got = try decode(old);
     try testing.expectEqualStrings("bob", got.nick);
@@ -560,7 +630,8 @@ test "decode tolerates a pre-caps snapshot (signon present, caps absent)" {
     const username_block = 2; // empty username len prefix
     const secured_block = 1; // trailing was_secured flag byte
     const token_block = 1; // empty session-token len prefix
-    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block - secured_block - token_block];
+    const v4_tail = 8 + 4 + 4; // umode bits + two empty pending len prefixes
+    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block - secured_block - token_block - v4_tail];
 
     const got = try decode(old);
     try testing.expectEqualStrings("carol", got.nick);
@@ -593,10 +664,11 @@ test "oper grant round-trips (priv bits + class + title)" {
 test "decode tolerates a pre-oper-grant snapshot (caps present, oper block absent)" {
     const allocator = testing.allocator;
     // A capsule from the caps-carry build: signon + caps blocks, but no oper block.
-    // Strip the oper block (8 bits + two empty len-prefixed strings = 8+2+2=12).
+    // Strip the oper block onward: 8+2+2 oper + 2 username + 1 secured + 1 token
+    // + 16 v4 tail (the decoder needs < 8 bytes after caps to default the rest).
     const bytes = try encode(allocator, .{ .nick = "dan", .caps = "echo-message", .is_oper = true });
     defer allocator.free(bytes);
-    const old = bytes[0 .. bytes.len - 12];
+    const old = bytes[0 .. bytes.len - 32];
     const got = try decode(old);
     try testing.expectEqualStrings("dan", got.nick);
     try testing.expectEqualStrings("echo-message", got.caps);
@@ -640,9 +712,9 @@ test "session_snapshot decode tolerates a pre-was_secured capsule (legacy upgrad
         .was_secured = true,
     });
     defer allocator.free(bytes);
-    // Strip the trailing session-token block (1 empty len byte) AND the
-    // was_secured byte to emulate the pre-flag (v1) layout.
-    const old = bytes[0 .. bytes.len - 2];
+    // Strip the v4 tail (16), the trailing session-token block (1 empty len
+    // byte) AND the was_secured byte to emulate the pre-flag (v1) layout.
+    const old = bytes[0 .. bytes.len - 18];
 
     const got = try decode(old);
     try testing.expect(!got.was_secured); // legacy blob → defaults false
@@ -692,9 +764,10 @@ test "cross-version: a v2 (pre-token) capsule decodes with an empty token (v2→
         .session_token = &tok,
     });
     defer allocator.free(bytes);
-    // A v2 build's blob is exactly this one minus the trailing token block
-    // ([u8 tlen=16][16 bytes]) — strip it to emulate the pre-token layout.
-    const v2 = bytes[0 .. bytes.len - 17];
+    // A v2 build's blob is exactly this one minus the v4 tail (16) and the
+    // trailing token block ([u8 tlen=16][16 bytes]) — strip both to emulate
+    // the pre-token layout.
+    const v2 = bytes[0 .. bytes.len - 33];
 
     const got = try decode(v2);
     try testing.expectEqual(@as(usize, 0), got.session_token.len); // defaults empty
@@ -732,4 +805,58 @@ test "session_snapshot peekFd recovers the fd for a decode-failure drop on resum
     var no_fd: [13]u8 = @splat(0);
     no_fd[12] = 0; // flags byte present, fd bytes absent
     try testing.expectEqual(@as(?i32, null), peekFd(&no_fd));
+}
+
+test "v4 tail round-trips (umodes + pending_in + pending_out)" {
+    const allocator = testing.allocator;
+    const bytes = try encode(allocator, .{
+        .nick = "judy",
+        .account = "judy",
+        .logged_in = true,
+        .fd = 61,
+        .caps = "sasl",
+        .umode_bits = 0b1010_0101,
+        .pending_in = "PRIVMSG #root :half a li",
+        .pending_out = ":srv 001 judy :Welco",
+    });
+    defer allocator.free(bytes);
+    const got = try decode(bytes);
+    try testing.expectEqual(@as(u64, 0b1010_0101), got.umode_bits);
+    try testing.expectEqualStrings("PRIVMSG #root :half a li", got.pending_in);
+    try testing.expectEqualStrings(":srv 001 judy :Welco", got.pending_out);
+    // Everything before the v4 tail still decodes.
+    try testing.expectEqualStrings("judy", got.nick);
+    try testing.expectEqualStrings("sasl", got.caps);
+    try testing.expectEqual(@as(i32, 61), got.fd);
+}
+
+test "cross-version: a v3 (pre-v4-tail) capsule decodes with defaults (v3->v4)" {
+    const allocator = testing.allocator;
+    const tok: [16]u8 = @splat(0x11);
+    const bytes = try encode(allocator, .{
+        .nick = "kilo",
+        .account = "kilo",
+        .logged_in = true,
+        .fd = 71,
+        .was_secured = true,
+        .session_token = &tok,
+        .umode_bits = 0xff,
+        .pending_in = "torn",
+        .pending_out = "tear",
+    });
+    defer allocator.free(bytes);
+    // A v3 build's blob is exactly this one minus the v4 tail:
+    // [u64 umode][u32 ilen=4]["torn"][u32 olen=4]["tear"] = 8+4+4+4+4 = 24.
+    const v3 = bytes[0 .. bytes.len - 24];
+
+    const got = try decode(v3);
+    try testing.expectEqual(@as(u64, 0), got.umode_bits); // defaults
+    try testing.expectEqual(@as(usize, 0), got.pending_in.len);
+    try testing.expectEqual(@as(usize, 0), got.pending_out.len);
+    // Every earlier field — including the v3 token tail — still decodes.
+    try testing.expectEqualSlices(u8, &tok, got.session_token);
+    try testing.expect(got.was_secured);
+    try testing.expectEqualStrings("kilo", got.nick);
+    try testing.expectEqual(@as(i32, 71), got.fd);
+    try testing.expect(got.logged_in);
 }

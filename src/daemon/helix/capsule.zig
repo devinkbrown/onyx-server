@@ -85,8 +85,12 @@ pub const registry = [_]Descriptor{
     // block ([u8 tlen][bytes]) so a carried client re-tracks in the SessionStore
     // under the SAME reclaim token instead of becoming a registry orphan.
     // `min_supported = 1` keeps accepting v1/v2 capsules sealed by pre-bump
-    // binaries; `session_snapshot.decode` reads both tails tolerantly.
-    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 3, .min_supported = 1, .max_supported = 3 },
+    // binaries; `session_snapshot.decode` reads both tails tolerantly. v4
+    // (2026-07) appends a trailing [u64 umode_bits][u32 ilen][pending_in]
+    // [u32 olen][pending_out] block so client-set umodes, the partial inbound
+    // line, and a plaintext connection's unsent SendQ tail all survive the
+    // swap (previously silently reset/dropped).
+    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 4, .min_supported = 1, .max_supported = 4 },
     .{ .kind = .channels, .schema_id = 0x4843_484e, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // v2 (2026-07): each session record appends the attached connection's join
     // fd (i32) and the detached restore snapshot (u32 len + bytes), so bouncer
