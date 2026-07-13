@@ -16641,8 +16641,9 @@ pub const LinuxServer = struct {
     /// hand-dialed initiator links seal a re-dial hint the successor dials at
     /// boot, and config-managed [mesh].connect peers re-dial via the mesh boot
     /// pass, keeping the netsplit window to one connect+handshake round-trip.
-    /// wss browser clients are not carried yet (no WS adapter resume); they
-    /// reconnect against the still-bound listener.
+    /// wss browser clients are carried too: the WS adapter's partial framing
+    /// state rides the v2 `.ws_session` capsule (see wsCarryable), so even a
+    /// mid-frame browser client survives with no lost bytes.
     pub fn handleUpgrade(self: *LinuxServer, conn: *ConnState) !void {
         if (!self.requirePriv(conn, .server_restart)) return;
         return self.performUpgrade(conn) catch |e| switch (e) {
