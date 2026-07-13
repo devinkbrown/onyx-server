@@ -36,6 +36,22 @@ pub const RelayVerb = message_relay.Verb;
 pub const ChannelModeStateEvent = channel_mode_state_event.ChannelModeStateEvent;
 pub const LocalNickResolver = route_table.LocalNickResolver;
 
+/// RECEIVER-SIDE account-residence verifier seam (Design C, the F1 proper fix).
+/// The daemon supplies a callback that verifies an incoming claim's residence
+/// proof — looked up from the RECEIVER-OWNED replicated `identity.residence.*`
+/// and `identity.key.*` props, never from any wire field — binding
+/// `{account, origin_node}`. The peer driver consults it to compute the
+/// PER-CLAIM `account_trusted` bool it passes to `resolveIncomingNick`.
+/// Absent (null) ⇒ nothing is ever trusted ⇒ the conservative UID path.
+pub const ResidenceVerifier = struct {
+    ctx: *anyopaque,
+    verify_fn: *const fn (ctx: *anyopaque, account: []const u8, origin_node: NodeId) bool,
+
+    pub fn verify(self: ResidenceVerifier, account: []const u8, origin_node: NodeId) bool {
+        return self.verify_fn(self.ctx, account, origin_node);
+    }
+};
+
 /// Length of a mesh UID, sized for the stack scratch the collision paths use to
 /// hold a forced-rename fallback nick.
 const nick_collision_uid_len = @import("uid_alloc.zig").encoded_len;
@@ -229,6 +245,10 @@ pub const S2sPeer = struct {
     /// Gated because these are newer S2S frame tags; older peers keep relying on
     /// the daemon's coarse full-state re-burst fallback.
     peer_supports_repair: bool = false,
+    /// Daemon-supplied residence-proof verifier (Design C / F1). Null (default,
+    /// and always on non-daemon/test peers) ⇒ no account is ever trusted ⇒ every
+    /// same-account short-circuit stays on the conservative UID path.
+    residence_verifier: ?ResidenceVerifier = null,
     /// Frames dropped because the peer's signed MeshPass token did not authorize
     /// the frame catalog family at runtime.
     rejected_admission_frames: u64 = 0,
@@ -1247,6 +1267,31 @@ pub const S2sPeer = struct {
         return @as(u32, 1) << @as(u5, @intCast(@intFromEnum(family)));
     }
 
+    /// Install (or clear) the daemon's residence-proof verifier. Borrowed; the
+    /// daemon must outlive the peer (it does — links tear down before shutdown).
+    pub fn setResidenceVerifier(self: *S2sPeer, verifier: ?ResidenceVerifier) void {
+        self.residence_verifier = verifier;
+    }
+
+    /// The PER-CLAIM `account_trusted` bool for an incoming membership/nick
+    /// claim (Design C verify order, fail-closed — ALL must hold or false):
+    ///   1. the claim carries an account at all;
+    ///   2. the carrying frame rode the ORIGIN-AUTHENTICATED path: the peer is
+    ///      signing-capable (so `verifiedPayload` verified the envelope and
+    ///      pinned `originShortId(pubkey)`) against a KNOWN remote node id —
+    ///      an unsigned/plaintext link can never yield trust;
+    ///   3. the daemon's verifier confirms a live residence proof binding
+    ///      `{account, origin_node}` against the receiver-owned replicated
+    ///      account pubkey.
+    /// False ⇒ the resolver blanks the wire account and the claim takes the
+    /// conservative UID path — today's safe behaviour, so F1 never reopens.
+    fn accountResidenceTrusted(self: *S2sPeer, account: []const u8, origin_node: NodeId) bool {
+        if (account.len == 0) return false;
+        if (!self.peer_supports_signing or self.remote_node_id == 0) return false;
+        const verifier = self.residence_verifier orelse return false;
+        return verifier.verify(account, origin_node);
+    }
+
     fn acceptsDirectOrigin(self: *S2sPeer, origin_node: NodeId) bool {
         if (self.remote_node_id != 0 and origin_node == self.remote_node_id) return true;
         self.rejected_origin_frames +|= 1;
@@ -1369,7 +1414,11 @@ pub const S2sPeer = struct {
         var skip_displace = false;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
         if (ev.present) {
-            switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc, ev.account)) {
+            // Design C: the plaintext wire `account` is only honored by the
+            // same-identity short-circuits when a residence proof verifies for
+            // exactly this (account, origin) — per claim, receiver-owned keys.
+            const account_trusted = self.accountResidenceTrusted(ev.account, ev.origin_node);
+            switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc, ev.account, account_trusted)) {
                 .keep => {},
                 .rename_to_uid => |uid| {
                     // Newcomer lost: store + surface this member under its UID.
@@ -1957,7 +2006,7 @@ pub const S2sPeer = struct {
         };
         var target_nick: []const u8 = ev.new_nick;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
-        switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc, ev.account)) {
+        switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc, ev.account, self.accountResidenceTrusted(ev.account, ev.origin_node))) {
             .keep => self.displaceIncumbentForRename(ev.new_nick, ev.origin_node),
             .rename_to_uid => |uid| {
                 @memcpy(uid_buf[0..uid.len], uid[0..]);
@@ -3251,6 +3300,69 @@ const ReclaimResolverStub = struct {
     }
 };
 
+/// Test residence verifier that trusts a fixed (account, origin) pair — stands
+/// in for the daemon's real receiver-owned proof lookup so the account-aware
+/// collision tests can exercise the TRUSTED path (Design C). With NO verifier
+/// installed, `accountResidenceTrusted` returns false and every same-account
+/// short-circuit falls to the conservative UID path (the F1 fail-closed default).
+const TrustVerifierStub = struct {
+    account: []const u8,
+    origin_node: NodeId,
+    fn verify(ctx: *anyopaque, account: []const u8, origin_node: NodeId) bool {
+        const self: *TrustVerifierStub = @ptrCast(@alignCast(ctx));
+        return origin_node == self.origin_node and std.mem.eql(u8, account, self.account);
+    }
+    fn verifier(self: *TrustVerifierStub) ResidenceVerifier {
+        return .{ .ctx = self, .verify_fn = verify };
+    }
+};
+
+test "same-account MEMBERSHIP short-circuits require a VERIFIED residence proof (F1: no verifier ⇒ UID)" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x71);
+    const kp_b = try signingKeyFor(0x72);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7EE);
+
+    // b holds "kain" locally with a STALE claim; a forges account=kain at a newer
+    // hlc. WITHOUT a residence verifier the plaintext account is untrusted, so no
+    // ghost_reclaim fires — the forged claim is homed under a UID instead.
+    var stub = ReclaimResolverStub{ .held_nick = "kain", .acct = "kain", .hlc = 50 };
+    b.routes.setLocalNickResolver(stub.resolver());
+
+    try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7EF);
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+    // A join under a forced UID, NOT a ghost_reclaim of the live local session.
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.joined, changes[0].kind);
+    try std.testing.expect(!std.mem.eql(u8, "kain", changes[0].nick)); // forced to its mesh UID
+}
+
 test "a strictly-newer same-account MEMBERSHIP surfaces a ghost_reclaim for the stale local session" {
     const allocator = std.testing.allocator;
     var tc = TestClock{ .now_ms = 10 };
@@ -3280,6 +3392,10 @@ test "a strictly-newer same-account MEMBERSHIP surfaces a ghost_reclaim for the 
     // b holds "kain" locally, logged in to account "kain", with a STALE claim (50).
     var stub = ReclaimResolverStub{ .held_nick = "kain", .acct = "kain", .hlc = 50 };
     b.routes.setLocalNickResolver(stub.resolver());
+    // a's kain carries a VERIFIED residence proof (Design C) — the receiver trusts
+    // the account for a's origin, so the same-account reclaim short-circuit fires.
+    var vstub = TrustVerifierStub{ .account = "kain", .origin_node = a_short };
+    b.setResidenceVerifier(vstub.verifier());
 
     // a (the live node) announces kain on the SAME account with a NEWER claim (200).
     try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
@@ -3325,6 +3441,8 @@ test "a same-account MEMBERSHIP that is NOT newer keeps the live local session (
     // b's local "kain" is the LIVE one (newer claim, 300) than a's claim (200).
     var stub = ReclaimResolverStub{ .held_nick = "kain", .acct = "kain", .hlc = 300 };
     b.routes.setLocalNickResolver(stub.resolver());
+    var vstub = TrustVerifierStub{ .account = "kain", .origin_node = a_short };
+    b.setResidenceVerifier(vstub.verifier());
 
     try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6EF);

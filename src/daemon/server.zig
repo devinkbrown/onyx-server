@@ -5746,6 +5746,7 @@ pub const LinuxServer = struct {
             });
             errdefer link.deinit();
             link.setLocalNickResolver(self.localNickResolver());
+            link.setResidenceVerifier(self.residenceVerifier());
             conn.s2s = link;
             // Clear the dangling pointer before the slot is freed if submitRecv
             // fails, so deinit can never observe a freed link.
@@ -6360,6 +6361,7 @@ pub const LinuxServer = struct {
         // authoritative, so the route table renames a colliding remote nick to its
         // mesh UID. Retained through the lazy inner stand-up (post-AKE).
         link.setLocalNickResolver(self.localNickResolver());
+        link.setResidenceVerifier(self.residenceVerifier());
         return link;
     }
 
@@ -11286,6 +11288,41 @@ pub const LinuxServer = struct {
     /// outlive every link (it does — links are torn down before server shutdown).
     fn localNickResolver(self: *LinuxServer) s2s_link.S2sLink.LocalNickResolver {
         return .{ .ctx = self, .held_fn = localNickHeld, .account_fn = localNickAccount, .hlc_fn = localNickHlc };
+    }
+
+    /// RECEIVER-side residence-proof verify callback (Design C / F1). Verify a
+    /// remote claim's `{account, origin_node}` against the RECEIVER-OWNED
+    /// replicated `identity.residence.<origin>` proof and `identity.key.*`
+    /// pubkey — never a wire field. Returns true iff a live proof verifies for
+    /// exactly this account+node. S2S runs reactor-0-only, so this read never
+    /// races a concurrent reactor's prop mutation the RCU store does not already
+    /// serialize. Any decode/lookup/verify miss ⇒ false (conservative UID path).
+    fn residenceTrusted(ctx: *anyopaque, account: []const u8, origin_node: u64) bool {
+        const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+        if (account.len == 0) return false;
+        const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+        var rkey_buf: [account_identity.residence_prop_prefix.len + account_identity.residence_node_hex_len]u8 = undefined;
+        const rkey = account_identity.residencePropKey(origin_node, &rkey_buf) orelse return false;
+        const proof_ev = self.props.getProp(entity, rkey) catch return false;
+        var wire_buf: [account_identity.max_residence_len]u8 = undefined;
+        const wire = decodeResidenceHex(proof_ev.value, &wire_buf) orelse return false;
+        const now_ms = self.grantNowU64();
+        // Try every enrolled identity key for the account: the proof must verify
+        // against at least one receiver-owned pubkey and bind {account, origin}.
+        var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+        const rows = self.props.listProps(entity, &views) catch return false;
+        for (rows) |kv| {
+            if (!account_identity.isPropKey(kv.key)) continue;
+            const claim = account_identity.parseClaimValue(kv.value) orelse continue;
+            _ = account_identity.verifyResidence(wire, claim.public_key, account, origin_node, now_ms) catch continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// Build the borrowed `ResidenceVerifier` the mesh links consult (Design C).
+    fn residenceVerifier(self: *LinuxServer) s2s_link.S2sLink.ResidenceVerifier {
+        return .{ .ctx = self, .verify_fn = residenceTrusted };
     }
 
     fn announceNickChange(self: *LinuxServer, old_nick: []const u8, new_nick: []const u8, ident: s2s_link.S2sLink.MemberIdentity) void {
@@ -17558,6 +17595,7 @@ pub const LinuxServer = struct {
         };
         conn.s2s_secured = link;
         link.setLocalNickResolver(self.localNickResolver());
+        link.setResidenceVerifier(self.residenceVerifier());
         conn.s2s_burst_done = true; // the reconverge below is driven explicitly
 
         if (snap.pending_out.len != 0) {
@@ -17857,6 +17895,7 @@ pub const LinuxServer = struct {
         });
         errdefer link.deinit();
         link.setLocalNickResolver(self.localNickResolver());
+        link.setResidenceVerifier(self.residenceVerifier());
         peer.s2s = link;
         errdefer peer.s2s = null;
 
@@ -49782,15 +49821,20 @@ fn testDmRelayVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
 var test_dm_relay_anchor: u8 = 0;
 const test_dm_relay_checker = sasl.PlainChecker{ .ptr = &test_dm_relay_anchor, .verifyFn = testDmRelayVerify };
 
-// A DM whose target nick resolves LOCALLY on the origin node must STILL relay to
-// mesh peers that also home that nick: multi-device one-nick accounts hold live
-// sessions on several nodes at once, and the pre-fix short-circuit (deliver
-// locally, return) split every such DM — the device on the other node received
-// nothing. Two live meshed nodes; account "ruri" is signed in as nick Ruri on
-// BOTH, account "kazu" as nick Kazu on BOTH. Kazu@node1 DMs Ruri: BOTH Ruri
-// sockets must receive the line, and Kazu's own second device on node2 must
-// receive the sent-copy (the inbound-relay sender mirror).
-test "threaded server: cross-node DM to a locally-held nick relays to mesh sibling sessions on the peer node" {
+// Design C / F1 fail-closed, at the live-integration level. Cross-node
+// multi-device coexistence (account "ruri" as nick Ruri on BOTH nodes) is what
+// lets a DM to a locally-held nick ALSO relay to the account's session on the
+// peer node — but ONLY when the peer's same-account claim is TRUSTED. Over a
+// plaintext (cryptographically UNauthenticated) mesh link with no enrolled
+// residence proof, the claim is untrusted: node1 UID-disambiguates Ruri@node2
+// (`resolveIncomingNick` account gate → conservative UID), so it does NOT home
+// "Ruri" on the node2 link and the relay is correctly suppressed. This proves a
+// FORGED/unproven plaintext account cannot draw a third node's DM to a phantom
+// (the exact F1 hole). LOCAL delivery is unaffected. The RESTORED multi-device
+// relay under a VERIFIED residence proof is proven deterministically in the
+// route_table / s2s_peer unit tests and the seed-replayable residence DST
+// (`substrate/suimyaku/residence_trust_dst.zig`).
+test "threaded server: an UNPROVEN cross-node same-account claim grants no coexistence relay (F1 fail-closed)" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
@@ -49902,32 +49946,34 @@ test "threaded server: cross-node DM to a locally-held nick relays to mesh sibli
     r2.reset();
     s2.reset();
 
-    // Probe until node1's per-link route table has learned Ruri@node2 (presence
-    // gossip) and one relayed copy lands on R2. Bounded manual polling — NOT
-    // recvUntil — so a miss cycles in ~250ms instead of the 20s budget.
-    var got_remote = false;
-    var probes: usize = 0;
-    while (probes < 160 and !got_remote) : (probes += 1) {
-        try writeAllFd(fd_s1, "PRIVMSG Ruri :ping-mesh\r\n");
-        const deadline = platform.monotonicMillis() + 250;
-        while (platform.monotonicMillis() < deadline and !got_remote) {
-            var fds = [_]posix.pollfd{.{ .fd = fd_r2, .events = linux.POLL.IN, .revents = 0 }};
-            const ready = posix.poll(&fds, 20) catch return error.Unexpected;
-            if (ready != 0 and (fds[0].revents & linux.POLL.IN) != 0) try r2.readAvailable();
-            if (std.mem.indexOf(u8, r2.written(), "PRIVMSG Ruri :ping-mesh") != null) got_remote = true;
-        }
-    }
-    // The recipient's session on the OTHER node received the DM (pre-fix: never).
-    try std.testing.expect(got_remote);
-    try expectContains(r2.written(), ":Kazu!");
+    // Kazu@node1 DMs Ruri. node1 finds Ruri LOCALLY (r1) and delivers directly.
+    // Because the node2 link is plaintext (unauthenticated) and Ruri@node2 has no
+    // residence proof, node1 UID-disambiguated Ruri@node2 and does NOT home "Ruri"
+    // on that link, so the coexistence relay is structurally suppressed — r2 and
+    // the sender-mirror s2 receive nothing regardless of timing (fail-closed).
+    try writeAllFd(fd_s1, "PRIVMSG Ruri :ping-mesh\r\n");
 
     // The local holder on the origin node received it directly.
-    try recvUntil(r1, "PRIVMSG Ruri :ping-mesh", 200);
+    try recvUntil(r1, "PRIVMSG Ruri :ping-mesh", 400);
     try expectContains(r1.written(), ":Kazu!");
 
-    // The sender's own second device on the far node received the sent-copy.
-    try recvUntil(s2, "PRIVMSG Ruri :ping-mesh", 200);
-    try expectContains(s2.written(), ":Kazu!");
+    // Drain the peer-node devices for a bounded window; the unproven-account
+    // relay must never arrive. The suppression is structural (no route homing),
+    // not a race, so a modest window is a sound negative assertion.
+    const drain_deadline = platform.monotonicMillis() + 500;
+    while (platform.monotonicMillis() < drain_deadline) {
+        var fds = [_]posix.pollfd{
+            .{ .fd = fd_r2, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = fd_s2, .events = linux.POLL.IN, .revents = 0 },
+        };
+        const ready = posix.poll(&fds, 40) catch return error.Unexpected;
+        if (ready != 0) {
+            if ((fds[0].revents & linux.POLL.IN) != 0) try r2.readAvailable();
+            if ((fds[1].revents & linux.POLL.IN) != 0) try s2.readAvailable();
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, r2.written(), "ping-mesh") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s2.written(), "ping-mesh") == null);
 }
 
 // FIX 1: the RECEIVING node re-enforces ITS OWN channel policy against a remote

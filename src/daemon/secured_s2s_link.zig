@@ -134,6 +134,10 @@ pub const SecuredLink = struct {
     /// S2sLink does not exist until the AKE completes). Re-applied to `inner` on
     /// creation. Null until the daemon installs it.
     local_nicks: ?s2s_link.S2sLink.LocalNickResolver = null,
+    /// Borrowed residence-proof verifier (Design C / F1), retained so it survives
+    /// the lazy `inner` stand-up and is re-applied when the inner peer is created.
+    /// Null until the daemon installs it (then no account is ever trusted).
+    residence_verifier: ?s2s_link.S2sLink.ResidenceVerifier = null,
     inbuf: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
     feed_seq: u64 = 0,
@@ -366,6 +370,13 @@ pub const SecuredLink = struct {
     pub fn setLocalNickResolver(self: *SecuredLink, resolver: ?s2s_link.S2sLink.LocalNickResolver) void {
         self.local_nicks = resolver;
         if (self.inner) |l| l.setLocalNickResolver(resolver);
+    }
+
+    /// Install (or clear) the daemon's residence-proof verifier (Design C / F1).
+    /// Retained across the lazy inner stand-up and applied when `inner` exists.
+    pub fn setResidenceVerifier(self: *SecuredLink, verifier: ?s2s_link.S2sLink.ResidenceVerifier) void {
+        self.residence_verifier = verifier;
+        if (self.inner) |l| l.setResidenceVerifier(verifier);
     }
     pub fn peerShortId(self: *const SecuredLink) ?u64 {
         if (self.session) |s| return s.peerShortId();
@@ -873,6 +884,7 @@ pub const SecuredLink = struct {
             .admitted_frame_families = self.establishedKeys().admitted_frame_families,
         });
         if (self.local_nicks) |resolver| link.setLocalNickResolver(resolver);
+        if (self.residence_verifier) |v| link.setResidenceVerifier(v);
         self.inner = link;
         self.phase = .established;
         if (self.role == .initiator) {

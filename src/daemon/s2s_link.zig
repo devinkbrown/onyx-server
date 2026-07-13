@@ -244,6 +244,11 @@ pub const S2sLink = struct {
         self.peer.routes.setLocalNickResolver(resolver);
     }
 
+    /// Install (or clear) the daemon's residence-proof verifier (Design C / F1).
+    pub fn setResidenceVerifier(self: *S2sLink, verifier: ?ResidenceVerifier) void {
+        self.peer.setResidenceVerifier(verifier);
+    }
+
     /// Which remote node currently owns `nick`, per the route table.
     pub fn routeNickNode(self: *const S2sLink, nick: []const u8) ?NodeId {
         return self.peer.routeNickNode(nick);
@@ -288,6 +293,7 @@ pub const S2sLink = struct {
 
     pub const MemberIdentity = s2s_peer.MemberIdentity;
     pub const LocalNickResolver = s2s_peer.LocalNickResolver;
+    pub const ResidenceVerifier = s2s_peer.ResidenceVerifier;
 
     /// Announce a local member's presence/departure in `channel` to the peer,
     /// carrying the member's real username/realname/visible-host identity.

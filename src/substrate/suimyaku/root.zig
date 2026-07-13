@@ -36,6 +36,7 @@ pub const nick_collision = @import("nick_collision.zig");
 pub const partition_detector = @import("partition_detector.zig");
 pub const peer_link = @import("peer_link.zig");
 pub const prolly = @import("prolly.zig");
+pub const residence_trust_dst = @import("residence_trust_dst.zig");
 pub const riblt = @import("riblt.zig");
 pub const route_table = @import("route_table.zig");
 pub const s2s_peer = @import("s2s_peer.zig");
@@ -81,6 +82,7 @@ test {
     _ = partition_detector;
     _ = peer_link;
     _ = prolly;
+    _ = residence_trust_dst;
     _ = riblt;
     _ = route_table;
     _ = s2s_peer;
