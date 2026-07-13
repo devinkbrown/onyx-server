@@ -17898,6 +17898,11 @@ pub const LinuxServer = struct {
     /// fd, restore its session (and live TLS engine when carried), and arm recv.
     /// Returns true on success; ANY failure closes the fd and frees the slot.
     fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot, ws_state: ?ws_snapshot.Snapshot) bool {
+        // Per-SHARD cap (rx() is the fd-derived target shard): matches the
+        // accept path, whose cap is also per-shard — each reactor's table is
+        // reserved to max_clients, so the bound protects buffer address
+        // stability, not a global head-count. A carried client landing on a
+        // full shard is dropped fail-safe (it reconnects).
         if (self.rx().clients.len() >= self.config.max_clients) {
             closeFd(snap.fd);
             return false;
@@ -33964,6 +33969,68 @@ test "multi-shard UPGRADE seal carries clients on EVERY shard (CLOEXEC cleared)"
         try std.testing.expectEqual(@as(usize, 0), fl0 & posix.FD_CLOEXEC);
         try std.testing.expectEqual(@as(usize, 0), fl1 & posix.FD_CLOEXEC);
     } else return error.SkipZigTest;
+}
+
+test "multi-shard UPGRADE quiesce parks the sibling worker, CAS-guards, and resumes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        server.requestStop(&run);
+        thr.join();
+    }
+    // Wait for the worker pool to come up. If the fabric/pool fell back to a
+    // single in-line reactor (no eventfd), the threaded quiesce handshake
+    // under test cannot exist — skip rather than fake it.
+    var spins: usize = 0;
+    while (server.pool.count() == 0) : (spins += 1) {
+        if (spins > 2000) return error.SkipZigTest;
+        testSleepMs(1);
+    }
+
+    // Claim the quiesce from this (non-worker) thread; rx() falls back to
+    // reactor 0, mirroring the SIGUSR2 sealer's geometry. The shard-1 worker
+    // must park (shard 0's worker is the claimed shard and stays exempt).
+    try server.quiesceSiblingReactors();
+    try std.testing.expect(server.upgrade_parked.load(.acquire) >= 1);
+    // A racing second UPGRADE must lose the CAS claim and refuse — two
+    // sealers must never both walk foreign shards.
+    try std.testing.expectError(error.ShardQuiesceFailed, server.quiesceSiblingReactors());
+
+    // Resume: the parked worker drains its park (counter returns to 0) ...
+    server.resumeSiblingReactors();
+    spins = 0;
+    while (server.upgrade_parked.load(.acquire) != 0) : (spins += 1) {
+        if (spins > 5000) return error.TestUnexpectedResult;
+        testSleepMs(1);
+    }
+    // ... and the daemon still serves: a fresh client registers and gets a
+    // PONG after the aborted-upgrade round trip (no wedged reactor, no
+    // leaked quiesce flag).
+    const cfd = try connectLoopback(port);
+    defer closeFd(cfd);
+    try writeAllFd(cfd, "NICK quiesced\r\nUSER q 0 * :q\r\nPING :alive\r\n");
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(alloc);
+    var rbuf: [1024]u8 = undefined;
+    var guard: usize = 0;
+    while (std.mem.indexOf(u8, acc.items, "PONG") == null) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(cfd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        try acc.appendSlice(alloc, rbuf[0..n]);
+    }
 }
 
 test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves both" {

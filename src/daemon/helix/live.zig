@@ -129,8 +129,16 @@ pub const env_listen_fd = "OROCHI_HELIX_LISTEN_FD";
 /// in shard order (`fd0,fd1,...`), preserved across execve so EVERY shard's
 /// SO_REUSEPORT listener survives the swap (no accept-queue drop on shards
 /// 1..N-1). `env_listen_fd` still carries shard 0's fd alone so an older
-/// successor image (which only knows the singular variable) adopts shard 0 and
-/// degrades gracefully. Emitted only when more than one shard listener exists.
+/// successor image (which only knows the singular variable) adopts shard 0.
+/// Emitted only when more than one shard listener exists.
+///
+/// ROLLBACK CAVEAT: a hot USR2 from a MULTI-SHARD predecessor down to a
+/// binary that predates this variable inherits shards 1..N-1's un-CLOEXEC'd
+/// listener fds without knowing to adopt OR close them — they stay in the
+/// SO_REUSEPORT group, silently black-holing the share of NEW connections the
+/// kernel hashes onto their never-accepted queues (existing/carried
+/// connections are unaffected; a cold restart self-heals). Roll back across
+/// this boundary with a cold restart, never USR2.
 pub const env_listen_fds = "OROCHI_HELIX_LISTEN_FDS";
 /// Hard cap on inherited per-shard listener fds parsed from the environment
 /// (bounds the fixed `Resume` buffer; shards beyond it bind fresh listeners).
