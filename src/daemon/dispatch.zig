@@ -1287,6 +1287,13 @@ pub const ClientSession = struct {
             self.setOperGrant(oper.OperPrivileges.fromBits(snap.oper_priv_bits), snap.oper_class, snap.oper_title);
         } else {
             self.is_oper = false;
+            // Fail-closed: the umode bitset above was copied wholesale (so
+            // carried server-managed marks like +z/+x survive the handoff),
+            // but the +a admin umode is DERIVED from the oper grant — a
+            // non-oper snapshot must never surface it, even from a corrupt
+            // or forged predecessor blob. The oper branch re-derives it via
+            // setOperGrant; this branch strips it explicitly.
+            self.umodes.remove(.admin);
         }
         // Re-enable the negotiated IRCv3 caps carried across the UPGRADE (by name),
         // so echo-message and friends keep working without a client reconnect.
@@ -2352,6 +2359,30 @@ test "session snapshot -> encode -> decode -> restore round-trips" {
     try std.testing.expect(s2.hasCap(.server_time));
     try std.testing.expect(s2.hasCap(.message_tags));
     try std.testing.expect(!s2.hasCap(.sasl));
+}
+
+test "restore carries client umodes; a forged +a on a non-oper snapshot is stripped" {
+    // Client-set modes ride the v4 umode_bits tail and must survive restore.
+    var s = ClientSession.init();
+    try s.setNick("bob");
+    _ = s.setUmode(.invisible, true);
+    _ = s.setUmode(.callerid, true);
+    var s2 = ClientSession.init();
+    s2.restore(s.snapshot());
+    try std.testing.expect(s2.hasUmode(.invisible));
+    try std.testing.expect(s2.hasUmode(.callerid));
+    try std.testing.expect(!s2.hasUmode(.admin));
+
+    // Fail-closed: a (corrupt/forged) snapshot claiming the server-managed +a
+    // WITHOUT an oper grant must not surface it — restore strips it on the
+    // non-oper branch; only setOperGrant may derive it.
+    var forged = s.snapshot();
+    forged.umode_bits |= @as(u64, 1) << @intFromEnum(usermode.UserMode.admin);
+    forged.is_oper = false;
+    var s3 = ClientSession.init();
+    s3.restore(forged);
+    try std.testing.expect(!s3.hasUmode(.admin));
+    try std.testing.expect(s3.hasUmode(.invisible)); // client-set bits still land
 }
 
 test "full registration handshake emits welcome numerics" {

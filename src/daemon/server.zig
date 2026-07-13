@@ -2068,6 +2068,16 @@ fn wsCarryable(ws: *const WsState) bool {
         ws.deframer.pending_error == null;
 }
 
+/// Ceiling on MONITOR targets carried per client across a Helix UPGRADE. The
+/// seal CLAMPS to this (a client watching more carries a truncated list) and
+/// the adopt decode buffer is sized by it — the two MUST stay in lockstep, or
+/// an over-cap capsule fails decode with TooMany and the whole list is lost
+/// (`[limits] monitorlimit` is configurable well above any fixed buffer).
+const max_carried_monitor_targets = 512;
+/// Same contract for SILENCE masks (`[limits] silencelimit`); seal enumeration
+/// and adopt decode both use this bound, so an over-cap list truncates.
+const max_carried_silence_masks = 256;
+
 const AcceptKind = enum { plain, tls, ws };
 
 pub const ConnState = struct {
@@ -17176,7 +17186,12 @@ pub const LinuxServer = struct {
             // client ids do not survive the swap). Best-effort: any failure
             // loses only the watch list, never the client.
             const mon_client = monitorIdFromClient(e.id);
-            const mon_n = self.monitor.monitorCount(mon_client);
+            // Clamp the seal to what the adopt side can decode: the restore
+            // buffer holds max_carried_monitor_targets entries, and a capsule
+            // exceeding it would fail decode with TooMany — losing the WHOLE
+            // list. A node configured with `monitorlimit` above the clamp
+            // carries a partial (truncated) list instead of nothing.
+            const mon_n = @min(self.monitor.monitorCount(mon_client), max_carried_monitor_targets);
             if (mon_n != 0) carry_mon: {
                 const targets = self.allocator.alloc([]const u8, mon_n) catch break :carry_mon;
                 defer self.allocator.free(targets);
@@ -17201,7 +17216,7 @@ pub const LinuxServer = struct {
             // client_id). The store is keyed by owner nick; the successor
             // resolves the adopted client's nick from the fd. Best-effort.
             carry_sil: {
-                var sil_masks: [256][]const u8 = undefined;
+                var sil_masks: [max_carried_silence_masks][]const u8 = undefined;
                 const sil_n = self.silence.masksInto(e.value.session.displayName(), &sil_masks);
                 if (sil_n == 0) break :carry_sil;
                 var wire_len: usize = 4 + 1 + 8 + 2; // magic + version + client_id + count
@@ -17397,7 +17412,7 @@ pub const LinuxServer = struct {
         for (caps) |c| {
             if (c.header.kind != .monitor_list) continue;
             if (c.fields.len == 0) continue;
-            var tgt_buf: [512][]const u8 = undefined;
+            var tgt_buf: [max_carried_monitor_targets][]const u8 = undefined;
             const mc = monitor_capsule.MonitorCapsule.decode(c.fields[0].bytes, &tgt_buf) catch continue;
             if (mc.client_id > std.math.maxInt(i32)) continue;
             const watcher = self.adoptedClientIdByFd(@intCast(mc.client_id)) orelse continue;
@@ -17416,7 +17431,7 @@ pub const LinuxServer = struct {
         for (caps) |c| {
             if (c.header.kind != .silence_list) continue;
             if (c.fields.len == 0) continue;
-            var mask_buf: [256][]const u8 = undefined;
+            var mask_buf: [max_carried_silence_masks][]const u8 = undefined;
             const sc = silence_capsule.SilenceCapsule.decode(c.fields[0].bytes, &mask_buf) catch continue;
             if (sc.client_id > std.math.maxInt(i32)) continue;
             const owner_conn = self.adoptedConnByFd(@intCast(sc.client_id)) orelse continue;
