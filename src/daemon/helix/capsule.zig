@@ -102,7 +102,14 @@ pub const registry = [_]Descriptor{
     // (u32), growing the embedded blob by 4 bytes. `min_supported = 1` keeps accepting
     // v1 capsules sealed by pre-bump binaries; `s2s_snapshot.decode` is version-aware.
     .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 2, .min_supported = 1, .max_supported = 2 },
-    .{ .kind = .ws_session, .schema_id = 0x4857_5353, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // v2 (2026-07): appends the WS adapter's partial framing state — the
+    // deframer's buffered partial inbound frame + fragmentation flags and the tx
+    // accumulator's partial outbound line — so a mid-frame wss client is carried
+    // instead of dropped (v1 only sealed at a clean framing boundary, which an
+    // active browser client almost never sits at, so every busy wss client
+    // reconnected on every upgrade). `min_supported = 1` keeps accepting v1
+    // capsules sealed by pre-bump binaries; `ws_snapshot.decode` is version-aware.
+    .{ .kind = .ws_session, .schema_id = 0x4857_5353, .current_version = 2, .min_supported = 1, .max_supported = 2 },
     .{ .kind = .tls_ticket_keys, .schema_id = 0x4854_4b59, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // One staged cross-mesh session-migration entry (a `session_migrate.encode`
     // wire blob: token + account + verified snapshot), one capsule per entry, so

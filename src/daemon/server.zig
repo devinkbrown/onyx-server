@@ -2047,19 +2047,21 @@ const WsState = struct {
     tx_len: usize = 0,
 };
 
-/// Whether a WebSocket adapter is at a clean framing boundary — safe to carry
-/// across a Helix UPGRADE by rebuilding a fresh empty adapter on the successor.
-/// True only when the handshake is complete (phase=open) and nothing is in
-/// flight in either direction: no partial inbound frame buffered in the
-/// deframer, no pending deframed event or error, no open fragmented message,
-/// and no partial outbound line accumulated in tx. If any residue exists,
-/// rebuilding a fresh adapter would drop those bytes and corrupt the stream, so
-/// the client is not carried (it reconnects instead).
-fn wsCleanBoundary(ws: *const WsState) bool {
+/// Whether a WebSocket adapter can be carried across a Helix UPGRADE. The
+/// handshake must be complete (phase=open) and the deframer must hold no
+/// popped-but-unconsumed event and no latent error — both exist only
+/// transiently INSIDE one `driveWs` turn (the drive loop drains events until
+/// `next()` returns null and an error sets `closing`), so between reactor
+/// turns they are always null; this only excludes a pathological mid-turn
+/// seal. Partial state that legitimately persists between turns IS carried:
+/// the deframer's buffered partial inbound frame bytes (+ fragmentation
+/// flags) and the tx accumulator's partial outbound line are serialized into
+/// the `.ws_session` capsule (v2) and restored verbatim on the successor, so
+/// a mid-frame browser client survives the upgrade with no lost bytes — the
+/// v1 clean-boundary-only gate dropped essentially every active wss client.
+/// A handshake-phase adapter is never carried (the browser reconnects).
+fn wsCarryable(ws: *const WsState) bool {
     return ws.phase == .open and
-        ws.tx_len == 0 and
-        ws.deframer.len == 0 and
-        !ws.deframer.fragmented and
         ws.deframer.pending == null and
         ws.deframer.pending_error == null;
 }
@@ -16980,16 +16982,18 @@ pub const LinuxServer = struct {
             if (requester_fd) |rfd| {
                 if (e.value.fd == rfd) continue;
             }
-            // wss browser client (Ruri & friends): carry it ONLY when its
-            // WebSocket adapter is at a clean framing boundary — handshake done
-            // (phase=open), no partial inbound frame in the deframer, no partial
-            // outbound line in the tx accumulator. At such a boundary the
-            // successor rebuilds a fresh empty adapter and resumes framing with
-            // no lost bytes (the TLS crypto rides its own capsule below). If the
-            // adapter is mid-frame, fall back to the historical behavior: don't
-            // carry it, its socket closes at execve and the browser reconnects
-            // against the still-bound listener.
-            const carry_ws = if (e.value.ws) |wsst| wsCleanBoundary(wsst) else false;
+            // wss browser client (Ruri & friends): carry it whenever its
+            // WebSocket adapter is past the HTTP Upgrade (phase=open) — the
+            // adapter's partial framing state (a mid-frame deframer + a partial
+            // outbound line) is serialized into the `.ws_session` capsule (v2)
+            // and restored verbatim on the successor, so being mid-frame no
+            // longer drops the client (the TLS crypto rides its own capsule
+            // below). Only a handshake-phase adapter — or the pathological
+            // popped-event-pending state that cannot exist between reactor
+            // turns — falls back to the historical behavior: not carried, its
+            // socket closes at execve and the browser reconnects against the
+            // still-bound listener.
+            const carry_ws = if (e.value.ws) |wsst| wsCarryable(wsst) else false;
             if (e.value.ws != null and !carry_ws) continue;
             // TLS client: export the live engine state FIRST — if it cannot be
             // exported the connection is not carried at all (its fd keeps
@@ -17106,7 +17110,18 @@ pub const LinuxServer = struct {
             // WebSocket adapter for this fd. An orphaned WS capsule is harmless
             // (ignored when no client matches its fd).
             if (carry_ws) {
-                const wb = ws_snapshot.encode(self.allocator, .{ .fd = e.value.fd, .phase_open = true }) catch {
+                const wsst = e.value.ws.?;
+                const wb = ws_snapshot.encode(self.allocator, .{
+                    .fd = e.value.fd,
+                    .phase_open = true,
+                    .fragmented = wsst.deframer.fragmented,
+                    .msg_binary = wsst.deframer.msg_binary,
+                    // Partial framing state (v2): the buffered partial inbound
+                    // frame's wire bytes + the partial outbound line, restored
+                    // verbatim by the successor so no byte is lost mid-frame.
+                    .deframer = wsst.deframer.buf[0..wsst.deframer.len],
+                    .tx = wsst.tx_buf[0..wsst.tx_len],
+                }) catch {
                     self.allocator.free(blob);
                     continue;
                 };
@@ -17240,7 +17255,7 @@ pub const LinuxServer = struct {
         for (caps) |c| {
             if (c.header.kind != .ws_session) continue;
             if (c.fields.len == 0) continue;
-            const wss = ws_snapshot.decode(c.fields[0].bytes) catch continue;
+            const wss = ws_snapshot.decode(c.fields[0].bytes, c.header.version) catch continue;
             ws_snaps.append(self.allocator, wss) catch continue;
         }
 
@@ -17477,15 +17492,36 @@ pub const LinuxServer = struct {
                 return false;
             }
         }
-        // wss browser client: rebuild the WebSocket framing adapter. It was
-        // carried only from a clean boundary, so a FRESH, empty adapter (phase
-        // open) resumes framing with no lost bytes — the TLS engine rebuilt
-        // above sits beneath it. Allocation failure drops the client cleanly
-        // (its fd is closed and the slot freed), never adopting a wss socket as
-        // raw IRC bytes (which would corrupt every frame the browser receives).
+        // wss browser client: rebuild the WebSocket framing adapter, restoring
+        // the carried partial framing state (v2 capsule) — the deframer's
+        // buffered partial inbound frame + fragmentation flags and the tx
+        // accumulator's partial outbound line — so a mid-frame client resumes
+        // with no lost bytes. A v1 capsule (clean-boundary seal) carries empty
+        // partials and rebuilds a fresh adapter exactly as before. The TLS
+        // engine rebuilt above sits beneath it. ANY failure (allocation, or a
+        // partial blob that cannot fit the adapter's buffers — impossible from
+        // an honest predecessor, but the arena is validated fail-closed) drops
+        // the client cleanly (fd closed, slot freed), never adopting a wss
+        // socket as raw IRC bytes (which would corrupt every frame).
         if (ws_state) |wsv| {
             if (wsv.phase_open) {
-                const ws = self.allocator.create(WsState) catch {
+                const ws_ok = blk: {
+                    const ws = self.allocator.create(WsState) catch break :blk false;
+                    ws.* = .{ .phase = .open };
+                    if (wsv.deframer.len > ws.deframer.buf.len or wsv.tx.len > ws.tx_buf.len) {
+                        self.allocator.destroy(ws);
+                        break :blk false;
+                    }
+                    @memcpy(ws.deframer.buf[0..wsv.deframer.len], wsv.deframer);
+                    ws.deframer.len = wsv.deframer.len;
+                    ws.deframer.fragmented = wsv.fragmented;
+                    ws.deframer.msg_binary = wsv.msg_binary;
+                    @memcpy(ws.tx_buf[0..wsv.tx.len], wsv.tx);
+                    ws.tx_len = wsv.tx.len;
+                    conn.ws = ws;
+                    break :blk true;
+                };
+                if (!ws_ok) {
                     if (conn.tls) |t| {
                         t.deinit();
                         self.allocator.destroy(t);
@@ -17495,9 +17531,7 @@ pub const LinuxServer = struct {
                     _ = self.rx().clients.free(id);
                     closeFd(snap.fd);
                     return false;
-                };
-                ws.* = .{ .phase = .open };
-                conn.ws = ws;
+                }
             }
         }
         // Re-populate the world nick registry so the carried client stays
@@ -50423,38 +50457,46 @@ test "threaded server: WHISPER and DATA relay to a remote-shard channel co-membe
     } else return error.SkipZigTest;
 }
 
-test "wsCleanBoundary: only an idle, open, residue-free adapter is carriable" {
+test "wsCarryable: any open adapter carries, incl. mid-frame; handshake/pending never" {
     const alloc = std.testing.allocator;
     const ws = try alloc.create(WsState); // heap: WsState holds MiB-sized buffers
     defer alloc.destroy(ws);
 
     // A fresh adapter is still in the HTTP Upgrade handshake — never carried.
     ws.* = .{};
-    try std.testing.expect(!wsCleanBoundary(ws));
+    try std.testing.expect(!wsCarryable(ws));
 
-    // Open, with nothing buffered in either direction: safe to carry.
+    // Open, with nothing buffered in either direction: carried.
     ws.* = .{ .phase = .open };
-    try std.testing.expect(wsCleanBoundary(ws));
+    try std.testing.expect(wsCarryable(ws));
 
-    // A partial inbound frame mid-arrival would be lost by a fresh deframer.
+    // A partial inbound frame mid-arrival is carried now — its wire bytes are
+    // serialized into the v2 capsule and restored verbatim by the successor
+    // (the v1 clean-boundary gate dropped exactly this, i.e. every busy client).
     ws.* = .{ .phase = .open };
     ws.deframer.len = 3;
-    try std.testing.expect(!wsCleanBoundary(ws));
+    try std.testing.expect(wsCarryable(ws));
 
-    // A partial outbound line in the tx accumulator would be lost.
+    // A partial outbound line in the tx accumulator is carried too.
     ws.* = .{ .phase = .open };
     ws.tx_len = 5;
-    try std.testing.expect(!wsCleanBoundary(ws));
+    try std.testing.expect(wsCarryable(ws));
 
-    // An open fragmented message must complete before a clean handoff.
+    // An open fragmented message carries with its fragmentation flags.
     ws.* = .{ .phase = .open };
     ws.deframer.fragmented = true;
-    try std.testing.expect(!wsCleanBoundary(ws));
+    try std.testing.expect(wsCarryable(ws));
 
-    // A buffered, not-yet-dispatched deframed event blocks the carry.
+    // A popped-but-unconsumed deframed event cannot exist between reactor turns;
+    // a mid-turn seal that sees one still refuses to carry (fail-safe).
     ws.* = .{ .phase = .open };
     ws.deframer.pending = .pong;
-    try std.testing.expect(!wsCleanBoundary(ws));
+    try std.testing.expect(!wsCarryable(ws));
+
+    // Same for a latent deframe error awaiting its next() surface.
+    ws.* = .{ .phase = .open };
+    ws.deframer.pending_error = error.BufferFull;
+    try std.testing.expect(!wsCarryable(ws));
 }
 
 test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
