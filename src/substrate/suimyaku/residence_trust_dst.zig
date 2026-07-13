@@ -146,6 +146,26 @@ fn runOne(allocator: std.mem.Allocator, seed: u64) !void {
         std.debug.print("F1 VIOLATION (static): unproven cross-node claim coexisted: {s}\n", .{@tagName(forged)});
         return error.UntrustedShortCircuit;
     }
+
+    // ---- Invariant 5 (mesh C1, the P2 store-side blank): a FORGED unproven
+    // incumbent grants NO coexistence to a LATER genuinely-trusted newcomer. This
+    // is the store half of F1: s2s_peer persists a forged (untrusted) claim
+    // account-LESS (P2), so even a later newcomer whose OWN proof verifies cannot
+    // `remote_same_account`-merge with the forged incumbent — the merge compares
+    // against the STORED incumbent account, which is "". The forger thus never
+    // draws a third node's same-account coexistence to itself.
+    var t3 = try RouteTable.init(allocator, .{ .max_nicks = 32, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer t3.deinit();
+    // The Byzantine node's forged claim was UNTRUSTED, so s2s_peer stored it with
+    // account="" (P2). Model exactly that: incumbent present under the real nick
+    // but account-less.
+    _ = try t3.applyMembership(chan, contested_nick, node_byzantine, 0, 100, true, .{ .account = "" }, 0);
+    // A genuine multi-device newcomer from a different node arrives TRUSTED.
+    const c1 = t3.resolveIncomingNick(contested_nick, node_genuine, 200, contested_account, true);
+    if (c1 == .remote_same_account or c1 == .local_same_account or c1 == .reclaim_local) {
+        std.debug.print("F1 VIOLATION (C1): forged account-less incumbent granted coexistence: {s}\n", .{@tagName(c1)});
+        return error.UntrustedShortCircuit;
+    }
 }
 
 fn applyDecision(table: *RouteTable, decision: NickDecision, node: NodeId, hlc: u64) void {

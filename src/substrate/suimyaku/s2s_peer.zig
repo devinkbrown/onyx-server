@@ -1413,6 +1413,14 @@ pub const S2sPeer = struct {
         var surfaced_nick: ?[]const u8 = null;
         var skip_displace = false;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
+        // P2 (F1 store-side blank): the account PERSISTED into the route table is
+        // the wire account ONLY when this claim's residence proof verifies; else
+        // "". A forged (untrusted) incumbent is therefore stored account-less and
+        // can NEVER later let a TRUSTED newcomer `remote_same_account`-merge with
+        // it on a third node (route_table compares against the STORED incumbent
+        // account). Blank by default so a part (present=false) is also account-
+        // less; set below for a trusted present claim.
+        var store_account: []const u8 = "";
         if (ev.present) {
             // Design C (F1): the plaintext wire `account` is only honored by the
             // same-identity collision short-circuits when a residence proof
@@ -1420,19 +1428,8 @@ pub const S2sPeer = struct {
             // origin-authenticated link, against receiver-owned keys. When
             // false, resolveIncomingNick blanks the account internally so the
             // claim takes the conservative UID path.
-            //
-            // NOTE (F1-authority, REQUIRED before enabling trust): the STORE-side
-            // account is NOT blanked here — applyMembership below persists the
-            // raw `ev.account`. While `residenceTrusted` is gated off
-            // (server.zig `accountKeyAuthorityGateAvailable` == false), no claim
-            // is ever trusted, so a forged incumbent can never coexist with a
-            // trusted newcomer and this is inert (and remote WHOIS 330 is
-            // unchanged). But enabling trust MUST also store `if (account_trusted)
-            // ev.account else ""` here and in recvNickChange, or a forged
-            // incumbent re-unlocks `remote_same_account` for a verified newcomer
-            // on third-party nodes. Kept as raw-store today to match the
-            // conservative baseline exactly; see the server.zig gate doc.
             const account_trusted = self.accountResidenceTrusted(ev.account, ev.origin_node);
+            store_account = if (account_trusted) ev.account else "";
             switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc, ev.account, account_trusted)) {
                 .keep => {},
                 .rename_to_uid => |uid| {
@@ -1465,7 +1462,7 @@ pub const S2sPeer = struct {
                         .username = ev.username,
                         .realname = ev.realname,
                         .host = ev.host,
-                        .account = ev.account,
+                        .account = store_account, // P2: only the trusted account is persisted
                         .real_host = ev.real_host,
                         .certfp = ev.certfp,
                     }, local_now) catch {};
@@ -1483,7 +1480,7 @@ pub const S2sPeer = struct {
             .username = ev.username,
             .realname = ev.realname,
             .host = ev.host,
-            .account = ev.account,
+            .account = store_account, // P2: blanked unless residence-trusted
             .real_host = ev.real_host,
             .certfp = ev.certfp,
         }, local_now) catch return;
@@ -2013,19 +2010,22 @@ pub const S2sPeer = struct {
         // mesh node) makes the RENAMER the loser: redirect it to its mesh UID
         // instead of clobbering the holder. A same-node incumbent is the user's
         // own prior nick, never a collision (resolveIncomingNick handles both).
+        // Design C (F1): the wire account is only honored by the same-identity
+        // short-circuits when a residence proof verifies (per claim, receiver-
+        // owned keys, origin-authenticated link); else it is blanked internally
+        // and the claim takes the conservative UID path. P2: the account PERSISTED
+        // via renameNick is likewise the wire account only when trusted, so a
+        // forged rename is stored account-less (no later coexistence merge).
+        const account_trusted = self.accountResidenceTrusted(ev.account, ev.origin_node);
         const ident = MemberIdentity{
             .username = ev.username,
             .realname = ev.realname,
             .host = ev.host,
-            .account = ev.account,
+            .account = if (account_trusted) ev.account else "",
         };
         var target_nick: []const u8 = ev.new_nick;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
-        // Design C (F1): the wire account is only honored by the same-identity
-        // short-circuits when a residence proof verifies (per claim, receiver-
-        // owned keys, origin-authenticated link); else it is blanked internally
-        // and the claim takes the conservative UID path.
-        switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc, ev.account, self.accountResidenceTrusted(ev.account, ev.origin_node))) {
+        switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc, ev.account, account_trusted)) {
             .keep => self.displaceIncumbentForRename(ev.new_nick, ev.origin_node),
             .rename_to_uid => |uid| {
                 @memcpy(uid_buf[0..uid.len], uid[0..]);
@@ -3479,6 +3479,144 @@ test "a same-account MEMBERSHIP that is NOT newer keeps the live local session (
     try std.testing.expectEqual(@as(usize, 1), changes.len);
     try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.joined, changes[0].kind);
     try std.testing.expectEqualStrings("kain", changes[0].nick); // real nick, NOT a UID
+}
+
+test "P2 (F1): an UNTRUSTED MEMBERSHIP is STORED account-less (no verifier ⇒ blanked)" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x81);
+    const kp_b = try signingKeyFor(0x82);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x8EE);
+
+    // No residence verifier ⇒ the wire account is untrusted. It must be blanked in
+    // the STORE, not just at resolve time: a forged incumbent persisted account-less
+    // can never let a later TRUSTED newcomer remote_same_account-merge with it.
+    try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x8EF);
+
+    const members = b.channelMembers("#room");
+    try std.testing.expectEqual(@as(usize, 1), members.len);
+    try std.testing.expectEqualStrings("kain", members[0].nick);
+    try std.testing.expectEqualStrings("", members[0].account); // blanked, NOT the wire "kain"
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+}
+
+test "P2 (F1): a TRUSTED MEMBERSHIP is STORED with the real account (verified ⇒ preserved)" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x83);
+    const kp_b = try signingKeyFor(0x84);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x9EE);
+
+    // a's kain carries a VERIFIED residence proof (Design C) — the receiver trusts
+    // the account, so the real account is preserved in the store (multi-device).
+    var vstub = TrustVerifierStub{ .account = "kain", .origin_node = a_short };
+    b.setResidenceVerifier(vstub.verifier());
+
+    try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x9EF);
+
+    const members = b.channelMembers("#room");
+    try std.testing.expectEqual(@as(usize, 1), members.len);
+    try std.testing.expectEqualStrings("kain", members[0].nick);
+    try std.testing.expectEqualStrings("kain", members[0].account); // real account preserved
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+}
+
+test "P2 (F1): a forged UNTRUSTED incumbent grants NO coexistence to a later TRUSTED newcomer" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x85);
+    const kp_b = try signingKeyFor(0x86);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xAEE);
+
+    // Node a forges an UNTRUSTED account=kain (no verifier yet) — stored blanked.
+    try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 100, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xAEF);
+    {
+        const members = b.channelMembers("#room");
+        try std.testing.expectEqual(@as(usize, 1), members.len);
+        try std.testing.expectEqualStrings("", members[0].account); // forged incumbent is account-less
+    }
+    {
+        const changes = try b.takeMembershipChanges();
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+
+    // The forged incumbent (a, account="") must grant NO same-account coexistence
+    // to a genuinely TRUSTED newcomer from a different node — because the stored
+    // incumbent account is blank, `remote_same_account` cannot fire. The newcomer
+    // is contested on the deterministic (hlc,node) tiebreak, never merged.
+    const decision = b.routes.resolveIncomingNick("kain", b_short ^ 0x1, 200, "kain", true);
+    try std.testing.expect(decision != .remote_same_account);
 }
 
 test "signing peers round-trip a signed KILL frame" {

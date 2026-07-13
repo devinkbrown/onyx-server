@@ -11409,18 +11409,22 @@ pub const LinuxServer = struct {
     ///      genuine home's key at any hlc). A Byzantine node with no SASL session
     ///      for the victim cannot write the victim's key.
     ///
-    ///  (2) STORE-SIDE account blanking on trust — PENDING (next commit):
-    ///      `recvMembership`/`recvNickChange` must persist
+    ///  (2) STORE-SIDE account blanking on trust — LANDED:
+    ///      `recvMembership`/`recvNickChange` now persist
     ///      `if (account_trusted) ev.account else ""` at the applyMembership/
     ///      renameNick sites, so a forged (untrusted) incumbent is stored
     ///      account-less and can NEVER later let a TRUSTED newcomer
-    ///      `remote_same_account`-merge with it on a third node.
+    ///      `remote_same_account`-merge with it on a third node. Proven by the
+    ///      `residence_trust_dst` forged-incumbent (C1) invariant.
     ///
-    /// This gate stays false — the conservative UID path — until (2) also lands,
-    /// then it is flipped true (residence trust becomes live). Owner: orochi-mesh
-    /// / stack-architect.
+    /// With both landed, residence trust is F1-sound: a PROVEN same-account claim
+    /// coexists (multi-device restored), an UNPROVEN/forged claim takes the
+    /// conservative UID path, and the sticky-trust rule (§4.4) never re-gates a
+    /// live established member (`route_table.zig` same-node `.keep`). The residual
+    /// cold-third-node pre-convergence window is the bounded R3 case (self-heals on
+    /// prop convergence). Owner: orochi-mesh / stack-architect.
     fn accountKeyAuthorityGateAvailable() bool {
-        return false; // TODO(F1-authority): flip true once the store-side blank (2) also lands.
+        return true; // F1: (1) ENTITY_PROP identity-write authority gate AND (2) store-side account blank both landed.
     }
 
     /// RECEIVER-side residence-proof verify callback (Design C / F1). Verify a
