@@ -26741,6 +26741,27 @@ pub const LinuxServer = struct {
         else
             "";
 
+        // Privilege non-downgrade: reclaiming a detached ghost must never strip
+        // elevation the LIVE session already holds. The migration snapshot
+        // carries at most a bare `is_oper` bool — no privilege bits, class, or
+        // title — so restore() below either drops oper entirely (ghost detached
+        // pre-elevation) or re-grants a zero-privilege bare oper. SASL oper
+        // elevation runs BEFORE this restore on login, so a freshly-elevated
+        // session would 481 on its next privileged action. Snapshot the live
+        // grant into stack buffers (the getters return slices INTO session
+        // storage that restore() rewrites) and re-assert it afterwards.
+        const live_was_oper = conn.session.isOper();
+        const live_priv_bits = conn.session.oper_priv.toBits();
+        const live_had_override = conn.session.hasUmode(.override);
+        var live_class_buf: [64]u8 = undefined;
+        const live_class_src = conn.session.operClass();
+        const live_class_len = @min(live_class_src.len, live_class_buf.len);
+        @memcpy(live_class_buf[0..live_class_len], live_class_src[0..live_class_len]);
+        var live_title_buf: [64]u8 = undefined;
+        const live_title_src = conn.session.operTitle();
+        const live_title_len = @min(live_title_src.len, live_title_buf.len);
+        @memcpy(live_title_buf[0..live_title_len], live_title_src[0..live_title_len]);
+
         // Restore identity/account/away/oper through the SAME session restore the
         // UPGRADE path uses, by projecting the migration snapshot onto a
         // session_snapshot.Snapshot. The fd is irrelevant (the client is already
@@ -26756,6 +26777,22 @@ pub const LinuxServer = struct {
             .away_active = snap.away.len != 0,
             .is_oper = snap.is_oper,
         });
+        // Merge, never downgrade: if the live session was opered, re-assert its
+        // grant (union of privilege bits — the ghost contributes at most zero —
+        // plus the live class/title, and the +j override umode auto_override
+        // granted at elevation). A non-oper live session adopting an opered
+        // ghost keeps the existing bare-oper restore semantics unchanged.
+        if (live_was_oper) {
+            const merged_bits = live_priv_bits | conn.session.oper_priv.toBits();
+            conn.session.setOperGrant(
+                oper_mod.OperPrivileges.fromBits(merged_bits),
+                live_class_buf[0..live_class_len],
+                live_title_buf[0..live_title_len],
+            );
+            if (live_had_override and conn.session.hasPriv(.oper_override)) {
+                _ = conn.session.setUmode(.override, true);
+            }
+        }
         self.injectSessionState(conn);
         conn.nick_claimed_at_ms = 0;
 
@@ -38032,6 +38069,69 @@ test "threaded server: login auto-restores detached nick and all channels before
     try writeAllFd(fd_b, "WHOIS trev\r\n");
     try recvUntil(&b, " 318 trev trev ", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "TempResume") == null);
+}
+
+test "threaded server: SASL-opered login keeps oper privileges across detached-ghost auto-restore" {
+    // Regression: SASL registration elevates the live session FIRST
+    // (elevateOperFromAccount), then applyLoginJoinState auto-restores the
+    // newest detached ghost of the same account. The ghost's migration
+    // snapshot carries at most a bare `is_oper` bool — no privilege bits,
+    // class, or title — so a blind session.restore() clobbered the freshly
+    // granted oper privileges to zero and the next privileged action 481'd.
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // Session A: SASL-oper as admin, join a channel, then drop abruptly so a
+    // detached ghost (with snapshot) is retained for the account.
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    var fd_a_open = true;
+    defer if (fd_a_open) closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try writeAllFd(fd_a, "NICK trev\r\nUSER trev 0 * :Trev\r\n");
+    try recvUntil(&a, " 381 trev ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #ops\r\n");
+    try recvUntil(&a, " 366 trev #ops ", 200);
+    closeFd(fd_a);
+    fd_a_open = false;
+    testSleepMs(50);
+
+    // Session B: fresh SASL-oper login on the same account. Registration
+    // elevates it (381), then the detached ghost is auto-restored (nick +
+    // channels). The restore must NOT downgrade the live elevation.
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var b = LiveClient{ .fd = fd_b };
+    try saslPlainPrelude(fd_b, "admin", "orochi");
+    try writeAllFd(fd_b, "NICK TempOper\r\nUSER webchat 0 * :Webchat\r\n");
+    try recvUntil(&b, " 381 TempOper ", 200);
+    try recvUntil(&b, "NICK :trev", 200);
+    try recvUntil(&b, "JOIN #ops", 200);
+
+    // The reclaimed session must still hold its granted privileges: a bare
+    // SHUN (list) requires .client_moderate — it must succeed, never 481.
+    b.reset();
+    try writeAllFd(fd_b, "SHUN\r\n");
+    try recvUntil(&b, "SHUN: end of list", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 481 ") == null);
 }
 
 test "threaded server: mesh-token local resume restores detached snapshot" {
