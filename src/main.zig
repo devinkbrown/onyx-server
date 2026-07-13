@@ -128,6 +128,11 @@ pub fn main(init: std.process.Init) !void {
     var srv_cfg = orochi.daemon.server.Config{ .port = 6680 };
     var held: ?orochi.daemon.config_boot.Loaded = null;
     defer if (held) |*h| h.deinit(allocator);
+    // Backing storage for the inherited per-shard listener fds (multi-shard
+    // Helix handoff). Lives on main's frame so the slice stored on the config
+    // stays valid for the whole boot.
+    var inherited_listeners: [orochi.daemon.helix.live.max_inherited_listeners]i32 = undefined;
+    if (comptime builtin.os.tag != .linux) _ = &inherited_listeners;
 
     var args = try std.process.Args.iterateAllocator(init.minimal.args, allocator);
     defer args.deinit(); // no-op on POSIX, frees the arg buffer on Windows/WASI
@@ -151,6 +156,16 @@ pub fn main(init: std.process.Init) !void {
                         std.debug.print("orochi: Helix resume — adopting listen fd {d}\n", .{lfd});
                     } else {
                         std.debug.print("orochi: Helix resume (no listen fd; binding fresh)\n", .{});
+                    }
+                    // Multi-shard predecessor: the full shard-ordered listener
+                    // list (entry 0 duplicates the singular fd above). Each
+                    // successor shard adopts its own; leftovers are closed at
+                    // server init. Copy into main's frame — the config slice
+                    // must outlive server init.
+                    if (r.listen_fd_count > 1) {
+                        inherited_listeners = r.listen_fds;
+                        srv_cfg.inherited_listener_fds = inherited_listeners[0..r.listen_fd_count];
+                        std.debug.print("orochi: Helix resume — adopting {d} per-shard listen fds\n", .{r.listen_fd_count});
                     }
                     // Hand the inherited state arena to the server, which reads it
                     // after boot and re-attaches the carried-over client connections.

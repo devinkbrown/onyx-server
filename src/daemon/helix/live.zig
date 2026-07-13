@@ -125,6 +125,16 @@ pub const env_control_fd = "OROCHI_HELIX_CONTROL_FD";
 /// The inherited listening-socket fd, preserved across execve so the successor
 /// keeps the port bound (no connection-refused window during an UPGRADE).
 pub const env_listen_fd = "OROCHI_HELIX_LISTEN_FD";
+/// Multi-shard listener handoff: comma-separated per-shard client-listener fds
+/// in shard order (`fd0,fd1,...`), preserved across execve so EVERY shard's
+/// SO_REUSEPORT listener survives the swap (no accept-queue drop on shards
+/// 1..N-1). `env_listen_fd` still carries shard 0's fd alone so an older
+/// successor image (which only knows the singular variable) adopts shard 0 and
+/// degrades gracefully. Emitted only when more than one shard listener exists.
+pub const env_listen_fds = "OROCHI_HELIX_LISTEN_FDS";
+/// Hard cap on inherited per-shard listener fds parsed from the environment
+/// (bounds the fixed `Resume` buffer; shards beyond it bind fresh listeners).
+pub const max_inherited_listeners = 64;
 
 pub const ExecPlan = struct {
     argv: []const [:0]const u8,
@@ -248,16 +258,21 @@ pub fn buildListenerExecPlan(
     return .{ .argv = argv, .envp = envp, .arena_fd = -1, .control_fd = -1 };
 }
 
-/// Build an exec plan carrying the sealed state arena AND the listening socket
-/// (no control socket). The successor reads the arena's capsules and adopts the
-/// listener. The caller must clear `FD_CLOEXEC` on both fds before `commit`.
+/// Build an exec plan carrying the sealed state arena AND the listening
+/// socket(s) (no control socket). `listen_fds` is the per-shard client-listener
+/// fd list in shard order; `listen_fds[0]` (shard 0) rides the singular
+/// `env_listen_fd` for older successors, and the full list additionally rides
+/// `env_listen_fds` when more than one shard listener is carried. The successor
+/// reads the arena's capsules and adopts the listeners. The caller must clear
+/// `FD_CLOEXEC` on the arena fd and every listener fd before `commit`.
 pub fn buildArenaListenerExecPlan(
     allocator: std.mem.Allocator,
     binary_path: []const u8,
     arena_fd: handoff.Fd,
-    listen_fd: handoff.Fd,
+    listen_fds: []const handoff.Fd,
     config_path: ?[]const u8,
 ) anyerror!ExecPlan {
+    if (listen_fds.len == 0) return error.NoListener;
     // argv = [binary, --supervisor, (config_path)?]. The config path is passed
     // through so the successor boots with the SAME config (ports, certs, opers,
     // cloak) rather than the built-in defaults.
@@ -273,12 +288,17 @@ pub fn buildArenaListenerExecPlan(
         errdefer allocator.free(argv[2]);
     }
 
-    var envp = try allocator.alloc([:0]const u8, 2);
+    const envc: usize = if (listen_fds.len > 1) 3 else 2;
+    var envp = try allocator.alloc([:0]const u8, envc);
     errdefer allocator.free(envp);
     envp[0] = try fdEnvEntry(allocator, env_arena_fd, arena_fd);
     errdefer allocator.free(envp[0]);
-    envp[1] = try fdEnvEntry(allocator, env_listen_fd, listen_fd);
+    envp[1] = try fdEnvEntry(allocator, env_listen_fd, listen_fds[0]);
     errdefer allocator.free(envp[1]);
+    if (listen_fds.len > 1) {
+        envp[2] = try fdListEnvEntry(allocator, env_listen_fds, listen_fds);
+        errdefer allocator.free(envp[2]);
+    }
 
     return .{ .argv = argv, .envp = envp, .arena_fd = arena_fd, .control_fd = -1 };
 }
@@ -292,6 +312,16 @@ pub const Resume = struct {
     /// The inherited listening socket, or null if the predecessor did not pass
     /// one (older handoff / listener not preserved).
     listen_fd: ?handoff.Fd = null,
+    /// Multi-shard listener handoff: the per-shard client-listener fds in shard
+    /// order (`listen_fds[0..listen_fd_count]`). Empty when the predecessor was
+    /// single-shard (or predates the list variable); `listen_fd` then carries
+    /// shard 0 alone.
+    listen_fds: [max_inherited_listeners]handoff.Fd = @splat(-1),
+    listen_fd_count: usize = 0,
+
+    pub fn listenFds(self: *const Resume) []const handoff.Fd {
+        return self.listen_fds[0..self.listen_fd_count];
+    }
 };
 
 pub fn resumeFromEnv() ?Resume {
@@ -315,7 +345,11 @@ pub fn resumeFromEnv() ?Resume {
     const control_fd = readFdFromEnvBlock(env, env_control_fd);
     const listen_fd = readFdFromEnvBlock(env, env_listen_fd);
     if (arena_fd == null and control_fd == null and listen_fd == null) return null;
-    return .{ .arena_fd = arena_fd, .control_fd = control_fd, .listen_fd = listen_fd };
+    var r: Resume = .{ .arena_fd = arena_fd, .control_fd = control_fd, .listen_fd = listen_fd };
+    if (findEnvValue(env, env_listen_fds)) |list| {
+        r.listen_fd_count = parseFdList(list, &r.listen_fds);
+    }
+    return r;
 }
 
 /// Successor side: read the sealed capsule arena (inherited memfd) and decode the
@@ -353,14 +387,51 @@ fn fdEnvEntry(allocator: std.mem.Allocator, name: []const u8, fd: handoff.Fd) ![
 }
 
 fn readFdFromEnvBlock(env: []const u8, name: []const u8) ?handoff.Fd {
+    const value = findEnvValue(env, name) orelse return null;
+    return std.fmt.parseInt(handoff.Fd, value, 10) catch null;
+}
+
+/// Find `name=` in a NUL-separated environ block; return the raw value slice.
+fn findEnvValue(env: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, env, 0);
     while (it.next()) |entry| {
         if (entry.len <= name.len or entry[name.len] != '=') continue;
         if (!std.mem.eql(u8, entry[0..name.len], name)) continue;
-        const value = entry[name.len + 1 ..];
-        return std.fmt.parseInt(handoff.Fd, value, 10) catch null;
+        return entry[name.len + 1 ..];
     }
     return null;
+}
+
+/// Parse a comma-separated fd list ("3,5,7") into `out`. Fail-closed on any
+/// malformed or negative element: the whole list is rejected (returns 0) so the
+/// successor falls back to the singular `env_listen_fd` + fresh binds rather
+/// than adopting a half-parsed set. Entries past `out.len` are ignored (those
+/// shards bind fresh SO_REUSEPORT listeners).
+fn parseFdList(value: []const u8, out: []handoff.Fd) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |tok| {
+        const fd = std.fmt.parseInt(handoff.Fd, tok, 10) catch return 0;
+        if (fd < 0) return 0;
+        if (n < out.len) {
+            out[n] = fd;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn fdListEnvEntry(allocator: std.mem.Allocator, name: []const u8, fds: []const handoff.Fd) ![:0]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, name);
+    try text.append(allocator, '=');
+    for (fds, 0..) |fd, i| {
+        if (i != 0) try text.append(allocator, ',');
+        var nbuf: [16]u8 = undefined;
+        try text.appendSlice(allocator, std.fmt.bufPrint(&nbuf, "{d}", .{fd}) catch unreachable);
+    }
+    return try allocator.dupeSentinel(u8, text.items, 0);
 }
 
 test "live prepare seals capsules and handoff passes fds" {
@@ -478,12 +549,49 @@ test "ExecPlan.commit execve's the target (fork + /bin/true)" {
 
 test "arena+listener exec plan carries both fds, no control" {
     const allocator = std.testing.allocator;
-    var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, 6, null);
+    var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{6}, null);
     defer plan.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), plan.envp.len);
     try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=5", plan.envp[0]);
     try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FD=6", plan.envp[1]);
     try std.testing.expectEqual(@as(handoff.Fd, -1), plan.control_fd);
+}
+
+test "arena+listener exec plan carries the per-shard listener list (multi-shard)" {
+    const allocator = std.testing.allocator;
+    var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{ 6, 9, 12 }, null);
+    defer plan.deinit(allocator);
+    // Singular var still carries shard 0 (older-successor compatibility), and
+    // the full shard-ordered list rides the plural var.
+    try std.testing.expectEqual(@as(usize, 3), plan.envp.len);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=5", plan.envp[0]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FD=6", plan.envp[1]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FDS=6,9,12", plan.envp[2]);
+    // An empty listener set is a caller bug — fail closed, never exec plan-less.
+    try std.testing.expectError(error.NoListener, buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, &.{}, null));
+}
+
+test "parseFdList round-trips, rejects malformed lists fail-closed" {
+    var out: [max_inherited_listeners]handoff.Fd = @splat(-1);
+    // Well-formed list parses in order.
+    try std.testing.expectEqual(@as(usize, 3), parseFdList("6,9,12", &out));
+    try std.testing.expectEqual(@as(handoff.Fd, 6), out[0]);
+    try std.testing.expectEqual(@as(handoff.Fd, 9), out[1]);
+    try std.testing.expectEqual(@as(handoff.Fd, 12), out[2]);
+    // A single fd is a one-element list.
+    try std.testing.expectEqual(@as(usize, 1), parseFdList("7", &out));
+    // Malformed / negative / empty elements reject the WHOLE list (the
+    // successor then falls back to the singular listen fd + fresh binds).
+    try std.testing.expectEqual(@as(usize, 0), parseFdList("6,x,12", &out));
+    try std.testing.expectEqual(@as(usize, 0), parseFdList("6,-1", &out));
+    try std.testing.expectEqual(@as(usize, 0), parseFdList("6,,9", &out));
+    try std.testing.expectEqual(@as(usize, 0), parseFdList("", &out));
+}
+
+test "findEnvValue locates the listener list in an environ block" {
+    const block = "FOO=bar\x00OROCHI_HELIX_LISTEN_FDS=6,9\x00BAZ=qux\x00";
+    try std.testing.expectEqualStrings("6,9", findEnvValue(block, env_listen_fds).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), findEnvValue("FOO=bar\x00", env_listen_fds));
 }
 
 test "listener-only exec plan carries just the listen fd" {

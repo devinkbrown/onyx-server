@@ -1634,6 +1634,12 @@ pub const Config = struct {
     /// (Helix hot-UPGRADE listener handoff: the port stays bound across execve).
     /// null = bind a new listener normally. Linux only.
     inherited_listener_fd: ?linux.fd_t = null,
+    /// Multi-shard Helix handoff: per-shard client-listener fds in shard order
+    /// (`[k]` adopted by reactor `k`). Takes precedence over
+    /// `inherited_listener_fd` (whose fd duplicates entry 0) when non-empty.
+    /// Entries past the successor's shard count are closed at init; shards past
+    /// the list bind fresh SO_REUSEPORT listeners. Linux only.
+    inherited_listener_fds: []const linux.fd_t = &.{},
     /// Inherited Helix state-arena memfd (UPGRADE handoff); `adoptInheritedSessions`
     /// reads it after boot to re-attach carried-over client connections. null = none.
     resume_arena_fd: ?linux.fd_t = null,
@@ -2640,6 +2646,9 @@ const Reactor = struct {
 /// the same pointer in the single-reactor configuration, so the fallback is exact.
 threadlocal var current_reactor: ?*Reactor = null;
 
+/// Sentinel for `upgrade_quiesce_shard`: no multi-shard UPGRADE seal in flight.
+const no_quiesce_shard: u32 = std.math.maxInt(u32);
+
 const ChannelPropClock = struct {
     channel: []u8,
     key: []u8,
@@ -2928,6 +2937,16 @@ pub const LinuxServer = struct {
     /// Worker-thread pool that owns the per-shard reactor threads while
     /// `runThreaded` runs the multi-reactor topology. Idle in single-reactor mode.
     pool: reactor_pool_mod.ReactorPool(*LinuxServer),
+    /// Multi-shard UPGRADE quiesce: the shard id currently sealing for a Helix
+    /// UPGRADE, or `no_quiesce_shard` (the idle state). While set, every OTHER
+    /// reactor worker parks between loop turns (touching neither its ring nor
+    /// its connection slab) so the sealing thread may safely read every shard's
+    /// per-connection state. Cleared on any upgrade failure so parked workers
+    /// resume; on success execve replaces the process.
+    upgrade_quiesce_shard: std.atomic.Value(u32) = std.atomic.Value(u32).init(no_quiesce_shard),
+    /// Count of reactor workers currently parked for the quiesce above. The
+    /// sealer waits for `live workers - 1` parks before touching foreign shards.
+    upgrade_parked: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     world: world_model.World,
     whowas: WhowasStore,
     monitor: monitor.MonitorStore,
@@ -3377,11 +3396,22 @@ pub const LinuxServer = struct {
         // on the same port (REUSEPORT requires every socket on the port to set
         // it; a single-reactor predecessor that bound a plain socket used to make
         // the multishard successor fail AddressInUse and fall back to boot-only).
-        // Shard 0 adopts the inherited fd across UPGRADE for a seamless handoff
-        // (no bind gap, no leak); sibling shards and fresh boots create their own.
-        const listener_fd = if (shard_id == 0 and config.inherited_listener_fd != null) blk: {
-            const fd = config.inherited_listener_fd.?;
-            srvLog("orochi: adopting inherited listener fd {d}\n", .{fd});
+        // Every shard adopts its own inherited fd across UPGRADE for a seamless
+        // handoff (no bind gap, no accept-queue drop): a multi-shard predecessor
+        // carries the full shard-ordered listener list, a single-shard (or
+        // older) predecessor carries just shard 0's fd. Shards past the carried
+        // list — and fresh boots — create their own.
+        const inherited: ?linux.fd_t = blk: {
+            if (shard_id < config.inherited_listener_fds.len) break :blk config.inherited_listener_fds[shard_id];
+            if (shard_id == 0 and config.inherited_listener_fds.len == 0) break :blk config.inherited_listener_fd;
+            break :blk null;
+        };
+        const listener_fd = if (inherited) |fd| blk: {
+            srvLog("orochi: adopting inherited listener fd {d} (shard {d})\n", .{ fd, shard_id });
+            // Restore exec hygiene: the fd survived ONE execve on purpose;
+            // re-arm CLOEXEC so it never leaks into any other child. The next
+            // UPGRADE clears it again for exactly the listeners it carries.
+            _ = linux.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
             break :blk fd;
         } else try reuseport.createReusePortListener(config.host, config.port, config.backlog);
         errdefer closeFd(listener_fd);
@@ -3481,6 +3511,12 @@ pub const LinuxServer = struct {
         errdefer for (reactors[0..built]) |*r| r.deinit();
         while (built < shard_count) : (built += 1) {
             reactors[built] = try initReactor(allocator, config, @intCast(built), reuse_port);
+        }
+        // A predecessor with MORE shards than this successor carried extra
+        // listener fds no reactor adopted: close them now so they neither leak
+        // nor keep receiving SO_REUSEPORT-balanced SYNs nobody will accept.
+        if (config.inherited_listener_fds.len > shard_count) {
+            for (config.inherited_listener_fds[shard_count..]) |fd| closeFd(fd);
         }
 
         var tls_ticket_key: tls_resumption.TicketKey = @splat(0);
@@ -5658,6 +5694,13 @@ pub const LinuxServer = struct {
     fn runLoopResilient(self: *LinuxServer, run: anytype) void {
         var consecutive_failures: u32 = 0;
         while (run.load(.acquire)) {
+            // Multi-shard UPGRADE quiesce: while another reactor seals every
+            // shard's connection state, park HERE — between loop turns, so this
+            // worker holds no ring/slab state mid-mutation. The sealer's wake
+            // (wakeAllReactors) pops this loop out of submitAndWait so the park
+            // is reached within one turn. Resumes when the sealer clears the
+            // flag (upgrade failed) or never (execve replaced the process).
+            self.parkForUpgradeQuiesce(run);
             if (self.runOnce()) |_| {
                 consecutive_failures = 0;
             } else |err| {
@@ -5672,6 +5715,60 @@ pub const LinuxServer = struct {
                 }
             }
         }
+    }
+
+    /// Park this reactor worker while a multi-shard UPGRADE seal owned by a
+    /// DIFFERENT shard is in flight. The parked-counter increment publishes
+    /// (release) every per-connection write this worker made before parking;
+    /// the sealer's acquire read of the counter therefore observes them all.
+    /// The park also honors the run flag so DIE/shutdown never deadlocks on a
+    /// wedged upgrade.
+    fn parkForUpgradeQuiesce(self: *LinuxServer, run: anytype) void {
+        const q = self.upgrade_quiesce_shard.load(.acquire);
+        if (q == no_quiesce_shard) return;
+        if (q < self.reactors.len and self.rx() == &self.reactors[q]) return; // the sealer itself
+        _ = self.upgrade_parked.fetchAdd(1, .acq_rel);
+        defer _ = self.upgrade_parked.fetchSub(1, .acq_rel);
+        while (self.upgrade_quiesce_shard.load(.acquire) != no_quiesce_shard) {
+            if (!run.load(.acquire)) return;
+            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&req, null);
+        }
+    }
+
+    /// Quiesce every OTHER reactor worker so the calling thread may seal all
+    /// shards' per-connection state for a Helix UPGRADE. Counts live pool
+    /// workers (zero when the reactors run in-line/single-threaded — then no
+    /// park is needed; the caller is the only thread touching any shard) and
+    /// waits, bounded, for each sibling to park. Fail-safe: a sibling that
+    /// never parks aborts the upgrade (`error.ShardQuiesceFailed`) rather than
+    /// sealing state a live thread still mutates.
+    fn quiesceSiblingReactors(self: *LinuxServer) !void {
+        if (self.reactors.len <= 1) return;
+        const workers = self.pool.count();
+        const expected: u32 = if (workers == 0) 0 else @intCast(workers - 1);
+        self.upgrade_quiesce_shard.store(self.rx().shard_id, .release);
+        if (expected == 0) return;
+        self.wakeAllReactors();
+        var waited_ms: u64 = 0;
+        while (self.upgrade_parked.load(.acquire) < expected) {
+            if (waited_ms >= 5_000) {
+                self.resumeSiblingReactors();
+                return error.ShardQuiesceFailed;
+            }
+            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = linux.nanosleep(&req, null);
+            waited_ms += 1;
+            // Re-nudge stragglers: a wake consumed before the flag was visible
+            // leaves a sibling blocked in submitAndWait until its sweep timer.
+            if (waited_ms % 200 == 0) self.wakeAllReactors();
+        }
+    }
+
+    /// Release a quiesce taken by `quiesceSiblingReactors` (upgrade failed —
+    /// the daemon keeps serving). Parked workers observe the clear and resume.
+    fn resumeSiblingReactors(self: *LinuxServer) void {
+        self.upgrade_quiesce_shard.store(no_quiesce_shard, .release);
     }
 
     pub fn handleAccept(self: *LinuxServer, event: ringlane.AcceptEvent) !void {
@@ -16752,7 +16849,7 @@ pub const LinuxServer = struct {
             // A refusal, not a failure: the oper already got the NOTICE
             // explaining why; swallowing it here keeps the connection alive
             // (a propagated handler error would tear it down).
-            error.MultiShardUpgradeUnsupported => {},
+            error.ShardQuiesceFailed => {},
             else => e,
         };
     }
@@ -16874,11 +16971,16 @@ pub const LinuxServer = struct {
         // detached (reclaimable) ghost — fail-safe, never a wrong re-join.
         var fd_by_cid = std.AutoHashMap(u64, i32).init(self.allocator);
         defer fd_by_cid.deinit();
-        var cit = self.rx().clients.iterator();
-        while (cit.next()) |e| {
-            if (e.value.s2s != null or e.value.s2s_secured != null) continue;
-            if (!e.value.session.registered()) continue;
-            fd_by_cid.put(monitorIdFromClient(e.id), e.value.fd) catch continue;
+        // Every shard's clients: an attached session may live on any reactor
+        // (callers quiesce siblings before the multi-shard seal), and missing a
+        // shard here silently degrades its attached sessions to detached ghosts.
+        for (self.reactors) |*r| {
+            var cit = r.clients.iterator();
+            while (cit.next()) |e| {
+                if (e.value.s2s != null or e.value.s2s_secured != null) continue;
+                if (!e.value.session.registered()) continue;
+                fd_by_cid.put(monitorIdFromClient(e.id), e.value.fd) catch continue;
+            }
         }
 
         var sealed: usize = 0;
@@ -16969,71 +17071,40 @@ pub const LinuxServer = struct {
         return true;
     }
 
-    fn performUpgrade(self: *LinuxServer, requester: ?*ConnState) !void {
-        if (comptime builtin.os.tag != .linux) {
-            self.upgradeNotice(requester, "UPGRADE is Linux-only");
-            return;
-        }
-        // Multi-reactor topology guard: the seal loop below walks ONLY reactor
-        // 0's client table (`self.rx().clients`), and per-connection state is
-        // single-writer by its owning reactor — sealing shards 1..N-1 from this
-        // thread would race their live reactor threads. Until a full
-        // quiesce-and-seal of every shard lands, REFUSE the upgrade outright:
-        // proceeding would keep FD_CLOEXEC on every shard-1..N-1 client socket
-        // and silently drop them all at execve (zero-drop would hold only for
-        // shard 0). Fail safe, loudly; operators restart to deploy instead.
-        if (self.reactors.len > 1) {
-            self.upgradeNotice(requester, "UPGRADE refused: [limits] num_shards > 1 — multi-shard seal not yet supported (a hot upgrade would drop every client on shards 1..N-1); restart to deploy");
-            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: multi-shard topology (num_shards > 1) would drop non-shard-0 clients") catch {};
-            return error.MultiShardUpgradeUnsupported;
-        }
-        const requester_fd: ?linux.fd_t = if (requester) |c| c.fd else null;
-        var nbuf: [128]u8 = undefined;
-        const requested_by = if (requester) |c| c.session.displayName() else "SIGUSR2";
-        const note = std.fmt.bufPrint(&nbuf, "UPGRADE requested by {s}", .{requested_by}) catch "UPGRADE";
-        try self.publishOperEvent(.oper_action, .critical, note);
+    /// Per-shard client counters accumulated by `sealShardClients` across the
+    /// whole multi-shard UPGRADE seal.
+    const SealCounts = struct {
+        /// Client connections carried (fd preserved + `.clients` capsule sealed).
+        clients: usize = 0,
+        /// Of those, how many carried a live TLS engine / a WS adapter.
+        tls: usize = 0,
+        ws: usize = 0,
+        /// Mesh links: re-dial hints sealed / secured links preserved (fd carried).
+        s2s_hints: usize = 0,
+        s2s_preserved: usize = 0,
+    };
 
-        // Serialize every registered session into encoded snapshot pieces.
-        var blobs: std.ArrayList([]u8) = .empty;
-        defer {
-            for (blobs.items) |b| self.allocator.free(b);
-            blobs.deinit(self.allocator);
-        }
-        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
-        defer pieces.deinit(self.allocator);
-        // Carry the process-global TLS session-ticket key(s) so tickets issued
-        // before the swap still open under the successor (which otherwise boots a
-        // fresh random key, killing every outstanding ticket). Emitted once, ahead
-        // of the per-client pieces; a decode/alloc failure just drops the piece and
-        // the successor keeps its freshly-minted key. `.bytes` is owned by `blobs`.
-        if (self.config.tls_enable_resumption) ticket: {
-            const tk = ticket_key_capsule.encode(self.allocator, .{
-                .current = self.tls_ticket_key,
-                .previous = self.tls_previous_ticket_key,
-            }) catch break :ticket;
-            blobs.append(self.allocator, tk) catch {
-                self.allocator.free(tk);
-                break :ticket;
-            };
-            pieces.append(self.allocator, .{ .kind = .tls_ticket_keys, .bytes = tk }) catch break :ticket;
-        }
-        // Seal the multi-session/bouncer registry (one `.sessions` capsule per
-        // account) so SESSION tokens + detached restore snapshots survive the
-        // swap. Adopted by the successor's Pass 2c, AFTER the clients pass —
-        // an attached session re-joins its carried connection by fd.
-        const session_accounts_sealed = self.sealSessionRegistry(&pieces, &blobs);
-        // Seal staged cross-mesh session migrations (one `.pending_migration`
-        // capsule per entry) so a capsule shipped by a peer just before the
-        // swap still unlocks the client's reclaim on the successor.
-        const migrations_sealed = self.sealPendingMigrations(&pieces, &blobs);
-        const carried_fds = try self.allocator.alloc(linux.fd_t, self.rx().clients.slots.items.len);
-        defer self.allocator.free(carried_fds);
-        var carried_fd_count: usize = 0;
-        var tls_carried: usize = 0;
-        var ws_carried: usize = 0;
-        var s2s_hints: usize = 0;
-        var s2s_preserved: usize = 0;
-        var it = self.rx().clients.iterator();
+    /// Seal ONE reactor shard's connections for a Helix UPGRADE: every carried
+    /// client gets its capsules queued on `pieces`/`blobs`, its socket fd
+    /// un-CLOEXEC'd, and the fd recorded in `carried_fds` (which must have room
+    /// for the shard's whole slot table). Established secured mesh links (a
+    /// reactor-0-only population) are preserved the same way; other links seal
+    /// a re-dial hint. Safe to call for a foreign shard ONLY while that shard's
+    /// worker is parked (`quiesceSiblingReactors`) or not running at all — the
+    /// parked-counter handshake publishes the shard's connection state to this
+    /// thread. Best-effort per connection: a client that cannot be sealed is
+    /// simply not carried (it reconnects), never fatal to the upgrade.
+    fn sealShardClients(
+        self: *LinuxServer,
+        r: *Reactor,
+        requester_fd: ?linux.fd_t,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+        blobs: *std.ArrayList([]u8),
+        carried_fds: []linux.fd_t,
+        fd_count: *usize,
+        counts: *SealCounts,
+    ) void {
+        var it = r.clients.iterator();
         while (it.next()) |e| {
             // S2S peer links: PRESERVE an established secured link across the swap
             // (zero-drop) — seal its crypto + inner framing state into an .s2s_link
@@ -17053,14 +17124,14 @@ pub const LinuxServer = struct {
                     // `send_armed` (a gossip-chatty mesh link is armed often, which
                     // would defeat preservation entirely).
                     const est = link.established();
-                    const sealed = est and self.sealSecuredLink(e.value, link, &pieces, &blobs);
+                    const sealed = est and self.sealSecuredLink(e.value, link, pieces, blobs);
                     if (sealed) {
                         // Preserved: carry the fd across execve; do NOT also seal a
                         // re-dial hint (that would open a duplicate link → churn).
                         _ = linux.fcntl(e.value.fd, posix.F.SETFD, 0);
-                        carried_fds[carried_fd_count] = e.value.fd;
-                        carried_fd_count += 1;
-                        s2s_preserved += 1;
+                        carried_fds[fd_count.*] = e.value.fd;
+                        fd_count.* += 1;
+                        counts.s2s_preserved += 1;
                         continue;
                     }
                     srvLog("orochi: UPGRADE — s2s_secured NOT preserved (established={}, send_armed={}); falling back to re-dial\n", .{ est, e.value.send_armed });
@@ -17076,7 +17147,7 @@ pub const LinuxServer = struct {
                         continue;
                     };
                     pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = hb }) catch continue;
-                    s2s_hints += 1;
+                    counts.s2s_hints += 1;
                 }
                 continue;
             }
@@ -17327,13 +17398,95 @@ pub const LinuxServer = struct {
                 };
                 pieces.append(self.allocator, .{ .kind = .silence_list, .bytes = wire }) catch break :carry_sil;
             }
-            if (tls_blob != null) tls_carried += 1;
-            if (carry_ws) ws_carried += 1;
+            if (tls_blob != null) counts.tls += 1;
+            if (carry_ws) counts.ws += 1;
             // Preserve the client socket across execve so the successor re-attaches it.
             _ = linux.fcntl(e.value.fd, posix.F.SETFD, 0);
-            carried_fds[carried_fd_count] = e.value.fd;
-            carried_fd_count += 1;
+            carried_fds[fd_count.*] = e.value.fd;
+            fd_count.* += 1;
+            counts.clients += 1;
         }
+    }
+
+    fn performUpgrade(self: *LinuxServer, requester: ?*ConnState) !void {
+        if (comptime builtin.os.tag != .linux) {
+            self.upgradeNotice(requester, "UPGRADE is Linux-only");
+            return;
+        }
+        const requester_fd: ?linux.fd_t = if (requester) |c| c.fd else null;
+        var nbuf: [128]u8 = undefined;
+        const requested_by = if (requester) |c| c.session.displayName() else "SIGUSR2";
+        const note = std.fmt.bufPrint(&nbuf, "UPGRADE requested by {s}", .{requested_by}) catch "UPGRADE";
+        try self.publishOperEvent(.oper_action, .critical, note);
+
+        // Multi-reactor topology: per-connection state is single-writer by its
+        // owning reactor, so before this thread may seal shards it does not own
+        // it QUIESCES every sibling worker (each parks between loop turns,
+        // touching neither its ring nor its slab). Fail-safe: a shard whose
+        // worker never parks cannot be sealed safely — the upgrade is refused
+        // rather than silently dropping (or racing) that shard's clients.
+        self.quiesceSiblingReactors() catch |e| {
+            self.upgradeNotice(requester, "UPGRADE refused: a reactor shard did not quiesce — its clients cannot be sealed safely; retry or restart to deploy");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: shard quiesce failed (multi-shard seal aborted)") catch {};
+            return e;
+        };
+        // Every non-execve exit below must let the parked siblings resume; on
+        // success execve replaces the process and this defer never runs.
+        defer self.resumeSiblingReactors();
+
+        // Serialize every registered session into encoded snapshot pieces.
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |b| self.allocator.free(b);
+            blobs.deinit(self.allocator);
+        }
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(self.allocator);
+        // Carry the process-global TLS session-ticket key(s) so tickets issued
+        // before the swap still open under the successor (which otherwise boots a
+        // fresh random key, killing every outstanding ticket). Emitted once, ahead
+        // of the per-client pieces; a decode/alloc failure just drops the piece and
+        // the successor keeps its freshly-minted key. `.bytes` is owned by `blobs`.
+        if (self.config.tls_enable_resumption) ticket: {
+            const tk = ticket_key_capsule.encode(self.allocator, .{
+                .current = self.tls_ticket_key,
+                .previous = self.tls_previous_ticket_key,
+            }) catch break :ticket;
+            blobs.append(self.allocator, tk) catch {
+                self.allocator.free(tk);
+                break :ticket;
+            };
+            pieces.append(self.allocator, .{ .kind = .tls_ticket_keys, .bytes = tk }) catch break :ticket;
+        }
+        // Seal the multi-session/bouncer registry (one `.sessions` capsule per
+        // account) so SESSION tokens + detached restore snapshots survive the
+        // swap. Adopted by the successor's Pass 2c, AFTER the clients pass —
+        // an attached session re-joins its carried connection by fd.
+        const session_accounts_sealed = self.sealSessionRegistry(&pieces, &blobs);
+        // Seal staged cross-mesh session migrations (one `.pending_migration`
+        // capsule per entry) so a capsule shipped by a peer just before the
+        // swap still unlocks the client's reclaim on the successor.
+        const migrations_sealed = self.sealPendingMigrations(&pieces, &blobs);
+        // Seal EVERY shard's clients. Siblings are parked (see the quiesce
+        // above), so reading foreign per-connection state here cannot race the
+        // owning reactor thread. The carried-fd scratch spans all shards.
+        var total_slots: usize = 0;
+        for (self.reactors) |*r| total_slots += r.clients.slots.items.len;
+        const carried_fds = try self.allocator.alloc(linux.fd_t, total_slots);
+        defer self.allocator.free(carried_fds);
+        var carried_fd_count: usize = 0;
+        var seal_counts = SealCounts{};
+        for (self.reactors) |*r| {
+            const shard_before = seal_counts.clients;
+            self.sealShardClients(r, requester_fd, &pieces, &blobs, carried_fds, &carried_fd_count, &seal_counts);
+            if (self.reactors.len > 1) {
+                srvLog("orochi: UPGRADE — shard {d}: {d} client(s) sealed\n", .{ r.shard_id, seal_counts.clients - shard_before });
+            }
+        }
+        const tls_carried = seal_counts.tls;
+        const ws_carried = seal_counts.ws;
+        const s2s_hints = seal_counts.s2s_hints;
+        const s2s_preserved = seal_counts.s2s_preserved;
 
         // Seal the state arena. On failure, fall back to a listener-only upgrade
         // so UPGRADE still works (just without state carry-over).
@@ -17360,16 +17513,30 @@ pub const LinuxServer = struct {
         var sbuf: [224]u8 = undefined;
         self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s), {d} staged migration(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed, migrations_sealed }) catch "UPGRADE: re-exec");
 
-        // Preserve the listener + arena across execve (clear FD_CLOEXEC).
-        _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
+        // Preserve EVERY shard's client listener + the arena across execve
+        // (clear FD_CLOEXEC). The successor adopts one listener per shard, so
+        // no shard's SO_REUSEPORT accept queue is dropped at the swap. The list
+        // is shard-ordered; entry 0 also rides the singular env variable for
+        // an older successor image.
+        const listener_fds = self.allocator.alloc(linux.fd_t, self.reactors.len) catch |e| {
+            restoreCloexec(carried_fds[0..carried_fd_count]);
+            var eb: [96]u8 = undefined;
+            self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            return;
+        };
+        defer self.allocator.free(listener_fds);
+        for (self.reactors, listener_fds) |*r, *lfd| {
+            lfd.* = r.listener_fd;
+            _ = linux.fcntl(r.listener_fd, posix.F.SETFD, 0);
+        }
         _ = linux.fcntl(arena.fd, posix.F.SETFD, 0);
         // Exec the on-disk launch path (the swapped-in new binary) when known,
         // not /proc/self/exe (which re-runs the current, old image). Carry the
         // config path so the successor boots with the real config.
         const exe_target = self.config.exe_path orelse "/proc/self/exe";
-        var plan = helix_live.buildArenaListenerExecPlan(self.allocator, exe_target, arena.fd, self.rx().listener_fd, self.config.config_path) catch |e| {
+        var plan = helix_live.buildArenaListenerExecPlan(self.allocator, exe_target, arena.fd, listener_fds, self.config.config_path) catch |e| {
             restoreCloexec(carried_fds[0..carried_fd_count]);
-            _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            restoreCloexec(listener_fds);
             _ = linux.fcntl(arena.fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
             self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
@@ -17378,7 +17545,7 @@ pub const LinuxServer = struct {
         defer plan.deinit(self.allocator);
         plan.commit(self.allocator) catch |e| {
             restoreCloexec(carried_fds[0..carried_fd_count]);
-            _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            restoreCloexec(listener_fds);
             _ = linux.fcntl(arena.fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
             self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
@@ -17486,7 +17653,16 @@ pub const LinuxServer = struct {
                     break;
                 }
             }
-            if (self.adoptInheritedClient(snap, tls_state, ws_state)) {
+            // Multi-shard: re-pin the client to its fd-derived shard by binding
+            // this (boot, pre-reactor-loop) thread to the target reactor for the
+            // adoption — every rx() inside adoptInheritedClient (slot alloc,
+            // recv arm on the shard's ring) then lands on that shard. The shard
+            // choice is deterministic in the fd; client ids never survive the
+            // swap (fd is the join key), so any consistent spread is correct.
+            current_reactor = &self.reactors[self.adoptShardForFd(snap.fd)];
+            const ok = self.adoptInheritedClient(snap, tls_state, ws_state);
+            current_reactor = &self.reactors[0];
+            if (ok) {
                 adopted += 1;
                 if (tls_state != null) adopted_tls += 1;
                 if (ws_state != null) adopted_ws += 1;
@@ -17662,13 +17838,26 @@ pub const LinuxServer = struct {
         return applied_n;
     }
 
+    /// Deterministic shard for an adopted inherited connection: derived from
+    /// the (non-negative) socket fd so the spread is stable within one adoption
+    /// pass without widening any capsule. The original owning shard is NOT
+    /// preserved — client ids never survive the swap (the fd is the Helix join
+    /// key), so shard identity carries no cross-upgrade meaning; only a
+    /// consistent, balanced pinning matters.
+    fn adoptShardForFd(self: *LinuxServer, fd: i32) usize {
+        std.debug.assert(fd >= 0);
+        return @as(usize, @intCast(fd)) % self.reactors.len;
+    }
+
     /// Find the successor-side client id of an adopted connection by its
     /// inherited socket fd (the Helix join key). Boot-time only — the client
-    /// table holds exactly the connections Pass 2 adopted.
+    /// tables hold exactly the connections Pass 2 adopted (across ALL shards).
     fn adoptedClientIdByFd(self: *LinuxServer, fd: i32) ?u64 {
-        var it = self.rx().clients.iterator();
-        while (it.next()) |e| {
-            if (e.value.fd == fd) return monitorIdFromClient(e.id);
+        for (self.reactors) |*r| {
+            var it = r.clients.iterator();
+            while (it.next()) |e| {
+                if (e.value.fd == fd) return monitorIdFromClient(e.id);
+            }
         }
         return null;
     }
@@ -17676,9 +17865,11 @@ pub const LinuxServer = struct {
     /// As `adoptedClientIdByFd`, but returns the connection itself — for
     /// adoption passes that need session state (e.g. the SILENCE owner nick).
     fn adoptedConnByFd(self: *LinuxServer, fd: i32) ?*ConnState {
-        var it = self.rx().clients.iterator();
-        while (it.next()) |e| {
-            if (e.value.fd == fd) return e.value;
+        for (self.reactors) |*r| {
+            var it = r.clients.iterator();
+            while (it.next()) |e| {
+                if (e.value.fd == fd) return e.value;
+            }
         }
         return null;
     }
@@ -33691,24 +33882,165 @@ test "rebroadcastLocalOpers re-mints an oper homed on a non-zero shard" {
     } else return error.SkipZigTest;
 }
 
-test "UPGRADE is refused on a multi-shard topology (num_shards > 1)" {
+test "multi-shard UPGRADE seal carries clients on EVERY shard (CLOEXEC cleared)" {
     if (comptime builtin.os.tag == .linux) {
-        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
+        const alloc = std.testing.allocator;
+        var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
         };
         defer server.deinit();
         try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
 
-        // The seal loop only walks reactor 0's client table and only clears
-        // CLOEXEC on reactor 0's sockets + listener: with num_shards > 1 every
-        // client on shards 1..N-1 would be silently dropped at execve. The
-        // upgrade must therefore refuse loudly instead of proceeding lossily.
-        try std.testing.expectError(
-            error.MultiShardUpgradeUnsupported,
-            server.performUpgrade(null),
-        );
+        // One registered client homed on EACH shard, each with a real socket
+        // (the seal clears FD_CLOEXEC on every carried fd — the H1 bug was
+        // exactly that shards 1..N-1 never got this and dropped at execve).
+        var sp0: [2]i32 = undefined;
+        if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sp0)) != .SUCCESS) return error.SkipZigTest;
+        defer for (sp0) |fd| closeFd(fd);
+        var sp1: [2]i32 = undefined;
+        if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sp1)) != .SUCCESS) return error.SkipZigTest;
+        defer for (sp1) |fd| closeFd(fd);
+        _ = linux.fcntl(sp0[0], posix.F.SETFD, posix.FD_CLOEXEC);
+        _ = linux.fcntl(sp1[0], posix.F.SETFD, posix.FD_CLOEXEC);
+
+        const id0 = try server.reactors[0].clients.alloc(ConnState.init(sp0[0]));
+        const c0 = server.reactors[0].clients.get(id0).?;
+        c0.overflow_allocator = alloc;
+        try c0.session.setNick("shardzero");
+        c0.session.registration.registered = true;
+        const id1 = try server.reactors[1].clients.alloc(ConnState.init(sp1[0]));
+        const c1 = server.reactors[1].clients.get(id1).?;
+        c1.overflow_allocator = alloc;
+        try c1.session.setNick("shardone");
+        c1.session.registration.registered = true;
+
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |b| alloc.free(b);
+            blobs.deinit(alloc);
+        }
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(alloc);
+        var fds: [8]linux.fd_t = undefined;
+        var nfds: usize = 0;
+        var counts = Server.SealCounts{};
+        // No reactor threads run in this test (pool idle), so sealing every
+        // shard from this thread mirrors the post-quiesce state of a live
+        // multi-shard UPGRADE.
+        for (server.reactors) |*r| server.sealShardClients(r, null, &pieces, &blobs, &fds, &nfds, &counts);
+
+        // Both shards' clients were carried: a `.clients` capsule each, the fd
+        // recorded, and CLOEXEC cleared so the socket survives execve.
+        try std.testing.expectEqual(@as(usize, 2), counts.clients);
+        try std.testing.expectEqual(@as(usize, 2), nfds);
+        var client_pieces: usize = 0;
+        for (pieces.items) |p| {
+            if (p.kind == .clients) client_pieces += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), client_pieces);
+        const fl0 = linux.fcntl(sp0[0], posix.F.GETFD, 0);
+        const fl1 = linux.fcntl(sp1[0], posix.F.GETFD, 0);
+        try std.testing.expectEqual(@as(usize, 0), fl0 & posix.FD_CLOEXEC);
+        try std.testing.expectEqual(@as(usize, 0), fl1 & posix.FD_CLOEXEC);
     } else return error.SkipZigTest;
+}
+
+test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves both" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    // Two carried client sockets whose fd parities DIFFER, so the fd-derived
+    // re-pin (fd % num_shards) provably lands one client on each of the two
+    // shards. A socketpair's two ends are two distinct fds; pick the even end
+    // of one pair and the odd end of the other (the unpicked end stays with
+    // the test as that client's remote peer).
+    var sp_a: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sp_a)) != .SUCCESS) return error.SkipZigTest;
+    var sp_b: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sp_b)) != .SUCCESS) return error.SkipZigTest;
+    const even_a: ?usize = if (@mod(sp_a[0], 2) == 0) 0 else if (@mod(sp_a[1], 2) == 0) 1 else null;
+    const odd_b: ?usize = if (@mod(sp_b[0], 2) == 1) 0 else if (@mod(sp_b[1], 2) == 1) 1 else null;
+    if (even_a == null or odd_b == null) {
+        // Pathological fd numbering (both ends of a pair share parity) — the
+        // property under test is untestable with these fds; skip, don't fake.
+        for (sp_a) |fd| closeFd(fd);
+        for (sp_b) |fd| closeFd(fd);
+        return error.SkipZigTest;
+    }
+    const carried_a = sp_a[even_a.?]; // adopts onto shard 0
+    const peer_a = sp_a[1 - even_a.?];
+    const carried_b = sp_b[odd_b.?]; // adopts onto shard 1
+    const peer_b = sp_b[1 - odd_b.?];
+    defer closeFd(peer_a); // carried ends transfer to the server on adopt
+    defer closeFd(peer_b);
+
+    const blob_a = try session_snapshot.encode(alloc, .{ .nick = "evenling", .realname = "A", .fd = carried_a });
+    defer alloc.free(blob_a);
+    const blob_b = try session_snapshot.encode(alloc, .{ .nick = "oddling", .realname = "B", .fd = carried_b });
+    defer alloc.free(blob_b);
+    const arena_pieces = [_]helix_live.StatePiece{
+        .{ .kind = .clients, .bytes = blob_a },
+        .{ .kind = .clients, .bytes = blob_b },
+    };
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-multishard-adopt",
+        .pieces = arena_pieces[0..],
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
+    server.config.resume_arena_fd = arena_dup;
+    server.adoptInheritedSessions();
+    current_reactor = null;
+
+    // Each client re-pinned to its fd-derived shard — including the NON-ZERO
+    // shard the pre-fix upgrade dropped entirely.
+    try std.testing.expectEqual(@as(usize, 1), server.reactors[0].clients.len());
+    try std.testing.expectEqual(@as(usize, 1), server.reactors[1].clients.len());
+    var it1 = server.reactors[1].clients.iterator();
+    const shard1_conn = it1.next().?.value;
+    try std.testing.expectEqual(carried_b, shard1_conn.fd);
+    try std.testing.expect(it1.next() == null);
+
+    // Both adopted connections are SERVED: recv was armed on each owning
+    // shard's own ring, so a PING through either socket gets a PONG from the
+    // successor — the zero-drop proof for a shard>0 client.
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        server.requestStop(&run);
+        thr.join();
+    }
+    for ([_]struct { fd: i32, ping: []const u8, pong: []const u8 }{
+        .{ .fd = peer_a, .ping = "PING :even\r\n", .pong = "PONG orochi.local :even" },
+        .{ .fd = peer_b, .ping = "PING :odd\r\n", .pong = "PONG orochi.local :odd" },
+    }) |case| {
+        try writeAllFd(case.fd, case.ping);
+        var acc: std.ArrayList(u8) = .empty;
+        defer acc.deinit(alloc);
+        var rbuf: [1024]u8 = undefined;
+        var guard: usize = 0;
+        while (std.mem.indexOf(u8, acc.items, case.pong) == null) : (guard += 1) {
+            if (guard > 64) return error.TestUnexpectedResult;
+            const n = try readFd(case.fd, &rbuf);
+            if (n == 0) return error.TestUnexpectedResult;
+            try acc.appendSlice(alloc, rbuf[0..n]);
+        }
+    }
 }
 
 test "periodic timer tick re-mints live oper grants inside the TTL" {

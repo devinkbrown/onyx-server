@@ -30,6 +30,12 @@ PORT = 16720
 TLS_PORT = 16721
 WS_PORT = 16722
 HOST = "127.0.0.1"
+# Reactor shards for the daemon under test: >1 so the smoke proves the
+# multi-shard UPGRADE (all-shard seal + adopt), the topology eshmaki runs.
+NUM_SHARDS = 2
+# Extra plain clients held open across the UPGRADE so SO_REUSEPORT balancing
+# statistically homes clients on every shard (P[all on shard 0] ~ 2^-N).
+FILLER_CLIENTS = 8
 ACCT = "admin"
 PASSWORD = "secretpass0"
 BOUNCE_ACCT = "bounce"
@@ -172,6 +178,10 @@ def main():
     with open(CONF, "w") as f:
         f.write(
             "[node]\nid = 1\n"
+            # Multi-shard topology: the UPGRADE must seal + adopt clients on
+            # EVERY reactor shard (H1 regression: shards 1..N-1 used to be
+            # refused/dropped), so the smoke runs the sharded model.
+            f"[limits]\nnum_shards = {NUM_SHARDS}\n"
             f"[listen]\nirc = {PORT}\nws = {WS_PORT}\n"
             f"[tls]\nenabled = true\nport = {TLS_PORT}\n"
             f"[sasl]\naccount_db = \"{DB}\"\n"
@@ -302,6 +312,19 @@ def main():
     w.sendall(midframe[:7])  # header + mask + first payload byte: mid-frame
     time.sleep(0.5)  # let the daemon buffer the partial frame in its deframer
 
+    # Filler clients: plain registered connections held OPEN across the swap.
+    # SO_REUSEPORT spreads them over the reactor shards, so with high
+    # probability at least one lives on a NON-ZERO shard — the population the
+    # pre-fix UPGRADE refused/dropped. Each must answer a PING afterwards.
+    fillers = []
+    for i in range(FILLER_CLIENTS):
+        fc = connect()
+        fc.sendall(f"NICK filler{i}\r\nUSER filler{i} 0 * :filler\r\n".encode())
+        if " 001 " not in recv_until(fc, b" 001 "):
+            fail(f"filler client {i} did not register before UPGRADE", proc)
+        fillers.append(fc)
+    print(f"PASS: {FILLER_CLIENTS} filler clients registered before UPGRADE")
+
     b.sendall(b"UPGRADE\r\n")
     # Read the requester's progress NOTICE before the socket dies at execve —
     # it surfaces a refusal ("UPGRADE refused/failed: ...") that would otherwise
@@ -326,6 +349,32 @@ def main():
     if "adopting inherited listener fd" not in log:
         fail("successor did not adopt the inherited listener", proc)
     print("PASS: successor adopted the inherited listener socket")
+
+    # Multi-shard: the predecessor logs per-shard seal counts; at least one
+    # NON-ZERO shard must have sealed clients (else the run never exercised
+    # the multi-shard path and the zero-drop claim for shards >0 is unproven).
+    shard_seals = {
+        int(s): int(n)
+        for s, n in re.findall(r"UPGRADE — shard (\d+): (\d+) client\(s\) sealed", log)
+    }
+    if not shard_seals:
+        fail("no per-shard seal log lines — multi-shard seal did not run", proc)
+    if not any(n > 0 for s, n in shard_seals.items() if s > 0):
+        fail(
+            f"no client sealed on any non-zero shard ({shard_seals}); "
+            "SO_REUSEPORT put every client on shard 0 — rerun (astronomically unlikely) "
+            "or the multi-shard seal regressed",
+            proc,
+        )
+    print(f"PASS: clients sealed on multiple shards {shard_seals}")
+
+    # The successor must adopt one inherited listener PER SHARD (the full
+    # SO_REUSEPORT set), not just shard 0's.
+    adopted_shards = {int(s) for s in re.findall(r"adopting inherited listener fd \d+ \(shard (\d+)\)", log)}
+    for shard in range(NUM_SHARDS):
+        if shard not in adopted_shards:
+            fail(f"successor did not adopt shard {shard}'s inherited listener ({adopted_shards})", proc)
+    print(f"PASS: successor adopted all {NUM_SHARDS} per-shard listener sockets")
     # The successor logs how many carried-over connections it re-attached; >=1
     # proves session state + the client fd both crossed the handoff.
     if "re-attached" in log and "re-attached 0 client" not in log:
@@ -353,6 +402,19 @@ def main():
     if "PONG" not in pong:
         fail(f"survivor connection did not answer PING after UPGRADE: {pong!r}", proc)
     print("PASS: pre-upgrade connection SURVIVED the swap (PING/PONG)")
+
+    # EVERY filler client — spread across the shards — must survive with recv
+    # re-armed on its (re-pinned) shard's ring: PING answers PONG on each.
+    for i, fc in enumerate(fillers):
+        try:
+            fc.sendall(f"PING :filler{i}\r\n".encode())
+            fpong = recv_until(fc, b"PONG")
+        except OSError as e:
+            fail(f"filler client {i} broke across UPGRADE: {e}", proc)
+        if "PONG" not in fpong:
+            fail(f"filler client {i} did not answer PING after UPGRADE: {fpong!r}", proc)
+        fc.close()
+    print(f"PASS: all {FILLER_CLIENTS} filler clients (all shards) SURVIVED the swap")
 
     # The TLS client must survive with its resumed record stream intact.
     try:
