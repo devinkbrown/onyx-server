@@ -202,11 +202,12 @@ WebSocket frames even when another attachment has the same account and nick.
 ### Mesh boundary
 
 Signed E2EE control events use the Event Spine and converge across the secured
-Undertow mesh. Binary WebSocket media forwarding is currently node-local. A
-call whose participants attach to different nodes receives converged presence,
-handshake, detach, and group-key signaling, but Onyx Server does not yet cascade
-the encrypted binary media frames between nodes. Cross-node binary media relay
-remains explicit follow-up work; it is not claimed by the v2 E2EE release.
+Undertow mesh. Binary WebSocket media is origin-cascaded across secured mesh
+peers as opaque `MEDIA_WS_DATAGRAM` frames (`0x25`): the admitting node validates
+the browser Cadence MAC, fans out locally, then publishes once to established
+secured peers; receivers re-wrap for local WS call participants and never
+re-mesh (loop prevention is origin-only emit). Payloads are never decrypted or
+re-encoded — E2EE stays end-to-end. Codec: `src/proto/media_ws_relay.zig`.
 
 ## WebTransport and WASM shims
 
@@ -219,6 +220,40 @@ Browser and client WASM exports are separate from the daemon plugin host.
 | `src/wasm/cadence_wasm.zig` | CadenceVox audio encode/decode and CadenceVis video intra/inter encode/decode for `wasm32-freestanding`. | `src/wasm/cadence_wasm.zig:1`, `src/wasm/cadence_wasm.zig:3`, `src/wasm/cadence_wasm.zig:17`, `src/wasm/cadence_wasm.zig:21`, `src/wasm/cadence_wasm.zig:35`, `src/wasm/cadence_wasm.zig:39`, `src/wasm/cadence_wasm.zig:49` |
 | `src/wasm/browser_transport.zig` | Browser transport shim core is re-exported from the package root; the wasm32 export wrapper lives in `src/wasm/transport_shim.zig`. | `src/root.zig:18`, `src/root.zig:21`, `src/wasm/browser_transport.zig:1`, `src/wasm/transport_shim.zig:1` |
 
+## Browser WS media vs native/WebRTC legs (E2EE boundary)
+
+Browser clients with `[media].ws_media_relay` use a third media plane that is
+**not** bridged to native Cadence UDP or WebRTC RTP:
+
+| Plane | Framing | Crypto | Cross-leg |
+| --- | --- | --- | --- |
+| Native UDP | Cadence container over UDP | Optional per-stream MAC (`native_media_require_mac`) | Yes ↔ WebRTC via `media_bridge` rewrap |
+| WebRTC UDP | RTP/SRTP (optional DTLS-SRTP) | SRTP group key or DTLS-exported keys | Yes ↔ native via `media_bridge` rewrap |
+| Browser WS | Cadence container over binary WebSocket | Per-stream MAC + **client-held E2EE** (AES-GCM group epoch; server has no key) | **No** — server must not decrypt; opaque fan-out to other WS members only |
+
+`handleWsMediaDatagram` validates MAC/stream/kind/attachment and relays the
+opaque ciphertext to other **on-node** WS call members, then **origin-only**
+cascades the same opaque bytes to secured mesh peers as S2S
+`MEDIA_WS_DATAGRAM` (`src/proto/media_ws_relay.zig`, tag `0x25`). Receivers
+local-fanout only and **never re-mesh** (loop prevention). It never feeds the
+payload into `media_bridge` rewrap: the Cadence payload is E2EE ciphertext with
+an attachment prefix, not a shared-codec native/RTP payload. A mixed WS+native
+call therefore cannot hear across legs without breaking E2EE (server decrypt) or
+shipping undecryptable bytes.
+
+To avoid advertising dead paths, `provisionMediaTransports` treats WebSocket
+connections specially:
+
+- never advertise `NATIVE` (browser path is not Cadence UDP)
+- advertise `TRANSPORT` only when the client explicitly requests WebRTC/DTLS
+  **and** the candidate host is not loopback (`media_host` default `127.0.0.1`
+  with no STUN is unroutable from a remote browser)
+- do not bridge-register a pure WS participant (not on either UDP leg)
+
+Browser primary path: `MEDIA JOIN` → `MACKEY` → binary Cadence frames. Configure
+`ws_media_relay` (and prefer `ws_media_require_mac`) for browser deployments;
+set a public `media_host` or STUN only for native/WebRTC UDP peers.
+
 ## Planning notes and divergences
 
 Where older media-transport design intent has not fully landed in the source, the current code verifies these concrete pieces:
@@ -227,4 +262,6 @@ Where older media-transport design intent has not fully landed in the source, th
 | --- | --- | --- |
 | Runtime media SFU sizing | SFU rooms now have a runtime participant cap defaulting to 64 and clamped to the inline 256-seat ceiling. The native Cadence call leg remains capped at 64. | `src/daemon/media_room.zig:17`, `src/daemon/media_room.zig:18`, `src/daemon/media_room.zig:37`, `src/daemon/native_media_transport.zig:42`, `src/daemon/native_media_transport.zig:43` |
 | Runtime Cadence reassembly sizing | Runtime window defaults exist, but actual `ReassemblyBuffer` capacity remains comptime-bound. | `src/substrate/cadence_frame.zig:34`, `src/substrate/cadence_frame.zig:39`, `src/substrate/cadence_frame.zig:397`, `src/substrate/cadence_frame.zig:418` |
-| Mixed-leg calls | The bridge exists as header rewrap only; it requires a shared codec payload and does not transcode. | `src/daemon/media_bridge.zig:10`, `src/daemon/media_bridge.zig:19`, `src/daemon/media_bridge.zig:254`, `src/daemon/media_bridge.zig:272` |
+| Mixed-leg calls | The bridge exists as header rewrap only between native UDP and WebRTC RTP; it requires a shared codec payload and does not transcode. Browser WS E2EE frames are not bridged. | `src/daemon/media_bridge.zig:10`, `src/daemon/media_bridge.zig:19`, `src/daemon/media_bridge.zig:254`, `src/daemon/media_bridge.zig:272`, `src/daemon/server.zig` `handleWsMediaDatagram` / `provisionMediaTransports` |
+| WS unroutable candidates | WS OFFER/ANSWER suppresses loopback TRANSPORT and always omits NATIVE; MACKEY remains the browser media plane. | `src/daemon/server.zig` `provisionMediaTransports`, `mediaHostIsLoopback` |
+| Mesh WS media cascade | **Shipped:** origin node meshes opaque Cadence WS datagrams via secured `MEDIA_WS_DATAGRAM`; receivers fan out locally only (no re-mesh). | `src/proto/media_ws_relay.zig`, `src/proto/s2s_frame.zig` tag `0x25`, `s2s_peer.sendMediaWsDatagram` / `takeMediaWsDatagrams`, `relayWsMediaDatagram` / `drainMediaWsDatagrams` |

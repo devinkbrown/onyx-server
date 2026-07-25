@@ -611,7 +611,7 @@ pub fn resumeFromEnv() ?Resume {
 }
 
 fn resumeFromEnvBlock(env: []const u8) ?Resume {
-    // ONYX_ Helix env names only (no OROCHI_ Japanese brand aliases).
+    // ONYX_ Helix env names only (Onyx brand only).
     const arena_fd = readFdFromEnvBlock(env, env_arena_fd);
     const control_fd = readFdFromEnvBlock(env, env_control_fd);
     const listen_fd = readFdFromEnvBlock(env, env_listen_fd);

@@ -307,6 +307,7 @@ fn bridgeOnRtcpFeedback(ctx: *anyopaque, channel: []const u8, rtcp: []const u8) 
 const memo_mod = @import("memo.zig");
 const webpush_mod = @import("webpush.zig");
 const memo_push_relay = @import("../proto/memo_push_relay.zig");
+const media_ws_relay = @import("../proto/media_ws_relay.zig");
 const transcript_mod = @import("transcript.zig");
 const announce_board_mod = @import("announce_board.zig");
 const bot_registry_mod = @import("bot_registry.zig");
@@ -1206,10 +1207,10 @@ fn mediaKindBit(kind: media_room.MediaKind) u8 {
 /// trips before the class is known.
 const default_sendq_cap: usize = 1 << 20; // 1 MiB
 /// One maximum-size inner S2S frame plus the secured record's u32 length prefix
-/// and ChaCha20-Poly1305 tag. A server-link class may be configured below this,
-/// but a negotiated peer must always make progress on one legal replica object.
-/// Ordinary client classes are never raised to this cap.
-const min_s2s_sendq_cap: usize = s2s_frame.default_max_frame_size + @sizeOf(u32) +
+/// and ChaCha20-Poly1305 tag. Sized for the media-cascade ceiling (a Cadence
+/// keyframe over MEDIA_WS_DATAGRAM) so a server-link class never stalls on a
+/// legal media frame. Ordinary client classes are never raised to this cap.
+const min_s2s_sendq_cap: usize = media_ws_relay.required_max_frame_size + @sizeOf(u32) +
     std.crypto.aead.chacha_poly.ChaCha20Poly1305.tag_length;
 const default_recv_bytes: usize = 4096;
 /// Upper bound on records demuxed in one kTLS-RX control-record drain pass, so a
@@ -1726,13 +1727,16 @@ pub const Config = struct {
     /// Require the native CadenceVox/CadenceVis UDP leg to carry a per-datagram MAC tag.
     /// Defaults false for compatibility until Nexus/Ocean emit matching tags.
     native_media_require_mac: bool = false,
-    /// Relay browser media datagrams (binary WebSocket frames) between a
-    /// channel's call participants. Off by default; the WS media plane is opt-in.
+    /// Primary browser media plane: relay binary WebSocket Cadence frames
+    /// (client-held E2EE ciphertext) between a channel's call participants.
+    /// Off by default; opt-in. When on, MEDIA JOIN issues MACKEY and OFFER
+    /// suppresses unroutable NATIVE/TRANSPORT for WS clients.
     ws_media_relay: bool = false,
     /// Require a valid per-stream MAC tag on every browser media datagram. When
     /// false (default), untagged datagrams still relay but a present tag must
     /// verify; the per-stream key is the same `native_stream_key`-derived
-    /// `(channel, participant)` key the native UDP leg uses.
+    /// `(channel, participant)` key the native UDP leg uses. Prefer true with
+    /// `ws_media_relay` in production.
     ws_media_require_mac: bool = false,
     /// Terminate DTLS-SRTP (RFC 5764) on the WebRTC UDP media plane so standard
     /// browser/mobile endpoints can key the SRTP leg via a DTLS handshake
@@ -1794,7 +1798,10 @@ pub const Config = struct {
     webhook_public_base: []const u8 = "",
     /// UDP port for the media (SFU) transport plane; 0 = ephemeral. Bound on boot.
     media_port: u16 = 0,
-    /// Host/IP advertised to clients as the server's media (ICE) candidate.
+    /// Host/IP advertised to native/WebRTC clients as the server's media (ICE)
+    /// candidate. Default 127.0.0.1 is local-only; production needs a public
+    /// address or STUN. Browser WS media uses MACKEY instead; loopback hosts
+    /// are suppressed for WS OFFER (see `provisionMediaTransports`).
     media_host: []const u8 = "127.0.0.1",
     /// Optional STUN server (IPv4 literal) queried at boot to discover the
     /// reflexive media candidate behind NAT; overrides media_host when it works.
@@ -2606,6 +2613,9 @@ pub const ConnState = struct {
     /// `resolveS2sCollision` to deterministically collapse the duplicate link
     /// that forms when both nodes auto-dial each other.
     s2s_initiator: bool = false,
+    /// Stats: `onS2sEstablished` counted for this peer so close drops
+    /// `s2s_links_active` exactly once (TCP accept alone does not establish).
+    s2s_established_counted: bool = false,
     /// True when this S2S link is being torn down by `resolveS2sCollision` as a
     /// duplicate (the same peer is still reachable via the surviving link). Its
     /// `closeConn` must NOT emit a netsplit — the members never actually left, so
@@ -2855,6 +2865,25 @@ const QueueSink = struct {
         // Route through appendToConn so a TLS connection's pre-registration /
         // PING replies are encrypted on the same seam as everything else.
         return appendToConn(self.conn, bytes);
+    }
+};
+
+/// Holds one pre-registration dispatcher reply until the live server has run
+/// admission checks that depend on the account store. In particular, the
+/// dispatcher must not leak a 001 welcome for a registered nick before the
+/// server verifies that SASL authenticated its owner.
+const PreregReplySink = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    fn write(self: *PreregReplySink, bytes: []const u8) ServerError!void {
+        if (bytes.len > self.buf.len - self.len) return error.OutputTooSmall;
+        @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    fn written(self: *const PreregReplySink) []const u8 {
+        return self.buf[0..self.len];
     }
 };
 
@@ -8172,6 +8201,14 @@ pub const LinuxServer = struct {
         }
         const link = try self.allocator.create(secured_s2s_link.SecuredLink);
         errdefer self.allocator.destroy(link);
+        // Raise the per-peer frame ceiling so a signed MEDIA_WS_DATAGRAM can
+        // carry a full browser Cadence frame. Leave the shared
+        // `s2s_frame.default_max_frame_size` (and thus portable-session
+        // snapshot budgets) at 1 MiB.
+        var media_s2s_cfg = self.config.s2s_config;
+        if (media_s2s_cfg.max_frame_size < media_ws_relay.required_max_frame_size) {
+            media_s2s_cfg.max_frame_size = media_ws_relay.required_max_frame_size;
+        }
         link.* = try secured_s2s_link.SecuredLink.init(.{
             .allocator = self.allocator,
             .role = role,
@@ -8189,7 +8226,7 @@ pub const LinuxServer = struct {
             .server_name = self.serverName(),
             .description = self.config.server_description,
             .local_epoch_ms = wall,
-            .inner_config = self.config.s2s_config,
+            .inner_config = media_s2s_cfg,
             .expected_remotes = pins[0..pin_count],
             .trusted_node_keys = self.mesh_trusted_node_keys,
         });
@@ -8233,6 +8270,18 @@ pub const LinuxServer = struct {
         self.forwardAcceptedRelayV2(&.{});
     }
 
+    /// Count a mesh-routable peer once for metrics + journal. Idempotent per conn.
+    fn noteS2sEstablished(self: *LinuxServer, conn: *ConnState, remote_name: []const u8, kind: []const u8) void {
+        if (conn.s2s_established_counted) return;
+        conn.s2s_established_counted = true;
+        self.stats.onS2sEstablished();
+        const name = if (remote_name.len != 0) remote_name else "pending-peer";
+        var buf: [160]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "mesh S2S established ({s}) peer={s}", .{ kind, name }) catch "mesh S2S established";
+        srvLog("onyx-server: {s}\n", .{line});
+        self.traceLog(.info, .s2s, line);
+    }
+
     /// Drive a PQ-secured S2S peer: feed inbound bytes through the framed Mooring
     /// link and queue its outbound. Logs the AKE establishment transition.
     fn driveS2sSecured(self: *LinuxServer, conn: *ConnState, link: *secured_s2s_link.SecuredLink, bytes: []const u8) void {
@@ -8265,7 +8314,7 @@ pub const LinuxServer = struct {
         // cross-reactor mutation). Runs before the peer_up announcement.
         if (link.established() and self.refuseJupedPeer(conn, link.remoteName())) return;
         if (!was and link.established()) {
-            self.traceLog(.info, .s2s, "s2s secured link established");
+            self.noteS2sEstablished(conn, link.remoteName(), "secured");
             self.logMeshEvent(.peer_up, link.remoteName(), "secured link established");
             self.publishServerLink(link.remoteName(), true);
             self.markPeerHealth(link.remoteName(), .established);
@@ -8330,6 +8379,7 @@ pub const LinuxServer = struct {
         self.drainKills(link);
         self.drainWards(link);
         self.drainMemoPushes(link);
+        self.drainMediaWsDatagrams(link);
         self.drainRepairResync(conn, link, true);
         // Consume tombstones first. The peer driver keeps frame families in
         // separate queues, so this ordering makes a consume win over a delayed
@@ -8467,6 +8517,7 @@ pub const LinuxServer = struct {
         // peer juped after linking is dropped on its next activity (own thread).
         if (link.established() and self.refuseJupedPeer(conn, link.remoteName())) return;
         if (!was and link.established()) {
+            self.noteS2sEstablished(conn, link.remoteName(), "plaintext");
             self.logMeshEvent(.peer_up, link.remoteName(), "link established");
             self.publishServerLink(link.remoteName(), true);
             self.markPeerHealth(link.remoteName(), .established);
@@ -12478,13 +12529,14 @@ pub const LinuxServer = struct {
                 // Drop this peer's network-wide clone contributions (keyed by the
                 // same node id `setRemote` used, so a dedup'd duplicate is skipped).
                 if (!conn.s2s_dedup) if (link.remoteNodeId()) |node| self.mesh_clones.dropNode(node);
+                const was_est = conn.s2s_established_counted;
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s_secured = null;
                 if (!conn.s2s_dedup) self.updatePartitionTransitions(); // detect a split this drop caused
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
-                self.stats.onClose(true);
+                self.stats.onClose(true, was_est);
                 return;
             }
             if (conn.s2s) |link| {
@@ -12500,16 +12552,17 @@ pub const LinuxServer = struct {
                 if (!conn.s2s_dedup) if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
                 // Drop this peer's network-wide clone contributions.
                 if (!conn.s2s_dedup) if (dropped_node) |node| self.mesh_clones.dropNode(node);
+                const was_est = conn.s2s_established_counted;
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s = null;
                 if (!conn.s2s_dedup) self.updatePartitionTransitions(); // detect a split this drop caused
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
-                self.stats.onClose(true);
+                self.stats.onClose(true, was_est);
                 return;
             }
-            self.stats.onClose(false);
+            self.stats.onClose(false, false);
             self.stats.onQuit();
             // Free any in-flight inbound multiline batch buffer.
             self.abortMultiline(conn);
@@ -13017,7 +13070,8 @@ pub const LinuxServer = struct {
                 return;
             }
             const external_exchange = conn.session.sasl_pending == .external;
-            var sink = QueueSink{ .conn = conn };
+            var prereg_reply_buf: [default_reply_bytes]u8 = undefined;
+            var sink = PreregReplySink{ .buf = &prereg_reply_buf };
             // Same per-client firewall as dispatchRegistered below: a full send
             // buffer, oversize reply, or an outbound control-byte reflection
             // (error.ControlByte) during preregistration closes only this
@@ -13035,6 +13089,18 @@ pub const LinuxServer = struct {
                 },
                 else => return err,
             };
+            if (conn.session.registered() and self.registeredNickRequiresAuthentication(conn, conn.session.displayName())) {
+                try queueNumeric(
+                    conn,
+                    .ERR_ERRONEUSNICKNAME,
+                    &.{conn.session.displayName()},
+                    "Nickname is registered; authenticate as this account before using it",
+                );
+                conn.close_reason = "Registered nickname requires authentication";
+                conn.closing = true;
+                return;
+            }
+            if (sink.written().len != 0) try appendToConn(conn, sink.written());
             if (std.ascii.eqlIgnoreCase(parsed.command, "AUTHENTICATE"))
                 conn.sasl_external_authenticated = external_exchange and
                     conn.session.client.registration.sasl == .succeeded and
@@ -13051,6 +13117,7 @@ pub const LinuxServer = struct {
                 // forward-confirmed reverse-DNS name if the operator enabled rDNS.
                 self.applyVisibleHost(conn);
                 try self.registerConnNick(id, conn);
+                if (conn.closing) return;
                 // Complete the registration burst after the 001-005 numerics
                 // (emitted by the dispatch welcome): LUSERS (251-255) then the
                 // MOTD (375/372/376 or 422), as every ircd does on connect.
@@ -13374,9 +13441,27 @@ pub const LinuxServer = struct {
         return entry;
     }
 
+    /// Registered account names are identity claims, not guest nicknames. The
+    /// account store is authoritative and the owner must have completed SASL
+    /// before registration or a later NICK change may adopt the name.
+    fn registeredNickRequiresAuthentication(self: *LinuxServer, conn: *ConnState, nick: []const u8) bool {
+        const svc = self.account_services orelse return false;
+        if (conn.session.account()) |account| {
+            if (std.ascii.eqlIgnoreCase(account, nick)) return false;
+        }
+        _ = svc.accountInfo(nick) catch return false;
+        return true;
+    }
+
     fn registerConnNick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
         const nick = conn.session.displayName();
         if (std.mem.eql(u8, nick, "*")) return;
+        if (self.registeredNickRequiresAuthentication(conn, nick)) {
+            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{nick}, "Nickname is registered; authenticate as this account before using it");
+            conn.close_reason = "Registered nickname requires authentication";
+            conn.closing = true;
+            return;
+        }
         if (self.saccess.matchNick(nick)) |entry| {
             try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{nick}, serverAccessReason(entry, "Nickname blocked by SACCESS"));
             conn.closing = true;
@@ -26666,6 +26751,10 @@ pub const LinuxServer = struct {
             if (close_fd_on_failure) closeFd(snap.fd);
             return null;
         };
+        var media_s2s_cfg = self.config.s2s_config;
+        if (media_s2s_cfg.max_frame_size < media_ws_relay.required_max_frame_size) {
+            media_s2s_cfg.max_frame_size = media_ws_relay.required_max_frame_size;
+        }
         link.* = secured_s2s_link.SecuredLink.resumeOuter(.{
             .allocator = self.allocator,
             .role = role,
@@ -26683,7 +26772,7 @@ pub const LinuxServer = struct {
             .server_name = self.serverName(),
             .description = self.config.server_description,
             .local_epoch_ms = wall,
-            .inner_config = self.config.s2s_config,
+            .inner_config = media_s2s_cfg,
             .expected_remotes = pins[0..pin_count],
             .trusted_node_keys = self.mesh_trusted_node_keys,
         }, .{
@@ -26810,6 +26899,7 @@ pub const LinuxServer = struct {
         self.updatePartitionTransitions();
         self.bindRelayV2UnboundIfReady(conn, link);
         self.stats.onS2sAccept();
+        self.noteS2sEstablished(conn, rname, "helix-resume");
         self.traceLog(.info, .s2s, "s2s secured peer preserved across upgrade");
     }
 
@@ -27050,6 +27140,8 @@ pub const LinuxServer = struct {
             peer.s2s_secured = link;
             errdefer peer.s2s_secured = null;
             try self.armConnect(peer);
+            // Outbound dial opens a TCP S2S slot (not yet Mooring-established).
+            self.stats.onS2sAccept();
             return peer.token;
         }
 
@@ -27072,6 +27164,7 @@ pub const LinuxServer = struct {
         errdefer peer.s2s = null;
 
         try self.armConnect(peer);
+        self.stats.onS2sAccept();
         return peer.token;
     }
 
@@ -31274,11 +31367,11 @@ pub const LinuxServer = struct {
                     null,
                     .{ .recipients = delivery_ids.items, .line = line },
                 ) catch {
-                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; event not sent — check mesh peers and retry");
                     return;
                 };
                 if (accepted_v2 == null) {
-                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the event; not delivered — retry or contact opers");
                     return;
                 }
             }
@@ -31389,11 +31482,11 @@ pub const LinuxServer = struct {
                     null,
                     .{ .recipients = delivery_ids.items, .line = line },
                 ) catch {
-                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; event not sent — check mesh peers and retry");
                     return;
                 };
                 if (accepted_v2 == null) {
-                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the event; not delivered — retry or contact opers");
                     return;
                 }
             }
@@ -31712,11 +31805,11 @@ pub const LinuxServer = struct {
                     null,
                     .{ .recipients = delivery_ids.items, .line = out },
                 ) catch {
-                    try self.failReply(conn, "WHISPER", "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                    try self.failReply(conn, "WHISPER", "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; event not sent — check mesh peers and retry");
                     return;
                 };
                 if (accepted_v2 == null) {
-                    try self.failReply(conn, "WHISPER", "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                    try self.failReply(conn, "WHISPER", "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the event; not delivered — retry or contact opers");
                     return;
                 }
             }
@@ -32965,6 +33058,10 @@ pub const LinuxServer = struct {
         const newnick = parsed.paramSlice()[0];
         if (!isValidNick(newnick)) {
             try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{newnick}, "Erroneous nickname");
+            return;
+        }
+        if (self.registeredNickRequiresAuthentication(conn, newnick)) {
+            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{newnick}, "Nickname is registered; authenticate as this account before using it");
             return;
         }
         if (self.saccess.matchNick(newnick)) |entry| {
@@ -41057,6 +41154,43 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Fan an already-validated browser Cadence datagram to every established
+    /// secured mesh peer. Origin-only: receivers never re-mesh (see
+    /// `drainMediaWsDatagrams`). Best-effort — a peer that rejects oversize or
+    /// is not signing-capable is skipped without affecting local delivery.
+    fn meshBroadcastMediaWsDatagram(self: *LinuxServer, channel: []const u8, datagram: []const u8) void {
+        if (datagram.len == 0 or datagram.len > media_ws_relay.max_datagram_len) return;
+        if (channel.len == 0 or channel.len > media_ws_relay.max_channel_len) return;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established()) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                link.sendMediaWsDatagram(channel, datagram) catch continue;
+                _ = self.flushSecuredS2sOutboundTo(pid, link);
+            }
+        }
+    }
+
+    /// Decode inbound secured MEDIA_WS_DATAGRAM cascades and fan out locally to
+    /// WS call participants. Never re-meshes: the origin node is the sole mesh
+    /// emitter (loop prevention). Browser MAC is not re-verified — the origin
+    /// already admitted the opaque E2EE datagram.
+    fn drainMediaWsDatagrams(self: *LinuxServer, link: anytype) void {
+        const payloads = link.takeMediaWsDatagrams() catch return;
+        defer {
+            for (payloads) |p| self.allocator.free(p);
+            self.allocator.free(payloads);
+        }
+        for (payloads) |p| {
+            const ev = media_ws_relay.decode(p) catch continue;
+            // Local-only fanout: pass a null sender so no local client is
+            // excluded as "self", and skip the mesh publish path.
+            self.fanoutWsMediaDatagramLocal(null, ev.channel, ev.datagram);
+        }
+    }
+
     /// Emit the caller's pending memos as server notices (without clearing).
     fn memoList(self: *LinuxServer, conn: *ConnState, account: []const u8) !void {
         for (self.memo.pending(account)) |m| {
@@ -41637,8 +41771,16 @@ pub const LinuxServer = struct {
 
     /// Ingest one binary-WebSocket media datagram from a registered call
     /// participant: validate the Cadence frame shape, lenient-verify the per-stream
-    /// MAC, and fan it out to the channel's other on-node call members. Media is
-    /// loss-tolerant — any problem drops this datagram, never the IRC session.
+    /// MAC, and fan it out to the channel's other on-node WS call members.
+    ///
+    /// Browser media plane (primary when `ws_media_relay` is on): MACKEY on JOIN
+    /// authenticates each Cadence frame; the Cadence payload is client-held E2EE
+    /// ciphertext (attachment-bound AES-GCM). The daemon never decrypts it and
+    /// never feeds it into the native↔WebRTC rewrap bridge — doing so would either
+    /// require a group key the server does not hold, or would ship undecryptable
+    /// ciphertext to native/RTP peers. Cross-leg mixed calls remain native UDP ↔
+    /// WebRTC RTP only. Media is loss-tolerant — any problem drops this datagram,
+    /// never the IRC session.
     fn handleWsMediaDatagram(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, datagram: []const u8) void {
         if (!self.config.ws_media_relay) return;
         if (!conn.session.registered()) return;
@@ -41664,6 +41806,7 @@ pub const LinuxServer = struct {
         // participant cannot MAC a victim's stream id and impersonate that track.
         if (!self.wsMediaFrameAuthorized(id, channel, participant, frame)) return;
 
+        // Opaque WS fan-out only — never rewrap into native/RTP (E2EE).
         self.relayWsMediaDatagram(id, channel, datagram);
     }
 
@@ -41733,12 +41876,22 @@ pub const LinuxServer = struct {
     }
 
     /// Fan a validated media datagram out to the channel's other call participants
-    /// over a binary WS frame. The frame is encoded once and reused for every
-    /// same-node recipient; cross-shard recipients ride the reactor fabric as a
-    /// preframed secure payload so the owning shard applies TLS/kTLS without
-    /// re-wrapping the bytes as a text WebSocket IRC line. Cross-node mesh media
-    /// relay remains a later SFU-cascade slice.
+    /// over a binary WS frame, then origin-cascade once onto the secured mesh so
+    /// remote-node participants receive the same opaque E2EE bytes. Same-node
+    /// recipients are encoded once and reused; cross-shard recipients ride the
+    /// reactor fabric as a preframed secure payload. Cross-node receivers only
+    /// local-fanout (never re-mesh) — see `drainMediaWsDatagrams`.
     fn relayWsMediaDatagram(self: *LinuxServer, sender: client_model.ClientId, channel: []const u8, datagram: []const u8) void {
+        self.fanoutWsMediaDatagramLocal(sender, channel, datagram);
+        self.meshBroadcastMediaWsDatagram(channel, datagram);
+    }
+
+    /// Local-only binary WS fanout for a Cadence media datagram. `sender` is the
+    /// originating client when this node admitted the frame (excluded from the
+    /// fanout); `null` means a mesh-received cascade (every local participant
+    /// is a candidate). Does not mesh-publish — callers that own the origin
+    /// path invoke `meshBroadcastMediaWsDatagram` separately.
+    fn fanoutWsMediaDatagramLocal(self: *LinuxServer, sender: ?client_model.ClientId, channel: []const u8, datagram: []const u8) void {
         if (datagram.len > WsState.max_media_frame) return; // exceeds the media frame ceiling
         // A media datagram (video keyframe) can be ~1.3 MB — far too large for a
         // stack buffer — so encode the binary WS frame once on the heap and reuse
@@ -41750,7 +41903,9 @@ pub const LinuxServer = struct {
         var members = self.world.memberIterator(channel) orelse return;
         while (members.next()) |member| {
             const mid = clientIdFromWorld(member.*);
-            if (mid.eql(sender)) continue;
+            if (sender) |sid| {
+                if (mid.eql(sid)) continue;
+            }
             const mconn = self.connFor(mid) orelse continue;
             if (mconn.closing) continue;
             const recipient_ws = mconn.ws orelse continue; // browser media only goes to WS peers
@@ -41765,9 +41920,12 @@ pub const LinuxServer = struct {
     }
 
     /// Derive this participant's per-stream MAC key and hand it to them over the
-    /// authenticated WS as a caller-only MEDIA Event Spine reply. Only the owning
-    /// participant ever receives its own key; the server re-derives to verify
-    /// (stateless).
+    /// authenticated WS as a caller-only MEDIA Event Spine reply (`MACKEY`).
+    /// For browser clients with `ws_media_relay`, this key plus binary Cadence
+    /// frames is the primary media plane — not the UDP NATIVE/TRANSPORT
+    /// candidates (those are suppressed when unroutable; see
+    /// `provisionMediaTransports`). Only the owning participant ever receives
+    /// its own key; the server re-derives to verify (stateless).
     fn issueMediaMacKey(self: *LinuxServer, conn: *ConnState, channel: []const u8, participant: []const u8) void {
         var k32: [cadence_frame.MAC_KEY_BYTES]u8 = undefined;
         cadence_frame.deriveNativeMediaMacKey(&self.native_stream_key, channel, participant, &k32);
@@ -42127,47 +42285,72 @@ pub const LinuxServer = struct {
 
     fn provisionMediaTransports(self: *LinuxServer, conn: *ConnState, channel: []const u8, participant_codecs: []const sdp.Codec, dtls_mode: bool, extra_args: []const []const u8) !void {
         const nick = conn.session.displayName();
+        const want_webrtc = dtls_mode or isWebrtcTransport(extra_args);
+
+        // Prefer the STUN-discovered reflexive candidate over the static host.
+        var host_buf: [16]u8 = undefined;
+        const cand_host = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
+        const host_loopback = mediaHostIsLoopback(cand_host);
+
+        // Browser WebSocket clients: the primary media plane is MACKEY + binary
+        // Cadence frames over the authenticated WS (`ws_media_relay`). Those
+        // frames carry client-held E2EE ciphertext the daemon cannot decrypt, so
+        // they are never rewrapped onto the native Cadence UDP or WebRTC RTP legs
+        // (see `handleWsMediaDatagram`). Advertising NATIVE/TRANSPORT with the
+        // default loopback `media_host` (no STUN) is actively misleading — the
+        // browser cannot use raw Cadence UDP, and a 127.0.0.1 ICE candidate is
+        // unroutable from a remote peer.
+        //
+        // Policy for WS connections:
+        //   - never advertise NATIVE (browser path is not the native UDP leg)
+        //   - advertise TRANSPORT only when the client explicitly requested
+        //     WebRTC/DTLS AND the candidate host is not loopback
+        //   - bridge-register only when a UDP leg was actually provisioned
+        // Non-WS (native IRC) clients keep the historical TRANSPORT+NATIVE path.
+        const is_ws = conn.ws != null;
+        const advertise_transport = if (is_ws) want_webrtc and !host_loopback else true;
+        const advertise_native = !is_ws;
 
         // Allocate this participant's ICE endpoint and advertise the server
         // transport (ufrag/pwd + media candidate) so the client can run STUN to
         // the SFU. OFFER and ANSWER both call this: negotiation is useless if
         // the answerer never receives reachable transport credentials.
-        if (self.media_plane.allocate(channel, nick)) |creds| {
-            // Prefer the STUN-discovered reflexive candidate over the static host.
-            var host_buf: [16]u8 = undefined;
-            const cand_host = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
-            var tbuf: [400]u8 = undefined;
-            if (dtls_mode) {
-                // RFC 8122: advertise the server's DTLS certificate fingerprint +
-                // setup=passive (Onyx Server is the DTLS server) INSTEAD of the SDES
-                // group key. The peer's offered fingerprint was already stored
-                // (fail-closed) above, so the handshake fails closed on a cert
-                // mismatch. `dtls_mode` implies `dtlsFingerprint` is non-null.
-                var fp_buf: [128]u8 = undefined;
-                const server_fp = self.media_plane.dtlsFingerprint(&fp_buf) orelse "";
-                const detail = std.fmt.bufPrint(&tbuf, "ufrag={s} pwd={s} candidate={s}:{d} fingerprint={s} setup=passive", .{
-                    creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, server_fp,
-                }) catch return;
-                try self.sendMediaEventReply(conn, "TRANSPORT", channel, detail);
-            } else {
-                // Legacy SDES path (byte-identical to pre-Increment-3): ship the
-                // per-call SRTP group key, base64'd, over the TLS IRC link.
-                const gk = self.media_plane.groupKey(channel);
-                var gk_b64: [std.base64.standard.Encoder.calcSize(gk.len)]u8 = undefined;
-                const srtp_b64 = std.base64.standard.Encoder.encode(&gk_b64, &gk);
-                const detail = std.fmt.bufPrint(&tbuf, "ufrag={s} pwd={s} candidate={s}:{d} srtp={s}", .{
-                    creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, srtp_b64,
-                }) catch return;
-                try self.sendMediaEventReply(conn, "TRANSPORT", channel, detail);
+        if (advertise_transport) {
+            if (self.media_plane.allocate(channel, nick)) |creds| {
+                var tbuf: [400]u8 = undefined;
+                if (dtls_mode) {
+                    // RFC 8122: advertise the server's DTLS certificate fingerprint +
+                    // setup=passive (Onyx Server is the DTLS server) INSTEAD of the SDES
+                    // group key. The peer's offered fingerprint was already stored
+                    // (fail-closed) above, so the handshake fails closed on a cert
+                    // mismatch. `dtls_mode` implies `dtlsFingerprint` is non-null.
+                    var fp_buf: [128]u8 = undefined;
+                    const server_fp = self.media_plane.dtlsFingerprint(&fp_buf) orelse "";
+                    const detail = std.fmt.bufPrint(&tbuf, "ufrag={s} pwd={s} candidate={s}:{d} fingerprint={s} setup=passive", .{
+                        creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, server_fp,
+                    }) catch return;
+                    try self.sendMediaEventReply(conn, "TRANSPORT", channel, detail);
+                } else {
+                    // Legacy SDES path (byte-identical to pre-Increment-3): ship the
+                    // per-call SRTP group key, base64'd, over the TLS IRC link.
+                    const gk = self.media_plane.groupKey(channel);
+                    var gk_b64: [std.base64.standard.Encoder.calcSize(gk.len)]u8 = undefined;
+                    const srtp_b64 = std.base64.standard.Encoder.encode(&gk_b64, &gk);
+                    const detail = std.fmt.bufPrint(&tbuf, "ufrag={s} pwd={s} candidate={s}:{d} srtp={s}", .{
+                        creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, srtp_b64,
+                    }) catch return;
+                    try self.sendMediaEventReply(conn, "TRANSPORT", channel, detail);
+                }
             }
         }
 
         // Native transport (our own CadenceVox/CadenceVis codec leg): register this
         // participant for the channel's native call and advertise the candidate +
         // the stream_id the client must stamp into its cadence frames. Independent
-        // of the WebRTC plane above; best-effort (media is optional).
+        // of the WebRTC plane above; best-effort (media is optional). Skipped for
+        // WebSocket clients — their media plane is MACKEY + binary WS frames.
         const stream_id = self.nativeStreamId(channel, nick);
-        if (self.native_media.port != 0) {
+        if (advertise_native and self.native_media.port != 0) {
             self.native_media.register(channel, nick, .voice, stream_id, .{}) catch {};
             var nbuf: [256]u8 = undefined;
             const mac_token = if (self.config.native_media_require_mac) " mac=hmac-sha256-128" else "";
@@ -42176,20 +42359,44 @@ pub const LinuxServer = struct {
             // plane above. The native UDP socket sits behind the same NAT as the
             // WebRTC socket, so the reflexive IP is identical; without this a
             // remote native client would be told 127.0.0.1 and never reach the SFU.
-            var native_host_buf: [16]u8 = undefined;
-            const native_cand = self.media_plane.candidateIp(&native_host_buf) orelse self.config.media_host;
             const detail = std.fmt.bufPrint(&nbuf, "candidate={s}:{d} stream={d} codec=CadenceVox/CadenceVis{s}", .{
-                native_cand, self.native_media.port, stream_id, mac_token,
+                cand_host, self.native_media.port, stream_id, mac_token,
             }) catch return;
             try self.sendMediaEventReply(conn, "NATIVE", channel, detail);
         }
-        // Record this participant's leg in the per-channel cross-leg bridge. The
-        // client opts into the WebRTC leg with `transport=webrtc` (default native).
-        // The bridge lets a native participant and an opt-in-WebRTC participant in
-        // the same call hear each other (rewrap only, never transcode).
-        const want_webrtc = dtls_mode or isWebrtcTransport(extra_args);
-        const leg: media_bridge_mod.Leg = if (want_webrtc) .webrtc else .native;
-        self.bridgeRegister(channel, nick, leg, stream_id, participant_codecs);
+
+        // Record this participant's leg in the per-channel cross-leg bridge only
+        // when they actually sit on a UDP leg. The bridge lets a native participant
+        // and an opt-in-WebRTC participant in the same call hear each other
+        // (rewrap only, never transcode). A pure WS browser is on neither leg.
+        if (advertise_transport or advertise_native) {
+            const leg: media_bridge_mod.Leg = if (want_webrtc and advertise_transport) .webrtc else .native;
+            self.bridgeRegister(channel, nick, leg, stream_id, participant_codecs);
+        }
+    }
+
+    /// True when an advertised media candidate host is loopback/unroutable from
+    /// a remote peer. Used to suppress TRANSPORT/NATIVE replies to browser WS
+    /// clients so they do not chase a 127.0.0.1 ICE path.
+    fn mediaHostIsLoopback(host: []const u8) bool {
+        if (host.len == 0) return true;
+        if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+        if (std.mem.eql(u8, host, "::1")) return true;
+        // IPv4 loopback 127.0.0.0/8 (covers 127.0.0.1 and the whole block).
+        if (std.mem.startsWith(u8, host, "127.")) return true;
+        return false;
+    }
+
+    test "mediaHostIsLoopback covers loopback and rejects routable hosts" {
+        try std.testing.expect(mediaHostIsLoopback("127.0.0.1"));
+        try std.testing.expect(mediaHostIsLoopback("127.1.2.3"));
+        try std.testing.expect(mediaHostIsLoopback("::1"));
+        try std.testing.expect(mediaHostIsLoopback("localhost"));
+        try std.testing.expect(mediaHostIsLoopback("LOCALHOST"));
+        try std.testing.expect(mediaHostIsLoopback(""));
+        try std.testing.expect(!mediaHostIsLoopback("203.0.113.5"));
+        try std.testing.expect(!mediaHostIsLoopback("stun.example.net"));
+        try std.testing.expect(!mediaHostIsLoopback("10.0.0.1"));
     }
 
     /// True when the OFFER opts into the WebRTC leg via a `transport=webrtc`
@@ -45129,13 +45336,13 @@ pub const LinuxServer = struct {
                     history_plan,
                     .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
                 ) catch {
-                    try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                    try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; event not sent — check mesh peers and retry");
                     return;
                 };
                 if (accepted_v2) |accepted|
                     message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf)
                 else {
-                    try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                    try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the event; not delivered — retry or contact opers");
                     return;
                 }
             }
@@ -45232,10 +45439,10 @@ pub const LinuxServer = struct {
                 null,
                 .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
             ) catch {
-                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; event not sent — check mesh peers and retry");
                 return;
             }) orelse {
-                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the event; not delivered — retry or contact opers");
                 return;
             };
             defer accepted.deinit(self.allocator);
@@ -45339,13 +45546,13 @@ pub const LinuxServer = struct {
                 } else null else null,
                 .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
             ) catch {
-                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh event");
+                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; event not sent — check mesh peers and retry");
                 return;
             };
             if (accepted_v2) |accepted|
                 message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf)
             else {
-                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh event authority rejected the event");
+                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the event; not delivered — retry or contact opers");
                 return;
             }
         }
@@ -45963,13 +46170,13 @@ pub const LinuxServer = struct {
                     history_plan,
                     .{ .recipients = delivery_ids.items, .line = eff_msg, .is_bot = conn.session.isBot() },
                 ) catch {
-                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh message");
+                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; message not sent — check mesh peers and retry");
                     return;
                 };
                 if (accepted_v2) |accepted| {
                     message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
                 } else {
-                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh message authority rejected the event");
+                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the message; not delivered — retry or contact opers");
                     return;
                 }
             }
@@ -46112,11 +46319,11 @@ pub const LinuxServer = struct {
                             null,
                             .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
                         ) catch {
-                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh message");
+                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; message not sent — check mesh peers and retry");
                             return;
                         };
                         if (accepted_v2 == null) {
-                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh message authority rejected the event");
+                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the message; not delivered — retry or contact opers");
                             return;
                         }
                         if (accepted_v2) |accepted| {
@@ -46348,7 +46555,7 @@ pub const LinuxServer = struct {
                 history_plan,
                 .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
             ) catch {
-                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not durably admit the mesh message");
+                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; message not sent — check mesh peers and retry");
                 return;
             };
             if (accepted_direct_v2) |accepted| {
@@ -46358,7 +46565,7 @@ pub const LinuxServer = struct {
                     self.chanstatsMessage(key, authored_prefix, command, text);
                 }
             } else {
-                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh message authority rejected the event");
+                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the message; not delivered — retry or contact opers");
                 return;
             }
         }
@@ -65667,12 +65874,15 @@ test "threaded server: CHANNEL ACCESS grants, denies non-founder, and queries" {
     try saslPlainPreludeWithCaps(fd_admin, "admin", "onyx", "standard-replies");
     try writeAllFd(fd_admin, "NICK Founder\r\nUSER founder 0 * :Founder\r\n");
     try recvUntil(&admin, " 381 Founder ", 200);
-    try writeAllFd(fd_bob, "CAP REQ :standard-replies\r\nNICK Bob\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
-    try recvUntil(&bob, " 001 Bob ", 200);
+    try writeAllFd(fd_bob, "CAP REQ :standard-replies\r\nNICK BobGuest\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(&bob, " 001 BobGuest ", 200);
 
     bob.reset();
     try writeAllFd(fd_bob, "IDENTIFY bob correcthorse\r\n");
     try recvUntil(&bob, "You are now identified as bob", 200);
+    bob.reset();
+    try writeAllFd(fd_bob, "NICK Bob\r\n");
+    try recvUntil(&bob, "NICK :Bob", 200);
 
     admin.reset();
     try writeAllFd(fd_admin, "CHANNEL REGISTER #c\r\n");
@@ -66578,6 +66788,60 @@ test "threaded server: pre-registration REGISTER fails and CAP LS 302 advertises
     try std.testing.expect(std.mem.indexOf(u8, client.written(), " 421 ") == null);
 }
 
+test "threaded server: registered nick requires owner authentication before use" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-registered-nick-auth.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("admin", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_guest = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_guest);
+    var guest = LiveClient{ .fd = fd_guest };
+    try writeAllFd(fd_guest, "NICK Admin\r\nUSER guest 0 * :Guest\r\n");
+    try recvUntil(&guest, " 432 Admin Admin :Nickname is registered; authenticate as this account before using it", 200);
+    try std.testing.expect(std.mem.indexOf(u8, guest.written(), " 001 Admin ") == null);
+
+    const fd_owner = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_owner);
+    var owner = LiveClient{ .fd = fd_owner };
+    try saslPlainPrelude(fd_owner, "admin", "onyx");
+    try writeAllFd(fd_owner, "NICK Admin\r\nUSER admin 0 * :Admin\r\n");
+    try recvUntil(&owner, " 001 Admin ", 200);
+
+    const fd_other = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_other);
+    var other = LiveClient{ .fd = fd_other };
+    try writeAllFd(fd_other, "NICK Guest42\r\nUSER guest 0 * :Guest\r\n");
+    try recvUntil(&other, " 001 Guest42 ", 200);
+    other.reset();
+    try writeAllFd(fd_other, "NICK Admin\r\n");
+    try recvUntil(&other, " 432 Guest42 Admin :Nickname is registered; authenticate as this account before using it", 200);
+}
+
 test "threaded server: VERIFY accepts account argument and legacy code form" {
     if (comptime builtin.os.tag == .linux) {
         var tmp = std.testing.tmpDir(.{});
@@ -66627,11 +66891,14 @@ test "threaded server: VERIFY accepts account argument and legacy code form" {
         const fd_b = connectLoopback(port) catch return error.SkipZigTest;
         defer closeFd(fd_b);
         var bob = LiveClient{ .fd = fd_b };
-        try writeAllFd(fd_b, "NICK Bob\r\nUSER bob 0 * :Bob\r\n");
-        try recvUntil(&bob, " 001 Bob ", 200);
+        try writeAllFd(fd_b, "NICK BobGuest\r\nUSER bob 0 * :Bob\r\n");
+        try recvUntil(&bob, " 001 BobGuest ", 200);
         bob.reset();
         try writeAllFd(fd_b, "IDENTIFY bob correcthorse\r\n");
         try recvUntil(&bob, "You are now identified as bob", 200);
+        bob.reset();
+        try writeAllFd(fd_b, "NICK Bob\r\n");
+        try recvUntil(&bob, "NICK :Bob", 200);
         bob.reset();
         try writeAllFd(fd_b, bob_verify);
         try recvUntil(&bob, "VERIFY: your account email is now verified", 200);
@@ -66672,12 +66939,15 @@ test "threaded server: GHOST rejects caller account for non-account nick" {
 
     try writeAllFd(fd_victim, "NICK AwayNick\r\nUSER away 0 * :Away Nick\r\n");
     try recvUntil(&victim, " 001 AwayNick ", 200);
-    try writeAllFd(fd_alice, "CAP REQ :standard-replies\r\nNICK Alice\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
-    try recvUntil(&alice, " 001 Alice ", 200);
+    try writeAllFd(fd_alice, "CAP REQ :standard-replies\r\nNICK AliceGuest\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&alice, " 001 AliceGuest ", 200);
 
     alice.reset();
     try writeAllFd(fd_alice, "IDENTIFY alice correcthorse\r\n");
     try recvUntil(&alice, "You are now identified as alice", 200);
+    alice.reset();
+    try writeAllFd(fd_alice, "NICK Alice\r\n");
+    try recvUntil(&alice, "NICK :Alice", 200);
 
     victim.reset();
     alice.reset();
@@ -73491,6 +73761,83 @@ test "WS media admission binds a valid participant MAC to its own stream and act
     resetTestSendQ(receiver);
     server.handleWsMediaDatagram(sender_id, sender, accepted_good);
     try std.testing.expectEqual(@as(usize, 0), receiver.send_len);
+}
+
+test "MEDIA WS OFFER suppresses unroutable NATIVE/TRANSPORT; non-WS still gets UDP candidates" {
+    // Browser WS media is MACKEY + binary Cadence (E2EE ciphertext). OFFER must
+    // not advertise loopback NATIVE/TRANSPORT candidates that the browser cannot
+    // use, and must not seat the WS client on the native↔WebRTC bridge.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .media_enabled = true,
+        .media_host = "127.0.0.1",
+        .ws_media_relay = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.start();
+    if (server.media_plane.port == 0 or server.native_media.port == 0) return error.SkipZigTest;
+    current_reactor = &server.reactors[0];
+
+    const ws_id = try addTestLocalClient(&server, "Browser", "browser");
+    const native_id = try addTestLocalClient(&server, "Desktop", "desktop");
+    const ws_conn = server.connFor(ws_id).?;
+    const native_conn = server.connFor(native_id).?;
+    ws_conn.session.registration.registered = true;
+    native_conn.session.registration.registered = true;
+    ws_conn.send_armed = true;
+    native_conn.send_armed = true;
+
+    const ws_state = try std.testing.allocator.create(WsState);
+    ws_state.* = .{ .phase = .open, .subprotocol = .onyx_irc_media };
+    ws_conn.ws = ws_state;
+
+    try server.world.restoreMember("#ws-offer", worldIdFromClient(ws_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#ws-offer", worldIdFromClient(native_id), world_model.MemberModes.empty());
+    try server.media_rooms.join("#ws-offer", "Browser", .voice);
+    try server.media_rooms.join("#ws-offer", "Desktop", .voice);
+
+    // WS browser OFFER without transport=webrtc: no TRANSPORT, no NATIVE, no bridge seat.
+    resetTestSendQ(ws_conn);
+    try server.mediaOffer(ws_conn, "#ws-offer", "cadencevox", &.{});
+    const ws_plain = ws_conn.send_buf[0..ws_conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, ws_plain, "OFFER-ACK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ws_plain, " MEDIA TRANSPORT ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ws_plain, " MEDIA NATIVE ") == null);
+    {
+        lockSpin(&server.media_bridges_mu);
+        defer server.media_bridges_mu.unlock();
+        try std.testing.expect(server.media_bridges.getPtr("#ws-offer") == null);
+    }
+
+    // Explicit transport=webrtc with loopback media_host is still suppressed
+    // (unroutable from a remote browser).
+    resetTestSendQ(ws_conn);
+    try server.mediaOffer(ws_conn, "#ws-offer", "cadencevox", &.{"transport=webrtc"});
+    const ws_webrtc = ws_conn.send_buf[0..ws_conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, ws_webrtc, " MEDIA TRANSPORT ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ws_webrtc, " MEDIA NATIVE ") == null);
+
+    // Non-WS native client still receives TRANSPORT + NATIVE and is bridge-registered.
+    resetTestSendQ(native_conn);
+    try server.mediaOffer(native_conn, "#ws-offer", "cadencevox", &.{});
+    const native_out = native_conn.send_buf[0..native_conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, native_out, " MEDIA TRANSPORT ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_out, " MEDIA NATIVE ") != null);
+    {
+        lockSpin(&server.media_bridges_mu);
+        defer server.media_bridges_mu.unlock();
+        const br = server.media_bridges.getPtr("#ws-offer");
+        try std.testing.expect(br != null);
+        try std.testing.expectEqual(@as(usize, 1), br.?.count());
+    }
 }
 
 test "threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs legacy srtp)" {

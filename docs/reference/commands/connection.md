@@ -22,11 +22,11 @@ There is no `STARTTLS` command; TLS is listener-level implicit TLS (`src/daemon/
 ## NICK
 
 - Syntax: `NICK <nick>`
-- Description: Before registration, stores the nick after validating control bytes and the configured `NICKLEN`; the live server reserves the nick during registration and can close the connection on SACCESS, reservation, nick-delay, or collision failure. After registration, the module handler changes the live nick, updates the world nick registry, broadcasts the `NICK` line, updates MONITOR/WHOWAS/event history, and propagates the change across Undertow.
+- Description: Before registration, stores the nick after validating control bytes and the configured `NICKLEN`; the live server withholds the welcome burst until it verifies that a registered account name is owned by the SASL-authenticated account, then reserves the nick and can close the connection on ownership, SACCESS, reservation, nick-delay, or collision failure. After registration, the module handler applies the same account-ownership gate before changing the live nick, updating the world registry, broadcasting `NICK`, updating MONITOR/WHOWAS/event history, and propagating the change across Undertow. Unregistered names remain available to guests.
 - Privileges: Any client before registration; registered client afterward.
 - Parameters: `nick` is required.
 - Replies: On registered nick change, broadcasts a `NICK` line to visible peers.
-- Errors: pre-registration missing `nick` returns `ERR_NEEDMOREPARAMS 461`; registered missing `nick` returns `ERR_NONICKNAMEGIVEN 431`. Invalid or blocked nicks return `ERR_ERRONEUSNICKNAME 432`; collisions return `ERR_NICKNAMEINUSE 433`; nick-delay holds return `ERR_UNAVAILRESOURCE 437`.
+- Errors: pre-registration missing `nick` returns `ERR_NEEDMOREPARAMS 461`; registered missing `nick` returns `ERR_NONICKNAMEGIVEN 431`. Invalid, blocked, reserved, or registered-but-not-owned nicks return `ERR_ERRONEUSNICKNAME 432`; collisions return `ERR_NICKNAMEINUSE 433`; nick-delay holds return `ERR_UNAVAILRESOURCE 437`. A registered-name rejection says that authentication is required and never emits `001` first.
 - Example: `NICK suzu`
 - Sources: `src/daemon/dispatch.zig:1710`, `src/daemon/dispatch.zig:1741`, `src/daemon/dispatch.zig:1758`, `src/daemon/server.zig:8527`, `src/daemon/server.zig:8564`, `src/daemon/server.zig:22055`, `src/daemon/server.zig:22127`, `src/daemon/modules/user_query.zig:43`, `src/daemon/modules/user_query.zig:84`
 

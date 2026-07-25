@@ -153,7 +153,7 @@ pub fn main(init: std.process.Init) !void {
         // flag and refuses a hot handoff unless the complete token matches.
         // This branch must stay ahead of all config, socket, and daemon setup.
         if (std.mem.eql(u8, first, onyx_server.daemon.helix.live.upgrade_capability_arg)) {
-            // English ONYX_ capability token only (no OROCHI_ brand alias).
+            // English ONYX_ capability token only (Onyx brand only).
             std.debug.print("{s}\n", .{
                 onyx_server.daemon.helix.live.upgrade_capability_token,
             });

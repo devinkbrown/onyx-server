@@ -486,13 +486,14 @@ pub const Config = struct {
         /// Require HMAC-tagged native CadenceVox/CadenceVis datagrams. Defaults off until
         /// clients implement the matching Cadence-frame tag contract.
         native_media_require_mac: bool = false,
-        /// Relay browser media datagrams (binary WebSocket frames) between a
-        /// channel's call participants. Off by default; the WS media plane is
-        /// opt-in (the browser must encode Cadence frames and append the MAC).
+        /// Primary browser media plane: relay binary WebSocket Cadence frames
+        /// (client-held E2EE ciphertext) between call participants. Off by
+        /// default; opt-in. Issues MACKEY on MEDIA JOIN; never rewraps onto
+        /// native/WebRTC legs (server has no E2EE group key).
         ws_media_relay: bool = false,
         /// Require a valid per-stream MAC tag on every browser media datagram.
         /// When false (default) untagged datagrams still relay, but a present tag
-        /// must verify.
+        /// must verify. Prefer true with `ws_media_relay` in production.
         ws_media_require_mac: bool = false,
         /// Terminate DTLS-SRTP (RFC 5764) on the WebRTC UDP media plane so
         /// standard browser/mobile endpoints can key the SRTP leg via a DTLS

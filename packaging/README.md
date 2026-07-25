@@ -26,7 +26,7 @@ There is still no published registry image; Docker remains build-from-source.
 The daemon binary is always **`onyx-server`**. The release script only prefixes a
 version and target on the *artifact filename*
 (`onyx-server-0.x.y-x86_64-linux-musl`); install/copy it as `onyx-server` (the
-Dockerfile does this). Older `orochi-*` names in a local `dist/` are historical
+Dockerfile does this). Older historical names in a local `dist/` are historical
 leftovers — ignore them; `release.sh` emits `onyx-server-*` only.
 
 Validate a config **without** booting:

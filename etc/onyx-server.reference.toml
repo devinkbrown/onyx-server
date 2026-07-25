@@ -175,7 +175,14 @@ s2s = 0
 media = 0
 # UDP port for the native CadenceVox/CadenceVis media leg (0 = ephemeral).
 native_media = 0
-# IPv4 advertised to clients as the server media (ICE) candidate.
+# Address advertised to native/WebRTC clients as the server media (ICE/NATIVE)
+# candidate. Default 127.0.0.1 is local-only — never leave it on internet nodes
+# (that black-holes any client that follows TRANSPORT/NATIVE). Production
+# native/WebRTC deployments MUST set a publicly routable hostname/IPv4, or
+# configure [media].stun_host/stun_port for a server-reflexive candidate.
+# Browser WebSocket media does NOT use this candidate: enable
+# [media].ws_media_relay (MACKEY + binary Cadence frames). Loopback candidates
+# are suppressed for WS clients so browsers never chase an unroutable UDP path.
 media_host = "127.0.0.1"
 
 
@@ -764,19 +771,26 @@ captions_max_channels = 4096              # channels with live transcripts (64..
 # are dropped before the SFU learns the sender. Requires matching client support
 # (the server advertises mac=hmac-sha256-128 on the native media line).
 native_media_require_mac = false
-# Relay browser media datagrams (binary WebSocket frames) between a channel's call
-# participants. Off by default; the WS media plane is opt-in. When on, MEDIA JOIN
-# hands each participant a per-stream MAC key over the authenticated WS
-# (EVENT <nick> MEDIA MACKEY <#chan> <base64>) and each browser datagram is verified
-# before fan-out. v1 fans out to same-node (same-shard) call members.
+# PRIMARY browser media plane. Relay binary WebSocket Cadence frames between a
+# channel's call participants. REQUIRED for the Onyx web client (Cadence frames
+# over onyx.irc-media.v1). When on, MEDIA JOIN hands each WS participant a
+# per-stream MAC key (EVENT <nick> MEDIA MACKEY <#chan> <base64>) and each
+# browser datagram is MAC-verified before fan-out. Same-node fanout always;
+# mesh cascade of opaque WS datagrams when secured S2S peers are present (see
+# MEDIA_WS_DATAGRAM / mesh media cascade). Frames carry client-held E2EE
+# ciphertext — the daemon never decrypts them and never rewraps them onto the
+# native Cadence UDP or WebRTC RTP legs. WS OFFER suppresses unroutable
+# NATIVE/TRANSPORT candidates (loopback media_host without STUN).
 ws_media_relay = false
 # Require a valid per-stream MAC tag on every browser media datagram. Default false
-# (untagged datagrams still relay, but a present tag must verify). The per-stream
-# key is the same native_stream_key-derived (channel, participant) key the native
-# UDP leg uses.
+# (untagged datagrams still relay, but a present tag must verify). Prefer true on
+# production once all browser clients tag (Onyx always tags when MACKEY is set).
+# The per-stream key is the same native_stream_key-derived (channel, participant)
+# key the native UDP leg uses.
 ws_media_require_mac = false
 # STUN server (IPv4 literal) queried at boot for the reflexive media candidate;
-# with stun_port set, overrides listen.media_host on success.
+# with stun_port set, overrides listen.media_host on success. Required for remote
+# native/WebRTC peers when media_host is not publicly reachable.
 # stun_host = "stun.example.net"
 # stun_port = 3478
 

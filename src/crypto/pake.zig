@@ -35,6 +35,7 @@
 //!
 //!   M = SHA-512("orochi-spake2-M-v1") mod L · G
 //!   N = SHA-512("orochi-spake2-N-v1") mod L · G
+
 //!
 //! The resulting compressed byte values are embedded as constants below and
 //! were verified with the standalone helper at the bottom of this file.
