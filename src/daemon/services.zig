@@ -2182,6 +2182,116 @@ pub const Services = struct {
         return self.store.family(.props).get(k) != null;
     }
 
+    // ── Account recovery codes (Era 2 B8) ───────────────────────────────────
+    // Single-use offline login codes. Stored hashed under props key
+    // "rcd\x00<account>" (never client-readable via METADATA). Format of value:
+    // concatenation of remaining 32-byte SHA-256 digests (count = value.len/32).
+    pub const recovery_code_count: usize = 10;
+    pub const recovery_code_raw_len: usize = 10; // printable alnum body (no dashes)
+    pub const recovery_digest_len: usize = 32;
+    const rcd_prefix = "rcd\x00";
+    const rcd_key_max: usize = rcd_prefix.len + account_max;
+    const rcd_blob_max: usize = recovery_code_count * recovery_digest_len;
+
+    fn rcdKey(buf: []u8, account: []const u8) ?[]const u8 {
+        if (account.len == 0 or account.len > account_max) return null;
+        if (buf.len < rcd_prefix.len + account.len) return null;
+        @memcpy(buf[0..rcd_prefix.len], rcd_prefix);
+        for (account, 0..) |c, i| buf[rcd_prefix.len + i] = std.ascii.toLower(c);
+        return buf[0 .. rcd_prefix.len + account.len];
+    }
+
+    fn hashRecoveryCode(out: *[recovery_digest_len]u8, account: []const u8, code: []const u8) void {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update("onyx-recovery-v1|");
+        // Domain-separate by account so a leaked digest cannot be replayed across accounts.
+        var acc_l: [account_max]u8 = undefined;
+        const n = @min(account.len, account_max);
+        for (account[0..n], 0..) |c, i| acc_l[i] = std.ascii.toLower(c);
+        h.update(acc_l[0..n]);
+        h.update("|");
+        h.update(code);
+        h.final(out);
+    }
+
+    /// How many unused recovery codes remain (0 if none stored).
+    pub fn recoveryCodesRemaining(self: *Services, account: []const u8) usize {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [rcd_key_max]u8 = undefined;
+        const k = rcdKey(&kb, account) orelse return 0;
+        const v = self.store.family(.props).get(k) orelse return 0;
+        if (v.len % recovery_digest_len != 0) return 0;
+        return v.len / recovery_digest_len;
+    }
+
+    /// Replace all recovery codes for `account` with `codes` (plaintext). Stores only digests.
+    pub fn recoveryCodesReplace(self: *Services, account: []const u8, codes: []const []const u8) ServiceError!void {
+        if (codes.len == 0 or codes.len > recovery_code_count) return error.InvalidRecord;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [rcd_key_max]u8 = undefined;
+        const k = rcdKey(&kb, account) orelse return error.NotFound;
+        var blob: [rcd_blob_max]u8 = undefined;
+        var offset: usize = 0;
+        for (codes) |code| {
+            if (code.len == 0 or code.len > 64) return error.InvalidRecord;
+            var dig: [recovery_digest_len]u8 = undefined;
+            hashRecoveryCode(&dig, account, code);
+            @memcpy(blob[offset .. offset + recovery_digest_len], &dig);
+            offset += recovery_digest_len;
+        }
+        try self.store.family(.props).put(k, blob[0..offset]);
+    }
+
+    /// Delete all recovery codes for `account` (idempotent).
+    pub fn recoveryCodesClear(self: *Services, account: []const u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [rcd_key_max]u8 = undefined;
+        const k = rcdKey(&kb, account) orelse return;
+        try self.store.family(.props).delete(k);
+    }
+
+    /// Consume one matching recovery code (constant-time scan). On success the
+    /// digest is removed from the blob. Returns AuthFailed when none match.
+    pub fn recoveryCodeConsume(self: *Services, account: []const u8, code: []const u8) ServiceError!void {
+        if (code.len == 0 or code.len > 64) return error.AuthFailed;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [rcd_key_max]u8 = undefined;
+        const k = rcdKey(&kb, account) orelse return error.NotFound;
+        const v = self.store.family(.props).get(k) orelse return error.AuthFailed;
+        if (v.len == 0 or v.len % recovery_digest_len != 0) return error.AuthFailed;
+        var want: [recovery_digest_len]u8 = undefined;
+        hashRecoveryCode(&want, account, code);
+        var match_i: ?usize = null;
+        var i: usize = 0;
+        while (i < v.len) : (i += recovery_digest_len) {
+            var dig: [recovery_digest_len]u8 = undefined;
+            @memcpy(&dig, v[i .. i + recovery_digest_len]);
+            if (std.crypto.timing_safe.eql([recovery_digest_len]u8, dig, want)) {
+                // Prefer first match; keep scanning for constant-ish work.
+                if (match_i == null) match_i = i;
+            }
+        }
+        const hit = match_i orelse return error.AuthFailed;
+        // Rewrite blob without the consumed digest.
+        var new_blob: [rcd_blob_max]u8 = undefined;
+        var w: usize = 0;
+        i = 0;
+        while (i < v.len) : (i += recovery_digest_len) {
+            if (i == hit) continue;
+            @memcpy(new_blob[w .. w + recovery_digest_len], v[i .. i + recovery_digest_len]);
+            w += recovery_digest_len;
+        }
+        if (w == 0) {
+            try self.store.family(.props).delete(k);
+        } else {
+            try self.store.family(.props).put(k, new_blob[0..w]);
+        }
+    }
+
     /// Invoke `cb(ctx, channel, level)` for every channel where `account` holds a
     /// live access grant — the durable reverse of `channelAccessList`, backing
     /// LISTCHANS. Stale grants (channel dropped, or dropped+re-registered) are
@@ -3556,6 +3666,33 @@ test "account TOTP secret: put/get/delete persist across reopen; case-insensitiv
         try std.testing.expect(!services.totpEnrolled("kain"));
         try std.testing.expect(services.totpSecretGet("kain", &buf) == null);
     }
+}
+
+test "recovery codes: generate, consume, remaining, clear" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-recovery.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+
+    try std.testing.expectEqual(@as(usize, 0), services.recoveryCodesRemaining("alice"));
+    const codes = [_][]const u8{ "ABCDEFGHJK", "MN01234567", "PQRSTVWXYZ" };
+    try services.recoveryCodesReplace("alice", &codes);
+    try std.testing.expectEqual(@as(usize, 3), services.recoveryCodesRemaining("ALICE"));
+
+    try services.recoveryCodeConsume("alice", "MN01234567");
+    try std.testing.expectEqual(@as(usize, 2), services.recoveryCodesRemaining("alice"));
+    // Already spent
+    try std.testing.expectError(error.AuthFailed, services.recoveryCodeConsume("alice", "MN01234567"));
+    try services.recoveryCodeConsume("alice", "ABCDEFGHJK");
+    try services.recoveryCodeConsume("alice", "PQRSTVWXYZ");
+    try std.testing.expectEqual(@as(usize, 0), services.recoveryCodesRemaining("alice"));
+
+    try services.recoveryCodesReplace("alice", &codes);
+    try services.recoveryCodesClear("alice");
+    try std.testing.expectEqual(@as(usize, 0), services.recoveryCodesRemaining("alice"));
 }
 
 test "channelsForAccount: durable reverse access lookup (LISTCHANS)" {

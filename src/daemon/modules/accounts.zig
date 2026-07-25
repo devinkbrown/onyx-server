@@ -25,6 +25,10 @@ fn totp(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleTotp(x.conn, x.parsed);
 }
+fn recoverycodes(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleRecoveryCodes(x.conn, x.parsed);
+}
 fn logout(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleLogout(x.id, x.conn);
@@ -126,6 +130,7 @@ pub const REGISTER_spec = registry.CommandSpec{ .name = "REGISTER", .feature = a
 pub const VERIFY_spec = registry.CommandSpec{ .name = "VERIFY", .feature = accounts_feature, .handler = verify };
 pub const IDENTIFY_spec = registry.CommandSpec{ .name = "IDENTIFY", .feature = accounts_feature, .handler = identify };
 pub const TOTP_spec = registry.CommandSpec{ .name = "TOTP", .min_params = 1, .feature = accounts_feature, .handler = totp, .summary = "manage two-factor auth (ENROLL|CONFIRM|DISABLE|STATUS)" };
+pub const RECOVERYCODES_spec = registry.CommandSpec{ .name = "RECOVERYCODES", .min_params = 1, .feature = accounts_feature, .handler = recoverycodes, .summary = "offline recovery codes (STATUS|GENERATE|CLEAR|LOGIN)" };
 pub const LOGOUT_spec = registry.CommandSpec{ .name = "LOGOUT", .feature = accounts_feature, .handler = logout };
 pub const DROP_spec = registry.CommandSpec{ .name = "DROP", .feature = accounts_feature, .handler = drop };
 pub const SETPASS_spec = registry.CommandSpec{ .name = "SETPASS", .feature = accounts_feature, .handler = setpass, .summary = "change your account password (current + new)" };
@@ -159,6 +164,7 @@ pub const module = registry.Module{
         VERIFY_spec,
         IDENTIFY_spec,
         TOTP_spec,
+        RECOVERYCODES_spec,
         LOGOUT_spec,
         DROP_spec,
         SETPASS_spec,

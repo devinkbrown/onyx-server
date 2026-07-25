@@ -21611,6 +21611,98 @@ pub const LinuxServer = struct {
         return self.failReply(conn, "TOTP", "INVALID_SUBCOMMAND", "Usage: TOTP <ENROLL|CONFIRM <code>|DISABLE|STATUS>");
     }
 
+    /// `RECOVERYCODES <STATUS|GENERATE [password]|CLEAR [password]|LOGIN <account> <code>>`
+    /// Offline single-use account recovery codes (Era 2 B8). GENERATE replaces the
+    /// entire set and returns plaintext once; LOGIN consumes a code and logs in
+    /// (bypasses password + TOTP). Codes are never re-listed after generation.
+    pub fn handleRecoveryCodes(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "RECOVERYCODES", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const p = parsed.paramSlice();
+        if (p.len < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"RECOVERYCODES"}, "Usage: RECOVERYCODES <STATUS|GENERATE|CLEAR|LOGIN>");
+            return;
+        }
+        const sub = p[0];
+        if (std.ascii.eqlIgnoreCase(sub, "STATUS")) {
+            const account = conn.session.account() orelse
+                return self.failReply(conn, "RECOVERYCODES", "ACCOUNT_REQUIRED", "Log in before checking recovery codes");
+            const remaining = svc.recoveryCodesRemaining(account);
+            try channelNotice(conn, "RECOVERYCODES: {d} unused code{s}", .{ remaining, if (remaining == 1) "" else "s" });
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "GENERATE")) {
+            const account = conn.session.account() orelse
+                return self.failReply(conn, "RECOVERYCODES", "ACCOUNT_REQUIRED", "Log in before generating recovery codes");
+            if (!conn.is_tls) return self.failReply(conn, "RECOVERYCODES", "INSECURE_TRANSPORT", "Generate recovery codes only over TLS");
+            if (p.len >= 2) {
+                _ = svc.identifyAccount(account, p[1]) catch |err| switch (err) {
+                    error.AuthFailed => return self.failReply(conn, "RECOVERYCODES", "AUTH_FAILED", "Password incorrect"),
+                    else => return self.failReply(conn, "RECOVERYCODES", "INTERNAL_ERROR", "Could not verify password"),
+                };
+            }
+            const io = self.config.crypto_io orelse
+                return self.failReply(conn, "RECOVERYCODES", "TEMPORARILY_UNAVAILABLE", "No randomness source configured");
+            var plain: [services_mod.Services.recovery_code_count][services_mod.Services.recovery_code_raw_len]u8 = undefined;
+            var code_slices: [services_mod.Services.recovery_code_count][]const u8 = undefined;
+            var i: usize = 0;
+            while (i < plain.len) : (i += 1) {
+                var raw: [services_mod.Services.recovery_code_raw_len]u8 = undefined;
+                io.random(&raw);
+                const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+                for (&plain[i], raw) |*out, b| out.* = alphabet[b % alphabet.len];
+                code_slices[i] = plain[i][0..];
+            }
+            svc.recoveryCodesReplace(account, code_slices[0..]) catch
+                return self.failReply(conn, "RECOVERYCODES", "INTERNAL_ERROR", "Could not store recovery codes");
+            try channelNotice(conn, "RECOVERYCODES: generated {d} single-use codes — copy them now; they will not be shown again", .{plain.len});
+            i = 0;
+            while (i < plain.len) : (i += 1) {
+                var shown: [11]u8 = undefined;
+                @memcpy(shown[0..5], plain[i][0..5]);
+                shown[5] = '-';
+                @memcpy(shown[6..11], plain[i][5..10]);
+                try channelNotice(conn, "RECOVERYCODES: {d}. {s}", .{ i + 1, shown[0..] });
+            }
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "CLEAR")) {
+            const account = conn.session.account() orelse
+                return self.failReply(conn, "RECOVERYCODES", "ACCOUNT_REQUIRED", "Log in before clearing recovery codes");
+            if (p.len >= 2) {
+                _ = svc.identifyAccount(account, p[1]) catch |err| switch (err) {
+                    error.AuthFailed => return self.failReply(conn, "RECOVERYCODES", "AUTH_FAILED", "Password incorrect"),
+                    else => return self.failReply(conn, "RECOVERYCODES", "INTERNAL_ERROR", "Could not verify password"),
+                };
+            }
+            svc.recoveryCodesClear(account) catch {};
+            try channelNotice(conn, "RECOVERYCODES: all recovery codes cleared", .{});
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "LOGIN")) {
+            if (p.len < 3) {
+                return self.failReply(conn, "RECOVERYCODES", "NEED_MORE_PARAMS", "Usage: RECOVERYCODES LOGIN <account> <code>");
+            }
+            const account = p[1];
+            var code_buf: [64]u8 = undefined;
+            var code_len: usize = 0;
+            for (p[2]) |c| {
+                if (c == '-' or c == ' ') continue;
+                if (code_len >= code_buf.len) break;
+                code_buf[code_len] = std.ascii.toUpper(c);
+                code_len += 1;
+            }
+            const code = code_buf[0..code_len];
+            svc.recoveryCodeConsume(account, code) catch |err| switch (err) {
+                error.AuthFailed, error.NotFound => return self.failReply(conn, "RECOVERYCODES", "AUTH_FAILED", "Invalid or already-used recovery code"),
+                else => return self.failReply(conn, "RECOVERYCODES", "INTERNAL_ERROR", "Could not consume recovery code"),
+            };
+            try self.finishLogin(conn, account);
+            try channelNotice(conn, "RECOVERYCODES: login ok — that code is now spent", .{});
+            return;
+        }
+        return self.failReply(conn, "RECOVERYCODES", "INVALID_SUBCOMMAND", "Usage: RECOVERYCODES <STATUS|GENERATE|CLEAR|LOGIN>");
+    }
+
     /// `WELCOME <ADD :line | CLEAR | SHOW>` — oper-managed network onboarding
     /// pack delivered once per account on first login (backed by welcome_pack).
     pub fn handleWelcome(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
