@@ -42,13 +42,15 @@ const max_word_len: usize = 32;
 
 pub const EventKind = enum { join, part, quit, kick };
 
-const UserAgg = struct {
+pub const UserAgg = struct {
     nick: []u8,
     messages: u64 = 0,
     words: u64 = 0,
     questions: u64 = 0,
     exclamations: u64 = 0,
     urls: u64 = 0,
+    /// CTCP ACTION (/me) lines by this nick (subset of messages).
+    actions: u64 = 0,
     monologue: u32 = 0,
     last_active: i64 = 0,
 };
@@ -59,13 +61,13 @@ const TopicEntry = struct {
     topic: []u8,
 };
 
-const DayBucket = struct {
+pub const DayBucket = struct {
     /// Unix day index (sec / 86400).
     day: i64,
     messages: u64 = 0,
 };
 
-const ChannelAgg = struct {
+pub const ChannelAgg = struct {
     name: []u8,
     first_seen: i64 = 0,
     last_active: i64 = 0,
@@ -76,6 +78,10 @@ const ChannelAgg = struct {
     quits: u64 = 0,
     kicks: u64 = 0,
     topic_changes: u64 = 0,
+    /// CTCP ACTION (/me) lines in this channel (subset of messages).
+    actions: u64 = 0,
+    /// High-water mark of simultaneous members (local + mesh), ophion peak_members.
+    peak_members: u64 = 0,
     hours: [24]u64 = @splat(0),
     heatmap: [7][24]u64 = @splat(@as([24]u64, @splat(0))),
     days: std.ArrayListUnmanaged(DayBucket) = .empty,
@@ -110,6 +116,9 @@ const ChannelAgg = struct {
 pub const ChanStats = struct {
     allocator: std.mem.Allocator,
     channels: std.StringHashMapUnmanaged(*ChannelAgg) = .empty,
+    /// Lowercased nicks excluded from all recording (bots, services, …).
+    /// Ported from ophion m_chanstats ignored_nicks.
+    ignored_nicks: std.StringHashMapUnmanaged(void) = .empty,
     /// A channel must reach this many messages before it is emitted (keeps the
     /// index free of fly-by one-liner channels). 0 = emit everything.
     min_messages: u64 = 1,
@@ -126,6 +135,51 @@ pub const ChanStats = struct {
             self.allocator.free(e.key_ptr.*);
         }
         self.channels.deinit(self.allocator);
+        var iit = self.ignored_nicks.keyIterator();
+        while (iit.next()) |k| self.allocator.free(k.*);
+        self.ignored_nicks.deinit(self.allocator);
+    }
+
+    /// Replace the ignore list with lowercased copies of `nicks`.
+    pub fn setIgnoredNicks(self: *ChanStats, nicks: []const []const u8) void {
+        var iit = self.ignored_nicks.keyIterator();
+        while (iit.next()) |k| self.allocator.free(k.*);
+        self.ignored_nicks.clearRetainingCapacity();
+        for (nicks) |raw| {
+            if (raw.len == 0) continue;
+            const key = self.allocator.alloc(u8, raw.len) catch continue;
+            for (raw, 0..) |c, i| key[i] = std.ascii.toLower(c);
+            const gop = self.ignored_nicks.getOrPut(self.allocator, key) catch {
+                self.allocator.free(key);
+                continue;
+            };
+            if (gop.found_existing) {
+                self.allocator.free(key);
+            } else {
+                gop.key_ptr.* = key;
+                gop.value_ptr.* = {};
+            }
+        }
+    }
+
+    pub fn isIgnored(self: *const ChanStats, nick: []const u8) bool {
+        if (nick.len == 0 or self.ignored_nicks.count() == 0) return false;
+        var buf: [64]u8 = undefined;
+        if (nick.len > buf.len) return false;
+        for (nick, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        return self.ignored_nicks.contains(buf[0..nick.len]);
+    }
+
+    /// Parse CTCP ACTION body if `text` is `\x01ACTION …\x01`; else null.
+    pub fn ctcpActionBody(text: []const u8) ?[]const u8 {
+        if (text.len < 9) return null;
+        if (text[0] != 0x01 or text[text.len - 1] != 0x01) return null;
+        const inner = text[1 .. text.len - 1];
+        if (inner.len < 7) return null;
+        if (!std.ascii.eqlIgnoreCase(inner[0..6], "ACTION")) return null;
+        if (inner.len == 6) return "";
+        if (inner[6] != ' ') return null;
+        return inner[7..];
     }
 
     /// Total recorded messages for a channel (0 if never recorded). Read-only
@@ -237,11 +291,17 @@ pub const ChanStats = struct {
     }
 
     /// Record one channel message. `now_ms` is wall-clock unix-ms.
+    /// CTCP ACTION (`\x01ACTION …\x01`) counts as a message and increments actions.
     pub fn recordMessage(self: *ChanStats, chan: []const u8, nick: []const u8, text: []const u8, now_ms: i64) void {
         if (chan.len == 0 or nick.len == 0) return;
+        if (self.isIgnored(nick)) return;
         const agg = self.channel(chan, now_ms) orelse return;
         agg.last_active = now_ms;
         agg.messages += 1;
+        const action_body = ctcpActionBody(text);
+        const is_action = action_body != null;
+        if (is_action) agg.actions += 1;
+        const body = action_body orelse text;
 
         const sec = @divFloor(now_ms, 1000);
         const day = @divFloor(sec, 86400);
@@ -252,9 +312,9 @@ pub const ChanStats = struct {
         agg.heatmap[weekday][hour] += 1;
         bumpDay(self.allocator, agg, day);
 
-        // Word + behavioural metrics.
+        // Word + behavioural metrics (ACTION uses the unwrapped body).
         var words: u64 = 0;
-        var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+        var it = std.mem.tokenizeAny(u8, body, " \t\r\n");
         while (it.next()) |tok| {
             words += 1;
             if (indexOfIgnoreCase(tok, "http://") != null or
@@ -271,12 +331,13 @@ pub const ChanStats = struct {
             usr.messages += 1;
             usr.words += words;
             usr.last_active = now_ms;
-            if (text.len != 0 and text[text.len - 1] == '?') usr.questions += 1;
-            for (text) |c| {
+            if (is_action) usr.actions += 1;
+            if (body.len != 0 and body[body.len - 1] == '?') usr.questions += 1;
+            for (body) |c| {
                 if (c == '!') usr.exclamations += 1;
             }
-            if (indexOfIgnoreCase(text, "http://") != null or
-                indexOfIgnoreCase(text, "https://") != null) usr.urls += 1;
+            if (indexOfIgnoreCase(body, "http://") != null or
+                indexOfIgnoreCase(body, "https://") != null) usr.urls += 1;
         }
 
         // Monologue: consecutive lines by the same nick.
@@ -290,6 +351,13 @@ pub const ChanStats = struct {
         if (u) |usr| {
             if (agg.monologue_run > usr.monologue) usr.monologue = agg.monologue_run;
         }
+    }
+
+    /// Raise the channel's peak concurrent member high-water mark.
+    pub fn notePresent(self: *ChanStats, chan: []const u8, present: usize) void {
+        const entry = self.channels.getEntry(chan) orelse return;
+        const agg = entry.value_ptr.*;
+        if (present > agg.peak_members) agg.peak_members = present;
     }
 
     pub fn recordEvent(self: *ChanStats, chan: []const u8, kind: EventKind, now_ms: i64) void {
@@ -428,14 +496,15 @@ pub const ChanStats = struct {
             const agg = e.value_ptr.*;
             if (agg.messages < self.min_messages) continue;
             const present = net.presentOf(agg.name);
+            if (present > agg.peak_members) agg.peak_members = present;
             self.writeChannelFile(io, dir_path, agg, now_ms, present);
 
             if (!first) iw.writeByte(',') catch return;
             first = false;
             iw.writeAll("{\"channel\":") catch return;
             writeJsonString(iw, agg.name) catch return;
-            iw.print(",\"messages\":{d},\"active_users\":{d},\"present\":{d},\"last_active\":{d},\"topic\":", .{
-                agg.messages, agg.users.count(), present, @divFloor(agg.last_active, 1000),
+            iw.print(",\"messages\":{d},\"active_users\":{d},\"present\":{d},\"peak_members\":{d},\"last_active\":{d},\"topic\":", .{
+                agg.messages, agg.users.count(), present, agg.peak_members, @divFloor(agg.last_active, 1000),
             }) catch return;
             writeJsonString(iw, currentTopic(agg)) catch return;
             // Compact recent-activity sparkline: the last up-to-14 daily message
@@ -576,8 +645,8 @@ pub const ChanStats = struct {
         w.writeAll("\"last_speaker\":") catch return;
         writeJsonString(w, agg.last_speaker) catch return;
         w.writeByte(',') catch return;
-        w.print("\"totals\":{{\"messages\":{d},\"words\":{d},\"active_users\":{d},\"joins\":{d},\"parts\":{d},\"quits\":{d},\"kicks\":{d},\"topic_changes\":{d}}},", .{
-            agg.messages, agg.words, agg.users.count(), agg.joins, agg.parts, agg.quits, agg.kicks, agg.topic_changes,
+        w.print("\"totals\":{{\"messages\":{d},\"words\":{d},\"active_users\":{d},\"joins\":{d},\"parts\":{d},\"quits\":{d},\"kicks\":{d},\"topic_changes\":{d},\"actions\":{d},\"peak_members\":{d}}},", .{
+            agg.messages, agg.words, agg.users.count(), agg.joins, agg.parts, agg.quits, agg.kicks, agg.topic_changes, agg.actions, agg.peak_members,
         }) catch return;
 
         // hours[24]
@@ -634,10 +703,10 @@ pub const ChanStats = struct {
         }
         w.writeAll("],") catch return;
 
-        // records
+        // records (ophion-aligned: busiest day, peak hour, peak concurrent members)
         const bd = busiestDay(agg);
-        w.print("\"records\":{{\"busiest_day\":{{\"date\":\"{s}\",\"messages\":{d}}},\"peak_hour\":{d}}}", .{
-            bd.date, bd.messages, peakHour(agg),
+        w.print("\"records\":{{\"busiest_day\":{{\"date\":\"{s}\",\"messages\":{d}}},\"peak_hour\":{d},\"peak_members\":{d}}}", .{
+            bd.date, bd.messages, peakHour(agg), agg.peak_members,
         }) catch return;
         w.writeByte('}') catch return;
     }
@@ -668,8 +737,8 @@ pub const ChanStats = struct {
             if (i != 0) try w.writeByte(',');
             try w.writeAll("{\"nick\":");
             try writeJsonString(w, u.nick);
-            try w.print(",\"messages\":{d},\"words\":{d},\"last_active\":{d},\"questions\":{d},\"exclamations\":{d},\"urls\":{d},\"monologue\":{d}}}", .{
-                u.messages, u.words, @divFloor(u.last_active, 1000), u.questions, u.exclamations, u.urls, u.monologue,
+            try w.print(",\"messages\":{d},\"words\":{d},\"last_active\":{d},\"questions\":{d},\"exclamations\":{d},\"urls\":{d},\"monologue\":{d},\"actions\":{d}}}", .{
+                u.messages, u.words, @divFloor(u.last_active, 1000), u.questions, u.exclamations, u.urls, u.monologue, u.actions,
             });
         }
         try w.writeAll("],");
@@ -868,7 +937,10 @@ const snapshot_name = ".chanstats.snapshot";
 // `snapshot_version`, not the magic — a reader can then distinguish "wrong
 // file" (bad magic) from "newer format" (good magic, higher version).
 const snapshot_magic = "OCS2";
-const snapshot_version: u8 = 1;
+/// v1: original OCS2 layout. v2: adds channel/user `actions` + channel `peak_members`
+/// (ophion m_chanstats parity fields). Readers accept both; writers emit v2.
+const snapshot_version: u8 = 2;
+const snapshot_version_v1: u8 = 1;
 
 fn putInt(w: *std.Io.Writer, comptime T: type, v: T) std.Io.Writer.Error!void {
     var b: [@sizeOf(T)]u8 = undefined;
@@ -923,7 +995,7 @@ fn snapChannel(w: *std.Io.Writer, agg: *ChannelAgg) std.Io.Writer.Error!void {
     try putBytes(w, agg.name);
     try putInt(w, i64, agg.first_seen);
     try putInt(w, i64, agg.last_active);
-    inline for (.{ agg.messages, agg.words, agg.joins, agg.parts, agg.quits, agg.kicks, agg.topic_changes }) |v| try putInt(w, u64, v);
+    inline for (.{ agg.messages, agg.words, agg.joins, agg.parts, agg.quits, agg.kicks, agg.topic_changes, agg.actions, agg.peak_members }) |v| try putInt(w, u64, v);
     for (agg.hours) |h| try putInt(w, u64, h);
     for (agg.heatmap) |row| for (row) |cell| try putInt(w, u64, cell);
     try putInt(w, u32, @intCast(agg.days.items.len));
@@ -939,6 +1011,7 @@ fn snapChannel(w: *std.Io.Writer, agg: *ChannelAgg) std.Io.Writer.Error!void {
         inline for (.{ u.messages, u.words, u.questions, u.exclamations, u.urls }) |x| try putInt(w, u64, x);
         try putInt(w, i64, u.last_active);
         try putInt(w, u32, u.monologue);
+        try putInt(w, u64, u.actions);
     }
     try putInt(w, u32, @intCast(agg.word_freq.count()));
     var wit = agg.word_freq.iterator();
@@ -971,16 +1044,16 @@ fn deserialize(self: *ChanStats, data: []const u8) bool {
     if (data.len < 4 or !std.mem.eql(u8, data[0..4], snapshot_magic)) return false;
     var c = Cursor{ .b = data, .i = 4 };
     const version = c.int(u8) orelse return false;
-    if (version != snapshot_version) return false; // unknown format → start empty
+    if (version != snapshot_version and version != snapshot_version_v1) return false;
     const ccount = c.int(u32) orelse return false;
     var i: u32 = 0;
     while (i < ccount) : (i += 1) {
-        if (!loadChannel(self, &c)) return false;
+        if (!loadChannel(self, &c, version)) return false;
     }
     return true;
 }
 
-fn loadChannel(self: *ChanStats, c: *Cursor) bool {
+fn loadChannel(self: *ChanStats, c: *Cursor, version: u8) bool {
     const name = c.bytes() orelse return false;
     // A snapshot with the same channel twice would double-append its days/
     // topics/word_freq onto the existing agg (scalars would just overwrite).
@@ -996,6 +1069,10 @@ fn loadChannel(self: *ChanStats, c: *Cursor) bool {
     agg.quits = c.int(u64) orelse return false;
     agg.kicks = c.int(u64) orelse return false;
     agg.topic_changes = c.int(u64) orelse return false;
+    if (version >= snapshot_version) {
+        agg.actions = c.int(u64) orelse return false;
+        agg.peak_members = c.int(u64) orelse return false;
+    }
     for (&agg.hours) |*h| h.* = c.int(u64) orelse return false;
     for (&agg.heatmap) |*row| for (row) |*cell| {
         cell.* = c.int(u64) orelse return false;
@@ -1022,6 +1099,7 @@ fn loadChannel(self: *ChanStats, c: *Cursor) bool {
         const urls = c.int(u64) orelse return false;
         const last_active = c.int(i64) orelse return false;
         const monologue = c.int(u32) orelse return false;
+        const actions: u64 = if (version >= snapshot_version) (c.int(u64) orelse return false) else 0;
         if (self.userOf(agg, nick)) |usr| {
             usr.messages = messages;
             usr.words = words;
@@ -1030,6 +1108,7 @@ fn loadChannel(self: *ChanStats, c: *Cursor) bool {
             usr.urls = urls;
             usr.last_active = last_active;
             usr.monologue = monologue;
+            usr.actions = actions;
         }
     }
     const words_len = c.int(u32) orelse return false;
@@ -1100,6 +1179,42 @@ test "records messages, words, hour buckets, and per-user behaviour metrics" {
     // The URL token is excluded from the word cloud but real words are kept.
     try std.testing.expect(agg.word_freq.get("hello") != null);
     try std.testing.expect(agg.word_freq.get("http://example.com") == null);
+}
+
+test "ophion parity: CTCP ACTION, ignore list, peak members" {
+    var s = ChanStats.init(std.testing.allocator);
+    defer s.deinit();
+    s.setIgnoredNicks(&.{"Announce", "GitHub"});
+    try std.testing.expect(s.isIgnored("announce"));
+    try std.testing.expect(!s.isIgnored("kain"));
+
+    const ts: i64 = 1_700_000_100_000;
+    s.recordMessage("#ops", "Announce", "bot noise", ts);
+    s.recordMessage("#ops", "kain", "\x01ACTION waves\x01", ts);
+    s.recordMessage("#ops", "kain", "hello", ts + 1);
+    try std.testing.expectEqual(@as(u64, 2), s.channelMessageCount("#ops")); // ignored bot not counted
+    const agg = s.channels.get("#ops").?;
+    try std.testing.expectEqual(@as(u64, 2), agg.messages);
+    try std.testing.expectEqual(@as(u64, 1), agg.actions);
+    try std.testing.expectEqual(@as(u64, 1), agg.users.get("kain").?.actions);
+    try std.testing.expect(ChanStats.ctcpActionBody("\x01ACTION waves\x01") != null);
+    try std.testing.expectEqualStrings("waves", ChanStats.ctcpActionBody("\x01ACTION waves\x01").?);
+
+    s.notePresent("#ops", 12);
+    s.notePresent("#ops", 7);
+    try std.testing.expectEqual(@as(u64, 12), agg.peak_members);
+
+    // Snapshot round-trip preserves v2 fields.
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    try serialize(&s, &aw.writer);
+    var s2 = ChanStats.init(std.testing.allocator);
+    defer s2.deinit();
+    try std.testing.expect(deserialize(&s2, aw.written()));
+    const a2 = s2.channels.get("#ops").?;
+    try std.testing.expectEqual(@as(u64, 1), a2.actions);
+    try std.testing.expectEqual(@as(u64, 12), a2.peak_members);
+    try std.testing.expectEqual(@as(u64, 1), a2.users.get("kain").?.actions);
 }
 
 test "records membership events and topic history" {

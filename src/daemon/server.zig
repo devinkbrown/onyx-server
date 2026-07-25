@@ -1759,6 +1759,8 @@ pub const Config = struct {
     /// <slug>.json per channel) for the channel-stats dashboard; nginx serves it
     /// at `/stats/data/`. Empty = channel stats off (no recording, no I/O).
     chanstats_dir: []const u8 = "",
+    /// Borrowed nicks excluded from chanstats (from `[stats] ignore_nicks`).
+    chanstats_ignore_nicks: []const []const u8 = &.{},
     /// Minimum interval between web-stats writes, in ms.
     stats_interval_ms: i64 = 30_000,
     /// Directory for periodic local backup sets. Empty = disabled. When enabled,
@@ -34200,6 +34202,9 @@ pub const LinuxServer = struct {
         if (self.config.chanstats_dir.len == 0) return;
         const io = self.config.crypto_io orelse return;
         chanstats_mod.loadSnapshot(&self.chanstats, io, self.config.chanstats_dir);
+        // Apply ophion-style ignore list after snapshot load so ignored bots
+        // never gain new samples (historical rows stay in the snapshot until prune).
+        self.chanstats.setIgnoredNicks(self.config.chanstats_ignore_nicks);
         const interval = @max(self.config.stats_interval_ms, @as(i64, 1));
         self.chanstats_prune_ready_ms = self.nowMs() + @max(interval * 4, @as(i64, 120_000));
     }
@@ -44524,6 +44529,149 @@ pub const LinuxServer = struct {
         // the new serial; the owned buffer is freed on the next publish/deinit.
         self.config.tls_ocsp_staple = null;
         return .reloaded;
+    }
+
+    /// CHANSTATS — ophion m_chanstats subset over the native ChanStats engine.
+    /// Registered members may query: TOPUSERS | WORDS | ACTIVITY | RECORD | HELP [#channel]
+    pub fn handleChanstats(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (self.config.chanstats_dir.len == 0) {
+            try self.noticeTo(conn, "CHANSTATS: channel statistics are disabled on this node");
+            return;
+        }
+        if (!conn.session.registered()) {
+            try queueNumeric(conn, .ERR_NOTREGISTERED, &.{}, "You have not registered");
+            return;
+        }
+        const params = parsed.paramSlice();
+        const sub = if (params.len >= 1) params[0] else "HELP";
+        const chan_arg = if (params.len >= 2) params[1] else "";
+
+        if (std.ascii.eqlIgnoreCase(sub, "HELP") or std.ascii.eqlIgnoreCase(sub, "USAGE")) {
+            try self.noticeTo(conn, "CHANSTATS TOPUSERS|WORDS|ACTIVITY|RECORD [#channel] — live channel stats");
+            try self.noticeTo(conn, "  TOPUSERS  top speakers by line count");
+            try self.noticeTo(conn, "  WORDS     top words (length ≥ 4)");
+            try self.noticeTo(conn, "  ACTIVITY  hourly UTC message totals");
+            try self.noticeTo(conn, "  RECORD    busiest day, peak hour, peak members, actions");
+            return;
+        }
+
+        if (chan_arg.len == 0 or !world_model.isChannelName(chan_arg)) {
+            try self.noticeTo(conn, "CHANSTATS: usage — CHANSTATS TOPUSERS|WORDS|ACTIVITY|RECORD #channel");
+            return;
+        }
+        const channel = chan_arg;
+
+        const agg: *chanstats_mod.ChannelAgg = blk: {
+            if (self.chanstats.channels.get(channel)) |a| break :blk a;
+            var it = self.chanstats.channels.iterator();
+            while (it.next()) |e| {
+                if (std.ascii.eqlIgnoreCase(e.key_ptr.*, channel)) break :blk e.value_ptr.*;
+            }
+            var nb: [default_reply_bytes]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&nb, "CHANSTATS: no data for {s} yet", .{channel}) catch "CHANSTATS: no data");
+            return;
+        };
+
+        var line: [default_reply_bytes]u8 = undefined;
+        if (std.ascii.eqlIgnoreCase(sub, "TOPUSERS") or std.ascii.eqlIgnoreCase(sub, "TOP")) {
+            try self.noticeTo(conn, std.fmt.bufPrint(&line, "CHANSTATS TOPUSERS for {s} ({d} lines, {d} speakers):", .{
+                agg.name, agg.messages, agg.users.count(),
+            }) catch "CHANSTATS TOPUSERS:");
+            // Partial sort into a small stack buffer of pointers.
+            const max_show = 15;
+            var ptrs: [64]*chanstats_mod.UserAgg = undefined;
+            var n: usize = 0;
+            var uit = agg.users.valueIterator();
+            while (uit.next()) |v| {
+                if (n == ptrs.len) break;
+                ptrs[n] = v.*;
+                n += 1;
+            }
+            // Selection sort by messages desc, limited.
+            var i: usize = 0;
+            while (i < n and i < max_show) : (i += 1) {
+                var best = i;
+                var j = i + 1;
+                while (j < n) : (j += 1) {
+                    if (ptrs[j].messages > ptrs[best].messages) best = j;
+                }
+                if (best != i) {
+                    const tmp = ptrs[i];
+                    ptrs[i] = ptrs[best];
+                    ptrs[best] = tmp;
+                }
+                try self.noticeTo(conn, std.fmt.bufPrint(&line, "  #{d}  {s}  {d} lines  {d} words  {d} actions", .{
+                    i + 1, ptrs[i].nick, ptrs[i].messages, ptrs[i].words, ptrs[i].actions,
+                }) catch continue);
+            }
+            if (n == 0) try self.noticeTo(conn, "  (no speakers yet)");
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "WORDS")) {
+            try self.noticeTo(conn, std.fmt.bufPrint(&line, "CHANSTATS WORDS for {s}:", .{agg.name}) catch "CHANSTATS WORDS:");
+            const Word = struct { w: []const u8, c: u64 };
+            var words: [40]Word = undefined;
+            var wn: usize = 0;
+            var wit = agg.word_freq.iterator();
+            while (wit.next()) |e| {
+                if (wn == words.len) break;
+                words[wn] = .{ .w = e.key_ptr.*, .c = e.value_ptr.* };
+                wn += 1;
+            }
+            var i: usize = 0;
+            const show = @min(wn, @as(usize, 15));
+            while (i < show) : (i += 1) {
+                var best = i;
+                var j = i + 1;
+                while (j < wn) : (j += 1) {
+                    if (words[j].c > words[best].c) best = j;
+                }
+                if (best != i) {
+                    const tmp = words[i];
+                    words[i] = words[best];
+                    words[best] = tmp;
+                }
+                try self.noticeTo(conn, std.fmt.bufPrint(&line, "  {s} ×{d}", .{ words[i].w, words[i].c }) catch continue);
+            }
+            if (wn == 0) try self.noticeTo(conn, "  (no words yet)");
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "ACTIVITY") or std.ascii.eqlIgnoreCase(sub, "HOURS")) {
+            try self.noticeTo(conn, std.fmt.bufPrint(&line, "CHANSTATS ACTIVITY for {s} (UTC hour → messages):", .{agg.name}) catch "CHANSTATS ACTIVITY:");
+            var hour: usize = 0;
+            while (hour < 24) : (hour += 1) {
+                if (agg.hours[hour] == 0) continue;
+                try self.noticeTo(conn, std.fmt.bufPrint(&line, "  {d:0>2}:00  {d}", .{ hour, agg.hours[hour] }) catch continue);
+            }
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "RECORD") or std.ascii.eqlIgnoreCase(sub, "RECORDS")) {
+            var best_msgs: u64 = 0;
+            for (agg.days.items) |d| {
+                if (d.messages >= best_msgs) best_msgs = d.messages;
+            }
+            var peak_h: usize = 0;
+            var peak_c: u64 = 0;
+            for (agg.hours, 0..) |h, hi| {
+                if (h > peak_c) {
+                    peak_c = h;
+                    peak_h = hi;
+                }
+            }
+            try self.noticeTo(conn, std.fmt.bufPrint(&line, "CHANSTATS RECORD for {s}:", .{agg.name}) catch "CHANSTATS RECORD:");
+            try self.noticeTo(conn, std.fmt.bufPrint(&line, "  messages={d} words={d} actions={d} joins={d} kicks={d}", .{
+                agg.messages, agg.words, agg.actions, agg.joins, agg.kicks,
+            }) catch "CHANSTATS RECORD");
+            try self.noticeTo(conn, std.fmt.bufPrint(&line, "  busiest_day_msgs={d}  peak_hour={d:0>2}:00 UTC ({d} msgs)  peak_members={d}", .{
+                best_msgs, peak_h, peak_c, agg.peak_members,
+            }) catch "CHANSTATS RECORD");
+            return;
+        }
+
+        try self.noticeTo(conn, "CHANSTATS: unknown subcommand — try CHANSTATS HELP");
     }
 
     /// INFO — RPL_INFO (371) lines bracketed by RPL_INFOSTART/RPL_ENDOFINFO.

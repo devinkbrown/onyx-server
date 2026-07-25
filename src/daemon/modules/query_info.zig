@@ -63,6 +63,11 @@ fn map(ctx: *anyopaque, _: registry.CommandInvocation) anyerror!void {
     try core.server.handleMap(core.conn);
 }
 
+fn chanstats(ctx: *anyopaque, _: registry.CommandInvocation) anyerror!void {
+    const core = Core.from(ctx);
+    try core.server.handleChanstats(core.conn, core.parsed);
+}
+
 pub const module = registry.Module{
     .id = "query.info",
     .commands = &.{
@@ -76,5 +81,6 @@ pub const module = registry.Module{
         .{ .name = "USERS", .handler = users },
         .{ .name = "LINKS", .handler = links },
         .{ .name = "MAP", .handler = map },
+        .{ .name = "CHANSTATS", .handler = chanstats, .summary = "channel stats: TOPUSERS|WORDS|ACTIVITY|RECORD #channel" },
     },
 };

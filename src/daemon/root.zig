@@ -23,6 +23,7 @@ pub const autojoin = @import("autojoin.zig");
 pub const bot_registry = @import("bot_registry.zig");
 pub const certfp_bind = @import("certfp_bind.zig");
 pub const chanmode = @import("chanmode.zig");
+pub const chanstats = @import("chanstats.zig");
 pub const client = @import("client.zig");
 pub const clone_detect = @import("clone_detect.zig");
 pub const clone_limit = @import("clone_limit.zig");
@@ -168,6 +169,7 @@ test {
     _ = bot_registry;
     _ = certfp_bind;
     _ = chanmode;
+    _ = chanstats;
     _ = client;
     _ = clone_detect;
     _ = clone_limit;

@@ -108,6 +108,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.stats.dir.len != 0) out.stats_web_dir = cfg.stats.dir;
     if (cfg.stats.channel_dir.len != 0) out.chanstats_dir = cfg.stats.channel_dir;
     if (cfg.stats.interval_ms != 0) out.stats_interval_ms = cfg.stats.interval_ms;
+    out.chanstats_ignore_nicks = cfg.stats.ignore_nicks;
     if (cfg.backup.dir.len != 0) out.backup_dir = cfg.backup.dir;
     if (cfg.backup.interval_ms != 0) out.backup_interval_ms = cfg.backup.interval_ms;
     if (cfg.sasl.account_db) |db| out.account_store_path = db;

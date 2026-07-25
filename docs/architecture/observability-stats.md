@@ -6,11 +6,31 @@ Onyx Server ships a native, in-process chanstats engine that aggregates live cha
 
 ## Per-channel statistics engine
 
-`ChanStats` owns a name-to-`ChannelAgg` map ([src/daemon/chanstats.zig:109](../../src/daemon/chanstats.zig#L109)). Three recorders drive it, all taking wall-clock unix-ms (`platform.realtimeMillis()`):
+`ChanStats` owns a name-to-`ChannelAgg` map ([src/daemon/chanstats.zig](../../src/daemon/chanstats.zig)). Three recorders drive it, all taking wall-clock unix-ms (`platform.realtimeMillis()`):
 
-- `recordMessage` counts a channel message, bumps the hour-of-day bucket, the 7x24 weekday heatmap, and the current day, tokenizes the text into word-frequency counts, and updates the author's `UserAgg` with question/exclamation/URL/monologue behaviour metrics ([src/daemon/chanstats.zig:232](../../src/daemon/chanstats.zig#L232)). Hour and weekday derive from the timestamp in UTC ([src/daemon/chanstats.zig:238](../../src/daemon/chanstats.zig#L238)).
-- `recordEvent` increments `joins`/`parts`/`quits`/`kicks` ([src/daemon/chanstats.zig:287](../../src/daemon/chanstats.zig#L287)).
-- `recordTopic` appends to a bounded topic history and increments `topic_changes` ([src/daemon/chanstats.zig:298](../../src/daemon/chanstats.zig#L298)).
+- `recordMessage` counts a channel message, bumps the hour-of-day bucket, the 7x24 weekday heatmap, and the current day, tokenizes the text into word-frequency counts, and updates the author's `UserAgg` with question/exclamation/URL/monologue/action behaviour metrics. CTCP ACTION (`\x01ACTION …\x01`) increments both messages and `actions`. Nicks in `[stats] ignore_nicks` are skipped entirely (ophion ignore list).
+- `recordEvent` increments `joins`/`parts`/`quits`/`kicks`.
+- `recordTopic` appends to a bounded topic history and increments `topic_changes`.
+- `notePresent` / flush-time presence raises `peak_members` (ophion high-water mark).
+
+### IRC surface: `CHANSTATS` (ophion subset)
+
+`CHANSTATS TOPUSERS|WORDS|ACTIVITY|RECORD #channel` — registered clients, NOTICE replies from live in-memory aggregates (no SQLite). Help via `CHANSTATS HELP`.
+
+### Ophion parity ledger (native subset)
+
+| Ophion m_chanstats | Onyx Server status |
+|---|---|
+| messages / words / joins / parts / kicks / topics | **DONE** |
+| hours + weekday heatmap + daily series | **DONE** |
+| top users + top words | **DONE** |
+| CTCP ACTION counters | **DONE** (`actions` on totals + top_users) |
+| peak concurrent members | **DONE** (`peak_members`) |
+| ignore nicks (bots) | **DONE** (`[stats] ignore_nicks`) |
+| CHANSTATS TOPUSERS/WORDS/ACTIVITY/RECORD | **DONE** (NOTICE subset) |
+| SQLite WAL + full HTML site regen | out of scope (JSON + Solid dashboard) |
+| quotes / quiz / hall-of-fame / digests / milestones | later |
+| mention matrix / compare pages / user profiles | later |
 
 The engine is bounded by construction: per-channel user (4096) and word (8192) tables are capped, and when a table is full only already-tracked users update while new words are ignored, so a hostile flood cannot pin unbounded memory ([src/daemon/chanstats.zig:31](../../src/daemon/chanstats.zig#L31), [src/daemon/chanstats.zig:215](../../src/daemon/chanstats.zig#L215), [src/daemon/chanstats.zig:321](../../src/daemon/chanstats.zig#L321)). Day history caps at 60 and topics at 40.
 
@@ -31,15 +51,16 @@ A per-channel `<slug>.json` (from `renderChannel`, top-N capped at 30 users / 40
   "present": 12,
   "last_speaker": "kain",
   "totals": {"messages": 842, "words": 5120, "active_users": 37,
-             "joins": 60, "parts": 22, "quits": 14, "kicks": 1, "topic_changes": 3},
+             "joins": 60, "parts": 22, "quits": 14, "kicks": 1, "topic_changes": 3,
+             "actions": 40, "peak_members": 28},
   "hours": [0,0,1, "...24 hourly totals..."],
   "days": [{"date": "2026-06-28", "messages": 120}, "..."],
   "heatmap": [[0,0,"...24..."], "...7 weekday rows..."],
   "top_users": [{"nick": "kain", "messages": 210, "words": 1400, "last_active": 1700000000,
-                 "questions": 12, "exclamations": 30, "urls": 4, "monologue": 6}, "..."],
+                 "questions": 12, "exclamations": 30, "urls": 4, "monologue": 6, "actions": 9}, "..."],
   "top_words": [{"word": "onyx", "count": 88}, "..."],
   "topics": [{"ts": 1699999000, "setter": "kain", "topic": "build channel"}, "...newest first..."],
-  "records": {"busiest_day": {"date": "2026-06-30", "messages": 300}, "peak_hour": 20}
+  "records": {"busiest_day": {"date": "2026-06-30", "messages": 300}, "peak_hour": 20, "peak_members": 28}
 }
 ```
 

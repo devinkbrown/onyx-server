@@ -521,6 +521,9 @@ pub const Config = struct {
         channel_dir: []const u8 = "",
         /// Minimum interval between stats writes, in ms (parsed from a duration).
         interval_ms: i64 = 30_000,
+        /// Nicks excluded from chanstats recording (bots/services). Case-insensitive.
+        /// Ported from ophion m_chanstats `ignored_nicks`.
+        ignore_nicks: []const []const u8 = &.{},
     };
 
     /// Periodic local backup publication. Off unless `dir` is set.
@@ -979,6 +982,7 @@ pub const Config = struct {
         if (self.media.stun_host) |value| allocator.free(value);
         allocator.free(self.stats.dir);
         allocator.free(self.stats.channel_dir);
+        freeStringList(allocator, self.stats.ignore_nicks);
         allocator.free(self.backup.dir);
         allocator.free(self.metrics.bind);
         if (self.webhook.bind) |value| allocator.free(value);
@@ -1294,6 +1298,10 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setStr(allocator, resolver, doc.getString("stats.dir"), &cfg.stats.dir);
     try setStr(allocator, resolver, doc.getString("stats.channel_dir"), &cfg.stats.channel_dir);
     if (doc.getString("stats.interval")) |s| cfg.stats.interval_ms = @intCast(try durationMs(s));
+    if (doc.getArray("stats.ignore_nicks")) |arr| {
+        freeStringList(allocator, cfg.stats.ignore_nicks);
+        cfg.stats.ignore_nicks = try ownStringArray(allocator, resolver, arr);
+    }
 
     try setStr(allocator, resolver, doc.getString("backup.dir"), &cfg.backup.dir);
     if (doc.getString("backup.interval")) |s| cfg.backup.interval_ms = @intCast(try durationMs(s));
