@@ -514,7 +514,9 @@ test "loopback round-trip send recv across vtable" {
     var send: [2]SendCompletion = undefined;
     try std.testing.expectEqual(@as(usize, 1), try tx.pollSendCompletions(&send));
     try std.testing.expectEqual(id, send[0].id);
-    try std.testing.expectEqual(@as(usize, 6), send[0].bytes);
+    // Default SimulationConfig has no max_send_bytes and randomize_partial_send=false,
+    // so the full payload is accepted in one completion (not a partial 6-byte fragment).
+    try std.testing.expectEqual(@as(usize, "adaptive".len), send[0].bytes);
     try std.testing.expectEqual(SendCompletion.Status.sent, send[0].status);
 
     var receive: [2]ReceiveCompletion = undefined;

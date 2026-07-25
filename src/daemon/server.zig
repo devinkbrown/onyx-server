@@ -58901,7 +58901,10 @@ test "session replica nick index is case-folded bounded and ambiguity-safe" {
     const t1: session_migrate.Token = @splat(1);
     const t2: session_migrate.Token = @splat(2);
     const t3: session_migrate.Token = @splat(3);
-    try Fixture.install(server, 1, t1, "acct-a", "Nova");
+    // All three installs MUST share one case-folded primary key ("ruri"). A brand
+    // purge once rewrote the first/third nicks to "Nova"/"nova", which broke the
+    // fold lookup against mixed "rUrI" and made get() return null.
+    try Fixture.install(server, 1, t1, "acct-a", "Ruri");
     const mixed = SessionReplicaNickKey.init("rUrI").?;
     var candidates = server.session_replica_nicks.get(mixed) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u8, 1), candidates.count);
@@ -58913,7 +58916,7 @@ test "session replica nick index is case-folded bounded and ambiguity-safe" {
     try std.testing.expectEqual(@as(u8, 2), candidates.count);
     try std.testing.expect(!candidates.ambiguous);
 
-    try Fixture.install(server, 3, t3, "acct-c", "nova");
+    try Fixture.install(server, 3, t3, "acct-c", "ruri");
     candidates = server.session_replica_nicks.get(mixed) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u8, 2), candidates.count);
     try std.testing.expect(candidates.ambiguous);
@@ -58926,7 +58929,7 @@ test "session replica nick index is case-folded bounded and ambiguity-safe" {
     try std.testing.expect(server.sessions.remove("acct-b", 2));
     try std.testing.expect(server.sessions.remove("acct-c", 3));
     const t4: session_migrate.Token = @splat(4);
-    try Fixture.install(server, 4, t4, "acct-d", "Nova");
+    try Fixture.install(server, 4, t4, "acct-d", "Ruri");
     candidates = server.session_replica_nicks.get(mixed) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u8, 1), candidates.count);
     try std.testing.expect(!candidates.ambiguous);
