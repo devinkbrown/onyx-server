@@ -52722,6 +52722,119 @@ test "MESSAGE_V2 RVL2 duplicate ingress and ACK handshake retire every direct-ne
     try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.receiptItems().len);
 }
 
+test "MESSAGE_V2 custody ACK and ACK_CONFIRM fail closed for off-mesh and unsolicited peers" {
+    // Custody advances only on an authenticated direct-neighbor ACK, and
+    // ACK_CONFIRM retires a receipt only for the exact ingress peer that
+    // reserved it. Off-mesh, self, unsolicited, and cross-peer confirmations
+    // must leave every authority byte-identical — otherwise a forged hop could
+    // manufacture coverage, free receipt capacity, or retire the last wire.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0xa1)), "rvl2-ack-failclosed");
+    defer local.deinit();
+    var peer_b = try node_identity.fromSeed(@as([32]u8, @splat(0xa2)), "rvl2-ack-failclosed");
+    defer peer_b.deinit();
+    var peer_c = try node_identity.fromSeed(@as([32]u8, @splat(0xa3)), "rvl2-ack-failclosed");
+    defer peer_c.deinit();
+    var stranger = try node_identity.fromSeed(@as([32]u8, @splat(0xa4)), "rvl2-ack-failclosed");
+    defer stranger.deinit();
+    const root_b = std.fmt.bytesToHex(peer_b.sign_kp.public_key, .lower);
+    const root_c = std.fmt.bytesToHex(peer_c.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &root_b, &root_c };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#ack-failclosed",
+        .source_prefix = "Bob!u@peer-b.test",
+        .account = "bob",
+        .text = "custody fail-closed pin",
+        .scope_kind = .channel,
+        .origin_node = peer_b.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &peer_b.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+    const peers = try server.collectRelayV2OutboxPeers(peer_b.shortId(), false);
+    defer alloc.free(peers);
+    const relay_id = switch (try server.admitRelayV2Detailed(msg, null, .{
+        .peers = peers,
+        .receipt_peer = peer_b.shortId(),
+        .wire = wire,
+        .unbound_excluded_peer = peer_b.shortId(),
+    }, null)) {
+        .accepted => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(server.relay_v2_event_log.contains(relay_id));
+    try std.testing.expect(server.relay_v2_outbox.contains(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.relay_v2_outbox.containsReceipt(peer_b.shortId(), relay_id));
+    try std.testing.expect(!server.relay_v2_outbox.containsReceipt(peer_c.shortId(), relay_id));
+
+    // Off-mesh hop cannot enter the live delivery path even with a valid wire.
+    try std.testing.expect(server.deliverRelayV2(msg, wire, stranger.shortId()) == .permanent);
+
+    const event_before = try server.relay_v2_event_log.encodeCheckpoint(alloc);
+    defer alloc.free(event_before);
+    const outbox_before = try server.relay_v2_outbox.encodeCheckpoint(alloc);
+    defer alloc.free(outbox_before);
+
+    // Neighbor ACK gates: stranger, self, and zero never mutate custody.
+    try std.testing.expect(!server.commitRelayV2NeighborAck(stranger.shortId(), relay_id));
+    try std.testing.expect(!server.commitRelayV2NeighborAck(local.shortId(), relay_id));
+    try std.testing.expect(!server.commitRelayV2NeighborAck(0, relay_id));
+
+    // ACK_CONFIRM gates: unsolicited peer (no receipt), cross-peer (receipt is
+    // for B only), stranger, self, and zero never retire B's receipt or C's
+    // forward obligation.
+    try std.testing.expect(!server.commitRelayV2IngressAckConfirm(peer_c.shortId(), relay_id));
+    try std.testing.expect(!server.commitRelayV2IngressAckConfirm(stranger.shortId(), relay_id));
+    try std.testing.expect(!server.commitRelayV2IngressAckConfirm(local.shortId(), relay_id));
+    try std.testing.expect(!server.commitRelayV2IngressAckConfirm(0, relay_id));
+    const ghost_id: relay_v2_replay_guard.RelayId = @splat(0x5a);
+    try std.testing.expect(!server.commitRelayV2IngressAckConfirm(peer_b.shortId(), ghost_id));
+
+    const event_after = try server.relay_v2_event_log.encodeCheckpoint(alloc);
+    defer alloc.free(event_after);
+    const outbox_after = try server.relay_v2_outbox.encodeCheckpoint(alloc);
+    defer alloc.free(outbox_after);
+    try std.testing.expectEqualSlices(u8, event_before, event_after);
+    try std.testing.expectEqualSlices(u8, outbox_before, outbox_after);
+    try std.testing.expect(server.relay_v2_outbox.contains(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.relay_v2_outbox.containsReceipt(peer_b.shortId(), relay_id));
+    try std.testing.expect(!server.relay_v2_event_log.isConfirmedBy(relay_id, peer_c.shortId()));
+    try std.testing.expect(!server.relay_v2_event_log.isConfirmedBy(relay_id, stranger.shortId()));
+
+    // Legitimate neighbor ACK still advances exactly one required confirmation
+    // and retires only that peer's outbox row; the fail-closed probes above
+    // must not have left partial authority drift.
+    try std.testing.expect(server.commitRelayV2NeighborAck(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.relay_v2_event_log.isConfirmedBy(relay_id, peer_c.shortId()));
+    try std.testing.expect(!server.relay_v2_outbox.contains(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.relay_v2_outbox.containsReceipt(peer_b.shortId(), relay_id));
+    // Cross-peer confirm still cannot steal B's receipt after C's legitimate ACK.
+    try std.testing.expect(!server.commitRelayV2IngressAckConfirm(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.relay_v2_outbox.containsReceipt(peer_b.shortId(), relay_id));
+    try std.testing.expect(server.commitRelayV2IngressAckConfirm(peer_b.shortId(), relay_id));
+    try std.testing.expect(!server.relay_v2_outbox.containsReceipt(peer_b.shortId(), relay_id));
+}
+
 test "MESSAGE_V2 RVL2 retry sweep cannot starve a later direct neighbor" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
