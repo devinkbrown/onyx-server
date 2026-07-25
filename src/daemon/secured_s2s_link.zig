@@ -554,6 +554,18 @@ pub const SecuredLink = struct {
         return if (self.inner) |l| l.remoteName() else "";
     }
 
+    /// Latest sampled mesh PING→PONG RTT in ms (null until the first sample).
+    pub fn lastRttMs(self: *const SecuredLink) ?u32 {
+        return if (self.inner) |l| l.lastRttMs() else null;
+    }
+
+    /// Emit a timestamped RTT probe over the secured inner CRDT stream.
+    pub fn probeRtt(self: *SecuredLink, now_ms: u64) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.probeRtt(now_ms);
+        try self.drainInner();
+    }
+
     /// The remote peer's own gossiped server description, resolved in the
     /// route-table/registry id space (matching WHOIS 312) rather than via
     /// `remoteNodeId()` (the authenticated shortId, which does NOT key the

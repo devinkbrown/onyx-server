@@ -3860,6 +3860,8 @@ pub const LinuxServer = struct {
     /// Per-S2S-peer link health (EWMA RTT, byte counters, state timestamps),
     /// keyed by remote server name, surfaced in the MESH peer table.
     peer_health: link_health_mod.Registry = .{},
+    /// Monotonic ms of the last mesh RTT probe sweep (reactor 0).
+    last_peer_rtt_probe_ms: i64 = 0,
     /// Recently-emitted synthetic oper-prefix (+Y/-Y) announcements, for
     /// idempotence. A mesh relink re-bursts BOTH a member's JOIN and its oper
     /// grant, and both re-announce the derived `*` — so a rejoining remote oper
@@ -5704,6 +5706,10 @@ pub const LinuxServer = struct {
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
         // rate-capped per peer, no-op while a dial is in flight or established).
         _ = self.sweepMeshAutoConnect(false, 1);
+        // Mesh RTT samples for status.json / MESH: timestamped PING→PONG on each
+        // established peer. Reactor-0-only (S2S links live here); cadence is short
+        // enough for a live status page but well below CRDT anti-entropy load.
+        if (self.rx() == &self.reactors[0]) self.maybeProbeMeshPeerRtt();
         // Publish the distinct-peer count for cross-shard LUSERS reads. Reactor 0
         // owns the peer links, so it is the only reactor that can compute this;
         // other shards read the published atomic. Converges within one tick of a
@@ -8327,7 +8333,10 @@ pub const LinuxServer = struct {
             if (!conn.session_replica_replay_pending) self.scheduleSessionReplicaReplay(conn);
         }
         self.bindRelayV2UnboundIfReady(conn, link);
-        if (link.established()) self.accountPeerBytes(link.remoteName(), bytes.len, out_len);
+        if (link.established()) {
+            self.accountPeerBytes(link.remoteName(), bytes.len, out_len);
+            self.syncPeerRtt(link.remoteName(), link.lastRttMs());
+        }
         // Apply signed session authority BEFORE user-message delivery. OFFER and
         // the first MESSAGE can share one socket read; draining the frame-family
         // queues in the opposite order would falsely reject that first event.
@@ -8532,7 +8541,10 @@ pub const LinuxServer = struct {
             };
             link.clearOutbound();
         }
-        if (link.established()) self.accountPeerBytes(link.remoteName(), bytes.len, out.len);
+        if (link.established()) {
+            self.accountPeerBytes(link.remoteName(), bytes.len, out.len);
+            self.syncPeerRtt(link.remoteName(), link.lastRttMs());
+        }
         // Drain inbound cross-node user messages and deliver to local clients.
         if (link.takeInbound()) |inbound| {
             for (inbound) |*owned| {
@@ -44867,6 +44879,47 @@ pub const LinuxServer = struct {
         if (out_bytes != 0) h.addOut(out_bytes, now);
     }
 
+    /// Fold a live mesh RTT sample into the peer health table (status.json / MESH).
+    fn syncPeerRtt(self: *LinuxServer, name: []const u8, rtt_ms: ?u32) void {
+        const sample = rtt_ms orelse return;
+        if (name.len == 0) return;
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const h = self.peer_health.get(name) orelse return;
+        h.observeRtt(sample, now);
+    }
+
+    /// Cadence for mesh RTT probes (status page "up · N ms"). Short enough that a
+    /// hard-refreshed status page usually sees a sample within one load.
+    const peer_rtt_probe_interval_ms: i64 = if (builtin.is_test) 50 else 15_000;
+
+    /// Emit timestamped PING probes on every established mesh peer and flush the
+    /// resulting outbound. Reactor-0-only caller (S2S slots live there).
+    fn maybeProbeMeshPeerRtt(self: *LinuxServer) void {
+        const now = self.nowMs();
+        if (self.last_peer_rtt_probe_ms != 0 and now - self.last_peer_rtt_probe_ms < peer_rtt_probe_interval_ms)
+            return;
+        self.last_peer_rtt_probe_ms = now;
+        const now_u: u64 = @intCast(@max(@as(i64, 0), now));
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.s2s_secured) |link| {
+                if (!link.established()) continue;
+                link.probeRtt(now_u) catch continue;
+                _ = self.flushMeshBurstStage(&slot.value);
+                self.syncPeerRtt(link.remoteName(), link.lastRttMs());
+            } else if (slot.value.s2s) |link| {
+                if (!link.established()) continue;
+                link.probeRtt(now_u) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch {
+                    link.clearOutbound();
+                    continue;
+                };
+                link.clearOutbound();
+                self.syncPeerRtt(link.remoteName(), link.lastRttMs());
+            }
+        }
+    }
+
     /// MESH (a.k.a. NETSTAT) — oper view of server-to-server mesh health,
     /// rendered by the pure `mesh_report` renderer from live S2S link state,
     /// enriched with per-peer link health (RTT, byte counters, time-in-state)
@@ -60689,6 +60742,8 @@ test "status.json: emits node health + mesh peers for the public status page" {
         server.config.network_icon_url = "https://example.test/onyx_server.png";
         server.markPeerHealth("ircx.us", .established);
         server.markPeerHealth("stale.node", .down);
+        // Public status page shows "up · N ms" only once peer_health has a sample.
+        server.syncPeerRtt("ircx.us", 17);
         _ = try server.history.append("#hist", .{ .msgid = "h1", .sender = "a!u@h", .text = "one", .timestamp = 1 });
         _ = try server.history.append("#hist", .{ .msgid = "h2", .sender = "a!u@h", .text = "two", .timestamp = 2 });
         _ = try server.history.append("alice", .{ .msgid = "d1", .sender = "b!u@h", .text = "dm", .timestamp = 3 });
@@ -60723,11 +60778,13 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"history\":{\"targets\":2,\"entries\":3,\"tombstones\":1,\"root\":\"") != null);
         const history_root_hex = std.fmt.bytesToHex(server.history.root(), .lower);
         try std.testing.expect(std.mem.indexOf(u8, text, &history_root_hex) != null);
-        // Both peers present, with correct up/state.
+        // Both peers present, with correct up/state and a sampled RTT for the live peer.
         try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"ircx.us\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"up\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"rtt_ms\":17") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"name\":\"stale.node\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"down\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"rtt_ms\":null") != null);
 
         server.config.network_discoverable = true;
         server.config.s2s_port = 6697;

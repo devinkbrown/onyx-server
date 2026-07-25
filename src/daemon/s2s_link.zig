@@ -177,6 +177,17 @@ pub const S2sLink = struct {
         try self.peer.sendPing(payload, self.sink());
     }
 
+    /// Emit a timestamped mesh RTT probe PING (8-byte little-endian now_ms).
+    pub fn probeRtt(self: *S2sLink, now_ms: u64) !void {
+        self.now_ms = now_ms;
+        try self.peer.sendRttProbe(self.sink(), now_ms);
+    }
+
+    /// Latest sampled PING→PONG RTT in ms, or null if never observed.
+    pub fn lastRttMs(self: *const S2sLink) ?u32 {
+        return self.peer.lastRttMs();
+    }
+
     /// Pending outbound bytes; copy to the wire, then call `clearOutbound`.
     pub fn outbound(self: *const S2sLink) []const u8 {
         return self.out.items;

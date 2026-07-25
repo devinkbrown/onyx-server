@@ -514,6 +514,10 @@ pub const S2sPeer = struct {
     repair_resync_requested: bool = false,
     ping_rx_count: usize = 0,
     pong_rx_count: usize = 0,
+    /// Most recent mesh PING→PONG round-trip in ms (null until the first sample).
+    /// Heartbeat / explicit RTT probes stamp an 8-byte little-endian monotonic
+    /// send time into the PING payload; the matching PONG echoes it.
+    last_rtt_ms: ?u32 = null,
     config: Config,
     /// This node's Ed25519 signing keypair (set on secured links), or null on the
     /// legacy unsigned (plaintext) path. When set, in-scope outbound frames are
@@ -1008,6 +1012,30 @@ pub const S2sPeer = struct {
         try emitFrame(self.allocator, sink, .PING, payload);
     }
 
+    /// Emit a timestamped PING so the matching PONG can sample mesh RTT.
+    /// Payload is an 8-byte little-endian monotonic `now_ms` (echoed by peers).
+    pub fn sendRttProbe(self: *S2sPeer, sink: ByteSink, now_ms: u64) !void {
+        var payload: [8]u8 = undefined;
+        std.mem.writeInt(u64, payload[0..8], now_ms, .little);
+        try emitFrame(self.allocator, sink, .PING, &payload);
+    }
+
+    /// Latest observed PING→PONG RTT in milliseconds, or null if never sampled.
+    pub fn lastRttMs(self: *const S2sPeer) ?u32 {
+        return self.last_rtt_ms;
+    }
+
+    fn noteRttSample(self: *S2sPeer, payload: []const u8, now_ms: u64) void {
+        if (payload.len != 8) return;
+        const sent = std.mem.readInt(u64, payload[0..8], .little);
+        if (now_ms < sent) return;
+        const delta = now_ms - sent;
+        // Cap pathological samples (clock jumps, stalled peers) so public status
+        // never claims multi-hour "latency".
+        if (delta > 600_000) return;
+        self.last_rtt_ms = @intCast(delta);
+    }
+
     /// Ask the peer to re-send its full converged state (used right after a Helix
     /// resume). Unsigned control frame — carries no trusted state itself.
     pub fn sendResync(self: *S2sPeer, sink: ByteSink) !void {
@@ -1035,7 +1063,9 @@ pub const S2sPeer = struct {
 
     pub fn tick(self: *S2sPeer, sink: ByteSink, now_ms: u64, rng_seed: u64, peers: []const NodeId) !void {
         if (self.session.link.tick() == .heartbeat_due) {
-            try emitFrame(self.allocator, sink, .PING, "");
+            // Timestamped heartbeat: peer echoes the payload as PONG so we can
+            // sample mesh RTT for status/MESH without a separate probe family.
+            try self.sendRttProbe(sink, now_ms);
         }
         if (!self.established) return;
 
@@ -1180,6 +1210,7 @@ pub const S2sPeer = struct {
             },
             .PONG => {
                 self.pong_rx_count += 1;
+                self.noteRttSample(frame.payload, now_ms);
                 if (std.mem.eql(u8, frame.payload, relay_v2_extension_reply) and
                     self.peer_supports_secure_relay_v2)
                     self.peer_supports_relay_v2_current = true;
@@ -4845,6 +4876,33 @@ test "PING emits matching PONG" {
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x51);
     try std.testing.expectEqual(@as(usize, 1), b.ping_rx_count);
     try std.testing.expectEqual(@as(usize, 1), a.pong_rx_count);
+}
+
+test "timestamped RTT probe samples PING to PONG latency" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 1_000 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 10, "a.test");
+    defer a.deinit();
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 20, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try std.testing.expect(a.lastRttMs() == null);
+    try a.sendRttProbe(a_to_b.sink(), tc.now_ms);
+    tc.now_ms += 42;
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x52);
+    try std.testing.expectEqual(@as(?u32, 42), a.lastRttMs());
+    // Capability-probe string PONGs must not clobber the sample.
+    try a.sendPing(relay_v2_extension_probe, a_to_b.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms + 5, 0x53);
+    try std.testing.expectEqual(@as(?u32, 42), a.lastRttMs());
 }
 
 test "partial inbound bytes are buffered until complete frame" {
