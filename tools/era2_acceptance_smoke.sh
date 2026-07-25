@@ -19,7 +19,7 @@ ver="$("$BIN_LOCAL" --version 2>&1 | tr -d '\n' || true)"
 echo "$ver" | grep -q "$EXPECT_VER" || fail "local version missing $EXPECT_VER (got: $ver)"
 ok "local version $EXPECT_VER"
 
-strings "$BIN_LOCAL" | grep -q RECOVERYCODES || fail "local binary missing RECOVERYCODES"
+grep -aFq RECOVERYCODES "$BIN_LOCAL" || fail "local binary missing RECOVERYCODES"
 ok "local RECOVERYCODES present"
 
 links="$(curl -fsS "$LOCAL_METRICS" | awk '/^onyx_s2s_links_active /{print $2}')"
@@ -27,7 +27,7 @@ links="$(curl -fsS "$LOCAL_METRICS" | awk '/^onyx_s2s_links_active /{print $2}')
 ok "local links_active=$links"
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 "$PEER_SSH" \
-  "systemctl is-active --quiet onyx-server.service && $BIN_PEER --version 2>&1 | grep -q $EXPECT_VER && strings $BIN_PEER | grep -q RECOVERYCODES" \
+  "systemctl is-active --quiet onyx-server.service && $BIN_PEER --version 2>&1 | grep -q $EXPECT_VER && grep -aFq RECOVERYCODES $BIN_PEER" \
   || fail "peer unit/version/RECOVERYCODES check failed"
 ok "peer unit + version + RECOVERYCODES"
 
