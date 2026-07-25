@@ -41171,12 +41171,25 @@ pub const LinuxServer = struct {
         svc.webpushPut(account, blob) catch {};
     }
 
-    /// Fire a push for an offline DM: encrypted `{"type":"dm","from":…,"text":…}`
-    /// to every subscription the recipient account holds. Also prunes endpoints
-    /// the push service reported gone (404/410) since the last call.
+    /// Fire a push for an offline/closed-tab recipient. Payload is compact JSON
+    /// sealed to the push subscription:
+    ///   `{"type":"dm|mention|call","from":…,"text":…[,"channel":…]}`
+    /// Also prunes endpoints the push service reported gone (404/410).
     fn webpushNotify(self: *LinuxServer, account: []const u8, from: []const u8, text: []const u8) void {
+        self.webpushNotifyKind(account, "dm", from, text, null);
+    }
+
+    fn webpushNotifyKind(
+        self: *LinuxServer,
+        account: []const u8,
+        kind: []const u8,
+        from: []const u8,
+        text: []const u8,
+        channel: ?[]const u8,
+    ) void {
         const worker = self.webpush_worker orelse return;
         const svc = self.account_services orelse return;
+        if (account.len == 0 or kind.len == 0) return;
 
         const subs = self.webpushLoad(svc, account);
         defer webpush_mod.freeList(self.allocator, subs);
@@ -41202,16 +41215,71 @@ pub const LinuxServer = struct {
         if (n == 0) return;
 
         // Payload: compact JSON, text truncated so it always encrypts in one record.
-        var pb: [512]u8 = undefined;
+        var pb: [640]u8 = undefined;
         var w = std.Io.Writer.fixed(&pb);
-        w.writeAll("{\"type\":\"dm\",\"from\":") catch return;
+        w.writeAll("{\"type\":") catch return;
+        writeJsonEscaped(&w, kind) catch return;
+        w.writeAll(",\"from\":") catch return;
         writeJsonEscaped(&w, from) catch return;
         w.writeAll(",\"text\":") catch return;
         const preview = if (text.len > 240) text[0..240] else text;
         writeJsonEscaped(&w, preview) catch return;
+        if (channel) |ch| {
+            w.writeAll(",\"channel\":") catch return;
+            writeJsonEscaped(&w, ch) catch return;
+        }
         w.writeAll("}") catch return;
 
         for (live[0..n]) |s_| worker.enqueue(s_.endpoint, s_.ua_public, s_.auth, w.buffered());
+    }
+
+    /// True when `hay` contains `needle` as a case-insensitive IRC nick token
+    /// (bounded by non-nick characters). Used for mention push (Era 3 C3).
+    fn textMentionsNick(hay: []const u8, needle: []const u8) bool {
+        if (needle.len == 0 or hay.len < needle.len) return false;
+        var i: usize = 0;
+        while (i + needle.len <= hay.len) : (i += 1) {
+            if (!std.ascii.eqlIgnoreCase(hay[i .. i + needle.len], needle)) continue;
+            const before_ok = i == 0 or !isIrcNickChar(hay[i - 1]);
+            const after = i + needle.len;
+            const after_ok = after == hay.len or !isIrcNickChar(hay[after]);
+            if (before_ok and after_ok) return true;
+        }
+        return false;
+    }
+
+    fn isIrcNickChar(c: u8) bool {
+        return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '[' or c == ']' or c == '\\' or c == '`' or c == '^' or c == '{' or c == '}' or c == '|';
+    }
+
+    /// Closed-tab mention push for channel PRIVMSG (best-effort, local members).
+    fn webpushNotifyChannelMentions(self: *LinuxServer, channel: []const u8, from: []const u8, text: []const u8) void {
+        if (self.webpush_worker == null) return;
+        var members = self.world.memberIterator(channel) orelse return;
+        while (members.next()) |member| {
+            const id = clientIdFromWorld(member.*);
+            const mconn = self.connFor(id) orelse continue;
+            const nick = mconn.session.displayName();
+            if (std.ascii.eqlIgnoreCase(nick, from)) continue;
+            if (!textMentionsNick(text, nick)) continue;
+            const acct = mconn.session.account() orelse continue;
+            self.webpushNotifyKind(acct, "mention", from, text, channel);
+        }
+    }
+
+    /// Closed-tab call invite when someone first joins media in a room.
+    fn webpushNotifyCallInvite(self: *LinuxServer, channel: []const u8, from: []const u8) void {
+        if (self.webpush_worker == null) return;
+        var members = self.world.memberIterator(channel) orelse return;
+        while (members.next()) |member| {
+            const id = clientIdFromWorld(member.*);
+            const mconn = self.connFor(id) orelse continue;
+            const nick = mconn.session.displayName();
+            if (std.ascii.eqlIgnoreCase(nick, from)) continue;
+            if (self.media_rooms.isParticipant(channel, nick)) continue;
+            const acct = mconn.session.account() orelse continue;
+            self.webpushNotifyKind(acct, "call", from, "Voice/video call started", channel);
+        }
     }
 
     /// Ask every secured mesh peer to run its own account-local Web Push worker
@@ -41809,6 +41877,8 @@ pub const LinuxServer = struct {
             };
             if (self.media_physical_attachments.items.len == 1 or physical.first_kind) conn.clearMediaE2eeAttachment();
             if (physical.first_kind) try self.broadcastMediaEvent(channel, "JOIN", nick, kname);
+            // Era 3 C3: closed-tab call invite for co-channel members not yet in media.
+            if (physical.first_kind) self.webpushNotifyCallInvite(channel, nick);
             // WS media plane: bind this connection to the call and hand it the
             // per-stream MAC key so its browser can authenticate each datagram.
             if (self.config.ws_media_relay and conn.ws != null) {
@@ -46302,6 +46372,10 @@ pub const LinuxServer = struct {
                 eff_msg,
                 delivery_mode,
             );
+            // Era 3 C3: closed-tab Web Push for nick mentions (best-effort).
+            if (!is_notice and min_rank == 0) {
+                self.webpushNotifyChannelMentions(chan, conn.session.displayName(), eff_text);
+            }
             // Cross-node relay: forward this channel message to mesh peers so
             // remote members of `chan` receive it. Loop-guarded; the far side
             // delivers only to its own local members. Best-effort.
