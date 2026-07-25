@@ -7,6 +7,7 @@ effort: high
 permissionMode: acceptEdits
 maxTurns: 80
 skills:
+  - onyx-server-agent-core
   - onyx-server-integration
   - onyx-server-session-mesh
   - onyx-server-message-spine

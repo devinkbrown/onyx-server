@@ -29,26 +29,43 @@ pub const Stats = struct {
 
     // --- gauges (up/down) ---
     connections_active: AtomicI64 = .init(0),
+    /// Mooring-/S2S-**established** peer links (AKE complete). Not TCP accepts.
     s2s_links_active: AtomicI64 = .init(0),
+    /// TCP-level S2S peer slots currently open (inbound accept or outbound dial).
+    /// Useful for "dial stuck before AKE" diagnosis; not the mesh-health signal.
+    s2s_tcp_active: AtomicI64 = .init(0),
 
     pub fn onAccept(self: *Stats) void {
         _ = self.connections_total.fetchAdd(1, .monotonic);
         _ = self.connections_active.fetchAdd(1, .monotonic);
     }
 
+    /// TCP S2S peer accepted or outbound dial slot opened. Does **not** mean
+    /// Mooring is up — use `onS2sEstablished` for that.
     pub fn onS2sAccept(self: *Stats) void {
         _ = self.s2s_accepts_total.fetchAdd(1, .monotonic);
+        _ = self.s2s_tcp_active.fetchAdd(1, .monotonic);
+    }
+
+    /// Secured (or plaintext CRDT) link finished handshake — mesh-routable peer.
+    pub fn onS2sEstablished(self: *Stats) void {
         _ = self.s2s_links_active.fetchAdd(1, .monotonic);
     }
 
-    /// A connection closed. `was_s2s` decrements the S2S gauge instead of the
-    /// client gauge so the two never cross-count.
-    pub fn onClose(self: *Stats, was_s2s: bool) void {
+    /// A connection closed. `was_s2s` selects S2S gauges; `s2s_was_established`
+    /// drops the Mooring-established gauge only when AKE had completed.
+    pub fn onClose(self: *Stats, was_s2s: bool, s2s_was_established: bool) void {
         if (was_s2s) {
-            decrementPositive(&self.s2s_links_active);
+            decrementPositive(&self.s2s_tcp_active);
+            if (s2s_was_established) decrementPositive(&self.s2s_links_active);
         } else {
             decrementPositive(&self.connections_active);
         }
+    }
+
+    /// Backward-compatible close for client-only paths.
+    pub fn onCloseClient(self: *Stats) void {
+        self.onClose(false, false);
     }
 
     pub fn onBytesIn(self: *Stats, n: usize) void {
@@ -82,12 +99,13 @@ pub const Stats = struct {
         value: i128,
     };
 
-    fn rows(self: *const Stats) [9]Row {
+    fn rows(self: *const Stats) [10]Row {
         return .{
             .{ .prom = "onyx_connections_total", .irc = "conns", .help = "Total client connections accepted", .kind = .counter, .value = self.connections_total.load(.acquire) },
             .{ .prom = "onyx_connections_active", .irc = "conns_active", .help = "Currently open client connections", .kind = .gauge, .value = self.connections_active.load(.acquire) },
-            .{ .prom = "onyx_s2s_accepts_total", .irc = "s2s", .help = "Total server-to-server peers accepted", .kind = .counter, .value = self.s2s_accepts_total.load(.acquire) },
-            .{ .prom = "onyx_s2s_links_active", .irc = "s2s_active", .help = "Currently established S2S links", .kind = .gauge, .value = self.s2s_links_active.load(.acquire) },
+            .{ .prom = "onyx_s2s_accepts_total", .irc = "s2s", .help = "Total server-to-server TCP peer slots opened", .kind = .counter, .value = self.s2s_accepts_total.load(.acquire) },
+            .{ .prom = "onyx_s2s_tcp_active", .irc = "s2s_tcp", .help = "Currently open S2S TCP peer slots (pre- or post-AKE)", .kind = .gauge, .value = self.s2s_tcp_active.load(.acquire) },
+            .{ .prom = "onyx_s2s_links_active", .irc = "s2s_active", .help = "Currently Mooring/CRDT-established S2S links", .kind = .gauge, .value = self.s2s_links_active.load(.acquire) },
             .{ .prom = "onyx_messages_in_total", .irc = "msgs_in", .help = "Total complete protocol lines received", .kind = .counter, .value = self.messages_in_total.load(.acquire) },
             .{ .prom = "onyx_bytes_in_total", .irc = "bytes_in", .help = "Total bytes received from clients", .kind = .counter, .value = self.bytes_in_total.load(.acquire) },
             .{ .prom = "onyx_bytes_out_total", .irc = "bytes_out", .help = "Total bytes queued to clients", .kind = .counter, .value = self.bytes_out_total.load(.acquire) },
@@ -143,7 +161,7 @@ test "counters and gauges move as expected" {
     s.onAccept();
     s.onBytesIn(100);
     s.onLine();
-    s.onClose(false);
+    s.onClose(false, false);
     try testing.expectEqual(@as(u64, 2), s.connections_total.load(.acquire));
     try testing.expectEqual(@as(i64, 1), s.connections_active.load(.acquire));
     try testing.expectEqual(@as(u64, 100), s.bytes_in_total.load(.acquire));
@@ -152,19 +170,25 @@ test "counters and gauges move as expected" {
 
 test "gauges never go negative on extra closes" {
     var s = Stats{};
-    s.onClose(false);
-    s.onClose(true);
+    s.onClose(false, false);
+    s.onClose(true, false);
+    s.onClose(true, true);
     try testing.expectEqual(@as(i64, 0), s.connections_active.load(.acquire));
     try testing.expectEqual(@as(i64, 0), s.s2s_links_active.load(.acquire));
+    try testing.expectEqual(@as(i64, 0), s.s2s_tcp_active.load(.acquire));
 }
 
-test "s2s accept/close uses the s2s gauge only" {
+test "s2s TCP accept is distinct from Mooring established" {
     var s = Stats{};
     s.onS2sAccept();
-    try testing.expectEqual(@as(i64, 1), s.s2s_links_active.load(.acquire));
-    try testing.expectEqual(@as(i64, 0), s.connections_active.load(.acquire));
-    s.onClose(true);
+    try testing.expectEqual(@as(i64, 1), s.s2s_tcp_active.load(.acquire));
     try testing.expectEqual(@as(i64, 0), s.s2s_links_active.load(.acquire));
+    try testing.expectEqual(@as(i64, 0), s.connections_active.load(.acquire));
+    s.onS2sEstablished();
+    try testing.expectEqual(@as(i64, 1), s.s2s_links_active.load(.acquire));
+    s.onClose(true, true);
+    try testing.expectEqual(@as(i64, 0), s.s2s_links_active.load(.acquire));
+    try testing.expectEqual(@as(i64, 0), s.s2s_tcp_active.load(.acquire));
 }
 
 test "prometheus export carries HELP, TYPE, and samples" {
@@ -193,6 +217,6 @@ test "forEachLine emits one token line per metric" {
     };
     var c = Collector{};
     try s.forEachLine(&c, Collector.emit);
-    try testing.expectEqual(@as(usize, 9), c.count);
+    try testing.expectEqual(@as(usize, 10), c.count);
     try testing.expect(c.saw_conns);
 }

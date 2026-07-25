@@ -282,6 +282,7 @@ const oper_event = @import("../../proto/oper_event.zig");
 const observe_event = @import("../../proto/observe_event.zig");
 const kill_relay = @import("../../proto/kill_relay.zig");
 const memo_push_relay = @import("../../proto/memo_push_relay.zig");
+const media_ws_relay = @import("../../proto/media_ws_relay.zig");
 const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.zig");
 const channel_list_event = @import("../../proto/channel_list_event.zig");
 const channel_mode_state_event = @import("../../proto/channel_mode_state_event.zig");
@@ -303,6 +304,9 @@ pub const ByteSink = struct {
 };
 
 pub const Config = struct {
+    /// Per-peer complete-frame ceiling (header + payload). Defaults to the
+    /// shared S2S 1 MiB bound; secured media-cascade links raise this to
+    /// `media_ws_relay.required_max_frame_size` so a Cadence keyframe fits.
     max_frame_size: usize = s2s_frame.default_max_frame_size,
     /// Maximum decoded SESSION_REPLICA transport objects staged for the daemon.
     /// The queue fails closed at the bound; it never evicts an earlier fact.
@@ -316,6 +320,10 @@ pub const Config = struct {
     /// Maximum verified OPER_EVENT_V2 wires staged for daemon-global replay
     /// admission. This per-link queue never evicts an earlier accepted event.
     max_oper_event_v2_frames: usize = 256,
+    /// Maximum verified MEDIA_WS_DATAGRAM payloads staged for local WS fanout.
+    /// Bounded tightly: each entry can be up to ~4 MiB (Cadence keyframe).
+    /// Fail-closed on overflow (drop newest) rather than growing unboundedly.
+    max_media_ws_datagrams: usize = 8,
     /// Per-link exact-event reflection cache for Event Spine v2. The daemon's
     /// durable global guard remains the only replay/delivery authority.
     oper_event_v2_seen_capacity: usize = 4096,
@@ -683,6 +691,10 @@ pub const S2sPeer = struct {
     /// to decode and run local Web Push delivery. These are signing-required:
     /// legacy/plaintext peers are ignored so DM previews do not ride unsigned S2S.
     memo_pushes: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Verified MEDIA_WS_DATAGRAM payloads received from this peer, awaiting the
+    /// daemon to fan out to local WS call participants. Signing-required;
+    /// receivers never re-mesh (origin-only emit is the loop guard).
+    media_ws_datagrams: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
     /// Per-link reflection cache only; not authoritative replay protection.
     seen_v2: message_relay_v2.SeenSet,
@@ -951,6 +963,8 @@ pub const S2sPeer = struct {
         self.wards.deinit(self.allocator);
         for (self.memo_pushes.items) |m| self.allocator.free(m);
         self.memo_pushes.deinit(self.allocator);
+        for (self.media_ws_datagrams.items) |m| self.allocator.free(m);
+        self.media_ws_datagrams.deinit(self.allocator);
         self.seen.deinit();
         self.seen_v2.deinit();
         self.seen_oper_event_v2.deinit();
@@ -1222,6 +1236,7 @@ pub const S2sPeer = struct {
             .REPAIR_REQUEST => try self.recvRepairRequest(frame.payload, sink),
             .REPAIR_RESPONSE => try self.recvRepairResponse(frame.payload),
             .MEMO_PUSH => try self.recvMemoPush(frame.payload),
+            .MEDIA_WS_DATAGRAM => try self.recvMediaWsDatagram(frame.payload),
         }
     }
 
@@ -1802,6 +1817,44 @@ pub const S2sPeer = struct {
         var buf: [memo_push_relay.max_encoded_len]u8 = undefined;
         const wire = try memo_push_relay.encode(.{ .account = account, .from = from, .text = text }, &buf);
         try self.emitSignable(sink, .MEMO_PUSH, wire);
+    }
+
+    /// Queue a verified inbound MEDIA_WS_DATAGRAM for daemon-side local WS
+    /// fanout. Signing-required (same fail-closed posture as MEMO_PUSH). Decode
+    /// validates channel/datagram bounds before the copy is retained; queue
+    /// overflow drops the newest frame rather than growing unboundedly.
+    fn recvMediaWsDatagram(self: *S2sPeer, frame_payload: []const u8) !void {
+        if (!self.peer_supports_signing) return;
+        const payload = self.verifiedPayload(.MEDIA_WS_DATAGRAM, frame_payload) orelse return;
+        _ = media_ws_relay.decode(payload) catch return;
+        if (self.media_ws_datagrams.items.len >= self.config.max_media_ws_datagrams) return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.media_ws_datagrams.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    /// Drain queued MEDIA_WS_DATAGRAM payloads (caller owns + frees each slice
+    /// and the outer slice). Each decodes with `media_ws_relay.decode`.
+    pub fn takeMediaWsDatagrams(self: *S2sPeer) ![][]u8 {
+        return self.media_ws_datagrams.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a signed MEDIA_WS_DATAGRAM to this peer. Origin-only cascade of an
+    /// already-validated browser Cadence datagram; no-op unless the peer
+    /// negotiated frame signing and this node has a signing key. Oversize
+    /// (relative to the peer's max_frame_size) fails closed as PayloadTooLarge.
+    pub fn sendMediaWsDatagram(self: *S2sPeer, sink: ByteSink, channel: []const u8, datagram: []const u8) !void {
+        if (!self.peer_supports_signing or self.signing_key == null) return;
+        if (datagram.len == 0 or datagram.len > media_ws_relay.max_datagram_len) return error.PayloadTooLarge;
+        if (channel.len == 0 or channel.len > media_ws_relay.max_channel_len) return error.InvalidField;
+
+        const encoded_len = media_ws_relay.header_len + channel.len + datagram.len;
+        const framed_len = s2s_frame.header_len + signed_frame.header_len + encoded_len;
+        if (framed_len > self.config.max_frame_size) return error.PayloadTooLarge;
+
+        const buf = try self.allocator.alloc(u8, encoded_len);
+        defer self.allocator.free(buf);
+        const wire = try media_ws_relay.encode(.{ .channel = channel, .datagram = datagram }, buf);
+        try self.emitSignable(sink, .MEDIA_WS_DATAGRAM, wire);
     }
 
     /// Emit a signed OBSERVE_EVENT to this peer (network-wide OBSERVE fan-out).
@@ -2416,6 +2469,7 @@ pub const S2sPeer = struct {
             .handshake, .control => .control,
             .crdt, .membership, .repair => .sync,
             .relay, .oper, .notification, .session => .irc_app,
+            .media => .media,
         };
     }
 
@@ -7578,6 +7632,89 @@ test "signing peers round-trip a signed MEMO_PUSH frame" {
     try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
 }
 
+test "signing peers round-trip a signed MEDIA_WS_DATAGRAM frame" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x71);
+    const kp_b = try signingKeyFor(0x72);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7EE);
+
+    const opaque_dg = "e2ee-cadence-ws-datagram-bytes";
+    try a.sendMediaWsDatagram(a_to_b.sink(), "#voice", opaque_dg);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7EF);
+
+    const frames = try b.takeMediaWsDatagrams();
+    defer {
+        for (frames) |p| allocator.free(p);
+        allocator.free(frames);
+    }
+    try std.testing.expectEqual(@as(usize, 1), frames.len);
+    const ev = try media_ws_relay.decode(frames[0]);
+    try std.testing.expectEqualStrings("#voice", ev.channel);
+    try std.testing.expectEqualStrings(opaque_dg, ev.datagram);
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "MEDIA_WS_DATAGRAM queue is fail-closed at max_media_ws_datagrams" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x73);
+    const kp_b = try signingKeyFor(0x74);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    b.config.max_media_ws_datagrams = 1;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7F0);
+
+    try a.sendMediaWsDatagram(a_to_b.sink(), "#c", "first");
+    try a.sendMediaWsDatagram(a_to_b.sink(), "#c", "second");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7F1);
+
+    const frames = try b.takeMediaWsDatagrams();
+    defer {
+        for (frames) |p| allocator.free(p);
+        allocator.free(frames);
+    }
+    try std.testing.expectEqual(@as(usize, 1), frames.len);
+    const ev = try media_ws_relay.decode(frames[0]);
+    try std.testing.expectEqualStrings("first", ev.datagram);
+}
+
 test "a forged frame (wrong signature) is rejected and counted" {
     const allocator = std.testing.allocator;
     var tc = TestClock{ .now_ms = 10 };
@@ -8089,9 +8226,9 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .CHANNEL_MODE_FLAGS,  .CHANNEL_LIST,           .CHANNEL_PROP,             .TOPIC,                            .NICKCHANGE,
         .CHANNEL_MODE_STATE,  .SESSION_MIGRATE,        .SESSION_MIGRATE_CONSUMED, .ENTITY_PROP,                      .CLONE_COUNT,
         .OPER_EVENT,          .OBSERVE_EVENT,          .KILL,                     .WARD,                             .RESYNC,
-        .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .MEMO_PUSH,                      .SESSION_REPLICA_OFFER,
+        .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .MEMO_PUSH,                        .SESSION_REPLICA_OFFER,
         .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE, .OPER_EVENT_V2,
-        .MESSAGE_V2_ACK,
+        .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug

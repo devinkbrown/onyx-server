@@ -832,6 +832,19 @@ pub const S2sLink = struct {
         return self.peer.takeMemoPushes();
     }
 
+    /// Emit a signed origin-only MEDIA_WS_DATAGRAM cascade for an already-
+    /// validated browser Cadence WS media datagram. Peer driver no-ops for
+    /// non-signing peers.
+    pub fn sendMediaWsDatagram(self: *S2sLink, channel: []const u8, datagram: []const u8) !void {
+        try self.peer.sendMediaWsDatagram(self.sink(), channel, datagram);
+    }
+
+    /// Drain queued MEDIA_WS_DATAGRAM payloads from this peer (caller owns +
+    /// frees each slice and the outer slice; decode with `media_ws_relay.decode`).
+    pub fn takeMediaWsDatagrams(self: *S2sLink) ![][]u8 {
+        return self.peer.takeMediaWsDatagrams();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis.
     pub fn collectTopology(self: *const S2sLink, out: []partition_detector.TopoNode) usize {
         return self.peer.collectTopology(out);

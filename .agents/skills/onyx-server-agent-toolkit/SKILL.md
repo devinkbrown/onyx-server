@@ -16,5 +16,16 @@ Design rules:
 - Use worktrees only from a coherent commit when a worker does not need the current dirty tree. Do not use experimental agent teams for overlapping writes or sequential integration.
 - Separate implementer, fresh reviewer, gate runner, deployer, and docs authority. Deployment never implies source-edit authority.
 - Prefer a small reusable roster plus task skills over a permanent agent for every directory.
+- **Token-lean agents (standing):** agent bodies stay dense (≤~3 KiB typical; zig-coder ≤~5 KiB). Put deep maps/invariants in skills (`onyx-server-agent-core` + domain skills including `onyx-server-mesh-ops`). Keep routing power in a short MUST-BE-USED description + 1–2 tiny examples + negative boundary — descriptions load on every parent turn. Archives of pre-compact agents live under `~/.claude/agents/_archive/`.
+- Keep `.agents/ROSTER.md` and `AGENTS.md` in sync with live dual-node paths (`orochi.service`, `/home/kain/orochi-run`, metrics `:9130`).
 
-Use `.agents/skills` as the canonical project skill tree and expose it to Claude through `.claude/skills`. Run `scripts/validate_toolkit.py`, `scripts/test_validate_toolkit.py`, `scripts/test_claude_review_stub.py`, and `scripts/test_claude_review.sh` after every authority or launcher change. Validate every skill with the skill-creator validator, then run a grounded integration review of `AGENTS.md` and the changed definitions. The structured Claude launcher must expose only exact-file `Read` plus schema-return permissions over a private immutable snapshot; live checkout hashes are a relevance check, not the reviewer's source view.
+Use `.agents/skills` as the canonical project skill tree and expose it to Claude through `.claude/skills`. After every authority or launcher change run:
+
+```sh
+python3 .agents/skills/onyx-server-agent-toolkit/scripts/validate_toolkit.py
+# optional if present:
+# python3 .agents/skills/onyx-server-agent-toolkit/scripts/test_validate_toolkit.py
+# tools/claude-review.sh  # snapshot-isolation regression
+```
+
+Validate every skill has frontmatter `name` + `description`. The structured Claude launcher must expose only exact-file `Read` plus schema-return permissions over a private immutable snapshot; live checkout hashes are a relevance check, not the reviewer's source view.

@@ -11,6 +11,11 @@ const std = @import("std");
 
 pub const header_len: usize = 5;
 pub const length_len: usize = 4;
+/// Default upper bound on one complete S2S frame (header + payload). Session
+/// migration / portable-snapshot ceilings are derived from this value, so it
+/// stays 1 MiB. Secured media cascade raises the *per-peer* `max_frame_size`
+/// (see `media_ws_relay.required_max_frame_size`) without widening the
+/// snapshot wire budget.
 pub const default_max_frame_size: usize = 1024 * 1024;
 
 const endian = .little;
@@ -130,6 +135,12 @@ pub const FrameType = enum(u8) {
     /// Hop receipt for a daemon-admitted immutable MESSAGE_V2 RelayId. A sender
     /// retains the exact wire until this secured, signed acknowledgment arrives.
     MESSAGE_V2_ACK = 0x24,
+    /// Origin-only cascade of an already-validated browser Cadence binary
+    /// WebSocket media datagram. Carries a bounded `media_ws_relay` record
+    /// {channel, opaque datagram}. Receivers fan out locally to WS call
+    /// participants and MUST NOT re-mesh (loop prevention is origin-only emit).
+    /// Secured-signed; never re-verifies the browser MAC (origin already did).
+    MEDIA_WS_DATAGRAM = 0x25,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -173,6 +184,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.SESSION_REPLICA_ATTACHMENT_LEASE) => .SESSION_REPLICA_ATTACHMENT_LEASE,
             @intFromEnum(FrameType.OPER_EVENT_V2) => .OPER_EVENT_V2,
             @intFromEnum(FrameType.MESSAGE_V2_ACK) => .MESSAGE_V2_ACK,
+            @intFromEnum(FrameType.MEDIA_WS_DATAGRAM) => .MEDIA_WS_DATAGRAM,
             else => null,
         };
     }
@@ -289,6 +301,8 @@ pub const FrameFamily = enum {
     repair,
     notification,
     session,
+    /// Opaque browser Cadence binary media cascade (never re-encoded).
+    media,
 
     pub fn token(self: FrameFamily) []const u8 {
         return switch (self) {
@@ -301,6 +315,7 @@ pub const FrameFamily = enum {
             .repair => "repair",
             .notification => "notification",
             .session => "session",
+            .media => "media",
         };
     }
 };
@@ -367,6 +382,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .SESSION_REPLICA_ATTACHMENT_LEASE, .token = "SESSION_REPLICA_ATTACHMENT_LEASE", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2 | cap_session_attachment_lease_v2, .summary = "SESSION_REPLICA v2 signed positive attachment lease." },
     .{ .frame_type = .OPER_EVENT_V2, .token = "OPER_EVENT_V2", .family = .oper, .auth = .secured_signed, .capability_mask = cap_event_spine_v2, .summary = "Secured multi-hop Event Spine notification with immutable origin signature." },
     .{ .frame_type = .MESSAGE_V2_ACK, .token = "MESSAGE_V2_ACK", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured hop receipt for an admitted MESSAGE_V2 RelayId." },
+    .{ .frame_type = .MEDIA_WS_DATAGRAM, .token = "MEDIA_WS_DATAGRAM", .family = .media, .auth = .secured_signed, .summary = "Origin-only cascade of an already-validated browser Cadence WS media datagram." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {
@@ -767,4 +783,13 @@ test "event spine v2 frame is secured and capability gated" {
     try testing.expectEqual(cap_event_spine_v2, spec.capability_mask);
     try testing.expectEqual(FrameType.OPER_EVENT_V2, frameSpecByTag(0x23).?.frame_type);
     try testing.expectEqual(FrameType.OPER_EVENT_V2, frameSpecByToken("OPER_EVENT_V2").?.frame_type);
+}
+
+test "media ws datagram frame is secured media family" {
+    const spec = frameSpec(.MEDIA_WS_DATAGRAM);
+    try testing.expectEqual(FrameFamily.media, spec.family);
+    try testing.expectEqual(FrameAuth.secured_signed, spec.auth);
+    try testing.expectEqual(@as(u8, 0), spec.capability_mask);
+    try testing.expectEqual(FrameType.MEDIA_WS_DATAGRAM, frameSpecByTag(0x25).?.frame_type);
+    try testing.expectEqual(FrameType.MEDIA_WS_DATAGRAM, frameSpecByToken("MEDIA_WS_DATAGRAM").?.frame_type);
 }

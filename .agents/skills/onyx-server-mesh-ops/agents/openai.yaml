@@ -1,0 +1,4 @@
+interface:
+  display_name: "Onyx Server Mesh Ops"
+  short_description: "Dual-node mesh metrics, health smokes, and post-deploy acceptance"
+  default_prompt: "Use $onyx-server-mesh-ops when verifying mesh health, diagnosing links_active vs tcp_active, or accepting a dual-node deploy."

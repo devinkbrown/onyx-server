@@ -127,6 +127,44 @@ verify systemd, logs, `/INFO`, `/STATS l`, and that node's
 `[stats].channel_dir/status.json`, then repeat on the peer. Do not cold-restart
 both nodes together unless accepting session loss and a temporary mesh partition.
 
+### Mesh health smoke (dual-node)
+
+After any hard restart or binary replace on a meshed pair, confirm Mooring is
+**established** (not merely TCP-dialed):
+
+```sh
+# On each node (or from an ops host that can reach both /metrics ports):
+python3 tools/mesh_health_smoke.py \
+  http://127.0.0.1:9130/metrics \
+  http://peer.example:9130/metrics
+
+# When the peer metrics port is loopback-only (Undertow eshmaki/ircx):
+MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py \
+  http://127.0.0.1:9130/metrics
+```
+
+Expect `links_active >= 1` and `peers_up >= 1` with `partitioned = 0` on both.
+`onyx_s2s_tcp_active` may be higher than `links_active` during AKE; a stuck
+`tcp_active > 0` with `links_active = 0` means handshake failure (check journal
+for `HandshakeTooLarge` / `PrekeyRejected` / `BadSignature` — usually wire
+domain or trust-root skew).
+
+One-line deploy sequence: [`docs/ops/mesh-metrics-deploy-checklist.md`](ops/mesh-metrics-deploy-checklist.md).
+Cross-node PRIVMSG (guest auto when SASL unset if the network allows unregistered
+nicks; SASL when creds present — fail-closed on SASL fail):
+
+```sh
+# Guest path (no credentials; works when nodes accept NICK+USER → 001)
+MESH_SMOKE_B=peer.example:6697 MESH_SMOKE_INSECURE_TLS=1 \
+  python3 tools/mesh_chat_smoke.py
+
+# SASL path (preferred for account-bound checks)
+export MESH_SMOKE_SASL_USER=… MESH_SMOKE_SASL_PASS=…   # or ANNOUNCE_SASL_*
+python3 tools/mesh_chat_smoke.py 127.0.0.1:6667 peer.example:6697
+# B is TLS by default; channel #root; unique PRIVMSG both directions.
+# MESH_SMOKE_REQUIRE_SASL=1 → exit 2 if credentials missing (no guest fallback).
+```
+
 ### MESSAGE_V2 activation runbook
 
 MESSAGE_V2 authoring has two configuration reloads after the bridge binary is
@@ -302,10 +340,10 @@ two-client certificate routing acceptance above, and confirm that E2EE control
 events traverse the mesh exactly once. Smoke the deployed browser application,
 service worker, status, roadmap, and stats data—not only its build output.
 
-The v2 gate does not prove cross-node binary WebSocket media delivery. Control
-events are mesh-wide, but encrypted binary media forwarding is node-local until
-an explicit mesh cascade is implemented and accepted with real media frames.
-Do not describe a two-node control-plane test as cross-node media delivery.
+Cross-node binary WebSocket media rides secured `MEDIA_WS_DATAGRAM` (origin-only
+cascade of opaque Cadence frames). Control-plane presence alone is not proof of
+media path health — accept with real media frames on both nodes. Do not describe
+a two-node control-plane-only test as cross-node media delivery.
 
 `status.json` and channel stats are file outputs, not daemon-owned HTTP routes. Serve
 the configured stats directory with nginx or another static file server if needed.

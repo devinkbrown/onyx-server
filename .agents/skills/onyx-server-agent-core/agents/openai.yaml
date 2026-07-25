@@ -1,0 +1,4 @@
+interface:
+  display_name: "Onyx Server Agent Core"
+  short_description: "Dense shared contract for Onyx Server Zig agents"
+  default_prompt: "Load $onyx-server-agent-core before any Onyx Server Zig implement/review work."

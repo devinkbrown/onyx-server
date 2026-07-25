@@ -1099,6 +1099,20 @@ pub const SecuredLink = struct {
         return link.takeMemoPushes();
     }
 
+    /// Emit a signed origin-only MEDIA_WS_DATAGRAM cascade over the encrypted
+    /// S2S leg. The inner peer requires frame signing.
+    pub fn sendMediaWsDatagram(self: *SecuredLink, channel: []const u8, datagram: []const u8) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendMediaWsDatagram(channel, datagram);
+        try self.drainInner();
+    }
+
+    /// Drain queued MEDIA_WS_DATAGRAM payloads decoded by the inner link.
+    pub fn takeMediaWsDatagrams(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeMediaWsDatagrams();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis
     /// (empty until the inner CRDT link is established).
     pub fn collectTopology(self: *const SecuredLink, out: []partition_detector.TopoNode) usize {
