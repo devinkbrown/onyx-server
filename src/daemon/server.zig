@@ -58901,26 +58901,25 @@ test "session replica nick index is case-folded bounded and ambiguity-safe" {
     const t1: session_migrate.Token = @splat(1);
     const t2: session_migrate.Token = @splat(2);
     const t3: session_migrate.Token = @splat(3);
-    // All three installs MUST share one case-folded primary key ("ruri"). A brand
-    // purge once rewrote the first/third nicks to "Nova"/"nova", which broke the
-    // fold lookup against mixed "rUrI" and made get() return null.
-    try Fixture.install(server, 1, t1, "acct-a", "Ruri");
-    const mixed = SessionReplicaNickKey.init("rUrI").?;
+    // All three installs MUST share one English case-folded primary key ("nova").
+    // Lookup uses mixed case "nOvA" — never the retired Japanese product nick.
+    try Fixture.install(server, 1, t1, "acct-a", "Nova");
+    const mixed = SessionReplicaNickKey.init("nOvA").?;
     var candidates = server.session_replica_nicks.get(mixed) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u8, 1), candidates.count);
     try std.testing.expect(!candidates.ambiguous);
     try std.testing.expect(std.crypto.timing_safe.eql(session_migrate.Token, t1, candidates.tokens[0]));
 
-    try Fixture.install(server, 2, t2, "acct-b", "RURI");
+    try Fixture.install(server, 2, t2, "acct-b", "NOVA");
     candidates = server.session_replica_nicks.get(mixed) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u8, 2), candidates.count);
     try std.testing.expect(!candidates.ambiguous);
 
-    try Fixture.install(server, 3, t3, "acct-c", "ruri");
+    try Fixture.install(server, 3, t3, "acct-c", "nova");
     candidates = server.session_replica_nicks.get(mixed) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u8, 2), candidates.count);
     try std.testing.expect(candidates.ambiguous);
-    try std.testing.expect(server.detachedReplicaTokenForNick("RURI") == null);
+    try std.testing.expect(server.detachedReplicaTokenForNick("NOVA") == null);
     try std.testing.expect(server.detachedReplicaTokenForNick("definitely-unknown") == null);
 
     // Historical same-nick identities do not poison a newly current detached
@@ -58929,11 +58928,11 @@ test "session replica nick index is case-folded bounded and ambiguity-safe" {
     try std.testing.expect(server.sessions.remove("acct-b", 2));
     try std.testing.expect(server.sessions.remove("acct-c", 3));
     const t4: session_migrate.Token = @splat(4);
-    try Fixture.install(server, 4, t4, "acct-d", "Ruri");
+    try Fixture.install(server, 4, t4, "acct-d", "Nova");
     candidates = server.session_replica_nicks.get(mixed) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u8, 1), candidates.count);
     try std.testing.expect(!candidates.ambiguous);
-    try std.testing.expect(std.crypto.timing_safe.eql(session_migrate.Token, t4, server.detachedReplicaTokenForNick("RURI").?));
+    try std.testing.expect(std.crypto.timing_safe.eql(session_migrate.Token, t4, server.detachedReplicaTokenForNick("NOVA").?));
 
     // Updating a current token's nick rebuilds both primary keys outside the hot path.
     try Fixture.updateNick(server, 4, t4, "acct-d", "OldNick");
