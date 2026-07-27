@@ -18,6 +18,7 @@ pub const convergence = @import("convergence.zig");
 pub const delta_codec = @import("delta_codec.zig");
 pub const delta_journal = @import("delta_journal.zig");
 pub const eg_walker = @import("eg_walker.zig");
+pub const e2ee_group_relay = @import("e2ee_group_relay.zig");
 pub const gossip_round = @import("gossip_round.zig");
 pub const gossip_views = @import("gossip_views.zig");
 pub const link_session = @import("link_session.zig");
@@ -66,6 +67,7 @@ test {
     _ = delta_codec;
     _ = delta_journal;
     _ = eg_walker;
+    _ = e2ee_group_relay;
     _ = gossip_round;
     _ = gossip_views;
     _ = link_session;

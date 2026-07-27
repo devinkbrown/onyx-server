@@ -16,7 +16,11 @@ gen() {
   done
   for sub in "$dir"/*/; do
     [ -f "${sub}root.zig" ] || continue
-    s=$(basename "$sub"); entries+=("$s|$s/root.zig")
+    s=$(basename "$sub")
+    # src/cli is an executable-root module with its own `onyx_server` import.
+    # Re-exporting it from src/root.zig assigns the same files to both modules.
+    [ "$dir" = "$SRC" ] && [ "$s" = cli ] && continue
+    entries+=("$s|$s/root.zig")
   done
   IFS=$'\n' read -r -d '' -a entries < <(printf '%s\n' "${entries[@]}" | sort && printf '\0') || true
   local imp="" tst=""

@@ -1,0 +1,57 @@
+{
+  "schema": "onyx-client-server-contract/v1",
+  "revision": 1,
+  "transport": {
+    "websocket": "one IRC message per frame; no trailing frame bytes"
+  },
+  "capabilities": {
+    "required_for_first_party_client": [
+      "message-tags",
+      "server-time",
+      "batch",
+      "labeled-response",
+      "echo-message",
+      "draft/chathistory"
+    ],
+    "vendor": {
+      "onyx/session-sync": "same-account attachment synchronization",
+      "onyx/bouncer": "automatic history rewind",
+      "onyx/topics": "named conversation tags and history",
+      "onyx/e2ee": "permits the +onyx/e2ee message tag"
+    }
+  },
+  "session": {
+    "commands": ["SESSION TOKEN", "SESSION MTOKEN", "SESSION RESUME <token>"],
+    "invariant": "A successful same-account resume preserves the logical attachment without duplicate JOIN or MODE events."
+  },
+  "group_e2ee": {
+    "status": "staged",
+    "content_envelope": "ONYXROOM1",
+    "message_tag": "+onyx/e2ee=mls",
+    "message_tag_semantics": "internal MLS-family marker only; does not claim RFC 9420 wire interoperability",
+    "server_role": "authenticated membership policy and opaque control-record delivery only",
+    "required_policy": "encryption-policy=required rejects untagged plaintext",
+    "v1_control_records": ["key-package", "welcome", "commit"],
+    "control_command": {
+      "name": "E2EEGROUP",
+      "ircx_required": true,
+      "forms": [
+        "<channel> <key-package|commit> <from-device> :<opaque-base64url>",
+        "<channel> welcome <from-device> <to-account> <to-device> :<opaque-base64url>"
+      ],
+      "limits": {
+        "channel_bytes": 128,
+        "device_id_bytes": 32,
+        "account_bytes": 64,
+        "payload_bytes": 4096
+      },
+      "payload_encoding": "canonical base64url without padding",
+      "persistence": "none"
+    },
+    "invariants": [
+      "The server never decrypts or stores a group secret.",
+      "A client without the current room epoch key renders a locked placeholder.",
+      "A membership change advances the epoch before subsequent content is accepted."
+    ]
+  }
+}

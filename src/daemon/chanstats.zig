@@ -1446,7 +1446,7 @@ test "snapshot serialize/deserialize round-trips the full aggregate" {
     try std.testing.expect(!deserialize(&empty, "XXXXXXXX")); // wrong magic
     try std.testing.expect(!deserialize(&empty, "OCS1\x01\x00\x00\x00\x00")); // superseded magic
     // Good magic but an unknown version byte → cleanly rejected (start empty).
-    try std.testing.expect(!deserialize(&empty, "OCS2\x02\x00\x00\x00\x00"));
+    try std.testing.expect(!deserialize(&empty, "OCS2\x03\x00\x00\x00\x00"));
     // Good magic + correct version + zero channels → valid empty snapshot.
     try std.testing.expect(deserialize(&empty, "OCS2\x01\x00\x00\x00\x00"));
     try std.testing.expectEqual(@as(usize, 0), empty.channels.count());
