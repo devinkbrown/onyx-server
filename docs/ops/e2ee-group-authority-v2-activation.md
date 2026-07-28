@@ -1,8 +1,35 @@
 # E2EE group authority v2 activation (EGRG)
 
-**Status:** first production activation is a **planned cold restart of both dual-node
-units behind a mesh-wide E2EEGROUP authoring quiesce/activation barrier**. Live Helix
-USR2 adoption of EGRG is **not** the first-rollout path.
+**Status:** first production dual-node activation **completed** (2026-07-28) via cold
+restart of both units under a coordinated full outage (both `0.5.6` predecessors
+stopped before any `0.5.7` successor started). Deployed predecessors did **not**
+expose the v2 operator control/metrics; `group_authoring_enabled=false` was
+prepared and validated as the **v2 successor startup barrier**, not as an active
+quiesce of the still-running old processes. Live Helix USR2 adoption of EGRG
+remains **not** the first-rollout path and is still out of scope for that
+completed cold wave. Detailed inventory and post-activation metrics:
+`docs/ops/release-v0.5.7-e2ee-group-control.md`.
+
+## First production activation record (2026-07-28)
+
+| Item | Fact |
+|------|------|
+| Path | Coordinated full outage first (both `0.5.6` predecessors stopped together before any successor start); `group_authoring_enabled=false` prepared/validated as **v2 successor startup barrier** only; install only after both down; both v2 units started under that barrier; authoring later via current-version rolling restart |
+| Units | `onyx-server.service` on `eshmaki.me` and `ircx.us` |
+| Banner (both) | `Onyx Server 0.5.7+b457c33` |
+| Artifact SHA-256 (identical both) | `a867fa71afaaeeda6c6f25b024a995ab8b1436e6b7f9d8b2541f6a1d32d28ed4` |
+| Config | `group_authoring_enabled=false` prepared for successors; validated on both nodes after install (both predecessors already down) before authoring release |
+| Authoring release | After both v2 units were up and secured mesh xcap readiness for current E2EEGROUP; enabled later with a current-version rolling restart |
+| Per-node post metrics | `local_authoring_enabled=1`, `current_capable_peers=1`, `required_peers=1`, `activation_ready=1`, hop_custody=`0`, ingress_receipts=`0`, pending=`0` |
+| Mesh health (both directions) | `links_active=1`, `peers_up=1`, `partitioned=0`, `tcp_active=1` |
+
+Not claimed here: client live OGC1 send/receive, browser encryption, or a GitHub
+Release asset.
+
+The sections below preserve the authority model, mixed-fleet hazard, and the
+cold-restart procedure as executed for this first rollout (both predecessors
+down before install) and as operator guidance for any later cold re-activation
+under mixed-version risk.
 
 ## Current truth (authority model)
 
@@ -32,52 +59,83 @@ During that mixed interval:
   under the current extension.
 
 That is a **deployment blocker**: first activation must not allow any E2EEGROUP authoring
-or mesh hop while the dual-node pair is version-split. One-node-at-a-time **process**
-restart remains the only allowed restart order (Helix USR2 is not the first path), but
-only **after** mesh-wide authoring is already fail-closed and only until **both** nodes
-are upgraded **and** current E2EEGROUP is negotiated on the secured link.
+or mesh hop while the dual-node pair is version-split. The **executed first cutover**
+avoided a live mixed pair by a **coordinated full outage**: stopping **both**
+`0.5.6` predecessor processes **before any** `0.5.7` successor started, installing
+the v2 image only after both were down, then starting both v2 units under a prepared
+`group_authoring_enabled=false` **successor startup barrier** (Helix USR2 is not the
+first path). Deployed `0.5.6` did **not** expose that control; it did not quiesce the
+still-running predecessors. Authoring was released only after both nodes ran v2
+**and** current E2EEGROUP was negotiated on the secured link (later enabled with a
+current-version rolling restart).
 
-## Fail-closed mesh-wide E2EEGROUP authoring quiesce / activation barrier
+## Fail-closed version-transition outage + v2 successor authoring barrier
 
-**Before the first node restarts**, establish a mesh-wide barrier that:
+For the **executed first cutover** (`0.5.6` → `0.5.7`), two distinct facts must not be
+collapsed:
 
-1. **Quiesces E2EEGROUP authoring** on **every** dual-node unit (no new origin-signed
-   E2EEGROUP controls admitted for mesh hop while the barrier holds).
+1. **Transition protection (actual fail-closed):** a coordinated **full outage** —
+   both predecessor processes stopped **together** before any successor start. That
+   is what prevented a live mixed-version authoring window. Deployed predecessors
+   lacked the v2 operator control/metrics, so no config key could actively quiesce
+   them.
+2. **Successor startup barrier (prepared/validated):** production config carried
+   `group_authoring_enabled=false` so **v2** units start authoring-disabled until
+   mesh/xcap readiness and a later current-version rolling enable.
+
+For **future** cold re-activations where **both** dual-node units already run an
+image that **does** expose the operator control, establish a mesh-wide authoring
+barrier that:
+
+1. **Quiesces E2EEGROUP authoring** on **every** dual-node unit via the enforceable
+   control (no new origin-signed E2EEGROUP controls admitted for mesh hop while the
+   barrier holds).
 2. Remains **fail-closed**: if the enforceable control is missing, misconfigured, or
    only partial (one node quiet, the other still authoring), **do not start** activation.
-3. Stays held through:
-   - drain of hop custody / acceptance of cold-drop for receipts on the node about to die,
-   - cold stop/install/start of node A,
-   - mesh health restore (`links_active`, secured S2S),
-   - cold stop/install/start of node B,
+3. Stays held through (first production cutover order, adapted when the control is
+   live on both sides):
+   - drain of hop custody / acceptance of cold-drop for receipts on **both** nodes,
+   - cold **stop of both** predecessor `onyx-server.service` processes **together**,
+   - install of the validated v2 binary **only after both** predecessors are down,
+   - cold **start of both** v2 units (still under the authoring barrier),
    - re-establishment of secured S2S **and** successful current E2EEGROUP xcap negotiate
      (`peer_supports_e2ee_group_current` both directions on the dual-node link).
 4. Is **released only after** both units run the v2-capable image **and** the current
    E2EEGROUP extension is negotiated mesh-wide for the dual-node pair (no remaining
-   pre-v2 E2EEGROUP peer in that pair).
+   pre-v2 E2EEGROUP peer in that pair). First cutover released authoring later via a
+   current-version rolling restart.
 
 There is no supported “author on the old node while the new node catches up” path: v2
 does not bridge controls to v1 peers.
 
-## First rollout (cold restart, barrier first, then one node at a time)
+## First rollout (cold restart; both predecessors down before install)
 
 Live Helix USR2 from a pre-marker / pre-EGRG binary will refuse this image
-(expected). **First mesh activation is cold restart only**, under the barrier above:
+(expected). **First mesh activation is cold restart only**, under the coordinated
+full outage + successor barrier truths above. This procedure was executed for
+dual-node production on 2026-07-28 (`0.5.7+b457c33`; see activation record above).
+It was **not** a one-node-at-a-time first cutover.
 
-0. **Activate mesh-wide E2EEGROUP authoring quiesce** (fail-closed). Prove neither dual-node
-   unit will admit new E2EEGROUP origin controls for the duration of activation.
-1. **Drain** MESSAGE_V2 hop custody on the node about to restart (no outstanding
+0. **Prepare and validate** production config with `group_authoring_enabled=false`
+   as the **v2 successor startup barrier**. (On the executed first cutover, deployed
+   `0.5.6` did **not** expose this control or its metrics — do **not** treat the key
+   as having quiesced the still-running predecessors.)
+1. **Drain** MESSAGE_V2 hop custody on **both** nodes about to restart (no outstanding
    V2 retry obligations that must survive process death).
 2. **Drain** E2EEGROUP hop custody and prove unsettled ingress receipts are
-   acceptable to drop (cold boot does not restore them). There is **no**
-   durable adopt of EGRG on this path.
-3. **Stop** `onyx-server.service` on **one** node only.
-4. Install the new binary/config, then **start** the node.
-5. Confirm mesh health (`links_active`, secured S2S). **Do not** lift the authoring
-   barrier. The peer is still pre-v2 for E2EEGROUP current; mixed authoring remains forbidden.
-6. Repeat stop/install/start for the second dual-node unit after the first is healthy.
-7. Confirm secured S2S **and** current E2EEGROUP xcap negotiate on the dual-node link.
-8. **Release** the mesh-wide E2EEGROUP authoring quiesce only after step 7.
+   acceptable to drop on **both** nodes (cold boot does not restore them). There is
+   **no** durable adopt of EGRG on this path. (Pre-v2 images may lack the v2 gauges;
+   operators use the instrumentation available on the running image.)
+3. **Stop** both predecessor `0.5.6` `onyx-server.service` processes **together**
+   (coordinated full outage — fail-closed protection for the version transition).
+4. **Only after both** predecessors are down: install the validated `0.5.7+b457c33`
+   binary/config on both nodes (config includes the successor authoring barrier).
+5. **Start** both v2 units (they come up under `group_authoring_enabled=false`).
+6. Confirm mesh health (`links_active`, secured S2S) **and** current E2EEGROUP xcap
+   negotiate on the dual-node link. **Do not** lift the successor authoring barrier
+   until this readiness is proven.
+7. **Release** authoring later with a **current-version rolling restart** (both nodes
+   already on the v2 image; not a mixed-version window).
 
 **No rollback** past an image/arena that already requires EGRG recognition:
 predecessors that cannot parse EGRG must reject the arena. Do **not** attempt
@@ -93,15 +151,21 @@ A later rollout may seal/adopt EGRG under Helix with the
 `e2ee-group-authority-v2` capability. That path **requires** EGRG + capability
 parity on both sides and is out of scope for the first cold-restart wave.
 
-## Pre-deploy implementation blockers
+## Pre-deploy implementation blockers (historical gate for first activation)
 
-Until the following land (or are proven present in the image under activation),
-**do not** run first production activation:
+For the **first** production activation these were required gates. They were
+satisfied for the 2026-07-28 dual-node cutover as follows: coordinated full
+outage of both `0.5.6` predecessors (the transition protection, because those
+images lacked the v2 control/metrics); `group_authoring_enabled=false` prepared
+and validated as the **v2 successor startup barrier**; custody/receipt/pending
+gauges observed zero **post-activation** on the v2 image as recorded above. They
+remain the operator checklist for any **future** cold re-activation that
+reintroduces mixed-version risk (where both sides already expose the control):
 
 | Blocker | Why |
 |---------|-----|
-| Enforceable mesh-wide E2EEGROUP authoring quiesce | Without a real operator control that fail-closes authoring on **all** dual-node units for the full barrier window, mixed v1/v2 authoring can still occur between restarts. Doc-only discipline is not enough. |
-| Custody/receipt observability | Source exposes count-only Prometheus gauges: `onyx_e2ee_group_hop_custody`, `onyx_e2ee_group_ingress_receipts`, and `onyx_e2ee_group_pending`. They are snapshotted under the E2EEGROUP authority mutex and disclose no payloads, relay IDs, or keys. Production activation still requires proving all three gauges are zero on both nodes before each cold stop. |
+| Fail-closed transition + enforceable authoring barrier | First cutover: coordinated both-stop (predecessors had no v2 control). Future same-generation cold work: a real operator control must fail-close authoring on **all** dual-node units for the full barrier window — doc-only discipline is not enough. |
+| Custody/receipt observability | Source exposes count-only Prometheus gauges: `onyx_e2ee_group_hop_custody`, `onyx_e2ee_group_ingress_receipts`, and `onyx_e2ee_group_pending`. They are snapshotted under the E2EEGROUP authority mutex and disclose no payloads, relay IDs, or keys. On images that expose them, prove all three gauges are zero on both nodes before each cold stop; the first `0.5.6`→`0.5.7` cutover recorded zeros after v2 start. |
 
 ### Instrumentation note
 
