@@ -323,6 +323,16 @@ pub const Authority = struct {
         return self.outbox.receiptLen();
     }
 
+    /// Number of unsettled exact relay identities retained across every origin.
+    /// This is count-only operational state: it never exposes signed wires,
+    /// opaque E2EEGROUP payloads, or origin keys.
+    pub fn pendingLen(self: *const Authority) usize {
+        var total: usize = 0;
+        var it = self.guard.pending.valueIterator();
+        while (it.next()) |history| total += history.facts.items.len;
+        return total;
+    }
+
     pub fn containsCustody(self: *const Authority, peer: u64, relay_id: RelayId) bool {
         return self.outbox.contains(peer, relay_id);
     }
@@ -1401,6 +1411,38 @@ test "E2EEGROUP mesh authority healthy traffic exceeds 10x pending cap without p
         try testing.expectEqual(@as(usize, 0), auth.guard.exactHistoryOf(enc.verified.origin_pubkey).len);
     }
     try testing.expectEqual(@as(usize, 0), auth.custodyLen());
+}
+
+test "E2EEGROUP mesh authority pendingLen reports unsettled identities only" {
+    var authority = try Authority.init(testing.allocator, .{
+        .replay = .{
+            .window_size = 4,
+            .max_origins = 1,
+            .exact_history_size = 4,
+        },
+        .max_outbox_entries = 4,
+        .max_receipts = 4,
+    });
+    defer authority.deinit();
+
+    var enc = try fixture(testing.allocator, 0x91, 9100, "UEVORElORy1MRU4");
+    defer enc.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 0), authority.pendingLen());
+    const admitted = try authority.admitAuthorizedWithCustody(
+        enc.verified,
+        &.{2},
+        enc.wire,
+    );
+    try testing.expectEqual(std.meta.Tag(Admission).accepted, std.meta.activeTag(admitted.admission));
+    try testing.expectEqual(@as(usize, 1), authority.pendingLen());
+    try testing.expect(try authority.acknowledgeKnown(
+        2,
+        enc.verified.relay_id,
+        enc.verified.origin_pubkey,
+        enc.verified.hlc,
+    ));
+    try testing.expectEqual(@as(usize, 0), authority.pendingLen());
 }
 
 test "E2EEGROUP mesh authority lost ACK_CONFIRM remains proven beyond replay window" {

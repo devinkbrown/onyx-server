@@ -17,7 +17,7 @@ voice/video), adds class-based connection policy with bounded growable SendQ/Rec
 nick-delay protection, and replaces the legacy TS6 server-to-server protocol with the
 native **Undertow + Mooring** cryptographic mesh.
 
-**Quick links:** [Download v0.5.6](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6) · [Quickstart](docs/guide/00-quickstart.md) ·
+**Quick links:** [Download v0.5.7](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.7) · [Quickstart](docs/guide/00-quickstart.md) ·
 [Documentation](docs/README.md) · [Architecture](docs/architecture/00-overview.md) ·
 [Command reference](docs/reference/commands/_index.md) ·
 [Contributing](CONTRIBUTING.md) · [Runbook](docs/RUNBOOK.md) ·
@@ -41,13 +41,13 @@ docker run -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
 **Native (fastest to a running node).**
 
 ```sh
-release=https://github.com/devinkbrown/onyx-server/releases/download/v0.5.6
-curl -fLO "$release/onyx-server-0.5.6-x86_64-linux-musl"
+release=https://github.com/devinkbrown/onyx-server/releases/download/v0.5.7
+curl -fLO "$release/onyx-server-0.5.7-x86_64-linux-musl"
 curl -fLO "$release/onyx-server.quickstart.toml"
 curl -fLO "$release/SHA256SUMS"
-grep ' onyx-server-0.5.6-x86_64-linux-musl$' SHA256SUMS | sha256sum -c -
-chmod +x onyx-server-0.5.6-x86_64-linux-musl
-./onyx-server-0.5.6-x86_64-linux-musl onyx-server.quickstart.toml
+grep ' onyx-server-0.5.7-x86_64-linux-musl$' SHA256SUMS | sha256sum -c -
+chmod +x onyx-server-0.5.7-x86_64-linux-musl
+./onyx-server-0.5.7-x86_64-linux-musl onyx-server.quickstart.toml
 ```
 
 Either way you get a working node — **`ws://localhost:8080`** for the Onyx browser

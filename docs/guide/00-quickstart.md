@@ -92,7 +92,7 @@ After the basic setup, define connection classes under `[class.<name>]` to contr
 - For a public node: [Production TLS card](tls.md#production-tls-card) (DNS, ACME,
   `ws_plain = false`) — also summarized in [`packaging/README.md`](../../packaging/README.md).
 - Download the verified static binary and quickstart from the public
-  [`v0.5.6` release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6),
+  [`v0.5.7` release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.7),
   or independently rebuild it with `packaging/release.sh`. The published path
   passed checksum, reproducibility, config, IRC, and WebSocket download smoke;
   it is currently unsigned, so do not imply signature-backed provenance.

@@ -19,6 +19,8 @@ pub const Hash = [Blake3.digest_length]u8;
 pub const CredentialKind = enum(u8) {
     certfp = 1,
     webauthn = 2,
+    e2ee_device = 3,
+    identity = 4,
 };
 
 pub const Action = enum(u8) {
@@ -167,4 +169,22 @@ test "event digest is length framed" {
         .key_hash = materialHash("k"),
     };
     try std.testing.expect(!std.mem.eql(u8, &eventDigest(a), &eventDigest(b)));
+}
+
+test "event digest domain-separates E2EE device and identity credentials" {
+    const base = Event{
+        .account = "alice",
+        .kind = .e2ee_device,
+        .action = .bind,
+        .key_id = "phone",
+        .key_hash = materialHash("mls-x25519:device-public-key"),
+        .timestamp_ms = 42,
+    };
+    var identity = base;
+    identity.kind = .identity;
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &eventDigest(base),
+        &eventDigest(identity),
+    ));
 }

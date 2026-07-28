@@ -471,6 +471,15 @@ Source: struct at `src/daemon/config_format.zig:263`, parsing at `src/daemon/con
 | `listen` | port integer | `0` | `0..65535` | Live Prometheus `/metrics` HTTP listener port. `0` or absent disables the endpoint (`src/daemon/config_boot.zig:69`, `src/daemon/server.zig:2443`). |
 | `bind` | string | `"127.0.0.1"` | IPv4 literal | Bind address for the metrics listener. Defaults to loopback; invalid/non-IPv4 values keep the secure loopback default (`src/daemon/config_boot.zig:71`, `src/daemon/config_boot.zig:112`). |
 
+## `[e2ee]`
+
+Source: `src/daemon/config_format.zig`, mapped by `src/daemon/config_boot.zig`,
+and enforced by the live E2EEGROUP command path in `src/daemon/server.zig`.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `group_authoring_enabled` | boolean | `true` | Startup state for accepting new locally-authored E2EEGROUP controls. Set `false` on every mesh node before the first EGRG cold activation so restarted successors remain quiesced. This does not stop inbound relay, custody retry, ACK, or ACK_CONFIRM drain work. |
+
 ## `[geoip]`
 
 Source: struct at `src/daemon/config_format.zig:188`, parsing at `src/daemon/config_format.zig:397`, mapping at `src/daemon/config_boot.zig:34`.

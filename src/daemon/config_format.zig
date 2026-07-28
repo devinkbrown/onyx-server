@@ -82,6 +82,7 @@ pub const Config = struct {
     stats: Stats = .{},
     backup: Backup = .{},
     metrics: Metrics = .{},
+    e2ee: E2ee = .{},
     accounts: Accounts = .{},
     bouncer: Bouncer = .{},
     filter: Filter = .{},
@@ -544,6 +545,14 @@ pub const Config = struct {
         /// private interface (or "0.0.0.0") only deliberately; front it with a
         /// firewall / reverse proxy for remote scraping.
         bind: []const u8 = "127.0.0.1",
+    };
+
+    /// `[e2ee]` — process-start policy for E2EEGROUP control authorship.
+    pub const E2ee = struct {
+        /// New local E2EEGROUP controls are accepted when true. Set false on
+        /// every node before the first EGRG cold activation so a restarted
+        /// successor remains quiesced until current mesh capability is proven.
+        group_authoring_enabled: bool = true,
     };
 
     /// `[accounts]` — durable services/account policy. These values are applied
@@ -1310,6 +1319,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // `bind` defaults to loopback (security: not public by default).
     cfg.metrics.listen = try portField(doc, "metrics.listen", cfg.metrics.listen);
     try setStr(allocator, resolver, doc.getString("metrics.bind"), &cfg.metrics.bind);
+
+    if (doc.getBool("e2ee.group_authoring_enabled")) |b|
+        cfg.e2ee.group_authoring_enabled = b;
 
     // [webhook] — Discord-compatible incoming webhook endpoint. OFF by default.
     if (doc.getBool("webhook.enabled")) |b| cfg.webhook.enabled = b;

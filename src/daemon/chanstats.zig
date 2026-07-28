@@ -1184,7 +1184,7 @@ test "records messages, words, hour buckets, and per-user behaviour metrics" {
 test "ophion parity: CTCP ACTION, ignore list, peak members" {
     var s = ChanStats.init(std.testing.allocator);
     defer s.deinit();
-    s.setIgnoredNicks(&.{"Announce", "GitHub"});
+    s.setIgnoredNicks(&.{ "Announce", "GitHub" });
     try std.testing.expect(s.isIgnored("announce"));
     try std.testing.expect(!s.isIgnored("kain"));
 

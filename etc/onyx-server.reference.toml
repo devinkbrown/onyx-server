@@ -837,6 +837,15 @@ listen = 0
 bind = "127.0.0.1"
 
 
+# --- [e2ee] — E2EEGROUP authoring activation barrier -------------------------
+[e2ee]
+# Startup state for new locally-authored group-control records. Set false on
+# every mesh node before the first EGRG cold activation; live opers also issue
+# `E2EEGROUP OFF` on the predecessor processes. Leave false through both cold
+# restarts, then use `E2EEGROUP ON` only after current xcap is established.
+group_authoring_enabled = true
+
+
 # --- [webhook] — incoming channel webhooks -----------------------------------
 # Discord-compatible and Block-Kit-lite JSON POST endpoint. Off by default; when
 # enabled, channel ops can create bindings with WEBHOOK CREATE <#channel> [name].

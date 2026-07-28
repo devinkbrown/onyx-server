@@ -514,6 +514,34 @@ pub const Services = struct {
         };
     }
 
+    /// Append a transparency event for a credential stored outside the account
+    /// service's own credential tables (for example signed E2EE/identity user
+    /// PROP state). The account is canonicalized under the same services lock
+    /// as certfp and WebAuthn events. Logging remains best-effort to preserve the
+    /// existing mutation contract used by all credential families.
+    pub fn recordExternalKeyTransparencyEvent(
+        self: *Services,
+        account: []const u8,
+        kind: key_transparency.CredentialKind,
+        action: key_transparency.Action,
+        key_id: []const u8,
+        material: []const u8,
+        timestamp_ms: i64,
+    ) void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const canonical = accountKey(account) catch return;
+        self.recordKeyTransparency(
+            canonical.asSlice(),
+            kind,
+            action,
+            key_id,
+            material,
+            timestamp_ms,
+        );
+    }
+
     /// Force the backing OroStore into a compact snapshot for external backup.
     /// The caller may copy `store.snapshot_path` after this returns. Serialized with
     /// normal services mutations so the snapshot represents a whole store state.
@@ -4102,6 +4130,54 @@ test "key transparency log records certfp and passkey binding changes" {
     try std.testing.expectEqualSlices(u8, &root, &snapshot.root);
     try std.testing.expect(snapshot.path.len != 0);
     try std.testing.expectError(error.IndexOutOfRange, services.keyTransparencyProof(std.testing.allocator, 99));
+}
+
+test "key transparency log records external E2EE device and identity changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-key-transparency-external.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+
+    services.recordExternalKeyTransparencyEvent(
+        "Alice",
+        .e2ee_device,
+        .bind,
+        "phone",
+        "mls-x25519:device-public-key",
+        10,
+    );
+    services.recordExternalKeyTransparencyEvent(
+        "ALICE",
+        .identity,
+        .delete,
+        "primary",
+        "identity-public-key",
+        20,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+    const root = kt.root();
+    const identity_delete = key_transparency.Event{
+        .account = "alice",
+        .kind = .identity,
+        .action = .delete,
+        .key_id = "primary",
+        .key_hash = key_transparency.materialHash("identity-public-key"),
+        .timestamp_ms = 20,
+    };
+    var proof = try kt.proof(1);
+    defer proof.deinit(std.testing.allocator);
+    try std.testing.expect(key_transparency.verifyInclusion(
+        root,
+        identity_delete,
+        proof,
+        1,
+        kt.len(),
+    ));
 }
 
 test "webauthn bind/lookup/list/delete round-trip" {

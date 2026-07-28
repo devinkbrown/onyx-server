@@ -2091,6 +2091,11 @@ pub const Config = struct {
     /// and forward V2 but author legacy only; active nodes author each V2-eligible
     /// mesh event as V2 only.
     relay_v2_authoring: relay_v2_activation.Mode = .compat,
+    /// Startup state for the local E2EEGROUP authoring barrier. Production maps
+    /// `[e2ee].group_authoring_enabled` here so a cold-started successor remains
+    /// quiesced throughout first activation. Default true preserves existing
+    /// deployments that have not entered that rollout.
+    e2ee_group_authoring_enabled: bool = true,
     /// Monotonic operator rollout generation. A non-zero value is meaningful
     /// only with a complete full-mesh `relay_v2_roster`.
     relay_v2_activation_epoch: u64 = 0,
@@ -3456,6 +3461,11 @@ pub const LinuxServer = struct {
     /// refloods promptly without turning unrelated wake traffic into a retry
     /// loop. The periodic sweep remains the recovery cadence for lost receipts.
     e2ee_group_retry_requested: std.atomic.Value(bool) = .init(false),
+    /// Operator-controlled local authorship barrier for cold E2EEGROUP
+    /// activation. This gate applies only to client-originated controls before
+    /// signing/admission; inbound relay, custody retry, ACK, and ACK_CONFIRM
+    /// processing remain live while quiesced.
+    e2ee_group_local_authoring_enabled: std.atomic.Value(bool),
     /// Rendered, attachment-specific IRC records retained until the exact
     /// physical reusable-session connection accepts them into its SendQ. Slow
     /// siblings therefore cannot lose an accepted mesh event or force healthy
@@ -4410,6 +4420,7 @@ pub const LinuxServer = struct {
             .relay_v2_outbox = relay_outbox,
             .relay_v2_event_log = relay_event_log,
             .e2ee_group_mesh_authority = e2ee_group_authority,
+            .e2ee_group_local_authoring_enabled = .init(config.e2ee_group_authoring_enabled),
             .attachment_delivery_spool = delivery_spool,
             .tls_ticket_key = tls_ticket_key,
             .native_stream_key = blk: {
@@ -4647,6 +4658,7 @@ pub const LinuxServer = struct {
         defer out.deinit(self.allocator);
         self.stats.writePrometheus(self.allocator, &out) catch return;
         self.writeNodeHealthPrometheus(self.allocator, &out) catch return;
+        self.writeE2eeGroupPrometheus(self.allocator, &out) catch return;
         self.metrics_snapshot.set(out.items) catch return;
     }
 
@@ -4669,6 +4681,176 @@ pub const LinuxServer = struct {
         try writePromGauge(allocator, out, "onyx_mesh_components", "Mesh connected components known to this node", health.mesh_components);
         try writePromGauge(allocator, out, "onyx_mesh_peers_up", "Mesh peers currently established from this node", health.mesh_peers_up);
         try writePromGauge(allocator, out, "onyx_mesh_peers_total", "Mesh peers tracked by this node", health.mesh_peers_total);
+    }
+
+    const E2eeGroupOperationalState = struct {
+        authoring_enabled: bool,
+        custody: usize,
+        receipts: usize,
+        pending: usize,
+        current_peers: usize,
+        required_peers: usize,
+
+        fn activationReady(self: E2eeGroupOperationalState) bool {
+            // Solo (no external-mesh expectation) is ready at 0/0. Mesh-capable
+            // nodes never reach 0/0: e2eeGroupPeerReadiness synthesizes a
+            // required peer so mixed-fleet re-enable stays fail-closed.
+            return self.current_peers == self.required_peers;
+        }
+    };
+
+    const E2eeGroupPeerReadiness = struct {
+        current: usize,
+        required: usize,
+    };
+
+    /// True when this process expects at least one external mesh neighbor for
+    /// E2EEGROUP current-capability (listen, dial targets, or trust roots).
+    /// A single-node roster alone is not an external-peer expectation.
+    fn e2eeGroupExpectsExternalPeers(self: *const LinuxServer) bool {
+        return self.config.s2s_port != 0 or
+            self.config.mesh_connect.len != 0 or
+            self.config.mesh_trust_roots.len != 0;
+    }
+
+    /// Mesh-capable nodes must never report activation-ready at 0/0 (inbound-
+    /// only listen with the peer down, trust roots configured but no live
+    /// link, dial list empty while S2S is enabled). A synthetic required peer
+    /// keeps ON fail-closed without naming peers or allocating.
+    fn e2eeGroupReadinessFailClosed(
+        self: *const LinuxServer,
+        readiness: E2eeGroupPeerReadiness,
+    ) E2eeGroupPeerReadiness {
+        if (readiness.required == 0 and self.e2eeGroupExpectsExternalPeers()) {
+            return .{ .current = readiness.current, .required = 1 };
+        }
+        return readiness;
+    }
+
+    fn e2eeGroupPeerReadiness(self: *LinuxServer) E2eeGroupPeerReadiness {
+        // A configured node-key roster is the strongest direct-neighbor truth:
+        // every non-local member must have one established current-capable link.
+        if (self.relay_v2_required_nodes.len != 0) {
+            var required: usize = 0;
+            var current: usize = 0;
+            for (self.relay_v2_required_nodes) |required_node| {
+                if (required_node == self.config.node_id) continue;
+                required += 1;
+                var ready = false;
+                for (self.reactors) |*reactor| {
+                    var it = reactor.clients.iterator();
+                    while (it.next()) |entry| {
+                        const link = entry.value.s2s_secured orelse continue;
+                        if (!link.established() or !link.supportsE2eeGroup()) continue;
+                        if (link.remoteNodeId() == required_node) {
+                            ready = true;
+                            break;
+                        }
+                    }
+                    if (ready) break;
+                }
+                if (ready) current += 1;
+            }
+            return self.e2eeGroupReadinessFailClosed(.{ .current = current, .required = required });
+        }
+
+        // TOFU has no offline node-id roster. Use every presently authenticated
+        // direct node plus the configured outbound dial count as the closest
+        // fail-closed truth: a missing dial contributes required-but-not-current,
+        // and a live plaintext/pre-current peer contributes direct-but-not-current.
+        var nodes: [64]u64 = @splat(0);
+        var capable: [64]bool = @splat(false);
+        var node_len: usize = 0;
+        var overflow = false;
+        const Remember = struct {
+            fn peer(
+                seen_nodes: *[64]u64,
+                seen_capable: *[64]bool,
+                seen_len: *usize,
+                overflowed: *bool,
+                node: u64,
+                is_capable: bool,
+            ) void {
+                if (node == 0) return;
+                for (seen_nodes[0..seen_len.*], 0..) |known, i| {
+                    if (known != node) continue;
+                    seen_capable[i] = seen_capable[i] or is_capable;
+                    return;
+                }
+                if (seen_len.* == seen_nodes.len) {
+                    overflowed.* = true;
+                    return;
+                }
+                seen_nodes[seen_len.*] = node;
+                seen_capable[seen_len.*] = is_capable;
+                seen_len.* += 1;
+            }
+        };
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                if (entry.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    Remember.peer(
+                        &nodes,
+                        &capable,
+                        &node_len,
+                        &overflow,
+                        link.remoteNodeId() orelse continue,
+                        link.supportsE2eeGroup(),
+                    );
+                } else if (entry.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    Remember.peer(
+                        &nodes,
+                        &capable,
+                        &node_len,
+                        &overflow,
+                        link.remoteNodeId() orelse continue,
+                        false,
+                    );
+                }
+            }
+        }
+        var current: usize = 0;
+        for (capable[0..node_len]) |is_capable| current += @intFromBool(is_capable);
+        return self.e2eeGroupReadinessFailClosed(.{
+            .current = current,
+            // Saturating the bounded observation set must fail closed. One
+            // synthetic required peer keeps activation false without exposing
+            // peer identities or allocating on the operator/metrics path.
+            .required = @max(node_len + @intFromBool(overflow), self.config.mesh_connect.len),
+        });
+    }
+
+    fn e2eeGroupOperationalState(self: *LinuxServer) E2eeGroupOperationalState {
+        const authoring_enabled = self.e2ee_group_local_authoring_enabled.load(.acquire);
+        const peers = self.e2eeGroupPeerReadiness();
+        lockSpin(&self.e2ee_group_mesh_mu);
+        defer self.e2ee_group_mesh_mu.unlock();
+        return .{
+            .authoring_enabled = authoring_enabled,
+            .custody = self.e2ee_group_mesh_authority.custodyLen(),
+            .receipts = self.e2ee_group_mesh_authority.receiptLen(),
+            .pending = self.e2ee_group_mesh_authority.pendingLen(),
+            .current_peers = peers.current,
+            .required_peers = peers.required,
+        };
+    }
+
+    /// Export only count-level E2EEGROUP delivery authority. The authority owns
+    /// opaque payloads, exact relay IDs, and origin keys; none of those cross
+    /// this operational boundary. One mutex snapshot keeps the three gauges
+    /// mutually coherent for a cold-restart drain decision.
+    fn writeE2eeGroupPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        const state = self.e2eeGroupOperationalState();
+        try writePromGauge(allocator, out, "onyx_e2ee_group_local_authoring_enabled", "Whether this node accepts new locally authored E2EEGROUP controls (1=yes, 0=quiesced)", @as(u8, if (state.authoring_enabled) 1 else 0));
+        try writePromGauge(allocator, out, "onyx_e2ee_group_current_capable_peers", "Direct mesh peers established with current E2EEGROUP support", state.current_peers);
+        try writePromGauge(allocator, out, "onyx_e2ee_group_required_peers", "Configured or authenticated direct mesh peers required before authoring resumes", state.required_peers);
+        try writePromGauge(allocator, out, "onyx_e2ee_group_activation_ready", "Whether every required direct mesh peer is current-capable (1=yes, 0=no)", @as(u8, if (state.activationReady()) 1 else 0));
+        try writePromGauge(allocator, out, "onyx_e2ee_group_hop_custody", "Exact E2EEGROUP hop wires awaiting peer ACK", state.custody);
+        try writePromGauge(allocator, out, "onyx_e2ee_group_ingress_receipts", "E2EEGROUP ingress receipts awaiting ACK_CONFIRM", state.receipts);
+        try writePromGauge(allocator, out, "onyx_e2ee_group_pending", "Unsettled exact E2EEGROUP relay identities", state.pending);
     }
 
     /// The per-webhook rate policy assembled from config.
@@ -13438,6 +13620,12 @@ pub const LinuxServer = struct {
         parsed: *const irc_line.LineView,
         line: []const u8,
     ) !ModuleOutcome {
+        // E2EEGROUP's live operator barrier is a server-owned extension of the
+        // registered client command. Intercept its one-parameter control shape
+        // before the ordinary four-parameter module minimum is applied; all
+        // payload-bearing authoring records continue through SerpentRegistry.
+        if (try self.handleE2eeGroupOperatorControl(conn, parsed)) return .handled;
+
         // SerpentRegistry module spine (strangler-fig): consult the comptime
         // module registry first. A migrated command is handled here.
         {
@@ -35345,6 +35533,10 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, text);
     }
 
+    fn keyTransparencyTimestampMs(self: *const LinuxServer) i64 {
+        return @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+    }
+
     const E2eeDeviceValue = struct {
         algorithm: []const u8,
         public_key: []const u8,
@@ -35951,6 +36143,104 @@ pub const LinuxServer = struct {
         return renderE2eeGroupLineFromPrefix(prefix, record, out);
     }
 
+    /// Operator-only process-local activation barrier:
+    ///
+    ///   E2EEGROUP STATUS
+    ///   E2EEGROUP OFF      (quiesce local authorship)
+    ///   E2EEGROUP ON       (resume local authorship)
+    ///
+    /// Count-only status deliberately omits RelayIds, origin keys, signed wires,
+    /// and opaque client payloads. Privilege is checked before any state read
+    /// so non-operators never observe drain/peer gauges through this command.
+    /// Returns false for every ordinary E2EEGROUP record so the module registry
+    /// retains its established min-params / feature-gate behavior.
+    fn handleE2eeGroupOperatorControl(
+        self: *LinuxServer,
+        conn: *ConnState,
+        parsed: *const irc_line.LineView,
+    ) !bool {
+        if (!std.ascii.eqlIgnoreCase(parsed.command, "E2EEGROUP")) return false;
+        const params = parsed.paramSlice();
+        if (params.len != 1) return false;
+        const sub = params[0];
+        const is_status = std.ascii.eqlIgnoreCase(sub, "STATUS");
+        const is_on = std.ascii.eqlIgnoreCase(sub, "ON");
+        const is_off = std.ascii.eqlIgnoreCase(sub, "OFF");
+        if (!is_status and !is_on and !is_off) return false;
+
+        // Match SerpentRegistry oper/registration gates before any barrier or
+        // observability side effects. Unregistered sockets never become oper.
+        if (!conn.session.registered()) {
+            try queueNumeric(conn, .ERR_NOTREGISTERED, &.{}, "You have not registered");
+            return true;
+        }
+        if (!conn.session.isOper()) {
+            try queueNumeric(
+                conn,
+                .ERR_NOPRIVILEGES,
+                &.{"E2EEGROUP"},
+                "Permission denied: E2EEGROUP authoring control is operator-only",
+            );
+            return true;
+        }
+
+        if (is_on) {
+            // Re-read readiness under the same operational snapshot used by
+            // metrics so ON cannot race a stale peer count against STATUS.
+            const readiness = self.e2eeGroupOperationalState();
+            if (!readiness.activationReady()) {
+                var reason_buf: [192]u8 = undefined;
+                const reason = std.fmt.bufPrint(
+                    &reason_buf,
+                    "Cannot enable local authoring: current-capable peers={d} required peers={d}",
+                    .{ readiness.current_peers, readiness.required_peers },
+                ) catch unreachable;
+                try self.failReply(
+                    conn,
+                    "E2EEGROUP",
+                    "PEERS_NOT_CURRENT",
+                    reason,
+                );
+                return true;
+            }
+        }
+
+        if (is_on or is_off) {
+            const enabled = is_on;
+            const prior = self.e2ee_group_local_authoring_enabled.swap(enabled, .acq_rel);
+            if (prior != enabled) {
+                // Log only the operator nick and the barrier transition — never
+                // relay IDs, peer shortIds, or payload material.
+                srvLog(
+                    "onyx-server: E2EEGROUP local authoring {s} by operator {s}\n",
+                    .{ if (enabled) "enabled" else "quiesced", conn.session.displayName() },
+                );
+                // Make the live scrape reflect the barrier transition without
+                // waiting for the ordinary stats cadence.
+                if (self.config.metrics_port != 0) self.refreshMetricsSnapshot();
+            }
+        }
+
+        const state = self.e2eeGroupOperationalState();
+        var buf: [512]u8 = undefined;
+        const reply = std.fmt.bufPrint(
+            &buf,
+            "E2EEGROUP STATUS local_authoring={s} quiesced={d} current_peers={d} required_peers={d} activation_ready={d} custody={d} receipts={d} pending={d}",
+            .{
+                if (state.authoring_enabled) "ON" else "OFF",
+                @as(u8, if (state.authoring_enabled) 0 else 1),
+                state.current_peers,
+                state.required_peers,
+                @as(u8, if (state.activationReady()) 1 else 0),
+                state.custody,
+                state.receipts,
+                state.pending,
+            },
+        ) catch unreachable;
+        try self.noticeTo(conn, reply);
+        return true;
+    }
+
     /// Local Phase 4a E2EEGROUP admission. The opaque payload is validated and
     /// copied only into the final bounded IRC line. It is never decrypted,
     /// logged, or placed in history; mesh-enabled delivery retains only the
@@ -35962,6 +36252,8 @@ pub const LinuxServer = struct {
             return self.failReply(conn, "E2EEGROUP", "IRCX_REQUIRED", "Opt in with IRCX before sending group E2EE controls");
         if (!conn.session.hasCap(.onyx_e2ee))
             return self.failReply(conn, "E2EEGROUP", "CAP_REQUIRED", "Negotiate onyx/e2ee before sending group E2EE controls");
+        if (!self.e2ee_group_local_authoring_enabled.load(.acquire))
+            return self.warnReply(conn, "E2EEGROUP", "AUTHORING_QUIESCED", "Local group E2EE authoring is quiesced by an operator");
 
         const record = e2ee_group_control.parse(parsed.paramSlice()) catch |err| {
             const code: []const u8 = switch (err) {
@@ -36160,6 +36452,14 @@ pub const LinuxServer = struct {
             const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
             const ev = self.props.setProp(entity, key, value, .{ .id = account, .access = .member }) catch
                 return self.failReply(conn, "E2EEKEY", "STORE_FAILED", "Could not store E2EE device key");
+            if (self.account_services) |svc| svc.recordExternalKeyTransparencyEvent(
+                account,
+                .e2ee_device,
+                .bind,
+                p[1],
+                value,
+                self.keyTransparencyTimestampMs(),
+            );
             self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
             self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
             var b: [128]u8 = undefined;
@@ -36175,7 +36475,22 @@ pub const LinuxServer = struct {
             const key = e2ee_policy.devicePropKey(p[1], &key_buf) orelse
                 return self.failReply(conn, "E2EEKEY", "BAD_DEVICE", "Device id must use A-Z, a-z, 0-9, dot, dash, or underscore");
             const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+            var removed_value_buf: [e2ee_policy.max_device_value_len]u8 = undefined;
+            const removed_value: ?[]const u8 = if (self.props.getProp(entity, key)) |prior| blk: {
+                if (prior.value.len > removed_value_buf.len) break :blk null;
+                @memcpy(removed_value_buf[0..prior.value.len], prior.value);
+                break :blk removed_value_buf[0..prior.value.len];
+            } else |_| null;
             self.props.deleteProp(entity, key) catch {};
+            if (removed_value) |material| if (self.account_services) |svc|
+                svc.recordExternalKeyTransparencyEvent(
+                    account,
+                    .e2ee_device,
+                    .delete,
+                    p[1],
+                    material,
+                    self.keyTransparencyTimestampMs(),
+                );
             self.propagateLocalEntityProp(false, entity.kind, entity.id, key, "", account);
             self.notifyLocalPropChange(conn, entity, key, "");
             var b: [96]u8 = undefined;
@@ -36265,6 +36580,15 @@ pub const LinuxServer = struct {
             const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
             const ev = self.props.setProp(entity, key, value, .{ .id = account, .access = .member }) catch
                 return self.failReply(conn, "IDENTITY", "STORE_FAILED", "Could not store portable identity key");
+            const identity_claim = account_identity.parseClaimValue(value) orelse unreachable;
+            if (self.account_services) |svc| svc.recordExternalKeyTransparencyEvent(
+                account,
+                .identity,
+                .bind,
+                p[1],
+                &identity_claim.public_key,
+                self.keyTransparencyTimestampMs(),
+            );
             self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
             self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
             var b: [128]u8 = undefined;
@@ -36359,7 +36683,24 @@ pub const LinuxServer = struct {
             const key = account_identity.propKey(p[1], &key_buf) orelse
                 return self.failReply(conn, "IDENTITY", "BAD_LABEL", "Identity label must use A-Z, a-z, 0-9, dot, dash, or underscore");
             const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+            const removed_public_key: ?[account_identity.public_key_len]u8 =
+                if (self.props.getProp(entity, key)) |prior|
+                    if (account_identity.parseClaimValue(prior.value)) |claim|
+                        claim.public_key
+                    else
+                        null
+                else |_|
+                    null;
             self.props.deleteProp(entity, key) catch {};
+            if (removed_public_key) |material| if (self.account_services) |svc|
+                svc.recordExternalKeyTransparencyEvent(
+                    account,
+                    .identity,
+                    .delete,
+                    p[1],
+                    &material,
+                    self.keyTransparencyTimestampMs(),
+                );
             self.propagateLocalEntityProp(false, entity.kind, entity.id, key, "", account);
             self.notifyLocalPropChange(conn, entity, key, "");
             var b: [96]u8 = undefined;
@@ -58298,6 +58639,147 @@ test "E2EEKEY advertises account device keys through user props" {
     try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "e2ee.device.phone"));
 }
 
+test "E2EEKEY and IDENTITY live mutations append verifiable key transparency events" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(
+        alloc,
+        std.testing.io,
+        tmp.dir,
+        "server-external-keytrans.wal",
+    );
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    const event_time_ms: i64 = 1_700_000_123_000;
+    var sim_time = reactor_mod.SimReactor.init(event_time_ms);
+
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .reactor = sim_time.reactor(),
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expectEqual(event_time_ms, server.keyTransparencyTimestampMs());
+
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    const e2ee_material = "mls-x25519:abcd+/=";
+
+    var e2ee_add = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    e2ee_add.params[0] = "ADD";
+    e2ee_add.params[1] = "phone";
+    e2ee_add.params[2] = "mls-x25519";
+    e2ee_add.params[3] = "abcd+/=";
+    e2ee_add.param_count = 4;
+    try server.handleE2eeKey(conn, &e2ee_add);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+
+    // A rejected property mutation never fabricates a transparency append.
+    var bad_e2ee = e2ee_add;
+    bad_e2ee.params[1] = "bad device";
+    try server.handleE2eeKey(conn, &bad_e2ee);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+
+    var e2ee_del = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    e2ee_del.params[0] = "DEL";
+    e2ee_del.params[1] = "phone";
+    e2ee_del.param_count = 2;
+    try server.handleE2eeKey(conn, &e2ee_del);
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+    // The legacy idempotent "DELETED" reply for an absent key remains, but no
+    // nonexistent credential change enters transparency.
+    try server.handleE2eeKey(conn, &e2ee_del);
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(
+        @as([Ed25519.KeyPair.seed_length]u8, @splat(0x79)),
+    );
+    const identity_public = kp.public_key.toBytes();
+    const public_hex = std.fmt.bytesToHex(identity_public, .lower);
+    var transcript_buf: [account_identity.max_transcript_len]u8 = undefined;
+    const transcript = account_identity.transcript(
+        "Alice",
+        "primary",
+        identity_public,
+        &transcript_buf,
+    ).?;
+    const signature = try kp.sign(transcript, null);
+    const sig_hex = std.fmt.bytesToHex(signature.toBytes(), .lower);
+
+    var identity_add = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
+    identity_add.params[0] = "ADD";
+    identity_add.params[1] = "primary";
+    identity_add.params[2] = &public_hex;
+    identity_add.params[3] = &sig_hex;
+    identity_add.param_count = 4;
+    try server.handleIdentity(conn, &identity_add);
+    try std.testing.expectEqual(@as(usize, 3), kt.len());
+
+    var identity_del = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
+    identity_del.params[0] = "DEL";
+    identity_del.params[1] = "primary";
+    identity_del.param_count = 2;
+    try server.handleIdentity(conn, &identity_del);
+    try std.testing.expectEqual(@as(usize, 4), kt.len());
+
+    const expected = [_]key_transparency.Event{
+        .{
+            .account = "alice",
+            .kind = .e2ee_device,
+            .action = .bind,
+            .key_id = "phone",
+            .key_hash = key_transparency.materialHash(e2ee_material),
+            .timestamp_ms = event_time_ms,
+        },
+        .{
+            .account = "alice",
+            .kind = .e2ee_device,
+            .action = .delete,
+            .key_id = "phone",
+            .key_hash = key_transparency.materialHash(e2ee_material),
+            .timestamp_ms = event_time_ms,
+        },
+        .{
+            .account = "alice",
+            .kind = .identity,
+            .action = .bind,
+            .key_id = "primary",
+            .key_hash = key_transparency.materialHash(&identity_public),
+            .timestamp_ms = event_time_ms,
+        },
+        .{
+            .account = "alice",
+            .kind = .identity,
+            .action = .delete,
+            .key_id = "primary",
+            .key_hash = key_transparency.materialHash(&identity_public),
+            .timestamp_ms = event_time_ms,
+        },
+    };
+    const root = kt.root();
+    for (expected, 0..) |event, position| {
+        var proof = try kt.proof(position);
+        defer proof.deinit(alloc);
+        try std.testing.expect(key_transparency.verifyInclusion(
+            root,
+            event,
+            proof,
+            position,
+            kt.len(),
+        ));
+    }
+}
+
 fn enrollTestE2eeDevice(server: *Server, account: []const u8, device: []const u8) !void {
     var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
     const key = e2ee_policy.devicePropKey(device, &key_buf) orelse return error.TestUnexpectedResult;
@@ -58532,6 +59014,278 @@ test "E2EEGROUP local handler fails closed and accepts the full payload bound" {
         .{&max_payload},
     );
     try std.testing.expectEqualSlices(u8, expected, target.send_buf[0..target.send_len]);
+}
+
+test "E2EEGROUP live operator quiesce is privileged observable non-mutating and reversible" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    // Exercise the registered command path with the accounts feature actually
+    // available. A nil services pointer intentionally disables that registry
+    // feature, which would test its generic 421 gate instead of the E2EEGROUP
+    // authoring barrier below.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "e2ee-group-quiesce.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var pair = try SessionReplayTestPair.initWithSeeds(alloc, 0xa1, 0xa2);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_connect = &.{"peer.test:7777"},
+        .e2ee_group_authoring_enabled = false,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer_conn = server.rx().clients.get(peer_id).?;
+    peer_conn.overflow_allocator = alloc;
+    peer_conn.token = try tokenFromId(peer_id);
+    peer_conn.send_armed = true;
+    peer_conn.sendq_cap = default_sendq_cap;
+    peer_conn.s2s_secured = &pair.a;
+    defer {
+        peer_conn.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+
+    const oper_id = try addTestLocalClient(&server, "Oper", "oper");
+    const sender_id = try addTestLocalClient(&server, "Alice", "alice");
+    const target_id = try addTestLocalClient(&server, "Bob", "bob");
+    const oper = server.connFor(oper_id).?;
+    const sender = server.connFor(sender_id).?;
+    const target = server.connFor(target_id).?;
+    for ([_]*ConnState{ oper, sender, target }) |conn|
+        conn.session.registration.registered = true;
+    oper.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    oper.session.addCap(.standard_replies);
+    sender.ircx = true;
+    sender.session.addCap(.standard_replies);
+    sender.session.addCap(.onyx_e2ee);
+    target.session.addCap(.onyx_e2ee);
+    _ = try server.world.join("#secure", worldIdFromClient(sender_id));
+    _ = try server.world.join("#secure", worldIdFromClient(target_id));
+    try enrollTestE2eeDevice(&server, "alice", "phone");
+
+    // The same live command path used by clients enforces privilege before
+    // touching the process-local activation barrier.
+    try server.processLiveLine(sender_id, sender, "E2EEGROUP ON");
+    try expectContains(sender.send_buf[0..sender.send_len], " 481 Alice E2EEGROUP ");
+    try std.testing.expect(!server.e2ee_group_local_authoring_enabled.load(.acquire));
+    resetTestSendQ(sender);
+
+    try server.processLiveLine(oper_id, oper, "E2EEGROUP STATUS");
+    try expectContains(
+        oper.send_buf[0..oper.send_len],
+        "E2EEGROUP STATUS local_authoring=OFF quiesced=1 current_peers=1 required_peers=1 activation_ready=1 custody=0 receipts=0 pending=0",
+    );
+    resetTestSendQ(oper);
+
+    // The startup config keeps a cold successor quiesced. Even an operator
+    // cannot release that barrier while its configured peer is missing.
+    peer_conn.s2s_secured = null;
+    try server.processLiveLine(oper_id, oper, "E2EEGROUP ON");
+    try expectContains(oper.send_buf[0..oper.send_len], "FAIL E2EEGROUP PEERS_NOT_CURRENT");
+    try expectContains(oper.send_buf[0..oper.send_len], "current-capable peers=0 required peers=1");
+    try std.testing.expect(!server.e2ee_group_local_authoring_enabled.load(.acquire));
+    resetTestSendQ(oper);
+
+    // Inbound-only mesh (S2S listen / trust without dial targets and without a
+    // live peer) must also fail closed: 0/0 readiness would let ON succeed
+    // while the dual-node peer is still pre-v2 or absent.
+    const prior_mesh_connect = server.config.mesh_connect;
+    server.config.mesh_connect = &.{};
+    server.config.s2s_port = 6697;
+    try server.processLiveLine(oper_id, oper, "E2EEGROUP ON");
+    try expectContains(oper.send_buf[0..oper.send_len], "FAIL E2EEGROUP PEERS_NOT_CURRENT");
+    try expectContains(oper.send_buf[0..oper.send_len], "current-capable peers=0 required peers=1");
+    try std.testing.expect(!server.e2ee_group_local_authoring_enabled.load(.acquire));
+    const inbound_only = server.e2eeGroupOperationalState();
+    try std.testing.expectEqual(@as(usize, 0), inbound_only.current_peers);
+    try std.testing.expectEqual(@as(usize, 1), inbound_only.required_peers);
+    try std.testing.expect(!inbound_only.activationReady());
+    resetTestSendQ(oper);
+    server.config.mesh_connect = prior_mesh_connect;
+    server.config.s2s_port = 0;
+    peer_conn.s2s_secured = &pair.a;
+
+    // An established secured transport is still ineligible until the exact
+    // E2EEGROUP current-capability bit is present.
+    if (pair.a.inner) |inner| {
+        inner.peer.peer_supports_e2ee_group_current = false;
+    } else return error.TestUnexpectedResult;
+    try server.processLiveLine(oper_id, oper, "E2EEGROUP ON");
+    try expectContains(oper.send_buf[0..oper.send_len], "FAIL E2EEGROUP PEERS_NOT_CURRENT");
+    try expectContains(oper.send_buf[0..oper.send_len], "current-capable peers=0 required peers=1");
+    try std.testing.expect(!server.e2ee_group_local_authoring_enabled.load(.acquire));
+    resetTestSendQ(oper);
+    pair.a.inner.?.peer.peer_supports_e2ee_group_current = true;
+
+    // Non-operator STATUS never discloses count gauges (privilege before read).
+    resetTestSendQ(sender);
+    try server.processLiveLine(sender_id, sender, "E2EEGROUP STATUS");
+    try expectContains(sender.send_buf[0..sender.send_len], " 481 Alice E2EEGROUP ");
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "custody=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "local_authoring=") == null);
+    resetTestSendQ(sender);
+
+    // OFF never depends on peer readiness and is idempotent.
+    try server.processLiveLine(oper_id, oper, "E2EEGROUP OFF");
+    try expectContains(oper.send_buf[0..oper.send_len], "local_authoring=OFF quiesced=1");
+    try std.testing.expect(!server.e2ee_group_local_authoring_enabled.load(.acquire));
+    resetTestSendQ(oper);
+
+    const Seed = struct {
+        fn admit(
+            srv: *Server,
+            identity: *const node_identity.NodeIdentity,
+            hlc: u64,
+            peers: []const u64,
+            ingress_peer: ?u64,
+        ) !e2ee_group_relay.RelayId {
+            var origin_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+            var origin_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+            var record = e2ee_group_relay.RelayRecord{
+                .kind = .commit,
+                .channel = "#seed",
+                .source_prefix = "Seed!seed@local",
+                .account = "seed",
+                .from_device = "device",
+                .payload = "AQIDBA",
+                .origin_node = identity.shortId(),
+                .hlc = hlc,
+            };
+            try e2ee_group_relay.stampOrigin(
+                srv.allocator,
+                &record,
+                &identity.sign_kp,
+                &origin_pubkey,
+                &origin_sig,
+            );
+            const wire = try e2ee_group_relay.encode(srv.allocator, record);
+            defer srv.allocator.free(wire);
+            const verified = switch (try srv.e2ee_group_mesh_authority.verifyRecord(
+                record,
+                srv.meshWallMs(),
+                mesh_clock_mod.default_max_future_skew_ms,
+            )) {
+                .verified => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            const admitted = try srv.e2ee_group_mesh_authority.admitAuthorizedWithCustodyAndIngress(
+                verified,
+                peers,
+                wire,
+                ingress_peer,
+                srv.meshWallMs() + e2ee_group_initial_retry_ms,
+            );
+            try std.testing.expectEqual(
+                std.meta.Tag(e2ee_group_mesh_authority.Admission).accepted,
+                std.meta.activeTag(admitted.admission),
+            );
+            return verified.relay_id;
+        }
+    };
+
+    // Seed independent outgoing custody and ingress-receipt obligations. The
+    // public surface exposes only their depths, never either RelayId or wire.
+    const custody_id = try Seed.admit(
+        &server,
+        &pair.ida,
+        server.nextMeshHlc(),
+        &.{pair.idb.shortId()},
+        null,
+    );
+    const receipt_id = try Seed.admit(
+        &server,
+        &pair.ida,
+        server.nextMeshHlc(),
+        &.{},
+        pair.idb.shortId(),
+    );
+    try server.processLiveLine(oper_id, oper, "E2EEGROUP STATUS");
+    try expectContains(
+        oper.send_buf[0..oper.send_len],
+        "local_authoring=OFF quiesced=1 current_peers=1 required_peers=1 activation_ready=1 custody=1 receipts=1 pending=2",
+    );
+    resetTestSendQ(oper);
+
+    var metrics: std.ArrayList(u8) = .empty;
+    defer metrics.deinit(alloc);
+    try server.writeE2eeGroupPrometheus(alloc, &metrics);
+    try expectContains(metrics.items, "onyx_e2ee_group_local_authoring_enabled 0");
+    try expectContains(metrics.items, "onyx_e2ee_group_current_capable_peers 1");
+    try expectContains(metrics.items, "onyx_e2ee_group_required_peers 1");
+    try expectContains(metrics.items, "onyx_e2ee_group_activation_ready 1");
+    try expectContains(metrics.items, "onyx_e2ee_group_hop_custody 1");
+    try expectContains(metrics.items, "onyx_e2ee_group_ingress_receipts 1");
+    try expectContains(metrics.items, "onyx_e2ee_group_pending 2");
+
+    // Quiesce never gates the authenticated receipt spine. A peer ACK retires
+    // outgoing custody and ACK_CONFIRM retires ingress receipt while authoring
+    // remains OFF.
+    try pair.b.sendE2eeGroupAck(custody_id);
+    const ack_wire = try alloc.dupe(u8, pair.b.outbound());
+    defer alloc.free(ack_wire);
+    pair.b.clearOutbound();
+    server.driveS2sSecured(peer_conn, &pair.a, ack_wire);
+    try pair.b.sendE2eeGroupAckConfirm(receipt_id);
+    const confirm_wire = try alloc.dupe(u8, pair.b.outbound());
+    defer alloc.free(confirm_wire);
+    pair.b.clearOutbound();
+    server.driveS2sSecured(peer_conn, &pair.a, confirm_wire);
+    const drained = server.e2eeGroupOperationalState();
+    try std.testing.expect(!drained.authoring_enabled);
+    try std.testing.expectEqual(@as(usize, 0), drained.custody);
+    try std.testing.expectEqual(@as(usize, 0), drained.receipts);
+    try std.testing.expectEqual(@as(usize, 0), drained.pending);
+
+    // A locally authored control is refused before nextMeshHlc, signing, replay
+    // admission, custody, or attachment delivery can mutate.
+    const authority_before = try server.e2ee_group_mesh_authority.encodeCheckpoint(alloc);
+    defer alloc.free(authority_before);
+    resetTestSendQ(sender);
+    resetTestSendQ(target);
+    try server.processLiveLine(
+        sender_id,
+        sender,
+        "E2EEGROUP #secure commit phone :AQIDBA",
+    );
+    try expectContains(sender.send_buf[0..sender.send_len], "WARN E2EEGROUP AUTHORING_QUIESCED");
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    const authority_after = try server.e2ee_group_mesh_authority.encodeCheckpoint(alloc);
+    defer alloc.free(authority_after);
+    try std.testing.expectEqualSlices(u8, authority_before, authority_after);
+
+    // Re-enabling restores the pre-quiesce live authoring path unchanged.
+    resetTestSendQ(oper);
+    try server.processLiveLine(oper_id, oper, "E2EEGROUP ON");
+    try expectContains(oper.send_buf[0..oper.send_len], "local_authoring=ON quiesced=0");
+    resetTestSendQ(sender);
+    try server.processLiveLine(
+        sender_id,
+        sender,
+        "E2EEGROUP #secure commit phone :AQIDBA",
+    );
+    try expectContains(
+        target.send_buf[0..target.send_len],
+        ":Alice!alice@localhost E2EE.COMMIT #secure phone :AQIDBA\r\n",
+    );
 }
 
 test "E2EEGROUP mesh live path accepts once refloods exact wire retries and retires exact peer ACK" {
@@ -63498,7 +64252,7 @@ test "stats node health summarizes peer and quorum state" {
     } else return error.SkipZigTest;
 }
 
-test "prometheus export includes mesh health gauges" {
+test "prometheus export includes mesh health and E2EEGROUP drain gauges" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -63521,6 +64275,14 @@ test "prometheus export includes mesh health gauges" {
         try std.testing.expect(std.mem.indexOf(u8, text, "onyx_mesh_components 2") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "onyx_mesh_peers_up 1") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "onyx_mesh_peers_total 2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_e2ee_group_local_authoring_enabled 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_e2ee_group_current_capable_peers 0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_e2ee_group_required_peers 0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_e2ee_group_activation_ready 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE onyx_e2ee_group_hop_custody gauge") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_e2ee_group_hop_custody 0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_e2ee_group_ingress_receipts 0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "onyx_e2ee_group_pending 0") != null);
     } else return error.SkipZigTest;
 }
 

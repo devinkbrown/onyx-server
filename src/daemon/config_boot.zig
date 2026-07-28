@@ -118,6 +118,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
         out.metrics_port = cfg.metrics.listen;
         if (parseIp4Host(cfg.metrics.bind)) |addr| out.metrics_bind_addr = addr;
     }
+    out.e2ee_group_authoring_enabled = cfg.e2ee.group_authoring_enabled;
     // [webhook] — Discord-compatible incoming webhook endpoint. Fully gated by
     // `enabled`; the bind defaults to loopback and widens only via an address.
     out.webhook_enabled = cfg.webhook.enabled;

@@ -101,14 +101,13 @@ Until the following land (or are proven present in the image under activation),
 | Blocker | Why |
 |---------|-----|
 | Enforceable mesh-wide E2EEGROUP authoring quiesce | Without a real operator control that fail-closes authoring on **all** dual-node units for the full barrier window, mixed v1/v2 authoring can still occur between restarts. Doc-only discipline is not enough. |
-| Custody/receipt observability | No dedicated first-class operator metric or control command today for E2EEGROUP hop-custody depth (peer+`RelayId`) or unsettled ingress receipt ledger (count / peer / `RelayId` / due ACK). Drain proofs need that surface (or already-shipped internal debug hooks of the running image—do not invent ad-hoc metrics/IRC commands). |
+| Custody/receipt observability | Source exposes count-only Prometheus gauges: `onyx_e2ee_group_hop_custody`, `onyx_e2ee_group_ingress_receipts`, and `onyx_e2ee_group_pending`. They are snapshotted under the E2EEGROUP authority mutex and disclose no payloads, relay IDs, or keys. Production activation still requires proving all three gauges are zero on both nodes before each cold stop. |
 
 ### Instrumentation note
 
-Treat **custody/receipt observability** as a pre-deploy instrumentation blocker for
-confident drain proofs. Operators must not invent ad-hoc metrics or IRC commands; prove
-drain from whatever internal debug hooks the running image already provides, or land
-explicit instrumentation before production activation.
+Treat the three E2EEGROUP gauges as the required pre-stop drain proof. Operators must not
+invent ad-hoc metrics or IRC commands: before each cold stop, prove all three gauges are
+zero on both nodes from the installed image.
 
 ### Not a pending-retirement blocker
 
