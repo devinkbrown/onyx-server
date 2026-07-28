@@ -36,6 +36,9 @@ pub const RelayVerb = s2s_peer.RelayVerb;
 pub const RelayMessageV2 = s2s_peer.RelayMessageV2;
 pub const RelayVerbV2 = s2s_peer.RelayVerbV2;
 pub const InboundMessageV2 = s2s_peer.InboundMessageV2;
+pub const E2eeGroupRelay = s2s_peer.E2eeGroupRelay;
+pub const E2eeGroupRelayId = s2s_peer.E2eeGroupRelayId;
+pub const InboundE2eeGroup = s2s_peer.InboundE2eeGroup;
 pub const SignedOperEventV2 = s2s_peer.SignedOperEventV2;
 pub const InboundOperEventV2 = s2s_peer.InboundOperEventV2;
 const channel_crdt = @import("../substrate/undertow/channel_crdt.zig");
@@ -560,6 +563,38 @@ pub const S2sLink = struct {
 
     pub fn takeInboundV2(self: *S2sLink) ![]s2s_peer.InboundMessageV2 {
         return self.peer.takeInboundV2();
+    }
+
+    pub fn supportsE2eeGroup(self: *const S2sLink) bool {
+        return self.peer.supportsE2eeGroup();
+    }
+
+    pub fn sendE2eeGroup(self: *S2sLink, record: E2eeGroupRelay) !void {
+        try self.peer.sendE2eeGroup(self.sink(), record);
+    }
+
+    pub fn forwardE2eeGroup(self: *S2sLink, wire: []const u8) !bool {
+        return self.peer.forwardE2eeGroup(self.sink(), wire);
+    }
+
+    pub fn replayRetainedE2eeGroupWire(self: *S2sLink, wire: []const u8) !void {
+        try self.peer.replayRetainedE2eeGroupWire(self.sink(), wire);
+    }
+
+    pub fn takeInboundE2eeGroup(self: *S2sLink) ![]InboundE2eeGroup {
+        return self.peer.takeInboundE2eeGroup();
+    }
+
+    pub fn probeE2eeGroupCurrent(self: *S2sLink) !void {
+        try self.peer.probeE2eeGroupCurrent(self.sink());
+    }
+
+    pub fn takeDroppedE2eeGroupFrames(self: *S2sLink) u64 {
+        return self.peer.takeDroppedE2eeGroupFrames();
+    }
+
+    pub fn takeRejectedE2eeGroupFrames(self: *S2sLink) u64 {
+        return self.peer.takeRejectedE2eeGroupFrames();
     }
 
     pub fn sendMessageV2Ack(self: *S2sLink, id: message_relay_v2.RelayId) !void {

@@ -21,6 +21,7 @@ const merkle = @import("merkle.zig");
 const peer_link = @import("peer_link.zig");
 const message_relay = @import("message_relay.zig");
 const message_relay_v2 = @import("message_relay_v2.zig");
+const e2ee_group_relay = @import("e2ee_group_relay.zig");
 const toml = @import("../../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
@@ -38,6 +39,8 @@ pub const InboundMessage = message_relay.Owned;
 pub const RelayVerb = message_relay.Verb;
 pub const RelayMessageV2 = message_relay_v2.RelayMessage;
 pub const RelayVerbV2 = message_relay_v2.Verb;
+pub const E2eeGroupRelay = e2ee_group_relay.RelayRecord;
+pub const E2eeGroupRelayId = e2ee_group_relay.RelayId;
 pub const SignedOperEventV2 = oper_event.SignedOperEventV2;
 pub const ChannelModeStateEvent = channel_mode_state_event.ChannelModeStateEvent;
 pub const LocalNickResolver = route_table.LocalNickResolver;
@@ -162,6 +165,8 @@ const relay_v2_extension_probe = "onyx-xcap-relay-v2-1?";
 const relay_v2_extension_reply = "onyx-xcap-relay-v2-1!";
 const relay_v2_ack_confirm_probe = "onyx-xcap-relay-v2-ack-confirm?";
 const relay_v2_ack_confirm_reply = "onyx-xcap-relay-v2-ack-confirm!";
+const e2ee_group_extension_probe = "onyx-xcap-e2ee-group-1?";
+const e2ee_group_extension_reply = "onyx-xcap-e2ee-group-1!";
 const session_replica_v3_probe = "onyx-xcap-session-replica-v3?";
 const session_replica_v3_reply = "onyx-xcap-session-replica-v3!";
 
@@ -317,6 +322,11 @@ pub const Config = struct {
     /// Per-link exact-event reflection cache. This is intentionally only a loop
     /// optimization; authoritative replay retirement is daemon-global.
     relay_v2_seen_capacity: usize = 4096,
+    /// Maximum verified E2EEGROUP controls staged for daemon-global replay
+    /// admission. The queue never evicts an earlier accepted control.
+    max_e2ee_group_frames: usize = 256,
+    /// Per-link E2EEGROUP reflection cache only. It is not replay authority.
+    e2ee_group_seen_capacity: usize = 4096,
     /// Maximum verified OPER_EVENT_V2 wires staged for daemon-global replay
     /// admission. This per-link queue never evicts an earlier accepted event.
     max_oper_event_v2_frames: usize = 256,
@@ -439,6 +449,21 @@ pub const InboundMessageV2 = struct {
     via_peer: NodeId,
 
     pub fn deinit(self: *InboundMessageV2, allocator: Allocator) void {
+        self.owned.deinit(allocator);
+        allocator.free(self.wire);
+        self.* = undefined;
+    }
+};
+
+/// One strictly decoded, origin-verified E2EEGROUP control plus the exact
+/// canonical inner wire image and authenticated immediate transport hop.
+pub const InboundE2eeGroup = struct {
+    owned: e2ee_group_relay.Owned,
+    wire: []u8,
+    relay_id: e2ee_group_relay.RelayId,
+    via_peer: NodeId,
+
+    pub fn deinit(self: *InboundE2eeGroup, allocator: Allocator) void {
         self.owned.deinit(allocator);
         allocator.free(self.wire);
         self.* = undefined;
@@ -577,6 +602,9 @@ pub const S2sPeer = struct {
     /// remain durable until the original sender explicitly confirms ACK receipt,
     /// instead of relying on a finite replay-window guess.
     peer_supports_relay_v2_ack_confirm: bool = false,
+    /// Remote answered the append-only E2EEGROUP schema probe. This is separate
+    /// from the full handshake byte and is valid only atop secure relay v2 base.
+    peer_supports_e2ee_group_current: bool = false,
     /// Remote advertised frame signing plus the explicit event-spine-v2 bit.
     peer_supports_event_spine_v2: bool = false,
     /// Daemon-supplied residence-proof verifier (Design C / F1). Null (default,
@@ -609,6 +637,10 @@ pub const S2sPeer = struct {
     inbound_v2_ack_confirms: std.ArrayListUnmanaged(message_relay_v2.RelayId) = .empty,
     dropped_relay_v2_frames: u64 = 0,
     rejected_relay_v2_frames: u64 = 0,
+    /// Verified opaque group controls awaiting daemon-global replay admission.
+    inbound_e2ee_group: std.ArrayListUnmanaged(InboundE2eeGroup) = .empty,
+    dropped_e2ee_group_frames: u64 = 0,
+    rejected_e2ee_group_frames: u64 = 0,
     /// Inbound signed oper-grant payloads (raw oper_cred_share bytes) decoded
     /// from OPER_GRANT frames, awaiting the daemon to verify + ingest them.
     inbound_grants: std.ArrayListUnmanaged([]u8) = .empty,
@@ -702,6 +734,8 @@ pub const S2sPeer = struct {
     seen: message_relay.SeenSet,
     /// Per-link reflection cache only; not authoritative replay protection.
     seen_v2: message_relay_v2.SeenSet,
+    /// Per-link E2EEGROUP reflection cache only; never replay authority.
+    seen_e2ee_group: message_relay_v2.SeenSet,
     /// Event Spine v2 per-link reflection cache only. Never a replay authority.
     seen_oper_event_v2: message_relay_v2.SeenSet,
 
@@ -758,6 +792,7 @@ pub const S2sPeer = struct {
             .event_spine_v2_transport_enabled = options.event_spine_v2_transport_enabled,
             .seen = message_relay.SeenSet.init(options.allocator, 1024),
             .seen_v2 = message_relay_v2.SeenSet.init(options.allocator, options.config.relay_v2_seen_capacity),
+            .seen_e2ee_group = message_relay_v2.SeenSet.init(options.allocator, options.config.e2ee_group_seen_capacity),
             .seen_oper_event_v2 = message_relay_v2.SeenSet.init(options.allocator, options.config.oper_event_v2_seen_capacity),
         };
     }
@@ -914,6 +949,7 @@ pub const S2sPeer = struct {
             .event_spine_v2_transport_enabled = options.event_spine_v2_transport_enabled,
             .seen = message_relay.SeenSet.init(options.allocator, 1024),
             .seen_v2 = message_relay_v2.SeenSet.init(options.allocator, options.config.relay_v2_seen_capacity),
+            .seen_e2ee_group = message_relay_v2.SeenSet.init(options.allocator, options.config.e2ee_group_seen_capacity),
             .seen_oper_event_v2 = message_relay_v2.SeenSet.init(options.allocator, options.config.oper_event_v2_seen_capacity),
         };
     }
@@ -925,6 +961,8 @@ pub const S2sPeer = struct {
         self.inbound_v2.deinit(self.allocator);
         self.inbound_v2_acks.deinit(self.allocator);
         self.inbound_v2_ack_confirms.deinit(self.allocator);
+        for (self.inbound_e2ee_group.items) |*record| record.deinit(self.allocator);
+        self.inbound_e2ee_group.deinit(self.allocator);
         for (self.inbound_grants.items) |g| self.allocator.free(g);
         self.inbound_grants.deinit(self.allocator);
         for (self.membership_changes.items) |*d| d.deinit(self.allocator);
@@ -971,6 +1009,7 @@ pub const S2sPeer = struct {
         self.media_ws_datagrams.deinit(self.allocator);
         self.seen.deinit();
         self.seen_v2.deinit();
+        self.seen_e2ee_group.deinit();
         self.seen_oper_event_v2.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -1200,6 +1239,9 @@ pub const S2sPeer = struct {
                     try emitFrame(self.allocator, sink, .PONG, relay_v2_extension_reply);
                 if (std.mem.eql(u8, frame.payload, relay_v2_ack_confirm_probe))
                     try emitFrame(self.allocator, sink, .PONG, relay_v2_ack_confirm_reply);
+                if (std.mem.eql(u8, frame.payload, e2ee_group_extension_probe) and
+                    self.supportsSecureRelayV2Base())
+                    try emitFrame(self.allocator, sink, .PONG, e2ee_group_extension_reply);
                 if (std.mem.eql(u8, frame.payload, session_replica_v3_probe) and
                     self.session_replica_attachment_transport_enabled and
                     self.session_replica_transport_enabled and self.signing_key != null and
@@ -1217,6 +1259,9 @@ pub const S2sPeer = struct {
                 if (std.mem.eql(u8, frame.payload, relay_v2_ack_confirm_reply) and
                     self.peer_supports_secure_relay_v2)
                     self.peer_supports_relay_v2_ack_confirm = true;
+                if (std.mem.eql(u8, frame.payload, e2ee_group_extension_reply) and
+                    self.supportsSecureRelayV2Base())
+                    self.peer_supports_e2ee_group_current = true;
                 if (std.mem.eql(u8, frame.payload, session_replica_v3_reply) and
                     self.session_replica_attachment_transport_enabled and
                     self.peer_supports_signing and self.peer_supports_session_replica_v2)
@@ -1239,6 +1284,7 @@ pub const S2sPeer = struct {
             .MESSAGE => try self.recvMessage(frame.payload),
             .MESSAGE_V2 => try self.recvMessageV2(frame.payload),
             .MESSAGE_V2_ACK => try self.recvMessageV2Ack(frame.payload),
+            .E2EE_GROUP => try self.recvE2eeGroup(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
             .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
             .ENTITY_PROP => try self.recvEntityProp(frame.payload),
@@ -2141,6 +2187,173 @@ pub const S2sPeer = struct {
     /// item and frees the returned slice.
     pub fn takeInboundV2(self: *S2sPeer) ![]InboundMessageV2 {
         return self.inbound_v2.toOwnedSlice(self.allocator);
+    }
+
+    pub fn supportsE2eeGroup(self: *const S2sPeer) bool {
+        return self.supportsSecureRelayV2Base() and self.peer_supports_e2ee_group_current;
+    }
+
+    fn requireE2eeGroup(self: *const S2sPeer) !void {
+        if (!self.established) return error.NotEstablished;
+        if (!self.secure_relay_transport_enabled or self.signing_key == null or
+            !self.peer_supports_signing)
+            return error.SecuredLinkRequired;
+        if (!self.peer_supports_secure_relay_v2 or
+            !self.peer_supports_e2ee_group_current)
+            return error.CapabilityNotNegotiated;
+    }
+
+    const VerifiedE2eeGroup = struct {
+        owned: e2ee_group_relay.Owned,
+        relay_id: e2ee_group_relay.RelayId,
+    };
+
+    /// Decode only the one canonical wire image and verify the immutable origin
+    /// signature before returning a RelayId. Allocation failure remains
+    /// recoverable and explicit; all attacker-controlled structural failures
+    /// collapse to InvalidE2eeGroup.
+    fn decodeVerifiedE2eeGroup(self: *S2sPeer, wire: []const u8) !VerifiedE2eeGroup {
+        var owned = e2ee_group_relay.decode(self.allocator, wire) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidE2eeGroup,
+        };
+        errdefer owned.deinit(self.allocator);
+        const relay_id = switch (try e2ee_group_relay.verifyAndRelayId(self.allocator, owned.record)) {
+            .verified => |id| id,
+            .origin_mismatch => return error.OriginMismatch,
+            .bad_signature => return error.BadOriginSignature,
+            .invalid_semantic => return error.InvalidE2eeGroup,
+        };
+        const canonical = e2ee_group_relay.encode(self.allocator, owned.record) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidE2eeGroup,
+        };
+        defer self.allocator.free(canonical);
+        if (!std.mem.eql(u8, canonical, wire)) return error.NonCanonicalE2eeGroup;
+        return .{ .owned = owned, .relay_id = relay_id };
+    }
+
+    /// Hop-authenticate, strictly decode, canonicalize, and origin-verify before
+    /// touching queue or reflection state. Malformed and tampered inputs soft
+    /// drop; OOM and bounded-queue backpressure remain visible to the caller.
+    fn recvE2eeGroup(self: *S2sPeer, outer_payload: []const u8) !void {
+        if (!self.supportsE2eeGroup()) {
+            self.rejected_e2ee_group_frames +|= 1;
+            return;
+        }
+        const payload = self.verifiedPayload(.E2EE_GROUP, outer_payload) orelse {
+            self.rejected_e2ee_group_frames +|= 1;
+            return;
+        };
+        var verified = self.decodeVerifiedE2eeGroup(payload) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                self.rejected_e2ee_group_frames +|= 1;
+                return;
+            },
+        };
+        if (self.inbound_e2ee_group.items.len >= self.config.max_e2ee_group_frames) {
+            self.dropped_e2ee_group_frames +|= 1;
+            verified.owned.deinit(self.allocator);
+            return error.E2eeGroupBackpressure;
+        }
+        const wire = self.allocator.dupe(u8, payload) catch |err| {
+            self.dropped_e2ee_group_frames +|= 1;
+            verified.owned.deinit(self.allocator);
+            return err;
+        };
+        self.inbound_e2ee_group.append(self.allocator, .{
+            .owned = verified.owned,
+            .wire = wire,
+            .relay_id = verified.relay_id,
+            .via_peer = self.remote_node_id,
+        }) catch |err| {
+            self.dropped_e2ee_group_frames +|= 1;
+            self.allocator.free(wire);
+            verified.owned.deinit(self.allocator);
+            return err;
+        };
+        // Reflection optimization only. Same-leg retries still queue for the
+        // daemon's authoritative global replay admission.
+        _ = self.seen_e2ee_group.observe(verified.relay_id);
+    }
+
+    /// Send one already origin-stamped E2EEGROUP control in canonical form.
+    pub fn sendE2eeGroup(
+        self: *S2sPeer,
+        sink: ByteSink,
+        record: e2ee_group_relay.RelayRecord,
+    ) !void {
+        try self.requireE2eeGroup();
+        const relay_id = switch (try e2ee_group_relay.verifyAndRelayId(self.allocator, record)) {
+            .verified => |id| id,
+            .origin_mismatch => return error.OriginMismatch,
+            .bad_signature => return error.BadOriginSignature,
+            .invalid_semantic => return error.InvalidE2eeGroup,
+        };
+        const wire = try e2ee_group_relay.encode(self.allocator, record);
+        defer self.allocator.free(wire);
+        try self.sendE2eeGroupWire(sink, wire, relay_id);
+    }
+
+    /// Forward the exact canonical inner bytes. Validation happens before the
+    /// link-local reflection cache, so forged identities cannot poison it.
+    pub fn forwardE2eeGroup(self: *S2sPeer, sink: ByteSink, wire: []const u8) !bool {
+        try self.requireE2eeGroup();
+        var verified = try self.decodeVerifiedE2eeGroup(wire);
+        defer verified.owned.deinit(self.allocator);
+        if (self.seen_e2ee_group.contains(verified.relay_id)) return false;
+        try self.sendE2eeGroupWire(sink, wire, verified.relay_id);
+        return true;
+    }
+
+    /// Retransmit a retained exact wire after recoverable downstream failure.
+    /// Strict canonical/origin validation and negotiated transport gates still
+    /// apply, but the reflection cache is deliberately not delivery proof and
+    /// therefore cannot suppress this retry.
+    pub fn replayRetainedE2eeGroupWire(
+        self: *S2sPeer,
+        sink: ByteSink,
+        wire: []const u8,
+    ) !void {
+        try self.requireE2eeGroup();
+        var verified = try self.decodeVerifiedE2eeGroup(wire);
+        defer verified.owned.deinit(self.allocator);
+        try self.sendE2eeGroupWire(sink, wire, verified.relay_id);
+    }
+
+    fn sendE2eeGroupWire(
+        self: *S2sPeer,
+        sink: ByteSink,
+        wire: []const u8,
+        relay_id: e2ee_group_relay.RelayId,
+    ) !void {
+        const framed_len = s2s_frame.header_len + signed_frame.header_len + wire.len;
+        if (framed_len > self.config.max_frame_size) return error.PayloadTooLarge;
+        try self.emitSignable(sink, .E2EE_GROUP, wire);
+        _ = self.seen_e2ee_group.observe(relay_id);
+    }
+
+    pub fn takeInboundE2eeGroup(self: *S2sPeer) ![]InboundE2eeGroup {
+        return self.inbound_e2ee_group.toOwnedSlice(self.allocator);
+    }
+
+    /// Re-negotiate the append-only E2EEGROUP schema after Helix resume. An old
+    /// peer sees only an ordinary bounded PING and never receives tag 0x26.
+    pub fn probeE2eeGroupCurrent(self: *S2sPeer, sink: ByteSink) !void {
+        if (!self.established) return error.NotEstablished;
+        if (!self.supportsSecureRelayV2Base()) return;
+        try emitFrame(self.allocator, sink, .PING, e2ee_group_extension_probe);
+    }
+
+    pub fn takeDroppedE2eeGroupFrames(self: *S2sPeer) u64 {
+        defer self.dropped_e2ee_group_frames = 0;
+        return self.dropped_e2ee_group_frames;
+    }
+
+    pub fn takeRejectedE2eeGroupFrames(self: *S2sPeer) u64 {
+        defer self.rejected_e2ee_group_frames = 0;
+        return self.rejected_e2ee_group_frames;
     }
 
     pub fn sendMessageV2Ack(self: *S2sPeer, sink: ByteSink, id: message_relay_v2.RelayId) !void {
@@ -3662,6 +3875,9 @@ pub const S2sPeer = struct {
         if (self.established and !had_attachment_lease_v2 and self.peer_supports_session_attachment_lease_v2)
             self.resync_requested = true;
         self.peer_supports_secure_relay_v2 = self.peer_supports_signing and (hs.caps & cap_secure_relay_v2) != 0;
+        // The fixed handshake byte only establishes the secured relay base.
+        // Re-authorize the current E2EEGROUP schema on every handshake.
+        self.peer_supports_e2ee_group_current = false;
         self.peer_supports_event_spine_v2 = self.peer_supports_signing and (hs.caps & cap_event_spine_v2) != 0;
         if (self.signedFramesRequired() and !self.peer_supports_signing) {
             return error.SignedFramesRequired;
@@ -3675,6 +3891,13 @@ pub const S2sPeer = struct {
             self.established = true;
             try self.emitBurst(sink);
         }
+        // The handshake capability byte is full, so every received handshake
+        // invalidates the append-only E2EEGROUP extension above and must trigger
+        // a fresh bounded proof once the secured relay base is established. This
+        // covers reciprocal RESYNC handshakes where `handshake_sent` is already
+        // true, while a same-socket Helix downgrade remains fail-closed.
+        if (self.supportsSecureRelayV2Base())
+            try emitFrame(self.allocator, sink, .PING, e2ee_group_extension_probe);
     }
 
     fn rememberRemote(self: *S2sPeer, hs: Handshake, now_ms: u64) !void {
@@ -5128,6 +5351,27 @@ fn stampedRelayV2(
     return msg;
 }
 
+fn stampedE2eeGroup(
+    allocator: Allocator,
+    kp: *const sign.KeyPair,
+    hlc: u64,
+    pubkey: *[e2ee_group_relay.pubkey_len]u8,
+    signature: *[e2ee_group_relay.sig_len]u8,
+) !e2ee_group_relay.RelayRecord {
+    var record = e2ee_group_relay.RelayRecord{
+        .kind = .commit,
+        .channel = "#root",
+        .source_prefix = "alice!u@example.invalid",
+        .account = "alice",
+        .from_device = "laptop.1",
+        .payload = "AQIDBA",
+        .origin_node = signed_frame.originShortId(kp.public_key),
+        .hlc = hlc,
+    };
+    try e2ee_group_relay.stampOrigin(allocator, &record, kp, pubkey, signature);
+    return record;
+}
+
 fn stampedOperEventV2(
     kp: *const sign.KeyPair,
     hlc: u64,
@@ -5145,6 +5389,207 @@ fn stampedOperEventV2(
     };
     try oper_event.stampOrigin(&event, kp, pubkey, signature);
     return event;
+}
+
+test "E2EEGROUP negotiation gates valid canonical receive and rejects unsigned tampered wire" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x91);
+    const kp_b = try signingKeyFor(0x92);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.secure_relay_transport_enabled = true;
+    b.secure_relay_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6410);
+    try std.testing.expect(a.supportsE2eeGroup());
+    try std.testing.expect(b.supportsE2eeGroup());
+    try a.sendResync(a_to_b.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6411);
+    try std.testing.expect(a.supportsE2eeGroup());
+    try std.testing.expect(b.supportsE2eeGroup());
+
+    var pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var signature: [e2ee_group_relay.sig_len]u8 = undefined;
+    const valid = try stampedE2eeGroup(allocator, &a.signing_key.?, 700, &pubkey, &signature);
+    const valid_wire = try e2ee_group_relay.encode(allocator, valid);
+    defer allocator.free(valid_wire);
+    const valid_id = switch (try e2ee_group_relay.verifyAndRelayId(allocator, valid)) {
+        .verified => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+    a.peer_supports_e2ee_group_current = false;
+    try std.testing.expectError(
+        error.CapabilityNotNegotiated,
+        a.sendE2eeGroup(a_to_b.sink(), valid),
+    );
+    try std.testing.expectEqual(@as(usize, 0), a_to_b.bytes.items.len);
+    a.peer_supports_e2ee_group_current = true;
+
+    // Negotiated signing makes a raw inner record an invalid hop envelope.
+    try emitFrame(allocator, a_to_b.sink(), .E2EE_GROUP, valid_wire);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6412);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedE2eeGroupFrames());
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
+
+    // A valid outer hop cannot rescue a tampered immutable origin signature.
+    var tampered = valid;
+    tampered.payload = "tampered";
+    const tampered_wire = try e2ee_group_relay.encode(allocator, tampered);
+    defer allocator.free(tampered_wire);
+    try a.emitSignable(a_to_b.sink(), .E2EE_GROUP, tampered_wire);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6413);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedE2eeGroupFrames());
+
+    // An overlong two-byte map-count varint is structurally equivalent to the
+    // canonical one-byte count, but CoilPack must reject that wire image.
+    const noncanonical = try allocator.alloc(u8, valid_wire.len + 1);
+    defer allocator.free(noncanonical);
+    noncanonical[0] = valid_wire[0];
+    noncanonical[1] = valid_wire[1] | 0x80;
+    noncanonical[2] = 0;
+    @memcpy(noncanonical[3..], valid_wire[2..]);
+    try a.emitSignable(a_to_b.sink(), .E2EE_GROUP, noncanonical);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6414);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedE2eeGroupFrames());
+
+    // Invalid claims never reserve the later authentic RelayId.
+    try a.sendE2eeGroup(a_to_b.sink(), valid);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6415);
+    const inbound = try b.takeInboundE2eeGroup();
+    defer {
+        for (inbound) |*item| item.deinit(allocator);
+        allocator.free(inbound);
+    }
+    try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    try std.testing.expectEqual(valid_id, inbound[0].relay_id);
+    try std.testing.expectEqual(a_short, inbound[0].via_peer);
+    try std.testing.expectEqualSlices(u8, valid_wire, inbound[0].wire);
+    try std.testing.expectEqualStrings("AQIDBA", inbound[0].owned.record.payload);
+    try std.testing.expect(!(try b.forwardE2eeGroup(b_to_a.sink(), inbound[0].wire)));
+    try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
+}
+
+test "E2EEGROUP forwarding is byte-identical across transit and queue backpressure is retryable" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_ab_state = ChannelCrdt.init(allocator, 2);
+    defer b_ab_state.deinit();
+    var b_bc_state = ChannelCrdt.init(allocator, 3);
+    defer b_bc_state.deinit();
+    var c_state = ChannelCrdt.init(allocator, 4);
+    defer c_state.deinit();
+    const kp_a = try signingKeyFor(0x93);
+    const kp_b_ab = try signingKeyFor(0x94);
+    const kp_b_bc = try signingKeyFor(0x94);
+    const kp_c = try signingKeyFor(0x95);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b_ab.public_key);
+    const c_node = signed_frame.originShortId(kp_c.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b_from_a = try newSigningPeer(allocator, &b_ab_state, &tc, kp_b_ab, a_short, 2000, "b.test");
+    defer b_from_a.deinit();
+    var b_to_c = try newSigningPeer(allocator, &b_bc_state, &tc, kp_b_bc, c_node, 2000, "b.test");
+    defer b_to_c.deinit();
+    var c = try newSigningPeer(allocator, &c_state, &tc, kp_c, b_short, 3000, "c.test");
+    defer c.deinit();
+    a.secure_relay_transport_enabled = true;
+    b_from_a.secure_relay_transport_enabled = true;
+    b_to_c.secure_relay_transport_enabled = true;
+    c.secure_relay_transport_enabled = true;
+    c.config.max_e2ee_group_frames = 1;
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b_from_a.startHandshake(b_to_a.sink());
+    try pump(&a, &b_from_a, &a_to_b, &b_to_a, tc.now_ms, 0x6420);
+    var b_to_c_wire = BufferSink{};
+    defer b_to_c_wire.deinit(allocator);
+    var c_to_b_wire = BufferSink{};
+    defer c_to_b_wire.deinit(allocator);
+    try b_to_c.startHandshake(b_to_c_wire.sink());
+    try c.startHandshake(c_to_b_wire.sink());
+    try pump(&b_to_c, &c, &b_to_c_wire, &c_to_b_wire, tc.now_ms, 0x6421);
+
+    var pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var signature: [e2ee_group_relay.sig_len]u8 = undefined;
+    const first = try stampedE2eeGroup(allocator, &a.signing_key.?, 701, &pubkey, &signature);
+    try a.sendE2eeGroup(a_to_b.sink(), first);
+    try pump(&a, &b_from_a, &a_to_b, &b_to_a, tc.now_ms, 0x6422);
+    const at_b = try b_from_a.takeInboundE2eeGroup();
+    defer {
+        for (at_b) |*item| item.deinit(allocator);
+        allocator.free(at_b);
+    }
+    try std.testing.expectEqual(@as(usize, 1), at_b.len);
+    try std.testing.expect(!(try b_from_a.forwardE2eeGroup(b_to_a.sink(), at_b[0].wire)));
+    try std.testing.expect(try b_to_c.forwardE2eeGroup(b_to_c_wire.sink(), at_b[0].wire));
+    try pump(&b_to_c, &c, &b_to_c_wire, &c_to_b_wire, tc.now_ms, 0x6423);
+    const at_c = try c.takeInboundE2eeGroup();
+    defer {
+        for (at_c) |*item| item.deinit(allocator);
+        allocator.free(at_c);
+    }
+    try std.testing.expectEqual(@as(usize, 1), at_c.len);
+    try std.testing.expectEqualSlices(u8, at_b[0].wire, at_c[0].wire);
+    try std.testing.expectEqual(b_short, at_c[0].via_peer);
+    try std.testing.expectEqual(a_short, at_c[0].owned.record.origin_node);
+
+    // Keep one accepted record queued, reject the next with explicit
+    // backpressure, then prove draining allows the exact record to retry.
+    var pubkey2: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var signature2: [e2ee_group_relay.sig_len]u8 = undefined;
+    const second = try stampedE2eeGroup(allocator, &a.signing_key.?, 702, &pubkey2, &signature2);
+    const second_wire = try e2ee_group_relay.encode(allocator, second);
+    defer allocator.free(second_wire);
+    try std.testing.expect(try b_to_c.forwardE2eeGroup(b_to_c_wire.sink(), second_wire));
+    var pubkey3: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var signature3: [e2ee_group_relay.sig_len]u8 = undefined;
+    const third = try stampedE2eeGroup(allocator, &a.signing_key.?, 703, &pubkey3, &signature3);
+    const third_wire = try e2ee_group_relay.encode(allocator, third);
+    defer allocator.free(third_wire);
+    try std.testing.expect(try b_to_c.forwardE2eeGroup(b_to_c_wire.sink(), third_wire));
+    try std.testing.expectError(
+        error.E2eeGroupBackpressure,
+        pump(&b_to_c, &c, &b_to_c_wire, &c_to_b_wire, tc.now_ms, 0x6424),
+    );
+    b_to_c_wire.clear();
+    try std.testing.expectEqual(@as(u64, 1), c.takeDroppedE2eeGroupFrames());
+    const queued = try c.takeInboundE2eeGroup();
+    defer {
+        for (queued) |*item| item.deinit(allocator);
+        allocator.free(queued);
+    }
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    try std.testing.expectEqual(@as(u64, 702), queued[0].owned.record.hlc);
+    try b_to_c.replayRetainedE2eeGroupWire(b_to_c_wire.sink(), third_wire);
+    try pump(&b_to_c, &c, &b_to_c_wire, &c_to_b_wire, tc.now_ms, 0x6425);
+    const retried = try c.takeInboundE2eeGroup();
+    defer {
+        for (retried) |*item| item.deinit(allocator);
+        allocator.free(retried);
+    }
+    try std.testing.expectEqual(@as(usize, 1), retried.len);
+    try std.testing.expectEqual(@as(u64, 703), retried[0].owned.record.hlc);
 }
 
 test "secure relay v2 negotiates only on secured peers and round-trips once" {
@@ -8286,7 +8731,7 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .OPER_EVENT,          .OBSERVE_EVENT,          .KILL,                     .WARD,                             .RESYNC,
         .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .MEMO_PUSH,                        .SESSION_REPLICA_OFFER,
         .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE, .OPER_EVENT_V2,
-        .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,
+        .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,      .E2EE_GROUP,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug

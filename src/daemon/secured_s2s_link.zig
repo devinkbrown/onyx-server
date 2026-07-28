@@ -36,6 +36,7 @@ const session_replica_frame = @import("../proto/session_replica_frame.zig");
 const signed_frame = @import("../substrate/undertow/signed_frame.zig");
 const s2s_peer = @import("../substrate/undertow/s2s_peer.zig");
 const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
+const e2ee_group_relay = @import("../substrate/undertow/e2ee_group_relay.zig");
 const partition_detector = @import("../substrate/undertow/partition_detector.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
 const oper_event = @import("../proto/oper_event.zig");
@@ -762,6 +763,55 @@ pub const SecuredLink = struct {
     pub fn takeInboundV2(self: *SecuredLink) anyerror![]s2s_link.InboundMessageV2 {
         const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundMessageV2, 0);
         return link.takeInboundV2();
+    }
+
+    pub fn supportsE2eeGroup(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsE2eeGroup();
+    }
+
+    pub fn sendE2eeGroup(self: *SecuredLink, record: s2s_link.E2eeGroupRelay) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendE2eeGroup(record);
+        try self.drainInner();
+    }
+
+    pub fn forwardE2eeGroup(self: *SecuredLink, wire: []const u8) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.forwardE2eeGroup(wire);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn replayRetainedE2eeGroupWire(
+        self: *SecuredLink,
+        wire: []const u8,
+    ) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.replayRetainedE2eeGroupWire(wire);
+        try self.drainInner();
+    }
+
+    pub fn takeInboundE2eeGroup(self: *SecuredLink) anyerror![]s2s_link.InboundE2eeGroup {
+        const link = self.inner orelse
+            return self.allocator.alloc(s2s_link.InboundE2eeGroup, 0);
+        return link.takeInboundE2eeGroup();
+    }
+
+    pub fn probeE2eeGroupCurrent(self: *SecuredLink) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.probeE2eeGroupCurrent();
+        try self.drainInner();
+    }
+
+    pub fn takeDroppedE2eeGroupFrames(self: *SecuredLink) u64 {
+        const link = self.inner orelse return 0;
+        return link.takeDroppedE2eeGroupFrames();
+    }
+
+    pub fn takeRejectedE2eeGroupFrames(self: *SecuredLink) u64 {
+        const link = self.inner orelse return 0;
+        return link.takeRejectedE2eeGroupFrames();
     }
 
     pub fn sendMessageV2Ack(self: *SecuredLink, id: message_relay_v2.RelayId) anyerror!void {
@@ -1595,6 +1645,53 @@ const FixedSessionTokenResolver = struct {
         return .{ .ctx = self, .resolve_fn = resolve };
     }
 };
+
+test "E2EEGROUP is negotiated encrypted and drained through SecuredLink" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    try testing.expect(p.a.supportsE2eeGroup());
+    try testing.expect(p.b.supportsE2eeGroup());
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+
+    var pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var signature: [e2ee_group_relay.sig_len]u8 = undefined;
+    var record = e2ee_group_relay.RelayRecord{
+        .kind = .commit,
+        .channel = "#root",
+        .source_prefix = "alice!u@example.invalid",
+        .account = "alice",
+        .from_device = "laptop.1",
+        .payload = "AQIDBA",
+        .origin_node = p.ida.shortId(),
+        .hlc = 900,
+    };
+    try e2ee_group_relay.stampOrigin(
+        testing.allocator,
+        &record,
+        &p.ida.sign_kp,
+        &pubkey,
+        &signature,
+    );
+    try p.a.sendE2eeGroup(record);
+    try testing.expect(p.a.outbound().len != 0);
+    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), record.payload) == null);
+    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), record.channel) == null);
+    try pump(&p.a, &p.b, false);
+
+    const inbound = try p.b.takeInboundE2eeGroup();
+    defer {
+        for (inbound) |*item| item.deinit(testing.allocator);
+        testing.allocator.free(inbound);
+    }
+    try testing.expectEqual(@as(usize, 1), inbound.len);
+    try testing.expectEqual(p.ida.shortId(), inbound[0].via_peer);
+    try testing.expectEqualStrings("#root", inbound[0].owned.record.channel);
+    try testing.expectEqual(
+        e2ee_group_relay.VerifyAndIdOutcome{ .verified = inbound[0].relay_id },
+        try e2ee_group_relay.verifyAndRelayId(testing.allocator, inbound[0].owned.record),
+    );
+}
 
 test "secure relay v2 is negotiated encrypted and drained through SecuredLink" {
     var p = try EstablishedPair.init();
