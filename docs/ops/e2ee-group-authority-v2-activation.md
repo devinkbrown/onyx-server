@@ -71,7 +71,7 @@ Live Helix USR2 from a pre-marker / pre-EGRG binary will refuse this image
 2. **Drain** E2EEGROUP hop custody and prove unsettled ingress receipts are
    acceptable to drop (cold boot does not restore them). There is **no**
    durable adopt of EGRG on this path.
-3. **Stop** `orochi.service` on **one** node only.
+3. **Stop** `onyx-server.service` on **one** node only.
 4. Install the new binary/config, then **start** the node.
 5. Confirm mesh health (`links_active`, secured S2S). **Do not** lift the authoring
    barrier. The peer is still pre-v2 for E2EEGROUP current; mixed authoring remains forbidden.
