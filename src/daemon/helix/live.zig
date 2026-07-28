@@ -276,7 +276,7 @@ pub const max_inherited_state_fds = 4096;
 /// `was_websocket` discriminator; a target lacking it must never receive fds.
 pub const upgrade_capability_arg = "--helix-upgrade-capabilities-v1";
 const upgrade_capability_caps =
-    "attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2";
+    "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2";
 pub const upgrade_capability_token =
     "ONYX_HELIX_UPGRADE_CAPS=" ++ upgrade_capability_caps;
 
@@ -1071,6 +1071,15 @@ test "upgrade capability token must occupy a complete output line" {
     try std.testing.expect(!hasUpgradeCapabilityLine(
         "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
     ));
+    // HEAD predecessor without e2ee-group-authority-v2 must refuse this target
+    // before exec: EGRG no longer seals completed receipts, and admit freezes
+    // event-time peer custody on first accept only.
+    try std.testing.expect(!hasUpgradeCapabilityLine(
+        "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2\n",
+    ));
+    // Exact current token (including e2ee-group-authority-v2) remains accepted.
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "e2ee-group-authority-v2") != null);
     // A predecessor that predates whole-arena integrity or exact
     // World/history/webhook ownership must refuse the new handoff contract;
     // operators can still cold-restart it.

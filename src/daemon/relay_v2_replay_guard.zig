@@ -83,6 +83,18 @@ pub const Probe = union(enum) {
     invalid_semantic,
 };
 
+/// Allocation-free identity lookup against the greatest-W window / watermark.
+/// Does not authenticate, admit, or mutate. `duplicate` proves the RelayId is
+/// still retained in the live window. `retired` is not accept-proof (covers
+/// never-admitted too-old events). Pending-exact beyond-window proof is owned
+/// by higher layers (E2EEGROUP), not RVG2.
+pub const IdentityLookup = enum {
+    unseen,
+    duplicate,
+    equivocation,
+    retired,
+};
+
 pub const InitError = error{InvalidConfig};
 
 pub const CheckpointError = std.mem.Allocator.Error || error{
@@ -230,6 +242,46 @@ pub const Guard = struct {
         return .accepted;
     }
 
+    /// Allocation-free greatest-W / watermark lookup. Never mutates.
+    pub fn probeIdentity(
+        self: *const Guard,
+        pubkey: PublicKey,
+        hlc: u64,
+        relay_id: RelayId,
+    ) IdentityLookup {
+        const origin = self.origins.get(pubkey) orelse return .unseen;
+        if (origin.retired_through_hlc) |watermark| {
+            if (hlc <= watermark) return .retired;
+        }
+        const index = lowerBound(origin.entries.items, hlc);
+        if (index < origin.entries.items.len and origin.entries.items[index].hlc == hlc) {
+            return if (std.mem.eql(u8, &origin.entries.items[index].relay_id, &relay_id))
+                .duplicate
+            else
+                .equivocation;
+        }
+        return .unseen;
+    }
+
+    /// Ordered origin public keys (canonical RVG2 checkpoint order).
+    pub fn orderedOriginPubkeys(
+        self: *const Guard,
+        allocator: std.mem.Allocator,
+    ) CheckpointError![]PublicKey {
+        const count = self.origins.count();
+        var keys = try allocator.alloc(PublicKey, count);
+        errdefer allocator.free(keys);
+        var it = self.origins.keyIterator();
+        var index: usize = 0;
+        while (it.next()) |key| : (index += 1) keys[index] = key.*;
+        std.mem.sort(PublicKey, keys, {}, struct {
+            fn less(_: void, a: PublicKey, b: PublicKey) bool {
+                return std.mem.lessThan(u8, &a, &b);
+            }
+        }.less);
+        return keys;
+    }
+
     /// Verify the immutable author and derive its relay identity exactly once,
     /// then enter that identity into durable replay authority. Invalid origin
     /// objects cannot mutate the guard or poison a later valid message.
@@ -268,17 +320,12 @@ pub const Guard = struct {
             .invalid_semantic => return .invalid_semantic,
         };
         const pubkey: PublicKey = msg.origin_pubkey[0..@sizeOf(PublicKey)].*;
-        const origin = self.origins.get(pubkey) orelse return .{ .unseen = relay_id };
-        if (origin.retired_through_hlc) |watermark| {
-            if (msg.hlc <= watermark) return .{ .retired = relay_id };
-        }
-        const index = lowerBound(origin.entries.items, msg.hlc);
-        if (index >= origin.entries.items.len or origin.entries.items[index].hlc != msg.hlc)
-            return .{ .unseen = relay_id };
-        return if (std.mem.eql(u8, &origin.entries.items[index].relay_id, &relay_id))
-            .{ .duplicate = relay_id }
-        else
-            .equivocation;
+        return switch (self.probeIdentity(pubkey, msg.hlc, relay_id)) {
+            .unseen => .{ .unseen = relay_id },
+            .duplicate => .{ .duplicate = relay_id },
+            .equivocation => .equivocation,
+            .retired => .{ .retired = relay_id },
+        };
     }
 
     /// Canonical deterministic checkpoint. The caller owns the returned bytes.
@@ -722,11 +769,40 @@ test "relay v2 replay guard isolates full origin keys and detects duplicates and
     try expectOrigin(&guard, alice, null, &.{ 10, 20 });
     try testing.expectEqualSlices(u8, &testId(2), &guard.origins.get(alice).?.entries.items[1].relay_id);
 
+    // Allocation-free probeIdentity is window/watermark-only (no exact history).
+    try testing.expectEqual(IdentityLookup.duplicate, guard.probeIdentity(alice, 20, testId(2)));
+    try testing.expectEqual(IdentityLookup.equivocation, guard.probeIdentity(alice, 20, testId(9)));
+    try testing.expectEqual(IdentityLookup.unseen, guard.probeIdentity(alice, 15, testId(5)));
+    try testing.expectEqual(IdentityLookup.unseen, guard.probeIdentity(third, 1, testId(1)));
+
     // The same HLC and RelayId under a different full key is an independent
     // origin, even if a future truncated node handle were to collide.
     try testing.expectEqual(Decision.accepted, try guard.admit(bob, 20, testId(2)));
     try testing.expectEqual(Decision.origin_capacity, try guard.admit(third, 1, testId(1)));
     try testing.expectEqual(@as(usize, 2), guard.origins.count());
+}
+
+test "relay v2 replay guard probeIdentity is non-mutating across unseen duplicate equivocation retired" {
+    var guard = try Guard.init(testing.allocator, .{ .window_size = 1, .max_origins = 1 });
+    defer guard.deinit();
+    const key = testKey(0x31);
+    try testing.expectEqual(IdentityLookup.unseen, guard.probeIdentity(key, 10, testId(1)));
+    try testing.expectEqual(Decision.accepted, try guard.admit(key, 10, testId(1)));
+    try testing.expectEqual(IdentityLookup.duplicate, guard.probeIdentity(key, 10, testId(1)));
+    try testing.expectEqual(IdentityLookup.equivocation, guard.probeIdentity(key, 10, testId(2)));
+
+    const before = try guard.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(before);
+    _ = guard.probeIdentity(key, 10, testId(1));
+    _ = guard.probeIdentity(key, 5, testId(5));
+    const after = try guard.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+
+    try testing.expectEqual(Decision.accepted, try guard.admit(key, 20, testId(2)));
+    // Evicted HLC is watermark-retired only — not accept-proof without higher layers.
+    try testing.expectEqual(IdentityLookup.retired, guard.probeIdentity(key, 10, testId(1)));
+    try testing.expectEqual(IdentityLookup.duplicate, guard.probeIdentity(key, 20, testId(2)));
 }
 
 test "relay v2 replay guard keeps greatest W and permanently retires every eviction" {

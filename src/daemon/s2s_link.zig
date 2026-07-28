@@ -569,6 +569,10 @@ pub const S2sLink = struct {
         return self.peer.supportsE2eeGroup();
     }
 
+    pub fn supportsE2eeGroupAckConfirm(self: *const S2sLink) bool {
+        return self.peer.supportsE2eeGroupAckConfirm();
+    }
+
     pub fn sendE2eeGroup(self: *S2sLink, record: E2eeGroupRelay) !void {
         try self.peer.sendE2eeGroup(self.sink(), record);
     }
@@ -589,8 +593,16 @@ pub const S2sLink = struct {
         try self.peer.sendE2eeGroupAck(self.sink(), id);
     }
 
+    pub fn sendE2eeGroupAckConfirm(self: *S2sLink, id: E2eeGroupRelayId) !void {
+        try self.peer.sendE2eeGroupAckConfirm(self.sink(), id);
+    }
+
     pub fn takeInboundE2eeGroupAcks(self: *S2sLink) ![]E2eeGroupRelayId {
         return self.peer.takeInboundE2eeGroupAcks();
+    }
+
+    pub fn takeInboundE2eeGroupAckConfirms(self: *S2sLink) ![]E2eeGroupRelayId {
+        return self.peer.takeInboundE2eeGroupAckConfirms();
     }
 
     pub fn probeE2eeGroupCurrent(self: *S2sLink) !void {

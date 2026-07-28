@@ -61,6 +61,8 @@ const relay_v2_replay_guard = @import("relay_v2_replay_guard.zig");
 const relay_v2_outbox = @import("relay_v2_outbox.zig");
 const relay_v2_event_log = @import("relay_v2_event_log.zig");
 const relay_v2_activation = @import("relay_v2_activation.zig");
+const e2ee_group_mesh_authority = @import("e2ee_group_mesh_authority.zig");
+const e2ee_group_relay = @import("../substrate/undertow/e2ee_group_relay.zig");
 const attachment_delivery_spool = @import("attachment_delivery_spool.zig");
 const oper_event = @import("../proto/oper_event.zig");
 const observe_event = @import("../proto/observe_event.zig");
@@ -360,9 +362,16 @@ const relay_v2_deferred_capacity: usize = 256;
 const relay_v2_initial_retry_ms: u64 = 1000;
 const relay_v2_retry_frame_budget: usize = 32;
 const relay_v2_retry_byte_budget: usize = 256 * 1024;
+const e2ee_group_initial_retry_ms: u64 = 1000;
+const e2ee_group_retry_frame_budget: usize = 32;
 const RelayV2RetryWork = struct {
     peer: u64,
     relay_id: relay_v2_replay_guard.RelayId,
+    wire: []u8,
+};
+const E2eeGroupRetryWork = struct {
+    peer: u64,
+    relay_id: e2ee_group_relay.RelayId,
     wire: []u8,
 };
 
@@ -3431,6 +3440,22 @@ pub const LinuxServer = struct {
     /// Durable exact MESSAGE_V2 wire until every event-time required node has
     /// confirmed authenticated acceptance. Shares the RVG2 mutation lane.
     relay_v2_event_log: relay_v2_event_log.EventLog,
+    /// Process-global exact-once authority plus RAM-only immediate-hop custody
+    /// for opaque signed E2EEGROUP controls. The payload is never persisted;
+    /// Helix may carry only replay metadata and only after custody reaches zero.
+    e2ee_group_mesh_authority: e2ee_group_mesh_authority.Authority,
+    /// One serialization lane for replay admission, custody ACK, retry snapshot,
+    /// and Helix seal/adopt. Live callers already hold World's write lock; this
+    /// explicit gate also protects direct tests and documents the global cut.
+    e2ee_group_mesh_mu: std.atomic.Mutex = .unlocked,
+    /// Fair bounded cursor over borrowed custody rows. Protected by
+    /// `e2ee_group_mesh_mu` and reset naturally when the row set shrinks.
+    e2ee_group_retry_cursor: usize = 0,
+    /// Foreign-shard admission requests one reactor-0 custody drive. A swap in
+    /// `onWakePoll` consumes the request exactly once, so accepted local work
+    /// refloods promptly without turning unrelated wake traffic into a retry
+    /// loop. The periodic sweep remains the recovery cadence for lost receipts.
+    e2ee_group_retry_requested: std.atomic.Value(bool) = .init(false),
     /// Rendered, attachment-specific IRC records retained until the exact
     /// physical reusable-session connection accepts them into its SendQ. Slow
     /// siblings therefore cannot lose an accepted mesh event or force healthy
@@ -4226,6 +4251,8 @@ pub const LinuxServer = struct {
         errdefer relay_outbox.deinit();
         var relay_event_log = try relay_v2_event_log.EventLog.init(allocator, .{});
         errdefer relay_event_log.deinit();
+        var e2ee_group_authority = try e2ee_group_mesh_authority.Authority.init(allocator, .{});
+        errdefer e2ee_group_authority.deinit();
         var delivery_spool = try attachment_delivery_spool.Spool.init(allocator, .{});
         errdefer delivery_spool.deinit();
         var event_replay_guard = try event_spine_replay_guard.Guard.init(allocator, .{});
@@ -4382,6 +4409,7 @@ pub const LinuxServer = struct {
             .relay_v2_replay_guard = relay_replay_guard,
             .relay_v2_outbox = relay_outbox,
             .relay_v2_event_log = relay_event_log,
+            .e2ee_group_mesh_authority = e2ee_group_authority,
             .attachment_delivery_spool = delivery_spool,
             .tls_ticket_key = tls_ticket_key,
             .native_stream_key = blk: {
@@ -5261,6 +5289,7 @@ pub const LinuxServer = struct {
         self.relay_v2_outbox.deinit();
         self.relay_v2_event_log.deinit();
         self.relay_v2_replay_guard.deinit();
+        self.e2ee_group_mesh_authority.deinit();
         self.attachment_delivery_spool.deinit();
         self.event_spine_replay_guard.deinit();
         self.chanstats.deinit();
@@ -5466,6 +5495,9 @@ pub const LinuxServer = struct {
         self.drainFabric();
         self.drainAttachmentSpoolForCurrentReactor();
         if (self.rx() == &self.reactors[0]) self.retryRelayV2Outbox();
+        if (self.rx() == &self.reactors[0] and
+            self.e2ee_group_retry_requested.swap(false, .acq_rel))
+            self.retryE2eeGroupCustody();
         self.abortPoisonedDeliveries();
     }
 
@@ -5704,6 +5736,7 @@ pub const LinuxServer = struct {
             self.sweepSessionReplicaStore();
             self.retryDeferredRelayV2();
             self.retryRelayV2Outbox();
+            self.retryE2eeGroupCustody();
         }
         self.sweepTempModes();
         // Keep the IRCX ACCESS store clock current on every reactor (a JOIN
@@ -8384,6 +8417,10 @@ pub const LinuxServer = struct {
         self.drainChannelPropChanges(link);
         // Apply remote IRCX user/member PROP changes (ENTITY_PROP) to the store.
         self.drainEntityPropChanges(link);
+        // E2EEGROUP authorization consumes the already-applied session,
+        // residence, membership, and device-property authorities above.
+        self.drainE2eeGroup(conn, link);
+        self.drainE2eeGroupAcks(link);
         // Apply/surface remote channel topic changes in real time.
         self.drainTopicChanges(link);
         // Audit origin-spoofed or misrouted direct-owned S2S frames.
@@ -9493,6 +9530,17 @@ pub const LinuxServer = struct {
         return digest[0..@sizeOf(attachment_delivery_spool.EventId)].*;
     }
 
+    fn e2eeGroupAttachmentEventId(
+        relay_id: e2ee_group_relay.RelayId,
+    ) attachment_delivery_spool.EventId {
+        var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        hasher.update("onyx-attachment-e2ee-group-v1\x00");
+        hasher.update(&relay_id);
+        hasher.final(&digest);
+        return digest[0..@sizeOf(attachment_delivery_spool.EventId)].*;
+    }
+
     /// Reserve one already-rendered physical attachment record. This is the
     /// compatibility entry point used by local event paths; MESSAGE_V2 admission
     /// prepares the complete recipient batch inside its authority transaction.
@@ -9620,6 +9668,60 @@ pub const LinuxServer = struct {
             .prepared = try self.attachment_delivery_spool.prepareBatch(records.items),
             .locked = true,
         };
+    }
+
+    /// Reserve the exact opaque E2EEGROUP line for every event-time physical
+    /// recipient. Unlike ordinary chat, no capable recipient may silently fall
+    /// back to best-effort SendQ delivery: an upstream ACK is permitted only
+    /// after the complete batch is retained.
+    ///
+    /// ADS1's Helix relation maps physical client ids through HSSN. Normal
+    /// recipient collection therefore excludes anonymous/untracked sockets as
+    /// ineligible before this point. If an eligible attachment loses that
+    /// authority between collection and preparation, refuse the whole admission
+    /// retryably before ACK instead of stranding an unadoptable record.
+    fn prepareE2eeGroupAttachmentDeliveryBatch(
+        self: *LinuxServer,
+        recipients: []const client_model.ClientId,
+        relay_id: e2ee_group_relay.RelayId,
+        line: []const u8,
+    ) !PreparedAttachmentDeliveryBatch {
+        var records: std.ArrayList(attachment_delivery_spool.BatchRecord) = .empty;
+        defer records.deinit(self.allocator);
+        try records.ensureTotalCapacity(self.allocator, recipients.len);
+        const event_id = e2eeGroupAttachmentEventId(relay_id);
+        for (recipients) |id| {
+            if (!self.attachmentHasReusableSession(id))
+                return error.UntrackedAttachment;
+            records.appendAssumeCapacity(.{
+                .client = monitorIdFromClient(id),
+                .event_id = event_id,
+                .bytes = line,
+            });
+        }
+        if (records.items.len == 0) return .{ .server = self };
+
+        // Lock order is attachment_delivery_mu -> e2ee_group_mesh_mu. Retain
+        // this lane through the authority admit and the joint no-fail cut.
+        lockSpin(&self.attachment_delivery_mu);
+        errdefer self.attachment_delivery_mu.unlock();
+        return .{
+            .server = self,
+            .prepared = try self.attachment_delivery_spool.prepareBatch(records.items),
+            .locked = true,
+        };
+    }
+
+    /// The joint cut is already live. Wake every owning shard, then drain the
+    /// caller's shard synchronously. SendQ pressure leaves the exact ADS1 head
+    /// retained; it is not a connection poison and never triggers a lossy
+    /// fallback through the cross-shard fabric.
+    fn driveE2eeGroupAttachmentDeliveries(
+        self: *LinuxServer,
+        recipients: []const client_model.ClientId,
+    ) void {
+        for (recipients) |id| self.wakeShard(id.shard);
+        self.drainAttachmentSpoolForCurrentReactor();
     }
 
     fn appendUniqueDeliveryId(
@@ -13199,6 +13301,7 @@ pub const LinuxServer = struct {
                     conn.closing = true;
                     return;
                 }
+                if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
                 try self.deliverMemo(conn); // hand over any offline messages
                 // OBSERVE: push a connect record to watching operators.
                 self.notifyObservers(.connect, observeSubject(conn, ""));
@@ -13253,6 +13356,12 @@ pub const LinuxServer = struct {
             => conn.closing = true,
             else => return err, // infra (OOM, ring) bubbles up
         };
+        // CAP remains legal after registration. If onyx/e2ee was just
+        // negotiated on a logged-in socket whose SessionStore attach could not
+        // be retained, reject the capability boundary explicitly instead of
+        // leaving a visible channel member that encrypted fan-out must omit.
+        if (std.ascii.eqlIgnoreCase(parsed.command, "CAP") and
+            !try self.enforceE2eeSessionEligibility(id, conn)) return;
     }
 
     fn dispatchRegistered(
@@ -23274,6 +23383,7 @@ pub const LinuxServer = struct {
         relay_event_log_bytes: usize,
         attachment_delivery_bytes: usize,
         event_replay_bytes: usize,
+        e2ee_group_replay_bytes: usize,
     };
 
     fn helixWorldRelationIdentity(
@@ -23470,6 +23580,39 @@ pub const LinuxServer = struct {
             return null;
         };
 
+        // EGRG is metadata-only. Opaque E2EEGROUP payloads and hop wires never
+        // enter Helix; any outstanding RAM custody makes the whole seal unsafe
+        // and therefore refuses the upgrade rather than losing recoverability.
+        lockSpin(&self.e2ee_group_mesh_mu);
+        const e2ee_group_replay_wire = self.e2ee_group_mesh_authority.encodeCheckpoint(
+            self.allocator,
+        ) catch |err| {
+            self.e2ee_group_mesh_mu.unlock();
+            srvLog(
+                "onyx-server: UPGRADE E2EEGROUP replay checkpoint seal failed ({s})\n",
+                .{@errorName(err)},
+            );
+            return null;
+        };
+        self.e2ee_group_mesh_mu.unlock();
+        var e2ee_group_replay_owned = true;
+        defer if (e2ee_group_replay_owned) self.allocator.free(e2ee_group_replay_wire);
+        blobs.append(self.allocator, e2ee_group_replay_wire) catch {
+            srvLog("onyx-server: UPGRADE E2EEGROUP replay blob ownership append failed\n", .{});
+            return null;
+        };
+        e2ee_group_replay_owned = false;
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = e2ee_group_replay_wire,
+            // Exact-once E2EEGROUP delivery authority. A predecessor or
+            // rollback binary that cannot recognize EGRG must reject the arena.
+            .min_supported = 2,
+        }) catch {
+            srvLog("onyx-server: UPGRADE E2EEGROUP replay piece append failed\n", .{});
+            return null;
+        };
+
         blobs.append(self.allocator, relay_outbox_wire) catch {
             srvLog("onyx-server: UPGRADE MESSAGE_V2 outbox blob ownership append failed\n", .{});
             return null;
@@ -23570,6 +23713,7 @@ pub const LinuxServer = struct {
             .relay_event_log_bytes = relay_event_log_wire.len,
             .attachment_delivery_bytes = attachment_delivery_wire.len,
             .event_replay_bytes = event_replay_wire.len,
+            .e2ee_group_replay_bytes = e2ee_group_replay_wire.len,
         };
     }
 
@@ -24345,8 +24489,8 @@ pub const LinuxServer = struct {
             self.deferredUpgradeNotice(request, "UPGRADE refused: sealed state arena is missing");
             return error.SessionReplicaConverging;
         };
-        var sbuf: [224]u8 = undefined;
-        srvLog("onyx-server: {s}\n", .{std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), mandatory state {d}/{d}/{d}/{d}/{d} bytes); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed, replica_objects_sealed, migrations_sealed, tombstones_sealed, mandatory_state_sealed.world_bytes, mandatory_state_sealed.history_bytes, mandatory_state_sealed.webhook_bytes, mandatory_state_sealed.relay_replay_bytes, mandatory_state_sealed.event_replay_bytes }) catch "UPGRADE: re-exec"});
+        var sbuf: [320]u8 = undefined;
+        srvLog("onyx-server: {s}\n", .{std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} wss, {d} mesh link(s) preserved, {d} re-dial hint(s), {d} session account(s), {d} replica object(s), {d} staged migration(s), {d} consumed tombstone(s), mandatory state {d}/{d}/{d}/{d}/{d}/{d} bytes); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, ws_carried, s2s_preserved, s2s_hints, session_accounts_sealed, replica_objects_sealed, migrations_sealed, tombstones_sealed, mandatory_state_sealed.world_bytes, mandatory_state_sealed.history_bytes, mandatory_state_sealed.webhook_bytes, mandatory_state_sealed.relay_replay_bytes, mandatory_state_sealed.event_replay_bytes, mandatory_state_sealed.e2ee_group_replay_bytes }) catch "UPGRADE: re-exec"});
 
         // Preserve EVERY shard's client listener + the arena across execve
         // (clear FD_CLOEXEC). The successor adopts one listener per shard, so
@@ -24758,9 +24902,32 @@ pub const LinuxServer = struct {
         var relay_event_log_checkpoint_bytes: ?[]const u8 = null;
         var attachment_delivery_checkpoint_bytes: ?[]const u8 = null;
         var event_replay_checkpoint_bytes: ?[]const u8 = null;
+        var e2ee_group_replay_checkpoint_bytes: ?[]const u8 = null;
         const mesh_descriptor = helix_capsule.descriptor(.mesh_checkpoint);
         for (caps) |c| {
             if (c.header.kind != .mesh_checkpoint) continue;
+            var recognized_e2ee_group = false;
+            for (c.fields) |field| {
+                if (e2ee_group_mesh_authority.isCheckpoint(field.bytes)) {
+                    recognized_e2ee_group = true;
+                    break;
+                }
+            }
+            if (recognized_e2ee_group) {
+                if (e2ee_group_replay_checkpoint_bytes != null or
+                    c.header.schema_id != mesh_descriptor.schema_id or
+                    c.header.version != mesh_descriptor.current_version or
+                    c.header.min_supported != 2 or
+                    c.header.max_supported != mesh_descriptor.max_supported or
+                    c.fields.len != 1 or c.fields[0].ordinal != 1 or
+                    !e2ee_group_mesh_authority.isCheckpoint(c.fields[0].bytes))
+                {
+                    self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate E2EEGROUP replay checkpoint");
+                    return error.InvalidInheritedHandoff;
+                }
+                e2ee_group_replay_checkpoint_bytes = c.fields[0].bytes;
+                continue;
+            }
             var recognized_relay = false;
             for (c.fields) |field| {
                 if (relay_v2_replay_guard.isCheckpoint(field.bytes)) {
@@ -24890,6 +25057,10 @@ pub const LinuxServer = struct {
             self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory Event Spine replay checkpoint");
             return error.InvalidInheritedHandoff;
         }
+        if (e2ee_group_replay_checkpoint_bytes == null) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory E2EEGROUP replay checkpoint");
+            return error.InvalidInheritedHandoff;
+        }
 
         // Decode all mandatory images and the complete client/member projection
         // before the boot-exclusive publication boundary. Every value below is
@@ -24977,6 +25148,15 @@ pub const LinuxServer = struct {
             return error.InvalidInheritedHandoff;
         };
         defer event_replay_replacement.deinit();
+        var e2ee_group_replay_replacement = e2ee_group_mesh_authority.Authority.decodeCheckpoint(
+            self.allocator,
+            self.e2ee_group_mesh_authority.config,
+            e2ee_group_replay_checkpoint_bytes.?,
+        ) catch {
+            self.abandonInheritedSessionState(caps, arena_fd, "invalid or configuration-incompatible E2EEGROUP replay checkpoint");
+            return error.InvalidInheritedHandoff;
+        };
+        defer e2ee_group_replay_replacement.deinit();
         const webhook_replacement = webhook_mod.WebhookStore.restoreUpgradeCheckpoint(
             webhook_checkpoint_bytes,
         ) catch {
@@ -26134,6 +26314,11 @@ pub const LinuxServer = struct {
             event_spine_replay_guard.Guard,
             &self.event_spine_replay_guard,
             &event_replay_replacement,
+        );
+        std.mem.swap(
+            e2ee_group_mesh_authority.Authority,
+            &self.e2ee_group_mesh_authority,
+            &e2ee_group_replay_replacement,
         );
         self.webhook_store.publishUpgradeReplacement(&webhook_replacement);
         self.inherited_webhook_store_restored = true;
@@ -31216,6 +31401,7 @@ pub const LinuxServer = struct {
         try appendToConn(conn, ack);
         if (result.issue_session_token and !result.guest) self.issueSessionTokenNotice(conn, "AUTH") catch {};
         if (result.guest) {
+            if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
             self.deliverWelcome(conn);
             self.emitClientRegistered(id, conn);
             self.evaluateNickProtection(conn);
@@ -31223,6 +31409,7 @@ pub const LinuxServer = struct {
         }
         if (oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(id, conn);
+        if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(id, conn);
         self.deliverWelcome(conn);
@@ -34397,6 +34584,7 @@ pub const LinuxServer = struct {
         self.restoreAccountSilence(conn, account);
         try self.elevateOperFromAccount(conn);
         self.trackSession(id, conn);
+        if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(id, conn);
         self.deliverWelcome(conn);
@@ -34460,6 +34648,7 @@ pub const LinuxServer = struct {
         }
         if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
+        if (!try self.enforceE2eeSessionEligibility(idFromToken(conn.token), conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(idFromToken(conn.token), conn);
         self.deliverWelcome(conn);
@@ -34566,6 +34755,7 @@ pub const LinuxServer = struct {
         try emitReplyLine(conn, line);
         try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
+        if (!try self.enforceE2eeSessionEligibility(idFromToken(conn.token), conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(idFromToken(conn.token), conn);
         self.deliverWelcome(conn);
@@ -35169,6 +35359,519 @@ pub const LinuxServer = struct {
         return .{ .algorithm = algorithm, .public_key = public_key };
     }
 
+    const E2eeGroupDeliveryOutcome = enum {
+        accepted,
+        duplicate,
+        retry,
+        rejected,
+    };
+
+    fn collectE2eeGroupOutboxPeers(
+        self: *LinuxServer,
+        excluded_peer: ?u64,
+    ) std.mem.Allocator.Error![]u64 {
+        var peers: std.ArrayList(u64) = .empty;
+        errdefer peers.deinit(self.allocator);
+        // A pinned direct-neighbor roster is event-time custody authority even
+        // while a peer is disconnected. Omitting a down peer here would turn
+        // RAM-only persistence into mesh fire-and-forget: there would be no row
+        // left for the reconnect retry API to drive.
+        if (self.relay_v2_required_nodes.len != 0) {
+            for (self.relay_v2_required_nodes) |peer| {
+                if (peer == self.config.node_id or
+                    (excluded_peer != null and peer == excluded_peer.?)) continue;
+                try peers.append(self.allocator, peer);
+            }
+            return peers.toOwnedSlice(self.allocator);
+        }
+
+        // TOFU has no configured offline membership to preserve. Its bounded
+        // fallback may custody only peers authenticated and eligible at this
+        // exact admission instant; operators that require partition recovery
+        // must pin the direct-neighbor trust-root set above.
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const link = entry.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsE2eeGroup()) continue;
+                const peer = link.remoteNodeId() orelse continue;
+                if (peer == 0 or peer == self.config.node_id or
+                    (excluded_peer != null and peer == excluded_peer.?)) continue;
+                var duplicate = false;
+                for (peers.items) |known| {
+                    if (known == peer) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) try peers.append(self.allocator, peer);
+            }
+        }
+        return peers.toOwnedSlice(self.allocator);
+    }
+
+    fn e2eeGroupDirectNeighbor(self: *LinuxServer, peer: u64) bool {
+        if (peer == 0 or peer == self.config.node_id) return false;
+        if (self.relay_v2_required_nodes.len != 0) {
+            for (self.relay_v2_required_nodes) |required| {
+                if (required == peer) return true;
+            }
+            return false;
+        }
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const link = entry.value.s2s_secured orelse continue;
+                if (link.established() and link.supportsE2eeGroup() and
+                    link.remoteNodeId() == peer) return true;
+            }
+        }
+        return false;
+    }
+
+    fn replayE2eeGroupWireToPeer(
+        self: *LinuxServer,
+        peer: u64,
+        wire: []const u8,
+    ) bool {
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const link = entry.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsE2eeGroup() or
+                    link.remoteNodeId() != peer) continue;
+                // The retained exact-wire API deliberately bypasses the
+                // reflection cache. A lost receipt must remain recoverable.
+                // A prior attempt may already own one complete encrypted record
+                // in the link while its SendQ is full. Page that record first;
+                // never append another retry behind congestion on every timer
+                // tick.
+                if (!self.flushSecuredS2sOutboundTo(entry.id, link)) return false;
+                link.replayRetainedE2eeGroupWire(wire) catch return false;
+                if (!self.flushSecuredS2sOutboundTo(entry.id, link)) return false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn collectE2eeGroupRetryWork(
+        self: *LinuxServer,
+        work: *[e2ee_group_retry_frame_budget]E2eeGroupRetryWork,
+    ) usize {
+        lockSpin(&self.e2ee_group_mesh_mu);
+        defer self.e2ee_group_mesh_mu.unlock();
+        const items = self.e2ee_group_mesh_authority.retryItems();
+        if (items.len == 0) {
+            self.e2ee_group_retry_cursor = 0;
+            return 0;
+        }
+        var cursor = self.e2ee_group_retry_cursor % items.len;
+        var count: usize = 0;
+        const limit = @min(items.len, work.len);
+        while (count < limit) : (count += 1) {
+            const item = items[cursor];
+            const wire = self.allocator.dupe(u8, item.wire) catch break;
+            work[count] = .{
+                .peer = item.peer,
+                .relay_id = item.relay_id,
+                .wire = wire,
+            };
+            cursor = (cursor + 1) % items.len;
+        }
+        self.e2ee_group_retry_cursor = cursor;
+        return count;
+    }
+
+    fn retryE2eeGroupCustody(self: *LinuxServer) void {
+        var work: [e2ee_group_retry_frame_budget]E2eeGroupRetryWork = undefined;
+        const work_len = self.collectE2eeGroupRetryWork(&work);
+        defer for (work[0..work_len]) |item| self.allocator.free(item.wire);
+        for (work[0..work_len]) |item| {
+            _ = item.relay_id;
+            _ = self.replayE2eeGroupWireToPeer(item.peer, item.wire);
+        }
+        self.retryE2eeGroupReceipts();
+    }
+
+    fn driveAcceptedE2eeGroupCustody(self: *LinuxServer) void {
+        if (current_reactor == &self.reactors[0]) {
+            self.retryE2eeGroupCustody();
+        } else if (self.reactors[0].wake) |*wake| {
+            self.e2ee_group_retry_requested.store(true, .release);
+            wake.wake();
+        }
+    }
+
+    fn markE2eeGroupReceiptAttempt(
+        self: *LinuxServer,
+        peer: u64,
+        relay_id: e2ee_group_relay.RelayId,
+        now_ms: u64,
+    ) void {
+        lockSpin(&self.e2ee_group_mesh_mu);
+        defer self.e2ee_group_mesh_mu.unlock();
+        for (self.e2ee_group_mesh_authority.receiptItems()) |receipt| {
+            if (receipt.peer != peer or
+                !std.mem.eql(u8, &receipt.relay_id, &relay_id)) continue;
+            const next_attempt = receipt.attempts +| 1;
+            const shift: u5 = @intCast(@min(next_attempt, 5));
+            _ = self.e2ee_group_mesh_authority.markReceiptAttempt(
+                peer,
+                relay_id,
+                now_ms +| (e2ee_group_initial_retry_ms << shift),
+            ) catch false;
+            return;
+        }
+    }
+
+    fn sendE2eeGroupAckOnLink(
+        self: *LinuxServer,
+        conn: *ConnState,
+        link: *secured_s2s_link.SecuredLink,
+        relay_id: e2ee_group_relay.RelayId,
+    ) bool {
+        if (!link.established() or !link.supportsE2eeGroup()) return false;
+        // Preflight any complete ciphertext retained by a prior congested ACK.
+        // With a full healthy SendQ, one receipt may remain link-owned, but a
+        // duplicate replay cannot append an unbounded receipt train behind it.
+        if (!self.flushMeshBurstStage(conn)) return false;
+        // `sendE2eeGroupAck` first commits a complete encrypted record into the
+        // SecuredLink-owned outbound buffer. Paging may move it into SendQ; on
+        // backpressure it remains link-owned. Either way no successful return
+        // depends on the socket having already written the bytes.
+        link.sendE2eeGroupAck(relay_id) catch return false;
+        _ = self.flushMeshBurstStage(conn);
+        return true;
+    }
+
+    fn sendE2eeGroupAckToPeer(
+        self: *LinuxServer,
+        peer: u64,
+        relay_id: e2ee_group_relay.RelayId,
+    ) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsE2eeGroup()) continue;
+                if ((link.remoteNodeId() orelse continue) != peer) continue;
+                const peer_id = slotClientId(reactor, slot_index, slot.gen);
+                if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return false;
+                link.sendE2eeGroupAck(relay_id) catch return false;
+                // Encoding the authenticated ACK is the send attempt. Even if
+                // SendQ is now full, the complete record remains link-owned and
+                // the next due pass will preflush instead of appending behind it.
+                _ = self.flushSecuredS2sOutboundTo(peer_id, link);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn sendE2eeGroupAckConfirmToPeer(
+        self: *LinuxServer,
+        peer: u64,
+        relay_id: e2ee_group_relay.RelayId,
+    ) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsE2eeGroupAckConfirm()) continue;
+                if ((link.remoteNodeId() orelse continue) != peer) continue;
+                const peer_id = slotClientId(reactor, slot_index, slot.gen);
+                if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return;
+                link.sendE2eeGroupAckConfirm(relay_id) catch return;
+                _ = self.flushSecuredS2sOutboundTo(peer_id, link);
+                return;
+            }
+        }
+    }
+
+    fn retryE2eeGroupReceipts(self: *LinuxServer) void {
+        const now_ms = self.meshWallMs();
+        var receipts: [e2ee_group_retry_frame_budget]e2ee_group_mesh_authority.Receipt = undefined;
+        lockSpin(&self.e2ee_group_mesh_mu);
+        const receipt_len = self.e2ee_group_mesh_authority.collectDueReceipts(
+            now_ms,
+            &receipts,
+        );
+        self.e2ee_group_mesh_mu.unlock();
+
+        for (receipts[0..receipt_len]) |receipt| {
+            if (!self.sendE2eeGroupAckToPeer(receipt.peer, receipt.relay_id))
+                continue;
+            self.markE2eeGroupReceiptAttempt(
+                receipt.peer,
+                receipt.relay_id,
+                now_ms,
+            );
+        }
+    }
+
+    fn e2eeGroupControlRecord(
+        record: e2ee_group_relay.RelayRecord,
+    ) e2ee_group_control.Record {
+        return .{
+            .channel = record.channel,
+            .kind = record.kind,
+            .from_device = record.from_device,
+            .to_account = if (record.to_account.len == 0) null else record.to_account,
+            .to_device = if (record.to_device.len == 0) null else record.to_device,
+            .payload = record.payload,
+        };
+    }
+
+    fn renderE2eeGroupLineFromPrefix(
+        prefix: []const u8,
+        record: e2ee_group_control.Record,
+        out: []u8,
+    ) ServerError![]const u8 {
+        return if (record.kind == .welcome)
+            std.fmt.bufPrint(
+                out,
+                ":{s} {s} {s} {s} {s} {s} :{s}\r\n",
+                .{
+                    prefix,
+                    record.kind.wireTag(),
+                    record.channel,
+                    record.from_device,
+                    record.to_account.?,
+                    record.to_device.?,
+                    record.payload,
+                },
+            ) catch error.OutputTooSmall
+        else
+            std.fmt.bufPrint(
+                out,
+                ":{s} {s} {s} {s} :{s}\r\n",
+                .{ prefix, record.kind.wireTag(), record.channel, record.from_device, record.payload },
+            ) catch error.OutputTooSmall;
+    }
+
+    fn deliverE2eeGroupLine(
+        self: *LinuxServer,
+        recipients: []const client_model.ClientId,
+        line: []const u8,
+    ) usize {
+        self.beginWakeBatch();
+        defer self.endWakeBatch();
+        var delivered: usize = 0;
+        for (recipients) |id| {
+            if (self.enqueueDeliveryMaybeClose(id, line, false, "Client quit") == .delivered)
+                delivered += 1;
+        }
+        return delivered;
+    }
+
+    /// Authorize one already origin-verified immutable control against the
+    /// receiver's converged residence, membership, account, and device facts.
+    /// Every fallible recipient/render/custody/receipt reservation precedes the
+    /// single authority commit. Only `.accepted` publishes local delivery; an
+    /// exact duplicate reserves or refreshes only its authenticated ingress
+    /// receipt, never custody, and earns another hop ACK.
+    fn deliverE2eeGroup(
+        self: *LinuxServer,
+        record: e2ee_group_relay.RelayRecord,
+        wire: []const u8,
+        via_peer: u64,
+    ) E2eeGroupDeliveryOutcome {
+        if (!self.e2eeGroupDirectNeighbor(via_peer)) return .rejected;
+
+        // Authenticate first, then perform an allocation-free replay lookup
+        // before consulting receiver-wall or mutable residence/membership/device
+        // state. An exact previously accepted identity is sufficient to re-ACK
+        // a lost receipt even after the receiver's wall clock steps backward.
+        lockSpin(&self.e2ee_group_mesh_mu);
+        const authenticated = self.e2ee_group_mesh_authority.authenticateRecord(
+            record,
+        ) catch {
+            self.e2ee_group_mesh_mu.unlock();
+            return .retry;
+        };
+        const verified = switch (authenticated) {
+            .verified => |identity| identity,
+            .origin_mismatch, .bad_signature, .invalid_semantic => {
+                self.e2ee_group_mesh_mu.unlock();
+                return .rejected;
+            },
+        };
+        const identity_lookup = self.e2ee_group_mesh_authority.probeIdentity(verified);
+        self.e2ee_group_mesh_mu.unlock();
+        switch (identity_lookup) {
+            .duplicate => {
+                // Reserve/refresh only the authenticated ingress receipt in the
+                // same authority lane. Custody membership stays fixed at first
+                // acceptance: recomputing peers here would recreate an already
+                // ACKed edge and make a valid A-B-C reflection cycle immortal.
+                lockSpin(&self.e2ee_group_mesh_mu);
+                const duplicate = self.e2ee_group_mesh_authority.admitAuthorizedWithCustodyAndIngress(
+                    verified,
+                    &.{},
+                    wire,
+                    via_peer,
+                    self.meshWallMs() +| e2ee_group_initial_retry_ms,
+                ) catch {
+                    self.e2ee_group_mesh_mu.unlock();
+                    return .retry;
+                };
+                self.e2ee_group_mesh_mu.unlock();
+                switch (duplicate.admission) {
+                    .duplicate => {},
+                    .origin_capacity => return .retry,
+                    .accepted, .equivocation, .retired => return .rejected,
+                }
+                self.driveAcceptedE2eeGroupCustody();
+                return .duplicate;
+            },
+            .equivocation, .retired => return .rejected,
+            .unseen => {},
+        }
+        if (e2ee_group_mesh_authority.isFutureSkewed(
+            verified,
+            self.meshWallMs(),
+            mesh_clock_mod.default_max_future_skew_ms,
+        ))
+            return .retry;
+
+        const source_nick = relaySourceNickFromPrefix(record.source_prefix) orelse
+            return .rejected;
+        const home = self.meshNickHomeNode(source_nick) orelse return .retry;
+        if (home != record.origin_node) return .rejected;
+        const residence_account = self.trustedRemoteAccountAtNode(
+            source_nick,
+            record.origin_node,
+        ) orelse return .retry;
+        if (!std.ascii.eqlIgnoreCase(residence_account, record.account))
+            return .rejected;
+        if (!self.remoteMemberOfChannelAtNode(
+            record.channel,
+            source_nick,
+            record.origin_node,
+        )) return .retry;
+        if (!self.e2eeDeviceOwnedByAccount(record.account, record.from_device))
+            return .retry;
+        if (record.kind == .welcome and
+            !self.e2eeDeviceOwnedByAccount(record.to_account, record.to_device))
+            return .retry;
+
+        const control = e2eeGroupControlRecord(record);
+        var recipients: std.ArrayList(client_model.ClientId) = .empty;
+        defer recipients.deinit(self.allocator);
+        self.collectE2eeGroupRecipients(control, &recipients) catch return .retry;
+        var line_buf: [e2ee_group_max_line_bytes]u8 = undefined;
+        const line = renderE2eeGroupLineFromPrefix(
+            record.source_prefix,
+            control,
+            &line_buf,
+        ) catch return .rejected;
+        const peers = self.collectE2eeGroupOutboxPeers(via_peer) catch return .retry;
+        defer self.allocator.free(peers);
+        var prepared_delivery = self.prepareE2eeGroupAttachmentDeliveryBatch(
+            recipients.items,
+            verified.relay_id,
+            line,
+        ) catch return .retry;
+        defer prepared_delivery.deinit();
+
+        // attachment_delivery_mu -> e2ee_group_mesh_mu. Authority performs all
+        // of its fallible preparation before its own no-fail publication; while
+        // both lanes remain locked, the accepted arm joins ADS1 to that same
+        // externally indivisible cut before any caller can emit ACK.
+        lockSpin(&self.e2ee_group_mesh_mu);
+        const admitted = self.e2ee_group_mesh_authority.admitAuthorizedWithCustodyAndIngress(
+            verified,
+            peers,
+            wire,
+            via_peer,
+            self.meshWallMs() +| e2ee_group_initial_retry_ms,
+        ) catch {
+            self.e2ee_group_mesh_mu.unlock();
+            return .retry;
+        };
+        switch (admitted.admission) {
+            .accepted => prepared_delivery.commit(),
+            else => {},
+        }
+        self.e2ee_group_mesh_mu.unlock();
+
+        switch (admitted.admission) {
+            .accepted => {
+                prepared_delivery.release();
+                self.driveE2eeGroupAttachmentDeliveries(recipients.items);
+                self.driveAcceptedE2eeGroupCustody();
+                return .accepted;
+            },
+            .duplicate => return .rejected,
+            .origin_capacity => return .retry,
+            .equivocation, .retired => return .rejected,
+        }
+    }
+
+    fn drainE2eeGroup(
+        self: *LinuxServer,
+        conn: *ConnState,
+        link: *secured_s2s_link.SecuredLink,
+    ) void {
+        const peer = link.remoteNodeId() orelse return;
+        const inbound = link.takeInboundE2eeGroup() catch return;
+        defer self.allocator.free(inbound);
+        for (inbound) |*item| {
+            defer item.deinit(self.allocator);
+            if (item.via_peer != peer) {
+                conn.closing = true;
+                return;
+            }
+            switch (self.deliverE2eeGroup(item.owned.record, item.wire, peer)) {
+                .accepted, .duplicate => {
+                    if (self.sendE2eeGroupAckOnLink(conn, link, item.relay_id))
+                        self.markE2eeGroupReceiptAttempt(
+                            peer,
+                            item.relay_id,
+                            self.meshWallMs(),
+                        );
+                },
+                .retry, .rejected => {},
+            }
+        }
+    }
+
+    fn drainE2eeGroupAcks(
+        self: *LinuxServer,
+        link: *secured_s2s_link.SecuredLink,
+    ) void {
+        const peer = link.remoteNodeId() orelse return;
+        const acks = link.takeInboundE2eeGroupAcks() catch return;
+        defer self.allocator.free(acks);
+        const confirms = link.takeInboundE2eeGroupAckConfirms() catch return;
+        defer self.allocator.free(confirms);
+        // Consume both independently bounded transport queues before rejecting
+        // an authenticated-but-off-roster link. Leaving confirms queued here
+        // would pin transport memory and replay the stale control on every read.
+        if (!self.e2eeGroupDirectNeighbor(peer)) return;
+        for (acks) |relay_id| {
+            lockSpin(&self.e2ee_group_mesh_mu);
+            _ = self.e2ee_group_mesh_authority.acknowledgeOutgoing(
+                peer,
+                relay_id,
+            ) catch false;
+            self.e2ee_group_mesh_mu.unlock();
+            // Authenticated direct-neighbor duplicate ACKs must receive another
+            // confirm after a lost ACK_CONFIRM, even after custody is gone.
+            self.sendE2eeGroupAckConfirmToPeer(peer, relay_id);
+        }
+
+        for (confirms) |relay_id| {
+            lockSpin(&self.e2ee_group_mesh_mu);
+            _ = self.e2ee_group_mesh_authority.confirmIngress(
+                peer,
+                relay_id,
+            ) catch false;
+            self.e2ee_group_mesh_mu.unlock();
+        }
+    }
+
     fn e2eeDeviceCount(self: *LinuxServer, account: []const u8) usize {
         const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
         var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
@@ -35196,6 +35899,12 @@ pub const LinuxServer = struct {
         const target = self.connFor(id) orelse return;
         if (target.closing or target.s2s != null or target.s2s_secured != null) return;
         if (!target.session.hasCap(.onyx_e2ee)) return;
+        // The CAP is only a feature negotiation bit, not durable participation
+        // authority. E2EEGROUP recipients must have an HSSN-tracked reusable
+        // attachment so their opaque row can survive SendQ pressure, reconnect,
+        // and Helix remap. Anonymous or session-cap-exhausted sockets are
+        // explicitly ineligible here; they cannot veto a room's accepted event.
+        if (!self.attachmentHasReusableSession(id)) return;
         try self.appendUniqueDeliveryId(recipients, id);
     }
 
@@ -35239,31 +35948,13 @@ pub const LinuxServer = struct {
     ) ServerError![]const u8 {
         var prefix_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
-        return if (record.kind == .welcome)
-            std.fmt.bufPrint(
-                out,
-                ":{s} {s} {s} {s} {s} {s} :{s}\r\n",
-                .{
-                    prefix,
-                    record.kind.wireTag(),
-                    record.channel,
-                    record.from_device,
-                    record.to_account.?,
-                    record.to_device.?,
-                    record.payload,
-                },
-            ) catch error.OutputTooSmall
-        else
-            std.fmt.bufPrint(
-                out,
-                ":{s} {s} {s} {s} :{s}\r\n",
-                .{ prefix, record.kind.wireTag(), record.channel, record.from_device, record.payload },
-            ) catch error.OutputTooSmall;
+        return renderE2eeGroupLineFromPrefix(prefix, record, out);
     }
 
     /// Local Phase 4a E2EEGROUP admission. The opaque payload is validated and
-    /// copied only into the final bounded IRC line; it is never decrypted,
-    /// logged, persisted, placed in history, or retained across reconnect.
+    /// copied only into the final bounded IRC line. It is never decrypted,
+    /// logged, or placed in history; mesh-enabled delivery retains only the
+    /// bounded exact per-attachment ADS1 record until that SendQ accepts it.
     pub fn handleE2eeGroup(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const account = conn.session.account() orelse
             return self.failReply(conn, "E2EEGROUP", "NOT_LOGGED_IN", "Authenticate before sending group E2EE controls");
@@ -35286,6 +35977,8 @@ pub const LinuxServer = struct {
         };
 
         const sender_id = idFromToken(conn.token);
+        if (!self.attachmentHasReusableSession(sender_id))
+            return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "A reusable session is required for group E2EE");
         if (!self.world.isMember(record.channel, worldIdFromClient(sender_id)))
             return self.failReply(conn, "E2EEGROUP", "NOT_ON_CHANNEL", "Sender is not a member of the target channel");
         if (!self.e2eeDeviceOwnedByAccount(account, record.from_device))
@@ -35305,17 +35998,112 @@ pub const LinuxServer = struct {
         if (record.kind == .welcome and recipients.items.len == 0)
             return self.failReply(conn, "E2EEGROUP", "TARGET_UNAVAILABLE", "Target account/device is absent or offline");
 
+        var source_prefix_buf: [default_reply_bytes]u8 = undefined;
+        const source_prefix = clientPrefix(conn, &source_prefix_buf) catch
+            return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "Could not bind group E2EE origin");
         var line_buf: [e2ee_group_max_line_bytes]u8 = undefined;
-        const line = renderE2eeGroupLine(conn, record, &line_buf) catch
+        const line = renderE2eeGroupLineFromPrefix(source_prefix, record, &line_buf) catch
             return self.failReply(conn, "E2EEGROUP", "BAD_PAYLOAD", "Group E2EE control record is too large");
 
-        self.beginWakeBatch();
-        defer self.endWakeBatch();
-        var delivered: usize = 0;
-        for (recipients.items) |id| {
-            if (self.enqueueDeliveryMaybeClose(id, line, false, "Client quit") == .delivered)
-                delivered += 1;
+        // A standalone server has no mesh signing authority and preserves the
+        // Phase 4a local-only behavior. Once a node identity exists, every local
+        // control enters the exact same signed replay/custody authority as
+        // inbound mesh controls before any client delivery becomes visible.
+        if (self.config.node_identity) |ident| {
+            var origin_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+            var origin_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+            var relay_record = e2ee_group_relay.RelayRecord{
+                .kind = record.kind,
+                .channel = record.channel,
+                .source_prefix = source_prefix,
+                .account = account,
+                .from_device = record.from_device,
+                .to_account = record.to_account orelse "",
+                .to_device = record.to_device orelse "",
+                .payload = record.payload,
+                .origin_node = ident.shortId(),
+                .hlc = self.nextMeshHlc(),
+            };
+            e2ee_group_relay.stampOrigin(
+                self.allocator,
+                &relay_record,
+                &ident.sign_kp,
+                &origin_pubkey,
+                &origin_sig,
+            ) catch
+                return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "Could not sign group E2EE control");
+            const wire = e2ee_group_relay.encode(self.allocator, relay_record) catch
+                return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "Could not stage group E2EE custody");
+            defer self.allocator.free(wire);
+            const peers = self.collectE2eeGroupOutboxPeers(null) catch
+                return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "Could not stage group E2EE custody");
+            defer self.allocator.free(peers);
+
+            lockSpin(&self.e2ee_group_mesh_mu);
+            const verification = self.e2ee_group_mesh_authority.verifyRecord(
+                relay_record,
+                self.meshWallMs(),
+                mesh_clock_mod.default_max_future_skew_ms,
+            ) catch {
+                self.e2ee_group_mesh_mu.unlock();
+                return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "Could not verify group E2EE origin");
+            };
+            const verified = switch (verification) {
+                .verified => |identity| identity,
+                else => {
+                    self.e2ee_group_mesh_mu.unlock();
+                    return self.failReply(conn, "E2EEGROUP", "ORIGIN_REJECTED", "Group E2EE origin was rejected");
+                },
+            };
+            self.e2ee_group_mesh_mu.unlock();
+            var prepared_delivery = self.prepareE2eeGroupAttachmentDeliveryBatch(
+                recipients.items,
+                verified.relay_id,
+                line,
+            ) catch
+                return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "Could not retain group E2EE delivery");
+            defer prepared_delivery.deinit();
+
+            // Hold ADS1 through the authority admit. Once accepted, both
+            // publications complete allocation-free before either lane opens.
+            lockSpin(&self.e2ee_group_mesh_mu);
+            const admitted = self.e2ee_group_mesh_authority.admitAuthorizedWithCustody(
+                verified,
+                peers,
+                wire,
+            ) catch {
+                self.e2ee_group_mesh_mu.unlock();
+                return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "Could not retain group E2EE custody");
+            };
+            switch (admitted.admission) {
+                .accepted => prepared_delivery.commit(),
+                else => {},
+            }
+            self.e2ee_group_mesh_mu.unlock();
+            switch (admitted.admission) {
+                .accepted => {
+                    prepared_delivery.release();
+                    self.driveE2eeGroupAttachmentDeliveries(recipients.items);
+                },
+                .duplicate => return,
+                .origin_capacity => return self.warnReply(
+                    conn,
+                    "E2EEGROUP",
+                    "TEMPORARILY_UNAVAILABLE",
+                    "Group E2EE custody or receipt capacity is temporarily full",
+                ),
+                .equivocation, .retired => return self.failReply(
+                    conn,
+                    "E2EEGROUP",
+                    "ORIGIN_REJECTED",
+                    "Group E2EE origin was rejected",
+                ),
+            }
+            self.driveAcceptedE2eeGroupCustody();
+            return;
         }
+
+        const delivered = self.deliverE2eeGroupLine(recipients.items, line);
         if (record.kind == .welcome and delivered == 0)
             return self.failReply(conn, "E2EEGROUP", "TARGET_UNAVAILABLE", "Target account/device is absent or offline");
     }
@@ -37152,6 +37940,30 @@ pub const LinuxServer = struct {
         };
         self.finalizeAttachEviction(outcome);
         return true;
+    }
+
+    /// `onyx/e2ee` promises retained attachment delivery, so a capable socket
+    /// may not remain live when its reusable SessionStore row could not be
+    /// established (for example, every per-account slot is still attached).
+    /// Close at registration/login/CAP boundaries before autojoin or further
+    /// participation; the delivery collector keeps its own defensive row check
+    /// for inherited or manually-constructed legacy state.
+    fn enforceE2eeSessionEligibility(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+    ) !bool {
+        if (!conn.session.hasCap(.onyx_e2ee)) return true;
+        if (self.attachmentHasReusableSession(id)) return true;
+        retainCloseReason(conn, "E2EE reusable session unavailable");
+        conn.closing = true;
+        try self.failReply(
+            conn,
+            "E2EEGROUP",
+            "SESSION_UNAVAILABLE",
+            "onyx/e2ee requires an available reusable session",
+        );
+        return false;
     }
 
     const ExternalResumeCandidate = union(enum) {
@@ -48381,9 +49193,23 @@ const SessionReplayTestPair = struct {
     b: secured_s2s_link.SecuredLink,
 
     fn init(allocator: std.mem.Allocator) !SessionReplayTestPair {
-        var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x31)), "session-replay-test");
+        return initWithSeeds(allocator, 0x31, 0x32);
+    }
+
+    fn initWithSeeds(
+        allocator: std.mem.Allocator,
+        local_seed: u8,
+        remote_seed: u8,
+    ) !SessionReplayTestPair {
+        var ida = try node_identity.fromSeed(
+            @as([32]u8, @splat(local_seed)),
+            "session-replay-test",
+        );
         errdefer ida.deinit();
-        var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x32)), "session-replay-test");
+        var idb = try node_identity.fromSeed(
+            @as([32]u8, @splat(remote_seed)),
+            "session-replay-test",
+        );
         errdefer idb.deinit();
         const pre_a = try ida.signedPrekey(1, 10, 1000, LinuxServer.s2s_bands, LinuxServer.s2s_features);
         const pre_b = try idb.signedPrekey(2, 10, 1000, LinuxServer.s2s_bands, LinuxServer.s2s_features);
@@ -57479,9 +58305,66 @@ fn enrollTestE2eeDevice(server: *Server, account: []const u8, device: []const u8
     _ = try server.props.setProp(entity, key, "mls-x25519:abcd", .{ .id = account, .access = .member });
 }
 
+test "E2EEGROUP cap-exhausted login and late negotiation fail explicitly before membership" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .session_max_per_account = 1,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const owner_id = try addTestLocalClient(&server, "Owner", "shared");
+    _ = try server.world.join("#secure", worldIdFromClient(owner_id));
+    try std.testing.expect(server.sessions.containsClient("shared", monitorIdFromClient(owner_id)));
+
+    // Model normal pre-registration capability negotiation followed by account
+    // login. The sole account slot remains attached to Owner, so the login must
+    // fail the E2EE eligibility boundary before autojoin can run.
+    const login_id = try addTestLocalClient(&server, "LoginExtra", null);
+    const login_extra = server.connFor(login_id).?;
+    login_extra.session.addCap(.standard_replies);
+    login_extra.session.addCap(.onyx_e2ee);
+    try server.finishLogin(login_extra, "shared");
+    try std.testing.expect(login_extra.closing);
+    try std.testing.expectEqualStrings("E2EE reusable session unavailable", login_extra.close_reason);
+    try expectContains(
+        login_extra.send_buf[0..login_extra.send_len],
+        "FAIL E2EEGROUP SESSION_UNAVAILABLE :onyx/e2ee requires an available reusable session",
+    );
+    try std.testing.expect(!server.sessions.containsClient("shared", monitorIdFromClient(login_id)));
+    try std.testing.expect(!server.world.isMember("#secure", worldIdFromClient(login_id)));
+
+    // CAP is also legal after registration. A legacy/untracked logged-in socket
+    // may request onyx/e2ee there, but it is closed explicitly instead of being
+    // silently omitted from encrypted fan-out.
+    const cap_id = try addTestLocalClient(&server, "CapExtra", "shared");
+    const cap_extra = server.connFor(cap_id).?;
+    cap_extra.session.registration.registered = true;
+    cap_extra.session.addCap(.standard_replies);
+    try std.testing.expect(!cap_extra.session.hasCap(.onyx_e2ee));
+    try std.testing.expect(!server.sessions.containsClient("shared", monitorIdFromClient(cap_id)));
+    try server.processLiveLine(cap_id, cap_extra, "CAP REQ :onyx/e2ee");
+    try std.testing.expect(cap_extra.session.hasCap(.onyx_e2ee));
+    try std.testing.expect(cap_extra.closing);
+    try expectContains(
+        cap_extra.send_buf[0..cap_extra.send_len],
+        "FAIL E2EEGROUP SESSION_UNAVAILABLE :onyx/e2ee requires an available reusable session",
+    );
+    try std.testing.expect(!server.world.isMember("#secure", worldIdFromClient(cap_id)));
+}
+
 test "E2EEGROUP local handler renders exact capable-member and targeted Welcome lines" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -57549,7 +58432,11 @@ test "E2EEGROUP local handler renders exact capable-member and targeted Welcome 
 
 test "E2EEGROUP local handler fails closed and accepts the full payload bound" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -57645,6 +58532,1306 @@ test "E2EEGROUP local handler fails closed and accepts the full payload bound" {
         .{&max_payload},
     );
     try std.testing.expectEqualSlices(u8, expected, target.send_buf[0..target.send_len]);
+}
+
+test "E2EEGROUP mesh live path accepts once refloods exact wire retries and retires exact peer ACK" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var ingress = try SessionReplayTestPair.initWithSeeds(alloc, 0x41, 0x42);
+    defer ingress.deinit();
+    var egress = try SessionReplayTestPair.initWithSeeds(alloc, 0x41, 0x43);
+    defer egress.deinit();
+    var sim_time = reactor_mod.SimReactor.init(1_000_000);
+    ingress.a.clearOutbound();
+    ingress.b.clearOutbound();
+    egress.a.clearOutbound();
+    egress.b.clearOutbound();
+    try std.testing.expect(ingress.a.supportsE2eeGroup());
+    try std.testing.expect(ingress.b.supportsE2eeGroup());
+    try std.testing.expect(egress.a.supportsE2eeGroup());
+    try std.testing.expect(egress.b.supportsE2eeGroup());
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .node_id = ingress.ida.shortId(),
+        .node_identity = &ingress.ida,
+        .crypto_io = std.testing.io,
+        .reactor = sim_time.reactor(),
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+    server.fabric = reactor_fabric.ReactorFabric.init(alloc, server.reactors.len) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    current_reactor = &server.reactors[0];
+    // Keep the live authority deliberately small so this one encrypted harness
+    // also proves settled traffic does not consume finite pending capacity.
+    server.e2ee_group_mesh_authority.deinit();
+    server.e2ee_group_mesh_authority = try e2ee_group_mesh_authority.Authority.init(
+        alloc,
+        .{
+            .replay = .{
+                .window_size = 4,
+                .max_origins = 16,
+                .exact_history_size = 4,
+            },
+            .max_outbox_entries = 16,
+            .max_receipts = 4,
+        },
+    );
+
+    const Residence = struct {
+        fn verify(
+            _: *anyopaque,
+            account: []const u8,
+            nick: []const u8,
+            origin_node: u64,
+            _: bool,
+        ) s2s_link.S2sLink.ResidenceDecision {
+            if (origin_node != 0 and std.ascii.eqlIgnoreCase(account, "bob") and
+                std.ascii.eqlIgnoreCase(nick, "Bob")) return .trusted;
+            return .untrusted;
+        }
+    };
+    ingress.a.setResidenceVerifier(.{ .ctx = server, .verify_fn = Residence.verify });
+
+    const ingress_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const ingress_conn = server.rx().clients.get(ingress_id).?;
+    ingress_conn.overflow_allocator = alloc;
+    ingress_conn.token = try tokenFromId(ingress_id);
+    ingress_conn.send_armed = true;
+    ingress_conn.sendq_cap = default_sendq_cap;
+    ingress_conn.s2s_secured = &ingress.a;
+    const egress_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const egress_conn = server.rx().clients.get(egress_id).?;
+    egress_conn.overflow_allocator = alloc;
+    egress_conn.token = try tokenFromId(egress_id);
+    egress_conn.send_armed = true;
+    egress_conn.sendq_cap = default_sendq_cap;
+    egress_conn.s2s_secured = &egress.a;
+    defer {
+        ingress_conn.s2s_secured = null;
+        egress_conn.s2s_secured = null;
+        _ = server.rx().clients.free(ingress_id);
+        _ = server.rx().clients.free(egress_id);
+    }
+    // The secured-link cleanup above owns reactor-0 ids. Restore its owner
+    // before that defer even if a later cross-shard assertion exits early.
+    defer current_reactor = &server.reactors[0];
+
+    const local_id = try addTestLocalClient(server, "Local", "local");
+    const local = server.connFor(local_id).?;
+    local.session.addCap(.onyx_e2ee);
+    local.send_armed = true;
+    _ = try server.world.join("#secure", worldIdFromClient(local_id));
+
+    // A same-token physical sibling on another shard must receive its own
+    // retained row. It deliberately keeps a distinct display nick: attachment
+    // authority comes from the exact reusable token, not nick affinity.
+    const local_token = server.sessions.resumeHandleForClient(
+        "local",
+        monitorIdFromClient(local_id),
+    ).?.token;
+    current_reactor = &server.reactors[1];
+    const sibling_id = try addTestLocalClient(server, "LocalSibling", "local");
+    const sibling = server.connFor(sibling_id).?;
+    sibling.session.addCap(.onyx_e2ee);
+    sibling.send_armed = true;
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        "local",
+        monitorIdFromClient(sibling_id),
+        local_token,
+    ));
+    _ = try server.world.join("#secure", worldIdFromClient(sibling_id));
+
+    // CAP alone is not E2EE participation authority. This anonymous capable
+    // member remains in the room but is ineligible for durable delivery and
+    // cannot pin custody or veto the tracked attachments' ACK.
+    current_reactor = &server.reactors[0];
+    const anonymous_id = try addTestLocalClient(server, "Anonymous", null);
+    const anonymous = server.connFor(anonymous_id).?;
+    anonymous.session.addCap(.onyx_e2ee);
+    anonymous.send_armed = true;
+    _ = try server.world.join("#secure", worldIdFromClient(anonymous_id));
+    try enrollTestE2eeDevice(server, "bob", "phone");
+
+    // Apply origin-bound membership/account authority before the E2EEGROUP
+    // frame. This is the same same-read ordering enforced by driveS2sSecured.
+    try ingress.b.sendMembership(
+        "#secure",
+        "Bob",
+        0,
+        server.nextMeshHlc(),
+        true,
+        .{
+            .username = "bob",
+            .realname = "Bob",
+            .host = "peer-b.test",
+            .account = "bob",
+        },
+        "",
+    );
+    const membership_wire = try alloc.dupe(u8, ingress.b.outbound());
+    defer alloc.free(membership_wire);
+    ingress.b.clearOutbound();
+    server.driveS2sSecured(ingress_conn, &ingress.a, membership_wire);
+    try std.testing.expect(!ingress_conn.closing);
+    try std.testing.expect(server.remoteMemberOfChannelAtNode(
+        "#secure",
+        "Bob",
+        ingress.idb.shortId(),
+    ));
+    try std.testing.expectEqualStrings(
+        "bob",
+        server.trustedRemoteAccountAtNode("Bob", ingress.idb.shortId()).?,
+    );
+    // Do not discard any encrypted authority response emitted by `ingress.a`:
+    // that would advance its send counter without advancing `ingress.b`'s
+    // receive counter, making the later authenticated E2EEGROUP receipt look
+    // corrupt. Page and consume the response before beginning the assertion
+    // window.
+    const authority_response = try copyTestSendQ(alloc, ingress_conn);
+    defer alloc.free(authority_response);
+    resetTestSendQ(ingress_conn);
+    if (authority_response.len != 0)
+        try ingress.b.feed(authority_response, server.meshWallMs());
+    try std.testing.expectEqual(@as(usize, 0), ingress.a.outbound().len);
+    current_reactor = &server.reactors[1];
+    server.drainFabric();
+    current_reactor = &server.reactors[0];
+    resetTestSendQ(egress_conn);
+    local.send_len = 0;
+    local.send_offset = 0;
+    sibling.send_len = 0;
+    sibling.send_offset = 0;
+    anonymous.send_len = 0;
+    anonymous.send_offset = 0;
+    egress.a.clearOutbound();
+
+    var origin_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var origin_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+    var record = e2ee_group_relay.RelayRecord{
+        .kind = .commit,
+        .channel = "#secure",
+        .source_prefix = "Bob!bob@peer-b.test",
+        .account = "bob",
+        .from_device = "phone",
+        .payload = "AQIDBA",
+        .origin_node = ingress.idb.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try e2ee_group_relay.stampOrigin(
+        alloc,
+        &record,
+        &ingress.idb.sign_kp,
+        &origin_pubkey,
+        &origin_sig,
+    );
+    const exact_wire = try e2ee_group_relay.encode(alloc, record);
+    defer alloc.free(exact_wire);
+    const relay_id = switch (try e2ee_group_relay.verifyAndRelayId(alloc, record)) {
+        .verified => |id| id,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // First attempt cannot reserve the complete two-attachment batch. The
+    // exact ingress must remain unseen and receive no ACK; otherwise the sender
+    // could retire its only copy before any local handoff existed.
+    var limited_spool = try attachment_delivery_spool.Spool.init(alloc, .{
+        .max_attachments = 1,
+        .max_records = 1,
+        .max_total_bytes = 512,
+        .max_record_bytes = 256,
+    });
+    var limited_installed = false;
+    defer {
+        if (limited_installed) std.mem.swap(
+            attachment_delivery_spool.Spool,
+            &server.attachment_delivery_spool,
+            &limited_spool,
+        );
+        limited_spool.deinit();
+    }
+    std.mem.swap(
+        attachment_delivery_spool.Spool,
+        &server.attachment_delivery_spool,
+        &limited_spool,
+    );
+    limited_installed = true;
+    _ = try server.attachment_delivery_spool.reserveBatch(&.{.{
+        .client = monitorIdFromClient(local_id),
+        .event_id = @splat(0x95),
+        .bytes = ":seed!u@h E2EE.COMMIT #secure phone :occupy\r\n",
+    }});
+    const spool_before_refusal = try server.attachment_delivery_spool.encodeCheckpoint(alloc);
+    defer alloc.free(spool_before_refusal);
+    const authority_before_refusal = try server.e2ee_group_mesh_authority.encodeCheckpoint(alloc);
+    defer alloc.free(authority_before_refusal);
+    try ingress.b.sendE2eeGroup(record);
+    const refused_ciphertext = try alloc.dupe(u8, ingress.b.outbound());
+    ingress.b.clearOutbound();
+    server.driveS2sSecured(ingress_conn, &ingress.a, refused_ciphertext);
+    alloc.free(refused_ciphertext);
+    const refused_reply = try copyTestSendQ(alloc, ingress_conn);
+    defer alloc.free(refused_reply);
+    try std.testing.expectEqual(@as(usize, 0), refused_reply.len);
+    try std.testing.expectEqual(@as(usize, 0), ingress.a.outbound().len);
+    const refused_verified = switch (try server.e2ee_group_mesh_authority.authenticateRecord(record)) {
+        .verified => |identity| identity,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(
+        e2ee_group_mesh_authority.IdentityLookup.unseen,
+        server.e2ee_group_mesh_authority.probeIdentity(refused_verified),
+    );
+    try std.testing.expectEqual(@as(usize, 0), server.e2ee_group_mesh_authority.custodyLen());
+    try std.testing.expectEqual(@as(usize, 0), server.e2ee_group_mesh_authority.receiptLen());
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
+    const spool_after_refusal = try server.attachment_delivery_spool.encodeCheckpoint(alloc);
+    defer alloc.free(spool_after_refusal);
+    const authority_after_refusal = try server.e2ee_group_mesh_authority.encodeCheckpoint(alloc);
+    defer alloc.free(authority_after_refusal);
+    try std.testing.expectEqualSlices(u8, spool_before_refusal, spool_after_refusal);
+    try std.testing.expectEqualSlices(u8, authority_before_refusal, authority_after_refusal);
+
+    // Restore the roomy live spool. Retrying the byte-identical signed origin
+    // now reaches the joint ADS1 + replay/custody/receipt cut.
+    std.mem.swap(
+        attachment_delivery_spool.Spool,
+        &server.attachment_delivery_spool,
+        &limited_spool,
+    );
+    limited_installed = false;
+    resetTestSendQ(ingress_conn);
+    local.sendq_cap = 0;
+    sibling.sendq_cap = 0;
+    try ingress.b.replayRetainedE2eeGroupWire(exact_wire);
+    const ingress_ciphertext = try alloc.dupe(u8, ingress.b.outbound());
+    defer alloc.free(ingress_ciphertext);
+    ingress.b.clearOutbound();
+    server.driveS2sSecured(ingress_conn, &ingress.a, ingress_ciphertext);
+    try std.testing.expectEqual(@as(usize, 2), server.attachment_delivery_spool.len());
+    try std.testing.expectEqual(@as(usize, 0), local.send_len);
+    try std.testing.expectEqual(@as(usize, 0), sibling.send_len);
+    try std.testing.expectEqual(@as(usize, 0), anonymous.send_len);
+    try std.testing.expect(!local.closing);
+    try std.testing.expect(!sibling.closing);
+    try std.testing.expect(!local.delivery_gap.load(.acquire));
+    try std.testing.expect(!sibling.delivery_gap.load(.acquire));
+    var retained: [2]attachment_delivery_spool.PendingRecord = undefined;
+    const retained_rows = server.attachment_delivery_spool.collectPending(&retained);
+    try std.testing.expectEqual(@as(usize, 2), retained_rows.len);
+    try expectContains(retained_rows[0].bytes, "E2EE.COMMIT #secure phone :AQIDBA");
+    try expectContains(retained_rows[1].bytes, "E2EE.COMMIT #secure phone :AQIDBA");
+    try std.testing.expectEqual(@as(usize, 1), server.e2ee_group_mesh_authority.custodyLen());
+    try std.testing.expect(server.e2ee_group_mesh_authority.containsCustody(
+        egress.idb.shortId(),
+        relay_id,
+    ));
+
+    // The accepted inbound hop receives a receipt only after global admission.
+    const ingress_ack_ciphertext = try copyTestSendQ(alloc, ingress_conn);
+    defer alloc.free(ingress_ack_ciphertext);
+    resetTestSendQ(ingress_conn);
+    try ingress.b.feed(ingress_ack_ciphertext, server.meshWallMs());
+    const ingress_acks = try ingress.b.takeInboundE2eeGroupAcks();
+    defer alloc.free(ingress_acks);
+    try std.testing.expectEqual(@as(usize, 1), ingress_acks.len);
+    try std.testing.expectEqualSlices(u8, &relay_id, &ingress_acks[0]);
+
+    // Free each physical SendQ independently. The shard-local drains retire
+    // exactly their own ADS1 head, and each attachment observes one copy.
+    local.sendq_cap = default_sendq_cap;
+    server.drainAttachmentSpoolForCurrentReactor();
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
+    current_reactor = &server.reactors[1];
+    sibling.sendq_cap = default_sendq_cap;
+    server.drainAttachmentSpoolForCurrentReactor();
+    current_reactor = &server.reactors[0];
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
+    const delivered_line = ":Bob!bob@peer-b.test E2EE.COMMIT #secure phone :AQIDBA\r\n";
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(local.send_buf[0..local.send_len], delivered_line),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(sibling.send_buf[0..sibling.send_len], delivered_line),
+    );
+    try std.testing.expectEqual(@as(usize, 0), anonymous.send_len);
+    // Drop this first ACK at the application boundary: the durable ingress
+    // receipt must remain until a later retry is explicitly confirmed.
+    try std.testing.expect(server.e2ee_group_mesh_authority.containsReceipt(
+        ingress.idb.shortId(),
+        relay_id,
+    ));
+    // An ACK from the ingress hop cannot retire C's distinct custody row.
+    try std.testing.expect(server.e2ee_group_mesh_authority.containsCustody(
+        egress.idb.shortId(),
+        relay_id,
+    ));
+
+    // The eligible second direct peer receives byte-identical signed origin.
+    const first_reflood = try copyTestSendQ(alloc, egress_conn);
+    defer alloc.free(first_reflood);
+    resetTestSendQ(egress_conn);
+    try egress.b.feed(first_reflood, server.meshWallMs());
+    const first_inbound = try egress.b.takeInboundE2eeGroup();
+    defer {
+        for (first_inbound) |*item| item.deinit(alloc);
+        alloc.free(first_inbound);
+    }
+    try std.testing.expectEqual(@as(usize, 1), first_inbound.len);
+    try std.testing.expectEqualSlices(u8, exact_wire, first_inbound[0].wire);
+
+    // Reactor-0 receipt retry recovers the deliberately lost first ACK without
+    // replaying or redelivering the control. ACK_CONFIRM retires only B's exact
+    // ingress receipt; C's outgoing custody remains independently retained.
+    sim_time.advance(3 * e2ee_group_initial_retry_ms);
+    server.retryE2eeGroupReceipts();
+    const ingress_ack_retry_ciphertext = try copyTestSendQ(alloc, ingress_conn);
+    defer alloc.free(ingress_ack_retry_ciphertext);
+    resetTestSendQ(ingress_conn);
+    try ingress.b.feed(ingress_ack_retry_ciphertext, server.meshWallMs());
+    const ingress_ack_retries = try ingress.b.takeInboundE2eeGroupAcks();
+    defer alloc.free(ingress_ack_retries);
+    try std.testing.expectEqual(@as(usize, 1), ingress_ack_retries.len);
+    try std.testing.expectEqualSlices(u8, &relay_id, &ingress_ack_retries[0]);
+    try ingress.b.sendE2eeGroupAckConfirm(relay_id);
+    const ingress_confirm_ciphertext = try alloc.dupe(u8, ingress.b.outbound());
+    defer alloc.free(ingress_confirm_ciphertext);
+    ingress.b.clearOutbound();
+    server.driveS2sSecured(
+        ingress_conn,
+        &ingress.a,
+        ingress_confirm_ciphertext,
+    );
+    try std.testing.expect(!server.e2ee_group_mesh_authority.containsReceipt(
+        ingress.idb.shortId(),
+        relay_id,
+    ));
+    try std.testing.expect(server.e2ee_group_mesh_authority.containsCustody(
+        egress.idb.shortId(),
+        relay_id,
+    ));
+
+    // A lost C receipt remains recoverable through the public exact-wire replay
+    // API. Saturate the healthy peer's SendQ: the first due attempt may retain
+    // one complete encrypted record in the link, but every later timer pass
+    // must preflight that record and leave both link growth and custody bounded.
+    const egress_sendq_cap = egress_conn.sendq_cap;
+    resetTestSendQ(egress_conn);
+    egress_conn.sendq_cap = 1;
+    egress_conn.send_buf[0] = 'x';
+    egress_conn.send_len = 1;
+    server.retryE2eeGroupCustody();
+    const congested_retry_len = egress.a.outbound().len;
+    try std.testing.expect(congested_retry_len != 0);
+    var congested_round: usize = 0;
+    while (congested_round < 8) : (congested_round += 1) {
+        server.retryE2eeGroupCustody();
+        try std.testing.expectEqual(congested_retry_len, egress.a.outbound().len);
+        try std.testing.expect(!egress_conn.closing);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            server.e2ee_group_mesh_authority.custodyLen(),
+        );
+    }
+    resetTestSendQ(egress_conn);
+    egress_conn.sendq_cap = egress_sendq_cap;
+    try std.testing.expect(server.flushMeshBurstStage(egress_conn));
+    try std.testing.expectEqual(@as(usize, 0), egress.a.outbound().len);
+    const retry_ciphertext = try copyTestSendQ(alloc, egress_conn);
+    defer alloc.free(retry_ciphertext);
+    resetTestSendQ(egress_conn);
+    try egress.b.feed(retry_ciphertext, server.meshWallMs());
+    const retry_inbound = try egress.b.takeInboundE2eeGroup();
+    defer {
+        for (retry_inbound) |*item| item.deinit(alloc);
+        alloc.free(retry_inbound);
+    }
+    try std.testing.expectEqual(@as(usize, 1), retry_inbound.len);
+    try std.testing.expectEqualSlices(u8, exact_wire, retry_inbound[0].wire);
+
+    // Replayed ingress is a global duplicate: no second local delivery, but it
+    // is re-ACKed and re-drives the still-live C custody obligation. Remove the
+    // mutable device authority first: a lost receipt must be resolved from the
+    // retained exact identity, not stranded because account state changed after
+    // the first globally authorized acceptance.
+    try server.props.deleteProp(
+        .{ .kind = .user, .id = "bob" },
+        "e2ee.device.phone",
+    );
+    try std.testing.expect(!server.e2eeDeviceOwnedByAccount("bob", "phone"));
+    // The accepted HLC is now more than the allowed future window ahead of the
+    // receiver's apparent wall. Immutable duplicate proof must still win over
+    // current skew policy and mutable authority drift.
+    sim_time.advance(-600_000);
+    try std.testing.expect(
+        mesh_clock_mod.MeshClock.physicalOf(record.hlc) >
+            server.meshWallMs() + mesh_clock_mod.default_max_future_skew_ms,
+    );
+    local.send_len = 0;
+    local.send_offset = 0;
+    resetTestSendQ(ingress_conn);
+    resetTestSendQ(egress_conn);
+    const ingress_sendq_cap = ingress_conn.sendq_cap;
+    ingress_conn.sendq_cap = 1;
+    ingress_conn.send_buf[0] = 'x';
+    ingress_conn.send_len = 1;
+    try ingress.b.replayRetainedE2eeGroupWire(exact_wire);
+    const duplicate_ciphertext = try alloc.dupe(u8, ingress.b.outbound());
+    defer alloc.free(duplicate_ciphertext);
+    ingress.b.clearOutbound();
+    server.driveS2sSecured(ingress_conn, &ingress.a, duplicate_ciphertext);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        local.send_buf[0..local.send_len],
+        "E2EE.COMMIT",
+    ) == null);
+    const congested_ack_len = ingress.a.outbound().len;
+    try std.testing.expect(congested_ack_len != 0);
+    var duplicate_round: usize = 0;
+    while (duplicate_round < 8) : (duplicate_round += 1) {
+        try ingress.b.replayRetainedE2eeGroupWire(exact_wire);
+        const repeated_ciphertext = try alloc.dupe(u8, ingress.b.outbound());
+        ingress.b.clearOutbound();
+        server.driveS2sSecured(ingress_conn, &ingress.a, repeated_ciphertext);
+        alloc.free(repeated_ciphertext);
+        try std.testing.expectEqual(congested_ack_len, ingress.a.outbound().len);
+        try std.testing.expect(!ingress_conn.closing);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            server.e2ee_group_mesh_authority.custodyLen(),
+        );
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            local.send_buf[0..local.send_len],
+            "E2EE.COMMIT",
+        ) == null);
+    }
+    resetTestSendQ(ingress_conn);
+    ingress_conn.sendq_cap = ingress_sendq_cap;
+    try std.testing.expect(server.flushMeshBurstStage(ingress_conn));
+    try std.testing.expectEqual(@as(usize, 0), ingress.a.outbound().len);
+    const duplicate_ack = try copyTestSendQ(alloc, ingress_conn);
+    defer alloc.free(duplicate_ack);
+    resetTestSendQ(ingress_conn);
+    try ingress.b.feed(duplicate_ack, server.meshWallMs());
+    const duplicate_acks = try ingress.b.takeInboundE2eeGroupAcks();
+    defer alloc.free(duplicate_acks);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_acks.len);
+    try std.testing.expectEqualSlices(u8, &relay_id, &duplicate_acks[0]);
+    try std.testing.expect(server.e2ee_group_mesh_authority.containsReceipt(
+        ingress.idb.shortId(),
+        relay_id,
+    ));
+    try ingress.b.sendE2eeGroupAckConfirm(relay_id);
+    const duplicate_confirm_ciphertext = try alloc.dupe(u8, ingress.b.outbound());
+    defer alloc.free(duplicate_confirm_ciphertext);
+    ingress.b.clearOutbound();
+    server.driveS2sSecured(
+        ingress_conn,
+        &ingress.a,
+        duplicate_confirm_ciphertext,
+    );
+    try std.testing.expect(!server.e2ee_group_mesh_authority.containsReceipt(
+        ingress.idb.shortId(),
+        relay_id,
+    ));
+
+    // The same stepped-back wall must still reject a genuinely unseen future
+    // identity without consuming replay authority or emitting a receipt.
+    var future_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var future_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+    var future_record = record;
+    future_record.hlc += 1;
+    try e2ee_group_relay.stampOrigin(
+        alloc,
+        &future_record,
+        &ingress.idb.sign_kp,
+        &future_pubkey,
+        &future_sig,
+    );
+    const future_verified = switch (try server.e2ee_group_mesh_authority.authenticateRecord(
+        future_record,
+    )) {
+        .verified => |identity| identity,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(e2ee_group_mesh_authority.isFutureSkewed(
+        future_verified,
+        server.meshWallMs(),
+        mesh_clock_mod.default_max_future_skew_ms,
+    ));
+    try ingress.b.sendE2eeGroup(future_record);
+    const future_ciphertext = try alloc.dupe(u8, ingress.b.outbound());
+    defer alloc.free(future_ciphertext);
+    ingress.b.clearOutbound();
+    resetTestSendQ(ingress_conn);
+    server.driveS2sSecured(ingress_conn, &ingress.a, future_ciphertext);
+    const future_reply = try copyTestSendQ(alloc, ingress_conn);
+    defer alloc.free(future_reply);
+    try std.testing.expectEqual(@as(usize, 0), future_reply.len);
+    lockSpin(&server.e2ee_group_mesh_mu);
+    const future_lookup = server.e2ee_group_mesh_authority.probeIdentity(future_verified);
+    const custody_len_after_future = server.e2ee_group_mesh_authority.custodyLen();
+    server.e2ee_group_mesh_mu.unlock();
+    try std.testing.expectEqual(
+        e2ee_group_mesh_authority.IdentityLookup.unseen,
+        future_lookup,
+    );
+    try std.testing.expectEqual(@as(usize, 1), custody_len_after_future);
+
+    // Only C's authenticated ACK retires `(C, RelayId)`. Drop the first
+    // ACK_CONFIRM after decoding it, then send a duplicate ACK: even though
+    // custody is already gone, A must emit the exact confirm again.
+    try egress.b.sendE2eeGroupAck(relay_id);
+    const egress_ack_ciphertext = try alloc.dupe(u8, egress.b.outbound());
+    defer alloc.free(egress_ack_ciphertext);
+    egress.b.clearOutbound();
+    server.driveS2sSecured(egress_conn, &egress.a, egress_ack_ciphertext);
+    try std.testing.expectEqual(@as(usize, 0), server.e2ee_group_mesh_authority.custodyLen());
+    const first_ack_confirm_ciphertext = try copyTestSendQ(alloc, egress_conn);
+    defer alloc.free(first_ack_confirm_ciphertext);
+    resetTestSendQ(egress_conn);
+    try egress.b.feed(first_ack_confirm_ciphertext, server.meshWallMs());
+    const dropped_ack_confirms = try egress.b.takeInboundE2eeGroupAckConfirms();
+    defer alloc.free(dropped_ack_confirms);
+    try std.testing.expectEqual(@as(usize, 1), dropped_ack_confirms.len);
+    try std.testing.expectEqualSlices(u8, &relay_id, &dropped_ack_confirms[0]);
+
+    try egress.b.sendE2eeGroupAck(relay_id);
+    const duplicate_egress_ack_ciphertext = try alloc.dupe(u8, egress.b.outbound());
+    defer alloc.free(duplicate_egress_ack_ciphertext);
+    egress.b.clearOutbound();
+    server.driveS2sSecured(
+        egress_conn,
+        &egress.a,
+        duplicate_egress_ack_ciphertext,
+    );
+    const retried_ack_confirm_ciphertext = try copyTestSendQ(alloc, egress_conn);
+    defer alloc.free(retried_ack_confirm_ciphertext);
+    resetTestSendQ(egress_conn);
+    try egress.b.feed(retried_ack_confirm_ciphertext, server.meshWallMs());
+    const retried_ack_confirms = try egress.b.takeInboundE2eeGroupAckConfirms();
+    defer alloc.free(retried_ack_confirms);
+    try std.testing.expectEqual(@as(usize, 1), retried_ack_confirms.len);
+    try std.testing.expectEqualSlices(u8, &relay_id, &retried_ack_confirms[0]);
+    try std.testing.expectEqual(@as(usize, 0), server.e2ee_group_mesh_authority.custodyLen());
+
+    // Consume C's queued exact-wire retries so both encrypted receive counters
+    // are aligned before exercising a full B -> A -> C -> A -> B reflection
+    // cycle. Once C's obligation is ACKed, duplicates from either side may earn
+    // a receipt, but must never recreate the opposite edge.
+    const queued_c_retries = try copyTestSendQ(alloc, egress_conn);
+    defer alloc.free(queued_c_retries);
+    resetTestSendQ(egress_conn);
+    if (queued_c_retries.len != 0)
+        try egress.b.feed(queued_c_retries, server.meshWallMs());
+    const queued_c_inbound = try egress.b.takeInboundE2eeGroup();
+    defer {
+        for (queued_c_inbound) |*item| item.deinit(alloc);
+        alloc.free(queued_c_inbound);
+    }
+
+    var cycle_round: usize = 0;
+    while (cycle_round < 3) : (cycle_round += 1) {
+        resetTestSendQ(ingress_conn);
+        resetTestSendQ(egress_conn);
+        local.send_len = 0;
+        local.send_offset = 0;
+
+        try ingress.b.replayRetainedE2eeGroupWire(exact_wire);
+        const from_b = try alloc.dupe(u8, ingress.b.outbound());
+        ingress.b.clearOutbound();
+        server.driveS2sSecured(ingress_conn, &ingress.a, from_b);
+        alloc.free(from_b);
+        try std.testing.expectEqual(@as(usize, 0), server.e2ee_group_mesh_authority.custodyLen());
+        try std.testing.expectEqual(@as(usize, 0), egress_conn.send_len);
+        try std.testing.expectEqual(@as(usize, 0), egress.a.outbound().len);
+        try std.testing.expectEqual(@as(usize, 0), local.send_len);
+        const ack_b = try copyTestSendQ(alloc, ingress_conn);
+        resetTestSendQ(ingress_conn);
+        try ingress.b.feed(ack_b, server.meshWallMs());
+        alloc.free(ack_b);
+        const acks_b = try ingress.b.takeInboundE2eeGroupAcks();
+        try std.testing.expectEqual(@as(usize, 1), acks_b.len);
+        try std.testing.expectEqualSlices(u8, &relay_id, &acks_b[0]);
+        alloc.free(acks_b);
+        try ingress.b.sendE2eeGroupAckConfirm(relay_id);
+        const confirm_b = try alloc.dupe(u8, ingress.b.outbound());
+        ingress.b.clearOutbound();
+        server.driveS2sSecured(ingress_conn, &ingress.a, confirm_b);
+        alloc.free(confirm_b);
+        try std.testing.expect(!server.e2ee_group_mesh_authority.containsReceipt(
+            ingress.idb.shortId(),
+            relay_id,
+        ));
+
+        try egress.b.replayRetainedE2eeGroupWire(exact_wire);
+        const from_c = try alloc.dupe(u8, egress.b.outbound());
+        egress.b.clearOutbound();
+        server.driveS2sSecured(egress_conn, &egress.a, from_c);
+        alloc.free(from_c);
+        try std.testing.expectEqual(@as(usize, 0), server.e2ee_group_mesh_authority.custodyLen());
+        try std.testing.expectEqual(@as(usize, 0), ingress_conn.send_len);
+        try std.testing.expectEqual(@as(usize, 0), ingress.a.outbound().len);
+        try std.testing.expectEqual(@as(usize, 0), local.send_len);
+        const ack_c = try copyTestSendQ(alloc, egress_conn);
+        resetTestSendQ(egress_conn);
+        try egress.b.feed(ack_c, server.meshWallMs());
+        alloc.free(ack_c);
+        const acks_c = try egress.b.takeInboundE2eeGroupAcks();
+        try std.testing.expectEqual(@as(usize, 1), acks_c.len);
+        try std.testing.expectEqualSlices(u8, &relay_id, &acks_c[0]);
+        alloc.free(acks_c);
+        try egress.b.sendE2eeGroupAckConfirm(relay_id);
+        const confirm_c = try alloc.dupe(u8, egress.b.outbound());
+        egress.b.clearOutbound();
+        server.driveS2sSecured(egress_conn, &egress.a, confirm_c);
+        alloc.free(confirm_c);
+        try std.testing.expect(!server.e2ee_group_mesh_authority.containsReceipt(
+            egress.idb.shortId(),
+            relay_id,
+        ));
+    }
+
+    // More than 10x the deliberately small pending cap of settled local
+    // controls must continue to admit: no custody and no ingress receipt means
+    // no pending-exact slot is consumed. Since the original receipt/custody is
+    // fully settled above, aging it beyond the ordinary window must retire it.
+    sim_time.advance(600_000);
+    const later_count =
+        server.e2ee_group_mesh_authority.config.replay.exact_history_size * 10 + 1;
+    var later_index: usize = 0;
+    while (later_index < later_count) : (later_index += 1) {
+        var later_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+        var later_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+        var later_record = record;
+        later_record.hlc = record.hlc + @as(u64, @intCast(later_index + 1));
+        try e2ee_group_relay.stampOrigin(
+            alloc,
+            &later_record,
+            &ingress.idb.sign_kp,
+            &later_pubkey,
+            &later_sig,
+        );
+        const later_wire = try e2ee_group_relay.encode(alloc, later_record);
+        const later_verified = switch (try server.e2ee_group_mesh_authority.authenticateRecord(
+            later_record,
+        )) {
+            .verified => |identity| identity,
+            else => return error.TestUnexpectedResult,
+        };
+        lockSpin(&server.e2ee_group_mesh_mu);
+        const later_admitted = server.e2ee_group_mesh_authority.admitAuthorizedWithCustody(
+            later_verified,
+            &.{},
+            later_wire,
+        ) catch |err| {
+            server.e2ee_group_mesh_mu.unlock();
+            alloc.free(later_wire);
+            return err;
+        };
+        server.e2ee_group_mesh_mu.unlock();
+        alloc.free(later_wire);
+        try std.testing.expectEqual(
+            std.meta.Tag(e2ee_group_mesh_authority.Admission).accepted,
+            std.meta.activeTag(later_admitted.admission),
+        );
+    }
+    const old_verified = switch (try server.e2ee_group_mesh_authority.authenticateRecord(
+        record,
+    )) {
+        .verified => |identity| identity,
+        else => return error.TestUnexpectedResult,
+    };
+    lockSpin(&server.e2ee_group_mesh_mu);
+    const old_after_window = server.e2ee_group_mesh_authority.probeIdentity(old_verified);
+    server.e2ee_group_mesh_mu.unlock();
+    try std.testing.expectEqual(
+        e2ee_group_mesh_authority.IdentityLookup.retired,
+        old_after_window,
+    );
+
+    resetTestSendQ(ingress_conn);
+    resetTestSendQ(egress_conn);
+    local.send_len = 0;
+    local.send_offset = 0;
+    try ingress.b.replayRetainedE2eeGroupWire(exact_wire);
+    const aged_retry = try alloc.dupe(u8, ingress.b.outbound());
+    defer alloc.free(aged_retry);
+    ingress.b.clearOutbound();
+    server.driveS2sSecured(ingress_conn, &ingress.a, aged_retry);
+    try std.testing.expectEqual(@as(usize, 0), local.send_len);
+    try std.testing.expectEqual(@as(usize, 0), server.e2ee_group_mesh_authority.custodyLen());
+    try std.testing.expectEqual(@as(usize, 0), egress_conn.send_len);
+    const aged_ack = try copyTestSendQ(alloc, ingress_conn);
+    defer alloc.free(aged_ack);
+    try std.testing.expectEqual(@as(usize, 0), aged_ack.len);
+
+    // Partition pressure consumes the four pending/receipt slots and fails the
+    // fifth admission closed without guard-only acceptance. One exact confirm
+    // frees capacity, and retrying the same fifth identity then succeeds.
+    const pending_cap: usize = 4;
+    var partition_ids: [pending_cap]e2ee_group_relay.RelayId = undefined;
+    var partition_index: usize = 0;
+    while (partition_index < pending_cap) : (partition_index += 1) {
+        var partition_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+        var partition_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+        var partition_record = record;
+        partition_record.hlc =
+            record.hlc + @as(u64, @intCast(later_count + partition_index + 100));
+        try e2ee_group_relay.stampOrigin(
+            alloc,
+            &partition_record,
+            &ingress.idb.sign_kp,
+            &partition_pubkey,
+            &partition_sig,
+        );
+        const partition_wire = try e2ee_group_relay.encode(alloc, partition_record);
+        const partition_verified = switch (try server.e2ee_group_mesh_authority.authenticateRecord(
+            partition_record,
+        )) {
+            .verified => |identity| identity,
+            else => return error.TestUnexpectedResult,
+        };
+        partition_ids[partition_index] = partition_verified.relay_id;
+        lockSpin(&server.e2ee_group_mesh_mu);
+        const partition_admitted = server.e2ee_group_mesh_authority.admitAuthorizedWithCustodyAndIngress(
+            partition_verified,
+            &.{},
+            partition_wire,
+            ingress.idb.shortId(),
+            server.meshWallMs() +| e2ee_group_initial_retry_ms,
+        ) catch |err| {
+            server.e2ee_group_mesh_mu.unlock();
+            alloc.free(partition_wire);
+            return err;
+        };
+        server.e2ee_group_mesh_mu.unlock();
+        alloc.free(partition_wire);
+        try std.testing.expectEqual(
+            std.meta.Tag(e2ee_group_mesh_authority.Admission).accepted,
+            std.meta.activeTag(partition_admitted.admission),
+        );
+    }
+    try std.testing.expectEqual(
+        pending_cap,
+        server.e2ee_group_mesh_authority.receiptLen(),
+    );
+
+    var overflow_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var overflow_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+    var overflow_record = record;
+    overflow_record.hlc =
+        record.hlc + @as(u64, @intCast(later_count + pending_cap + 100));
+    try e2ee_group_relay.stampOrigin(
+        alloc,
+        &overflow_record,
+        &ingress.idb.sign_kp,
+        &overflow_pubkey,
+        &overflow_sig,
+    );
+    const overflow_wire = try e2ee_group_relay.encode(alloc, overflow_record);
+    defer alloc.free(overflow_wire);
+    const overflow_verified = switch (try server.e2ee_group_mesh_authority.authenticateRecord(
+        overflow_record,
+    )) {
+        .verified => |identity| identity,
+        else => return error.TestUnexpectedResult,
+    };
+    lockSpin(&server.e2ee_group_mesh_mu);
+    const overflow_refused = server.e2ee_group_mesh_authority.admitAuthorizedWithCustodyAndIngress(
+        overflow_verified,
+        &.{},
+        overflow_wire,
+        ingress.idb.shortId(),
+        server.meshWallMs() +| e2ee_group_initial_retry_ms,
+    );
+    const overflow_probe = server.e2ee_group_mesh_authority.probeIdentity(overflow_verified);
+    server.e2ee_group_mesh_mu.unlock();
+    try std.testing.expectError(
+        error.CapacityExceeded,
+        overflow_refused,
+    );
+    try std.testing.expectEqual(
+        e2ee_group_mesh_authority.IdentityLookup.unseen,
+        overflow_probe,
+    );
+    try std.testing.expectEqual(
+        pending_cap,
+        server.e2ee_group_mesh_authority.receiptLen(),
+    );
+
+    lockSpin(&server.e2ee_group_mesh_mu);
+    try std.testing.expect(try server.e2ee_group_mesh_authority.confirmIngress(
+        ingress.idb.shortId(),
+        partition_ids[0],
+    ));
+    const overflow_recovered = try server.e2ee_group_mesh_authority.admitAuthorizedWithCustodyAndIngress(
+        overflow_verified,
+        &.{},
+        overflow_wire,
+        ingress.idb.shortId(),
+        server.meshWallMs() +| e2ee_group_initial_retry_ms,
+    );
+    server.e2ee_group_mesh_mu.unlock();
+    try std.testing.expectEqual(
+        std.meta.Tag(e2ee_group_mesh_authority.Admission).accepted,
+        std.meta.activeTag(overflow_recovered.admission),
+    );
+    for (partition_ids[1..]) |partition_id| {
+        lockSpin(&server.e2ee_group_mesh_mu);
+        try std.testing.expect(try server.e2ee_group_mesh_authority.confirmIngress(
+            ingress.idb.shortId(),
+            partition_id,
+        ));
+        server.e2ee_group_mesh_mu.unlock();
+    }
+    lockSpin(&server.e2ee_group_mesh_mu);
+    try std.testing.expect(try server.e2ee_group_mesh_authority.confirmIngress(
+        ingress.idb.shortId(),
+        overflow_verified.relay_id,
+    ));
+    server.e2ee_group_mesh_mu.unlock();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        server.e2ee_group_mesh_authority.receiptLen(),
+    );
+}
+
+test "E2EEGROUP configured disconnected peer remains in event-time custody" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x51)), "e2ee-disconnected");
+    defer local.deinit();
+    var ingress = try node_identity.fromSeed(@as([32]u8, @splat(0x52)), "e2ee-disconnected");
+    defer ingress.deinit();
+    var disconnected = try node_identity.fromSeed(@as([32]u8, @splat(0x53)), "e2ee-disconnected");
+    defer disconnected.deinit();
+    const ingress_root = std.fmt.bytesToHex(ingress.sign_kp.public_key, .lower);
+    const disconnected_root = std.fmt.bytesToHex(disconnected.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &ingress_root, &disconnected_root };
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const peers = try server.collectE2eeGroupOutboxPeers(ingress.shortId());
+    defer alloc.free(peers);
+    try std.testing.expectEqual(@as(usize, 1), peers.len);
+    try std.testing.expectEqual(disconnected.shortId(), peers[0]);
+
+    var origin_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var origin_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+    var record = e2ee_group_relay.RelayRecord{
+        .kind = .key_package,
+        .channel = "#offline-peer",
+        .source_prefix = "Local!local@node.test",
+        .account = "local",
+        .from_device = "phone",
+        .payload = "AQIDBA",
+        .origin_node = local.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try e2ee_group_relay.stampOrigin(
+        alloc,
+        &record,
+        &local.sign_kp,
+        &origin_pubkey,
+        &origin_sig,
+    );
+    const wire = try e2ee_group_relay.encode(alloc, record);
+    defer alloc.free(wire);
+    const verification = try server.e2ee_group_mesh_authority.verifyRecord(
+        record,
+        server.meshWallMs(),
+        mesh_clock_mod.default_max_future_skew_ms,
+    );
+    const verified = switch (verification) {
+        .verified => |identity| identity,
+        else => return error.TestUnexpectedResult,
+    };
+    const admitted = try server.e2ee_group_mesh_authority.admitAuthorizedWithCustody(
+        verified,
+        peers,
+        wire,
+    );
+    try std.testing.expect(admitted.admission == .accepted);
+    try std.testing.expect(server.e2ee_group_mesh_authority.containsCustody(
+        disconnected.shortId(),
+        verified.relay_id,
+    ));
+
+    // A retry while C is down emits nothing and cannot retire its exact row.
+    server.retryE2eeGroupCustody();
+    try std.testing.expect(server.e2ee_group_mesh_authority.containsCustody(
+        disconnected.shortId(),
+        verified.relay_id,
+    ));
+    // Another authenticated direct peer cannot steal C's obligation.
+    try std.testing.expect(!try server.e2ee_group_mesh_authority.acknowledge(
+        ingress.shortId(),
+        verified.relay_id,
+    ));
+    try std.testing.expect(try server.e2ee_group_mesh_authority.acknowledge(
+        disconnected.shortId(),
+        verified.relay_id,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), server.e2ee_group_mesh_authority.custodyLen());
+}
+
+test "E2EEGROUP Helix seal refuses outstanding opaque custody without mutation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x54)), "e2ee-seal");
+    defer ident.deinit();
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &ident,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var origin_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var origin_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+    var record = e2ee_group_relay.RelayRecord{
+        .kind = .commit,
+        .channel = "#seal",
+        .source_prefix = "Local!local@node.test",
+        .account = "local",
+        .from_device = "phone",
+        .payload = "AQIDBA",
+        .origin_node = ident.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try e2ee_group_relay.stampOrigin(
+        alloc,
+        &record,
+        &ident.sign_kp,
+        &origin_pubkey,
+        &origin_sig,
+    );
+    const wire = try e2ee_group_relay.encode(alloc, record);
+    defer alloc.free(wire);
+    const verification = try server.e2ee_group_mesh_authority.verifyRecord(
+        record,
+        server.meshWallMs(),
+        mesh_clock_mod.default_max_future_skew_ms,
+    );
+    const verified = switch (verification) {
+        .verified => |identity| identity,
+        else => return error.TestUnexpectedResult,
+    };
+    _ = try server.e2ee_group_mesh_authority.admitAuthorizedWithCustody(
+        verified,
+        &.{99},
+        wire,
+    );
+
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    server.world.lockWrite();
+    const sealed = server.sealMandatoryStateUpgradeCheckpoints(&pieces, &blobs);
+    server.world.unlockWrite();
+    try std.testing.expect(sealed == null);
+    try std.testing.expect(server.e2ee_group_mesh_authority.containsCustody(
+        99,
+        verified.relay_id,
+    ));
+    for (pieces.items) |piece| {
+        try std.testing.expect(
+            piece.kind != .mesh_checkpoint or
+                !e2ee_group_mesh_authority.isCheckpoint(piece.bytes),
+        );
+    }
+}
+
+test "E2EEGROUP Helix carries receipt metadata and ACK_CONFIRM retires pending exact after adopt" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var origin = try node_identity.fromSeed(
+        @as([32]u8, @splat(0x56)),
+        "e2ee-receipt-carry",
+    );
+    defer origin.deinit();
+    const config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = origin.shortId(),
+        .node_identity = &origin,
+        .crypto_io = std.testing.io,
+    };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+
+    var origin_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var origin_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+    var record = e2ee_group_relay.RelayRecord{
+        .kind = .commit,
+        .channel = "#receipt-carry",
+        .source_prefix = "Origin!origin@node.test",
+        .account = "origin",
+        .from_device = "phone",
+        .payload = "AQIDBA",
+        .origin_node = origin.shortId(),
+        .hlc = predecessor.nextMeshHlc(),
+    };
+    try e2ee_group_relay.stampOrigin(
+        alloc,
+        &record,
+        &origin.sign_kp,
+        &origin_pubkey,
+        &origin_sig,
+    );
+    const wire = try e2ee_group_relay.encode(alloc, record);
+    defer alloc.free(wire);
+    const verification = try predecessor.e2ee_group_mesh_authority.verifyRecord(
+        record,
+        predecessor.meshWallMs(),
+        mesh_clock_mod.default_max_future_skew_ms,
+    );
+    const verified = switch (verification) {
+        .verified => |identity| identity,
+        else => return error.TestUnexpectedResult,
+    };
+    const ingress_peer: u64 = 0x4242;
+    const first_retry_ms: u64 = 7_777_000;
+    const admitted =
+        try predecessor.e2ee_group_mesh_authority.admitAuthorizedWithCustodyAndIngress(
+            verified,
+            &.{},
+            wire,
+            ingress_peer,
+            first_retry_ms,
+        );
+    try std.testing.expect(admitted.admission == .accepted);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        predecessor.e2ee_group_mesh_authority.custodyLen(),
+    );
+    try std.testing.expect(predecessor.e2ee_group_mesh_authority.containsReceipt(
+        ingress_peer,
+        verified.relay_id,
+    ));
+    try std.testing.expect(predecessor.e2ee_group_mesh_authority.guard.hasPendingExact(
+        verified.origin_pubkey,
+        verified.hlc,
+        verified.relay_id,
+    ));
+    try std.testing.expect(
+        try predecessor.e2ee_group_mesh_authority.markReceiptAttempt(
+            ingress_peer,
+            verified.relay_id,
+            first_retry_ms + 500,
+        ),
+    );
+    const before = try predecessor.e2ee_group_mesh_authority.encodeCheckpoint(alloc);
+    defer alloc.free(before);
+
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(
+        successor,
+        pieces.items,
+        "onyx-test-e2ee-receipt-carry",
+    );
+    current_reactor = null;
+
+    const carried = try successor.e2ee_group_mesh_authority.encodeCheckpoint(alloc);
+    defer alloc.free(carried);
+    try std.testing.expectEqualSlices(u8, before, carried);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        successor.e2ee_group_mesh_authority.custodyLen(),
+    );
+    try std.testing.expect(successor.e2ee_group_mesh_authority.containsReceipt(
+        ingress_peer,
+        verified.relay_id,
+    ));
+    const receipts = successor.e2ee_group_mesh_authority.receiptItems();
+    try std.testing.expectEqual(@as(usize, 1), receipts.len);
+    try std.testing.expectEqual(first_retry_ms + 500, receipts[0].retry_after_ms);
+    try std.testing.expectEqual(@as(u32, 1), receipts[0].attempts);
+    try std.testing.expect(successor.e2ee_group_mesh_authority.guard.hasPendingExact(
+        verified.origin_pubkey,
+        verified.hlc,
+        verified.relay_id,
+    ));
+
+    try std.testing.expect(try successor.e2ee_group_mesh_authority.confirmIngress(
+        ingress_peer,
+        verified.relay_id,
+    ));
+    try std.testing.expect(!successor.e2ee_group_mesh_authority.containsReceipt(
+        ingress_peer,
+        verified.relay_id,
+    ));
+    try std.testing.expect(!successor.e2ee_group_mesh_authority.guard.hasPendingExact(
+        verified.origin_pubkey,
+        verified.hlc,
+        verified.relay_id,
+    ));
+    try std.testing.expectEqual(
+        e2ee_group_mesh_authority.IdentityLookup.duplicate,
+        successor.e2ee_group_mesh_authority.probeIdentity(verified),
+    );
+}
+
+test "E2EEGROUP Helix corrupt mandatory checkpoint leaves live authority byte exact" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var fixture = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fixture.deinit();
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(&fixture, &pieces, &blobs);
+    var e2ee_checkpoint: ?[]const u8 = null;
+    for (pieces.items) |piece| {
+        if (piece.kind == .mesh_checkpoint and
+            e2ee_group_mesh_authority.isCheckpoint(piece.bytes))
+        {
+            e2ee_checkpoint = piece.bytes;
+            break;
+        }
+    }
+    const corrupt = try alloc.dupe(u8, e2ee_checkpoint orelse
+        return error.TestUnexpectedResult);
+    defer alloc.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    try std.testing.expect(replaceUpgradeFixtureAuthority(
+        &pieces,
+        .e2ee_group,
+        .{
+            .kind = .mesh_checkpoint,
+            .bytes = corrupt,
+            .min_supported = 2,
+        },
+    ));
+
+    var successor = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer successor.deinit();
+    var kp = try node_identity.fromSeed(@as([32]u8, @splat(0x55)), "e2ee-adopt");
+    defer kp.deinit();
+    var origin_pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+    var origin_sig: [e2ee_group_relay.sig_len]u8 = undefined;
+    var sentinel = e2ee_group_relay.RelayRecord{
+        .kind = .commit,
+        .channel = "#sentinel",
+        .source_prefix = "Sentinel!s@node.test",
+        .account = "sentinel",
+        .from_device = "phone",
+        .payload = "AQIDBA",
+        .origin_node = kp.shortId(),
+        .hlc = successor.nextMeshHlc(),
+    };
+    try e2ee_group_relay.stampOrigin(
+        alloc,
+        &sentinel,
+        &kp.sign_kp,
+        &origin_pubkey,
+        &origin_sig,
+    );
+    const sentinel_wire = try e2ee_group_relay.encode(alloc, sentinel);
+    defer alloc.free(sentinel_wire);
+    const sentinel_verification = try successor.e2ee_group_mesh_authority.verifyRecord(
+        sentinel,
+        successor.meshWallMs(),
+        mesh_clock_mod.default_max_future_skew_ms,
+    );
+    const sentinel_verified = switch (sentinel_verification) {
+        .verified => |identity| identity,
+        else => return error.TestUnexpectedResult,
+    };
+    _ = try successor.e2ee_group_mesh_authority.admitAuthorizedWithCustody(
+        sentinel_verified,
+        &.{},
+        sentinel_wire,
+    );
+    const before = try successor.e2ee_group_mesh_authority.encodeCheckpoint(alloc);
+    defer alloc.free(before);
+
+    _ = try rejectUpgradePiecesForTest(
+        &successor,
+        pieces.items,
+        "onyx-test-e2ee-group-corrupt-adopt",
+    );
+    current_reactor = null;
+    const after = try successor.e2ee_group_mesh_authority.encodeCheckpoint(alloc);
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectEqual(@as(usize, 0), successor.e2ee_group_mesh_authority.custodyLen());
 }
 
 test "IDENTITY advertises self-signed portable account keys through user props" {
@@ -85089,7 +87276,13 @@ test "wsCarryable: any open adapter carries, incl. mid-frame; handshake/pending 
     try std.testing.expect(!wsCarryable(ws));
 }
 
-const UpgradeFixtureAuthority = enum { mesh_clock, property, replica_store, pending };
+const UpgradeFixtureAuthority = enum {
+    mesh_clock,
+    property,
+    replica_store,
+    pending,
+    e2ee_group,
+};
 
 fn replaceUpgradeFixtureAuthority(
     pieces: *std.ArrayList(helix_live.StatePiece),
@@ -85103,6 +87296,8 @@ fn replaceUpgradeFixtureAuthority(
             .property => piece.kind == .mesh_checkpoint and prop_checkpoint.isUpgradeCheckpoint(piece.bytes),
             .replica_store => piece.kind == .mesh_checkpoint and session_replica_v2.Store.isUpgradeCheckpoint(piece.bytes),
             .pending => piece.kind == .pending_migration,
+            .e2ee_group => piece.kind == .mesh_checkpoint and
+                e2ee_group_mesh_authority.isCheckpoint(piece.bytes),
         };
         if (!matches) continue;
         piece.* = replacement;

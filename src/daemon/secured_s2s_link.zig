@@ -770,6 +770,11 @@ pub const SecuredLink = struct {
         return link.supportsE2eeGroup();
     }
 
+    pub fn supportsE2eeGroupAckConfirm(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsE2eeGroupAckConfirm();
+    }
+
     pub fn sendE2eeGroup(self: *SecuredLink, record: s2s_link.E2eeGroupRelay) anyerror!void {
         const link = self.inner orelse return error.NotEstablished;
         try link.sendE2eeGroup(record);
@@ -807,12 +812,29 @@ pub const SecuredLink = struct {
         try self.drainInner();
     }
 
+    pub fn sendE2eeGroupAckConfirm(
+        self: *SecuredLink,
+        id: s2s_link.E2eeGroupRelayId,
+    ) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendE2eeGroupAckConfirm(id);
+        try self.drainInner();
+    }
+
     pub fn takeInboundE2eeGroupAcks(
         self: *SecuredLink,
     ) anyerror![]s2s_link.E2eeGroupRelayId {
         const link = self.inner orelse
             return self.allocator.alloc(s2s_link.E2eeGroupRelayId, 0);
         return link.takeInboundE2eeGroupAcks();
+    }
+
+    pub fn takeInboundE2eeGroupAckConfirms(
+        self: *SecuredLink,
+    ) anyerror![]s2s_link.E2eeGroupRelayId {
+        const link = self.inner orelse
+            return self.allocator.alloc(s2s_link.E2eeGroupRelayId, 0);
+        return link.takeInboundE2eeGroupAckConfirms();
     }
 
     pub fn probeE2eeGroupCurrent(self: *SecuredLink) anyerror!void {
@@ -1668,6 +1690,8 @@ test "E2EEGROUP is negotiated encrypted and drained through SecuredLink" {
     defer p.deinit();
     try testing.expect(p.a.supportsE2eeGroup());
     try testing.expect(p.b.supportsE2eeGroup());
+    try testing.expect(p.a.supportsE2eeGroupAckConfirm());
+    try testing.expect(p.b.supportsE2eeGroupAckConfirm());
     p.a.clearOutbound();
     p.b.clearOutbound();
 
@@ -1709,14 +1733,77 @@ test "E2EEGROUP is negotiated encrypted and drained through SecuredLink" {
         try e2ee_group_relay.verifyAndRelayId(testing.allocator, inbound[0].owned.record),
     );
 
+    // ACK round-trip is encrypted: RelayId never appears in Mooring ciphertext.
     try p.b.sendE2eeGroupAck(inbound[0].relay_id);
     try testing.expect(p.b.outbound().len != 0);
     try testing.expect(std.mem.indexOf(u8, p.b.outbound(), &inbound[0].relay_id) == null);
     try pump(&p.a, &p.b, false);
-    const acks = try p.a.takeInboundE2eeGroupAcks();
-    defer testing.allocator.free(acks);
-    try testing.expectEqual(@as(usize, 1), acks.len);
-    try testing.expectEqualSlices(u8, &inbound[0].relay_id, &acks[0]);
+    {
+        const acks = try p.a.takeInboundE2eeGroupAcks();
+        defer testing.allocator.free(acks);
+        try testing.expectEqual(@as(usize, 1), acks.len);
+        try testing.expectEqualSlices(u8, &inbound[0].relay_id, &acks[0]);
+    }
+
+    // Duplicate ACK coalesces; lost-then-retry delivers once more after drain.
+    try p.b.sendE2eeGroupAck(inbound[0].relay_id);
+    try p.b.sendE2eeGroupAck(inbound[0].relay_id);
+    try pump(&p.a, &p.b, false);
+    {
+        const acks = try p.a.takeInboundE2eeGroupAcks();
+        defer testing.allocator.free(acks);
+        try testing.expectEqual(@as(usize, 1), acks.len);
+        try testing.expectEqualSlices(u8, &inbound[0].relay_id, &acks[0]);
+    }
+
+    // ACK_CONFIRM (flag=1) is independently queued and also hop-encrypted.
+    try p.a.sendE2eeGroupAckConfirm(inbound[0].relay_id);
+    try p.a.sendE2eeGroupAckConfirm(inbound[0].relay_id);
+    try testing.expect(p.a.outbound().len != 0);
+    try testing.expect(std.mem.indexOf(u8, p.a.outbound(), &inbound[0].relay_id) == null);
+    try pump(&p.a, &p.b, false);
+    {
+        const confirms = try p.b.takeInboundE2eeGroupAckConfirms();
+        defer testing.allocator.free(confirms);
+        try testing.expectEqual(@as(usize, 1), confirms.len);
+        try testing.expectEqualSlices(u8, &inbound[0].relay_id, &confirms[0]);
+    }
+    {
+        const empty_acks = try p.b.takeInboundE2eeGroupAcks();
+        defer testing.allocator.free(empty_acks);
+        try testing.expectEqual(@as(usize, 0), empty_acks.len);
+    }
+
+    // Independent bounds: full ACK queue does not block ACK_CONFIRM.
+    p.a.inner.?.peer.config.max_e2ee_group_ack_frames = 1;
+    p.b.inner.?.peer.config.max_e2ee_group_ack_frames = 1;
+    const id_ack: s2s_link.E2eeGroupRelayId = @splat(0x71);
+    const id_ack2: s2s_link.E2eeGroupRelayId = @splat(0x72);
+    const id_conf: s2s_link.E2eeGroupRelayId = @splat(0x73);
+    try p.b.sendE2eeGroupAck(id_ack);
+    try p.b.sendE2eeGroupAck(id_ack2);
+    try p.b.sendE2eeGroupAckConfirm(id_conf);
+    try pump(&p.a, &p.b, false);
+    try testing.expectEqual(@as(u64, 1), p.a.takeDroppedE2eeGroupFrames());
+    {
+        const acks = try p.a.takeInboundE2eeGroupAcks();
+        defer testing.allocator.free(acks);
+        try testing.expectEqual(@as(usize, 1), acks.len);
+        try testing.expectEqualSlices(u8, &id_ack, &acks[0]);
+    }
+    {
+        const confirms = try p.a.takeInboundE2eeGroupAckConfirms();
+        defer testing.allocator.free(confirms);
+        try testing.expectEqual(@as(usize, 1), confirms.len);
+        try testing.expectEqualSlices(u8, &id_conf, &confirms[0]);
+    }
+
+    // Old schema / unnegotiated: clear v2 flag and prove fail-closed send.
+    p.b.inner.?.peer.peer_supports_e2ee_group_current = false;
+    try testing.expect(!p.b.supportsE2eeGroup());
+    try testing.expect(!p.b.supportsE2eeGroupAckConfirm());
+    try testing.expectError(error.CapabilityNotNegotiated, p.b.sendE2eeGroupAck(id_ack));
+    try testing.expectError(error.CapabilityNotNegotiated, p.b.sendE2eeGroupAckConfirm(id_conf));
 }
 
 test "secure relay v2 is negotiated encrypted and drained through SecuredLink" {

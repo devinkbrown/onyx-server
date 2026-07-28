@@ -14,6 +14,7 @@ const std = @import("std");
 const capsule = @import("capsule.zig");
 const event_spine_replay_guard = @import("../event_spine_replay_guard.zig");
 const attachment_delivery_spool = @import("../attachment_delivery_spool.zig");
+const e2ee_group_mesh_authority = @import("../e2ee_group_mesh_authority.zig");
 const relay_v2_event_log = @import("../relay_v2_event_log.zig");
 const relay_v2_replay_guard = @import("../relay_v2_replay_guard.zig");
 const relay_v2_outbox = @import("../relay_v2_outbox.zig");
@@ -80,6 +81,9 @@ pub const Error = error{
     MissingAttachmentDeliverySpool,
     DuplicateAttachmentDeliverySpool,
     InvalidAttachmentDeliverySpool,
+    MissingE2eeGroupMeshAuthority,
+    DuplicateE2eeGroupMeshAuthority,
+    InvalidE2eeGroupMeshAuthority,
     DuplicateMeshClock,
     MissingMeshClock,
     InvalidMeshClock,
@@ -101,6 +105,7 @@ pub const Summary = struct {
     relay_v2_outbox: usize = 0,
     relay_v2_event_log: usize = 0,
     attachment_delivery_spool: usize = 0,
+    e2ee_group_mesh_authority: usize = 0,
     mesh_clock: usize = 0,
     oper_grants: usize = 0,
 };
@@ -303,6 +308,18 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             summary.attachment_delivery_spool = 1;
             continue;
         }
+        // EGRG: guard metadata + exact accepted history (no completed receipts);
+        // authority encode succeeds only with empty hop custody — payload and
+        // live custody wires are never checkpointed.
+        if (e2ee_group_mesh_authority.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.UnknownMeshCheckpoint;
+            _ = e2ee_group_mesh_authority.validateCheckpoint(bytes) catch
+                return error.InvalidE2eeGroupMeshAuthority;
+            if (summary.e2ee_group_mesh_authority != 0)
+                return error.DuplicateE2eeGroupMeshAuthority;
+            summary.e2ee_group_mesh_authority = 1;
+            continue;
+        }
         if (prop_checkpoint.isUpgradeCheckpoint(bytes)) {
             if (item.header.min_supported != 2) return error.UnknownMeshCheckpoint;
             continue;
@@ -341,6 +358,7 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
     if (summary.relay_v2_outbox != 1) return error.MissingRelayV2Outbox;
     if (summary.relay_v2_event_log != 1) return error.MissingRelayV2EventLog;
     if (summary.attachment_delivery_spool != 1) return error.MissingAttachmentDeliverySpool;
+    if (summary.e2ee_group_mesh_authority != 1) return error.MissingE2eeGroupMeshAuthority;
     if (summary.mesh_clock != 1) return error.MissingMeshClock;
     // `oper_grants` is deliberately AT-MOST-once, not required: an arena sealed
     // by a pre-checkpoint predecessor simply lacks the piece and must still
@@ -503,6 +521,13 @@ fn testAttachmentDeliveryCheckpoint(allocator: std.mem.Allocator) ![]u8 {
     return spool.encodeCheckpoint(allocator);
 }
 
+/// Canonical empty EGRG mesh authority (metadata + empty exact history; no custody).
+fn testE2eeGroupMeshAuthorityCheckpoint(allocator: std.mem.Allocator) ![]u8 {
+    var auth = try e2ee_group_mesh_authority.Authority.init(allocator, .{});
+    defer auth.deinit();
+    return auth.encodeCheckpoint(allocator);
+}
+
 fn testMeshClockCap(bytes: []const u8, field: *[1]capsule.Field) capsule.Capsule {
     field.* = .{.{ .ordinal = 1, .bytes = bytes }};
     var cap = capsule.make(.mesh_checkpoint, field);
@@ -566,6 +591,8 @@ test "current handoff relations accept exact mixed client sidecars S2S and redia
     defer allocator.free(relay_event_log);
     const attachment_delivery = try testAttachmentDeliveryCheckpoint(allocator);
     defer allocator.free(attachment_delivery);
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
 
     const pieces = [_]TestPiece{
         .{ .kind = .clients, .bytes = client_a },
@@ -585,13 +612,14 @@ test "current handoff relations accept exact mixed client sidecars S2S and redia
         .{ .kind = .mesh_checkpoint, .bytes = relay_outbox },
         .{ .kind = .mesh_checkpoint, .bytes = relay_event_log },
         .{ .kind = .mesh_checkpoint, .bytes = attachment_delivery },
+        .{ .kind = .mesh_checkpoint, .bytes = e2ee_group },
     };
     var fields: [pieces.len][1]capsule.Field = undefined;
     var caps: [pieces.len]capsule.Capsule = undefined;
     const current = makeTestCaps(&pieces, &fields, &caps);
     // The PROP checkpoint's v2 minimum is intentionally stricter than the
     // shared mesh-checkpoint descriptor's legacy-compatible v1 minimum.
-    for (caps[caps.len - 6 ..]) |*cap| cap.header.min_supported = 2;
+    for (caps[caps.len - 7 ..]) |*cap| cap.header.min_supported = 2;
     for (&caps) |*cap| {
         if (cap.header.kind == .mesh_checkpoint and
             hasPrefix(cap.fields[0].bytes, &mesh_clock_snapshot.magic))
@@ -610,6 +638,7 @@ test "current handoff relations accept exact mixed client sidecars S2S and redia
     try std.testing.expectEqual(@as(usize, 1), summary.relay_v2_outbox);
     try std.testing.expectEqual(@as(usize, 1), summary.relay_v2_event_log);
     try std.testing.expectEqual(@as(usize, 1), summary.attachment_delivery_spool);
+    try std.testing.expectEqual(@as(usize, 1), summary.e2ee_group_mesh_authority);
     try std.testing.expectEqual(@as(usize, 1), summary.mesh_clock);
 
     // A v2 predecessor owns the same fd graph but predates the caps-extension
@@ -665,6 +694,8 @@ test "current handoff relations accept a pre-bump v1 TLS sidecar (netsplit guard
     defer allocator.free(relay_event_log);
     const attachment_delivery = try testAttachmentDeliveryCheckpoint(allocator);
     defer allocator.free(attachment_delivery);
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
 
     const pieces = [_]TestPiece{
@@ -677,12 +708,13 @@ test "current handoff relations accept a pre-bump v1 TLS sidecar (netsplit guard
         .{ .kind = .mesh_checkpoint, .bytes = relay_outbox },
         .{ .kind = .mesh_checkpoint, .bytes = relay_event_log },
         .{ .kind = .mesh_checkpoint, .bytes = attachment_delivery },
+        .{ .kind = .mesh_checkpoint, .bytes = e2ee_group },
         .{ .kind = .mesh_checkpoint, .bytes = &clock },
     };
     var fields: [pieces.len][1]capsule.Field = undefined;
     var caps: [pieces.len]capsule.Capsule = undefined;
     _ = makeTestCaps(&pieces, &fields, &caps);
-    for (caps[caps.len - 6 ..]) |*cap| cap.header.min_supported = 2;
+    for (caps[caps.len - 7 ..]) |*cap| cap.header.min_supported = 2;
     // Stamp the TLS capsule as a legacy v1 image (what a pre-bump predecessor
     // produced), keeping the flag-bearing v2 blob bytes.
     caps[1].header.version = 1;
@@ -730,6 +762,8 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     defer allocator.free(relay_event_log);
     const attachment_delivery = try testAttachmentDeliveryCheckpoint(allocator);
     defer allocator.free(attachment_delivery);
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
 
     const base = [_]TestPiece{
@@ -746,12 +780,13 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
         .{ .kind = .mesh_checkpoint, .bytes = relay_outbox },
         .{ .kind = .mesh_checkpoint, .bytes = relay_event_log },
         .{ .kind = .mesh_checkpoint, .bytes = attachment_delivery },
+        .{ .kind = .mesh_checkpoint, .bytes = e2ee_group },
         .{ .kind = .mesh_checkpoint, .bytes = &clock },
     };
     var base_fields: [base.len][1]capsule.Field = undefined;
     var base_caps: [base.len]capsule.Capsule = undefined;
     _ = makeTestCaps(&base, &base_fields, &base_caps);
-    for (base_caps[base_caps.len - 6 ..]) |*cap| cap.header.min_supported = 2;
+    for (base_caps[base_caps.len - 7 ..]) |*cap| cap.header.min_supported = 2;
     _ = try validateCurrent(&base_caps, &.{ 10, 11 });
 
     try std.testing.expectError(error.MissingTls, validateCurrent(&.{ base_caps[0], base_caps[1], base_caps[3] }, &.{ 10, 11 }));
@@ -979,10 +1014,15 @@ test "current handoff relations reject optional sidecar owner and cardinality vi
     var attachment_delivery_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = attachment_delivery }};
     var attachment_delivery_cap = capsule.make(.mesh_checkpoint, &attachment_delivery_field);
     attachment_delivery_cap.header.min_supported = 2;
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
+    var e2ee_group_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = e2ee_group }};
+    var e2ee_group_cap = capsule.make(.mesh_checkpoint, &e2ee_group_field);
+    e2ee_group_cap.header.min_supported = 2;
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    _ = try validateCurrent(&.{ client_cap, monitor_cap, silence_cap, event_replay_cap, relay_replay_cap, relay_outbox_cap, relay_event_log_cap, attachment_delivery_cap, clock_cap }, &.{10});
+    _ = try validateCurrent(&.{ client_cap, monitor_cap, silence_cap, event_replay_cap, relay_replay_cap, relay_outbox_cap, relay_event_log_cap, attachment_delivery_cap, e2ee_group_cap, clock_cap }, &.{10});
     try std.testing.expectError(error.MissingMonitor, validateCurrent(&.{ client_cap, silence_cap }, &.{10}));
     try std.testing.expectError(error.MissingSilence, validateCurrent(&.{ client_cap, monitor_cap }, &.{10}));
     try std.testing.expectError(error.DuplicateSilence, validateCurrent(&.{ client_cap, silence_cap, silence_cap }, &.{10}));
@@ -1013,6 +1053,8 @@ test "current handoff relations reject owner-fd S2S and redial violations" {
     defer allocator.free(relay_event_log);
     const attachment_delivery = try testAttachmentDeliveryCheckpoint(allocator);
     defer allocator.free(attachment_delivery);
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     const pieces = [_]TestPiece{
         .{ .kind = .clients, .bytes = client },
@@ -1025,12 +1067,13 @@ test "current handoff relations reject owner-fd S2S and redial violations" {
         .{ .kind = .mesh_checkpoint, .bytes = relay_outbox },
         .{ .kind = .mesh_checkpoint, .bytes = relay_event_log },
         .{ .kind = .mesh_checkpoint, .bytes = attachment_delivery },
+        .{ .kind = .mesh_checkpoint, .bytes = e2ee_group },
         .{ .kind = .mesh_checkpoint, .bytes = &clock },
     };
     var fields: [pieces.len][1]capsule.Field = undefined;
     var caps: [pieces.len]capsule.Capsule = undefined;
     _ = makeTestCaps(&pieces, &fields, &caps);
-    for (caps[caps.len - 6 ..]) |*cap| cap.header.min_supported = 2;
+    for (caps[caps.len - 7 ..]) |*cap| cap.header.min_supported = 2;
     _ = try validateCurrent(&caps, &.{ 10, 20 });
     try std.testing.expectError(error.DuplicateStateFd, validateCurrent(&caps, &.{ 10, 20, 20 }));
     try std.testing.expectError(error.MissingStateFd, validateCurrent(&caps, &.{10}));
@@ -1081,18 +1124,23 @@ test "current handoff relations require exactly one canonical ESG2 authority" {
     var attachment_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = attachment_delivery }};
     var attachment_cap = capsule.make(.mesh_checkpoint, &attachment_field);
     attachment_cap.header.min_supported = 2;
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
+    var e2ee_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = e2ee_group }};
+    var e2ee_cap = capsule.make(.mesh_checkpoint, &e2ee_field);
+    e2ee_cap.header.min_supported = 2;
 
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ current, relay_cap, outbox_cap, event_log_cap, attachment_cap, clock_cap }, &.{});
+    const summary = try validateCurrent(&.{ current, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.event_spine_replay);
     try std.testing.expectError(
         error.MissingMeshClock,
-        validateCurrent(&.{ current, relay_cap, outbox_cap, event_log_cap, attachment_cap }, &.{}),
+        validateCurrent(&.{ current, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}),
     );
-    try std.testing.expectError(error.MissingEventSpineReplay, validateCurrent(&.{ relay_cap, outbox_cap, event_log_cap, attachment_cap }, &.{}));
-    try std.testing.expectError(error.DuplicateEventSpineReplay, validateCurrent(&.{ current, current, relay_cap, outbox_cap, event_log_cap, attachment_cap }, &.{}));
+    try std.testing.expectError(error.MissingEventSpineReplay, validateCurrent(&.{ relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
+    try std.testing.expectError(error.DuplicateEventSpineReplay, validateCurrent(&.{ current, current, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
 
     var legacy_compatible = current;
     legacy_compatible.header.min_supported = 1;
@@ -1145,14 +1193,19 @@ test "current handoff relations require exactly one canonical RVG2 authority" {
     var attachment_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = attachment_delivery }};
     var attachment_cap = capsule.make(.mesh_checkpoint, &attachment_field);
     attachment_cap.header.min_supported = 2;
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
+    var e2ee_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = e2ee_group }};
+    var e2ee_cap = capsule.make(.mesh_checkpoint, &e2ee_field);
+    e2ee_cap.header.min_supported = 2;
 
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ event_cap, current, outbox_cap, event_log_cap, attachment_cap, clock_cap }, &.{});
+    const summary = try validateCurrent(&.{ event_cap, current, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.relay_v2_replay);
-    try std.testing.expectError(error.MissingRelayV2Replay, validateCurrent(&.{ event_cap, outbox_cap, event_log_cap, attachment_cap }, &.{}));
-    try std.testing.expectError(error.DuplicateRelayV2Replay, validateCurrent(&.{ event_cap, current, current, outbox_cap, event_log_cap, attachment_cap }, &.{}));
+    try std.testing.expectError(error.MissingRelayV2Replay, validateCurrent(&.{ event_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
+    try std.testing.expectError(error.DuplicateRelayV2Replay, validateCurrent(&.{ event_cap, current, current, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
 
     var legacy_compatible = current;
     legacy_compatible.header.min_supported = 1;
@@ -1215,18 +1268,23 @@ test "current handoff relations require exactly one canonical RVO2 authority" {
     var attachment_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = attachment_delivery }};
     var attachment_cap = capsule.make(.mesh_checkpoint, &attachment_field);
     attachment_cap.header.min_supported = 2;
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
+    var e2ee_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = e2ee_group }};
+    var e2ee_cap = capsule.make(.mesh_checkpoint, &e2ee_field);
+    e2ee_cap.header.min_supported = 2;
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, clock_cap }, &.{});
+    const summary = try validateCurrent(&.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.relay_v2_outbox);
     try std.testing.expectError(
         error.MissingRelayV2Outbox,
-        validateCurrent(&.{ event_cap, relay_cap, event_log_cap, attachment_cap }, &.{}),
+        validateCurrent(&.{ event_cap, relay_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}),
     );
     try std.testing.expectError(
         error.DuplicateRelayV2Outbox,
-        validateCurrent(&.{ event_cap, relay_cap, outbox_cap, outbox_cap, event_log_cap, attachment_cap }, &.{}),
+        validateCurrent(&.{ event_cap, relay_cap, outbox_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}),
     );
     const corrupt = try allocator.dupe(u8, outbox);
     defer allocator.free(corrupt);
@@ -1252,6 +1310,8 @@ test "current handoff relations require exactly one canonical RVL2 authority" {
     defer allocator.free(event_log);
     const attachment = try testAttachmentDeliveryCheckpoint(allocator);
     defer allocator.free(attachment);
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
 
     var event_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = event_replay }};
     var event_cap = capsule.make(.mesh_checkpoint, &event_field);
@@ -1268,19 +1328,22 @@ test "current handoff relations require exactly one canonical RVL2 authority" {
     var attachment_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = attachment }};
     var attachment_cap = capsule.make(.mesh_checkpoint, &attachment_field);
     attachment_cap.header.min_supported = 2;
+    var e2ee_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = e2ee_group }};
+    var e2ee_cap = capsule.make(.mesh_checkpoint, &e2ee_field);
+    e2ee_cap.header.min_supported = 2;
 
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, clock_cap }, &.{});
+    const summary = try validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.relay_v2_event_log);
     try std.testing.expectError(
         error.MissingRelayV2EventLog,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, attachment_cap }, &.{}),
+        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, attachment_cap, e2ee_cap }, &.{}),
     );
     try std.testing.expectError(
         error.DuplicateRelayV2EventLog,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, log_cap, attachment_cap }, &.{}),
+        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, log_cap, attachment_cap, e2ee_cap }, &.{}),
     );
     var legacy = log_cap;
     legacy.header.min_supported = 1;
@@ -1307,6 +1370,8 @@ test "current handoff relations require exactly one canonical ADS1 authority" {
     defer allocator.free(event_log);
     const attachment = try testAttachmentDeliveryCheckpoint(allocator);
     defer allocator.free(attachment);
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
 
     var event_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = event_replay }};
     var event_cap = capsule.make(.mesh_checkpoint, &event_field);
@@ -1323,19 +1388,22 @@ test "current handoff relations require exactly one canonical ADS1 authority" {
     var attachment_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = attachment }};
     var attachment_cap = capsule.make(.mesh_checkpoint, &attachment_field);
     attachment_cap.header.min_supported = 2;
+    var e2ee_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = e2ee_group }};
+    var e2ee_cap = capsule.make(.mesh_checkpoint, &e2ee_field);
+    e2ee_cap.header.min_supported = 2;
 
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, clock_cap }, &.{});
+    const summary = try validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.attachment_delivery_spool);
     try std.testing.expectError(
         error.MissingAttachmentDeliverySpool,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap }, &.{}),
+        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, e2ee_cap }, &.{}),
     );
     try std.testing.expectError(
         error.DuplicateAttachmentDeliverySpool,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, attachment_cap }, &.{}),
+        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, attachment_cap, e2ee_cap }, &.{}),
     );
     var legacy = attachment_cap;
     legacy.header.min_supported = 1;
@@ -1348,6 +1416,114 @@ test "current handoff relations require exactly one canonical ADS1 authority" {
     var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
     corrupt_cap.header.min_supported = 2;
     try std.testing.expectError(error.InvalidAttachmentDeliverySpool, validateCurrent(&.{corrupt_cap}, &.{}));
+}
+
+test "current handoff relations require exactly one canonical EGRG authority" {
+    const allocator = std.testing.allocator;
+    const event_replay = try testEventSpineReplayCheckpoint(allocator);
+    defer allocator.free(event_replay);
+    const relay_replay = try testRelayV2ReplayCheckpoint(allocator);
+    defer allocator.free(relay_replay);
+    const outbox = try testRelayV2OutboxCheckpoint(allocator);
+    defer allocator.free(outbox);
+    const event_log = try testRelayV2EventLogCheckpoint(allocator);
+    defer allocator.free(event_log);
+    const attachment = try testAttachmentDeliveryCheckpoint(allocator);
+    defer allocator.free(attachment);
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
+    try std.testing.expect(e2ee_group_mesh_authority.isCheckpoint(e2ee_group));
+
+    var event_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = event_replay }};
+    var event_cap = capsule.make(.mesh_checkpoint, &event_field);
+    event_cap.header.min_supported = 2;
+    var replay_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = relay_replay }};
+    var replay_cap = capsule.make(.mesh_checkpoint, &replay_field);
+    replay_cap.header.min_supported = 2;
+    var outbox_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = outbox }};
+    var outbox_cap = capsule.make(.mesh_checkpoint, &outbox_field);
+    outbox_cap.header.min_supported = 2;
+    var log_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = event_log }};
+    var log_cap = capsule.make(.mesh_checkpoint, &log_field);
+    log_cap.header.min_supported = 2;
+    var attachment_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = attachment }};
+    var attachment_cap = capsule.make(.mesh_checkpoint, &attachment_field);
+    attachment_cap.header.min_supported = 2;
+    var e2ee_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = e2ee_group }};
+    var e2ee_cap = capsule.make(.mesh_checkpoint, &e2ee_field);
+    e2ee_cap.header.min_supported = 2;
+
+    const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
+    var clock_field: [1]capsule.Field = undefined;
+    const clock_cap = testMeshClockCap(&clock, &clock_field);
+    const summary = try validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
+    try std.testing.expectEqual(@as(usize, 1), summary.e2ee_group_mesh_authority);
+    try std.testing.expectError(
+        error.MissingE2eeGroupMeshAuthority,
+        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, clock_cap }, &.{}),
+    );
+    try std.testing.expectError(
+        error.DuplicateE2eeGroupMeshAuthority,
+        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, e2ee_cap, clock_cap }, &.{}),
+    );
+    var legacy = e2ee_cap;
+    legacy.header.min_supported = 1;
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{legacy}, &.{}));
+
+    const corrupt = try allocator.dupe(u8, e2ee_group);
+    defer allocator.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    var corrupt_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
+    var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
+    corrupt_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidE2eeGroupMeshAuthority, validateCurrent(&.{corrupt_cap}, &.{}));
+
+    const trailing = try allocator.alloc(u8, e2ee_group.len + 1);
+    defer allocator.free(trailing);
+    @memcpy(trailing[0..e2ee_group.len], e2ee_group);
+    trailing[e2ee_group.len] = 0;
+    var trailing_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = trailing }};
+    var trailing_cap = capsule.make(.mesh_checkpoint, &trailing_field);
+    trailing_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidE2eeGroupMeshAuthority, validateCurrent(&.{trailing_cap}, &.{}));
+
+    // Zero the inner RVG2 window_size (RVG2 header bytes 5..7). EGRG body is
+    // rvg2_len(4) || rvg2, so absolute offsets are egrg_header_len+4+5..6.
+    // Recompute the inner RVG2 checksum (domain onyx-relay-v2-replay-checkpoint-v1)
+    // then the outer EGRG v2 checksum so open succeeds and nested validation
+    // reaches InvalidConfig (surfaced here as InvalidE2eeGroupMeshAuthority).
+    const invalid_config = try allocator.dupe(u8, e2ee_group);
+    defer allocator.free(invalid_config);
+    const egrg_header_len: usize = 9;
+    const rvg2_len_field_len: usize = 4;
+    const checksum_len: usize = std.crypto.hash.Blake3.digest_length;
+    try std.testing.expect(invalid_config.len > egrg_header_len + rvg2_len_field_len + checksum_len + 7);
+    const rvg2_off = egrg_header_len + rvg2_len_field_len;
+    const rvg2_len: usize = std.mem.readInt(u32, invalid_config[egrg_header_len..][0..4], .big);
+    try std.testing.expect(rvg2_len > checksum_len);
+    try std.testing.expect(invalid_config.len >= rvg2_off + rvg2_len + checksum_len);
+    invalid_config[rvg2_off + 5] = 0;
+    invalid_config[rvg2_off + 6] = 0;
+    const rvg2 = invalid_config[rvg2_off .. rvg2_off + rvg2_len];
+    const rvg2_prefix_len = rvg2_len - checksum_len;
+    var rvg2_hash = std.crypto.hash.Blake3.init(.{});
+    rvg2_hash.update("onyx-relay-v2-replay-checkpoint-v1");
+    rvg2_hash.update(rvg2[0..rvg2_prefix_len]);
+    rvg2_hash.final(rvg2[rvg2_prefix_len..][0..checksum_len]);
+    const prefix_len = invalid_config.len - checksum_len;
+    var egrg_hash = std.crypto.hash.Blake3.init(.{});
+    egrg_hash.update("onyx-e2ee-group-replay-checkpoint-v2");
+    egrg_hash.update(invalid_config[0..prefix_len]);
+    egrg_hash.final(invalid_config[prefix_len..][0..checksum_len]);
+    const e2ee_group_replay_guard = @import("../e2ee_group_replay_guard.zig");
+    try std.testing.expectError(error.InvalidConfig, e2ee_group_replay_guard.validateCheckpoint(invalid_config));
+    var invalid_config_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = invalid_config }};
+    var invalid_config_cap = capsule.make(.mesh_checkpoint, &invalid_config_field);
+    invalid_config_cap.header.min_supported = 2;
+    try std.testing.expectError(
+        error.InvalidE2eeGroupMeshAuthority,
+        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, invalid_config_cap }, &.{}),
+    );
 }
 
 test "current handoff relations validate the at-most-once oper-grant checkpoint" {
@@ -1380,6 +1556,11 @@ test "current handoff relations validate the at-most-once oper-grant checkpoint"
     var attachment_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = attachment }};
     var attachment_cap = capsule.make(.mesh_checkpoint, &attachment_field);
     attachment_cap.header.min_supported = 2;
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
+    var e2ee_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = e2ee_group }};
+    var e2ee_cap = capsule.make(.mesh_checkpoint, &e2ee_field);
+    e2ee_cap.header.min_supported = 2;
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
@@ -1404,7 +1585,7 @@ test "current handoff relations validate the at-most-once oper-grant checkpoint"
 
     // Present once: accepted and counted.
     const with = try validateCurrent(
-        &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, clock_cap, grants_cap },
+        &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap, grants_cap },
         &.{},
     );
     try std.testing.expectEqual(@as(usize, 1), with.oper_grants);
@@ -1412,14 +1593,14 @@ test "current handoff relations validate the at-most-once oper-grant checkpoint"
     // ABSENT is legal: a pre-checkpoint predecessor's arena still adopts
     // (empty registry = pre-checkpoint behavior). No Missing error.
     const without = try validateCurrent(
-        &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, clock_cap },
+        &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap },
         &.{},
     );
     try std.testing.expectEqual(@as(usize, 0), without.oper_grants);
 
     // Duplicate is ambiguous authority.
     try std.testing.expectError(error.DuplicateOperGrants, validateCurrent(
-        &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, clock_cap, grants_cap, grants_cap },
+        &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap, grants_cap, grants_cap },
         &.{},
     ));
 

@@ -165,8 +165,10 @@ const relay_v2_extension_probe = "onyx-xcap-relay-v2-1?";
 const relay_v2_extension_reply = "onyx-xcap-relay-v2-1!";
 const relay_v2_ack_confirm_probe = "onyx-xcap-relay-v2-ack-confirm?";
 const relay_v2_ack_confirm_reply = "onyx-xcap-relay-v2-ack-confirm!";
-const e2ee_group_extension_probe = "onyx-xcap-e2ee-group-1?";
-const e2ee_group_extension_reply = "onyx-xcap-e2ee-group-1!";
+/// v2 negotiates safe-retirement ACK/ACK_CONFIRM (flag byte on E2EE_GROUP_ACK).
+/// v1 peers never answer this probe and never receive tag 0x26/0x27.
+const e2ee_group_extension_probe = "onyx-xcap-e2ee-group-2?";
+const e2ee_group_extension_reply = "onyx-xcap-e2ee-group-2!";
 const session_replica_v3_probe = "onyx-xcap-session-replica-v3?";
 const session_replica_v3_reply = "onyx-xcap-session-replica-v3!";
 
@@ -325,9 +327,9 @@ pub const Config = struct {
     /// Maximum verified E2EEGROUP controls staged for daemon-global replay
     /// admission. The queue never evicts an earlier accepted control.
     max_e2ee_group_frames: usize = 256,
-    /// Maximum immediate-hop E2EEGROUP receipts staged for daemon outbox
-    /// retirement. This queue is deliberately distinct from MESSAGE_V2 ACK
-    /// state even though both receipt payloads are 16-byte RelayIds.
+    /// Maximum immediate-hop E2EEGROUP ACK or ACK_CONFIRM receipts staged for
+    /// daemon outbox/receipt retirement. Distinct from MESSAGE_V2 ACK queues
+    /// even when both payloads are 16-byte RelayIds (confirm adds a flag byte).
     max_e2ee_group_ack_frames: usize = 256,
     /// Per-link E2EEGROUP reflection cache only. It is not replay authority.
     e2ee_group_seen_capacity: usize = 4096,
@@ -606,8 +608,9 @@ pub const S2sPeer = struct {
     /// remain durable until the original sender explicitly confirms ACK receipt,
     /// instead of relying on a finite replay-window guess.
     peer_supports_relay_v2_ack_confirm: bool = false,
-    /// Remote answered the append-only E2EEGROUP schema probe. This is separate
-    /// from the full handshake byte and is valid only atop secure relay v2 base.
+    /// Remote answered the append-only E2EEGROUP v2 schema probe (ACK/ACK_CONFIRM
+    /// retirement). Separate from the handshake byte; valid only atop secure
+    /// relay v2 base.
     peer_supports_e2ee_group_current: bool = false,
     /// Remote advertised frame signing plus the explicit event-spine-v2 bit.
     peer_supports_event_spine_v2: bool = false,
@@ -643,8 +646,11 @@ pub const S2sPeer = struct {
     rejected_relay_v2_frames: u64 = 0,
     /// Verified opaque group controls awaiting daemon-global replay admission.
     inbound_e2ee_group: std.ArrayListUnmanaged(InboundE2eeGroup) = .empty,
-    /// Secured immediate-hop E2EEGROUP receipts awaiting retained-outbox removal.
+    /// Secured immediate-hop E2EEGROUP ACKs awaiting retained-outbox removal.
     inbound_e2ee_group_acks: std.ArrayListUnmanaged(e2ee_group_relay.RelayId) = .empty,
+    /// Secured immediate-hop E2EEGROUP ACK_CONFIRMs awaiting ingress-receipt
+    /// retirement (sender of the ACK confirms it saw the receipt).
+    inbound_e2ee_group_ack_confirms: std.ArrayListUnmanaged(e2ee_group_relay.RelayId) = .empty,
     dropped_e2ee_group_frames: u64 = 0,
     rejected_e2ee_group_frames: u64 = 0,
     /// Inbound signed oper-grant payloads (raw oper_cred_share bytes) decoded
@@ -970,6 +976,7 @@ pub const S2sPeer = struct {
         for (self.inbound_e2ee_group.items) |*record| record.deinit(self.allocator);
         self.inbound_e2ee_group.deinit(self.allocator);
         self.inbound_e2ee_group_acks.deinit(self.allocator);
+        self.inbound_e2ee_group_ack_confirms.deinit(self.allocator);
         for (self.inbound_grants.items) |g| self.allocator.free(g);
         self.inbound_grants.deinit(self.allocator);
         for (self.membership_changes.items) |*d| d.deinit(self.allocator);
@@ -2201,6 +2208,12 @@ pub const S2sPeer = struct {
         return self.supportsSecureRelayV2Base() and self.peer_supports_e2ee_group_current;
     }
 
+    /// E2EEGROUP v2 extension authorizes both hop ACK and ACK_CONFIRM (flag=1).
+    /// Same gate as `supportsE2eeGroup` — no separate capability bit.
+    pub fn supportsE2eeGroupAckConfirm(self: *const S2sPeer) bool {
+        return self.supportsE2eeGroup();
+    }
+
     fn requireE2eeGroup(self: *const S2sPeer) !void {
         if (!self.established) return error.NotEstablished;
         if (!self.secure_relay_transport_enabled or self.signing_key == null or
@@ -2346,9 +2359,10 @@ pub const S2sPeer = struct {
         return self.inbound_e2ee_group.toOwnedSlice(self.allocator);
     }
 
-    /// Hop-authenticate and strictly accept only the E2EEGROUP RelayId bytes.
-    /// Malformed, unsigned, unnegotiated, duplicate, and queue-pressure traffic
-    /// is advisory and therefore soft-dropped; allocation failure stays visible.
+    /// Hop-authenticate and strictly accept E2EEGROUP ACK (RelayId) or
+    /// ACK_CONFIRM (RelayId + flag=1). Malformed, unsigned, unnegotiated,
+    /// wrong-flag, duplicate, and queue-pressure traffic is advisory and
+    /// soft-dropped; allocation failure stays visible.
     fn recvE2eeGroupAck(self: *S2sPeer, outer_payload: []const u8) !void {
         if (!self.supportsE2eeGroup()) {
             self.rejected_e2ee_group_frames +|= 1;
@@ -2358,26 +2372,36 @@ pub const S2sPeer = struct {
             self.rejected_e2ee_group_frames +|= 1;
             return;
         };
-        if (payload.len != e2ee_group_relay.relay_id_len) {
+        const is_confirm = payload.len == e2ee_group_relay.relay_id_len + 1;
+        if (payload.len != e2ee_group_relay.relay_id_len and !is_confirm) {
+            self.rejected_e2ee_group_frames +|= 1;
+            return;
+        }
+        if (is_confirm and payload[e2ee_group_relay.relay_id_len] != 1) {
             self.rejected_e2ee_group_frames +|= 1;
             return;
         }
         const id: e2ee_group_relay.RelayId = payload[0..e2ee_group_relay.relay_id_len].*;
-        for (self.inbound_e2ee_group_acks.items) |queued| {
+        const queue = if (is_confirm)
+            &self.inbound_e2ee_group_ack_confirms
+        else
+            &self.inbound_e2ee_group_acks;
+        for (queue.items) |queued| {
             if (std.crypto.timing_safe.eql(e2ee_group_relay.RelayId, queued, id)) return;
         }
-        // A missed receipt only causes the sender to retry its retained exact
-        // wire. Never fault an otherwise healthy secured stream on queue pressure.
-        if (self.inbound_e2ee_group_acks.items.len >= self.config.max_e2ee_group_ack_frames) {
+        // Soft-drop under pressure: ACK/confirm is progress, not authority.
+        // Sender retries retained custody wire or the receipt ACK itself.
+        if (queue.items.len >= self.config.max_e2ee_group_ack_frames) {
             self.dropped_e2ee_group_frames +|= 1;
             return;
         }
-        self.inbound_e2ee_group_acks.append(self.allocator, id) catch |err| {
+        queue.append(self.allocator, id) catch |err| {
             self.dropped_e2ee_group_frames +|= 1;
             return err;
         };
     }
 
+    /// Send hop ACK for one admitted E2EEGROUP RelayId (custody retirement path).
     pub fn sendE2eeGroupAck(
         self: *S2sPeer,
         sink: ByteSink,
@@ -2387,8 +2411,26 @@ pub const S2sPeer = struct {
         try self.emitSignable(sink, .E2EE_GROUP_ACK, &id);
     }
 
+    /// Confirm that this peer received the ingress peer's ACK for RelayId.
+    /// Payload is RelayId || 0x01, domain-separated under E2EE_GROUP_ACK.
+    pub fn sendE2eeGroupAckConfirm(
+        self: *S2sPeer,
+        sink: ByteSink,
+        id: e2ee_group_relay.RelayId,
+    ) !void {
+        try self.requireE2eeGroup();
+        var payload: [e2ee_group_relay.relay_id_len + 1]u8 = undefined;
+        @memcpy(payload[0..e2ee_group_relay.relay_id_len], &id);
+        payload[e2ee_group_relay.relay_id_len] = 1;
+        try self.emitSignable(sink, .E2EE_GROUP_ACK, &payload);
+    }
+
     pub fn takeInboundE2eeGroupAcks(self: *S2sPeer) ![]e2ee_group_relay.RelayId {
         return self.inbound_e2ee_group_acks.toOwnedSlice(self.allocator);
+    }
+
+    pub fn takeInboundE2eeGroupAckConfirms(self: *S2sPeer) ![]e2ee_group_relay.RelayId {
+        return self.inbound_e2ee_group_ack_confirms.toOwnedSlice(self.allocator);
     }
 
     /// Re-negotiate the append-only E2EEGROUP schema after Helix resume. An old
@@ -5672,12 +5714,26 @@ test "E2EEGROUP ACK is domain separated authenticated deduplicated bounded and c
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6430);
     try std.testing.expect(a.supportsE2eeGroup());
     try std.testing.expect(b.supportsE2eeGroup());
+    try std.testing.expect(a.supportsE2eeGroupAckConfirm());
+    try std.testing.expect(b.supportsE2eeGroupAckConfirm());
+
+    // Legacy e2ee-group-1 PONG never arms v2 (ACK/ACK_CONFIRM) capability.
+    a.peer_supports_e2ee_group_current = false;
+    try emitFrame(allocator, b_to_a.sink(), .PONG, "onyx-xcap-e2ee-group-1!");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6429);
+    try std.testing.expect(!a.supportsE2eeGroup());
+    try std.testing.expect(!a.supportsE2eeGroupAckConfirm());
+    a.peer_supports_e2ee_group_current = true;
 
     const first: e2ee_group_relay.RelayId = @splat(0x51);
     b.peer_supports_e2ee_group_current = false;
     try std.testing.expectError(
         error.CapabilityNotNegotiated,
         b.sendE2eeGroupAck(b_to_a.sink(), first),
+    );
+    try std.testing.expectError(
+        error.CapabilityNotNegotiated,
+        b.sendE2eeGroupAckConfirm(b_to_a.sink(), first),
     );
     try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
     b.peer_supports_e2ee_group_current = true;
@@ -5690,9 +5746,24 @@ test "E2EEGROUP ACK is domain separated authenticated deduplicated bounded and c
     try std.testing.expectEqual(@as(usize, 1), acks.len);
     try std.testing.expectEqualSlices(u8, &first, &acks[0]);
     allocator.free(acks);
+    var confirms = try a.takeInboundE2eeGroupAckConfirms();
+    try std.testing.expectEqual(@as(usize, 0), confirms.len);
+    allocator.free(confirms);
     const chat_acks = try a.takeInboundV2Acks();
     defer allocator.free(chat_acks);
     try std.testing.expectEqual(@as(usize, 0), chat_acks.len);
+
+    // ACK_CONFIRM uses the same frame tag with flag=1 and a separate queue.
+    try b.sendE2eeGroupAckConfirm(b_to_a.sink(), first);
+    try b.sendE2eeGroupAckConfirm(b_to_a.sink(), first);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6431);
+    confirms = try a.takeInboundE2eeGroupAckConfirms();
+    try std.testing.expectEqual(@as(usize, 1), confirms.len);
+    try std.testing.expectEqualSlices(u8, &first, &confirms[0]);
+    allocator.free(confirms);
+    acks = try a.takeInboundE2eeGroupAcks();
+    try std.testing.expectEqual(@as(usize, 0), acks.len);
+    allocator.free(acks);
 
     // Queue allocation failure is explicit and reserves no receipt identity, so
     // the same authenticated ACK succeeds on retry with the normal allocator.
@@ -5718,15 +5789,22 @@ test "E2EEGROUP ACK is domain separated authenticated deduplicated bounded and c
     try std.testing.expectEqualSlices(u8, &retry_id, &acks[0]);
     allocator.free(acks);
 
-    // Strict length and signed-hop gates soft-drop malformed or unsigned input.
+    // Strict length/flag and signed-hop gates soft-drop malformed or unsigned input.
     try b.emitSignable(b_to_a.sink(), .E2EE_GROUP_ACK, "short");
     try emitFrame(allocator, b_to_a.sink(), .E2EE_GROUP_ACK, &first);
+    var bad_flag: [e2ee_group_relay.relay_id_len + 1]u8 = undefined;
+    @memcpy(bad_flag[0..e2ee_group_relay.relay_id_len], &first);
+    bad_flag[e2ee_group_relay.relay_id_len] = 2;
+    try b.emitSignable(b_to_a.sink(), .E2EE_GROUP_ACK, &bad_flag);
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6432);
-    try std.testing.expectEqual(@as(u64, 2), a.takeRejectedE2eeGroupFrames());
+    try std.testing.expectEqual(@as(u64, 3), a.takeRejectedE2eeGroupFrames());
     try std.testing.expectEqual(@as(u64, 1), a.takeRejectedOriginFrames());
     acks = try a.takeInboundE2eeGroupAcks();
     try std.testing.expectEqual(@as(usize, 0), acks.len);
     allocator.free(acks);
+    confirms = try a.takeInboundE2eeGroupAckConfirms();
+    try std.testing.expectEqual(@as(usize, 0), confirms.len);
+    allocator.free(confirms);
 
     // An envelope signed in MESSAGE_V2_ACK's tag domain is invalid when replayed
     // under E2EE_GROUP_ACK even though both payload types are 16-byte arrays.
@@ -5744,19 +5822,33 @@ test "E2EEGROUP ACK is domain separated authenticated deduplicated bounded and c
 
     // Queue overflow is advisory: preserve the first two receipts and soft-drop
     // the excess so its sender will retry the exact retained E2EEGROUP wire.
+    // ACK and ACK_CONFIRM queues are independently bounded — fill both before
+    // draining either so neither queue's pressure blocks the other.
     const second: e2ee_group_relay.RelayId = @splat(0x52);
     const third: e2ee_group_relay.RelayId = @splat(0x53);
     const fourth: e2ee_group_relay.RelayId = @splat(0x54);
     try b.sendE2eeGroupAck(b_to_a.sink(), second);
     try b.sendE2eeGroupAck(b_to_a.sink(), third);
     try b.sendE2eeGroupAck(b_to_a.sink(), fourth);
+    const conf_a: e2ee_group_relay.RelayId = @splat(0x61);
+    const conf_b: e2ee_group_relay.RelayId = @splat(0x62);
+    const conf_c: e2ee_group_relay.RelayId = @splat(0x63);
+    try b.sendE2eeGroupAckConfirm(b_to_a.sink(), conf_a);
+    try b.sendE2eeGroupAckConfirm(b_to_a.sink(), conf_b);
+    try b.sendE2eeGroupAckConfirm(b_to_a.sink(), conf_c);
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6434);
+    // One overflowed ACK + one overflowed confirm.
+    try std.testing.expectEqual(@as(u64, 2), a.takeDroppedE2eeGroupFrames());
     acks = try a.takeInboundE2eeGroupAcks();
     defer allocator.free(acks);
     try std.testing.expectEqual(@as(usize, 2), acks.len);
     try std.testing.expectEqualSlices(u8, &second, &acks[0]);
     try std.testing.expectEqualSlices(u8, &third, &acks[1]);
-    try std.testing.expectEqual(@as(u64, 1), a.takeDroppedE2eeGroupFrames());
+    confirms = try a.takeInboundE2eeGroupAckConfirms();
+    defer allocator.free(confirms);
+    try std.testing.expectEqual(@as(usize, 2), confirms.len);
+    try std.testing.expectEqualSlices(u8, &conf_a, &confirms[0]);
+    try std.testing.expectEqualSlices(u8, &conf_b, &confirms[1]);
 }
 
 test "secure relay v2 negotiates only on secured peers and round-trips once" {

@@ -194,7 +194,7 @@ test "reject malformed, ambiguous, and oversized control records" {
         "#root", "welcome", "phone", "Kain", "tablet",
     }));
     try std.testing.expectError(error.InvalidAccount, parse(&.{
-        "#root", "welcome", "phone", "bad account", "tablet", "opaque",
+        "#root", "welcome", "phone", "bad account", "tablet", "b3BhcXVl",
     }));
     try std.testing.expectError(error.InvalidPayload, parse(&.{
         "#root", "commit", "phone", "not+base64url",
