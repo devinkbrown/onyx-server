@@ -798,6 +798,23 @@ pub const SecuredLink = struct {
         return link.takeInboundE2eeGroup();
     }
 
+    pub fn sendE2eeGroupAck(
+        self: *SecuredLink,
+        id: s2s_link.E2eeGroupRelayId,
+    ) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendE2eeGroupAck(id);
+        try self.drainInner();
+    }
+
+    pub fn takeInboundE2eeGroupAcks(
+        self: *SecuredLink,
+    ) anyerror![]s2s_link.E2eeGroupRelayId {
+        const link = self.inner orelse
+            return self.allocator.alloc(s2s_link.E2eeGroupRelayId, 0);
+        return link.takeInboundE2eeGroupAcks();
+    }
+
     pub fn probeE2eeGroupCurrent(self: *SecuredLink) anyerror!void {
         const link = self.inner orelse return error.NotEstablished;
         try link.probeE2eeGroupCurrent();
@@ -1691,6 +1708,15 @@ test "E2EEGROUP is negotiated encrypted and drained through SecuredLink" {
         e2ee_group_relay.VerifyAndIdOutcome{ .verified = inbound[0].relay_id },
         try e2ee_group_relay.verifyAndRelayId(testing.allocator, inbound[0].owned.record),
     );
+
+    try p.b.sendE2eeGroupAck(inbound[0].relay_id);
+    try testing.expect(p.b.outbound().len != 0);
+    try testing.expect(std.mem.indexOf(u8, p.b.outbound(), &inbound[0].relay_id) == null);
+    try pump(&p.a, &p.b, false);
+    const acks = try p.a.takeInboundE2eeGroupAcks();
+    defer testing.allocator.free(acks);
+    try testing.expectEqual(@as(usize, 1), acks.len);
+    try testing.expectEqualSlices(u8, &inbound[0].relay_id, &acks[0]);
 }
 
 test "secure relay v2 is negotiated encrypted and drained through SecuredLink" {

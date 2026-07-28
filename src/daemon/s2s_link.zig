@@ -585,6 +585,14 @@ pub const S2sLink = struct {
         return self.peer.takeInboundE2eeGroup();
     }
 
+    pub fn sendE2eeGroupAck(self: *S2sLink, id: E2eeGroupRelayId) !void {
+        try self.peer.sendE2eeGroupAck(self.sink(), id);
+    }
+
+    pub fn takeInboundE2eeGroupAcks(self: *S2sLink) ![]E2eeGroupRelayId {
+        return self.peer.takeInboundE2eeGroupAcks();
+    }
+
     pub fn probeE2eeGroupCurrent(self: *S2sLink) !void {
         try self.peer.probeE2eeGroupCurrent(self.sink());
     }

@@ -325,6 +325,10 @@ pub const Config = struct {
     /// Maximum verified E2EEGROUP controls staged for daemon-global replay
     /// admission. The queue never evicts an earlier accepted control.
     max_e2ee_group_frames: usize = 256,
+    /// Maximum immediate-hop E2EEGROUP receipts staged for daemon outbox
+    /// retirement. This queue is deliberately distinct from MESSAGE_V2 ACK
+    /// state even though both receipt payloads are 16-byte RelayIds.
+    max_e2ee_group_ack_frames: usize = 256,
     /// Per-link E2EEGROUP reflection cache only. It is not replay authority.
     e2ee_group_seen_capacity: usize = 4096,
     /// Maximum verified OPER_EVENT_V2 wires staged for daemon-global replay
@@ -639,6 +643,8 @@ pub const S2sPeer = struct {
     rejected_relay_v2_frames: u64 = 0,
     /// Verified opaque group controls awaiting daemon-global replay admission.
     inbound_e2ee_group: std.ArrayListUnmanaged(InboundE2eeGroup) = .empty,
+    /// Secured immediate-hop E2EEGROUP receipts awaiting retained-outbox removal.
+    inbound_e2ee_group_acks: std.ArrayListUnmanaged(e2ee_group_relay.RelayId) = .empty,
     dropped_e2ee_group_frames: u64 = 0,
     rejected_e2ee_group_frames: u64 = 0,
     /// Inbound signed oper-grant payloads (raw oper_cred_share bytes) decoded
@@ -963,6 +969,7 @@ pub const S2sPeer = struct {
         self.inbound_v2_ack_confirms.deinit(self.allocator);
         for (self.inbound_e2ee_group.items) |*record| record.deinit(self.allocator);
         self.inbound_e2ee_group.deinit(self.allocator);
+        self.inbound_e2ee_group_acks.deinit(self.allocator);
         for (self.inbound_grants.items) |g| self.allocator.free(g);
         self.inbound_grants.deinit(self.allocator);
         for (self.membership_changes.items) |*d| d.deinit(self.allocator);
@@ -1285,6 +1292,7 @@ pub const S2sPeer = struct {
             .MESSAGE_V2 => try self.recvMessageV2(frame.payload),
             .MESSAGE_V2_ACK => try self.recvMessageV2Ack(frame.payload),
             .E2EE_GROUP => try self.recvE2eeGroup(frame.payload),
+            .E2EE_GROUP_ACK => try self.recvE2eeGroupAck(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
             .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
             .ENTITY_PROP => try self.recvEntityProp(frame.payload),
@@ -2338,8 +2346,53 @@ pub const S2sPeer = struct {
         return self.inbound_e2ee_group.toOwnedSlice(self.allocator);
     }
 
+    /// Hop-authenticate and strictly accept only the E2EEGROUP RelayId bytes.
+    /// Malformed, unsigned, unnegotiated, duplicate, and queue-pressure traffic
+    /// is advisory and therefore soft-dropped; allocation failure stays visible.
+    fn recvE2eeGroupAck(self: *S2sPeer, outer_payload: []const u8) !void {
+        if (!self.supportsE2eeGroup()) {
+            self.rejected_e2ee_group_frames +|= 1;
+            return;
+        }
+        const payload = self.verifiedPayload(.E2EE_GROUP_ACK, outer_payload) orelse {
+            self.rejected_e2ee_group_frames +|= 1;
+            return;
+        };
+        if (payload.len != e2ee_group_relay.relay_id_len) {
+            self.rejected_e2ee_group_frames +|= 1;
+            return;
+        }
+        const id: e2ee_group_relay.RelayId = payload[0..e2ee_group_relay.relay_id_len].*;
+        for (self.inbound_e2ee_group_acks.items) |queued| {
+            if (std.crypto.timing_safe.eql(e2ee_group_relay.RelayId, queued, id)) return;
+        }
+        // A missed receipt only causes the sender to retry its retained exact
+        // wire. Never fault an otherwise healthy secured stream on queue pressure.
+        if (self.inbound_e2ee_group_acks.items.len >= self.config.max_e2ee_group_ack_frames) {
+            self.dropped_e2ee_group_frames +|= 1;
+            return;
+        }
+        self.inbound_e2ee_group_acks.append(self.allocator, id) catch |err| {
+            self.dropped_e2ee_group_frames +|= 1;
+            return err;
+        };
+    }
+
+    pub fn sendE2eeGroupAck(
+        self: *S2sPeer,
+        sink: ByteSink,
+        id: e2ee_group_relay.RelayId,
+    ) !void {
+        try self.requireE2eeGroup();
+        try self.emitSignable(sink, .E2EE_GROUP_ACK, &id);
+    }
+
+    pub fn takeInboundE2eeGroupAcks(self: *S2sPeer) ![]e2ee_group_relay.RelayId {
+        return self.inbound_e2ee_group_acks.toOwnedSlice(self.allocator);
+    }
+
     /// Re-negotiate the append-only E2EEGROUP schema after Helix resume. An old
-    /// peer sees only an ordinary bounded PING and never receives tag 0x26.
+    /// peer sees only an ordinary bounded PING and never receives tags 0x26/0x27.
     pub fn probeE2eeGroupCurrent(self: *S2sPeer, sink: ByteSink) !void {
         if (!self.established) return error.NotEstablished;
         if (!self.supportsSecureRelayV2Base()) return;
@@ -5592,6 +5645,120 @@ test "E2EEGROUP forwarding is byte-identical across transit and queue backpressu
     try std.testing.expectEqual(@as(u64, 703), retried[0].owned.record.hlc);
 }
 
+test "E2EEGROUP ACK is domain separated authenticated deduplicated bounded and capability gated" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x96);
+    const kp_b = try signingKeyFor(0x97);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.secure_relay_transport_enabled = true;
+    b.secure_relay_transport_enabled = true;
+    a.config.max_e2ee_group_ack_frames = 2;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6430);
+    try std.testing.expect(a.supportsE2eeGroup());
+    try std.testing.expect(b.supportsE2eeGroup());
+
+    const first: e2ee_group_relay.RelayId = @splat(0x51);
+    b.peer_supports_e2ee_group_current = false;
+    try std.testing.expectError(
+        error.CapabilityNotNegotiated,
+        b.sendE2eeGroupAck(b_to_a.sink(), first),
+    );
+    try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
+    b.peer_supports_e2ee_group_current = true;
+
+    // The exact secured receipt round-trips once; same-batch duplicates coalesce.
+    try b.sendE2eeGroupAck(b_to_a.sink(), first);
+    try b.sendE2eeGroupAck(b_to_a.sink(), first);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6431);
+    var acks = try a.takeInboundE2eeGroupAcks();
+    try std.testing.expectEqual(@as(usize, 1), acks.len);
+    try std.testing.expectEqualSlices(u8, &first, &acks[0]);
+    allocator.free(acks);
+    const chat_acks = try a.takeInboundV2Acks();
+    defer allocator.free(chat_acks);
+    try std.testing.expectEqual(@as(usize, 0), chat_acks.len);
+
+    // Queue allocation failure is explicit and reserves no receipt identity, so
+    // the same authenticated ACK succeeds on retry with the normal allocator.
+    const retry_id: e2ee_group_relay.RelayId = @splat(0x50);
+    var retry_env_buf: [signed_frame.header_len + e2ee_group_relay.relay_id_len]u8 = undefined;
+    const retry_env = try signed_frame.wrap(
+        &retry_env_buf,
+        &b.signing_key.?,
+        @intFromEnum(s2s_frame.FrameType.E2EE_GROUP_ACK),
+        &retry_id,
+    );
+    {
+        const normal_allocator = a.allocator;
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        a.allocator = failing.allocator();
+        defer a.allocator = normal_allocator;
+        try std.testing.expectError(error.OutOfMemory, a.recvE2eeGroupAck(retry_env));
+    }
+    try std.testing.expectEqual(@as(u64, 1), a.takeDroppedE2eeGroupFrames());
+    try a.recvE2eeGroupAck(retry_env);
+    acks = try a.takeInboundE2eeGroupAcks();
+    try std.testing.expectEqual(@as(usize, 1), acks.len);
+    try std.testing.expectEqualSlices(u8, &retry_id, &acks[0]);
+    allocator.free(acks);
+
+    // Strict length and signed-hop gates soft-drop malformed or unsigned input.
+    try b.emitSignable(b_to_a.sink(), .E2EE_GROUP_ACK, "short");
+    try emitFrame(allocator, b_to_a.sink(), .E2EE_GROUP_ACK, &first);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6432);
+    try std.testing.expectEqual(@as(u64, 2), a.takeRejectedE2eeGroupFrames());
+    try std.testing.expectEqual(@as(u64, 1), a.takeRejectedOriginFrames());
+    acks = try a.takeInboundE2eeGroupAcks();
+    try std.testing.expectEqual(@as(usize, 0), acks.len);
+    allocator.free(acks);
+
+    // An envelope signed in MESSAGE_V2_ACK's tag domain is invalid when replayed
+    // under E2EE_GROUP_ACK even though both payload types are 16-byte arrays.
+    var wrong_domain_buf: [signed_frame.header_len + e2ee_group_relay.relay_id_len]u8 = undefined;
+    const wrong_domain = try signed_frame.wrap(
+        &wrong_domain_buf,
+        &b.signing_key.?,
+        @intFromEnum(s2s_frame.FrameType.MESSAGE_V2_ACK),
+        &first,
+    );
+    try emitFrame(allocator, b_to_a.sink(), .E2EE_GROUP_ACK, wrong_domain);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6433);
+    try std.testing.expectEqual(@as(u64, 1), a.takeRejectedE2eeGroupFrames());
+    try std.testing.expectEqual(@as(u64, 1), a.takeRejectedOriginFrames());
+
+    // Queue overflow is advisory: preserve the first two receipts and soft-drop
+    // the excess so its sender will retry the exact retained E2EEGROUP wire.
+    const second: e2ee_group_relay.RelayId = @splat(0x52);
+    const third: e2ee_group_relay.RelayId = @splat(0x53);
+    const fourth: e2ee_group_relay.RelayId = @splat(0x54);
+    try b.sendE2eeGroupAck(b_to_a.sink(), second);
+    try b.sendE2eeGroupAck(b_to_a.sink(), third);
+    try b.sendE2eeGroupAck(b_to_a.sink(), fourth);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6434);
+    acks = try a.takeInboundE2eeGroupAcks();
+    defer allocator.free(acks);
+    try std.testing.expectEqual(@as(usize, 2), acks.len);
+    try std.testing.expectEqualSlices(u8, &second, &acks[0]);
+    try std.testing.expectEqualSlices(u8, &third, &acks[1]);
+    try std.testing.expectEqual(@as(u64, 1), a.takeDroppedE2eeGroupFrames());
+}
+
 test "secure relay v2 negotiates only on secured peers and round-trips once" {
     const allocator = std.testing.allocator;
     var tc = TestClock{ .now_ms = 10 };
@@ -8731,7 +8898,7 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .OPER_EVENT,          .OBSERVE_EVENT,          .KILL,                     .WARD,                             .RESYNC,
         .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .MEMO_PUSH,                        .SESSION_REPLICA_OFFER,
         .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE, .OPER_EVENT_V2,
-        .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,      .E2EE_GROUP,
+        .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,      .E2EE_GROUP,               .E2EE_GROUP_ACK,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug

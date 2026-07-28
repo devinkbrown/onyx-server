@@ -147,6 +147,10 @@ pub const FrameType = enum(u8) {
     /// Negotiated by a bounded PING/PONG extension over secure-relay-v2 because
     /// the stable one-byte handshake capability layout is already full.
     E2EE_GROUP = 0x26,
+    /// Immediate-hop receipt for one daemon-admitted E2EEGROUP RelayId. The
+    /// distinct frame tag domain-separates this signed receipt from MESSAGE_V2
+    /// acknowledgments even though both RelayId types are 16 bytes.
+    E2EE_GROUP_ACK = 0x27,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -192,6 +196,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.MESSAGE_V2_ACK) => .MESSAGE_V2_ACK,
             @intFromEnum(FrameType.MEDIA_WS_DATAGRAM) => .MEDIA_WS_DATAGRAM,
             @intFromEnum(FrameType.E2EE_GROUP) => .E2EE_GROUP,
+            @intFromEnum(FrameType.E2EE_GROUP_ACK) => .E2EE_GROUP_ACK,
             else => null,
         };
     }
@@ -391,6 +396,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .MESSAGE_V2_ACK, .token = "MESSAGE_V2_ACK", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured hop receipt for an admitted MESSAGE_V2 RelayId." },
     .{ .frame_type = .MEDIA_WS_DATAGRAM, .token = "MEDIA_WS_DATAGRAM", .family = .media, .auth = .secured_signed, .summary = "Origin-only cascade of an already-validated browser Cadence WS media datagram." },
     .{ .frame_type = .E2EE_GROUP, .token = "E2EE_GROUP", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured opaque E2EEGROUP control with immutable origin signature and RelayId." },
+    .{ .frame_type = .E2EE_GROUP_ACK, .token = "E2EE_GROUP_ACK", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured immediate-hop receipt for an admitted E2EEGROUP RelayId." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {
@@ -802,12 +808,16 @@ test "media ws datagram frame is secured media family" {
     try testing.expectEqual(FrameType.MEDIA_WS_DATAGRAM, frameSpecByToken("MEDIA_WS_DATAGRAM").?.frame_type);
 }
 
-test "E2EE group frame is secured and base-transport gated without a new capability bit" {
-    const spec = frameSpec(.E2EE_GROUP);
-    try testing.expectEqual(FrameFamily.relay, spec.family);
-    try testing.expectEqual(FrameAuth.secured_signed, spec.auth);
-    try testing.expectEqual(cap_secure_relay_v2, spec.capability_mask);
+test "E2EE group frames are secured and base-transport gated without a new capability bit" {
+    inline for (.{ FrameType.E2EE_GROUP, FrameType.E2EE_GROUP_ACK }) |frame_type| {
+        const spec = frameSpec(frame_type);
+        try testing.expectEqual(FrameFamily.relay, spec.family);
+        try testing.expectEqual(FrameAuth.secured_signed, spec.auth);
+        try testing.expectEqual(cap_secure_relay_v2, spec.capability_mask);
+    }
     try testing.expectEqual(FrameType.E2EE_GROUP, frameSpecByTag(0x26).?.frame_type);
     try testing.expectEqual(FrameType.E2EE_GROUP, frameSpecByToken("E2EE_GROUP").?.frame_type);
+    try testing.expectEqual(FrameType.E2EE_GROUP_ACK, frameSpecByTag(0x27).?.frame_type);
+    try testing.expectEqual(FrameType.E2EE_GROUP_ACK, frameSpecByToken("E2EE_GROUP_ACK").?.frame_type);
     try testing.expectEqual(@as(usize, 8), capability_catalog.len);
 }
