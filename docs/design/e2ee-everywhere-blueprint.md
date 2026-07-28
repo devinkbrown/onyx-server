@@ -318,39 +318,39 @@ The roadmap explicitly requires correcting Discord-DAVE's known weaknesses:
 
 ### 5.2 Key material published as signed CRDT PROP (server stores, never reads)
 
-Extend the existing `e2ee.device.*` user-PROP with the group primitives. All are opaque
-to the daemon; all ride the **already-signed** ENTITY_PROP CRDT
-(`entity_prop_event.zig`), so they cross the mesh authenticated per-origin and survive
-partition/USR2.
+Keep long-term device identity and optional transparency hints in the existing
+signed ENTITY_PROP CRDT. Ephemeral KeyPackage, Welcome, and Commit material uses
+the bounded `E2EEGROUP` control-record contract in §5.3 instead of creating a
+second persisted group-state authority in PROP.
 
 | PROP key (user entity) | Value (opaque, bounded) | Purpose |
 | --- | --- | --- |
 | `e2ee.device.<id>` | `alg:b64key` (existing, `e2ee_policy.zig:82-98`) | Long-term device identity pubkey (bootstrap) |
-| `e2ee.kp.<id>` (**new**) | `b64(KeyPackage)` | Per-device MLS KeyPackage for being added to groups |
 | `e2ee.kt.<id>` (**new, optional**) | `b64(kt-inclusion-proof-hint)` | Client-cached KT position for audit |
 
-Value length stays inside the metadata store bound (≤ 512 B — `metadata.zig:14`); a
-KeyPackage larger than that is chunked across `e2ee.kp.<id>.<n>` keys, or (preferred)
-the metadata value cap is raised for the `e2ee.*` namespace only via a bounded option
-(`metadata.zig:44` `Options.max_value_bytes`) — an `onyx-server-config` decision.
+Values stay inside the existing metadata-store bound. Group control records have
+their own canonical base64url and 4096-byte opaque-payload bounds, so no
+namespace-specific PROP value-cap exception is required.
 
 ### 5.3 Group control blobs (server FORWARDS, never opens)
 
-- **Welcome** — targeted opaque relay to exactly the newly-added device(s). Proposed
-  transport: a new `E2EE WELCOME <target> :<b64blob>` subcommand routed like a DM
-  (server delivers to the target's session(s); if offline, queued like a DM). The server
-  sees target + size, never contents.
-- **Commit / epoch change** — rides the **Event Spine** as a typed, opaque event
-  (`EVENT ... E2EE EPOCH <channel> <epoch> :<b64commit>`), fanned out to channel members
-  exactly like other typed Event-Spine events. Epoch transitions being Event-Spine events
-  is the roadmap's stated design. The daemon forwards the blob and the (authenticated)
-  sender leaf id; it does not interpret the tree.
+- **One versioned command surface** — `E2EEGROUP <channel>
+  <key-package|commit> <from-device> :<b64blob>` fans a bounded opaque record to
+  capable channel members. `E2EEGROUP <channel> welcome <from-device>
+  <to-account> <to-device> :<b64blob>` targets only the named account/device.
+  The sender must be an authenticated member and own the advertised
+  `e2ee.device.<from-device>` PROP. The daemon sees routing metadata and size,
+  never group secrets.
+- **Mesh relay** — the exact parsed control record is origin-signed and forwarded
+  under its own replay/equivocation authority. The v1 contract is deliberately
+  non-persistent: an offline Welcome fails explicitly and the client retries
+  after the target reconnects. Helix preserves replay authority, not payloads.
 - **Ciphertext** — ordinary `PRIVMSG`/`TAGMSG` carrying `SFrame(payload)` with
   `+onyx/e2ee=mls`. CHATHISTORY, session-sync, and the outbox already carry it
   untouched (the DM precedent — `dmCipher.ts:14-16`).
 
 **Deploy-order:** every one of these is a wire change → **client-FIRST**. Onyx must
-tolerate a daemon that doesn't yet forward `E2EE`/`EPOCH` (feature-detect via the
+tolerate a daemon that does not yet expose `E2EEGROUP` (feature-detect via the
 `onyx/e2ee` cap) and vice-versa.
 
 ### 5.4 Client group-state module (Onyx, new — `src/lib/e2ee/group/`)
@@ -458,8 +458,8 @@ Each phase compiles, gates on its own suite, lands independently, and is **byte-
 | **0. Research** | §6 items confirmed; the tree-hash-binding gap in `treekem.zig` resolved as design input | **deep-researcher** | brief with citations + confidence | — |
 | **1. KT covers E2EE keys** | `CredentialKind.e2ee_device`/`identity`; KT append at `handleE2eeKey ADD/DEL`; `KEYTRANS` returns device-key proofs | zig-coder (onyx-server-ircx for command surface, onyx-server-crypto-reviewer review) | unit + KAT for `eventDigest`; additive, no wire break | server-safe (additive) |
 | **2. WASM group crypto** | Build `treekem.zig`+`mls_keyschedule.zig`+`sframe.zig` to a browser WASM module; thin TS `mlsGroup.ts` binding; parity tests vs the Zig unit tests | zig-coder (WASM build) + solidjs-coder (binding) | KAT parity WASM↔Zig; `onyx pnpm test` | client-only, no wire yet |
-| **3. Group state in store** | `groupEpochs` slice; KeyPackage publish to `e2ee.kp.*`; epoch state immutable in store | onyx-store | slice tests; no-op when cap absent | client-FIRST |
-| **4. Opaque transport** | Daemon forwards `E2EE WELCOME` + `EVENT ... E2EE EPOCH` blobs; membership/authz gate; **never opens** blobs; policy-`required` fail-closed tag-gate | onyx-server-ircx (+ onyx-server-mesh-reviewer for ENTITY_PROP/Event-Spine) | loopback e2e; DST for mesh crossing + USR2 opaque-carry | **client-FIRST**, then server |
+| **3. Group state in store** | `groupEpochs` slice; device KeyPackages queued for bounded `E2EEGROUP` publication; epoch state immutable in store | onyx-store | slice tests; no-op when cap absent | client-FIRST |
+| **4. Opaque transport** | Daemon forwards versioned `E2EEGROUP` KeyPackage/Welcome/Commit records; membership/device-ownership gate; **never opens or persists** blobs; policy-`required` fail-closed tag-gate | onyx-server-ircx + onyx-server-integrator (+ onyx-server-mesh-reviewer) | loopback e2e; DST for mesh crossing + USR2 replay-authority carry | **client-FIRST**, then server |
 | **5. Text E2EE end-to-end** | SFrame text sealing from the exporter; send/receive/CHATHISTORY/vault-at-rest; locked-placeholder on wrong epoch; DAVE-flaw AAD + committing-AEAD | solidjs-coder + onyx-vault (retention) | onyx-e2e critical flow (two contexts, encrypted channel); vault ciphertext-only regression | client-FIRST |
 | **6. KT audit loop** | Client audits own key history + peer inclusion + root consistency (split-view detection) | solidjs-coder | unit for proof verify; e2e for swap-detection | client-only |
 | **7. Multi-device** | N-leaf-per-user; add/remove device Commits | solidjs-coder + onyx-store | e2e: second device joins & reads; removed device locked | client-FIRST |

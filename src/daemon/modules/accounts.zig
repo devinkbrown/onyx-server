@@ -105,6 +105,10 @@ fn e2eeKey(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleE2eeKey(x.conn, x.parsed);
 }
+fn e2eeGroup(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleE2eeGroup(x.conn, x.parsed);
+}
 fn identity(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleIdentity(x.conn, x.parsed);
@@ -151,6 +155,7 @@ pub const CERTADD_spec = registry.CommandSpec{ .name = "CERTADD", .feature = acc
 pub const WEBAUTHN_spec = registry.CommandSpec{ .name = "WEBAUTHN", .min_params = 1, .feature = accounts_feature, .handler = webauthn, .summary = "manage passkeys / passwordless login (REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|RENAME|STATUS)" };
 pub const KEYTRANS_spec = registry.CommandSpec{ .name = "KEYTRANS", .feature = accounts_feature, .handler = keytrans, .summary = "inspect account credential transparency roots and inclusion proofs" };
 pub const E2EEKEY_spec = registry.CommandSpec{ .name = "E2EEKEY", .feature = accounts_feature, .handler = e2eeKey, .summary = "manage public E2EE device keys (ADD|LIST|DEL|STATUS)" };
+pub const E2EEGROUP_spec = registry.CommandSpec{ .name = "E2EEGROUP", .min_params = 4, .feature = accounts_feature, .handler = e2eeGroup, .summary = "relay bounded opaque group E2EE control records" };
 pub const IDENTITY_spec = registry.CommandSpec{ .name = "IDENTITY", .feature = accounts_feature, .handler = identity, .summary = "manage portable account identity keys (ADD|LIST|DEL|STATUS|VERIFY)" };
 pub const CERTLIST_spec = registry.CommandSpec{ .name = "CERTLIST", .feature = accounts_feature, .handler = certList };
 pub const CERTDEL_spec = registry.CommandSpec{ .name = "CERTDEL", .feature = accounts_feature, .handler = certDel };
@@ -187,6 +192,7 @@ pub const module = registry.Module{
         WEBAUTHN_spec,
         KEYTRANS_spec,
         E2EEKEY_spec,
+        E2EEGROUP_spec,
         IDENTITY_spec,
         RECOGNIZE_spec,
         LISTCHANS_spec,
@@ -202,6 +208,7 @@ test "accounts commands are feature gated except SASLINFO" {
     try @import("std").testing.expect(!registry.commandAvailable(WEBAUTHN_spec, caps));
     try @import("std").testing.expect(!registry.commandAvailable(KEYTRANS_spec, caps));
     try @import("std").testing.expect(!registry.commandAvailable(E2EEKEY_spec, caps));
+    try @import("std").testing.expect(!registry.commandAvailable(E2EEGROUP_spec, caps));
     try @import("std").testing.expect(!registry.commandAvailable(IDENTITY_spec, caps));
     try @import("std").testing.expect(registry.commandAvailable(SASLINFO_spec, caps));
 }

@@ -144,6 +144,7 @@ const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
 const account_identity = @import("../proto/account_identity.zig");
 const e2ee_policy = @import("../proto/e2ee_policy.zig");
+const e2ee_group_control = @import("../proto/e2ee_group_control.zig");
 const topic_tag = @import("../proto/topic_tag.zig");
 const ircx_prop_providers = @import("../proto/ircx_prop_providers.zig");
 const ircx_access_store = @import("../proto/ircx_access_store.zig");
@@ -1162,6 +1163,11 @@ fn srvLog(comptime fmt: []const u8, args: anytype) void {
 // Timeout-sweep period and IP-reputation penalty weights are operator-tunable
 // via `[limits].sweep_interval` and `[reputation]` (see Config fields).
 const default_reply_bytes: usize = 8192;
+/// A maximum-size canonical E2EEGROUP payload plus the longest source prefix,
+/// command, channel, device, and account routing fields. Kept independently
+/// below SendQ's 8-KiB logical-record bound so the protocol's full 4096-byte
+/// opaque payload budget remains live rather than parser-only.
+const e2ee_group_max_line_bytes: usize = e2ee_group_control.max_payload_len + 1024;
 
 const MediaPhysicalAttachment = struct {
     client: client_model.ClientId,
@@ -35174,6 +35180,146 @@ pub const LinuxServer = struct {
         return count;
     }
 
+    fn e2eeDeviceOwnedByAccount(self: *LinuxServer, account: []const u8, device: []const u8) bool {
+        var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+        const key = e2ee_policy.devicePropKey(device, &key_buf) orelse return false;
+        const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+        const entry = self.props.getProp(entity, key) catch return false;
+        return splitE2eeDeviceValue(entry.value) != null;
+    }
+
+    fn appendE2eeGroupRecipient(
+        self: *LinuxServer,
+        recipients: *std.ArrayList(client_model.ClientId),
+        id: client_model.ClientId,
+    ) std.mem.Allocator.Error!void {
+        const target = self.connFor(id) orelse return;
+        if (target.closing or target.s2s != null or target.s2s_secured != null) return;
+        if (!target.session.hasCap(.onyx_e2ee)) return;
+        try self.appendUniqueDeliveryId(recipients, id);
+    }
+
+    fn collectE2eeGroupRecipients(
+        self: *LinuxServer,
+        record: e2ee_group_control.Record,
+        recipients: *std.ArrayList(client_model.ClientId),
+    ) std.mem.Allocator.Error!void {
+        if (record.kind != .welcome) {
+            var members = self.world.memberIterator(record.channel) orelse return;
+            while (members.next()) |member| {
+                try self.appendE2eeGroupRecipient(recipients, clientIdFromWorld(member.*));
+            }
+            return;
+        }
+
+        // Route targeted account authority through SessionStore rather than a
+        // nick lookup. One logical session may have several physical
+        // attachments; every live, capable attachment in the room receives the
+        // same opaque Welcome and lets its client filter by `to_device`.
+        const account = record.to_account.?;
+        var canonical_account_buf: [e2ee_group_control.max_account_len]u8 = undefined;
+        const canonical_account = std.ascii.lowerString(canonical_account_buf[0..account.len], account);
+        const sessions = try self.sessions.copySessionsAlloc(self.allocator, canonical_account);
+        defer self.allocator.free(sessions);
+        for (sessions) |session| {
+            if (!session.attached) continue;
+            const id = clientIdFromMonitor(session.client);
+            const target = self.connFor(id) orelse continue;
+            const live_account = target.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(live_account, account)) continue;
+            if (!self.world.isMember(record.channel, worldIdFromClient(id))) continue;
+            try self.appendE2eeGroupRecipient(recipients, id);
+        }
+    }
+
+    fn renderE2eeGroupLine(
+        conn: *const ConnState,
+        record: e2ee_group_control.Record,
+        out: []u8,
+    ) ServerError![]const u8 {
+        var prefix_buf: [default_reply_bytes]u8 = undefined;
+        const prefix = try clientPrefix(conn, &prefix_buf);
+        return if (record.kind == .welcome)
+            std.fmt.bufPrint(
+                out,
+                ":{s} {s} {s} {s} {s} {s} :{s}\r\n",
+                .{
+                    prefix,
+                    record.kind.wireTag(),
+                    record.channel,
+                    record.from_device,
+                    record.to_account.?,
+                    record.to_device.?,
+                    record.payload,
+                },
+            ) catch error.OutputTooSmall
+        else
+            std.fmt.bufPrint(
+                out,
+                ":{s} {s} {s} {s} :{s}\r\n",
+                .{ prefix, record.kind.wireTag(), record.channel, record.from_device, record.payload },
+            ) catch error.OutputTooSmall;
+    }
+
+    /// Local Phase 4a E2EEGROUP admission. The opaque payload is validated and
+    /// copied only into the final bounded IRC line; it is never decrypted,
+    /// logged, persisted, placed in history, or retained across reconnect.
+    pub fn handleE2eeGroup(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const account = conn.session.account() orelse
+            return self.failReply(conn, "E2EEGROUP", "NOT_LOGGED_IN", "Authenticate before sending group E2EE controls");
+        if (!conn.ircx)
+            return self.failReply(conn, "E2EEGROUP", "IRCX_REQUIRED", "Opt in with IRCX before sending group E2EE controls");
+        if (!conn.session.hasCap(.onyx_e2ee))
+            return self.failReply(conn, "E2EEGROUP", "CAP_REQUIRED", "Negotiate onyx/e2ee before sending group E2EE controls");
+
+        const record = e2ee_group_control.parse(parsed.paramSlice()) catch |err| {
+            const code: []const u8 = switch (err) {
+                error.NeedMoreParams => "NEED_MORE_PARAMS",
+                error.TooManyParams => "TOO_MANY_PARAMS",
+                error.InvalidChannel => "BAD_CHANNEL",
+                error.InvalidKind => "BAD_KIND",
+                error.InvalidDevice => "BAD_DEVICE",
+                error.InvalidAccount => "BAD_ACCOUNT",
+                error.InvalidPayload => "BAD_PAYLOAD",
+            };
+            return self.failReply(conn, "E2EEGROUP", code, "Malformed group E2EE control record");
+        };
+
+        const sender_id = idFromToken(conn.token);
+        if (!self.world.isMember(record.channel, worldIdFromClient(sender_id)))
+            return self.failReply(conn, "E2EEGROUP", "NOT_ON_CHANNEL", "Sender is not a member of the target channel");
+        if (!self.e2eeDeviceOwnedByAccount(account, record.from_device))
+            return self.failReply(conn, "E2EEGROUP", "DEVICE_NOT_OWNED", "The sending account does not own from-device");
+        if (record.kind == .welcome and
+            !self.e2eeDeviceOwnedByAccount(record.to_account.?, record.to_device.?))
+        {
+            return self.failReply(conn, "E2EEGROUP", "TARGET_UNAVAILABLE", "Target account/device is absent or offline");
+        }
+
+        // Complete every fallible parse, authority, recipient-set, and render
+        // step before publishing the first socket delivery.
+        var recipients: std.ArrayList(client_model.ClientId) = .empty;
+        defer recipients.deinit(self.allocator);
+        self.collectE2eeGroupRecipients(record, &recipients) catch
+            return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "Could not stage group E2EE delivery");
+        if (record.kind == .welcome and recipients.items.len == 0)
+            return self.failReply(conn, "E2EEGROUP", "TARGET_UNAVAILABLE", "Target account/device is absent or offline");
+
+        var line_buf: [e2ee_group_max_line_bytes]u8 = undefined;
+        const line = renderE2eeGroupLine(conn, record, &line_buf) catch
+            return self.failReply(conn, "E2EEGROUP", "BAD_PAYLOAD", "Group E2EE control record is too large");
+
+        self.beginWakeBatch();
+        defer self.endWakeBatch();
+        var delivered: usize = 0;
+        for (recipients.items) |id| {
+            if (self.enqueueDeliveryMaybeClose(id, line, false, "Client quit") == .delivered)
+                delivered += 1;
+        }
+        if (record.kind == .welcome and delivered == 0)
+            return self.failReply(conn, "E2EEGROUP", "TARGET_UNAVAILABLE", "Target account/device is absent or offline");
+    }
+
     pub fn handleE2eeKey(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const p = parsed.paramSlice();
         const sub = if (p.len == 0) "STATUS" else p[0];
@@ -57324,6 +57470,181 @@ test "E2EEKEY advertises account device keys through user props" {
     try server.handleE2eeKey(conn, &del);
     try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DELETED id=phone");
     try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "e2ee.device.phone"));
+}
+
+fn enrollTestE2eeDevice(server: *Server, account: []const u8, device: []const u8) !void {
+    var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+    const key = e2ee_policy.devicePropKey(device, &key_buf) orelse return error.TestUnexpectedResult;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+    _ = try server.props.setProp(entity, key, "mls-x25519:abcd", .{ .id = account, .access = .member });
+}
+
+test "E2EEGROUP local handler renders exact capable-member and targeted Welcome lines" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const sender_id = try addTestLocalClient(&server, "Alice", "alice");
+    const bob_id = try addTestLocalClient(&server, "Bob", "bob");
+    const bob_phone_id = try addTestLocalClient(&server, "BobPhone", "bob");
+    const old_id = try addTestLocalClient(&server, "Old", "old");
+    const outsider_id = try addTestLocalClient(&server, "Outside", "outside");
+    const sender = server.connFor(sender_id).?;
+    const bob = server.connFor(bob_id).?;
+    const bob_phone = server.connFor(bob_phone_id).?;
+    const old = server.connFor(old_id).?;
+    const outsider = server.connFor(outsider_id).?;
+
+    for ([_]*ConnState{ sender, bob, bob_phone, old, outsider }) |conn| conn.ircx = true;
+    for ([_]*ConnState{ sender, bob, bob_phone, outsider }) |conn| conn.session.addCap(.onyx_e2ee);
+    _ = try server.world.join("#secure", worldIdFromClient(sender_id));
+    _ = try server.world.join("#secure", worldIdFromClient(bob_id));
+    _ = try server.world.join("#secure", worldIdFromClient(bob_phone_id));
+    _ = try server.world.join("#secure", worldIdFromClient(old_id));
+    try enrollTestE2eeDevice(&server, "alice", "phone");
+    try enrollTestE2eeDevice(&server, "bob", "tablet");
+
+    var key_package = try irc_line.parseLine("E2EEGROUP #secure key-package phone :AQIDBA");
+    try server.handleE2eeGroup(sender, &key_package);
+    const expected_key = ":Alice!alice@localhost E2EE.KEYPACKAGE #secure phone :AQIDBA\r\n";
+    try expectContains(sender.send_buf[0..sender.send_len], expected_key);
+    try expectContains(bob.send_buf[0..bob.send_len], expected_key);
+    try expectContains(bob_phone.send_buf[0..bob_phone.send_len], expected_key);
+    try std.testing.expectEqual(@as(usize, 0), old.send_len);
+    try std.testing.expectEqual(@as(usize, 0), outsider.send_len);
+
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    bob.send_len = 0;
+    bob.send_offset = 0;
+    bob_phone.send_len = 0;
+    bob_phone.send_offset = 0;
+    var commit = try irc_line.parseLine("E2EEGROUP #secure commit phone :b3BhcXVl");
+    try server.handleE2eeGroup(sender, &commit);
+    const expected_commit = ":Alice!alice@localhost E2EE.COMMIT #secure phone :b3BhcXVl\r\n";
+    try expectContains(sender.send_buf[0..sender.send_len], expected_commit);
+    try expectContains(bob.send_buf[0..bob.send_len], expected_commit);
+    try expectContains(bob_phone.send_buf[0..bob_phone.send_len], expected_commit);
+
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    bob.send_len = 0;
+    bob.send_offset = 0;
+    bob_phone.send_len = 0;
+    bob_phone.send_offset = 0;
+    // Wire account spelling is preserved for clients, while the route-first
+    // SessionStore lookup must use the canonical lowercase key stored at login.
+    var welcome = try irc_line.parseLine("E2EEGROUP #secure welcome phone Bob tablet :d2VsY29tZQ");
+    try server.handleE2eeGroup(sender, &welcome);
+    const expected_welcome = ":Alice!alice@localhost E2EE.WELCOME #secure phone Bob tablet :d2VsY29tZQ\r\n";
+    try std.testing.expectEqual(@as(usize, 0), sender.send_len);
+    try expectContains(bob.send_buf[0..bob.send_len], expected_welcome);
+    try expectContains(bob_phone.send_buf[0..bob_phone.send_len], expected_welcome);
+    try std.testing.expectEqual(@as(usize, 0), old.send_len);
+    try std.testing.expectEqual(@as(usize, 0), outsider.send_len);
+}
+
+test "E2EEGROUP local handler fails closed and accepts the full payload bound" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const sender_id = try addTestLocalClient(&server, "Alice", "alice");
+    const target_id = try addTestLocalClient(&server, "Bob", "bob");
+    const off_channel_id = try addTestLocalClient(&server, "Carol", "carol");
+    const guest_id = try addTestLocalClient(&server, "Guest", null);
+    const no_cap_id = try addTestLocalClient(&server, "NoCap", "nocap");
+    const no_ircx_id = try addTestLocalClient(&server, "NoIrcx", "noircx");
+    const outsider_id = try addTestLocalClient(&server, "Outside", "outside");
+    const sender = server.connFor(sender_id).?;
+    const target = server.connFor(target_id).?;
+    const off_channel = server.connFor(off_channel_id).?;
+    const guest = server.connFor(guest_id).?;
+    const no_cap = server.connFor(no_cap_id).?;
+    const no_ircx = server.connFor(no_ircx_id).?;
+    const outsider = server.connFor(outsider_id).?;
+    for ([_]*ConnState{ sender, target, off_channel, guest, outsider }) |conn| {
+        conn.ircx = true;
+        conn.session.addCap(.onyx_e2ee);
+    }
+    no_cap.ircx = true;
+    no_ircx.session.addCap(.onyx_e2ee);
+    _ = try server.world.join("#secure", worldIdFromClient(sender_id));
+    _ = try server.world.join("#secure", worldIdFromClient(target_id));
+    _ = try server.world.join("#secure", worldIdFromClient(guest_id));
+    _ = try server.world.join("#secure", worldIdFromClient(no_cap_id));
+    _ = try server.world.join("#secure", worldIdFromClient(no_ircx_id));
+    try enrollTestE2eeDevice(&server, "alice", "phone");
+    try enrollTestE2eeDevice(&server, "bob", "tablet");
+    try enrollTestE2eeDevice(&server, "carol", "laptop");
+
+    var malformed = try irc_line.parseLine("E2EEGROUP #secure commit phone :not+base64url");
+    try server.handleE2eeGroup(sender, &malformed);
+    try expectContains(sender.send_buf[0..sender.send_len], "FAIL E2EEGROUP BAD_PAYLOAD");
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    var unowned = try irc_line.parseLine("E2EEGROUP #secure commit missing :AQIDBA");
+    try server.handleE2eeGroup(sender, &unowned);
+    try expectContains(sender.send_buf[0..sender.send_len], "FAIL E2EEGROUP DEVICE_NOT_OWNED");
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    var no_target_device = try irc_line.parseLine("E2EEGROUP #secure welcome phone bob missing :AQIDBA");
+    try server.handleE2eeGroup(sender, &no_target_device);
+    try expectContains(sender.send_buf[0..sender.send_len], "FAIL E2EEGROUP TARGET_UNAVAILABLE");
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    var off_channel_target = try irc_line.parseLine("E2EEGROUP #secure welcome phone carol laptop :AQIDBA");
+    try server.handleE2eeGroup(sender, &off_channel_target);
+    try expectContains(sender.send_buf[0..sender.send_len], "FAIL E2EEGROUP TARGET_UNAVAILABLE");
+    try std.testing.expectEqual(@as(usize, 0), off_channel.send_len);
+
+    var guest_line = try irc_line.parseLine("E2EEGROUP #secure commit phone :AQIDBA");
+    try server.handleE2eeGroup(guest, &guest_line);
+    try expectContains(guest.send_buf[0..guest.send_len], "FAIL E2EEGROUP NOT_LOGGED_IN");
+
+    var no_cap_line = try irc_line.parseLine("E2EEGROUP #secure commit phone :AQIDBA");
+    try server.handleE2eeGroup(no_cap, &no_cap_line);
+    try expectContains(no_cap.send_buf[0..no_cap.send_len], "FAIL E2EEGROUP CAP_REQUIRED");
+
+    var no_ircx_line = try irc_line.parseLine("E2EEGROUP #secure commit phone :AQIDBA");
+    try server.handleE2eeGroup(no_ircx, &no_ircx_line);
+    try expectContains(no_ircx.send_buf[0..no_ircx.send_len], "FAIL E2EEGROUP IRCX_REQUIRED");
+
+    var outsider_line = try irc_line.parseLine("E2EEGROUP #secure commit phone :AQIDBA");
+    try server.handleE2eeGroup(outsider, &outsider_line);
+    try expectContains(outsider.send_buf[0..outsider.send_len], "FAIL E2EEGROUP NOT_ON_CHANNEL");
+
+    var max_payload: [e2ee_group_control.max_payload_len]u8 = @splat('A');
+    var max_line = irc_line.LineView{ .raw = "", .command = "E2EEGROUP" };
+    max_line.params[0] = "#secure";
+    max_line.params[1] = "commit";
+    max_line.params[2] = "phone";
+    max_line.params[3] = &max_payload;
+    max_line.param_count = 4;
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    target.send_len = 0;
+    target.send_offset = 0;
+    try server.handleE2eeGroup(sender, &max_line);
+    var expected_buf: [e2ee_group_max_line_bytes]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        ":Alice!alice@localhost E2EE.COMMIT #secure phone :{s}\r\n",
+        .{&max_payload},
+    );
+    try std.testing.expectEqualSlices(u8, expected, target.send_buf[0..target.send_len]);
 }
 
 test "IDENTITY advertises self-signed portable account keys through user props" {

@@ -46,6 +46,12 @@
         "payload_bytes": 4096
       },
       "payload_encoding": "canonical base64url without padding",
+      "delivery": {
+        "channel_record": ":<source-prefix> E2EE.KEYPACKAGE|E2EE.COMMIT <channel> <from-device> :<opaque-base64url>",
+        "welcome_record": ":<source-prefix> E2EE.WELCOME <channel> <from-device> <to-account> <to-device> :<opaque-base64url>",
+        "recipient_gate": "onyx/e2ee negotiated and locally joined to the channel",
+        "welcome_absence": "explicit TARGET_UNAVAILABLE failure; no offline persistence in v1"
+      },
       "persistence": "none"
     },
     "invariants": [
