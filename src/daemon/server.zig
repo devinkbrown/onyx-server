@@ -38283,9 +38283,12 @@ pub const LinuxServer = struct {
         return true;
     }
 
-    /// `onyx/e2ee` promises retained attachment delivery, so a capable socket
-    /// may not remain live when its reusable SessionStore row could not be
-    /// established (for example, every per-account slot is still attached).
+    /// `onyx/e2ee` promises retained attachment delivery for authenticated
+    /// account sockets. A capable account socket may not remain live when its
+    /// reusable SessionStore row could not be established (for example, every
+    /// per-account slot is still attached). True guests / unauthenticated
+    /// sockets never attach a reusable row and keep the ordinary best-effort
+    /// delivery contract, so they may negotiate the cap without a session.
     /// Close at registration/login/CAP boundaries before autojoin or further
     /// participation; the delivery collector keeps its own defensive row check
     /// for inherited or manually-constructed legacy state.
@@ -38296,6 +38299,11 @@ pub const LinuxServer = struct {
     ) !bool {
         if (!conn.session.hasCap(.onyx_e2ee)) return true;
         if (self.attachmentHasReusableSession(id)) return true;
+        // No authenticated account ⇒ no reusable SessionStore attachment is
+        // expected (guest / anonymous best-effort). Fail closed only for
+        // account sockets that negotiated the durable-delivery promise without
+        // a live reusable row.
+        if (conn.session.account() == null) return true;
         retainCloseReason(conn, "E2EE reusable session unavailable");
         conn.closing = true;
         try self.failReply(
@@ -58838,6 +58846,34 @@ test "E2EEGROUP cap-exhausted login and late negotiation fail explicitly before 
         "FAIL E2EEGROUP SESSION_UNAVAILABLE :onyx/e2ee requires an available reusable session",
     );
     try std.testing.expect(!server.world.isMember("#secure", worldIdFromClient(cap_id)));
+}
+
+test "E2EEGROUP guest CAP REQ onyx/e2ee after registration stays open" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // True unauthenticated guest: registered, no account, no reusable SessionStore
+    // row. Best-effort delivery permits onyx/e2ee without SESSION_UNAVAILABLE.
+    const guest_id = try addTestLocalClient(&server, "GuestE2ee", null);
+    const guest = server.connFor(guest_id).?;
+    guest.session.registration.registered = true;
+    guest.session.addCap(.standard_replies);
+    try std.testing.expect(guest.session.account() == null);
+    try std.testing.expect(!guest.session.hasCap(.onyx_e2ee));
+    try std.testing.expect(!server.attachmentHasReusableSession(guest_id));
+    try server.processLiveLine(guest_id, guest, "CAP REQ :onyx/e2ee");
+    try std.testing.expect(guest.session.hasCap(.onyx_e2ee));
+    try std.testing.expect(!guest.closing);
+    try std.testing.expect(std.mem.indexOf(u8, guest.send_buf[0..guest.send_len], "SESSION_UNAVAILABLE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, guest.send_buf[0..guest.send_len], "E2EEGROUP") == null);
 }
 
 test "E2EEGROUP local handler renders exact capable-member and targeted Welcome lines" {
