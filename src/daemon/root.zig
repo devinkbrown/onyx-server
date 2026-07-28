@@ -41,6 +41,7 @@ pub const dlog = @import("dlog.zig");
 pub const dnsbl = @import("dnsbl.zig");
 pub const dnsbl_resolver = @import("dnsbl_resolver.zig");
 pub const dualstack_udp = @import("dualstack_udp.zig");
+pub const e2ee_group_mesh_authority = @import("e2ee_group_mesh_authority.zig");
 pub const e2ee_group_outbox = @import("e2ee_group_outbox.zig");
 pub const e2ee_group_replay_guard = @import("e2ee_group_replay_guard.zig");
 pub const event_spine = @import("event_spine.zig");
@@ -189,6 +190,7 @@ test {
     _ = dnsbl;
     _ = dnsbl_resolver;
     _ = dualstack_udp;
+    _ = e2ee_group_mesh_authority;
     _ = e2ee_group_outbox;
     _ = e2ee_group_replay_guard;
     _ = event_spine;
