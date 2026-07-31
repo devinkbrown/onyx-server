@@ -2395,6 +2395,13 @@ const DeferredSessionMeshIdentity = struct {
 pub const ConnState = struct {
     fd: linux.fd_t = -1,
     token: RingFdToken = .{ .slot = 0, .gen = 0 },
+    /// Last mesh QUIT delivered to this physical client. A remote QUIT is
+    /// represented by one withdrawal per shared channel; recipient-local
+    /// deduplication preserves exactly one IRC QUIT without hiding it from a
+    /// client that shares only a later channel.
+    remote_quit_nick_hash: u64 = 0,
+    remote_quit_at_ms: i64 = 0,
+    remote_quit_seen: bool = false,
     session: dispatch.ClientSession = dispatch.ClientSession.init(),
     /// Set only when the registration SASL exchange itself completed through
     /// EXTERNAL. A presented certificate without a successful EXTERNAL proof is
@@ -3295,6 +3302,15 @@ fn akickLiveFailCode(err: anyerror) []const u8 {
 /// relink re-bursts membership + grant within a few ms; anything longer than a
 /// genuine transition is coincidental, so a small window is enough.
 const oper_prefix_dedup_ms: i64 = 2_000;
+/// Backward-compatible marker carried in MEMBERSHIP's existing optional
+/// `setter` slot when a negative membership fact came from IRC QUIT rather than
+/// PART. Older peers already decode (and ignore) setter on departures; current
+/// peers use it to preserve one identity-wide QUIT across the mesh.
+const mesh_quit_setter = "ONYX-QUIT";
+/// All per-channel withdrawals for one QUIT are written consecutively to each
+/// peer link. Collapse those copies into one client-visible QUIT while keeping
+/// the independently-applied route-table removals.
+const remote_quit_dedup_ms: i64 = 1_000;
 
 /// Bounded ring of recent oper-prefix announcements, for `emitOperPrefixMode`
 /// idempotence. No allocation: fixed capacity, fixed-size name buffers. A
@@ -13000,6 +13016,22 @@ pub const LinuxServer = struct {
 
         const nick = conn.session.displayName();
         const announce = !std.mem.eql(u8, nick, "*");
+        // Preserve QUIT (rather than degrading it to a PART per channel) across
+        // the existing MEMBERSHIP wire without breaking rolling peers. Setter is
+        // already an optional, backward-compatible field; realname is irrelevant
+        // after departure, so this event uses it for the bounded quit reason.
+        var quit_reason_buf: [client_model.MAX_REALNAME_BYTES]u8 = undefined;
+        const quit_reason_len = @min(reason.len, quit_reason_buf.len);
+        for (reason[0..quit_reason_len], 0..) |byte, i| {
+            quit_reason_buf[i] = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+        }
+        var quit_identity = membershipIdentityOf(conn);
+        quit_identity.realname = quit_reason_buf[0..quit_reason_len];
+        // Presence first lets a current peer issue the identity-wide QUIT while
+        // every channel route is still visible. Per-channel negatives follow to
+        // converge authority and are client-display-deduped at the receiver.
+        if (announce and !conn.session_mesh_announce_pending)
+            self.announceMembership(presence_channel, nick, 0, false, quit_identity, mesh_quit_setter);
         var it = self.world.channels.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.members.contains(worldIdFromClient(id))) {
@@ -13009,20 +13041,13 @@ pub const LinuxServer = struct {
                 // withdrawal must always run to completion.
                 self.broadcastChannel(entry.key_ptr.*, msg, id) catch {};
                 self.recordHistoryEventSender(entry.key_ptr.*, quit_prefix, "QUIT", quit_body);
-                // Tell mesh peers this member is gone so their remote roster drops
-                // it and they emit a PART to their own local members (otherwise a
-                // disconnect leaves a ghost on the far side of the mesh). Carry the
-                // real identity so the far side renders the member's actual
-                // `user@host`, not the `mesh@<origin>` placeholder.
+                // Tell mesh peers this member is gone so their remote roster
+                // drops it. The QUIT marker preserves identity-wide client
+                // semantics while each channel fact still converges separately.
                 if (announce and !conn.session_mesh_announce_pending)
-                    self.announceMembership(entry.key_ptr.*, nick, 0, false, membershipIdentityOf(conn), "");
+                    self.announceMembership(entry.key_ptr.*, nick, 0, false, quit_identity, mesh_quit_setter);
             }
         }
-        // Withdraw the user's mesh PRESENCE (the no-channel-aware counterpart of the
-        // per-channel parts above) so peers drop them from the route_table even if
-        // they were in no channel. Mirrors the announce in `registerConnNick`.
-        if (announce and !conn.session_mesh_announce_pending)
-            self.announceMembership(presence_channel, nick, 0, false, membershipIdentityOf(conn), "");
     }
 
     /// Drive an implicit-TLS client's recv chunk: frame + decrypt through the
@@ -15760,6 +15785,10 @@ pub const LinuxServer = struct {
                 if (self.isOverrideOper(ch.nick)) self.emitOperPrefixMode(ch.channel, ch.nick, true);
             },
             .parted => {
+                if (std.mem.eql(u8, ch.setter, mesh_quit_setter)) {
+                    self.emitRemoteQuit(ch, remote_name);
+                    return;
+                }
                 // Echo artifact: the user is still connected here — a fabricated
                 // PART would desync client nicklists from the server roster.
                 if (self.nickIsLiveLocal(ch.nick)) return;
@@ -15770,6 +15799,86 @@ pub const LinuxServer = struct {
             // Not a roster transition — handled in drainIdentityTransitions, never
             // surfaced as an IRC line here.
             .ghost_reclaim => {},
+        }
+    }
+
+    fn remoteNickInChannel(self: *LinuxServer, channel: []const u8, nick: []const u8) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const members = blk: {
+                    if (slot.value.s2s_secured) |link| {
+                        if (link.established()) break :blk link.channelMembers(channel);
+                    } else if (slot.value.s2s) |link| {
+                        if (link.established()) break :blk link.channelMembers(channel);
+                    }
+                    continue;
+                };
+                for (members) |member| {
+                    if (std.ascii.eqlIgnoreCase(member.nick, nick)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn remoteQuitSeenRecently(conn: *ConnState, nick: []const u8, now_ms: i64) bool {
+        var folded: [client_model.MAX_NICK_BYTES]u8 = undefined;
+        if (nick.len > folded.len) return false;
+        for (nick, 0..) |byte, i| folded[i] = std.ascii.toLower(byte);
+        const nick_hash = std.hash.Wyhash.hash(0, folded[0..nick.len]);
+        const repeated = conn.remote_quit_seen and
+            conn.remote_quit_nick_hash == nick_hash and
+            now_ms >= conn.remote_quit_at_ms and
+            now_ms - conn.remote_quit_at_ms <= remote_quit_dedup_ms;
+        if (!repeated) {
+            conn.remote_quit_nick_hash = nick_hash;
+            conn.remote_quit_at_ms = now_ms;
+            conn.remote_quit_seen = true;
+        }
+        return repeated;
+    }
+
+    /// Render one remote logical departure to every local client sharing at
+    /// least one channel with the nick. The trigger channel is included even
+    /// though its route fact was removed before this derived delta was queued.
+    fn emitRemoteQuit(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
+        if (self.nickIsLiveLocal(ch.nick)) return;
+
+        const server_host = if (remote_name.len != 0) remote_name else default_host;
+        const user = if (ch.username.len != 0) ch.username else world_projection.remote_user_placeholder;
+        const host = if (ch.host.len != 0) ch.host else server_host;
+        const reason = if (ch.realname.len != 0) ch.realname else "Client quit";
+        var line_buf: [900]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &line_buf,
+            ":{s}!{s}@{s} QUIT :{s}\r\n",
+            .{ ch.nick, user, host, reason },
+        ) catch return;
+
+        var recipients: std.ArrayList(client_model.ClientId) = .empty;
+        defer recipients.deinit(self.allocator);
+        var channels = self.world.channelIterator();
+        while (channels.next()) |channel| {
+            const trigger_channel = !isPresenceChannel(ch.channel) and
+                std.ascii.eqlIgnoreCase(channel.name, ch.channel);
+            if (!trigger_channel and !self.remoteNickInChannel(channel.name, ch.nick)) continue;
+            var members = self.world.memberIterator(channel.name) orelse continue;
+            while (members.next()) |member| {
+                const recipient = clientIdFromWorld(member.*);
+                const conn = self.connFor(recipient) orelse continue;
+                if (conn.s2s != null or conn.s2s_secured != null) continue;
+                self.appendUniqueDeliveryId(&recipients, recipient) catch return;
+            }
+        }
+
+        var tag_buf: [48]u8 = undefined;
+        const tag = serverTimeTag(&tag_buf);
+        const now_ms = self.nowMs();
+        for (recipients.items) |recipient| {
+            const conn = self.connFor(recipient) orelse continue;
+            if (remoteQuitSeenRecently(conn, ch.nick, now_ms)) continue;
+            self.deliverTimed(recipient, tag, line) catch continue;
         }
     }
 
@@ -15976,6 +16085,11 @@ pub const LinuxServer = struct {
                     if (first.kind != .joined) {
                         if (first.kind == .ghost_reclaim) {
                             self.reclaimGhostSession(first);
+                        } else if (isPresenceChannel(first.channel) and
+                            first.kind == .parted and
+                            std.mem.eql(u8, first.setter, mesh_quit_setter))
+                        {
+                            self.emitRemoteQuit(first, remote);
                         } else if (!isPresenceChannel(first.channel)) {
                             self.emitRemoteMembership(first, remote);
                         }
@@ -55969,6 +56083,90 @@ fn addTestLocalClient(server: *Server, nick: []const u8, account: ?[]const u8) !
     } else return error.SkipZigTest;
 }
 
+test "remote QUIT marked mesh departures render once per local recipient across shared channels" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    current_reactor = &server.reactors[0];
+    const both_id = try addTestLocalClient(&server, "BothWatcher", null);
+    const later_id = try addTestLocalClient(&server, "LaterWatcher", null);
+    const both = server.connFor(both_id).?;
+    const later = server.connFor(later_id).?;
+    both.session.registration.registered = true;
+    later.session.registration.registered = true;
+    try server.world.restoreMember("#first", worldIdFromClient(both_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#later", worldIdFromClient(both_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#later", worldIdFromClient(later_id), world_model.MemberModes.empty());
+    resetTestSendQ(both);
+    resetTestSendQ(later);
+
+    const Delta = struct {
+        channel: []const u8,
+        nick: []const u8 = "Remote",
+        username: []const u8 = "remote",
+        realname: []const u8 = "Connection reset",
+        host: []const u8 = "remote.example",
+        setter: []const u8 = mesh_quit_setter,
+        account: []const u8 = "",
+        kind: s2s_peer_mod.S2sPeer.MembershipDelta.Kind = .parted,
+        status: u4 = 0,
+        prev_status: u4 = 0,
+    };
+
+    // Presence arrives first but has no channel audience and must not consume
+    // the recipient-local dedup slot.
+    const presence = Delta{ .channel = presence_channel };
+    server.emitRemoteQuit(&presence, "origin.example");
+    try std.testing.expectEqual(@as(usize, 0), both.send_len);
+    try std.testing.expectEqual(@as(usize, 0), later.send_len);
+
+    const first = Delta{ .channel = "#first" };
+    server.emitRemoteMembership(&first, "origin.example");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(both.send_buf[0..both.send_len], " QUIT :Connection reset\r\n"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), later.send_len);
+
+    const later_delta = Delta{ .channel = "#later" };
+    server.emitRemoteMembership(&later_delta, "origin.example");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(both.send_buf[0..both.send_len], " QUIT :Connection reset\r\n"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(later.send_buf[0..later.send_len], " QUIT :Connection reset\r\n"),
+    );
+
+    resetTestSendQ(both);
+    const ordinary_part = .{
+        .channel = "#first",
+        .nick = "Remote",
+        .username = "remote",
+        .realname = "",
+        .host = "remote.example",
+        .setter = "",
+        .account = "",
+        .kind = s2s_peer_mod.S2sPeer.MembershipDelta.Kind.parted,
+        .status = @as(u4, 0),
+        .prev_status = @as(u4, 0),
+    };
+    server.emitRemoteMembership(&ordinary_part, "origin.example");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(both.send_buf[0..both.send_len], " PART #first\r\n"),
+    );
+}
+
 const LiveClient = struct {
     fd: linux.fd_t,
     buf: [default_reply_bytes]u8 = undefined,
@@ -64336,6 +64534,20 @@ test "oper-prefix dedup: collapses repeat +Y within the window, allows real tran
     try std.testing.expect(!d.seenRecently("#root", "kain", true, 1600));
     // After the window elapses, the same announcement fires again (real re-add).
     try std.testing.expect(!d.seenRecently("#root", "trev", true, 1000 + oper_prefix_dedup_ms + 1));
+}
+
+test "remote QUIT dedup is recipient-local and case-insensitive" {
+    var first = ConnState.init(-1);
+    var second = ConnState.init(-1);
+
+    try std.testing.expect(!LinuxServer.remoteQuitSeenRecently(&first, "Remote", 1_000));
+    try std.testing.expect(LinuxServer.remoteQuitSeenRecently(&first, "REMOTE", 1_010));
+    try std.testing.expect(!LinuxServer.remoteQuitSeenRecently(&second, "remote", 1_010));
+    try std.testing.expect(!LinuxServer.remoteQuitSeenRecently(
+        &first,
+        "Remote",
+        1_000 + remote_quit_dedup_ms + 1,
+    ));
 }
 
 test "status.json: peerStatusString maps every link state" {
