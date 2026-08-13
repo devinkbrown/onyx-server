@@ -11927,6 +11927,8 @@ pub const LinuxServer = struct {
         // Bound the strip buffer to the largest deliverable line body so an
         // oversized colour-formatted MESSAGE_V2 cannot fail the strip and fall
         // through with raw mIRC codes on a +f channel (CWE-400 / policy bypass).
+        // Required-room ciphertext is validated on the original body first;
+        // +f must never rewrite an admitted ONYXROOM1 envelope.
         var noformat_buf: [default_reply_bytes]u8 = undefined;
         var dm_key_buf: [320]u8 = undefined;
         var recipient_account_buf: [session_replica_account_max]u8 = undefined;
@@ -11942,16 +11944,6 @@ pub const LinuxServer = struct {
 
         switch (msg.scope_kind) {
             .channel => {
-                if (msg.verb != .tagmsg and !is_data_family and
-                    self.world.channelHasExtFlag(msg.target, .noformat) and
-                    color_strip.hasFormatting(msg.text))
-                {
-                    effective_text = color_strip.stripFormattingWith(
-                        .{ .max_output_bytes = default_reply_bytes },
-                        msg.text,
-                        &noformat_buf,
-                    ) catch msg.text;
-                }
                 // Topology is never channel-membership authority. A third-hop
                 // origin signature proves authorship, not +n bypass rights;
                 // only the separately authenticated webhook shape is external.
@@ -11976,12 +11968,32 @@ pub const LinuxServer = struct {
                     effective_sender_modes,
                     policy_account,
                 )) return .permanent;
-                const local_content_allowed = self.messageSatisfiesEncryptionPolicy(
-                    msg.target,
-                    if (safe_tags.len != 0) safe_tags else null,
-                ) and !(is_data_family and
+                // DATA/REQUEST/REPLY stay on the pre-envelope contract: required
+                // rooms only asked for a legacy e2ee tag, never ONYXROOM1 text.
+                const e2ee_ok = if (is_data_family)
+                    self.channelEncryptionPolicy(msg.target) != .required or
+                        e2ee_policy.encryptedTagPresent(if (safe_tags.len != 0) safe_tags else null)
+                else
+                    self.messageSatisfiesEncryptionPolicy(
+                        msg.target,
+                        if (safe_tags.len != 0) safe_tags else null,
+                        msg.text,
+                        msg.verb == .tagmsg,
+                    );
+                const local_content_allowed = e2ee_ok and !(is_data_family and
                     self.world.channelHasExtFlag(msg.target, .nocomicdata) and
                     effective_sender_modes.rank() < 2);
+                if (local_content_allowed and msg.verb != .tagmsg and !is_data_family and
+                    self.channelEncryptionPolicy(msg.target) != .required and
+                    self.world.channelHasExtFlag(msg.target, .noformat) and
+                    color_strip.hasFormatting(msg.text))
+                {
+                    effective_text = color_strip.stripFormattingWith(
+                        .{ .max_output_bytes = default_reply_bytes },
+                        msg.text,
+                        &noformat_buf,
+                    ) catch msg.text;
+                }
                 if (local_sender_allowed and local_content_allowed) {
                     speech = self.relayChannelSpeechGate(
                         msg.target,
@@ -12441,6 +12453,14 @@ pub const LinuxServer = struct {
             // policy. Channels without those flags always deliver. The multi-hop
             // re-forward below is unaffected (a downstream node re-checks its own
             // policy), so a transient desync here does not strand the message.
+            // Typed DATA/REQUEST/REPLY never used the room-text pairing; keep
+            // the legacy relay path ungated so comic-chat frames still fan out.
+            if (!is_data_family and !self.messageSatisfiesEncryptionPolicy(
+                clean_msg.target,
+                if (clean_msg.tags.len != 0) clean_msg.tags else null,
+                clean_msg.text,
+                clean_msg.verb == .tagmsg,
+            )) return;
             const speech = self.relayChannelSpeechGate(
                 clean_msg.target,
                 clean_msg.source_nick,
@@ -12471,7 +12491,11 @@ pub const LinuxServer = struct {
             {
                 return;
             }
-            if (clean_msg.verb != .tagmsg and !is_data_family and self.world.channelHasExtFlag(clean_msg.target, .noformat) and color_strip.hasFormatting(clean_msg.text)) {
+            if (clean_msg.verb != .tagmsg and !is_data_family and
+                self.channelEncryptionPolicy(clean_msg.target) != .required and
+                self.world.channelHasExtFlag(clean_msg.target, .noformat) and
+                color_strip.hasFormatting(clean_msg.text))
+            {
                 if (color_strip.stripFormattingWith(.{ .max_output_bytes = default_reply_bytes }, clean_msg.text, &nf_text_buf)) |clean|
                     eff_text = clean
                 else |_| {}
@@ -31672,8 +31696,17 @@ pub const LinuxServer = struct {
         return e2ee_policy.policyValue(ev.value) orelse .off;
     }
 
-    fn messageSatisfiesEncryptionPolicy(self: *LinuxServer, channel: []const u8, raw_tags: ?[]const u8) bool {
-        return self.channelEncryptionPolicy(channel) != .required or e2ee_policy.encryptedTagPresent(raw_tags);
+    fn messageSatisfiesEncryptionPolicy(
+        self: *LinuxServer,
+        channel: []const u8,
+        raw_tags: ?[]const u8,
+        body: []const u8,
+        tag_only: bool,
+    ) bool {
+        return switch (self.channelEncryptionPolicy(channel)) {
+            .off, .optional => true,
+            .required => e2ee_policy.requiredRoomCommandAdmitted(raw_tags, body, tag_only),
+        };
     }
 
     fn historyPolicyAllows(self: *LinuxServer, channel: []const u8, is_member: bool, is_oper: bool) bool {
@@ -48569,7 +48602,7 @@ pub const LinuxServer = struct {
                 if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                 return;
             }
-            if (!self.messageSatisfiesEncryptionPolicy(chan, clean_client_tags)) {
+            if (!self.messageSatisfiesEncryptionPolicy(chan, clean_client_tags, text, false)) {
                 if (!is_notice) try self.failReply(conn, command, "E2EE_REQUIRED", "Channel requires encrypted messages");
                 return;
             }
@@ -48579,7 +48612,10 @@ pub const LinuxServer = struct {
             // Fantasy bot: a speaker's PRIVMSG beginning with '!' may invoke the
             // weather/news bot. The message is still delivered to the channel
             // normally below; this only posts the server's answer as a NOTICE.
-            if (!is_notice and text.len > 1 and text[0] == '!') {
+            // Required rooms never treat ciphertext as a bot command.
+            if (!is_notice and self.channelEncryptionPolicy(chan) != .required and
+                text.len > 1 and text[0] == '!')
+            {
                 self.handleFantasy(id, conn, chan, text);
             }
             // +f noformat (IRCX NOFORMAT; chm_nocolour): strip mIRC
@@ -48591,7 +48627,9 @@ pub const LinuxServer = struct {
             var nf_msg_buf: [default_reply_bytes]u8 = undefined;
             var eff_text = text;
             var eff_msg = msg;
-            if (self.world.channelHasExtFlag(chan, .noformat) and color_strip.hasFormatting(text)) {
+            if (self.channelEncryptionPolicy(chan) != .required and
+                self.world.channelHasExtFlag(chan, .noformat) and color_strip.hasFormatting(text))
+            {
                 if (color_strip.stripFormattingWith(.{ .max_output_bytes = default_reply_bytes }, text, &nf_text_buf)) |clean| {
                     var nf_prefix_buf: [320]u8 = undefined;
                     if (clientPrefix(conn, &nf_prefix_buf)) |pfx| {
@@ -66807,8 +66845,11 @@ test "E2EE policy: channel PROP validates and required rooms reject plaintext" {
         try std.testing.expectEqual(LinuxServer.ChannelEncryptionPolicy.off, server.channelEncryptionPolicy("#secure"));
         _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
         try std.testing.expectEqual(LinuxServer.ChannelEncryptionPolicy.required, server.channelEncryptionPolicy("#secure"));
-        try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#secure", null));
-        try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#secure", "+onyx/e2ee=1"));
+        try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#secure", null, "plain", false));
+        try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#secure", "+onyx/e2ee=1", "tagged plaintext", false));
+        try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#secure", "+onyx/e2ee=mls", "tagged plaintext", false));
+        try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#secure", "+typing=active", "", true));
+        try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#secure", null, "", true));
 
         const id = try addTestLocalClient(&server, "alice", null);
         const conn = server.connFor(id).?;
@@ -66818,6 +66859,271 @@ test "E2EE policy: channel PROP validates and required rooms reject plaintext" {
         try server.messageOne(id, conn, "PRIVMSG", "#secure", "plain", null);
         try expectContains(conn.send_buf[0..conn.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
     } else return error.SkipZigTest;
+}
+
+fn testMinRoomEnvelope(out: []u8) []const u8 {
+    var body: [e2ee_policy.min_room_envelope_decoded_len]u8 = @splat(0);
+    body[0] = e2ee_policy.room_envelope_version;
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const need = e2ee_policy.room_envelope_prefix.len + encoder.calcSize(body.len);
+    std.debug.assert(out.len >= need);
+    @memcpy(out[0..e2ee_policy.room_envelope_prefix.len], e2ee_policy.room_envelope_prefix);
+    _ = encoder.encode(out[e2ee_policy.room_envelope_prefix.len..need], &body);
+    return out[0..need];
+}
+
+test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#e2eebody" };
+    _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
+
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    alice.session.addCap(.onyx_e2ee);
+    bob.session.addCap(.onyx_e2ee);
+    _ = try server.world.join("#e2eebody", worldIdFromClient(alice_id));
+    _ = try server.world.join("#e2eebody", worldIdFromClient(bob_id));
+    _ = try server.world.setChannelFlag("#e2eebody", .no_external, false);
+
+    var envelope_buf: [96]u8 = undefined;
+    const envelope = testMinRoomEnvelope(&envelope_buf);
+    try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=mls", envelope, false));
+    try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=1", envelope, false));
+    try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=mls", "plain", false));
+    try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=sframe", envelope, false));
+    try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#e2eebody", null, envelope, false));
+    try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eebody", "+typing=active", "", true));
+
+    const history_before = server.history.totalStoredCount();
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", "tagged plaintext", "+onyx/e2ee=mls");
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "tagged plaintext") == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "NOTICE", "#e2eebody", "notice plaintext", "+onyx/e2ee=mls");
+    try std.testing.expectEqual(@as(usize, 0), alice.send_len);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "notice plaintext") == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", envelope, "+onyx/e2ee=1");
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], envelope) == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", envelope, null);
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], envelope) == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    const oversize = try std.testing.allocator.alloc(u8, e2ee_policy.max_room_envelope_wire_len + 1);
+    defer std.testing.allocator.free(oversize);
+    @memcpy(oversize[0..e2ee_policy.room_envelope_prefix.len], e2ee_policy.room_envelope_prefix);
+    @memset(oversize[e2ee_policy.room_envelope_prefix.len..], 'A');
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", oversize, "+onyx/e2ee=mls");
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "ONYXROOM1") == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", envelope, "+onyx/e2ee=mls");
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try expectContains(bob.send_buf[0..bob.send_len], envelope);
+    var hbuf: [8]lotus.Message = undefined;
+    const recorded = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+    try std.testing.expectEqualStrings(envelope, recorded[0].text);
+    try std.testing.expectEqualStrings("PRIVMSG", recorded[0].command);
+
+    const mesh_before = server.history.totalStoredCount();
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "#e2eebody",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+onyx/e2ee=mls",
+        .text = "mesh tagged plaintext",
+        .origin_node = 4242,
+        .hlc = 11,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "mesh tagged plaintext") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "mesh tagged plaintext") == null);
+    try std.testing.expectEqual(mesh_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    server.deliverRelay(.{
+        .verb = .notice,
+        .target = "#e2eebody",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+onyx/e2ee=1",
+        .text = envelope,
+        .origin_node = 4242,
+        .hlc = 12,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], envelope) == null);
+    try std.testing.expectEqual(mesh_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "#e2eebody",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+onyx/e2ee=mls",
+        .text = envelope,
+        .origin_node = 4242,
+        .hlc = 13,
+    });
+    try expectContains(alice.send_buf[0..alice.send_len], envelope);
+    try expectContains(bob.send_buf[0..bob.send_len], envelope);
+    const after_mesh = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
+    try std.testing.expectEqual(@as(usize, 2), after_mesh.len);
+
+    _ = try server.world.setChannelExtFlag("#e2eebody", .noformat, true);
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", envelope, "+onyx/e2ee=mls");
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try expectContains(bob.send_buf[0..bob.send_len], envelope);
+    const after_noformat = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
+    try std.testing.expectEqual(@as(usize, 3), after_noformat.len);
+    try std.testing.expectEqualStrings(envelope, after_noformat[0].text);
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", "!weather nowhere", "+onyx/e2ee=mls");
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "!weather") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "NOTICE") == null);
+}
+
+test "E2EEPOLICYBODY optional rooms still accept untagged plaintext" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#e2eeopt" };
+    _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "optional", .{ .id = "op", .access = .owner });
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    _ = try server.world.join("#e2eeopt", worldIdFromClient(alice_id));
+    _ = try server.world.join("#e2eeopt", worldIdFromClient(bob_id));
+
+    try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eeopt", null, "plain", false));
+    try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eeopt", "+onyx/e2ee=1", "plain", false));
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eeopt", "plain optional", null);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try expectContains(bob.send_buf[0..bob.send_len], "plain optional");
+}
+
+test "E2EEPOLICYBODY off rooms still accept untagged plaintext" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#e2eeoff" };
+    _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "off", .{ .id = "op", .access = .owner });
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    _ = try server.world.join("#e2eeoff", worldIdFromClient(alice_id));
+    _ = try server.world.join("#e2eeoff", worldIdFromClient(bob_id));
+
+    try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eeoff", null, "plain", false));
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eeoff", "plain off", null);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try expectContains(bob.send_buf[0..bob.send_len], "plain off");
+}
+
+test "E2EEPOLICYBODY TAGMSG stays tag-only in required rooms" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#e2eetag" };
+    _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    alice.session.addCap(.message_tags);
+    alice.session.addCap(.typing);
+    bob.session.addCap(.message_tags);
+    bob.session.addCap(.typing);
+    _ = try server.world.join("#e2eetag", worldIdFromClient(alice_id));
+    _ = try server.world.join("#e2eetag", worldIdFromClient(bob_id));
+    _ = try server.world.setChannelFlag("#e2eetag", .no_external, false);
+
+    // Existing required-room policy never demanded a text envelope for TAGMSG.
+    // Typing/react remain tag-only; requiring ONYXROOM1 would drop them.
+    const history_before = server.history.totalStoredCount();
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    var tagmsg = try irc_line.parseLine("@+typing=active TAGMSG #e2eetag");
+    try server.handleTagmsg(alice_id, alice, &tagmsg);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try expectContains(bob.send_buf[0..bob.send_len], "TAGMSG #e2eetag");
+    try expectContains(bob.send_buf[0..bob.send_len], "+typing=active");
+    try std.testing.expect(server.history.totalStoredCount() >= history_before);
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    server.deliverRelay(.{
+        .verb = .tagmsg,
+        .target = "#e2eetag",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+typing=active",
+        .text = "",
+        .origin_node = 4242,
+        .hlc = 21,
+    });
+    try expectContains(alice.send_buf[0..alice.send_len], "TAGMSG #e2eetag");
+    try expectContains(bob.send_buf[0..bob.send_len], "TAGMSG #e2eetag");
 }
 
 test "AI policy: public PROP visibility reaches non-op channel members" {

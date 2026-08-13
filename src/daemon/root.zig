@@ -264,6 +264,60 @@ comptime {
     }
 }
 
+// Compile the TEST-ONLY transaction/expiry conformance model without publishing it.
+comptime {
+    const std = @import("std");
+    const dst = @import("ocg2_transaction_dst.zig");
+    _ = dst.run;
+    _ = dst.step;
+    if (@hasDecl(@This(), "ocg2_transaction_dst"))
+        @compileError("OCG2 transaction DST must stay unexported from daemon root");
+    const allowed = .{
+        "Phase", "Input", "Output", "World", "step", "run",
+    };
+    const names = @typeInfo(dst).@"struct".decl_names;
+    if (names.len != allowed.len)
+        @compileError("OCG2 transaction DST public surface is not the exact allowlist");
+    for (names) |name| {
+        var found = false;
+        for (allowed) |allowed_name| {
+            if (std.mem.eql(u8, name, allowed_name)) found = true;
+        }
+        if (!found)
+            @compileError("OCG2 transaction DST exposes a public declaration outside the allowlist");
+    }
+    if (@typeInfo(dst.Input).@"struct".decl_names.len != 0)
+        @compileError("Input must not expose public methods");
+    if (@typeInfo(dst.Output).@"struct".decl_names.len != 0)
+        @compileError("Output must not expose public methods");
+    if (@typeInfo(dst.World).@"struct".decl_names.len != 0)
+        @compileError("World must not expose public methods");
+    for (.{ dst.Input, dst.Output, dst.World }) |T| {
+        const info = @typeInfo(T);
+        switch (info) {
+            .@"struct" => |struct_info| {
+                for (struct_info.field_types) |field_type| {
+                    switch (@typeInfo(field_type)) {
+                        .pointer => @compileError("OCG2 transaction DST public structs must not hold pointers or slices"),
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    for (.{
+        "apply",          "execute",           "grant",
+        "revoke",         "mint",              "transmit",
+        "session",        "callback",          "Visitor",
+        "ProjectionData", "DurableOperLookup", "Services",
+        "Store",          "reconcile",         "executeAuthorized",
+    }) |name| {
+        if (@hasDecl(dst, name))
+            @compileError("OCG2 transaction DST must not expose a runtime privilege surface");
+    }
+}
+
 test {
     _ = module_manifest;
     _ = key_transparency;
@@ -275,6 +329,7 @@ test {
     _ = @import("ocg2_authority_issuer.zig");
     _ = @import("ocg2_reconcile_schedule.zig");
     _ = @import("ocg2_reconcile_workset.zig");
+    _ = @import("ocg2_transaction_dst.zig");
     // gen:tests:begin
     _ = account_verify;
     _ = acme_cli;
@@ -522,5 +577,53 @@ test "OCG2WORK external import cannot reach apply grant session or export" {
         "Store",          "reconcile",         "executeAuthorized",
     }) |name| {
         try std.testing.expect(!@hasDecl(workset, name));
+    }
+}
+
+test "S6C6 external import cannot reach runtime privilege surface" {
+    const std = @import("std");
+    const dst = @import("ocg2_transaction_dst.zig");
+    try std.testing.expect(!@hasDecl(@This(), "ocg2_transaction_dst"));
+    const allowed = .{
+        "Phase", "Input", "Output", "World", "step", "run",
+    };
+    const names = @typeInfo(dst).@"struct".decl_names;
+    try std.testing.expectEqual(@as(usize, allowed.len), names.len);
+    inline for (names) |name| {
+        var found = false;
+        inline for (allowed) |allowed_name| {
+            if (std.mem.eql(u8, name, allowed_name)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(dst.Input).@"struct".decl_names.len);
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(dst.Output).@"struct".decl_names.len);
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(dst.World).@"struct".decl_names.len);
+    inline for (@typeInfo(dst.Input).@"struct".field_types) |field_type| {
+        try std.testing.expect(switch (@typeInfo(field_type)) {
+            .pointer => false,
+            else => true,
+        });
+    }
+    inline for (@typeInfo(dst.Output).@"struct".field_types) |field_type| {
+        try std.testing.expect(switch (@typeInfo(field_type)) {
+            .pointer => false,
+            else => true,
+        });
+    }
+    inline for (@typeInfo(dst.World).@"struct".field_types) |field_type| {
+        try std.testing.expect(switch (@typeInfo(field_type)) {
+            .pointer => false,
+            else => true,
+        });
+    }
+    inline for (.{
+        "apply",          "execute",           "grant",
+        "revoke",         "mint",              "transmit",
+        "session",        "callback",          "Visitor",
+        "ProjectionData", "DurableOperLookup", "Services",
+        "Store",          "reconcile",         "executeAuthorized",
+    }) |name| {
+        try std.testing.expect(!@hasDecl(dst, name));
     }
 }

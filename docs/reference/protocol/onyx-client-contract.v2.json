@@ -1,6 +1,6 @@
 {
   "schema": "onyx-client-server-contract/v2",
-  "revision": 2,
+  "revision": 3,
   "transport": {
     "websocket": "one IRC message per frame; no trailing frame bytes"
   },
@@ -27,16 +27,31 @@
     "local_authoring_quiesce": "operator-only E2EEGROUP ON|OFF|STATUS; inbound relay, ACK, and retry stay live while quiesced"
   },
   "client": {
-    "group_crypto": "staged_unwired",
-    "group_crypto_semantics": "OGC1 sign/parse/verify helpers exist; live store send/open, trusted-directory verify, and room-key install are not product-wired",
-    "inbound_adapter": {
-      "status": "staged_unwired",
+    "group_control_observer": {
+      "status": "production_wired",
+      "owner": "connection_and_account_owned_bridge",
+      "server_reply_authentication": "E2EEKEY replies are accepted only from the exact server prefix learned from 001",
       "consumes": [
         "E2EE.KEYPACKAGE",
         "E2EE.COMMIT",
         "E2EE.WELCOME"
       ],
       "does_not_consume": "inbound E2EEGROUP"
+    },
+    "group_control_runtime": {
+      "status": "production_wired",
+      "trusted_directory_verification": "production_wired",
+      "genesis_session_provisioning": "production_wired",
+      "genesis_semantics": "authenticated OGC1-v2 commit and welcome pairs may provision an ephemeral epoch-1 GroupSession only for epoch 0 to 1, priorEpoch 0, a zero prior commit hash, and exact routing, identity, commit, membership, body, context, and epoch-key-commitment binding",
+      "higher_epoch_semantics": "requires an existing current session or explicit recovery",
+      "session_persistence": "activation_hold"
+    },
+    "group_message_crypto": {
+      "envelope_helpers": "implemented",
+      "store_seal": "activation_hold",
+      "store_open": "activation_hold",
+      "outbound": "required rooms reject plaintext; no production path seals and tags ONYXROOM1",
+      "inbound": "ONYXROOM1 remains ciphertext in the store and renders as a locked placeholder"
     }
   },
   "eligibility": {
@@ -90,7 +105,18 @@
       ],
       "helix_checkpoint": "replay_metadata_only"
     },
-    "required_policy": "encryption-policy=required rejects untagged plaintext",
+    "required_policy": {
+      "status": "production_active",
+      "admission": "tag_and_body",
+      "tag": "+onyx/e2ee=mls",
+      "body": "canonical ONYXROOM1 envelope",
+      "body_validation": "exact prefix, canonical unpadded base64url, version 1, decoded length at least 33 bytes, and bounded by the server message limit",
+      "server_validation": "structural only; the daemon neither decrypts nor authenticates ciphertext",
+      "local_privmsg_failure": "FAIL PRIVMSG E2EE_REQUIRED",
+      "local_notice_failure": "silent_drop",
+      "mesh_relay_failure": "permanent_reject",
+      "tagmsg": "admitted as a tag-only command without a text envelope"
+    },
     "control_records": [
       "key-package",
       "welcome",
@@ -131,6 +157,36 @@
       "scope": "channel_local",
       "channels": "comma-separated list with a shared reason",
       "intent": "one-way exact-token withdrawal of the named channels only"
+    }
+  },
+  "message_policy_vectors": {
+    "accepted": {
+      "required_room_ciphertext": {
+        "line": "@+onyx/e2ee=mls PRIVMSG #secure :ONYXROOM1 AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "outcome": "accepted"
+      },
+      "required_room_tagmsg": {
+        "line": "@+typing=active TAGMSG #secure",
+        "outcome": "accepted"
+      }
+    },
+    "rejected": {
+      "tagged_plaintext": {
+        "line": "@+onyx/e2ee=mls PRIVMSG #secure :plaintext",
+        "fail": "FAIL PRIVMSG E2EE_REQUIRED"
+      },
+      "untagged_envelope": {
+        "line": "PRIVMSG #secure :ONYXROOM1 AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "fail": "FAIL PRIVMSG E2EE_REQUIRED"
+      },
+      "wrong_tag_value": {
+        "line": "@+onyx/e2ee=1 PRIVMSG #secure :ONYXROOM1 AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "fail": "FAIL PRIVMSG E2EE_REQUIRED"
+      },
+      "malformed_envelope": {
+        "line": "@+onyx/e2ee=mls PRIVMSG #secure :ONYXROOM1 not+base64url",
+        "fail": "FAIL PRIVMSG E2EE_REQUIRED"
+      }
     }
   },
   "command_vectors": {

@@ -18,7 +18,7 @@ from typing import Any, Mapping, Sequence
 
 
 SCHEMA = "onyx-client-server-contract/v2"
-REVISION = 2
+REVISION = 3
 REQUIRED_CAPS = (
     "message-tags",
     "server-time",
@@ -33,6 +33,72 @@ CONTROL_FORMS = (
     "<channel> welcome <from-device> <to-account> <to-device> :<opaque-base64url>",
 )
 INBOUND_VERBS = ("E2EE.KEYPACKAGE", "E2EE.COMMIT", "E2EE.WELCOME")
+CLIENT_FIELDS = {
+    "group_control_observer": {
+        "status": "production_wired",
+        "owner": "connection_and_account_owned_bridge",
+        "server_reply_authentication": "E2EEKEY replies are accepted only from the exact server prefix learned from 001",
+        "consumes": list(INBOUND_VERBS),
+        "does_not_consume": "inbound E2EEGROUP",
+    },
+    "group_control_runtime": {
+        "status": "production_wired",
+        "trusted_directory_verification": "production_wired",
+        "genesis_session_provisioning": "production_wired",
+        "genesis_semantics": "authenticated OGC1-v2 commit and welcome pairs may provision an ephemeral epoch-1 GroupSession only for epoch 0 to 1, priorEpoch 0, a zero prior commit hash, and exact routing, identity, commit, membership, body, context, and epoch-key-commitment binding",
+        "higher_epoch_semantics": "requires an existing current session or explicit recovery",
+        "session_persistence": "activation_hold",
+    },
+    "group_message_crypto": {
+        "envelope_helpers": "implemented",
+        "store_seal": "activation_hold",
+        "store_open": "activation_hold",
+        "outbound": "required rooms reject plaintext; no production path seals and tags ONYXROOM1",
+        "inbound": "ONYXROOM1 remains ciphertext in the store and renders as a locked placeholder",
+    },
+}
+REQUIRED_POLICY_FIELDS = {
+    "status": "production_active",
+    "admission": "tag_and_body",
+    "tag": "+onyx/e2ee=mls",
+    "body": "canonical ONYXROOM1 envelope",
+    "body_validation": "exact prefix, canonical unpadded base64url, version 1, decoded length at least 33 bytes, and bounded by the server message limit",
+    "server_validation": "structural only; the daemon neither decrypts nor authenticates ciphertext",
+    "local_privmsg_failure": "FAIL PRIVMSG E2EE_REQUIRED",
+    "local_notice_failure": "silent_drop",
+    "mesh_relay_failure": "permanent_reject",
+    "tagmsg": "admitted as a tag-only command without a text envelope",
+}
+MESSAGE_POLICY_VECTORS = {
+    "accepted": {
+        "required_room_ciphertext": {
+            "line": "@+onyx/e2ee=mls PRIVMSG #secure :ONYXROOM1 AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "outcome": "accepted",
+        },
+        "required_room_tagmsg": {
+            "line": "@+typing=active TAGMSG #secure",
+            "outcome": "accepted",
+        },
+    },
+    "rejected": {
+        "tagged_plaintext": {
+            "line": "@+onyx/e2ee=mls PRIVMSG #secure :plaintext",
+            "fail": "FAIL PRIVMSG E2EE_REQUIRED",
+        },
+        "untagged_envelope": {
+            "line": "PRIVMSG #secure :ONYXROOM1 AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "fail": "FAIL PRIVMSG E2EE_REQUIRED",
+        },
+        "wrong_tag_value": {
+            "line": "@+onyx/e2ee=1 PRIVMSG #secure :ONYXROOM1 AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "fail": "FAIL PRIVMSG E2EE_REQUIRED",
+        },
+        "malformed_envelope": {
+            "line": "@+onyx/e2ee=mls PRIVMSG #secure :ONYXROOM1 not+base64url",
+            "fail": "FAIL PRIVMSG E2EE_REQUIRED",
+        },
+    },
+}
 TRANSIENT_PERSISTENCE = (
     "bounded_ads1_attachment_spool",
     "ram_mesh_hop_custody_until_ack",
@@ -255,16 +321,7 @@ def semantic_errors(contract: Any) -> list[str]:
     client = contract.get("client")
     need(_is_mapping(client), "client must be an object")
     if _is_mapping(client):
-        need(client.get("group_crypto") == "staged_unwired", "client.group_crypto must be staged_unwired")
-        inbound = client.get("inbound_adapter")
-        need(_is_mapping(inbound), "client.inbound_adapter must be an object")
-        if _is_mapping(inbound):
-            need(inbound.get("status") == "staged_unwired", "client inbound adapter remains staged_unwired")
-            need(_exact_seq(inbound.get("consumes"), INBOUND_VERBS), "inbound adapter must consume E2EE.* verbs")
-            need(
-                inbound.get("does_not_consume") == "inbound E2EEGROUP",
-                "inbound adapter must not consume inbound E2EEGROUP",
-            )
+        need(client == CLIENT_FIELDS, "client observer/runtime/message activation split is frozen")
 
     eligibility = contract.get("eligibility")
     need(_is_mapping(eligibility), "eligibility must be an object")
@@ -316,6 +373,7 @@ def semantic_errors(contract: Any) -> list[str]:
             need(signer.get("requirement") == "mandatory_external", "trusted signer must be mandatory_external")
             need(signer.get("semantics") == TRUSTED_SIGNER_SEMANTICS, "trusted signer semantics are frozen")
         need(group.get("server_secrets") == "none", "server must have no group secrets")
+        need(group.get("required_policy") == REQUIRED_POLICY_FIELDS, "required-room tag/body policy is frozen")
         persistence = group.get("persistence")
         need(_is_mapping(persistence), "persistence must be an object")
         if _is_mapping(persistence):
@@ -371,6 +429,8 @@ def semantic_errors(contract: Any) -> list[str]:
     if _is_mapping(presence):
         need(presence.get("quit") == PRESENCE_QUIT_FIELDS, "presence.quit fields are frozen")
         need(presence.get("part") == PRESENCE_PART_FIELDS, "presence.part fields are frozen")
+
+    need(contract.get("message_policy_vectors") == MESSAGE_POLICY_VECTORS, "message policy vectors are frozen")
 
     vectors = contract.get("command_vectors")
     need(_is_mapping(vectors), "command_vectors must be an object")

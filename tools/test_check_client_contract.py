@@ -127,7 +127,7 @@ class ContractSemanticsTests(unittest.TestCase):
         )
 
     def test_client_inbound_consumes_e2ee_records_not_e2eegroup(self) -> None:
-        inbound = SOURCE["client"]["inbound_adapter"]
+        inbound = SOURCE["client"]["group_control_observer"]
         self.assertEqual(
             ["E2EE.KEYPACKAGE", "E2EE.COMMIT", "E2EE.WELCOME"],
             inbound["consumes"],
@@ -136,7 +136,13 @@ class ContractSemanticsTests(unittest.TestCase):
 
     def test_status_split_is_frozen(self) -> None:
         self.assertEqual("production_active", SOURCE["server"]["group_control"])
-        self.assertEqual("staged_unwired", SOURCE["client"]["group_crypto"])
+        client = SOURCE["client"]
+        self.assertEqual("production_wired", client["group_control_observer"]["status"])
+        self.assertEqual("production_wired", client["group_control_runtime"]["status"])
+        self.assertEqual("production_wired", client["group_control_runtime"]["genesis_session_provisioning"])
+        self.assertEqual("activation_hold", client["group_control_runtime"]["session_persistence"])
+        self.assertEqual("activation_hold", client["group_message_crypto"]["store_seal"])
+        self.assertEqual("activation_hold", client["group_message_crypto"]["store_open"])
 
     def test_session_resume_and_presence_objects_are_exact(self) -> None:
         self.assertEqual(checker.SESSION_RESUME_FIELDS, SOURCE["session"]["resume"])
@@ -167,16 +173,32 @@ class MutationRejectionTests(unittest.TestCase):
                 lambda value: value["e2ee_group"]["persistence"].__setitem__("helix_checkpoint", "include_payloads"),
             ),
             (
-                "inbound adapter status",
-                lambda value: value["client"]["inbound_adapter"].__setitem__("status", "production_active"),
+                "observer status",
+                lambda value: value["client"]["group_control_observer"].__setitem__("status", "staged_unwired"),
             ),
             (
-                "inbound adapter missing",
-                lambda value: value["client"].pop("inbound_adapter"),
+                "observer missing",
+                lambda value: value["client"].pop("group_control_observer"),
             ),
             (
-                "inbound adapter malformed",
-                lambda value: value["client"].__setitem__("inbound_adapter", None),
+                "runtime malformed",
+                lambda value: value["client"].__setitem__("group_control_runtime", None),
+            ),
+            (
+                "genesis provisioning drift",
+                lambda value: value["client"]["group_control_runtime"].__setitem__("genesis_session_provisioning", "not_wired"),
+            ),
+            (
+                "store seal activation drift",
+                lambda value: value["client"]["group_message_crypto"].__setitem__("store_seal", "production_active"),
+            ),
+            (
+                "required policy admission",
+                lambda value: value["e2ee_group"]["required_policy"].__setitem__("admission", "tag_only"),
+            ),
+            (
+                "message policy tagged plaintext",
+                lambda value: value["message_policy_vectors"]["rejected"]["tagged_plaintext"].__setitem__("fail", "accepted"),
             ),
             (
                 "persistence missing",
@@ -295,7 +317,7 @@ class MutationRejectionTests(unittest.TestCase):
             ),
             (
                 "inbound verbs",
-                lambda value: value["client"]["inbound_adapter"].__setitem__("consumes", ["E2EEGROUP"]),
+                lambda value: value["client"]["group_control_observer"].__setitem__("consumes", ["E2EEGROUP"]),
             ),
             ("quit scope", lambda value: value["presence"]["quit"].__setitem__("scope", "channel_local")),
             ("part scope", lambda value: value["presence"]["part"].__setitem__("scope", "identity_wide")),
