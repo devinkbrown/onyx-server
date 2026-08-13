@@ -804,3 +804,13 @@ Release and deployment evidence:
 
 S6-C4 runtime activation remains explicitly on HOLD despite deployment of its
 inert compiled leaf. No commit or push was made.
+## 2026-08-13 final two-node deployment
+
+- Release commit: `1156eb3` (`feat: advance durable identity reconciliation`).
+- Static stripped musl artifact: Onyx Server `0.5.8+1156eb3`, SHA-256 `9ec9e48dc2523b6461288ba1b0a1ad1e00895960fc7b882c78373729f3dabaac`.
+- Local config and peer config both passed `--check-config` with the staged artifact before replacement.
+- Local Helix upgrade: PID `828697` preserved; rollback `/home/kain/onyx-server-run/onyx-server.rollback-20260813-2327-5d833209f2fe`; six carried clients and the secured mesh link restored.
+- Peer Helix upgrade: PID `1245448` preserved; rollback `/home/trev/onyx-server-run/onyx-server.rollback-20260813-2325-5d833209f2fe`. The first attempt safely refused with `SessionReplicaConverging`; the second succeeded after convergence and restored three carried clients plus the secured mesh link.
+- Both nodes' installed files and `/proc/<pid>/exe` hash to the exact artifact above; both units are active.
+- Final gates: S6-C5 84/84 Debug and ReleaseSafe; services 512/512 both modes; unfiltered module suite 8,238 pass / 5 skip / 8,243 total; ReleaseFast build; runtime smoke; multi-shard Helix smoke; dual-node Era 2 acceptance; metrics `links_active=1`, `peers_up=1`, `partitioned=0`, `tcp_active=1` on both nodes; bidirectional cross-node PRIVMSG smoke.
+- Sol accepted S6-C5 as runtime-inactive source. C5 caller wiring and OCG2 runtime activation remain strict HOLD and were not enabled by this deployment.
