@@ -22,6 +22,79 @@ const cadence_frame = @import("../substrate/cadence_frame.zig");
 const media_session = @import("../substrate/media_session.zig");
 const certfp_bind = @import("certfp_bind.zig");
 const certfp = @import("../proto/certfp.zig");
+const durable_oper_authority = @import("durable_oper_authority.zig");
+const durable_oper_authority_boot = @import("durable_oper_authority_boot.zig");
+const node_identity = @import("node_identity.zig");
+const store_mod = @import("store.zig");
+
+pub const Ocg2BootConfig = struct {
+    enabled: bool = false,
+    authority: ?durable_oper_authority.Config = null,
+};
+
+pub const Ocg2LocalRole = enum { authority, receiver };
+
+pub const Ocg2IdentityError = error{
+    Ocg2Disabled,
+    MissingNodeIdentity,
+    Ocg2AuthorityPublicKeyMismatch,
+};
+
+pub const Ocg2ActivationSource = enum { initialized, restored };
+
+pub const Ocg2Activation = struct {
+    state: durable_oper_authority.State,
+    source: Ocg2ActivationSource,
+};
+
+pub fn mapOcg2BootConfig(cfg: config_format.Config) Ocg2BootConfig {
+    if (!cfg.oper_ocg2.enabled) return .{};
+    return .{ .enabled = true, .authority = .{
+        .authority_node_id = cfg.oper_ocg2.authority_node_id,
+        .authority_pubkey = cfg.oper_ocg2.authority_public_key.?,
+    } };
+}
+
+/// Classify this process without ever importing authority private material from
+/// shared OCG2 config. If the local node claims the authority short ID, require
+/// its complete Ed25519 public key to equal the configured root.
+pub fn validateOcg2LocalIdentity(
+    cfg: Ocg2BootConfig,
+    identity: ?*const node_identity.NodeIdentity,
+) Ocg2IdentityError!Ocg2LocalRole {
+    if (!cfg.enabled) return error.Ocg2Disabled;
+    const local = identity orelse return error.MissingNodeIdentity;
+    const authority = cfg.authority orelse return error.Ocg2Disabled;
+    if (local.shortId() != authority.authority_node_id) return .receiver;
+    if (!std.crypto.timing_safe.eql(
+        [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8,
+        local.sign_kp.public_key,
+        authority.authority_pubkey,
+    )) return error.Ocg2AuthorityPublicKeyMismatch;
+    return .authority;
+}
+
+/// Activate the local durable image. Exactly two absent rows are the explicit
+/// cold-start case. One absent row is partial state and is never repaired; two
+/// present rows are validated and restored against the frozen authority tuple.
+pub fn activateOcg2Store(
+    allocator: std.mem.Allocator,
+    store: *store_mod.OroStore,
+    cfg: Ocg2BootConfig,
+) durable_oper_authority_boot.Error!Ocg2Activation {
+    const authority = cfg.authority orelse return error.InvalidAuthority;
+    const marker_present = store.get(.props, durable_oper_authority.marker_key) != null;
+    const snapshot_present = store.get(.props, durable_oper_authority.snapshot_key) != null;
+    if (marker_present != snapshot_present) return error.PartialInitialization;
+    if (!marker_present) return .{
+        .state = try durable_oper_authority_boot.initialize(allocator, store, authority),
+        .source = .initialized,
+    };
+    return .{
+        .state = try durable_oper_authority_boot.load(allocator, store, authority),
+        .source = .restored,
+    };
+}
 
 /// Overlay non-empty/non-zero config values onto `base` (which carries defaults).
 /// `cfg`'s string fields (e.g. host) are borrowed — keep `cfg` alive as long as
@@ -443,6 +516,9 @@ pub fn mapAcmeBootConfig(cfg: config_format.Config) AcmeBootConfig {
 pub const Loaded = struct {
     config: server.Config,
     parsed: config_format.Config,
+    /// Public-only OCG2 root projection. Main validates the local node identity
+    /// and owns any activated state; Server receives no pointer or capability.
+    ocg2: Ocg2BootConfig = .{},
     /// Owned oper bindings backing `config.oper_registry` (strings borrow `parsed`).
     oper_bindings: []oper_mod.OperBinding = &.{},
     /// Parsed `[tls]` intent (strings borrow `parsed`); the live listener and
@@ -547,6 +623,7 @@ pub fn loadFromText(
     return .{
         .config = config,
         .parsed = parsed,
+        .ocg2 = mapOcg2BootConfig(parsed),
         .oper_bindings = oper_bindings,
         .tls = mapTlsBootConfig(parsed),
         .acme = mapAcmeBootConfig(parsed),
@@ -1321,6 +1398,61 @@ test "missing required [node].id is rejected" {
     const allocator = testing.allocator;
     const text = "[listen]\nirc = 6680\n";
     try testing.expectError(error.ParseError, loadFromText(allocator, text, .{ .port = 6680 }, .{}));
+}
+
+fn testOcg2BootConfig(seed: u8) !Ocg2BootConfig {
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(seed)), "ocg2-test");
+    defer identity.deinit();
+    return .{ .enabled = true, .authority = .{
+        .authority_node_id = identity.shortId(),
+        .authority_pubkey = identity.sign_kp.public_key,
+    } };
+}
+
+test "OCG2 boot identity classification keeps receivers public-only and exact authority full-key bound" {
+    const config = try testOcg2BootConfig(0xC1);
+    var authority_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC1)), "ocg2-test");
+    defer authority_identity.deinit();
+    try testing.expectEqual(Ocg2LocalRole.authority, try validateOcg2LocalIdentity(config, &authority_identity));
+
+    var receiver_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC2)), "ocg2-test");
+    defer receiver_identity.deinit();
+    try testing.expectEqual(Ocg2LocalRole.receiver, try validateOcg2LocalIdentity(config, &receiver_identity));
+    try testing.expectError(error.MissingNodeIdentity, validateOcg2LocalIdentity(config, null));
+
+    authority_identity.sign_kp.public_key[0] ^= 1;
+    try testing.expectError(
+        error.Ocg2AuthorityPublicKeyMismatch,
+        validateOcg2LocalIdentity(config, &authority_identity),
+    );
+}
+
+test "OCG2 store activation cold restores and rejects key change and partial state" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config = try testOcg2BootConfig(0xC3);
+    const wrong = try testOcg2BootConfig(0xC4);
+    var store = try store_mod.OroStore.openWithConfig(
+        testing.allocator,
+        testing.io,
+        tmp.dir,
+        "config-boot-ocg2.wal",
+        .{},
+    );
+    defer store.deinit();
+    var cold = try activateOcg2Store(testing.allocator, &store, config);
+    defer cold.state.deinit();
+    try testing.expectEqual(Ocg2ActivationSource.initialized, cold.source);
+    try testing.expect(store.get(.props, durable_oper_authority.marker_key) != null);
+    try testing.expect(store.get(.props, durable_oper_authority.snapshot_key) != null);
+
+    var restored = try activateOcg2Store(testing.allocator, &store, config);
+    defer restored.state.deinit();
+    try testing.expectEqual(Ocg2ActivationSource.restored, restored.source);
+    try testing.expectError(error.InvalidAuthority, activateOcg2Store(testing.allocator, &store, wrong));
+
+    try store.delete(.props, durable_oper_authority.snapshot_key);
+    try testing.expectError(error.PartialInitialization, activateOcg2Store(testing.allocator, &store, config));
 }
 
 test "[class.*] parses into the connection-class registry with v4/v6 + TLS match" {

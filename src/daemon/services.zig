@@ -4,18 +4,114 @@
 //! In-process IRC services over OroStore with typed results and no IRC I/O.
 const std = @import("std");
 
+const sign = @import("../crypto/sign.zig");
 const store_mod = @import("store.zig");
 const toml = @import("../proto/toml.zig");
 const scram_store_mod = @import("scram_store.zig");
 const sasl = @import("../proto/sasl.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const webauthn_creds = @import("webauthn_creds.zig");
+const durable_credential_props = @import("durable_credential_props.zig");
+const durable_oper_authority = @import("durable_oper_authority.zig");
+const durable_oper_authority_boot = @import("durable_oper_authority_boot.zig");
+const oper_session_provenance = @import("oper_session_provenance.zig");
+const ocg2_reconcile_schedule = @import("ocg2_reconcile_schedule.zig");
+const ocg2_reconcile_workset = @import("ocg2_reconcile_workset.zig");
 const key_transparency = @import("key_transparency.zig");
+const key_transparency_store = @import("key_transparency_store.zig");
+const entity_prop_event = @import("../proto/entity_prop_event.zig");
+const e2ee_policy = @import("../proto/e2ee_policy.zig");
+const oper_cred_share = @import("../proto/oper_cred_share.zig");
+const node_identity_mod = @import("node_identity.zig");
+const node_short_id_mod = @import("../crypto/node_short_id.zig");
 const mmr = @import("../substrate/merkle_mountain_range.zig");
 const rwlock = @import("../substrate/rwlock.zig");
 const svc_enforce = @import("svc_enforce.zig");
 const svc_acclist = @import("svc_acclist.zig");
 const svc_chanbadwords = @import("svc_chanbadwords.zig");
+
+/// Private post-copy test hook. Production callers pass null; tests use it to
+/// deterministically merge a successor between detached crypto and the exact
+/// latest-tuple recheck without exposing a production race-control API.
+const AfterCopyHook = struct {
+    callback: *const fn (*anyopaque) void,
+    context: *anyopaque,
+};
+
+fn ocg2ReconcileAccountCanonical(account: []const u8) bool {
+    if (account.len == 0 or account.len > durable_oper_authority.max_account_len) return false;
+    for (account) |byte| {
+        const ok = (byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or
+            byte == '_' or byte == '.' or byte == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn ocg2ReconcileExpectedValid(expected: ocg2_reconcile_workset.BaselineEntry, now_ms: u64) bool {
+    if (expected.account_len == 0 or expected.account_len > expected.account_buf.len or
+        expected.account_len > durable_oper_authority.max_account_len)
+        return false;
+    if (!ocg2ReconcileAccountCanonical(expected.account_buf[0..expected.account_len])) return false;
+    if (expected.revision == 0) return false;
+    const live = expected.phase == .not_yet_valid or expected.phase == .active;
+    const terminal = expected.phase == .expired or expected.phase == .tombstone or expected.phase == .equivocation;
+    if (live) {
+        const deadline = expected.next_transition_ms orelse return false;
+        return deadline > now_ms;
+    }
+    if (terminal) return expected.next_transition_ms == null;
+    return false;
+}
+
+fn ocg2ReconcileIdentityMatches(
+    expected: ocg2_reconcile_workset.BaselineEntry,
+    hint: ocg2_reconcile_schedule.ReinspectHint,
+) bool {
+    if (expected.account_len != hint.account_len) return false;
+    if (!std.mem.eql(
+        u8,
+        expected.account_buf[0..expected.account_len],
+        hint.account_buf[0..hint.account_len],
+    )) return false;
+    if (expected.revision != hint.revision) return false;
+    if (!std.mem.eql(u8, &expected.digest, &hint.digest)) return false;
+    if (!std.mem.eql(u8, &expected.wire_sha256, &hint.wire_sha256)) return false;
+    if (expected.phase != hint.phase) return false;
+    if (expected.next_transition_ms) |left| {
+        return if (hint.next_transition_ms) |right| left == right else false;
+    }
+    return hint.next_transition_ms == null;
+}
+
+fn ocg2ReconcileLiveMatchesCopy(
+    state: *durable_oper_authority.State,
+    availability_epoch: u64,
+    current_epoch: u64,
+    state_identity: *durable_oper_authority.State,
+    account: []const u8,
+    copy: *const durable_oper_authority.TransactionCopy,
+) bool {
+    if (state != state_identity or !state.servingAvailable() or current_epoch != availability_epoch)
+        return false;
+    const latest = state.latest(account) orelse return false;
+    var live_sha: [durable_oper_authority.digest_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(latest.wire, &live_sha, .{});
+    const authority = state.authority();
+    return latest.revision == copy.revision and
+        latest.kind == copy.kind and
+        latest.issued_ms == copy.issued_ms and
+        latest.expiry_ms == copy.expiry_ms and
+        latest.equivocation == copy.equivocation and
+        std.mem.eql(u8, latest.account, copy.account()) and
+        std.mem.eql(u8, &latest.digest, &copy.digest) and
+        std.mem.eql(u8, &live_sha, &copy.wire_sha256) and
+        std.mem.eql(u8, &latest.conflict_digest, &copy.conflict_digest) and
+        authority.authority_node_id == copy.authority_node_id and
+        std.mem.eql(u8, &authority.authority_pubkey, &copy.authority_pubkey) and
+        std.mem.eql(u8, latest.wire, copy.signedWire());
+}
 
 pub const OroStore = store_mod.OroStore;
 pub const ScramStore = scram_store_mod.ScramStore;
@@ -403,10 +499,22 @@ pub const Services = struct {
     /// In-memory companion (see certfp_bind.zig); null = EXTERNAL has nothing to
     /// match and fails closed.
     certfp_binds: ?*certfp_bind_mod.CertfpBindStore = null,
-    /// Optional append-only key-transparency log for account credential changes.
-    /// The log must outlive `self`; append failures are non-fatal until the log is
-    /// exposed as a client/operator contract.
+    /// Optional node-local observational history for credential facts.
+    /// The log must outlive `self`. CERTFP/WebAuthn/E2EE/identity PROP
+    /// mutations stay successful when an observational append is unavailable.
+    /// A corrupt log stays fail-closed (`unusable`); it is never treated as
+    /// current or authoritative device/identity state.
     key_transparency: ?*key_transparency.KeyTransparencyLog = null,
+    /// Borrowed durable credential-property image. The owner restores the
+    /// DPROP1 snapshot before attachment and must outlive `self`.
+    durable_credential_props_state: ?*durable_credential_props.State = null,
+    /// Borrowed inactive OCG2 durable authority. No runtime privilege consumer
+    /// reads this pointer; it exists only for durable merge/revision APIs.
+    durable_oper_authority_state: ?*durable_oper_authority.State = null,
+    /// Monotonic security-state epoch. Successful record merges deliberately do
+    /// not advance it, so detached reads may return their copied predecessor;
+    /// every fail-closed availability transition does advance it.
+    durable_oper_availability_epoch: u64 = 0,
     lock: rwlock.RwLock = .{},
 
     pub fn init(store: *OroStore, state: ?StateHook) Services {
@@ -435,17 +543,1193 @@ pub const Services = struct {
         self.certfp_binds = binds;
     }
 
-    /// Attach the account credential transparency log. Credential mutations
-    /// append canonical events under the services lock.
+    /// Attach the account credential transparency log and restore any durable
+    /// `kt1:` records from the services OroStore. A corrupt or truncated store
+    /// marks the log unusable; it is never overwritten with a fresh empty root.
     pub fn attachKeyTransparencyLog(self: *Services, log: *key_transparency.KeyTransparencyLog) void {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
         self.key_transparency = log;
+        key_transparency_store.restore(self.store, log) catch {};
+    }
+
+    /// Attach an already-restored DPROP1 image. Services borrows the state;
+    /// ownership and destruction remain with the daemon lifecycle.
+    pub fn attachDurableCredentialProps(self: *Services, state: *durable_credential_props.State) void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        self.durable_credential_props_state = state;
+    }
+
+    pub const DurableOperActivationError = durable_oper_authority.Error || error{
+        AlreadyActive,
+        AuthorityUnavailable,
+        MissingDurableMarker,
+        MissingDurableSnapshot,
+        DurableSnapshotMismatch,
+    };
+
+    /// Attach only a state restored or cold-initialized from this exact
+    /// Services OroStore. Services borrows the state; the process owner must
+    /// keep it alive until after Services is no longer reachable.
+    pub fn activateDurableOperAuthority(
+        self: *Services,
+        state: *durable_oper_authority.State,
+    ) DurableOperActivationError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        if (self.durable_oper_authority_state != null) return error.AlreadyActive;
+        // An exact but not-yet-reserved image is attachable solely so the
+        // inactive reservation API can cross its first durable cut.  A state
+        // that was already authorized and then poisoned remains fatal.
+        if (!state.servingAvailable() and state.securityTimeAuthorized())
+            return error.AuthorityUnavailable;
+        const marker = self.store.get(.props, durable_oper_authority.marker_key) orelse
+            return error.MissingDurableMarker;
+        try durable_oper_authority.validateMarker(marker, state.authority());
+        const durable_snapshot = self.store.get(.props, durable_oper_authority.snapshot_key) orelse
+            return error.MissingDurableSnapshot;
+        if (state.snapshot().len == 0 or !std.mem.eql(u8, state.snapshot(), durable_snapshot))
+            return error.DurableSnapshotMismatch;
+        self.durable_oper_authority_state = state;
+    }
+
+    fn attachDurableOperAuthorityForTest(self: *Services, state: *durable_oper_authority.State) void {
+        if (!state.securityTimeAuthorized()) {
+            var reservation = state.prepareSecurityTimeReservation(0, 1_000_000_000) catch unreachable;
+            reservation.update.commitInto(state);
+        }
+        self.durable_oper_authority_state = state;
+    }
+
+    fn attachInactiveDurableOperAuthorityForTest(self: *Services, state: *durable_oper_authority.State) void {
+        self.durable_oper_authority_state = state;
+    }
+
+    fn markDurableOperUnavailableLocked(
+        self: *Services,
+        state: *durable_oper_authority.State,
+    ) void {
+        state.markUnavailable();
+        self.durable_oper_availability_epoch = std.math.add(
+            u64,
+            self.durable_oper_availability_epoch,
+            1,
+        ) catch std.math.maxInt(u64);
+    }
+
+    fn markDurableOperUnavailableForTest(self: *Services) void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const state = self.durable_oper_authority_state orelse return;
+        self.markDurableOperUnavailableLocked(state);
+    }
+
+    pub const DurableOperLookup = oper_session_provenance.DurableOperLookup;
+    pub const DurableOperGrantCopy = oper_session_provenance.DurableOperGrantCopy;
+    pub const DurableOperTransactionCopy = durable_oper_authority.TransactionCopy;
+
+    /// Exact copied durable transaction state.  The terminal variants carry
+    /// the same fixed-buffer identity as `.active`; none is a runtime grant.
+    pub const DurableOperTransaction = union(enum) {
+        disabled,
+        unavailable,
+        absent,
+        active: DurableOperTransactionCopy,
+        tombstone: DurableOperTransactionCopy,
+        equivocation: DurableOperTransactionCopy,
+    };
+
+    /// Inspect the durable OCG2 authority image under the Services read lock.
+    /// Every successful grant result is copied into fixed inline storage before
+    /// the lock is released; callers never receive a borrowed RecordView or
+    /// durable-state slice. OCG2 remains an inactive authority image: this API
+    /// only reports typed state for the Step 5 reconciler.
+    pub fn inspectDurableOperAuthority(
+        self: *Services,
+        account: []const u8,
+        now_ms: u64,
+    ) oper_session_provenance.DurableOperLookup {
+        return self.inspectDurableOperAuthorityInner(account, now_ms, null);
+    }
+
+    /// Inspect the exact latest durable transaction, including terminal
+    /// tombstone/equivocation identities.  The returned copy owns no borrowed
+    /// slices and is safe after the Services read lock is released.  This API
+    /// is diagnostic only; it does not participate in session authorization.
+    pub fn inspectDurableOperTransaction(
+        self: *Services,
+        account: []const u8,
+        now_ms: u64,
+    ) DurableOperTransaction {
+        return self.inspectDurableOperTransactionInner(account, now_ms, null);
+    }
+
+    /// Observation of one C4 expected durable identity.  This is not a grant,
+    /// revoke, session, or persistence API.  Missing expected records are
+    /// `authority_unavailable`, never absent.
+    pub const DurableOperReconcileObservation = union(enum) {
+        disabled,
+        authority_unavailable,
+        invalid_work,
+        superseded,
+        matched_not_yet_valid,
+        matched_expired,
+        matched_tombstone,
+        matched_equivocation,
+        matched_active: DurableOperGrantCopy,
+    };
+
+    /// Reinspect one C4 work item against the attached serving durable image.
+    /// Validation of `work.expected` happens before any lock or state slice.
+    /// Crypto and C3 classification run on a fixed copy outside the lock.
+    pub fn inspectDurableOperReconcileWork(
+        self: *Services,
+        work: ocg2_reconcile_workset.WorkItem,
+        security_now_ms: u64,
+    ) DurableOperReconcileObservation {
+        return self.inspectDurableOperReconcileWorkInner(work, security_now_ms, null);
+    }
+
+    comptime {
+        const observe_info = @typeInfo(DurableOperReconcileObservation).@"union";
+        const observe_tags = .{
+            "disabled",
+            "authority_unavailable",
+            "invalid_work",
+            "superseded",
+            "matched_not_yet_valid",
+            "matched_expired",
+            "matched_tombstone",
+            "matched_equivocation",
+            "matched_active",
+        };
+        if (observe_info.field_names.len != observe_tags.len)
+            @compileError("DurableOperReconcileObservation tags are frozen");
+        for (observe_info.field_names, observe_info.field_types) |name, field_type| {
+            var allowed = false;
+            for (observe_tags) |tag| {
+                if (std.mem.eql(u8, name, tag)) allowed = true;
+            }
+            if (!allowed) @compileError("DurableOperReconcileObservation carries an undeclared tag");
+            if (std.mem.eql(u8, name, "matched_active")) {
+                if (field_type != DurableOperGrantCopy)
+                    @compileError("matched_active may only carry DurableOperGrantCopy");
+            } else if (field_type != void) {
+                @compileError("non-active reconcile observations must stay empty");
+            }
+        }
+
+        const inspect_info = @typeInfo(@TypeOf(inspectDurableOperReconcileWork)).@"fn";
+        if (inspect_info.param_types.len != 3)
+            @compileError("inspectDurableOperReconcileWork has a fixed (self, work, now) surface");
+        if (inspect_info.param_types[1] != ocg2_reconcile_workset.WorkItem)
+            @compileError("inspectDurableOperReconcileWork consumes a C4 WorkItem by value");
+        if (inspect_info.param_types[2] != u64)
+            @compileError("inspectDurableOperReconcileWork takes caller-supplied security_now_ms");
+        if (inspect_info.return_type != DurableOperReconcileObservation)
+            @compileError("inspectDurableOperReconcileWork returns DurableOperReconcileObservation");
+        for (inspect_info.param_types) |param_type| {
+            if (param_type == std.mem.Allocator)
+                @compileError("inspectDurableOperReconcileWork must stay allocation-free");
+        }
+    }
+
+    fn inspectDurableOperReconcileWorkInner(
+        self: *Services,
+        work: ocg2_reconcile_workset.WorkItem,
+        security_now_ms: u64,
+        after_copy: ?AfterCopyHook,
+    ) DurableOperReconcileObservation {
+        if (!ocg2ReconcileExpectedValid(work.expected, security_now_ms)) return .invalid_work;
+        const account = work.expected.account_buf[0..work.expected.account_len];
+
+        var attempt: usize = 0;
+        while (attempt < 2) : (attempt += 1) {
+            var copy: durable_oper_authority.TransactionCopy = undefined;
+            var state_identity: *durable_oper_authority.State = undefined;
+            var availability_epoch: u64 = 0;
+            var copied = false;
+
+            {
+                self.lock.lockShared();
+                defer self.lock.unlockShared();
+                const state = self.durable_oper_authority_state orelse return .disabled;
+                if (!state.servingAvailable()) return .authority_unavailable;
+                const record = state.latest(account) orelse return .authority_unavailable;
+                if (durable_oper_authority.copyTransaction(state.authority(), record)) |exact| {
+                    copy = exact;
+                    state_identity = state;
+                    availability_epoch = self.durable_oper_availability_epoch;
+                    copied = true;
+                } else if (attempt != 0) {
+                    return .authority_unavailable;
+                }
+            }
+
+            if (!copied) continue;
+            if (after_copy) |hook| hook.callback(hook.context);
+
+            var hint_slot: [1]ocg2_reconcile_schedule.ReinspectHint = undefined;
+            const copies = [_]durable_oper_authority.TransactionCopy{copy};
+            const classified = switch (ocg2_reconcile_schedule.build(&copies, security_now_ms, &hint_slot)) {
+                .complete => hint_slot[0],
+                .invalid, .insufficient_output => {
+                    if (self.ocg2ReconcileCopyStillLive(account, &copy, state_identity, availability_epoch) or attempt != 0)
+                        return .authority_unavailable;
+                    continue;
+                },
+            };
+
+            const identity_match = ocg2ReconcileIdentityMatches(work.expected, classified);
+            var grant: ?DurableOperGrantCopy = null;
+            if (identity_match and classified.phase == .active) {
+                const public_key = std.crypto.sign.Ed25519.PublicKey.fromBytes(copy.authority_pubkey) catch {
+                    if (self.ocg2ReconcileCopyStillLive(account, &copy, state_identity, availability_epoch) or attempt != 0)
+                        return .authority_unavailable;
+                    continue;
+                };
+                const fields = oper_cred_share.verifyOcg2(
+                    copy.signedWire(),
+                    public_key,
+                    copy.authority_node_id,
+                    security_now_ms,
+                ) catch {
+                    if (self.ocg2ReconcileCopyStillLive(account, &copy, state_identity, availability_epoch) or attempt != 0)
+                        return .authority_unavailable;
+                    continue;
+                };
+                if (!std.mem.eql(u8, fields.account, copy.account()) or
+                    fields.revision != copy.revision or fields.kind != copy.kind or
+                    fields.issued_ms != copy.issued_ms or fields.expiry_ms != copy.expiry_ms or
+                    fields.authority_node_id != copy.authority_node_id or
+                    !std.mem.eql(u8, &fields.authority_pubkey, &copy.authority_pubkey))
+                {
+                    if (self.ocg2ReconcileCopyStillLive(account, &copy, state_identity, availability_epoch) or attempt != 0)
+                        return .authority_unavailable;
+                    continue;
+                }
+                grant = DurableOperGrantCopy.copyFromVerified(
+                    fields.account,
+                    fields.class,
+                    fields.title,
+                    fields.privilege_bits,
+                    copy.revision,
+                    copy.digest,
+                    copy.authority_node_id,
+                    copy.authority_pubkey,
+                    copy.issued_ms,
+                    copy.expiry_ms,
+                    copy.kind,
+                    copy.equivocation,
+                    copy.signedWire(),
+                );
+                if (grant == null) {
+                    if (self.ocg2ReconcileCopyStillLive(account, &copy, state_identity, availability_epoch) or attempt != 0)
+                        return .authority_unavailable;
+                    continue;
+                }
+            }
+
+            if (!self.ocg2ReconcileCopyStillLive(account, &copy, state_identity, availability_epoch)) {
+                if (attempt == 0) continue;
+                return .authority_unavailable;
+            }
+            if (!identity_match) return .superseded;
+            return switch (classified.phase) {
+                .not_yet_valid => .matched_not_yet_valid,
+                .active => .{ .matched_active = grant.? },
+                .expired => .matched_expired,
+                .tombstone => .matched_tombstone,
+                .equivocation => .matched_equivocation,
+            };
+        }
+        return .authority_unavailable;
+    }
+
+    fn ocg2ReconcileCopyStillLive(
+        self: *Services,
+        account: []const u8,
+        copy: *const durable_oper_authority.TransactionCopy,
+        state_identity: *durable_oper_authority.State,
+        availability_epoch: u64,
+    ) bool {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const state = self.durable_oper_authority_state orelse return false;
+        return ocg2ReconcileLiveMatchesCopy(
+            state,
+            availability_epoch,
+            self.durable_oper_availability_epoch,
+            state_identity,
+            account,
+            copy,
+        );
+    }
+
+    fn inspectDurableOperTransactionInner(
+        self: *Services,
+        account: []const u8,
+        now_ms: u64,
+        after_copy: ?AfterCopyHook,
+    ) DurableOperTransaction {
+        const canonical = canonicalAccount(account) catch return .absent;
+        var attempt: usize = 0;
+        while (attempt < 2) : (attempt += 1) {
+            var account_buf: [durable_oper_authority.max_account_len]u8 = @splat(0);
+            var wire_buf: [durable_oper_authority.max_wire_len]u8 = undefined;
+            var wire_len: usize = 0;
+            var revision: u64 = 0;
+            var issued_ms: u64 = 0;
+            var expiry_ms: u64 = 0;
+            var digest: [durable_oper_authority.digest_len]u8 = undefined;
+            var conflict_digest: [durable_oper_authority.digest_len]u8 = undefined;
+            var kind: oper_cred_share.Ocg2Kind = .grant;
+            var equivocation = false;
+            var authority: durable_oper_authority.Config = undefined;
+            var state_identity: *durable_oper_authority.State = undefined;
+            var availability_epoch: u64 = 0;
+            var status: enum { active, tombstone, equivocation } = .active;
+
+            {
+                self.lock.lockShared();
+                defer self.lock.unlockShared();
+                const state = self.durable_oper_authority_state orelse return .disabled;
+                if (!state.servingAvailable()) return .unavailable;
+                const record = state.latest(canonical.asSlice()) orelse return .absent;
+                // A grant that is not effective is intentionally not exposed
+                // as active.  Step5's lookup retains its richer expiry state.
+                if (!record.equivocation and record.kind == .grant and !record.effective(now_ms)) return .absent;
+                if (record.equivocation) {
+                    status = .equivocation;
+                } else if (record.kind == .tombstone) {
+                    status = .tombstone;
+                }
+                if (record.account.len > account_buf.len or record.wire.len == 0 or record.wire.len > wire_buf.len)
+                    return .unavailable;
+                @memcpy(account_buf[0..record.account.len], record.account);
+                wire_len = record.wire.len;
+                @memcpy(wire_buf[0..wire_len], record.wire);
+                revision = record.revision;
+                issued_ms = record.issued_ms;
+                expiry_ms = record.expiry_ms;
+                digest = record.digest;
+                conflict_digest = record.conflict_digest;
+                kind = record.kind;
+                equivocation = record.equivocation;
+                authority = state.authority();
+                state_identity = state;
+                availability_epoch = self.durable_oper_availability_epoch;
+            }
+
+            if (after_copy) |hook| hook.callback(hook.context);
+
+            const public_key = std.crypto.sign.Ed25519.PublicKey.fromBytes(authority.authority_pubkey) catch return .unavailable;
+            // Terminal copies remain inspectable even after grant expiry.  Use
+            // the signed issue time for structural verification in those
+            // cases; active grants retain the caller's current-time check.
+            const verify_now = if (status == .active) now_ms else issued_ms;
+            const fields = oper_cred_share.verifyOcg2(wire_buf[0..wire_len], public_key, authority.authority_node_id, verify_now) catch return .unavailable;
+            if (!std.mem.eql(u8, fields.account, account_buf[0..canonical.len]) or
+                fields.revision != revision or fields.kind != kind or
+                fields.issued_ms != issued_ms or fields.expiry_ms != expiry_ms or
+                fields.authority_node_id != authority.authority_node_id or
+                !std.mem.eql(u8, &fields.authority_pubkey, &authority.authority_pubkey))
+                return .unavailable;
+
+            var tuple_stable = false;
+            {
+                self.lock.lockShared();
+                defer self.lock.unlockShared();
+                const state = self.durable_oper_authority_state orelse return .unavailable;
+                const latest = state.latest(canonical.asSlice()) orelse {
+                    if (attempt == 0) continue;
+                    return .unavailable;
+                };
+                tuple_stable = state == state_identity and state.servingAvailable() and
+                    self.durable_oper_availability_epoch == availability_epoch and
+                    latest.revision == revision and std.mem.eql(u8, &latest.digest, &digest) and
+                    std.mem.eql(u8, &latest.conflict_digest, &conflict_digest) and
+                    latest.kind == kind and latest.equivocation == equivocation and
+                    latest.issued_ms == issued_ms and latest.expiry_ms == expiry_ms and
+                    std.mem.eql(u8, latest.account, account_buf[0..canonical.len]) and
+                    std.mem.eql(u8, latest.wire, wire_buf[0..wire_len]);
+            }
+            if (!tuple_stable) continue;
+
+            const copy = durable_oper_authority.copyTransaction(authority, .{
+                .account = account_buf[0..canonical.len],
+                .revision = revision,
+                .kind = kind,
+                .issued_ms = issued_ms,
+                .expiry_ms = expiry_ms,
+                .digest = digest,
+                .conflict_digest = conflict_digest,
+                .equivocation = equivocation,
+                .wire = wire_buf[0..wire_len],
+            }) orelse return .unavailable;
+            return switch (status) {
+                .active => .{ .active = copy },
+                .tombstone => .{ .tombstone = copy },
+                .equivocation => .{ .equivocation = copy },
+            };
+        }
+        return .unavailable;
+    }
+
+    fn inspectDurableOperAuthorityInner(
+        self: *Services,
+        account: []const u8,
+        now_ms: u64,
+        after_copy: ?AfterCopyHook,
+    ) oper_session_provenance.DurableOperLookup {
+        const canonical = canonicalAccount(account) catch return .absent;
+        // Crypto is intentionally outside the Services lock.  At most one
+        // retry is allowed after the exact latest-record tuple check; a second
+        // instability fails closed instead of returning a predecessor grant.
+        var attempt: usize = 0;
+        while (attempt < 2) : (attempt += 1) {
+            var wire_buf: [durable_oper_authority.max_wire_len]u8 = undefined;
+            var wire_len: usize = 0;
+            var authority_node_id: u64 = 0;
+            var authority_pubkey: [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8 = undefined;
+            var revision: u64 = 0;
+            var digest: [durable_oper_authority.digest_len]u8 = undefined;
+            var issued_ms: u64 = 0;
+            var expiry_ms: u64 = 0;
+            var kind: oper_cred_share.Ocg2Kind = .grant;
+            var equivocation = false;
+            var state_identity: *durable_oper_authority.State = undefined;
+            var availability_epoch: u64 = 0;
+
+            {
+                self.lock.lockShared();
+                defer self.lock.unlockShared();
+                const state = self.durable_oper_authority_state orelse return .disabled;
+                if (!state.servingAvailable()) return .unavailable;
+                state_identity = state;
+                availability_epoch = self.durable_oper_availability_epoch;
+                const record = state.latest(canonical.asSlice()) orelse return .absent;
+                kind = record.kind;
+                equivocation = record.equivocation;
+                if (equivocation) return .equivocation;
+                if (kind == .tombstone) return .tombstone;
+                if (record.issued_ms > now_ms) return .not_yet_valid;
+                if (now_ms >= record.expiry_ms) return .expired;
+                if (record.wire.len > wire_buf.len) return .unavailable;
+                const authority = state.authority();
+                authority_node_id = authority.authority_node_id;
+                authority_pubkey = authority.authority_pubkey;
+                revision = record.revision;
+                digest = record.digest;
+                issued_ms = record.issued_ms;
+                expiry_ms = record.expiry_ms;
+                wire_len = record.wire.len;
+                @memcpy(wire_buf[0..wire_len], record.wire);
+            }
+
+            if (after_copy) |hook| hook.callback(hook.context);
+
+            const public_key = std.crypto.sign.Ed25519.PublicKey.fromBytes(authority_pubkey) catch return .unavailable;
+            const fields = oper_cred_share.verifyOcg2(wire_buf[0..wire_len], public_key, authority_node_id, now_ms) catch return .unavailable;
+            if (!std.mem.eql(u8, fields.account, canonical.asSlice()) or
+                fields.kind != kind or fields.revision != revision or fields.issued_ms != issued_ms or
+                fields.expiry_ms != expiry_ms or fields.authority_node_id != authority_node_id or
+                !std.mem.eql(u8, &fields.authority_pubkey, &authority_pubkey))
+                return .unavailable;
+
+            var tuple_stable = false;
+            {
+                self.lock.lockShared();
+                defer self.lock.unlockShared();
+                const state = self.durable_oper_authority_state orelse return .unavailable;
+                const latest = state.latest(canonical.asSlice()) orelse {
+                    if (attempt == 0) continue;
+                    return .unavailable;
+                };
+                tuple_stable = state == state_identity and state.servingAvailable() and
+                    self.durable_oper_availability_epoch == availability_epoch and
+                    latest.revision == revision and std.mem.eql(u8, &latest.digest, &digest) and latest.kind == kind and
+                    latest.equivocation == equivocation and latest.issued_ms == issued_ms and
+                    latest.expiry_ms == expiry_ms;
+            }
+            if (!tuple_stable) continue;
+
+            const copy = oper_session_provenance.DurableOperGrantCopy.copyFromVerified(
+                fields.account,
+                fields.class,
+                fields.title,
+                fields.privilege_bits,
+                revision,
+                digest,
+                authority_node_id,
+                authority_pubkey,
+                issued_ms,
+                expiry_ms,
+                kind,
+                equivocation,
+                wire_buf[0..wire_len],
+            ) orelse return .unavailable;
+            return .{ .active = copy };
+        }
+        return .unavailable;
+    }
+
+    pub const DurableOperPreadmission = enum { out_of_memory, invalid_record, capacity, busy, exhausted, store_failure };
+    pub const DurableOperRestart = enum { ambiguous_store, fatal_store, fatal_state };
+    pub const DurableOperMergeOutcome = union(enum) {
+        disabled,
+        unavailable,
+        stale,
+        replay,
+        committed,
+        equivocation_committed,
+        preadmission: DurableOperPreadmission,
+        restart_required: DurableOperRestart,
+    };
+
+    /// Persist one already-signed OCG2 authority record. Every state allocation,
+    /// snapshot byte, and OroStore reservation precedes the durable cut.
+    pub fn commitDurableOperRecord(self: *Services, wire: []const u8, now_ms: u64) DurableOperMergeOutcome {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const state = self.durable_oper_authority_state orelse return .disabled;
+        if (!state.servingAvailable()) return .unavailable;
+        const prepared = state.prepareMerge(wire, now_ms) catch |err| return switch (err) {
+            error.OutOfMemory => .{ .preadmission = .out_of_memory },
+            error.CapacityExceeded, error.BoundsExceeded => .{ .preadmission = .capacity },
+            error.PreparedMutationActive => .{ .preadmission = .busy },
+            error.GenerationExhausted => .{ .preadmission = .exhausted },
+            error.StateDestroyed => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .fatal_state };
+            },
+            else => .{ .preadmission = .invalid_record },
+        };
+        var update = switch (prepared) {
+            .stale => return .stale,
+            .replay => return .replay,
+            .update => |value| value,
+        };
+        defer update.abort();
+        var durable_put = self.store.preparePut(.props, durable_oper_authority.snapshot_key, update.snapshot()) catch |err| return switch (err) {
+            error.OutOfMemory => .{ .preadmission = .out_of_memory },
+            error.RecordTooLarge => .{ .preadmission = .capacity },
+            error.PreparedMutationActive => .{ .preadmission = .busy },
+            error.SequenceExhausted => .{ .preadmission = .exhausted },
+            error.IoAmbiguous => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .ambiguous_store };
+            },
+            error.StorePoisoned => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .fatal_store };
+            },
+            else => .{ .preadmission = .store_failure },
+        };
+        defer durable_put.abort();
+        durable_put.commit() catch |err| {
+            self.markDurableOperUnavailableLocked(state);
+            return switch (err) {
+                error.IoAmbiguous => .{ .restart_required = .ambiguous_store },
+                else => .{ .restart_required = .fatal_store },
+            };
+        };
+        const disposition = update.disposition;
+        if (!update.commitIntoChecked(state)) {
+            self.markDurableOperUnavailableLocked(state);
+            return .{ .restart_required = .fatal_state };
+        }
+        return if (disposition == .equivocation) .equivocation_committed else .committed;
+    }
+
+    pub const DurableOperRevisionOutcome = union(enum) {
+        disabled,
+        unavailable,
+        committed: u64,
+        preadmission: DurableOperPreadmission,
+        restart_required: DurableOperRestart,
+    };
+
+    /// Stable public spelling for the restart/fail-closed taxonomy used by
+    /// all inactive durable-authority cuts.
+    pub const DurableOperRestartReason = DurableOperRestart;
+
+    pub const DurableOperSecurityTimeResult = union(enum) {
+        disabled,
+        unavailable,
+        committed: u64,
+        preadmission: DurableOperPreadmission,
+        restart_required: DurableOperRestartReason,
+    };
+
+    /// Runtime effective security time.  A missing reservation and a poisoned
+    /// authority are both unavailable, while disabled remains distinguishable
+    /// for callers that have not attached the inactive image.
+    pub const DurableOperSecurityNow = union(enum) {
+        disabled,
+        unavailable,
+        now: u64,
+    };
+
+    /// Persist a monotonically increasing security-time horizon.  The raw
+    /// realtime sample must be covered by the requested horizon; all state and
+    /// store allocations happen before the same durable cut used by OCG2
+    /// records and revision floors.
+    pub fn reserveDurableOperSecurityTime(
+        self: *Services,
+        raw_now_ms: u64,
+        reserve_until_ms: u64,
+    ) DurableOperSecurityTimeResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const state = self.durable_oper_authority_state orelse return .disabled;
+        if (!state.servingAvailable() and state.securityTimeAuthorized()) return .unavailable;
+        if (reserve_until_ms < raw_now_ms or reserve_until_ms <= state.securityReservedUntil())
+            return .{ .preadmission = .invalid_record };
+
+        var prepared = state.prepareSecurityTimeReservation(raw_now_ms, reserve_until_ms) catch |err| return switch (err) {
+            error.OutOfMemory => .{ .preadmission = .out_of_memory },
+            error.CapacityExceeded, error.BoundsExceeded => .{ .preadmission = .capacity },
+            error.PreparedMutationActive => .{ .preadmission = .busy },
+            error.GenerationExhausted, error.ReservationOverflow => .{ .preadmission = .exhausted },
+            error.ReservationNotExtended => .{ .preadmission = .invalid_record },
+            error.StateDestroyed => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .fatal_state };
+            },
+            error.StateUnavailable => .unavailable,
+            else => .{ .preadmission = .store_failure },
+        };
+        defer prepared.update.abort();
+
+        var durable_put = self.store.preparePut(
+            .props,
+            durable_oper_authority.snapshot_key,
+            prepared.update.snapshot(),
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => .{ .preadmission = .out_of_memory },
+            error.RecordTooLarge => .{ .preadmission = .capacity },
+            error.PreparedMutationActive => .{ .preadmission = .busy },
+            error.SequenceExhausted => .{ .preadmission = .exhausted },
+            error.IoAmbiguous => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .ambiguous_store };
+            },
+            error.StorePoisoned => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .fatal_store };
+            },
+            else => .{ .preadmission = .store_failure },
+        };
+        defer durable_put.abort();
+        durable_put.commit() catch |err| {
+            self.markDurableOperUnavailableLocked(state);
+            return switch (err) {
+                error.IoAmbiguous => .{ .restart_required = .ambiguous_store },
+                else => .{ .restart_required = .fatal_store },
+            };
+        };
+
+        if (!prepared.update.commitIntoChecked(state)) {
+            self.markDurableOperUnavailableLocked(state);
+            return .{ .restart_required = .fatal_state };
+        }
+        return .{ .committed = reserve_until_ms };
+    }
+
+    /// Compute effective security time from a realtime sample plus elapsed
+    /// monotonic duration, refusing to serve a value beyond the last durable
+    /// reservation.  Callers must extend the reservation before crossing it.
+    pub fn durableOperSecurityNow(
+        self: *Services,
+        raw_realtime_ms: u64,
+        monotonic_elapsed_ms: u64,
+    ) DurableOperSecurityNow {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const state = self.durable_oper_authority_state orelse return .disabled;
+        if (!state.servingAvailable() or !state.securityTimeAuthorized()) return .unavailable;
+        const reserved_until_ms = state.securityReservedUntil();
+        if (reserved_until_ms == 0) return .unavailable;
+        const boot_effective_ms = if (state.security_clock_started)
+            state.security_boot_effective_ms
+        else
+            @max(raw_realtime_ms, state.securityFloor());
+        const elapsed_effective_ms = std.math.add(
+            u64,
+            boot_effective_ms,
+            monotonic_elapsed_ms,
+        ) catch return .unavailable;
+        const effective_ms = @max(
+            @max(state.security_last_effective_ms, elapsed_effective_ms),
+            raw_realtime_ms,
+        );
+        if (effective_ms > reserved_until_ms) return .unavailable;
+        if (!state.security_clock_started) {
+            state.security_clock_started = true;
+            state.security_boot_effective_ms = boot_effective_ms;
+        }
+        state.security_last_effective_ms = effective_ms;
+        return .{ .now = effective_ms };
+    }
+
+    pub const durable_oper_security_horizon_renewal_threshold_ms: u64 =
+        durable_oper_authority.security_horizon_renewal_threshold_ms;
+    pub const durable_oper_security_horizon_window_ms: u64 =
+        durable_oper_authority.security_horizon_window_ms;
+
+    comptime {
+        if (durable_oper_security_horizon_renewal_threshold_ms != 3_600_000)
+            @compileError("S6-C2 renewal threshold is frozen at 3_600_000ms");
+        if (durable_oper_security_horizon_window_ms != 90_000_000)
+            @compileError("S6-C2 window is frozen at ocg2_max_ttl_ms + threshold");
+        if (durable_oper_security_horizon_window_ms !=
+            oper_cred_share.ocg2_max_ttl_ms + durable_oper_security_horizon_renewal_threshold_ms)
+            @compileError("S6-C2 window must be TTL plus the renewal threshold");
+    }
+
+    pub const DurableOperSecurityHorizonCopy = struct {
+        effective_now_ms: u64,
+        security_floor_ms: u64,
+        reserved_until_ms: u64,
+        remaining_ms: u64,
+    };
+
+    pub const DurableOperSecurityHorizonResult = union(enum) {
+        disabled,
+        unavailable,
+        current: DurableOperSecurityHorizonCopy,
+        renewed: DurableOperSecurityHorizonCopy,
+        preadmission: DurableOperPreadmission,
+        restart_required: DurableOperRestartReason,
+    };
+
+    const ProjectedDurableOperSecurity = struct {
+        boot_effective_ms: u64,
+        effective_ms: u64,
+    };
+
+    fn projectDurableOperSecurityLocked(
+        state: *const durable_oper_authority.State,
+        raw_realtime_ms: u64,
+        monotonic_elapsed_ms: u64,
+    ) error{ FirstSampleRequiresZeroElapsed, ElapsedOverflow }!ProjectedDurableOperSecurity {
+        if (!state.security_clock_started) {
+            if (monotonic_elapsed_ms != 0) return error.FirstSampleRequiresZeroElapsed;
+            const boot_effective_ms = @max(raw_realtime_ms, state.securityFloor());
+            return .{
+                .boot_effective_ms = boot_effective_ms,
+                .effective_ms = boot_effective_ms,
+            };
+        }
+        const elapsed_effective_ms = std.math.add(
+            u64,
+            state.security_boot_effective_ms,
+            monotonic_elapsed_ms,
+        ) catch return error.ElapsedOverflow;
+        return .{
+            .boot_effective_ms = state.security_boot_effective_ms,
+            .effective_ms = @max(
+                @max(state.security_last_effective_ms, elapsed_effective_ms),
+                raw_realtime_ms,
+            ),
+        };
+    }
+
+    fn durableOperSecurityHorizonCopy(
+        effective_ms: u64,
+        floor_ms: u64,
+        reserved_until_ms: u64,
+    ) DurableOperSecurityHorizonCopy {
+        return .{
+            .effective_now_ms = effective_ms,
+            .security_floor_ms = floor_ms,
+            .reserved_until_ms = reserved_until_ms,
+            .remaining_ms = reserved_until_ms - effective_ms,
+        };
+    }
+
+    fn publishDurableOperSecurityAnchorsLocked(
+        state: *durable_oper_authority.State,
+        projected: ProjectedDurableOperSecurity,
+    ) void {
+        if (!state.security_clock_started) {
+            state.security_clock_started = true;
+            state.security_boot_effective_ms = projected.boot_effective_ms;
+        }
+        state.security_last_effective_ms = projected.effective_ms;
+    }
+
+    /// Ensure the inactive durable security horizon covers the frozen window.
+    /// One exclusive lock, no nested public Services calls.  A non-mutating
+    /// projection decides current vs renew; anchors become visible only on
+    /// the current path or after a successful durable cut.
+    pub fn ensureDurableOperSecurityHorizon(
+        self: *Services,
+        raw_realtime_ms: u64,
+        monotonic_elapsed_ms: u64,
+    ) DurableOperSecurityHorizonResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const state = self.durable_oper_authority_state orelse return .disabled;
+        if (state.destroyed) {
+            self.markDurableOperUnavailableLocked(state);
+            return .{ .restart_required = .fatal_state };
+        }
+        if (!state.servingAvailable() and state.securityTimeAuthorized()) return .unavailable;
+
+        const projected = projectDurableOperSecurityLocked(
+            state,
+            raw_realtime_ms,
+            monotonic_elapsed_ms,
+        ) catch |err| return switch (err) {
+            error.FirstSampleRequiresZeroElapsed => .{ .preadmission = .invalid_record },
+            error.ElapsedOverflow => .{ .preadmission = .exhausted },
+        };
+
+        const reserved_until_ms = state.securityReservedUntil();
+        if (state.security_clock_started and projected.effective_ms > reserved_until_ms) {
+            self.markDurableOperUnavailableLocked(state);
+            return .{ .restart_required = .fatal_state };
+        }
+
+        const remaining_ms = if (reserved_until_ms >= projected.effective_ms)
+            reserved_until_ms - projected.effective_ms
+        else
+            0;
+        const needs_renew = !state.securityTimeAuthorized() or
+            reserved_until_ms < projected.effective_ms or
+            remaining_ms <= durable_oper_security_horizon_renewal_threshold_ms;
+        if (!needs_renew) {
+            publishDurableOperSecurityAnchorsLocked(state, projected);
+            return .{ .current = durableOperSecurityHorizonCopy(
+                projected.effective_ms,
+                state.securityFloor(),
+                reserved_until_ms,
+            ) };
+        }
+
+        const base_ms = @max(
+            @max(raw_realtime_ms, state.securityFloor()),
+            reserved_until_ms,
+        );
+        const target_ms = std.math.add(
+            u64,
+            base_ms,
+            durable_oper_security_horizon_window_ms,
+        ) catch return .{ .preadmission = .exhausted };
+
+        var prepared = state.prepareSecurityTimeReservation(raw_realtime_ms, target_ms) catch |err| return switch (err) {
+            error.OutOfMemory => .{ .preadmission = .out_of_memory },
+            error.CapacityExceeded, error.BoundsExceeded => .{ .preadmission = .capacity },
+            error.PreparedMutationActive => .{ .preadmission = .busy },
+            error.GenerationExhausted, error.ReservationOverflow => .{ .preadmission = .exhausted },
+            error.ReservationNotExtended => .{ .preadmission = .invalid_record },
+            error.StateDestroyed => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .fatal_state };
+            },
+            error.StateUnavailable => .unavailable,
+            else => .{ .preadmission = .store_failure },
+        };
+        defer prepared.update.abort();
+        if (!state.overlayPreparedSecurityAnchors(projected.boot_effective_ms, projected.effective_ms)) {
+            self.markDurableOperUnavailableLocked(state);
+            return .{ .restart_required = .fatal_state };
+        }
+
+        var durable_put = self.store.preparePut(
+            .props,
+            durable_oper_authority.snapshot_key,
+            prepared.update.snapshot(),
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => .{ .preadmission = .out_of_memory },
+            error.RecordTooLarge => .{ .preadmission = .capacity },
+            error.PreparedMutationActive => .{ .preadmission = .busy },
+            error.SequenceExhausted => .{ .preadmission = .exhausted },
+            error.IoAmbiguous => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .ambiguous_store };
+            },
+            error.StorePoisoned => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .fatal_store };
+            },
+            else => .{ .preadmission = .store_failure },
+        };
+        defer durable_put.abort();
+        durable_put.commit() catch |err| {
+            self.markDurableOperUnavailableLocked(state);
+            return switch (err) {
+                error.IoAmbiguous => .{ .restart_required = .ambiguous_store },
+                else => .{ .restart_required = .fatal_store },
+            };
+        };
+
+        if (!prepared.update.commitIntoChecked(state)) {
+            self.markDurableOperUnavailableLocked(state);
+            return .{ .restart_required = .fatal_state };
+        }
+        return .{ .renewed = durableOperSecurityHorizonCopy(
+            projected.effective_ms,
+            state.securityFloor(),
+            state.securityReservedUntil(),
+        ) };
+    }
+
+    pub const DurableOperTransactionsResult = union(enum) {
+        disabled,
+        unavailable,
+        copied: usize,
+        preadmission: DurableOperPreadmission,
+        restart_required: DurableOperRestartReason,
+    };
+
+    /// Exclusive, allocation-free diagnostic listing of every latest durable
+    /// OCG2 transaction.  Fixed copies only; never a privilege grant.  An
+    /// invariant failure poisons the inactive image.
+    pub fn copyDurableOperTransactions(
+        self: *Services,
+        out: []DurableOperTransactionCopy,
+    ) DurableOperTransactionsResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const state = self.durable_oper_authority_state orelse return .disabled;
+        if (state.destroyed) {
+            self.markDurableOperUnavailableLocked(state);
+            return .{ .restart_required = .fatal_state };
+        }
+        if (!state.servingAvailable() and state.securityTimeAuthorized()) return .unavailable;
+        const copied = state.copyTransactions(out) catch |err| return switch (err) {
+            error.CapacityExceeded => .{ .preadmission = .capacity },
+            error.InvalidRecord => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .fatal_state };
+            },
+        };
+        return .{ .copied = copied };
+    }
+
+    /// Durably allocate an authority-side revision. The revision is returned
+    /// only after the prepared snapshot crosses the store cut; no wire producer
+    /// exists here, preventing precommit transmission by construction.
+    pub fn allocateDurableOperRevision(self: *Services, account: []const u8) DurableOperRevisionOutcome {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const state = self.durable_oper_authority_state orelse return .disabled;
+        if (!state.servingAvailable()) return .unavailable;
+        var prepared = state.prepareRevision(account) catch |err| return switch (err) {
+            error.OutOfMemory => .{ .preadmission = .out_of_memory },
+            error.CapacityExceeded, error.BoundsExceeded => .{ .preadmission = .capacity },
+            error.PreparedMutationActive => .{ .preadmission = .busy },
+            error.GenerationExhausted => .{ .preadmission = .exhausted },
+            error.StateDestroyed => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .fatal_state };
+            },
+            else => .{ .preadmission = .invalid_record },
+        };
+        defer prepared.update.abort();
+        var durable_put = self.store.preparePut(.props, durable_oper_authority.snapshot_key, prepared.update.snapshot()) catch |err| return switch (err) {
+            error.OutOfMemory => .{ .preadmission = .out_of_memory },
+            error.RecordTooLarge => .{ .preadmission = .capacity },
+            error.PreparedMutationActive => .{ .preadmission = .busy },
+            error.SequenceExhausted => .{ .preadmission = .exhausted },
+            error.IoAmbiguous => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .ambiguous_store };
+            },
+            error.StorePoisoned => blk: {
+                self.markDurableOperUnavailableLocked(state);
+                break :blk .{ .restart_required = .fatal_store };
+            },
+            else => .{ .preadmission = .store_failure },
+        };
+        defer durable_put.abort();
+        durable_put.commit() catch |err| {
+            self.markDurableOperUnavailableLocked(state);
+            return switch (err) {
+                error.IoAmbiguous => .{ .restart_required = .ambiguous_store },
+                else => .{ .restart_required = .fatal_store },
+            };
+        };
+        const revision = prepared.revision;
+        if (!prepared.update.commitIntoChecked(state)) {
+            self.markDurableOperUnavailableLocked(state);
+            return .{ .restart_required = .fatal_state };
+        }
+        return .{ .committed = revision };
+    }
+
+    pub const DurableOperAuthorityMatch = enum {
+        disabled,
+        unavailable,
+        mismatch,
+        ready,
+    };
+
+    /// Exact public-tuple + reservation match for the inactive durable
+    /// authority. Ready requires attachment, serving availability, an
+    /// authorized security reservation, and a constant-time full public-key
+    /// match together with the short-id. This is not a privilege grant.
+    pub fn matchDurableOperAuthority(
+        self: *Services,
+        expected: durable_oper_authority.Config,
+    ) DurableOperAuthorityMatch {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const state = self.durable_oper_authority_state orelse return .disabled;
+        if (!state.servingAvailable() or !state.securityTimeAuthorized()) return .unavailable;
+        if (expected.authority_node_id == 0) return .mismatch;
+        const actual = state.authority();
+        const node_ok = actual.authority_node_id == expected.authority_node_id;
+        const key_ok = std.crypto.timing_safe.eql(
+            @TypeOf(actual.authority_pubkey),
+            actual.authority_pubkey,
+            expected.authority_pubkey,
+        );
+        if (!node_ok or !key_ok) return .mismatch;
+        return .ready;
+    }
+
+    /// One-way exclusive poison of durable operator authority. Advances the
+    /// availability epoch. There is no matching re-enable on this process.
+    pub fn failClosedDurableOperAuthority(self: *Services) void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const state = self.durable_oper_authority_state orelse return;
+        self.markDurableOperUnavailableLocked(state);
+    }
+
+    pub const DurableDeviceFactPreadmission = enum {
+        out_of_memory,
+        invalid_fact,
+        capacity,
+        busy,
+        exhausted,
+        store_failure,
+    };
+
+    pub const DurableDeviceFactRestart = enum {
+        ambiguous_store,
+        fatal_store,
+        fatal_state,
+    };
+
+    pub const DurableDeviceFactKeyTransparency = enum {
+        disabled,
+        recorded,
+        unavailable,
+    };
+
+    pub const DurableDeviceFactOutcome = union(enum) {
+        disabled,
+        stale,
+        replay,
+        equivocation,
+        preadmission: DurableDeviceFactPreadmission,
+        committed: struct {
+            key_transparency: DurableDeviceFactKeyTransparency,
+        },
+        restart_required: DurableDeviceFactRestart,
+    };
+
+    /// Commit one locally-authored `e2ee.device.*` fact across the DPROP1
+    /// in-memory image and its sole OroStore snapshot row.
+    ///
+    /// All fallible DPROP allocations and OroStore reservations happen before
+    /// the durable cut. A successful prepared-store commit is immediately
+    /// followed by the allocation-free DPROP swap. An ambiguous store result
+    /// is never retried here: the poisoned store must be reopened so WAL replay
+    /// decides whether the candidate crossed the durability boundary. The
+    /// exact-fact key-transparency append is observational and best-effort.
+    pub fn commitLocalDurableDeviceFact(
+        self: *Services,
+        event: entity_prop_event.EntityPropEvent,
+    ) DurableDeviceFactOutcome {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const state = self.durable_credential_props_state orelse return .disabled;
+        const canonical = canonicalAccount(event.entity) catch return .{ .preadmission = .invalid_fact };
+        if (!std.mem.eql(u8, event.entity, canonical.asSlice()) or
+            !std.mem.eql(u8, event.owner, canonical.asSlice()))
+        {
+            return .{ .preadmission = .invalid_fact };
+        }
+        const prepared_outcome = state.prepare(event) catch |err| return switch (err) {
+            error.OutOfMemory => .{ .preadmission = .out_of_memory },
+            error.CapacityExceeded, error.BoundsExceeded => .{ .preadmission = .capacity },
+            error.PreparedMutationActive => .{ .preadmission = .busy },
+            error.GenerationExhausted => .{ .preadmission = .exhausted },
+            error.StateDestroyed, error.StateMismatch, error.PreparedAlreadyConsumed => .{ .restart_required = .fatal_state },
+            else => .{ .preadmission = .invalid_fact },
+        };
+
+        var update = switch (prepared_outcome) {
+            .stale => return .stale,
+            .replay => return .replay,
+            .equivocation => return .equivocation,
+            .update => |prepared| prepared,
+        };
+        defer update.abort();
+
+        var durable_put = self.store.preparePut(
+            .props,
+            durable_credential_props.store_key,
+            update.snapshot(),
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => .{ .preadmission = .out_of_memory },
+            error.RecordTooLarge => .{ .preadmission = .capacity },
+            error.PreparedMutationActive => .{ .preadmission = .busy },
+            error.SequenceExhausted => .{ .preadmission = .exhausted },
+            error.IoAmbiguous => .{ .restart_required = .ambiguous_store },
+            error.StorePoisoned => .{ .restart_required = .fatal_store },
+            else => .{ .preadmission = .store_failure },
+        };
+        defer durable_put.abort();
+
+        durable_put.commit() catch |err| return switch (err) {
+            error.IoAmbiguous => .{ .restart_required = .ambiguous_store },
+            else => .{ .restart_required = .fatal_store },
+        };
+        update.commitInto(state);
+
+        const kt_status: DurableDeviceFactKeyTransparency = if (self.key_transparency == null)
+            .disabled
+        else if (self.commitKeyTransparencyHashed(
+            event.entity,
+            .e2ee_device,
+            if (event.present) .bind else .delete,
+            event.key[e2ee_policy.device_prop_prefix.len..],
+            key_transparency.factObservationHash(.{
+                .account = event.entity,
+                .kind = .e2ee_device,
+                .action = if (event.present) .bind else .delete,
+                .key_id = event.key[e2ee_policy.device_prop_prefix.len..],
+                .hlc = event.hlc,
+                .origin_node = event.origin_node,
+                .origin_pubkey = event.origin_pubkey,
+            }, event.value),
+            key_transparency.observationTimestampMs(event.hlc),
+        ))
+            .recorded
+        else |_|
+            .unavailable;
+
+        return .{ .committed = .{ .key_transparency = kt_status } };
     }
 
     pub const KeyTransparencyStatus = struct {
         enabled: bool,
+        /// False when the durable log is attached but restore failed closed.
+        available: bool = true,
+        /// Always observational / node-local until durable PROP state exists.
+        semantics: []const u8 = "observational",
+        scope: []const u8 = "node-local",
         entries: usize = 0,
         root: key_transparency.Hash = @splat(0),
     };
@@ -469,14 +1753,17 @@ pub const Services = struct {
         }
     };
 
-    /// Return the current credential transparency root/size for status surfaces.
+    /// Return the observational log root/size for status surfaces. This is
+    /// not current/authoritative credential state.
     pub fn keyTransparencyStatus(self: *Services) KeyTransparencyStatus {
         self.lock.lockShared();
         defer self.lock.unlockShared();
 
         const log = self.key_transparency orelse return .{ .enabled = false };
+        if (log.unusable) return .{ .enabled = true, .available = false };
         return .{
             .enabled = true,
+            .available = true,
             .entries = log.len(),
             .root = log.root(),
         };
@@ -484,7 +1771,7 @@ pub const Services = struct {
 
     /// Copy an inclusion proof for `position` into caller-owned memory. The
     /// returned snapshot is stable after the services lock releases.
-    pub fn keyTransparencyProof(self: *Services, allocator: std.mem.Allocator, position: usize) (std.mem.Allocator.Error || error{ Disabled, IndexOutOfRange })!KeyTransparencyProofSnapshot {
+    pub fn keyTransparencyProof(self: *Services, allocator: std.mem.Allocator, position: usize) (std.mem.Allocator.Error || error{ Disabled, Unavailable, IndexOutOfRange })!KeyTransparencyProofSnapshot {
         self.lock.lockShared();
         defer self.lock.unlockShared();
 
@@ -492,6 +1779,7 @@ pub const Services = struct {
         var proof = log.proof(position) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.IndexOutOfRange => return error.IndexOutOfRange,
+            error.Unavailable => return error.Unavailable,
         };
         defer proof.deinit(log.tree.allocator);
 
@@ -514,12 +1802,108 @@ pub const Services = struct {
         };
     }
 
-    /// Append a transparency event for a credential stored outside the account
-    /// service's own credential tables (for example signed E2EE/identity user
-    /// PROP state). The account is canonicalized under the same services lock
-    /// as certfp and WebAuthn events. Logging remains best-effort to preserve the
-    /// existing mutation contract used by all credential families.
-    pub fn recordExternalKeyTransparencyEvent(
+    pub const KeyTransparencyEventSnapshot = struct {
+        position: usize,
+        size: usize,
+        root: key_transparency.Hash,
+        event: key_transparency.OwnedEvent,
+    };
+
+    pub const KeyTransparencyDeviceSnapshot = struct {
+        position: usize,
+        size: usize,
+        root: key_transparency.Hash,
+        /// Latest observed action (`bind` / `delete`). Not current/bound state.
+        observation: key_transparency.ObservedAction,
+        event: key_transparency.OwnedEvent,
+    };
+
+    pub const KeyTransparencyRecordError = key_transparency.CodecError || key_transparency_store.StoreError || error{
+        InvalidName,
+        Unavailable,
+    };
+
+    /// Copy the immutable event body at `position`. The snapshot does not
+    /// include raw credential material — only the canonical account, kind,
+    /// action, key id, material hash, timestamp, and leaf hash.
+    pub fn keyTransparencyEvent(
+        self: *Services,
+        position: usize,
+    ) error{ Disabled, Unavailable, IndexOutOfRange }!KeyTransparencyEventSnapshot {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const log = self.key_transparency orelse return error.Disabled;
+        const event = log.eventAt(position) catch |err| switch (err) {
+            error.Unavailable => return error.Unavailable,
+            error.IndexOutOfRange => return error.IndexOutOfRange,
+        };
+        return .{
+            .position = position,
+            .size = log.len(),
+            .root = log.root(),
+            .event = event,
+        };
+    }
+
+    /// Latest observed E2EE-device action for the server-canonical account.
+    /// Observational / node-local: not current, bound, or authoritative.
+    pub fn keyTransparencyDevice(
+        self: *Services,
+        account: []const u8,
+        device_id: []const u8,
+    ) error{ Disabled, Unavailable, InvalidName, InvalidKeyId, NotFound }!KeyTransparencyDeviceSnapshot {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const log = self.key_transparency orelse return error.Disabled;
+        const canonical = accountKey(account) catch return error.InvalidName;
+        const found = log.latestDeviceObservation(canonical.asSlice(), device_id) catch |err| switch (err) {
+            error.Unavailable => return error.Unavailable,
+            error.InvalidAccount => return error.InvalidName,
+            error.InvalidKeyId => return error.InvalidKeyId,
+        };
+        const row = found orelse return error.NotFound;
+        return .{
+            .position = row.position,
+            .size = log.len(),
+            .root = log.root(),
+            .observation = row.observation,
+            .event = row.event,
+        };
+    }
+
+    /// Exact durable-checkpoint comparison for `old_size`. O(1) `kt1:c:<size>`
+    /// lookup; never reallocates a prefix under this lock. Missing/corrupt
+    /// checkpoints fail closed. This is not a compact MMR consistency proof.
+    pub fn keyTransparencyConsistency(
+        self: *Services,
+        old_size: usize,
+    ) (key_transparency.ConsistencyError || error{Disabled})!key_transparency.PrefixComparison {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const log = self.key_transparency orelse return error.Disabled;
+        if (log.unusable) return error.Unavailable;
+        if (old_size > log.len()) return error.SizeAhead;
+        if (old_size == 0) return log.compareCheckpoint(0, null);
+        const loaded = key_transparency_store.loadCheckpoint(self.store, old_size) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unavailable => return error.Unavailable,
+            else => return error.Corrupt,
+        };
+        const row = loaded orelse return error.UnknownCheckpoint;
+        return log.compareCheckpoint(old_size, .{
+            .root = row.root,
+            .last_leaf = row.last_leaf,
+        });
+    }
+
+    /// Best-effort observational append. PROP/mesh callers must not treat
+    /// failure as a mutation rollback. A durable miss marks the log unusable.
+    /// `material` is hashed for binds. Deletes hash the canonical tombstone
+    /// fact identity (`hlc` + origin), never fabricated current state.
+    pub fn observeKeyTransparencyEvent(
         self: *Services,
         account: []const u8,
         kind: key_transparency.CredentialKind,
@@ -528,11 +1912,75 @@ pub const Services = struct {
         material: []const u8,
         timestamp_ms: i64,
     ) void {
+        self.observeKeyTransparencyFact(
+            account,
+            kind,
+            action,
+            key_id,
+            material,
+            timestamp_ms,
+            null,
+        );
+    }
+
+    pub const ObservationOrigin = struct {
+        hlc: u64,
+        origin_node: u64,
+        origin_pubkey: []const u8 = &.{},
+    };
+
+    pub fn observeKeyTransparencyFact(
+        self: *Services,
+        account: []const u8,
+        kind: key_transparency.CredentialKind,
+        action: key_transparency.Action,
+        key_id: []const u8,
+        material: []const u8,
+        timestamp_ms: i64,
+        origin: ?ObservationOrigin,
+    ) void {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
         const canonical = accountKey(account) catch return;
-        self.recordKeyTransparency(
+        const key_hash = observationFactHash(
+            canonical.asSlice(),
+            kind,
+            action,
+            key_id,
+            material,
+            origin,
+        );
+        self.commitKeyTransparencyHashed(
+            canonical.asSlice(),
+            kind,
+            action,
+            key_id,
+            key_hash,
+            timestamp_ms,
+        ) catch {};
+    }
+
+    /// Append an observational event for a credential stored outside the
+    /// account service's own tables (signed E2EE/identity user PROP facts).
+    /// Exact event identity is the canonical digest; a replay of the same
+    /// bytes is a no-op. Failure is returned for explicit callers/tests.
+    /// Local PROP mutations must use `observeKeyTransparencyEvent` and must
+    /// not roll back a successful prop write.
+    pub fn recordExternalKeyTransparencyEvent(
+        self: *Services,
+        account: []const u8,
+        kind: key_transparency.CredentialKind,
+        action: key_transparency.Action,
+        key_id: []const u8,
+        material: []const u8,
+        timestamp_ms: i64,
+    ) KeyTransparencyRecordError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const canonical = accountKey(account) catch return error.InvalidName;
+        try self.commitKeyTransparency(
             canonical.asSlice(),
             kind,
             action,
@@ -2787,6 +4235,28 @@ pub const Services = struct {
         }
     }
 
+    fn observationFactHash(
+        account: []const u8,
+        kind: key_transparency.CredentialKind,
+        action: key_transparency.Action,
+        key_id: []const u8,
+        material: []const u8,
+        origin: ?ObservationOrigin,
+    ) key_transparency.Hash {
+        if (origin) |src| {
+            return key_transparency.factObservationHash(.{
+                .account = account,
+                .kind = kind,
+                .action = action,
+                .key_id = key_id,
+                .hlc = src.hlc,
+                .origin_node = src.origin_node,
+                .origin_pubkey = src.origin_pubkey,
+            }, material);
+        }
+        return key_transparency.materialHash(material);
+    }
+
     fn recordKeyTransparency(
         self: *Services,
         account: []const u8,
@@ -2796,15 +4266,59 @@ pub const Services = struct {
         material: []const u8,
         timestamp_ms: i64,
     ) void {
+        self.commitKeyTransparency(account, kind, action, key_id, material, timestamp_ms) catch {};
+    }
+
+    fn commitKeyTransparency(
+        self: *Services,
+        account: []const u8,
+        kind: key_transparency.CredentialKind,
+        action: key_transparency.Action,
+        key_id: []const u8,
+        material: []const u8,
+        timestamp_ms: i64,
+    ) KeyTransparencyRecordError!void {
+        return self.commitKeyTransparencyHashed(
+            account,
+            kind,
+            action,
+            key_id,
+            key_transparency.materialHash(material),
+            timestamp_ms,
+        );
+    }
+
+    fn commitKeyTransparencyHashed(
+        self: *Services,
+        account: []const u8,
+        kind: key_transparency.CredentialKind,
+        action: key_transparency.Action,
+        key_id: []const u8,
+        key_hash: key_transparency.Hash,
+        timestamp_ms: i64,
+    ) KeyTransparencyRecordError!void {
         const log = self.key_transparency orelse return;
-        _ = log.append(.{
-            .account = account,
+        if (log.unusable) return error.Unavailable;
+        const canonical = accountKey(account) catch return error.InvalidName;
+        const event = key_transparency.Event{
+            .account = canonical.asSlice(),
             .kind = kind,
             .action = action,
             .key_id = key_id,
-            .key_hash = key_transparency.materialHash(material),
+            .key_hash = key_hash,
             .timestamp_ms = timestamp_ms,
-        }) catch {};
+        };
+        const owned = try key_transparency.ownedFromEvent(event);
+        if (log.hasDigest(owned.leaf)) return;
+        const result = try log.appendOwned(owned);
+        if (result.duplicate) return;
+        key_transparency_store.commit(self.store, result.position, owned, result.root) catch |err| {
+            // Observational: do not roll back a recorded observation. Durable
+            // miss makes the log unavailable rather than inventing a successful
+            // undo of a mutation the caller may already have applied.
+            log.unusable = true;
+            return err;
+        };
     }
 
     /// Fail-closed authentication gate: whether `account` must be denied every
@@ -3070,6 +4584,13 @@ fn accountKey(input: []const u8) ServiceError!AccountName {
     }
     out.len = @intCast(input.len);
     return out;
+}
+
+/// Canonicalize an account exactly as account storage, SCRAM provisioning, and
+/// service authentication do. Daemon admission paths use this instead of
+/// growing a second, subtly different account-name policy.
+pub fn canonicalAccount(input: []const u8) ServiceError!AccountName {
+    return accountKey(input);
 }
 
 fn channelKey(input: []const u8) ServiceError!ChannelName {
@@ -3433,6 +4954,364 @@ fn sameBytes(comptime len: usize, a: *const [len]u8, b: *const [len]u8) bool {
 
 fn openTestStore(tmp: std.testing.TmpDir, name: []const u8) !OroStore {
     return OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, name);
+}
+
+fn durableServicesEvent(
+    seed_byte: u8,
+    account: []const u8,
+    key: []const u8,
+    hlc: u64,
+    present: bool,
+    value: []const u8,
+) !entity_prop_event.EntityPropEvent {
+    return durableServicesEventWithOwner(seed_byte, account, account, key, hlc, present, value);
+}
+
+fn durableServicesEventWithOwner(
+    seed_byte: u8,
+    account: []const u8,
+    owner: []const u8,
+    key: []const u8,
+    hlc: u64,
+    present: bool,
+    value: []const u8,
+) !entity_prop_event.EntityPropEvent {
+    var kp = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(seed_byte)));
+    defer kp.deinit();
+    const public_key = kp.public_key;
+    var event = entity_prop_event.EntityPropEvent{
+        .present = present,
+        .kind = .user,
+        .origin_node = entity_prop_event.originShortId(public_key),
+        .hlc = hlc,
+        .entity = account,
+        .key = key,
+        .value = value,
+        .owner = owner,
+    };
+    const transcript = try entity_prop_event.originTranscript(std.testing.allocator, event);
+    defer std.testing.allocator.free(transcript);
+    const signature = try kp.signCtx(entity_prop_event.sign_domain, transcript);
+    event.origin_pubkey = try std.testing.allocator.dupe(u8, &public_key);
+    errdefer std.testing.allocator.free(event.origin_pubkey);
+    event.origin_sig = try std.testing.allocator.dupe(u8, &signature);
+    return event;
+}
+
+fn freeDurableServicesEvent(event: entity_prop_event.EntityPropEvent) void {
+    std.testing.allocator.free(event.origin_pubkey);
+    std.testing.allocator.free(event.origin_sig);
+}
+
+test "DPROP Services canonical account uses service account policy" {
+    const canonical = try canonicalAccount("Alice.EXAMPLE-1");
+    try std.testing.expectEqualStrings("alice.example-1", canonical.asSlice());
+    try std.testing.expectError(error.InvalidName, canonicalAccount("bad account"));
+}
+
+test "DPROP Services durable commit survives OroStore reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const event = try durableServicesEvent(0x81, "alice", "e2ee.device.phone", 51, true, "mls-x25519:abcd+/=");
+    defer freeDurableServicesEvent(event);
+    const config = durable_credential_props.Config{ .local_origin_node = event.origin_node };
+
+    {
+        var store = try openTestStore(tmp, "services-dprop-reopen.wal");
+        defer store.deinit();
+        var state = try durable_credential_props.State.init(std.testing.allocator, config);
+        defer state.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = Services.init(&store, null);
+        services.attachDurableCredentialProps(&state);
+        services.attachKeyTransparencyLog(&kt);
+
+        const committed = services.commitLocalDurableDeviceFact(event);
+        switch (committed) {
+            .committed => |result| try std.testing.expectEqual(
+                Services.DurableDeviceFactKeyTransparency.recorded,
+                result.key_transparency,
+            ),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.count());
+        try std.testing.expectEqualStrings(
+            state.snapshot(),
+            store.family(.props).get(durable_credential_props.store_key) orelse return error.TestUnexpectedResult,
+        );
+    }
+
+    {
+        var store = try openTestStore(tmp, "services-dprop-reopen.wal");
+        defer store.deinit();
+        const image = store.family(.props).get(durable_credential_props.store_key) orelse return error.TestUnexpectedResult;
+        var restored = try durable_credential_props.decode(std.testing.allocator, config, image);
+        defer restored.deinit();
+        try std.testing.expectEqual(@as(usize, 1), restored.count());
+        try std.testing.expectEqual(@as(u64, 51), restored.maxHlc());
+        try std.testing.expectEqualStrings(
+            "mls-x25519:abcd+/=",
+            restored.get("alice", "e2ee.device.phone").?.value,
+        );
+    }
+}
+
+test "DPROP Services precommit rejection is inert and reservations clean up" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-dprop-preadmit.wal");
+    defer store.deinit();
+    const event = try durableServicesEvent(0x82, "alice", "e2ee.device.phone", 61, true, "mls-x25519:abcd+/=");
+    defer freeDurableServicesEvent(event);
+    const mismatched_owner = try durableServicesEventWithOwner(
+        0x82,
+        "alice",
+        "mallory",
+        "e2ee.device.phone",
+        60,
+        true,
+        "mls-x25519:abcd+/=",
+    );
+    defer freeDurableServicesEvent(mismatched_owner);
+    var state = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = event.origin_node });
+    defer state.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+    services.attachKeyTransparencyLog(&kt);
+
+    const owner_rejected = services.commitLocalDurableDeviceFact(mismatched_owner);
+    try std.testing.expectEqual(
+        Services.DurableDeviceFactPreadmission.invalid_fact,
+        owner_rejected.preadmission,
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.count());
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expect(store.family(.props).get(durable_credential_props.store_key) == null);
+
+    var invalid = event;
+    invalid.key = "STATUS";
+    const rejected = services.commitLocalDurableDeviceFact(invalid);
+    try std.testing.expectEqual(
+        Services.DurableDeviceFactPreadmission.invalid_fact,
+        rejected.preadmission,
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.count());
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expect(store.family(.props).get(durable_credential_props.store_key) == null);
+
+    const committed = services.commitLocalDurableDeviceFact(event);
+    try std.testing.expect(committed == .committed);
+    try std.testing.expectEqual(
+        Services.DurableDeviceFactKeyTransparency.recorded,
+        committed.committed.key_transparency,
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.count());
+    try std.testing.expect(services.commitLocalDurableDeviceFact(event) == .replay);
+    try std.testing.expectEqual(@as(usize, 1), state.count());
+}
+
+test "DPROP Services ambiguous prepared write requires reopen without publishing state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const event = try durableServicesEvent(0x83, "alice", "e2ee.device.phone", 71, true, "mls-x25519:abcd+/=");
+    defer freeDurableServicesEvent(event);
+    const config = durable_credential_props.Config{ .local_origin_node = event.origin_node };
+
+    {
+        var store = try openTestStore(tmp, "services-dprop-ambiguous.wal");
+        defer store.deinit();
+        var state = try durable_credential_props.State.init(std.testing.allocator, config);
+        defer state.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = Services.init(&store, null);
+        services.attachDurableCredentialProps(&state);
+        services.attachKeyTransparencyLog(&kt);
+        store.setPreparedIoFault(.{ .sync = true });
+
+        const outcome = services.commitLocalDurableDeviceFact(event);
+        try std.testing.expectEqual(
+            Services.DurableDeviceFactRestart.ambiguous_store,
+            outcome.restart_required,
+        );
+        try std.testing.expect(store.preparedWritesPoisoned());
+        try std.testing.expectEqual(@as(usize, 0), state.count());
+        try std.testing.expectEqual(@as(usize, 0), kt.len());
+        try std.testing.expect(store.family(.props).get(durable_credential_props.store_key) == null);
+        const second = services.commitLocalDurableDeviceFact(event);
+        try std.testing.expectEqual(
+            Services.DurableDeviceFactRestart.fatal_store,
+            second.restart_required,
+        );
+        try std.testing.expectEqual(@as(usize, 0), state.count());
+        try std.testing.expectEqual(@as(usize, 0), kt.len());
+    }
+
+    {
+        var store = try openTestStore(tmp, "services-dprop-ambiguous.wal");
+        defer store.deinit();
+        const image = store.family(.props).get(durable_credential_props.store_key) orelse return error.TestUnexpectedResult;
+        var restored = try durable_credential_props.decode(std.testing.allocator, config, image);
+        defer restored.deinit();
+        try std.testing.expectEqual(@as(usize, 1), restored.count());
+        try std.testing.expectEqualStrings("alice", restored.factAt(0).?.entity);
+    }
+}
+
+test "DPROP Services failed and torn prepared writes reopen absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const event = try durableServicesEvent(0x85, "alice", "e2ee.device.phone", 91, true, "mls-x25519:abcd+/=");
+    defer freeDurableServicesEvent(event);
+    const config = durable_credential_props.Config{ .local_origin_node = event.origin_node };
+    const cases = [_]struct {
+        wal_name: []const u8,
+        fault: store_mod.PreparedIoFault,
+    }{
+        .{ .wal_name = "services-dprop-write-failed.wal", .fault = .{ .write = .failed } },
+        .{ .wal_name = "services-dprop-write-short.wal", .fault = .{ .write = .short } },
+    };
+
+    for (cases) |case| {
+        {
+            var store = try openTestStore(tmp, case.wal_name);
+            defer store.deinit();
+            var state = try durable_credential_props.State.init(std.testing.allocator, config);
+            defer state.deinit();
+            var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+            defer kt.deinit();
+            var services = Services.init(&store, null);
+            services.attachDurableCredentialProps(&state);
+            services.attachKeyTransparencyLog(&kt);
+            store.setPreparedIoFault(case.fault);
+
+            const outcome = services.commitLocalDurableDeviceFact(event);
+            try std.testing.expectEqual(
+                Services.DurableDeviceFactRestart.ambiguous_store,
+                outcome.restart_required,
+            );
+            try std.testing.expect(store.preparedWritesPoisoned());
+            try std.testing.expectEqual(@as(usize, 0), state.count());
+            try std.testing.expectEqual(@as(usize, 0), kt.len());
+            try std.testing.expect(store.family(.props).get(durable_credential_props.store_key) == null);
+            const second = services.commitLocalDurableDeviceFact(event);
+            try std.testing.expectEqual(
+                Services.DurableDeviceFactRestart.fatal_store,
+                second.restart_required,
+            );
+        }
+
+        var reopened = try openTestStore(tmp, case.wal_name);
+        defer reopened.deinit();
+        try std.testing.expect(reopened.family(.props).get(durable_credential_props.store_key) == null);
+    }
+}
+
+test "DPROP Services failed prepared overwrite preserves old snapshot on reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const old_event = try durableServicesEvent(0x87, "alice", "e2ee.device.phone", 110, true, "mls-x25519:old+/=");
+    defer freeDurableServicesEvent(old_event);
+    const new_event = try durableServicesEvent(0x87, "alice", "e2ee.device.phone", 111, true, "mls-x25519:new+/=");
+    defer freeDurableServicesEvent(new_event);
+    const config = durable_credential_props.Config{ .local_origin_node = old_event.origin_node };
+
+    {
+        var store = try openTestStore(tmp, "services-dprop-write-failed-old.wal");
+        defer store.deinit();
+        var state = try durable_credential_props.State.init(std.testing.allocator, config);
+        defer state.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = Services.init(&store, null);
+        services.attachDurableCredentialProps(&state);
+        services.attachKeyTransparencyLog(&kt);
+        try std.testing.expect(services.commitLocalDurableDeviceFact(old_event) == .committed);
+        try std.testing.expectEqual(@as(usize, 1), kt.len());
+
+        store.setPreparedIoFault(.{ .write = .failed });
+        const outcome = services.commitLocalDurableDeviceFact(new_event);
+        try std.testing.expectEqual(
+            Services.DurableDeviceFactRestart.ambiguous_store,
+            outcome.restart_required,
+        );
+        try std.testing.expectEqualStrings(
+            "mls-x25519:old+/=",
+            state.get("alice", "e2ee.device.phone").?.value,
+        );
+        try std.testing.expectEqual(@as(usize, 1), kt.len());
+    }
+
+    var reopened = try openTestStore(tmp, "services-dprop-write-failed-old.wal");
+    defer reopened.deinit();
+    const image = reopened.family(.props).get(durable_credential_props.store_key) orelse return error.TestUnexpectedResult;
+    var restored = try durable_credential_props.decode(std.testing.allocator, config, image);
+    defer restored.deinit();
+    try std.testing.expectEqualStrings(
+        "mls-x25519:old+/=",
+        restored.get("alice", "e2ee.device.phone").?.value,
+    );
+}
+
+test "DPROP Services undersized store rejection is inert and unpoisoned" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try OroStore.openWithConfig(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "services-dprop-too-small.wal",
+        .{ .max_record_bytes = 16 },
+    );
+    defer store.deinit();
+    const event = try durableServicesEvent(0x86, "alice", "e2ee.device.phone", 101, true, "mls-x25519:abcd+/=");
+    defer freeDurableServicesEvent(event);
+    var state = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = event.origin_node });
+    defer state.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+    services.attachKeyTransparencyLog(&kt);
+
+    const outcome = services.commitLocalDurableDeviceFact(event);
+    try std.testing.expectEqual(
+        Services.DurableDeviceFactPreadmission.capacity,
+        outcome.preadmission,
+    );
+    try std.testing.expect(!store.preparedWritesPoisoned());
+    try std.testing.expectEqual(@as(usize, 0), state.count());
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expect(store.family(.props).get(durable_credential_props.store_key) == null);
+}
+
+test "DPROP Services key transparency failure cannot roll back durable fact" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-dprop-kt-failure.wal");
+    defer store.deinit();
+    const event = try durableServicesEvent(0x84, "alice", "e2ee.device.phone", 81, true, "mls-x25519:abcd+/=");
+    defer freeDurableServicesEvent(event);
+    var state = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = event.origin_node });
+    defer state.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+    services.attachKeyTransparencyLog(&kt);
+    kt.unusable = true;
+
+    const outcome = services.commitLocalDurableDeviceFact(event);
+    try std.testing.expectEqual(
+        Services.DurableDeviceFactKeyTransparency.unavailable,
+        outcome.committed.key_transparency,
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.count());
+    try std.testing.expect(store.family(.props).get(durable_credential_props.store_key) != null);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
 }
 
 test "register and identify account" {
@@ -4089,7 +5968,7 @@ test "certfp list and delete enforce account ownership" {
     try std.testing.expect(services.accountForCertfp(fp_alice) == null);
 }
 
-test "key transparency log records certfp and passkey binding changes" {
+test "KEYTRANS log records certfp and passkey binding changes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try openTestStore(tmp, "services-key-transparency.wal");
@@ -4132,7 +6011,7 @@ test "key transparency log records certfp and passkey binding changes" {
     try std.testing.expectError(error.IndexOutOfRange, services.keyTransparencyProof(std.testing.allocator, 99));
 }
 
-test "key transparency log records external E2EE device and identity changes" {
+test "KEYTRANS log records external E2EE device and identity changes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try openTestStore(tmp, "services-key-transparency-external.wal");
@@ -4142,7 +6021,7 @@ test "key transparency log records external E2EE device and identity changes" {
     var services = Services.init(&store, null);
     services.attachKeyTransparencyLog(&kt);
 
-    services.recordExternalKeyTransparencyEvent(
+    try services.recordExternalKeyTransparencyEvent(
         "Alice",
         .e2ee_device,
         .bind,
@@ -4150,7 +6029,7 @@ test "key transparency log records external E2EE device and identity changes" {
         "mls-x25519:device-public-key",
         10,
     );
-    services.recordExternalKeyTransparencyEvent(
+    try services.recordExternalKeyTransparencyEvent(
         "ALICE",
         .identity,
         .delete,
@@ -4178,6 +6057,282 @@ test "key transparency log records external E2EE device and identity changes" {
         1,
         kt.len(),
     ));
+}
+
+test "KEYTRANS store restores events across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openTestStore(tmp, "services-kt-restart.wal");
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        try services.recordExternalKeyTransparencyEvent("Alice", .e2ee_device, .bind, "phone", "v1", 10);
+        try services.recordExternalKeyTransparencyEvent("Alice", .e2ee_device, .delete, "phone", "v1", 20);
+        try std.testing.expectEqual(@as(usize, 2), kt.len());
+    }
+
+    var store = try openTestStore(tmp, "services-kt-restart.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+
+    const ev = try services.keyTransparencyEvent(0);
+    try std.testing.expectEqualStrings("alice", ev.event.account());
+    try std.testing.expectEqual(key_transparency.CredentialKind.e2ee_device, ev.event.kind);
+    try std.testing.expectEqual(key_transparency.Action.bind, ev.event.action);
+    try std.testing.expectEqualStrings("phone", ev.event.keyId());
+    try std.testing.expectEqualSlices(u8, &key_transparency.materialHash("v1"), &ev.event.key_hash);
+    try std.testing.expectEqualSlices(u8, &key_transparency.eventDigest(ev.event.asEvent()), &ev.event.leaf);
+
+    const device = try services.keyTransparencyDevice("ALICE", "phone");
+    try std.testing.expectEqual(key_transparency.Action.delete, device.observation);
+    try std.testing.expectEqual(@as(usize, 1), device.position);
+    try std.testing.expectError(error.NotFound, services.keyTransparencyDevice("alice", "missing"));
+
+    const cmp = try services.keyTransparencyConsistency(1);
+    try std.testing.expectEqual(key_transparency.PrefixStatus.match, cmp.prefix);
+    try std.testing.expectEqual(@as(usize, 1), cmp.old_size);
+    try std.testing.expectEqual(@as(usize, 2), cmp.size);
+}
+
+test "KEYTRANS add then delete lookup and unknown device" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-kt-device.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+
+    try std.testing.expectError(error.NotFound, services.keyTransparencyDevice("alice", "phone"));
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "phone", "pub", 1);
+    const bound = try services.keyTransparencyDevice("alice", "phone");
+    try std.testing.expectEqual(key_transparency.Action.bind, bound.observation);
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .delete, "phone", "pub", 2);
+    const deleted = try services.keyTransparencyDevice("alice", "phone");
+    try std.testing.expectEqual(key_transparency.Action.delete, deleted.observation);
+}
+
+test "KEYTRANS unusable store fails required E2EE records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-kt-unusable.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "phone", "pub", 1);
+
+    var ev_key: [key_transparency_store.event_key_len]u8 = undefined;
+    try store.family(.props).put(key_transparency_store.eventKey(0, &ev_key), "junk");
+
+    var kt2 = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt2.deinit();
+    var services2 = Services.init(&store, null);
+    services2.attachKeyTransparencyLog(&kt2);
+    try std.testing.expect(kt2.unusable);
+    try std.testing.expectError(
+        error.Unavailable,
+        services2.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "tablet", "pub", 2),
+    );
+    try std.testing.expectEqual(@as(usize, 0), kt2.len());
+}
+
+test "KEYTRANS consistency missing checkpoint is UNKNOWN_CHECKPOINT" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-kt-unknown-ckpt.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    _ = try kt.append(.{
+        .account = "alice",
+        .kind = .e2ee_device,
+        .action = .bind,
+        .key_id = "phone",
+        .key_hash = key_transparency.materialHash("pub"),
+        .timestamp_ms = 1,
+    });
+    try std.testing.expectError(error.UnknownCheckpoint, services.keyTransparencyConsistency(1));
+    const empty = try services.keyTransparencyConsistency(0);
+    try std.testing.expectEqual(key_transparency.PrefixStatus.match, empty.prefix);
+}
+
+test "KEYTRANS consistency corrupt checkpoint is CORRUPT" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-kt-corrupt-ckpt.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "phone", "pub", 1);
+
+    var ckpt_key: [key_transparency_store.checkpoint_key_len]u8 = undefined;
+    try store.family(.props).put(key_transparency_store.checkpointKey(1, &ckpt_key), "junk");
+    try std.testing.expectError(error.Corrupt, services.keyTransparencyConsistency(1));
+}
+
+test "KEYTRANS observe is best-effort when log is unusable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-kt-observe-best-effort.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "phone", "pub", 1);
+    var ev_key: [key_transparency_store.event_key_len]u8 = undefined;
+    try store.family(.props).put(key_transparency_store.eventKey(0, &ev_key), "junk");
+
+    var kt2 = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt2.deinit();
+    var services2 = Services.init(&store, null);
+    services2.attachKeyTransparencyLog(&kt2);
+    try std.testing.expect(kt2.unusable);
+    services2.observeKeyTransparencyEvent("alice", .e2ee_device, .bind, "tablet", "pub", 2);
+    try std.testing.expectEqual(@as(usize, 0), kt2.len());
+    try std.testing.expect(kt2.unusable);
+}
+
+test "KEYTRANS replay of the same observational event does not grow the log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-kt-replay.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "phone", "pub", 77);
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "phone", "pub", 77);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+}
+
+test "KEYTRANS accepted facts with origin use exact identity for bind and delete" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-kt-fact-id.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+
+    const origin_a = Services.ObservationOrigin{ .hlc = 50, .origin_node = 1, .origin_pubkey = "pk1" };
+    const origin_b = Services.ObservationOrigin{ .hlc = 50, .origin_node = 2, .origin_pubkey = "pk2" };
+    services.observeKeyTransparencyFact("Alice", .e2ee_device, .bind, "phone", "mat", 50, origin_a);
+    services.observeKeyTransparencyFact("Alice", .e2ee_device, .bind, "phone", "mat", 50, origin_a);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+    services.observeKeyTransparencyFact("Alice", .e2ee_device, .bind, "phone", "mat", 50, origin_b);
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+    services.observeKeyTransparencyFact("Alice", .e2ee_device, .delete, "phone", "", 50, origin_a);
+    try std.testing.expectEqual(@as(usize, 3), kt.len());
+    services.observeKeyTransparencyFact("Alice", .e2ee_device, .delete, "phone", "", 50, origin_a);
+    try std.testing.expectEqual(@as(usize, 3), kt.len());
+
+    const expected_bind = key_transparency.factObservationHash(.{
+        .account = "alice",
+        .kind = .e2ee_device,
+        .action = .bind,
+        .key_id = "phone",
+        .hlc = 50,
+        .origin_node = 1,
+        .origin_pubkey = "pk1",
+    }, "mat");
+    try std.testing.expectEqualSlices(u8, &expected_bind, &(try kt.eventAt(0)).key_hash);
+    const expected_del = key_transparency.factObservationHash(.{
+        .account = "alice",
+        .kind = .e2ee_device,
+        .action = .delete,
+        .key_id = "phone",
+        .hlc = 50,
+        .origin_node = 1,
+        .origin_pubkey = "pk1",
+    }, "");
+    try std.testing.expectEqualSlices(u8, &expected_del, &(try kt.eventAt(2)).key_hash);
+}
+
+test "KEYTRANS cold restart keeps different-origin facts distinct" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wal_name = "services-kt-origin-restart.wal";
+    {
+        var store = try openTestStore(tmp, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        services.observeKeyTransparencyFact("alice", .e2ee_device, .bind, "phone", "mat", 9, .{
+            .hlc = 9,
+            .origin_node = 1,
+            .origin_pubkey = "a",
+        });
+        try std.testing.expectEqual(@as(usize, 1), kt.len());
+    }
+    var store = try openTestStore(tmp, wal_name);
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+    services.observeKeyTransparencyFact("alice", .e2ee_device, .bind, "phone", "mat", 9, .{
+        .hlc = 9,
+        .origin_node = 2,
+        .origin_pubkey = "b",
+    });
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+    services.observeKeyTransparencyFact("alice", .e2ee_device, .bind, "phone", "mat", 9, .{
+        .hlc = 9,
+        .origin_node = 1,
+        .origin_pubkey = "a",
+    });
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+}
+
+test "KEYTRANS local certfp records still hash material only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-kt-certfp-material.wal");
+    defer store.deinit();
+    var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+    defer binds.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachCertfpBinds(&binds);
+    services.attachKeyTransparencyLog(&kt);
+    const fp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try services.bindCertfp("alice", fp);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+    try std.testing.expectEqualSlices(u8, &key_transparency.materialHash(fp), &(try kt.eventAt(0)).key_hash);
+}
+
+test "KEYTRANS observe without origin keeps material hash for bind" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-kt-no-origin.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    services.observeKeyTransparencyEvent("alice", .identity, .bind, "primary", "pub", 3);
+    try std.testing.expectEqualSlices(u8, &key_transparency.materialHash("pub"), &(try kt.eventAt(0)).key_hash);
 }
 
 test "webauthn bind/lookup/list/delete round-trip" {
@@ -5141,4 +7296,2470 @@ test "Services concurrent account writers and readers preserve account records" 
             try std.testing.expectEqualStrings("thread@example.test", info.account_info.email.asSlice());
         }
     }
+}
+
+const Ocg2ProvMtCtx = struct {
+    services: *Services,
+    successor_wire: []const u8,
+    failures: *std.atomic.Value(u32),
+    result: oper_session_provenance.DurableOperLookup = .absent,
+
+    fn writer(ctx: *Ocg2ProvMtCtx) void {
+        switch (ctx.services.commitDurableOperRecord(ctx.successor_wire, 2_001)) {
+            .committed => {},
+            else => _ = ctx.failures.fetchAdd(1, .monotonic),
+        }
+    }
+
+    fn reader(ctx: *Ocg2ProvMtCtx) void {
+        for (0..32) |_| {
+            const lookup = ctx.services.inspectDurableOperAuthority("alice", 2_001);
+            switch (lookup) {
+                .active => |grant| {
+                    if (!std.mem.eql(u8, grant.account(), "alice") or
+                        !(std.mem.eql(u8, grant.title(), "Initial") or std.mem.eql(u8, grant.title(), "Successor")))
+                        _ = ctx.failures.fetchAdd(1, .monotonic);
+                },
+                else => _ = ctx.failures.fetchAdd(1, .monotonic),
+            }
+            // Keep the last copied result in caller-owned inline storage.  The
+            // writer may replace the durable record concurrently; no borrowed
+            // state slice is allowed to escape inspectDurableOperAuthority.
+            ctx.result = lookup;
+        }
+    }
+};
+
+fn markDurableOperUnavailableAfterCopy(ctx: *anyopaque) void {
+    const services: *Services = @ptrCast(@alignCast(ctx));
+    services.markDurableOperUnavailableForTest();
+}
+
+fn signOcg2RaceWire(
+    kp: std.crypto.sign.Ed25519.KeyPair,
+    authority: durable_oper_authority.Config,
+    account: []const u8,
+    revision: u64,
+    kind: oper_cred_share.Ocg2Kind,
+    title: []const u8,
+    issued_ms: u64,
+    expiry_ms: u64,
+    out: []u8,
+) ![]const u8 {
+    return out[0..try oper_cred_share.signOcg2(kp, .{
+        .kind = kind,
+        .account = account,
+        .revision = revision,
+        .privilege_bits = if (kind == .grant) 1 << 3 else 0,
+        .class = if (kind == .grant) "moderator" else "",
+        .title = if (kind == .grant) title else "",
+        .authority_node_id = authority.authority_node_id,
+        .authority_pubkey = authority.authority_pubkey,
+        .issued_ms = issued_ms,
+        .expiry_ms = if (kind == .grant) expiry_ms else 0,
+    }, issued_ms, out)];
+}
+
+const Ocg2AfterCopyAction = enum {
+    successor,
+    tombstone,
+    equivocation,
+    unrelated_account,
+    two_successors,
+};
+
+const Ocg2AfterCopyRaceCtx = struct {
+    services: *Services,
+    action: Ocg2AfterCopyAction,
+    wires: [2][]const u8,
+    calls: usize = 0,
+
+    fn hook(ctx: *anyopaque) void {
+        const self: *Ocg2AfterCopyRaceCtx = @ptrCast(@alignCast(ctx));
+        defer self.calls += 1;
+        switch (self.action) {
+            .two_successors => if (self.calls < 2) {
+                _ = self.services.commitDurableOperRecord(self.wires[self.calls], 1_000);
+            },
+            else => if (self.calls == 0) {
+                _ = self.services.commitDurableOperRecord(self.wires[0], 1_000);
+            },
+        }
+    }
+
+    fn asHook(self: *Ocg2AfterCopyRaceCtx) AfterCopyHook {
+        return .{ .callback = hook, .context = self };
+    }
+};
+
+test "OCG2PROV Services copied lookup races a later merge without borrowed slices" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xB2)));
+    const public_key = kp.public_key.toBytes();
+    const authority_config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2prov-race.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, authority_config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_wire: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .grant,
+        .account = "alice",
+        .revision = 1,
+        .privilege_bits = 1 << 3,
+        .class = "moderator",
+        .title = "Initial",
+        .authority_node_id = authority_config.authority_node_id,
+        .authority_pubkey = authority_config.authority_pubkey,
+        .issued_ms = 1_000,
+        .expiry_ms = 6_000,
+    }, 1_000, &initial_wire);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial_wire[0..initial_len], 1_000));
+
+    var successor_wire: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const successor_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .grant,
+        .account = "alice",
+        .revision = 2,
+        .privilege_bits = 1 << 3,
+        .class = "moderator",
+        .title = "Successor",
+        .authority_node_id = authority_config.authority_node_id,
+        .authority_pubkey = authority_config.authority_pubkey,
+        .issued_ms = 2_001,
+        .expiry_ms = 7_000,
+    }, 2_001, &successor_wire);
+    var failures = std.atomic.Value(u32).init(0);
+    var ctx = Ocg2ProvMtCtx{
+        .services = &services,
+        .successor_wire = successor_wire[0..successor_len],
+        .failures = &failures,
+    };
+    var reader = try std.Thread.spawn(.{}, Ocg2ProvMtCtx.reader, .{&ctx});
+    var writer = try std.Thread.spawn(.{}, Ocg2ProvMtCtx.writer, .{&ctx});
+    reader.join();
+    writer.join();
+
+    try std.testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+    switch (ctx.result) {
+        .active => |grant| {
+            try std.testing.expectEqualStrings("alice", grant.account());
+            try std.testing.expect(std.mem.eql(u8, grant.title(), "Initial") or std.mem.eql(u8, grant.title(), "Successor"));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // The detached copy remains readable after the writer has committed its
+    // successor, proving that no state-owned slice escaped the locked read.
+    const final = services.inspectDurableOperAuthority("alice", 2_001);
+    switch (final) {
+        .active => |grant| try std.testing.expectEqualStrings("Successor", grant.title()),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (ctx.result) {
+        .active => |grant| try std.testing.expect(std.mem.eql(u8, grant.title(), "Initial") or std.mem.eql(u8, grant.title(), "Successor")),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "OCG2PROV Services detached lookup observes unavailable transition after copy" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xB3)));
+    const public_key = kp.public_key.toBytes();
+    const authority_config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2prov-unavailable-race.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, authority_config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var wire: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const wire_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .grant,
+        .account = "alice",
+        .revision = 1,
+        .privilege_bits = 1 << 3,
+        .class = "moderator",
+        .title = "Initial",
+        .authority_node_id = authority_config.authority_node_id,
+        .authority_pubkey = authority_config.authority_pubkey,
+        .issued_ms = 1_000,
+        .expiry_ms = 6_000,
+    }, 1_000, &wire);
+    try std.testing.expectEqual(
+        Services.DurableOperMergeOutcome.committed,
+        services.commitDurableOperRecord(wire[0..wire_len], 1_000),
+    );
+
+    const result = services.inspectDurableOperAuthorityInner(
+        "alice",
+        1_000,
+        .{ .callback = markDurableOperUnavailableAfterCopy, .context = &services },
+    );
+    try std.testing.expectEqual(oper_session_provenance.DurableOperLookup.unavailable, result);
+    try std.testing.expect(!state.servingAvailable());
+    try std.testing.expectEqual(@as(u64, 1), services.durable_oper_availability_epoch);
+}
+
+test "OCG2PROV post-copy same-account successor never returns predecessor" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xC1)));
+    const public_key = kp.public_key.toBytes();
+    const authority = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2-race-successor.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, authority);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial = try signOcg2RaceWire(kp, authority, "alice", 1, .grant, "Initial", 1_000, 6_000, &initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial, 1_000));
+    var successor_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const successor = try signOcg2RaceWire(kp, authority, "alice", 2, .grant, "Successor", 1_000, 7_000, &successor_buf);
+    var race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .successor, .wires = .{ successor, "" } };
+
+    const lookup = services.inspectDurableOperAuthorityInner("alice", 1_000, race.asHook());
+    switch (lookup) {
+        .active => |grant| {
+            try std.testing.expectEqualStrings("Successor", grant.title());
+            try std.testing.expectEqual(@as(u64, 2), grant.revision);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 2), race.calls);
+    try std.testing.expectEqual(@as(u64, 2), state.latest("alice").?.revision);
+}
+
+test "OCG2PROV post-copy same-account tombstone never returns predecessor" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xC2)));
+    const public_key = kp.public_key.toBytes();
+    const authority = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2-race-tombstone.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, authority);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial = try signOcg2RaceWire(kp, authority, "alice", 1, .grant, "Initial", 1_000, 6_000, &initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial, 1_000));
+    var tombstone_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const tombstone = try signOcg2RaceWire(kp, authority, "alice", 2, .tombstone, "", 1_000, 0, &tombstone_buf);
+    var race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .tombstone, .wires = .{ tombstone, "" } };
+
+    const lookup = services.inspectDurableOperAuthorityInner("alice", 1_000, race.asHook());
+    try std.testing.expectEqual(oper_session_provenance.DurableOperLookup.tombstone, lookup);
+    try std.testing.expectEqual(@as(usize, 1), race.calls);
+    try std.testing.expectEqual(oper_cred_share.Ocg2Kind.tombstone, state.latest("alice").?.kind);
+}
+
+test "OCG2PROV post-copy same-revision equivocation never returns predecessor" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xC3)));
+    const public_key = kp.public_key.toBytes();
+    const authority = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2-race-equivocation.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, authority);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial = try signOcg2RaceWire(kp, authority, "alice", 1, .grant, "Initial", 1_000, 6_000, &initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial, 1_000));
+    var conflict_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const conflict = try signOcg2RaceWire(kp, authority, "alice", 1, .grant, "Conflict", 1_000, 6_000, &conflict_buf);
+    var race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .equivocation, .wires = .{ conflict, "" } };
+
+    const lookup = services.inspectDurableOperAuthorityInner("alice", 1_000, race.asHook());
+    try std.testing.expectEqual(oper_session_provenance.DurableOperLookup.equivocation, lookup);
+    try std.testing.expectEqual(@as(usize, 1), race.calls);
+    try std.testing.expect(state.latest("alice").?.equivocation);
+}
+
+test "OCG2PROV post-copy unrelated-account merge may preserve predecessor" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xC4)));
+    const public_key = kp.public_key.toBytes();
+    const authority = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2-race-unrelated.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, authority);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial = try signOcg2RaceWire(kp, authority, "alice", 1, .grant, "Initial", 1_000, 6_000, &initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial, 1_000));
+    var bob_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const bob = try signOcg2RaceWire(kp, authority, "bob", 1, .grant, "Bob", 1_000, 6_000, &bob_buf);
+    var race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .unrelated_account, .wires = .{ bob, "" } };
+
+    const lookup = services.inspectDurableOperAuthorityInner("alice", 1_000, race.asHook());
+    switch (lookup) {
+        .active => |grant| {
+            try std.testing.expectEqualStrings("Initial", grant.title());
+            try std.testing.expectEqual(@as(u64, 1), grant.revision);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), race.calls);
+    try std.testing.expectEqual(@as(u64, 1), state.latest("bob").?.revision);
+}
+
+test "OCG2PROV post-copy second same-account instability fails unavailable" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xC5)));
+    const public_key = kp.public_key.toBytes();
+    const authority = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2-race-unstable.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, authority);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial = try signOcg2RaceWire(kp, authority, "alice", 1, .grant, "Initial", 1_000, 6_000, &initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial, 1_000));
+    var successor_one_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const successor_one = try signOcg2RaceWire(kp, authority, "alice", 2, .grant, "Successor One", 1_000, 6_000, &successor_one_buf);
+    var successor_two_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const successor_two = try signOcg2RaceWire(kp, authority, "alice", 3, .grant, "Successor Two", 1_000, 6_000, &successor_two_buf);
+    var race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .two_successors, .wires = .{ successor_one, successor_two } };
+
+    const lookup = services.inspectDurableOperAuthorityInner("alice", 1_000, race.asHook());
+    try std.testing.expectEqual(oper_session_provenance.DurableOperLookup.unavailable, lookup);
+    try std.testing.expectEqual(@as(usize, 2), race.calls);
+    try std.testing.expectEqual(@as(u64, 3), state.latest("alice").?.revision);
+}
+
+test "OCG2AUTH Services durable commit revision restart and ambiguous poison" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xA1)));
+    const public_key = kp.public_key.toBytes();
+    const authority_config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var wire_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const wire_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .grant,
+        .account = "alice",
+        .revision = 1,
+        .privilege_bits = 1 << 3,
+        .class = "moderator",
+        .title = "Moderator",
+        .authority_node_id = authority_config.authority_node_id,
+        .authority_pubkey = authority_config.authority_pubkey,
+        .issued_ms = 1000,
+        .expiry_ms = 5000,
+    }, 1000, &wire_buf);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openTestStore(tmp, "services-ocg2auth.wal");
+        defer store.deinit();
+        var state = try durable_oper_authority.State.init(std.testing.allocator, authority_config);
+        defer state.deinit();
+        var services = Services.init(&store, null);
+        services.attachDurableOperAuthorityForTest(&state);
+        try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(wire_buf[0..wire_len], 1000));
+        const revision = services.allocateDurableOperRevision("alice");
+        switch (revision) {
+            .committed => |value| try std.testing.expectEqual(@as(u64, 2), value),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    {
+        var reopened = try openTestStore(tmp, "services-ocg2auth.wal");
+        defer reopened.deinit();
+        const image = reopened.get(.props, durable_oper_authority.snapshot_key) orelse return error.TestUnexpectedResult;
+        var restored = try durable_oper_authority.decode(std.testing.allocator, authority_config, image);
+        defer restored.deinit();
+        var next = try restored.prepareRevision("alice");
+        defer next.update.abort();
+        try std.testing.expectEqual(@as(u64, 3), next.revision);
+    }
+
+    var poison_store = try openTestStore(tmp, "services-ocg2auth-poison.wal");
+    defer poison_store.deinit();
+    var poison_state = try durable_oper_authority.State.init(std.testing.allocator, authority_config);
+    defer poison_state.deinit();
+    var poisoned_services = Services.init(&poison_store, null);
+    poisoned_services.attachDurableOperAuthorityForTest(&poison_state);
+    poison_store.setPreparedIoFault(.{ .sync = true });
+    const ambiguous = poisoned_services.commitDurableOperRecord(wire_buf[0..wire_len], 1000);
+    switch (ambiguous) {
+        .restart_required => |reason| try std.testing.expectEqual(Services.DurableOperRestart.ambiguous_store, reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!poison_state.servingAvailable());
+    try std.testing.expect(poison_state.effective("alice", 1000) == null);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.unavailable, poisoned_services.commitDurableOperRecord(wire_buf[0..wire_len], 1000));
+
+    var constrained_store = try store_mod.OroStore.openWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "services-ocg2auth-capacity.wal", .{
+        .max_record_bytes = 64,
+    });
+    defer constrained_store.deinit();
+    var constrained_state = try durable_oper_authority.State.init(std.testing.allocator, authority_config);
+    defer constrained_state.deinit();
+    var constrained_services = Services.init(&constrained_store, null);
+    constrained_services.attachDurableOperAuthorityForTest(&constrained_state);
+    const rejected = constrained_services.commitDurableOperRecord(wire_buf[0..wire_len], 1000);
+    switch (rejected) {
+        .preadmission => |reason| try std.testing.expectEqual(Services.DurableOperPreadmission.capacity, reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 0), constrained_state.count());
+    try std.testing.expect(constrained_state.servingAvailable());
+    try std.testing.expect(constrained_store.get(.props, durable_oper_authority.snapshot_key) == null);
+}
+
+test "OCG2AUTH Services activation requires exact durable image and rejects unavailable duplicate receiver" {
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xA5)));
+    const public_key = kp.public_key.toBytes();
+    const authority_config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2-activation.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority_boot.initialize(std.testing.allocator, &store, authority_config);
+    defer state.deinit();
+
+    var services = Services.init(&store, null);
+    try services.activateDurableOperAuthority(&state);
+    try std.testing.expectError(error.AlreadyActive, services.activateDurableOperAuthority(&state));
+    switch (services.reserveDurableOperSecurityTime(1_000, 5_000)) {
+        .committed => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var unavailable = try durable_oper_authority_boot.load(std.testing.allocator, &store, authority_config);
+    defer unavailable.deinit();
+    unavailable.markUnavailable();
+    var unavailable_services = Services.init(&store, null);
+    try std.testing.expectError(
+        error.AuthorityUnavailable,
+        unavailable_services.activateDurableOperAuthority(&unavailable),
+    );
+
+    var other_store = try openTestStore(tmp, "services-ocg2-receiver-empty.wal");
+    defer other_store.deinit();
+    var receiver_services = Services.init(&other_store, null);
+    try std.testing.expectError(
+        error.MissingDurableMarker,
+        receiver_services.activateDurableOperAuthority(&state),
+    );
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.disabled, receiver_services.commitDurableOperRecord("", 0));
+}
+
+test "OCG2PROV Services copied lookup classifies lifecycle and survives later merge" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xB1)));
+    const public_key = kp.public_key.toBytes();
+    const authority_config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2prov.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, authority_config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+
+    try std.testing.expectEqual(oper_session_provenance.DurableOperLookup.disabled, services.inspectDurableOperAuthority("alice", 1000));
+    services.attachDurableOperAuthorityForTest(&state);
+    try std.testing.expectEqual(oper_session_provenance.DurableOperLookup.absent, services.inspectDurableOperAuthority("alice", 1000));
+
+    var future_wire: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const future_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .grant,
+        .account = "alice",
+        .revision = 1,
+        .privilege_bits = 1 << 3,
+        .class = "moderator",
+        .title = "Future",
+        .authority_node_id = authority_config.authority_node_id,
+        .authority_pubkey = authority_config.authority_pubkey,
+        .issued_ms = 2000,
+        .expiry_ms = 5000,
+    }, 1000, &future_wire);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(future_wire[0..future_len], 1000));
+    try std.testing.expectEqual(oper_session_provenance.DurableOperLookup.not_yet_valid, services.inspectDurableOperAuthority("alice", 1000));
+    const copied = services.inspectDurableOperAuthority("alice", 2000);
+    switch (copied) {
+        .active => |grant| {
+            try std.testing.expectEqualStrings("alice", grant.account());
+            try std.testing.expectEqualStrings("Future", grant.title());
+            try std.testing.expectEqual(@as(u64, 1), grant.revision);
+            try std.testing.expectEqual(@as(u64, 2000), grant.issued_ms);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(oper_session_provenance.DurableOperLookup.expired, services.inspectDurableOperAuthority("alice", 5000));
+
+    var successor_wire: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const successor_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .grant,
+        .account = "alice",
+        .revision = 2,
+        .privilege_bits = 1 << 3,
+        .class = "moderator",
+        .title = "Successor",
+        .authority_node_id = authority_config.authority_node_id,
+        .authority_pubkey = authority_config.authority_pubkey,
+        .issued_ms = 2001,
+        .expiry_ms = 6000,
+    }, 2001, &successor_wire);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(successor_wire[0..successor_len], 2001));
+    switch (copied) {
+        .active => |grant| try std.testing.expectEqualStrings("Future", grant.title()),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var tombstone_wire: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const tombstone_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .tombstone,
+        .account = "bob",
+        .revision = 1,
+        .privilege_bits = 0,
+        .class = "",
+        .title = "",
+        .authority_node_id = authority_config.authority_node_id,
+        .authority_pubkey = authority_config.authority_pubkey,
+        .issued_ms = 2000,
+        .expiry_ms = 0,
+    }, 2000, &tombstone_wire);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(tombstone_wire[0..tombstone_len], 2000));
+    try std.testing.expectEqual(oper_session_provenance.DurableOperLookup.tombstone, services.inspectDurableOperAuthority("bob", 2000));
+}
+
+test "OCG2CLOCK Services reservation cut rollback restart and boundary" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xD1)));
+    const public_key = kp.public_key.toBytes();
+    const config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "services-ocg2clock.wal");
+        var state = try durable_oper_authority.State.init(std.testing.allocator, config);
+        var services = Services.init(&store, null);
+        defer state.deinit();
+        services.attachInactiveDurableOperAuthorityForTest(&state);
+
+        try std.testing.expectEqual(Services.DurableOperSecurityNow.unavailable, services.durableOperSecurityNow(1_000, 0));
+        switch (services.reserveDurableOperSecurityTime(1_000, 5_000)) {
+            .committed => |until| try std.testing.expectEqual(@as(u64, 5_000), until),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.durableOperSecurityNow(1_000, 0)) {
+            .now => |effective| try std.testing.expectEqual(@as(u64, 1_000), effective),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.durableOperSecurityNow(1_000, 1)) {
+            .now => |effective| try std.testing.expectEqual(@as(u64, 1_001), effective),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.durableOperSecurityNow(900, 2)) {
+            .now => |effective| try std.testing.expectEqual(@as(u64, 1_002), effective),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.durableOperSecurityNow(1_000, 4_000)) {
+            .now => |effective| try std.testing.expectEqual(@as(u64, 5_000), effective),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqual(Services.DurableOperSecurityNow.unavailable, services.durableOperSecurityNow(1_000, 4_001));
+        try std.testing.expectEqual(Services.DurableOperSecurityNow.unavailable, services.durableOperSecurityNow(5_001, 0));
+        switch (services.reserveDurableOperSecurityTime(1_000, 4_999)) {
+            .preadmission => |reason| try std.testing.expectEqual(Services.DurableOperPreadmission.invalid_record, reason),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqual(@as(u64, 5_000), state.securityReservedUntil());
+
+        store.setPreparedIoFault(.{ .sync = true });
+        switch (services.reserveDurableOperSecurityTime(1_000, 6_000)) {
+            .restart_required => |reason| try std.testing.expectEqual(Services.DurableOperRestart.ambiguous_store, reason),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expect(!state.servingAvailable());
+        try std.testing.expectEqual(@as(u64, 5_000), state.securityReservedUntil());
+        store.deinit();
+    }
+
+    var reopened = try openTestStore(tmp, "services-ocg2clock.wal");
+    defer reopened.deinit();
+    const snapshot = reopened.get(.props, durable_oper_authority.snapshot_key) orelse return error.TestUnexpectedResult;
+    var restored = try durable_oper_authority.decode(std.testing.allocator, config, snapshot);
+    defer restored.deinit();
+    try std.testing.expect(restored.servingAvailable());
+    // The ambiguous sync may have crossed the store cut.  Recovery trusts WAL
+    // replay rather than the unavailable in-memory predecessor and therefore
+    // restores the candidate horizon if it was durable.
+    try std.testing.expectEqual(@as(u64, 6_000), restored.securityReservedUntil());
+    var restored_services = Services.init(&reopened, null);
+    restored_services.attachDurableOperAuthorityForTest(&restored);
+    switch (restored_services.durableOperSecurityNow(1_000, 0)) {
+        .now => |effective| try std.testing.expectEqual(@as(u64, 6_000), effective),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(Services.DurableOperSecurityNow.unavailable, restored_services.durableOperSecurityNow(1_000, 1));
+    // A restart begins at the last durable horizon.  Reserving the next window
+    // preserves that boot anchor in memory while advancing the next restart's
+    // durable floor.
+    switch (restored_services.reserveDurableOperSecurityTime(1_000, 9_000)) {
+        .committed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (restored_services.durableOperSecurityNow(1_000, 1)) {
+        .now => |effective| try std.testing.expectEqual(@as(u64, 6_001), effective),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "OCG2CLOCK reservation write short and sync ambiguity resolve only by reopen" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xD3)));
+    const public_key = kp.public_key.toBytes();
+    const config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    const cases = [_]struct {
+        name: []const u8,
+        fault: store_mod.PreparedIoFault,
+        candidate_replays: bool,
+    }{
+        .{ .name = "ocg2clock-write-failed.wal", .fault = .{ .write = .failed }, .candidate_replays = false },
+        .{ .name = "ocg2clock-write-short.wal", .fault = .{ .write = .short }, .candidate_replays = false },
+        .{ .name = "ocg2clock-sync.wal", .fault = .{ .sync = true }, .candidate_replays = true },
+    };
+
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var store = try openTestStore(tmp, case.name);
+            var state = try durable_oper_authority_boot.initialize(std.testing.allocator, &store, config);
+            defer state.deinit();
+            var services = Services.init(&store, null);
+            try services.activateDurableOperAuthority(&state);
+            store.setPreparedIoFault(case.fault);
+            switch (services.reserveDurableOperSecurityTime(1_000, 5_000)) {
+                .restart_required => |reason| try std.testing.expectEqual(Services.DurableOperRestart.ambiguous_store, reason),
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expect(!state.servingAvailable());
+            try std.testing.expectEqual(@as(u64, 0), state.securityReservedUntil());
+            try std.testing.expectEqual(@as(u64, 1), services.durable_oper_availability_epoch);
+            store.deinit();
+        }
+
+        var reopened = try openTestStore(tmp, case.name);
+        defer reopened.deinit();
+        var restored = try durable_oper_authority_boot.load(std.testing.allocator, &reopened, config);
+        defer restored.deinit();
+        if (case.candidate_replays) {
+            try std.testing.expect(restored.servingAvailable());
+            try std.testing.expect(restored.securityTimeAuthorized());
+            try std.testing.expectEqual(@as(u64, 5_000), restored.securityFloor());
+            try std.testing.expectEqual(@as(u64, 5_000), restored.securityReservedUntil());
+        } else {
+            try std.testing.expect(!restored.servingAvailable());
+            try std.testing.expect(!restored.securityTimeAuthorized());
+            try std.testing.expectEqual(@as(u64, 0), restored.securityFloor());
+            try std.testing.expectEqual(@as(u64, 0), restored.securityReservedUntil());
+        }
+    }
+}
+
+test "OCG2CLOCK security time max u64 boundary and overflow fail closed" {
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xD4)));
+    const public_key = kp.public_key.toBytes();
+    const config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2clock-max.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachInactiveDurableOperAuthorityForTest(&state);
+    const max = std.math.maxInt(u64);
+    switch (services.reserveDurableOperSecurityTime(max - 2, max)) {
+        .committed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (services.durableOperSecurityNow(max - 2, 0)) {
+        .now => |value| try std.testing.expectEqual(max - 2, value),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (services.durableOperSecurityNow(max - 3, 1)) {
+        .now => |value| try std.testing.expectEqual(max - 1, value),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (services.durableOperSecurityNow(max - 3, 2)) {
+        .now => |value| try std.testing.expectEqual(max, value),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(Services.DurableOperSecurityNow.unavailable, services.durableOperSecurityNow(max - 3, 3));
+
+    var fresh = try durable_oper_authority.State.init(std.testing.allocator, config);
+    defer fresh.deinit();
+    var fresh_services = Services.init(&store, null);
+    fresh_services.attachInactiveDurableOperAuthorityForTest(&fresh);
+    switch (fresh_services.reserveDurableOperSecurityTime(max, max)) {
+        .preadmission => |reason| try std.testing.expectEqual(Services.DurableOperPreadmission.exhausted, reason),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "OCG2CLOCK full reservation cut is allocation-failure atomic" {
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xD5)));
+    const public_key = kp.public_key.toBytes();
+    const config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, cfg: durable_oper_authority.Config) !void {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var store = try store_mod.OroStore.openWithConfig(
+                allocator,
+                std.testing.io,
+                tmp.dir,
+                "services-ocg2clock-alloc.wal",
+                .{},
+            );
+            defer store.deinit();
+            var state = try durable_oper_authority_boot.initialize(allocator, &store, cfg);
+            defer state.deinit();
+            var services = Services.init(&store, null);
+            try services.activateDurableOperAuthority(&state);
+            switch (services.reserveDurableOperSecurityTime(1_000, 5_000)) {
+                .committed => {},
+                .preadmission => |reason| if (reason == .out_of_memory) return error.OutOfMemory else return error.TestUnexpectedResult,
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expectEqual(@as(u64, 5_000), state.securityFloor());
+            try std.testing.expectEqual(@as(u64, 5_000), state.securityReservedUntil());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{config});
+}
+
+test "OCG2TXN Services copied active terminal identities are exact and canonical" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xD2)));
+    const public_key = kp.public_key.toBytes();
+    const config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2txn.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    try std.testing.expectEqual(Services.DurableOperTransaction.disabled, services.inspectDurableOperTransaction("alice", 1_000));
+    services.attachDurableOperAuthorityForTest(&state);
+    try std.testing.expectEqual(Services.DurableOperTransaction.absent, services.inspectDurableOperTransaction("alice", 1_000));
+
+    var grant_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const grant_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .grant,
+        .account = "alice",
+        .revision = 1,
+        .privilege_bits = 1 << 3,
+        .class = "moderator",
+        .title = "Exact",
+        .authority_node_id = config.authority_node_id,
+        .authority_pubkey = config.authority_pubkey,
+        .issued_ms = 1_000,
+        .expiry_ms = 5_000,
+    }, 1_000, &grant_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(grant_buf[0..grant_len], 1_000));
+    const grant_wire = grant_buf[0..grant_len];
+    switch (services.inspectDurableOperTransaction("ALICE", 1_000)) {
+        .active => |copy| {
+            try std.testing.expectEqualStrings("alice", copy.account());
+            try std.testing.expectEqual(@as(u64, 1), copy.revision);
+            try std.testing.expectEqual(oper_cred_share.Ocg2Kind.grant, copy.kind);
+            try std.testing.expectEqual(@as(u64, 1_000), copy.issued_ms);
+            try std.testing.expectEqual(@as(u64, 5_000), copy.expiry_ms);
+            try std.testing.expectEqual(config.authority_node_id, copy.authority_node_id);
+            try std.testing.expectEqualSlices(u8, &config.authority_pubkey, &copy.authority_pubkey);
+            var expected_blake3: [durable_oper_authority.digest_len]u8 = undefined;
+            std.crypto.hash.Blake3.hash(grant_wire, &expected_blake3, .{});
+            try std.testing.expectEqualSlices(u8, &expected_blake3, &copy.digest);
+            var expected_sha256: [durable_oper_authority.digest_len]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(grant_wire, &expected_sha256, .{});
+            try std.testing.expectEqualSlices(u8, &expected_sha256, &copy.wire_sha256);
+            try std.testing.expectEqualSlices(u8, grant_wire, copy.signedWire());
+            try std.testing.expect(std.mem.allEqual(u8, &copy.conflict_digest, 0));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var successor_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const successor = try signOcg2RaceWire(kp, config, "alice", 2, .grant, "Successor", 1_000, 6_000, &successor_buf);
+    var stable_race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .successor, .wires = .{ successor, "" } };
+    switch (services.inspectDurableOperTransactionInner("alice", 1_000, stable_race.asHook())) {
+        .active => |copy| {
+            try std.testing.expectEqual(@as(u64, 2), copy.revision);
+            try std.testing.expectEqualStrings("alice", copy.account());
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 2), stable_race.calls);
+
+    var car_initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const car_initial = try signOcg2RaceWire(kp, config, "car", 1, .grant, "Initial", 1_000, 6_000, &car_initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(car_initial, 1_000));
+    var car_successor_one_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const car_successor_one = try signOcg2RaceWire(kp, config, "car", 2, .grant, "One", 1_000, 6_000, &car_successor_one_buf);
+    var car_successor_two_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const car_successor_two = try signOcg2RaceWire(kp, config, "car", 3, .grant, "Two", 1_000, 6_000, &car_successor_two_buf);
+    var unstable_race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .two_successors, .wires = .{ car_successor_one, car_successor_two } };
+    try std.testing.expectEqual(
+        Services.DurableOperTransaction.unavailable,
+        services.inspectDurableOperTransactionInner("car", 1_000, unstable_race.asHook()),
+    );
+    try std.testing.expectEqual(@as(usize, 2), unstable_race.calls);
+    try std.testing.expectEqual(@as(u64, 3), state.latest("car").?.revision);
+
+    var tombstone_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const tombstone_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .tombstone,
+        .account = "alice",
+        .revision = 3,
+        .privilege_bits = 0,
+        .class = "",
+        .title = "",
+        .authority_node_id = config.authority_node_id,
+        .authority_pubkey = config.authority_pubkey,
+        .issued_ms = 1_100,
+        .expiry_ms = 0,
+    }, 1_100, &tombstone_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(tombstone_buf[0..tombstone_len], 1_100));
+    switch (services.inspectDurableOperTransaction("alice", 1_100)) {
+        .tombstone => |copy| {
+            try std.testing.expectEqualStrings("alice", copy.account());
+            try std.testing.expectEqual(oper_cred_share.Ocg2Kind.tombstone, copy.kind);
+            try std.testing.expectEqual(config.authority_node_id, copy.authority_node_id);
+            try std.testing.expectEqualSlices(u8, &config.authority_pubkey, &copy.authority_pubkey);
+            try std.testing.expectEqualSlices(u8, tombstone_buf[0..tombstone_len], copy.signedWire());
+            var tombstone_blake3: [durable_oper_authority.digest_len]u8 = undefined;
+            std.crypto.hash.Blake3.hash(copy.signedWire(), &tombstone_blake3, .{});
+            try std.testing.expectEqualSlices(u8, &tombstone_blake3, &copy.digest);
+            var tombstone_sha256: [durable_oper_authority.digest_len]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(copy.signedWire(), &tombstone_sha256, .{});
+            try std.testing.expectEqualSlices(u8, &tombstone_sha256, &copy.wire_sha256);
+            try std.testing.expect(std.mem.allEqual(u8, &copy.conflict_digest, 0));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var first_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const first_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .grant,
+        .account = "bob",
+        .revision = 1,
+        .privilege_bits = 1 << 3,
+        .class = "moderator",
+        .title = "First",
+        .authority_node_id = config.authority_node_id,
+        .authority_pubkey = config.authority_pubkey,
+        .issued_ms = 1_000,
+        .expiry_ms = 5_000,
+    }, 1_000, &first_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(first_buf[0..first_len], 1_000));
+    var conflict_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const conflict_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .grant,
+        .account = "bob",
+        .revision = 1,
+        .privilege_bits = 1 << 3,
+        .class = "moderator",
+        .title = "Conflict",
+        .authority_node_id = config.authority_node_id,
+        .authority_pubkey = config.authority_pubkey,
+        .issued_ms = 1_000,
+        .expiry_ms = 5_000,
+    }, 1_000, &conflict_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.equivocation_committed, services.commitDurableOperRecord(conflict_buf[0..conflict_len], 1_000));
+    switch (services.inspectDurableOperTransaction("BOB", 1_000)) {
+        .equivocation => |copy| {
+            try std.testing.expectEqualStrings("bob", copy.account());
+            try std.testing.expect(copy.equivocation);
+            try std.testing.expectEqual(config.authority_node_id, copy.authority_node_id);
+            try std.testing.expectEqualSlices(u8, &config.authority_pubkey, &copy.authority_pubkey);
+            try std.testing.expect(!std.mem.allEqual(u8, &copy.conflict_digest, 0));
+            try std.testing.expect(!std.mem.eql(u8, &copy.digest, &copy.conflict_digest));
+            try std.testing.expect(copy.signedWire().len != 0);
+            var stored_blake3: [durable_oper_authority.digest_len]u8 = undefined;
+            std.crypto.hash.Blake3.hash(copy.signedWire(), &stored_blake3, .{});
+            try std.testing.expectEqualSlices(u8, &stored_blake3, &copy.digest);
+            var stored_sha256: [durable_oper_authority.digest_len]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(copy.signedWire(), &stored_sha256, .{});
+            try std.testing.expectEqualSlices(u8, &stored_sha256, &copy.wire_sha256);
+            var first_digest: [durable_oper_authority.digest_len]u8 = undefined;
+            std.crypto.hash.Blake3.hash(first_buf[0..first_len], &first_digest, .{});
+            var conflicting_digest: [durable_oper_authority.digest_len]u8 = undefined;
+            std.crypto.hash.Blake3.hash(conflict_buf[0..conflict_len], &conflicting_digest, .{});
+            const low = if (std.mem.order(u8, &first_digest, &conflicting_digest) == .lt) first_digest else conflicting_digest;
+            const high = if (std.mem.order(u8, &first_digest, &conflicting_digest) == .lt) conflicting_digest else first_digest;
+            try std.testing.expectEqualSlices(u8, &low, &copy.digest);
+            try std.testing.expectEqualSlices(u8, &high, &copy.conflict_digest);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "OCG2ISSUER Services authority match and one-way fail-closed" {
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xE1)));
+    const public_key = kp.public_key.toBytes();
+    const config = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+        .authority_pubkey = public_key,
+    };
+    const other_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xE2)));
+    const other_key = other_kp.public_key.toBytes();
+    const other = durable_oper_authority.Config{
+        .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(other_key)),
+        .authority_pubkey = other_key,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-ocg2issuer-match.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    try std.testing.expectEqual(Services.DurableOperAuthorityMatch.disabled, services.matchDurableOperAuthority(config));
+    services.failClosedDurableOperAuthority();
+    try std.testing.expectEqual(Services.DurableOperAuthorityMatch.disabled, services.matchDurableOperAuthority(config));
+
+    var inactive = try durable_oper_authority.State.init(std.testing.allocator, config);
+    defer inactive.deinit();
+    services.attachInactiveDurableOperAuthorityForTest(&inactive);
+    try std.testing.expectEqual(Services.DurableOperAuthorityMatch.unavailable, services.matchDurableOperAuthority(config));
+    switch (services.reserveDurableOperSecurityTime(1_000, 5_000)) {
+        .committed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(Services.DurableOperAuthorityMatch.ready, services.matchDurableOperAuthority(config));
+    try std.testing.expectEqual(Services.DurableOperAuthorityMatch.mismatch, services.matchDurableOperAuthority(other));
+    try std.testing.expectEqual(Services.DurableOperAuthorityMatch.mismatch, services.matchDurableOperAuthority(.{
+        .authority_node_id = 0,
+        .authority_pubkey = public_key,
+    }));
+    const epoch = services.durable_oper_availability_epoch;
+    services.failClosedDurableOperAuthority();
+    try std.testing.expect(!inactive.servingAvailable());
+    try std.testing.expectEqual(epoch + 1, services.durable_oper_availability_epoch);
+    try std.testing.expectEqual(Services.DurableOperAuthorityMatch.unavailable, services.matchDurableOperAuthority(config));
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.unavailable, services.commitDurableOperRecord("", 1_000));
+    services.failClosedDurableOperAuthority();
+    try std.testing.expectEqual(epoch + 2, services.durable_oper_availability_epoch);
+    try std.testing.expectEqual(Services.DurableOperAuthorityMatch.unavailable, services.matchDurableOperAuthority(config));
+}
+
+const S6c2Horizon = struct {
+    kp: std.crypto.sign.Ed25519.KeyPair,
+    config: durable_oper_authority.Config,
+
+    fn init(seed: u8) !S6c2Horizon {
+        const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(seed)));
+        const public_key = kp.public_key.toBytes();
+        return .{
+            .kp = kp,
+            .config = .{
+                .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+                .authority_pubkey = public_key,
+            },
+        };
+    }
+};
+
+fn expectHorizonCopy(
+    copy: Services.DurableOperSecurityHorizonCopy,
+    effective_ms: u64,
+    floor_ms: u64,
+    reserved_until_ms: u64,
+) !void {
+    try std.testing.expectEqual(effective_ms, copy.effective_now_ms);
+    try std.testing.expectEqual(floor_ms, copy.security_floor_ms);
+    try std.testing.expectEqual(reserved_until_ms, copy.reserved_until_ms);
+    try std.testing.expectEqual(reserved_until_ms - effective_ms, copy.remaining_ms);
+}
+
+test "S6C2 Services horizon constants match the frozen window" {
+    try std.testing.expectEqual(@as(u64, 3_600_000), Services.durable_oper_security_horizon_renewal_threshold_ms);
+    try std.testing.expectEqual(@as(u64, 90_000_000), Services.durable_oper_security_horizon_window_ms);
+    try std.testing.expectEqual(
+        oper_cred_share.ocg2_max_ttl_ms + Services.durable_oper_security_horizon_renewal_threshold_ms,
+        Services.durable_oper_security_horizon_window_ms,
+    );
+}
+
+test "S6C2 Services ensure first use requires zero elapsed then renews the window" {
+    const auth = try S6c2Horizon.init(0xA1);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c2-first.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    try std.testing.expectEqual(Services.DurableOperSecurityHorizonResult.disabled, services.ensureDurableOperSecurityHorizon(1_000, 0));
+
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    services.attachInactiveDurableOperAuthorityForTest(&state);
+    switch (services.ensureDurableOperSecurityHorizon(1_000, 1)) {
+        .preadmission => |reason| try std.testing.expectEqual(Services.DurableOperPreadmission.invalid_record, reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!state.security_clock_started);
+    try std.testing.expectEqual(@as(u64, 0), state.securityReservedUntil());
+    try std.testing.expectEqual(Services.DurableOperSecurityNow.unavailable, services.durableOperSecurityNow(1_000, 0));
+
+    const window = Services.durable_oper_security_horizon_window_ms;
+    switch (services.ensureDurableOperSecurityHorizon(1_000, 0)) {
+        .renewed => |copy| try expectHorizonCopy(copy, 1_000, 1_000 + window, 1_000 + window),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(state.security_clock_started);
+    try std.testing.expectEqual(1_000 + window, state.securityReservedUntil());
+    try std.testing.expectEqual(@as(u64, 1_000), state.security_last_effective_ms);
+    switch (services.ensureDurableOperSecurityHorizon(1_000, 0)) {
+        .current => |copy| try expectHorizonCopy(copy, 1_000, 1_000 + window, 1_000 + window),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(1_000 + window, state.securityReservedUntil());
+}
+
+test "S6C2 Services ensure remaining 1h+1 stays current and 1h below and zero renew" {
+    const auth = try S6c2Horizon.init(0xA2);
+    const threshold = Services.durable_oper_security_horizon_renewal_threshold_ms;
+    const window = Services.durable_oper_security_horizon_window_ms;
+    const raw: u64 = 10_000;
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try openTestStore(tmp, "services-s6c2-plus1.wal");
+        defer store.deinit();
+        var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+        defer state.deinit();
+        var services = Services.init(&store, null);
+        services.attachInactiveDurableOperAuthorityForTest(&state);
+        switch (services.reserveDurableOperSecurityTime(raw, raw + threshold + 1)) {
+            .committed => {},
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.ensureDurableOperSecurityHorizon(raw, 0)) {
+            .current => |copy| try expectHorizonCopy(copy, raw, raw + threshold + 1, raw + threshold + 1),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqual(raw + threshold + 1, state.securityReservedUntil());
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try openTestStore(tmp, "services-s6c2-1h.wal");
+        defer store.deinit();
+        var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+        defer state.deinit();
+        var services = Services.init(&store, null);
+        services.attachInactiveDurableOperAuthorityForTest(&state);
+        switch (services.reserveDurableOperSecurityTime(raw, raw + threshold)) {
+            .committed => {},
+            else => return error.TestUnexpectedResult,
+        }
+        const expected = raw + threshold + window;
+        switch (services.ensureDurableOperSecurityHorizon(raw, 0)) {
+            .renewed => |copy| try expectHorizonCopy(copy, raw, expected, expected),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try openTestStore(tmp, "services-s6c2-below.wal");
+        defer store.deinit();
+        var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+        defer state.deinit();
+        var services = Services.init(&store, null);
+        services.attachInactiveDurableOperAuthorityForTest(&state);
+        switch (services.reserveDurableOperSecurityTime(raw, raw + threshold - 1)) {
+            .committed => {},
+            else => return error.TestUnexpectedResult,
+        }
+        const expected = raw + threshold - 1 + window;
+        switch (services.ensureDurableOperSecurityHorizon(raw, 0)) {
+            .renewed => |copy| try expectHorizonCopy(copy, raw, expected, expected),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try openTestStore(tmp, "services-s6c2-zero.wal");
+        defer store.deinit();
+        var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+        defer state.deinit();
+        var services = Services.init(&store, null);
+        services.attachInactiveDurableOperAuthorityForTest(&state);
+        switch (services.reserveDurableOperSecurityTime(raw, raw + window)) {
+            .committed => {},
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.ensureDurableOperSecurityHorizon(raw, 0)) {
+            .current => |copy| try expectHorizonCopy(copy, raw, raw + window, raw + window),
+            else => return error.TestUnexpectedResult,
+        }
+        const expected = raw + window + window;
+        switch (services.ensureDurableOperSecurityHorizon(raw, window)) {
+            .renewed => |copy| try expectHorizonCopy(copy, raw + window, expected, expected),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqual(raw + window, state.security_last_effective_ms);
+    }
+}
+
+test "S6C2 Services ensure reopen raw forward rollback and monotonic crossing" {
+    const auth = try S6c2Horizon.init(0xA3);
+    const threshold = Services.durable_oper_security_horizon_renewal_threshold_ms;
+    const window = Services.durable_oper_security_horizon_window_ms;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "services-s6c2-clock.wal");
+        var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+        var services = Services.init(&store, null);
+        defer state.deinit();
+        services.attachInactiveDurableOperAuthorityForTest(&state);
+        switch (services.ensureDurableOperSecurityHorizon(1_000, 0)) {
+            .renewed => |copy| try expectHorizonCopy(copy, 1_000, 1_000 + window, 1_000 + window),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.ensureDurableOperSecurityHorizon(2_000, 0)) {
+            .current => |copy| try expectHorizonCopy(copy, 2_000, 1_000 + window, 1_000 + window),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.ensureDurableOperSecurityHorizon(900, 5)) {
+            .current => |copy| try expectHorizonCopy(copy, 2_000, 1_000 + window, 1_000 + window),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.ensureDurableOperSecurityHorizon(900, 1_005)) {
+            .current => |copy| try expectHorizonCopy(copy, 2_005, 1_000 + window, 1_000 + window),
+            else => return error.TestUnexpectedResult,
+        }
+        store.deinit();
+    }
+
+    var reopened = try openTestStore(tmp, "services-s6c2-clock.wal");
+    defer reopened.deinit();
+    const snapshot = reopened.get(.props, durable_oper_authority.snapshot_key) orelse return error.TestUnexpectedResult;
+    var restored = try durable_oper_authority.decode(std.testing.allocator, auth.config, snapshot);
+    defer restored.deinit();
+    try std.testing.expect(!restored.security_clock_started);
+    var restored_services = Services.init(&reopened, null);
+    restored_services.attachInactiveDurableOperAuthorityForTest(&restored);
+    switch (restored_services.ensureDurableOperSecurityHorizon(1_000, 1)) {
+        .preadmission => |reason| try std.testing.expectEqual(Services.DurableOperPreadmission.invalid_record, reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!restored.security_clock_started);
+    const reopen_effective = restored.securityFloor();
+    const reopen_target = reopen_effective + window;
+    switch (restored_services.ensureDurableOperSecurityHorizon(1_000, 0)) {
+        .renewed => |copy| try expectHorizonCopy(copy, reopen_effective, reopen_target, reopen_target),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var cross_store = try openTestStore(tmp, "services-s6c2-cross.wal");
+    defer cross_store.deinit();
+    var cross_state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer cross_state.deinit();
+    var cross_services = Services.init(&cross_store, null);
+    cross_services.attachInactiveDurableOperAuthorityForTest(&cross_state);
+    switch (cross_services.reserveDurableOperSecurityTime(1_000, 1_000 + threshold + 5)) {
+        .committed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (cross_services.ensureDurableOperSecurityHorizon(1_000, 0)) {
+        .current => |copy| try std.testing.expectEqual(threshold + 5, copy.remaining_ms),
+        else => return error.TestUnexpectedResult,
+    }
+    const crossed = 1_000 + threshold + 5 + window;
+    switch (cross_services.ensureDurableOperSecurityHorizon(1_000, 6)) {
+        .renewed => |copy| try expectHorizonCopy(copy, 1_006, crossed, crossed),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "S6C2 Services ensure established beyond horizon is sticky fatal" {
+    const auth = try S6c2Horizon.init(0xA4);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c2-fatal.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachInactiveDurableOperAuthorityForTest(&state);
+    switch (services.reserveDurableOperSecurityTime(1_000, 5_000)) {
+        .committed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    const epoch = services.durable_oper_availability_epoch;
+    switch (services.ensureDurableOperSecurityHorizon(1_000, 4_001)) {
+        .restart_required => |reason| try std.testing.expectEqual(Services.DurableOperRestart.fatal_state, reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!state.servingAvailable());
+    try std.testing.expectEqual(epoch + 1, services.durable_oper_availability_epoch);
+    try std.testing.expectEqual(@as(u64, 5_000), state.securityReservedUntil());
+    try std.testing.expectEqual(Services.DurableOperSecurityHorizonResult.unavailable, services.ensureDurableOperSecurityHorizon(1_000, 0));
+    try std.testing.expectEqual(Services.DurableOperSecurityNow.unavailable, services.durableOperSecurityNow(1_000, 0));
+}
+
+test "S6C2 Services ensure overflow and first-sample errors are preadmission" {
+    const auth = try S6c2Horizon.init(0xA5);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c2-overflow.wal");
+    defer store.deinit();
+    const max = std.math.maxInt(u64);
+
+    {
+        var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+        defer state.deinit();
+        var services = Services.init(&store, null);
+        services.attachInactiveDurableOperAuthorityForTest(&state);
+        switch (services.ensureDurableOperSecurityHorizon(1_000, 1)) {
+            .preadmission => |reason| try std.testing.expectEqual(Services.DurableOperPreadmission.invalid_record, reason),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expect(!state.security_clock_started);
+    }
+
+    {
+        var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+        defer state.deinit();
+        var services = Services.init(&store, null);
+        services.attachInactiveDurableOperAuthorityForTest(&state);
+        switch (services.reserveDurableOperSecurityTime(max - 2, max)) {
+            .committed => {},
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.ensureDurableOperSecurityHorizon(max - 2, 3)) {
+            .preadmission => |reason| try std.testing.expectEqual(Services.DurableOperPreadmission.exhausted, reason),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqual(max, state.securityReservedUntil());
+        try std.testing.expect(state.servingAvailable());
+    }
+
+    {
+        var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+        defer state.deinit();
+        var services = Services.init(&store, null);
+        services.attachInactiveDurableOperAuthorityForTest(&state);
+        switch (services.reserveDurableOperSecurityTime(max - 1_000, max)) {
+            .committed => {},
+            else => return error.TestUnexpectedResult,
+        }
+        switch (services.ensureDurableOperSecurityHorizon(max - 1_000, 0)) {
+            .preadmission => |reason| try std.testing.expectEqual(Services.DurableOperPreadmission.exhausted, reason),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqual(max, state.securityReservedUntil());
+        try std.testing.expectEqual(max - 1_000, state.security_last_effective_ms);
+    }
+}
+
+test "S6C2 Services ensure OOM and store faults expose no projection" {
+    const auth = try S6c2Horizon.init(0xA6);
+    const cases = [_]struct {
+        name: []const u8,
+        fault: store_mod.PreparedIoFault,
+        candidate_replays: bool,
+    }{
+        .{ .name = "services-s6c2-write-failed.wal", .fault = .{ .write = .failed }, .candidate_replays = false },
+        .{ .name = "services-s6c2-write-short.wal", .fault = .{ .write = .short }, .candidate_replays = false },
+        .{ .name = "services-s6c2-sync.wal", .fault = .{ .sync = true }, .candidate_replays = true },
+    };
+
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var store = try openTestStore(tmp, case.name);
+            var state = try durable_oper_authority_boot.initialize(std.testing.allocator, &store, auth.config);
+            defer state.deinit();
+            var services = Services.init(&store, null);
+            try services.activateDurableOperAuthority(&state);
+            store.setPreparedIoFault(case.fault);
+            switch (services.ensureDurableOperSecurityHorizon(1_000, 0)) {
+                .restart_required => |reason| try std.testing.expectEqual(Services.DurableOperRestart.ambiguous_store, reason),
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expect(!state.servingAvailable());
+            try std.testing.expect(!state.security_clock_started);
+            try std.testing.expectEqual(@as(u64, 0), state.securityReservedUntil());
+            try std.testing.expectEqual(@as(u64, 0), state.security_last_effective_ms);
+            try std.testing.expectEqual(Services.DurableOperSecurityNow.unavailable, services.durableOperSecurityNow(1_000, 0));
+            store.deinit();
+        }
+
+        var reopened = try openTestStore(tmp, case.name);
+        defer reopened.deinit();
+        var restored = try durable_oper_authority_boot.load(std.testing.allocator, &reopened, auth.config);
+        defer restored.deinit();
+        if (case.candidate_replays) {
+            try std.testing.expect(restored.servingAvailable());
+            try std.testing.expectEqual(1_000 + Services.durable_oper_security_horizon_window_ms, restored.securityReservedUntil());
+        } else {
+            try std.testing.expect(!restored.servingAvailable());
+            try std.testing.expectEqual(@as(u64, 0), restored.securityReservedUntil());
+        }
+    }
+}
+
+test "S6C2 Services ensure full cut is allocation-failure atomic" {
+    const auth = try S6c2Horizon.init(0xA7);
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, cfg: durable_oper_authority.Config) !void {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var store = try store_mod.OroStore.openWithConfig(
+                allocator,
+                std.testing.io,
+                tmp.dir,
+                "services-s6c2-alloc.wal",
+                .{},
+            );
+            defer store.deinit();
+            var state = try durable_oper_authority_boot.initialize(allocator, &store, cfg);
+            defer state.deinit();
+            var services = Services.init(&store, null);
+            try services.activateDurableOperAuthority(&state);
+            switch (services.ensureDurableOperSecurityHorizon(1_000, 0)) {
+                .renewed => |copy| {
+                    try expectHorizonCopy(
+                        copy,
+                        1_000,
+                        1_000 + Services.durable_oper_security_horizon_window_ms,
+                        1_000 + Services.durable_oper_security_horizon_window_ms,
+                    );
+                },
+                .preadmission => |reason| if (reason == .out_of_memory) return error.OutOfMemory else return error.TestUnexpectedResult,
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expectEqual(1_000 + Services.durable_oper_security_horizon_window_ms, state.securityFloor());
+            try std.testing.expectEqual(@as(u64, 1_000), state.security_last_effective_ms);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{auth.config});
+}
+
+test "S6C2 Services ensure concurrent current and renew serialize" {
+    const auth = try S6c2Horizon.init(0xA8);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c2-conc.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachInactiveDurableOperAuthorityForTest(&state);
+
+    const Worker = struct {
+        services: *Services,
+        result: Services.DurableOperSecurityHorizonResult = .disabled,
+        fn run(self: *@This()) void {
+            self.result = self.services.ensureDurableOperSecurityHorizon(1_000, 0);
+        }
+    };
+    var workers = [_]Worker{
+        .{ .services = &services },
+        .{ .services = &services },
+    };
+    var threads: [workers.len]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer for (threads[0..spawned]) |thread| thread.join();
+    for (&workers, 0..) |*worker, index| {
+        threads[index] = std.Thread.spawn(.{}, Worker.run, .{worker}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |thread| thread.join();
+
+    var renewed: usize = 0;
+    var current: usize = 0;
+    for (workers) |worker| {
+        switch (worker.result) {
+            .renewed => renewed += 1,
+            .current => current += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), renewed);
+    try std.testing.expectEqual(@as(usize, 1), current);
+    try std.testing.expectEqual(1_000 + Services.durable_oper_security_horizon_window_ms, state.securityReservedUntil());
+    try std.testing.expectEqual(@as(u64, 1_000), state.security_last_effective_ms);
+}
+
+test "S6C2 Services copyDurableOperTransactions empty exact over under and all kinds" {
+    const auth = try S6c2Horizon.init(0xA9);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c2-list.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var empty_disabled: [1]Services.DurableOperTransactionCopy = .{.{ .revision = 9 }};
+    try std.testing.expectEqual(Services.DurableOperTransactionsResult.disabled, services.copyDurableOperTransactions(&empty_disabled));
+    try std.testing.expectEqual(@as(u64, 9), empty_disabled[0].revision);
+
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    services.attachInactiveDurableOperAuthorityForTest(&state);
+    switch (services.copyDurableOperTransactions(empty_disabled[0..0])) {
+        .copied => |n| try std.testing.expectEqual(@as(usize, 0), n),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(u64, 9), empty_disabled[0].revision);
+
+    services.attachDurableOperAuthorityForTest(&state);
+    var car_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const car = try signOcg2RaceWire(auth.kp, auth.config, "car", 1, .grant, "Future", 4_000, 9_000, &car_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(car, 1_000));
+    var alice_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const alice = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Live", 1_000, 5_000, &alice_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(alice, 1_000));
+    var zed_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const zed = try signOcg2RaceWire(auth.kp, auth.config, "zed", 1, .tombstone, "", 1_200, 0, &zed_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(zed, 1_200));
+    var bob_first_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const bob_first = try signOcg2RaceWire(auth.kp, auth.config, "bob", 1, .grant, "First", 1_000, 5_000, &bob_first_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(bob_first, 1_000));
+    var bob_conflict_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const bob_conflict = try signOcg2RaceWire(auth.kp, auth.config, "bob", 1, .grant, "Conflict", 1_000, 5_000, &bob_conflict_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.equivocation_committed, services.commitDurableOperRecord(bob_conflict, 1_000));
+
+    const sentinel = Services.DurableOperTransactionCopy{ .revision = 11 };
+    var under = [_]Services.DurableOperTransactionCopy{sentinel};
+    switch (services.copyDurableOperTransactions(&under)) {
+        .preadmission => |reason| try std.testing.expectEqual(Services.DurableOperPreadmission.capacity, reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(u64, 11), under[0].revision);
+    try std.testing.expectEqual(@as(usize, 0), under[0].account_len);
+
+    var exact: [4]Services.DurableOperTransactionCopy = .{ sentinel, sentinel, sentinel, sentinel };
+    switch (services.copyDurableOperTransactions(&exact)) {
+        .copied => |n| try std.testing.expectEqual(@as(usize, 4), n),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualStrings("alice", exact[0].account());
+    try std.testing.expectEqualStrings("bob", exact[1].account());
+    try std.testing.expectEqualStrings("car", exact[2].account());
+    try std.testing.expectEqualStrings("zed", exact[3].account());
+    try std.testing.expectEqualSlices(u8, alice, exact[0].signedWire());
+    try std.testing.expect(exact[1].equivocation);
+    try std.testing.expectEqualSlices(u8, car, exact[2].signedWire());
+    try std.testing.expectEqual(oper_cred_share.Ocg2Kind.tombstone, exact[3].kind);
+    try std.testing.expectEqual(auth.config.authority_node_id, exact[0].authority_node_id);
+    try std.testing.expectEqualSlices(u8, &auth.config.authority_pubkey, &exact[0].authority_pubkey);
+    try std.testing.expect(exact[0].signedWire().ptr != alice.ptr);
+
+    var over: [5]Services.DurableOperTransactionCopy = .{ sentinel, sentinel, sentinel, sentinel, sentinel };
+    switch (services.copyDurableOperTransactions(&over)) {
+        .copied => |n| try std.testing.expectEqual(@as(usize, 4), n),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(u64, 11), over[4].revision);
+}
+
+test "S6C2 Services copyDurableOperTransactions lifetime and invariant fatal" {
+    const auth = try S6c2Horizon.init(0xAA);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c2-life.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var alice_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const alice = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Owned", 1_000, 5_000, &alice_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(alice, 1_000));
+    var held: [1]Services.DurableOperTransactionCopy = undefined;
+    switch (services.copyDurableOperTransactions(&held)) {
+        .copied => |n| try std.testing.expectEqual(@as(usize, 1), n),
+        else => return error.TestUnexpectedResult,
+    }
+    var successor_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const successor = try signOcg2RaceWire(auth.kp, auth.config, "alice", 2, .grant, "Next", 1_100, 6_000, &successor_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(successor, 1_100));
+    try std.testing.expectEqual(@as(u64, 1), held[0].revision);
+    try std.testing.expectEqualSlices(u8, alice, held[0].signedWire());
+
+    state.testXorRecordDigest(0);
+    const epoch = services.durable_oper_availability_epoch;
+    switch (services.copyDurableOperTransactions(&held)) {
+        .restart_required => |reason| try std.testing.expectEqual(Services.DurableOperRestart.fatal_state, reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!state.servingAvailable());
+    try std.testing.expectEqual(epoch + 1, services.durable_oper_availability_epoch);
+    try std.testing.expectEqual(Services.DurableOperTransactionsResult.unavailable, services.copyDurableOperTransactions(&held));
+}
+
+const S6c5Auth = struct {
+    kp: std.crypto.sign.Ed25519.KeyPair,
+    config: durable_oper_authority.Config,
+
+    fn init(seed: u8) !S6c5Auth {
+        const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(seed)));
+        const public_key = kp.public_key.toBytes();
+        return .{
+            .kp = kp,
+            .config = .{
+                .authority_node_id = node_short_id_mod.shortId(node_identity_mod.nodeIdFromPublicKey(public_key)),
+                .authority_pubkey = public_key,
+            },
+        };
+    }
+};
+
+fn s6c5WorkFromCopy(
+    copy: durable_oper_authority.TransactionCopy,
+    now_ms: u64,
+    cause: ocg2_reconcile_workset.Cause,
+) !ocg2_reconcile_workset.WorkItem {
+    var hints: [1]ocg2_reconcile_schedule.ReinspectHint = undefined;
+    switch (ocg2_reconcile_schedule.build((&copy)[0..1], now_ms, &hints)) {
+        .complete => {},
+        else => return error.TestUnexpectedResult,
+    }
+    var expected = ocg2_reconcile_workset.BaselineEntry{
+        .revision = hints[0].revision,
+        .digest = hints[0].digest,
+        .wire_sha256 = hints[0].wire_sha256,
+        .phase = hints[0].phase,
+        .next_transition_ms = hints[0].next_transition_ms,
+        .account_len = hints[0].account_len,
+    };
+    @memcpy(expected.account_buf[0..hints[0].account_len], hints[0].account_buf[0..hints[0].account_len]);
+    return .{ .cause = cause, .expected = expected };
+}
+
+fn s6c5Copied(services: *Services, out: []Services.DurableOperTransactionCopy) ![]Services.DurableOperTransactionCopy {
+    switch (services.copyDurableOperTransactions(out)) {
+        .copied => |n| return out[0..n],
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn s6c5WorkForAccount(
+    services: *Services,
+    account: []const u8,
+    now_ms: u64,
+    cause: ocg2_reconcile_workset.Cause,
+) !ocg2_reconcile_workset.WorkItem {
+    var copies: [durable_oper_authority.max_records]Services.DurableOperTransactionCopy = undefined;
+    const listed = try s6c5Copied(services, &copies);
+    for (listed) |copy| {
+        if (std.mem.eql(u8, copy.account(), account)) return s6c5WorkFromCopy(copy, now_ms, cause);
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn s6c5XorConflictDigest(state: *durable_oper_authority.State, account: []const u8) void {
+    for (state.records.items) |*record| {
+        if (std.mem.eql(u8, record.account, account)) {
+            record.conflict_digest = record.digest;
+            return;
+        }
+    }
+}
+
+const S6c5MtCtx = struct {
+    services: *Services,
+    expected: ocg2_reconcile_workset.WorkItem,
+    successor_wire: []const u8,
+    failures: *std.atomic.Value(u32),
+    published: *std.atomic.Value(bool),
+    last: Services.DurableOperReconcileObservation = .disabled,
+    saw_stale_after_publish: bool = false,
+
+    fn writer(ctx: *S6c5MtCtx) void {
+        switch (ctx.services.commitDurableOperRecord(ctx.successor_wire, 2_001)) {
+            .committed => {},
+            else => _ = ctx.failures.fetchAdd(1, .monotonic),
+        }
+        ctx.published.store(true, .release);
+    }
+
+    fn observeStale(ctx: *S6c5MtCtx, began_after_publish: bool) void {
+        const observed = ctx.services.inspectDurableOperReconcileWork(ctx.expected, 2_001);
+        if (began_after_publish) {
+            switch (observed) {
+                .superseded => {},
+                else => _ = ctx.failures.fetchAdd(1, .monotonic),
+            }
+            ctx.saw_stale_after_publish = true;
+        } else {
+            switch (observed) {
+                .matched_active => |grant| {
+                    if (!std.mem.eql(u8, grant.account(), "alice") or
+                        !std.mem.eql(u8, grant.title(), "Initial") or
+                        grant.revision != 1)
+                        _ = ctx.failures.fetchAdd(1, .monotonic);
+                },
+                .superseded => {},
+                else => _ = ctx.failures.fetchAdd(1, .monotonic),
+            }
+        }
+        ctx.last = observed;
+    }
+
+    fn reader(ctx: *S6c5MtCtx) void {
+        for (0..32) |_| {
+            ctx.observeStale(ctx.published.load(.acquire));
+        }
+        while (!ctx.published.load(.acquire)) {
+            std.atomic.spinLoopHint();
+        }
+        ctx.observeStale(true);
+    }
+};
+
+test "S6C5 Services disabled unavailable and missing expected are observational" {
+    const auth = try S6c5Auth.init(0x51);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-disabled.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+
+    var expected = ocg2_reconcile_workset.BaselineEntry{
+        .revision = 1,
+        .phase = .expired,
+        .account_len = 5,
+    };
+    @memcpy(expected.account_buf[0..5], "alice");
+    const work = ocg2_reconcile_workset.WorkItem{ .cause = .inventory_added, .expected = expected };
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.disabled, services.inspectDurableOperReconcileWork(work, 1_000));
+
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    services.attachInactiveDurableOperAuthorityForTest(&state);
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.authority_unavailable, services.inspectDurableOperReconcileWork(work, 1_000));
+
+    services.attachDurableOperAuthorityForTest(&state);
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.authority_unavailable, services.inspectDurableOperReconcileWork(work, 1_000));
+
+    var alice_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const alice = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Live", 1_000, 5_000, &alice_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(alice, 1_000));
+    var bob_expected = expected;
+    bob_expected.account_buf[0] = 'b';
+    bob_expected.account_buf[1] = 'o';
+    bob_expected.account_buf[2] = 'b';
+    bob_expected.account_len = 3;
+    try std.testing.expectEqual(
+        Services.DurableOperReconcileObservation.authority_unavailable,
+        services.inspectDurableOperReconcileWork(.{ .expected = bob_expected }, 1_000),
+    );
+}
+
+test "S6C5 Services exact active copy wire and authority" {
+    const auth = try S6c5Auth.init(0x52);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-active.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var alice_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const alice = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Moderator", 1_000, 5_000, &alice_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(alice, 1_000));
+    const work = try s6c5WorkForAccount(&services, "alice", 1_000, .inventory_added);
+    switch (services.inspectDurableOperReconcileWork(work, 1_000)) {
+        .matched_active => |grant| {
+            try std.testing.expectEqualStrings("alice", grant.account());
+            try std.testing.expectEqualStrings("moderator", grant.class());
+            try std.testing.expectEqualStrings("Moderator", grant.title());
+            try std.testing.expectEqual(@as(u64, 1), grant.revision);
+            try std.testing.expectEqual(@as(u64, 1_000), grant.issued_ms);
+            try std.testing.expectEqual(@as(u64, 5_000), grant.expiry_ms);
+            try std.testing.expectEqual(auth.config.authority_node_id, grant.authority_node_id);
+            try std.testing.expectEqualSlices(u8, &auth.config.authority_pubkey, &grant.authority_pubkey);
+            try std.testing.expectEqualSlices(u8, alice, grant.signedWire());
+            try std.testing.expect(grant.signedWire().ptr != alice.ptr);
+            try std.testing.expectEqualSlices(u8, &work.expected.digest, &grant.digest);
+            try std.testing.expectEqualSlices(u8, &work.expected.wire_sha256, &grant.wire_sha256);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "S6C5 Services time boundaries future exact issue active exact expiry expired" {
+    const auth = try S6c5Auth.init(0x53);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-time.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var alice_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const alice = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Clock", 1_000, 5_000, &alice_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(alice, 1_000));
+
+    const future = try s6c5WorkForAccount(&services, "alice", 999, .temporal_transition);
+    try std.testing.expectEqual(ocg2_reconcile_schedule.Phase.not_yet_valid, future.expected.phase);
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.matched_not_yet_valid, services.inspectDurableOperReconcileWork(future, 999));
+
+    const at_issue = try s6c5WorkForAccount(&services, "alice", 1_000, .temporal_transition);
+    try std.testing.expectEqual(ocg2_reconcile_schedule.Phase.active, at_issue.expected.phase);
+    switch (services.inspectDurableOperReconcileWork(at_issue, 1_000)) {
+        .matched_active => |grant| try std.testing.expectEqualStrings("Clock", grant.title()),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const mid = try s6c5WorkForAccount(&services, "alice", 2_500, .inventory_added);
+    switch (services.inspectDurableOperReconcileWork(mid, 2_500)) {
+        .matched_active => |grant| try std.testing.expectEqual(@as(u64, 1), grant.revision),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const last_active = try s6c5WorkForAccount(&services, "alice", 4_999, .inventory_added);
+    switch (services.inspectDurableOperReconcileWork(last_active, 4_999)) {
+        .matched_active => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    const at_expiry = try s6c5WorkForAccount(&services, "alice", 5_000, .temporal_transition);
+    try std.testing.expectEqual(ocg2_reconcile_schedule.Phase.expired, at_expiry.expected.phase);
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.matched_expired, services.inspectDurableOperReconcileWork(at_expiry, 5_000));
+
+    const later = try s6c5WorkForAccount(&services, "alice", 6_000, .inventory_added);
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.matched_expired, services.inspectDurableOperReconcileWork(later, 6_000));
+}
+
+test "S6C5 Services tombstone equivocation and every C4 cause" {
+    const auth = try S6c5Auth.init(0x54);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-terminal.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var tomb_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const tomb = try signOcg2RaceWire(auth.kp, auth.config, "zed", 1, .tombstone, "", 1_200, 0, &tomb_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(tomb, 1_200));
+    const tomb_work = try s6c5WorkForAccount(&services, "zed", 1_200, .inventory_added);
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.matched_tombstone, services.inspectDurableOperReconcileWork(tomb_work, 1_200));
+
+    var first_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const first = try signOcg2RaceWire(auth.kp, auth.config, "bob", 1, .grant, "First", 1_000, 5_000, &first_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(first, 1_000));
+    var conflict_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const conflict = try signOcg2RaceWire(auth.kp, auth.config, "bob", 1, .grant, "Conflict", 1_000, 5_000, &conflict_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.equivocation_committed, services.commitDurableOperRecord(conflict, 1_000));
+    const equiv_work = try s6c5WorkForAccount(&services, "bob", 1_000, .equivocation);
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.matched_equivocation, services.inspectDurableOperReconcileWork(equiv_work, 1_000));
+
+    var alice_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const alice = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Cause", 1_000, 5_000, &alice_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(alice, 1_000));
+    for ([_]ocg2_reconcile_workset.Cause{ .inventory_added, .successor, .equivocation, .temporal_transition }) |cause| {
+        const work = try s6c5WorkForAccount(&services, "alice", 1_000, cause);
+        switch (services.inspectDurableOperReconcileWork(work, 1_000)) {
+            .matched_active => |grant| try std.testing.expectEqualStrings("Cause", grant.title()),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "S6C5 Services malformed expected is invalid_work without state access" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-malformed.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    const epoch = services.durable_oper_availability_epoch;
+    var valid = ocg2_reconcile_workset.BaselineEntry{
+        .revision = 1,
+        .phase = .expired,
+        .account_len = 5,
+    };
+    @memcpy(valid.account_buf[0..5], "alice");
+
+    var empty = valid;
+    empty.account_len = 0;
+    var too_long = valid;
+    too_long.account_len = durable_oper_authority.max_account_len + 1;
+    var overflow = valid;
+    overflow.account_len = std.math.maxInt(usize);
+    var upper = valid;
+    upper.account_buf[0] = 'A';
+    var punct = valid;
+    punct.account_buf[0] = '!';
+    var zero_rev = valid;
+    zero_rev.revision = 0;
+    var active_null = valid;
+    active_null.phase = .active;
+    active_null.next_transition_ms = null;
+    var active_past = valid;
+    active_past.phase = .active;
+    active_past.next_transition_ms = 1_000;
+    var future_null = valid;
+    future_null.phase = .not_yet_valid;
+    future_null.next_transition_ms = null;
+    var expired_deadline = valid;
+    expired_deadline.next_transition_ms = 9_000;
+    var tomb_deadline = valid;
+    tomb_deadline.phase = .tombstone;
+    tomb_deadline.next_transition_ms = 4_000;
+    var equiv_deadline = valid;
+    equiv_deadline.phase = .equivocation;
+    equiv_deadline.next_transition_ms = 4_000;
+
+    const cases = [_]ocg2_reconcile_workset.BaselineEntry{
+        empty,
+        too_long,
+        overflow,
+        upper,
+        punct,
+        zero_rev,
+        active_null,
+        active_past,
+        future_null,
+        expired_deadline,
+        tomb_deadline,
+        equiv_deadline,
+    };
+    for (cases) |expected| {
+        try std.testing.expectEqual(
+            Services.DurableOperReconcileObservation.invalid_work,
+            services.inspectDurableOperReconcileWork(.{ .expected = expected }, 1_000),
+        );
+    }
+    try std.testing.expectEqual(epoch, services.durable_oper_availability_epoch);
+    try std.testing.expect(services.durable_oper_authority_state == null);
+}
+
+test "S6C5 Services each identity mismatch is superseded" {
+    const auth = try S6c5Auth.init(0x55);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-mismatch.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var alice_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const alice = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Live", 1_000, 5_000, &alice_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(alice, 1_000));
+    var bob_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const bob = try signOcg2RaceWire(auth.kp, auth.config, "bob", 1, .grant, "Other", 1_000, 5_000, &bob_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(bob, 1_000));
+
+    const base = try s6c5WorkForAccount(&services, "alice", 1_000, .inventory_added);
+    var account = base;
+    @memcpy(account.expected.account_buf[0..3], "bob");
+    account.expected.account_len = 3;
+    var revision = base;
+    revision.expected.revision = 9;
+    var digest = base;
+    digest.expected.digest[0] ^= 0xff;
+    var sha = base;
+    sha.expected.wire_sha256[0] ^= 0xff;
+    var phase = base;
+    phase.expected.phase = .expired;
+    phase.expected.next_transition_ms = null;
+    var deadline = base;
+    deadline.expected.next_transition_ms = 9_000;
+
+    for ([_]ocg2_reconcile_workset.WorkItem{ account, revision, digest, sha, phase, deadline }) |work| {
+        try std.testing.expectEqual(Services.DurableOperReconcileObservation.superseded, services.inspectDurableOperReconcileWork(work, 1_000));
+    }
+}
+
+test "S6C5 Services stable successor tombstone and equivocation are superseded" {
+    const auth = try S6c5Auth.init(0x56);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-supersede.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Initial", 1_000, 6_000, &initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial, 1_000));
+    const stale = try s6c5WorkForAccount(&services, "alice", 1_000, .successor);
+
+    var successor_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const successor = try signOcg2RaceWire(auth.kp, auth.config, "alice", 2, .grant, "Successor", 1_000, 7_000, &successor_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(successor, 1_000));
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.superseded, services.inspectDurableOperReconcileWork(stale, 1_000));
+
+    var tomb_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const tomb = try signOcg2RaceWire(auth.kp, auth.config, "alice", 3, .tombstone, "", 1_000, 0, &tomb_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(tomb, 1_000));
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.superseded, services.inspectDurableOperReconcileWork(stale, 1_000));
+
+    var first_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const first = try signOcg2RaceWire(auth.kp, auth.config, "carol", 1, .grant, "First", 1_000, 5_000, &first_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(first, 1_000));
+    const carol_stale = try s6c5WorkForAccount(&services, "carol", 1_000, .equivocation);
+    var conflict_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const conflict = try signOcg2RaceWire(auth.kp, auth.config, "carol", 1, .grant, "Conflict", 1_000, 5_000, &conflict_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.equivocation_committed, services.commitDurableOperRecord(conflict, 1_000));
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.superseded, services.inspectDurableOperReconcileWork(carol_stale, 1_000));
+}
+
+test "S6C5 Services signature authority wire tuple and conflict corruption are unavailable" {
+    const auth = try S6c5Auth.init(0x57);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-corrupt.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var alice_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const alice = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Live", 1_000, 5_000, &alice_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(alice, 1_000));
+    const work = try s6c5WorkForAccount(&services, "alice", 1_000, .inventory_added);
+
+    const view = state.latest("alice").?;
+    @constCast(view.wire)[view.wire.len - 1] ^= 0x01;
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.authority_unavailable, services.inspectDurableOperReconcileWork(work, 1_000));
+    @constCast(view.wire)[view.wire.len - 1] ^= 0x01;
+
+    const saved_node = state.config.authority_node_id;
+    state.config.authority_node_id ^= 1;
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.authority_unavailable, services.inspectDurableOperReconcileWork(work, 1_000));
+    state.config.authority_node_id = saved_node;
+
+    state.testXorRecordDigest(0);
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.authority_unavailable, services.inspectDurableOperReconcileWork(work, 1_000));
+    state.testXorRecordDigest(0);
+
+    var first_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const first = try signOcg2RaceWire(auth.kp, auth.config, "bob", 1, .grant, "First", 1_000, 5_000, &first_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(first, 1_000));
+    var conflict_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const conflict = try signOcg2RaceWire(auth.kp, auth.config, "bob", 1, .grant, "Conflict", 1_000, 5_000, &conflict_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.equivocation_committed, services.commitDurableOperRecord(conflict, 1_000));
+    const equiv_work = try s6c5WorkForAccount(&services, "bob", 1_000, .equivocation);
+    s6c5XorConflictDigest(&state, "bob");
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.authority_unavailable, services.inspectDurableOperReconcileWork(equiv_work, 1_000));
+}
+
+test "S6C5 Services post-copy races successor tombstone equivocation and unrelated" {
+    const auth = try S6c5Auth.init(0x58);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-races.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Initial", 1_000, 6_000, &initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial, 1_000));
+    const expected = try s6c5WorkForAccount(&services, "alice", 1_000, .successor);
+
+    var successor_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const successor = try signOcg2RaceWire(auth.kp, auth.config, "alice", 2, .grant, "Successor", 1_000, 7_000, &successor_buf);
+    var successor_race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .successor, .wires = .{ successor, "" } };
+    try std.testing.expectEqual(
+        Services.DurableOperReconcileObservation.superseded,
+        services.inspectDurableOperReconcileWorkInner(expected, 1_000, successor_race.asHook()),
+    );
+
+    var tess_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const tess = try signOcg2RaceWire(auth.kp, auth.config, "tess", 1, .grant, "Tess", 1_000, 6_000, &tess_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(tess, 1_000));
+    var tomb_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const tomb = try signOcg2RaceWire(auth.kp, auth.config, "tess", 2, .tombstone, "", 1_000, 0, &tomb_buf);
+    const tomb_expected = try s6c5WorkForAccount(&services, "tess", 1_000, .successor);
+    var tomb_race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .tombstone, .wires = .{ tomb, "" } };
+    try std.testing.expectEqual(
+        Services.DurableOperReconcileObservation.superseded,
+        services.inspectDurableOperReconcileWorkInner(tomb_expected, 1_000, tomb_race.asHook()),
+    );
+
+    var first_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const first = try signOcg2RaceWire(auth.kp, auth.config, "carol", 1, .grant, "First", 1_000, 5_000, &first_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(first, 1_000));
+    var conflict_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const conflict = try signOcg2RaceWire(auth.kp, auth.config, "carol", 1, .grant, "Conflict", 1_000, 5_000, &conflict_buf);
+    const carol_expected = try s6c5WorkForAccount(&services, "carol", 1_000, .equivocation);
+    var equiv_race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .equivocation, .wires = .{ conflict, "" } };
+    try std.testing.expectEqual(
+        Services.DurableOperReconcileObservation.superseded,
+        services.inspectDurableOperReconcileWorkInner(carol_expected, 1_000, equiv_race.asHook()),
+    );
+
+    var dave_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const dave = try signOcg2RaceWire(auth.kp, auth.config, "dave", 1, .grant, "Dave", 1_000, 6_000, &dave_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(dave, 1_000));
+    const dave_expected = try s6c5WorkForAccount(&services, "dave", 1_000, .inventory_added);
+    var eve_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const eve = try signOcg2RaceWire(auth.kp, auth.config, "eve", 1, .grant, "Eve", 1_000, 6_000, &eve_buf);
+    var unrelated = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .unrelated_account, .wires = .{ eve, "" } };
+    switch (services.inspectDurableOperReconcileWorkInner(dave_expected, 1_000, unrelated.asHook())) {
+        .matched_active => |grant| {
+            try std.testing.expectEqualStrings("Dave", grant.title());
+            try std.testing.expectEqual(@as(u64, 1), grant.revision);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(u64, 1), state.latest("eve").?.revision);
+}
+
+test "S6C5 Services second instability and epoch change are unavailable" {
+    const auth = try S6c5Auth.init(0x59);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-unstable.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Initial", 1_000, 6_000, &initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial, 1_000));
+    const expected = try s6c5WorkForAccount(&services, "alice", 1_000, .successor);
+    var one_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const one = try signOcg2RaceWire(auth.kp, auth.config, "alice", 2, .grant, "One", 1_000, 6_000, &one_buf);
+    var two_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const two = try signOcg2RaceWire(auth.kp, auth.config, "alice", 3, .grant, "Two", 1_000, 6_000, &two_buf);
+    var race = Ocg2AfterCopyRaceCtx{ .services = &services, .action = .two_successors, .wires = .{ one, two } };
+    try std.testing.expectEqual(
+        Services.DurableOperReconcileObservation.authority_unavailable,
+        services.inspectDurableOperReconcileWorkInner(expected, 1_000, race.asHook()),
+    );
+    try std.testing.expectEqual(@as(usize, 2), race.calls);
+
+    var bob_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const bob = try signOcg2RaceWire(auth.kp, auth.config, "bob", 1, .grant, "Bob", 1_000, 6_000, &bob_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(bob, 1_000));
+    const bob_expected = try s6c5WorkForAccount(&services, "bob", 1_000, .inventory_added);
+    const epoch = services.durable_oper_availability_epoch;
+    try std.testing.expectEqual(
+        Services.DurableOperReconcileObservation.authority_unavailable,
+        services.inspectDurableOperReconcileWorkInner(
+            bob_expected,
+            1_000,
+            .{ .callback = markDurableOperUnavailableAfterCopy, .context = &services },
+        ),
+    );
+    try std.testing.expect(!state.servingAvailable());
+    try std.testing.expectEqual(epoch + 1, services.durable_oper_availability_epoch);
+}
+
+test "S6C5 Services active copy outlives later merge and inspect performs no allocator activity" {
+    const public_info = @typeInfo(@TypeOf(Services.inspectDurableOperReconcileWork)).@"fn";
+    const inner_info = @typeInfo(@TypeOf(Services.inspectDurableOperReconcileWorkInner)).@"fn";
+    inline for (public_info.param_types ++ inner_info.param_types) |param_type| {
+        try std.testing.expect(param_type != std.mem.Allocator);
+    }
+    try std.testing.expect(public_info.return_type != std.mem.Allocator);
+    try std.testing.expect(inner_info.return_type != std.mem.Allocator);
+
+    const src = @embedFile("services.zig");
+    const public_fn = "pub fn inspectDurableOperReconcileWork(";
+    const inner_fn = "fn inspectDurableOperReconcileWorkInner(";
+    const live_fn = "fn ocg2ReconcileCopyStillLive(";
+    const next_fn = "fn inspectDurableOperTransactionInner(";
+    const public_at = std.mem.indexOf(u8, src, public_fn) orelse return error.TestUnexpectedResult;
+    const inner_at = std.mem.indexOf(u8, src, inner_fn) orelse return error.TestUnexpectedResult;
+    const live_at = std.mem.indexOf(u8, src, live_fn) orelse return error.TestUnexpectedResult;
+    const next_at = std.mem.indexOf(u8, src, next_fn) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(public_at < inner_at and inner_at < live_at and live_at < next_at);
+    inline for (.{ src[inner_at..next_at], src[public_at .. std.mem.indexOf(u8, src[public_at..], "comptime {").? + public_at] }) |body| {
+        inline for (.{ "allocator(", ".allocator", "alloc(", "create(", "dupe(" }) |needle| {
+            try std.testing.expect(std.mem.indexOf(u8, body, needle) == null);
+        }
+    }
+
+    const auth = try S6c5Auth.init(0x5A);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-life.wal");
+    defer store.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var state = try durable_oper_authority.State.init(failing.allocator(), auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Owned", 1_000, 5_000, &initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial, 1_000));
+    const work = try s6c5WorkForAccount(&services, "alice", 1_000, .inventory_added);
+
+    const allocs_before = failing.allocations;
+    const bytes_before = failing.allocated_bytes;
+    const index_before = failing.alloc_index;
+    const resize_before = failing.resize_index;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    const observed = services.inspectDurableOperReconcileWork(work, 1_000);
+    try std.testing.expectEqual(allocs_before, failing.allocations);
+    try std.testing.expectEqual(bytes_before, failing.allocated_bytes);
+    try std.testing.expectEqual(index_before, failing.alloc_index);
+    try std.testing.expectEqual(resize_before, failing.resize_index);
+    try std.testing.expect(!failing.has_induced_failure);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+
+    switch (observed) {
+        .matched_active => |grant| {
+            var successor_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+            const successor = try signOcg2RaceWire(auth.kp, auth.config, "alice", 2, .grant, "Next", 1_100, 6_000, &successor_buf);
+            try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(successor, 1_100));
+            try std.testing.expectEqualStrings("Owned", grant.title());
+            try std.testing.expectEqual(@as(u64, 1), grant.revision);
+            try std.testing.expectEqualSlices(u8, initial, grant.signedWire());
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "S6C5 Services inspect leaves snapshot WAL sequence and security clock identical" {
+    const auth = try S6c5Auth.init(0x5B);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-identity.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var alice_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const alice = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Clock", 1_000, 5_000, &alice_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(alice, 1_000));
+    const work = try s6c5WorkForAccount(&services, "alice", 1_000, .inventory_added);
+
+    const snap_before = try std.testing.allocator.dupe(u8, state.snapshot());
+    defer std.testing.allocator.free(snap_before);
+    const seq_before = store.next_seq;
+    const wal_before = store.wal_offset;
+    const gen_before = store.next_prepared_generation;
+    const state_gen = state.generation;
+    const state_epoch = state.epoch;
+    const floor = state.securityFloor();
+    const reserved = state.securityReservedUntil();
+    const last = state.security_last_effective_ms;
+    const boot = state.security_boot_effective_ms;
+    const avail = services.durable_oper_availability_epoch;
+    const count = state.count();
+
+    switch (services.inspectDurableOperReconcileWork(work, 1_000)) {
+        .matched_active => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectEqualSlices(u8, snap_before, state.snapshot());
+    try std.testing.expectEqual(seq_before, store.next_seq);
+    try std.testing.expectEqual(wal_before, store.wal_offset);
+    try std.testing.expectEqual(gen_before, store.next_prepared_generation);
+    try std.testing.expectEqual(state_gen, state.generation);
+    try std.testing.expectEqual(state_epoch, state.epoch);
+    try std.testing.expectEqual(floor, state.securityFloor());
+    try std.testing.expectEqual(reserved, state.securityReservedUntil());
+    try std.testing.expectEqual(last, state.security_last_effective_ms);
+    try std.testing.expectEqual(boot, state.security_boot_effective_ms);
+    try std.testing.expectEqual(avail, services.durable_oper_availability_epoch);
+    try std.testing.expectEqual(count, state.count());
+    try std.testing.expect(state.servingAvailable());
+}
+
+test "S6C5 Services concurrent reader writer never returns a predecessor grant" {
+    const auth = try S6c5Auth.init(0x5C);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-conc.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var initial_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const initial = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Initial", 1_000, 6_000, &initial_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(initial, 1_000));
+    const expected = try s6c5WorkForAccount(&services, "alice", 2_001, .successor);
+    var successor_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const successor = try signOcg2RaceWire(auth.kp, auth.config, "alice", 2, .grant, "Successor", 2_001, 7_000, &successor_buf);
+
+    var failures = std.atomic.Value(u32).init(0);
+    var published = std.atomic.Value(bool).init(false);
+    var ctx = S6c5MtCtx{
+        .services = &services,
+        .expected = expected,
+        .successor_wire = successor,
+        .failures = &failures,
+        .published = &published,
+    };
+    var reader = try std.Thread.spawn(.{}, S6c5MtCtx.reader, .{&ctx});
+    var writer = try std.Thread.spawn(.{}, S6c5MtCtx.writer, .{&ctx});
+    reader.join();
+    writer.join();
+    try std.testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+    try std.testing.expect(published.load(.acquire));
+    try std.testing.expect(ctx.saw_stale_after_publish);
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.superseded, ctx.last);
+    try std.testing.expectEqual(Services.DurableOperReconcileObservation.superseded, services.inspectDurableOperReconcileWork(expected, 2_001));
+    const live = try s6c5WorkForAccount(&services, "alice", 2_001, .successor);
+    switch (services.inspectDurableOperReconcileWork(live, 2_001)) {
+        .matched_active => |grant| {
+            try std.testing.expectEqualStrings("Successor", grant.title());
+            try std.testing.expectEqual(@as(u64, 2), grant.revision);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "S6C5 Services C2 C3 C4 C5 integration covers all phases and the 256 bound" {
+    const auth = try S6c5Auth.init(0x5D);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-s6c5-integrate.wal");
+    defer store.deinit();
+    var state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer state.deinit();
+    var services = Services.init(&store, null);
+    services.attachDurableOperAuthorityForTest(&state);
+
+    var alice_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const alice = try signOcg2RaceWire(auth.kp, auth.config, "alice", 1, .grant, "Expired", 500, 900, &alice_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(alice, 500));
+    var bob_first_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const bob_first = try signOcg2RaceWire(auth.kp, auth.config, "bob", 1, .grant, "First", 1_000, 5_000, &bob_first_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(bob_first, 1_000));
+    var bob_conflict_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const bob_conflict = try signOcg2RaceWire(auth.kp, auth.config, "bob", 1, .grant, "Conflict", 1_000, 5_000, &bob_conflict_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.equivocation_committed, services.commitDurableOperRecord(bob_conflict, 1_000));
+    var car_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const car = try signOcg2RaceWire(auth.kp, auth.config, "car", 1, .grant, "Future", 4_000, 9_000, &car_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(car, 1_000));
+    var zed_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const zed = try signOcg2RaceWire(auth.kp, auth.config, "zed", 1, .tombstone, "", 1_200, 0, &zed_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(zed, 1_200));
+    var live_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const live = try signOcg2RaceWire(auth.kp, auth.config, "mia", 1, .grant, "Live", 1_000, 5_000, &live_buf);
+    try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, services.commitDurableOperRecord(live, 1_000));
+
+    var copies: [6]Services.DurableOperTransactionCopy = undefined;
+    const listed = try s6c5Copied(&services, &copies);
+    try std.testing.expectEqual(@as(usize, 5), listed.len);
+    var hints: [5]ocg2_reconcile_schedule.ReinspectHint = undefined;
+    try std.testing.expectEqual(std.meta.Tag(ocg2_reconcile_schedule.BuildResult).complete, std.meta.activeTag(ocg2_reconcile_schedule.build(listed, 1_000, &hints)));
+    var candidates: [5]ocg2_reconcile_workset.BaselineEntry = undefined;
+    var work: [5]ocg2_reconcile_workset.WorkItem = undefined;
+    try std.testing.expectEqual(
+        std.meta.Tag(ocg2_reconcile_workset.BuildResult).complete,
+        std.meta.activeTag(ocg2_reconcile_workset.build(&.{}, null, &hints, 1_000, &candidates, &work)),
+    );
+    var saw_expired = false;
+    var saw_equiv = false;
+    var saw_future = false;
+    var saw_tomb = false;
+    var saw_active = false;
+    for (work) |item| {
+        switch (services.inspectDurableOperReconcileWork(item, 1_000)) {
+            .matched_expired => saw_expired = true,
+            .matched_equivocation => saw_equiv = true,
+            .matched_not_yet_valid => saw_future = true,
+            .matched_tombstone => saw_tomb = true,
+            .matched_active => saw_active = true,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expect(saw_expired and saw_equiv and saw_future and saw_tomb and saw_active);
+
+    var full_state = try durable_oper_authority.State.init(std.testing.allocator, auth.config);
+    defer full_state.deinit();
+    var full_store = try openTestStore(tmp, "services-s6c5-256.wal");
+    defer full_store.deinit();
+    var full = Services.init(&full_store, null);
+    full.attachDurableOperAuthorityForTest(&full_state);
+    var i: usize = 0;
+    while (i < durable_oper_authority.max_records) : (i += 1) {
+        var name = [4]u8{ 'n', '0', '0', '0' };
+        var value = i;
+        name[3] = '0' + @as(u8, @intCast(value % 10));
+        value /= 10;
+        name[2] = '0' + @as(u8, @intCast(value % 10));
+        value /= 10;
+        name[1] = '0' + @as(u8, @intCast(value % 10));
+        var wire_buf: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+        const wire = try signOcg2RaceWire(auth.kp, auth.config, &name, 1, .grant, "N", 1_000, 5_000, &wire_buf);
+        try std.testing.expectEqual(Services.DurableOperMergeOutcome.committed, full.commitDurableOperRecord(wire, 1_000));
+    }
+    var full_copies: [durable_oper_authority.max_records]Services.DurableOperTransactionCopy = undefined;
+    const full_listed = try s6c5Copied(&full, &full_copies);
+    try std.testing.expectEqual(durable_oper_authority.max_records, full_listed.len);
+    var full_hints: [durable_oper_authority.max_records]ocg2_reconcile_schedule.ReinspectHint = undefined;
+    try std.testing.expectEqual(
+        std.meta.Tag(ocg2_reconcile_schedule.BuildResult).complete,
+        std.meta.activeTag(ocg2_reconcile_schedule.build(full_listed, 1_000, &full_hints)),
+    );
+    var full_candidates: [durable_oper_authority.max_records]ocg2_reconcile_workset.BaselineEntry = undefined;
+    var full_work: [durable_oper_authority.max_records]ocg2_reconcile_workset.WorkItem = undefined;
+    try std.testing.expectEqual(
+        std.meta.Tag(ocg2_reconcile_workset.BuildResult).complete,
+        std.meta.activeTag(ocg2_reconcile_workset.build(&.{}, null, &full_hints, 1_000, &full_candidates, &full_work)),
+    );
+    try std.testing.expectEqual(durable_oper_authority.max_records, full_work.len);
+    for (full_work) |item| {
+        switch (full.inspectDurableOperReconcileWork(item, 1_000)) {
+            .matched_active => |grant| try std.testing.expectEqual(@as(u64, 1), grant.revision),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "S6C5 Services reflection keeps C4 private and production callers at zero" {
+    try std.testing.expect(!@hasDecl(Services, "WorkItem"));
+    try std.testing.expect(!@hasDecl(Services, "BaselineEntry"));
+    try std.testing.expect(!@hasDecl(Services, "Cause"));
+    try std.testing.expect(!@hasDecl(Services, "ReinspectHint"));
+    try std.testing.expect(!@hasDecl(Services, "ocg2_reconcile_workset"));
+    try std.testing.expect(!@hasDecl(Services, "ocg2_reconcile_schedule"));
+    try std.testing.expect(!@hasDecl(Services, "AfterCopyHook"));
+    try std.testing.expect(@hasDecl(Services, "DurableOperReconcileObservation"));
+    try std.testing.expect(@hasDecl(Services, "inspectDurableOperReconcileWork"));
+    const public_decls = @typeInfo(Services).@"struct".decl_names;
+    var saw_observation = false;
+    var saw_inspect = false;
+    inline for (public_decls) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "inspectDurableOperReconcileWorkInner"));
+        try std.testing.expect(!std.mem.eql(u8, name, "WorkItem"));
+        try std.testing.expect(!std.mem.eql(u8, name, "BaselineEntry"));
+        try std.testing.expect(!std.mem.eql(u8, name, "AfterCopyHook"));
+        if (std.mem.eql(u8, name, "DurableOperReconcileObservation")) saw_observation = true;
+        if (std.mem.eql(u8, name, "inspectDurableOperReconcileWork")) saw_inspect = true;
+    }
+    try std.testing.expect(saw_observation and saw_inspect);
+    inline for (.{
+        "applyDurableOperReconcileWork",
+        "executeDurableOperReconcileWork",
+        "grantDurableOperReconcileWork",
+        "revokeDurableOperReconcileWork",
+        "acknowledgeDurableOperReconcileWork",
+        "reconcileDurableOperWork",
+    }) |name| {
+        try std.testing.expect(!@hasDecl(Services, name));
+    }
+
+    const src = @embedFile("services.zig");
+    const test_mark = "const S6c5Auth = struct";
+    const split = std.mem.indexOf(u8, src, test_mark) orelse return error.TestUnexpectedResult;
+    const production = src[0..split];
+    const call = ".inspectDurableOperReconcileWork(";
+    var search: usize = 0;
+    var production_calls: usize = 0;
+    while (std.mem.indexOfPos(u8, production, search, call)) |at| {
+        const after = production[at + ".inspectDurableOperReconcileWork".len ..];
+        if (!std.mem.startsWith(u8, after, "Inner")) production_calls += 1;
+        search = at + call.len;
+    }
+    try std.testing.expectEqual(@as(usize, 0), production_calls);
 }

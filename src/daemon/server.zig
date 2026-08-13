@@ -47,6 +47,7 @@ const svc_clonescan = @import("svc_clonescan.zig");
 const svc_lastseen = @import("svc_lastseen.zig");
 const proofmark = @import("proofmark.zig");
 const key_transparency = @import("key_transparency.zig");
+const durable_credential_props = @import("durable_credential_props.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const svc_enforce = @import("svc_enforce.zig");
@@ -100,6 +101,7 @@ const migration_relay = @import("helix/migration_relay.zig");
 const session_migrate = @import("helix/session_migrate.zig");
 const session_replica_v2 = @import("helix/session_replica.zig");
 const oper_cred_share = @import("../proto/oper_cred_share.zig");
+const oper_session_provenance = @import("oper_session_provenance.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
 const whowas = @import("whowas.zig");
@@ -147,6 +149,7 @@ const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
 const account_identity = @import("../proto/account_identity.zig");
 const e2ee_policy = @import("../proto/e2ee_policy.zig");
 const e2ee_group_control = @import("../proto/e2ee_group_control.zig");
+const e2ee_group_delivery = @import("../proto/e2ee_group_delivery.zig");
 const topic_tag = @import("../proto/topic_tag.zig");
 const ircx_prop_providers = @import("../proto/ircx_prop_providers.zig");
 const ircx_access_store = @import("../proto/ircx_access_store.zig");
@@ -1399,19 +1402,6 @@ fn formatNumericCode(code: Numeric, buf: []u8) []const u8 {
     return buf[0..3];
 }
 
-/// WHOIS operator flags for a REMOTE user derived from a propagated cross-mesh
-/// oper grant's privilege bits: `oper_override` renders "is an IRC operator",
-/// `server_admin` upgrades the wording to Network Administrator. Zero bits
-/// (a revocation tombstone) grants nothing.
-const RemoteOperStatus = struct { is_oper: bool, is_admin: bool };
-
-fn remoteGrantWhoisStatus(privilege_bits: u64) RemoteOperStatus {
-    if (privilege_bits == 0) return .{ .is_oper = false, .is_admin = false };
-    const privs = oper_mod.OperPrivileges.fromBits(privilege_bits);
-    const admin = privs.has(.server_admin);
-    return .{ .is_oper = admin or privs.has(.oper_override), .is_admin = admin };
-}
-
 pub const ServerError = error{
     InvalidAddress,
     PermissionDenied,
@@ -1548,6 +1538,21 @@ pub fn freeIsupportTokens(allocator: std.mem.Allocator, tokens: []const []const 
     allocator.free(tokens);
 }
 
+pub const DurableDeviceBoot = union(enum) {
+    inactive,
+    /// Explicit migration/test mode: remove every legacy device PROP and its
+    /// clock without installing a durable authority. Production main never
+    /// selects this arm.
+    purge_only,
+    authoritative: struct {
+        /// Strictly restored from the configured account OroStore before the
+        /// server is constructed. The owner must outlive both Services and the
+        /// server.
+        state: *durable_credential_props.State,
+        local_origin_node: u64,
+    },
+};
+
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16,
@@ -1628,9 +1633,9 @@ pub const Config = struct {
     /// `!news` is served from these files (robust full coverage) instead of
     /// in-daemon TLS fetches. `[geo] news_cache_dir`.
     geo_news_cache_dir: []const u8 = "",
-    /// Path for persisting runtime operator grants (GRANT/REVOKE). When set, the
-    /// active grants are written here on change and reloaded at boot so they
-    /// survive a restart. `[oper] grants_path`.
+    /// Path for persisting inactive legacy OCG1 records (GRANT/REVOKE). When
+    /// set, non-tombstone records are written here and reloaded at boot for
+    /// compatibility telemetry; they never authorize sessions.
     oper_grants_path: []const u8 = "",
     /// Path for persisting the Event Spine history ring (`[oper]
     /// event_history_path`); loaded at boot, rewritten on the stats cadence.
@@ -2130,6 +2135,10 @@ pub const Config = struct {
     /// Account services (REGISTER/IDENTIFY/DROP/…) backed by the WAL store. Null =
     /// account management disabled. Borrowed; outlives the server (owned by main).
     account_services: ?*services_mod.Services = null,
+    /// Boot-only DPROP1 authority. Production leaves this inactive unless main
+    /// has opened the configured account OroStore, loaded the reserved snapshot
+    /// strictly, and attached the exact same State to Services.
+    durable_device_boot: DurableDeviceBoot = .inactive,
     /// Hostname cloak key. When set, every client's real IP/host is HMAC-cloaked
     /// on connect so other users never see the raw address. Null = no cloaking
     /// (real host shown). main derives this from `[server] cloak_secret`, or a
@@ -3173,6 +3182,10 @@ const Reactor = struct {
 /// `boundPort`), where `rx()` falls back to the single embedded reactor — which is
 /// the same pointer in the single-reactor configuration, so the fallback is exact.
 threadlocal var current_reactor: ?*Reactor = null;
+// Test-only final-edge allocator tripwire. Production never assigns these;
+// the guarded writes compile to no work outside a test artifact.
+threadlocal var test_dprop_commit_fail_index: ?*usize = null;
+threadlocal var test_dprop_commit_alloc_index: ?*const usize = null;
 
 /// Sentinel for `upgrade_quiesce_shard`: no multi-shard UPGRADE seal in flight.
 const no_quiesce_shard: u32 = std.math.maxInt(u32);
@@ -3197,6 +3210,75 @@ const RuntimeFeatureConfig = struct {
     config: Config,
     owned_disabled_features: ?[][]const u8 = null,
 };
+
+const DurableDeviceAuthority = struct {
+    state: *durable_credential_props.State,
+    local_origin_node: u64,
+    local_origin_pubkey: [entity_prop_event.pubkey_len]u8,
+};
+
+const DurableDevicePlan = union(enum) {
+    inactive,
+    purge_only,
+    authoritative: DurableDeviceAuthority,
+};
+
+/// Validate the boot authority before `initReactor` opens any socket. Merely
+/// attaching a DPROP State to Services is not activation: the explicit union is
+/// the sole server-level authority switch.
+fn validateDurableDeviceBoot(config: Config) !DurableDevicePlan {
+    return switch (config.durable_device_boot) {
+        .inactive => .inactive,
+        .purge_only => .purge_only,
+        .authoritative => |authority| blk: {
+            if (authority.local_origin_node == 0 or config.node_id == 0)
+                return error.DurableDeviceActivationFailed;
+            const identity = config.node_identity orelse return error.DurableDeviceActivationFailed;
+            if (identity.shortId() != authority.local_origin_node or
+                config.node_id != authority.local_origin_node or
+                authority.state.localOriginNode() != authority.local_origin_node)
+                return error.DurableDeviceActivationFailed;
+            const services = config.account_services orelse return error.DurableDeviceActivationFailed;
+            if (services.durable_credential_props_state != authority.state)
+                return error.DurableDeviceActivationFailed;
+            break :blk .{ .authoritative = .{
+                .state = authority.state,
+                .local_origin_node = authority.local_origin_node,
+                .local_origin_pubkey = identity.sign_kp.public_key,
+            } };
+        },
+    };
+}
+
+fn buildConfiguredDurableDeviceCandidate(
+    allocator: std.mem.Allocator,
+    props: *const ircx_prop_store.DefaultStore,
+    channel_clocks: *const prop_checkpoint.ChannelClockMap,
+    entity_clocks: *const prop_checkpoint.EntityClockMap,
+    plan: DurableDevicePlan,
+) !prop_checkpoint.Restored {
+    return switch (plan) {
+        .inactive => unreachable,
+        .purge_only => prop_checkpoint.buildDurableDeviceCandidate(
+            allocator,
+            props,
+            channel_clocks,
+            entity_clocks,
+            null,
+            null,
+            null,
+        ),
+        .authoritative => |authority| prop_checkpoint.buildDurableDeviceCandidate(
+            allocator,
+            props,
+            channel_clocks,
+            entity_clocks,
+            authority.state,
+            authority.local_origin_node,
+            authority.local_origin_pubkey,
+        ),
+    };
+}
 
 fn disabledFeaturePresent(features: []const []const u8, needle: []const u8) bool {
     for (features) |feature| {
@@ -3315,6 +3397,8 @@ const remote_quit_dedup_ms: i64 = 1_000;
 /// Bounded ring of recent oper-prefix announcements, for `emitOperPrefixMode`
 /// idempotence. No allocation: fixed capacity, fixed-size name buffers. A
 /// matching (channel, nick, add) within the window is suppressed as a repeat.
+/// The opposite direction replaces the remembered state so a real `+Y,-Y,+Y`
+/// sequence is never mistaken for relink duplication.
 const OperPrefixDedup = struct {
     const cap = 16;
     const name_max = 64;
@@ -3335,16 +3419,18 @@ const OperPrefixDedup = struct {
         return std.ascii.eqlIgnoreCase(buf, s);
     }
 
-    /// Return true if the same (channel, nick, add) was announced within the
-    /// window — a duplicate to suppress. Otherwise records it and returns false.
+    /// Return true if the same current direction was announced within the
+    /// window — a duplicate to suppress. An opposite direction is a semantic
+    /// transition: replace the keyed state immediately and allow it through.
     fn seenRecently(self: *OperPrefixDedup, channel: []const u8, nick: []const u8, add: bool, now_ms: i64) bool {
         if (channel.len > name_max or nick.len > name_max) return false; // don't dedup outliers
         for (&self.entries) |*e| {
             if (!e.used) continue;
-            if (now_ms - e.ts_ms > oper_prefix_dedup_ms) continue;
-            if (e.add == add and eqCi(e.chan[0..e.chan_len], channel) and eqCi(e.nick[0..e.nick_len], nick)) {
-                return true;
-            }
+            if (!eqCi(e.chan[0..e.chan_len], channel) or !eqCi(e.nick[0..e.nick_len], nick)) continue;
+            if (e.add == add and now_ms - e.ts_ms <= oper_prefix_dedup_ms) return true;
+            e.add = add;
+            e.ts_ms = now_ms;
+            return false;
         }
         // Record (evicting the oldest slot via the ring head).
         const e = &self.entries[self.head];
@@ -3518,6 +3604,18 @@ pub const LinuxServer = struct {
     /// *sender identity* to its home node (and also guards the legacy unsigned
     /// path, where `origin_node` is otherwise fully spoofable).
     rejected_relay_home_mismatch: u64 = 0,
+    /// Remote user `e2ee.device.*` facts are never an authority source. Count
+    /// their pre-admission quarantine separately so operators can distinguish a
+    /// credential-injection attempt from an ordinary bad origin signature.
+    remote_device_props_quarantined: u64 = 0,
+    /// E5E1 retires both user identity namespaces from ENTITY_PROP authority.
+    /// Count the folded pre-signature quarantine separately from signature and
+    /// legacy home-authority rejects.
+    remote_identity_props_quarantined: u64 = 0,
+    /// A DPROP1 ambiguous/fatal durable cut is process-fatal for subsequent
+    /// device-property authorship. It is deliberately sticky: only reopening
+    /// OroStore and reconstructing the server may decide the durable outcome.
+    durable_device_restart_required: bool = false,
     /// Per-reactor I/O (ring, connection table, listeners, wake). One entry per
     /// shard, heap-allocated at init (`reactors.len == clamped num_shards`).
     /// `reactors[0]` is the single-reactor fast path; reached through `rx()` so
@@ -4240,11 +4338,43 @@ pub const LinuxServer = struct {
         // Canonicalize once at the Server boundary so every producer, route,
         // dedup key, and secured-link handshake observes the same node handle.
         if (config.node_identity) |ident| config.node_id = ident.shortId();
+        const durable_plan = try validateDurableDeviceBoot(config);
         try validateMeshAdmissionSecurity(config);
         const boot_unix = @divTrunc(platform.realtimeMillis(), 1000);
         protocol_inventory.setBootUnix(boot_unix);
         protocol_inventory.setNodeId(config.node_id);
         protocol_inventory.setMeshPeerCount(0);
+        // Build the complete cold PROP successor before opening even the first
+        // listener. DPROP validation, purge/repopulation, clock allocation, and
+        // checked HLC observation are therefore incapable of leaving a bound
+        // but non-authoritative daemon behind on failure.
+        var initial_props = ircx_prop_store.DefaultStore.init(allocator);
+        defer initial_props.deinit();
+        var initial_channel_clocks: prop_checkpoint.ChannelClockMap = .empty;
+        defer initial_channel_clocks.deinit(allocator);
+        var initial_entity_clocks: prop_checkpoint.EntityClockMap = .empty;
+        defer initial_entity_clocks.deinit(allocator);
+        var durable_property_candidate: ?prop_checkpoint.Restored = null;
+        defer if (durable_property_candidate) |*candidate| candidate.deinit();
+        var initial_mesh_clock: mesh_clock_mod.MeshClock = .{};
+        switch (durable_plan) {
+            .inactive => {},
+            .purge_only, .authoritative => {
+                durable_property_candidate = try buildConfiguredDurableDeviceCandidate(
+                    allocator,
+                    &initial_props,
+                    &initial_channel_clocks,
+                    &initial_entity_clocks,
+                    durable_plan,
+                );
+                try initial_mesh_clock.observeChecked(
+                    durable_property_candidate.?.max_hlc,
+                    @intCast(@max(@as(i64, 0), platform.realtimeMillis())),
+                    mesh_clock_mod.default_max_future_skew_ms,
+                );
+            },
+        }
+
         const shard_count = clampShards(config);
         // For >1 shard EVERY listener (shard 0 included) must be SO_REUSEPORT or
         // the kernel rejects the second bind on the shared port. The single-shard
@@ -4482,7 +4612,10 @@ pub const LinuxServer = struct {
             .spamtrap = spamtrap_mod.DefaultSpamtrap.init(allocator),
             .metadata = metadata_store.DefaultStore.init(allocator),
             .geo = geo_ptr,
-            .props = ircx_prop_store.DefaultStore.init(allocator),
+            .props = if (durable_property_candidate) |candidate|
+                candidate.props
+            else
+                ircx_prop_store.DefaultStore.init(allocator),
             .access = ircx_access_store.AccessStore.init(allocator),
             .saccess = ircx_saccess.ServerAccessStore.init(allocator),
             .chan_akick = svc_akick.AkickStore.init(allocator),
@@ -4540,10 +4673,16 @@ pub const LinuxServer = struct {
             .transcript = transcript_mod.TranscriptLog.initConfig(allocator, config.transcript_config),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
+            .mesh_clock = initial_mesh_clock,
             .reactor = config.reactor,
             .start_ms = if (config.reactor) |r| r.nowMillis() else platform.monotonicMillis(),
             .boot_unix = boot_unix,
         };
+        if (durable_property_candidate) |candidate| {
+            self.channel_prop_clocks = candidate.channel_clocks;
+            self.entity_prop_clocks = candidate.entity_clocks;
+            durable_property_candidate = null;
+        }
     }
 
     /// By-value construction, kept for callers that own the result directly.
@@ -4578,7 +4717,7 @@ pub const LinuxServer = struct {
                 .max_per_account = self.config.session_max_per_account,
             });
         }
-        // Restore runtime operator grants persisted by a previous run.
+        // Restore inactive legacy OCG1 records persisted by a previous run.
         self.loadGrants();
         // Restore per-channel statistics persisted by a previous run so they
         // survive a restart or USR2 hot-upgrade.
@@ -6710,8 +6849,11 @@ pub const LinuxServer = struct {
             services_mod.Services.KeyTransparencyStatus{ .enabled = false };
         w.writeAll(",\"accounts\":{\"key_transparency\":{\"enabled\":") catch return w.buffered();
         w.writeAll(if (kt_status.enabled) "true" else "false") catch return w.buffered();
+        w.writeAll(",\"available\":") catch return w.buffered();
+        w.writeAll(if (kt_status.available) "true" else "false") catch return w.buffered();
+        w.writeAll(",\"semantics\":\"observational\",\"scope\":\"node-local\"") catch return w.buffered();
         w.print(",\"entries\":{d},\"root\":", .{kt_status.entries}) catch return w.buffered();
-        if (kt_status.enabled) {
+        if (kt_status.enabled and kt_status.available) {
             const root_hex = std.fmt.bytesToHex(kt_status.root, .lower);
             w.print("\"{s}\"", .{&root_hex}) catch return w.buffered();
         } else {
@@ -12286,11 +12428,6 @@ pub const LinuxServer = struct {
         // (never render / fold into history) but still re-forward so a downstream
         // node with fresher routing decides for itself. Account is NOT consulted —
         // it is origin-controlled and unsigned.
-        //
-        // TODO(mesh-nick-binding): consider fail-closed-on-UNKNOWN once cross-node
-        // presence convergence is guaranteed, so an unlearned signed prefix is
-        // dropped rather than delivered. Left out here to avoid regressing legitimate
-        // convergence-lagged / legacy-unsigned cross-node delivery.
         if (self.relaySenderHomeMismatch(clean_msg.source_nick, clean_msg.origin_node) and replica_modes == null) {
             self.recordRelayHomeMismatch(clean_msg, self.meshNickHomeNode(clean_msg.source_nick) orelse clean_msg.origin_node);
             return;
@@ -14678,6 +14815,142 @@ pub const LinuxServer = struct {
         return out[0..written.len];
     }
 
+    /// Pre-staged LWW clock bytes. All fallible allocations happen here; the
+    /// later commit only swaps pointers or `putAssumeCapacity`.
+    const StagedEntityPropClock = struct {
+        replace: ?*EntityPropClock = null,
+        map_key: []u8 = &.{},
+        entity: []u8 = &.{},
+        key: []u8 = &.{},
+        owner: []u8,
+        origin_pubkey: []u8,
+        origin_sig: []u8,
+        kind: entity_prop_event.EntityKind,
+        hlc: u64,
+        present: bool,
+        origin_node: u64,
+
+        fn discard(self: *StagedEntityPropClock, allocator: std.mem.Allocator) void {
+            if (self.replace == null) {
+                if (self.map_key.len != 0) allocator.free(self.map_key);
+                if (self.entity.len != 0) allocator.free(self.entity);
+                if (self.key.len != 0) allocator.free(self.key);
+            }
+            allocator.free(self.owner);
+            allocator.free(self.origin_pubkey);
+            allocator.free(self.origin_sig);
+            self.* = undefined;
+        }
+    };
+
+    fn stageEntityPropClock(
+        self: *LinuxServer,
+        kind: entity_prop_event.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+        origin_node: u64,
+        origin_pubkey: []const u8,
+        origin_sig: []const u8,
+    ) ?StagedEntityPropClock {
+        if (self.entityPropClock(kind, entity, key)) |existing| {
+            if (hlc <= existing.hlc) return null;
+            const owner_copy = self.allocator.dupe(u8, owner) catch return null;
+            const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
+                self.allocator.free(owner_copy);
+                return null;
+            };
+            const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
+                self.allocator.free(owner_copy);
+                self.allocator.free(pubkey_copy);
+                return null;
+            };
+            return .{
+                .replace = existing,
+                .owner = owner_copy,
+                .origin_pubkey = pubkey_copy,
+                .origin_sig = sig_copy,
+                .kind = kind,
+                .hlc = hlc,
+                .present = present,
+                .origin_node = origin_node,
+            };
+        }
+
+        self.entity_prop_clocks.ensureUnusedCapacity(self.allocator, 1) catch return null;
+        const map_key = self.allocEntityPropClockKey(kind, entity, key) catch return null;
+        const entity_copy = self.allocator.dupe(u8, entity) catch {
+            self.allocator.free(map_key);
+            return null;
+        };
+        const key_copy = self.allocator.dupe(u8, key) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            return null;
+        };
+        const owner_copy = self.allocator.dupe(u8, owner) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            self.allocator.free(key_copy);
+            return null;
+        };
+        const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            self.allocator.free(key_copy);
+            self.allocator.free(owner_copy);
+            return null;
+        };
+        const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            self.allocator.free(key_copy);
+            self.allocator.free(owner_copy);
+            self.allocator.free(pubkey_copy);
+            return null;
+        };
+        return .{
+            .map_key = map_key,
+            .entity = entity_copy,
+            .key = key_copy,
+            .owner = owner_copy,
+            .origin_pubkey = pubkey_copy,
+            .origin_sig = sig_copy,
+            .kind = kind,
+            .hlc = hlc,
+            .present = present,
+            .origin_node = origin_node,
+        };
+    }
+
+    fn commitStagedEntityPropClock(self: *LinuxServer, staged: StagedEntityPropClock) void {
+        if (staged.replace) |existing| {
+            self.allocator.free(existing.owner);
+            self.allocator.free(existing.origin_pubkey);
+            self.allocator.free(existing.origin_sig);
+            existing.owner = staged.owner;
+            existing.origin_pubkey = staged.origin_pubkey;
+            existing.origin_sig = staged.origin_sig;
+            existing.hlc = staged.hlc;
+            existing.present = staged.present;
+            existing.origin_node = staged.origin_node;
+            return;
+        }
+        self.entity_prop_clocks.putAssumeCapacity(staged.map_key, .{
+            .kind = staged.kind,
+            .entity = staged.entity,
+            .key = staged.key,
+            .owner = staged.owner,
+            .hlc = staged.hlc,
+            .present = staged.present,
+            .origin_node = staged.origin_node,
+            .origin_pubkey = staged.origin_pubkey,
+            .origin_sig = staged.origin_sig,
+        });
+    }
+
     /// LWW-record a user/member PROP clock. The ENTITY_PROP counterpart of
     /// `recordChannelPropClock`: stores the ORIGINAL author's `origin_node` + the
     /// self-contained multi-hop `(pubkey, sig)` so a later re-broadcast/burst
@@ -14698,81 +14971,18 @@ pub const LinuxServer = struct {
         origin_pubkey: []const u8,
         origin_sig: []const u8,
     ) bool {
-        if (self.entityPropClock(kind, entity, key)) |existing| {
-            if (hlc <= existing.hlc) return false;
-            const owner_copy = self.allocator.dupe(u8, owner) catch return false;
-            const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
-                self.allocator.free(owner_copy);
-                return false;
-            };
-            const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
-                self.allocator.free(owner_copy);
-                self.allocator.free(pubkey_copy);
-                return false;
-            };
-            self.allocator.free(existing.owner);
-            self.allocator.free(existing.origin_pubkey);
-            self.allocator.free(existing.origin_sig);
-            existing.owner = owner_copy;
-            existing.origin_pubkey = pubkey_copy;
-            existing.origin_sig = sig_copy;
-            existing.hlc = hlc;
-            existing.present = present;
-            existing.origin_node = origin_node;
-            return true;
-        }
-
-        const map_key = self.allocEntityPropClockKey(kind, entity, key) catch return false;
-        const entity_copy = self.allocator.dupe(u8, entity) catch {
-            self.allocator.free(map_key);
-            return false;
-        };
-        const key_copy = self.allocator.dupe(u8, key) catch {
-            self.allocator.free(map_key);
-            self.allocator.free(entity_copy);
-            return false;
-        };
-        const owner_copy = self.allocator.dupe(u8, owner) catch {
-            self.allocator.free(map_key);
-            self.allocator.free(entity_copy);
-            self.allocator.free(key_copy);
-            return false;
-        };
-        const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
-            self.allocator.free(map_key);
-            self.allocator.free(entity_copy);
-            self.allocator.free(key_copy);
-            self.allocator.free(owner_copy);
-            return false;
-        };
-        const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
-            self.allocator.free(map_key);
-            self.allocator.free(entity_copy);
-            self.allocator.free(key_copy);
-            self.allocator.free(owner_copy);
-            self.allocator.free(pubkey_copy);
-            return false;
-        };
-
-        self.entity_prop_clocks.putNoClobber(self.allocator, map_key, .{
-            .kind = kind,
-            .entity = entity_copy,
-            .key = key_copy,
-            .owner = owner_copy,
-            .hlc = hlc,
-            .present = present,
-            .origin_node = origin_node,
-            .origin_pubkey = pubkey_copy,
-            .origin_sig = sig_copy,
-        }) catch {
-            self.allocator.free(map_key);
-            self.allocator.free(entity_copy);
-            self.allocator.free(key_copy);
-            self.allocator.free(owner_copy);
-            self.allocator.free(pubkey_copy);
-            self.allocator.free(sig_copy);
-            return false;
-        };
+        const staged = self.stageEntityPropClock(
+            kind,
+            entity,
+            key,
+            owner,
+            hlc,
+            present,
+            origin_node,
+            origin_pubkey,
+            origin_sig,
+        ) orelse return false;
+        self.commitStagedEntityPropClock(staged);
         return true;
     }
 
@@ -14821,6 +15031,7 @@ pub const LinuxServer = struct {
         present: bool,
         origin: s2s_peer_mod.S2sPeer.PropOrigin,
     ) void {
+        if (kind == .user and account_identity.isReservedNamespace(key)) return;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
                 if (!slot.occupied) continue;
@@ -14839,6 +15050,214 @@ pub const LinuxServer = struct {
         }
     }
 
+    const DurableDeviceMutationOutcome = enum {
+        committed,
+        not_logged_in,
+        owner_mismatch,
+        invalid_fact,
+        signer_unavailable,
+        durable_unavailable,
+        stale,
+        replay,
+        equivocation,
+        preadmission_failed,
+        restart_required,
+    };
+
+    /// Recognize the reserved namespace case-insensitively because PROP storage
+    /// folds keys. Without this gate `E2EE.DEVICE.foo` could bypass the durable
+    /// writer and overwrite the same folded live row as `e2ee.device.foo`.
+    fn isReservedDevicePropPrefix(raw: []const u8) bool {
+        return raw.len >= e2ee_policy.device_prop_prefix.len and
+            std.ascii.eqlIgnoreCase(raw[0..e2ee_policy.device_prop_prefix.len], e2ee_policy.device_prop_prefix);
+    }
+
+    fn canonicalDevicePropKey(raw: []const u8, out: *[e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8) ?[]const u8 {
+        if (!isReservedDevicePropPrefix(raw) or
+            raw.len <= e2ee_policy.device_prop_prefix.len or
+            raw.len > e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len)
+            return null;
+        const device_id = raw[e2ee_policy.device_prop_prefix.len..];
+        if (!e2ee_policy.validDeviceId(device_id)) return null;
+        @memcpy(out[0..e2ee_policy.device_prop_prefix.len], e2ee_policy.device_prop_prefix);
+        _ = std.ascii.lowerString(out[e2ee_policy.device_prop_prefix.len..][0..device_id.len], device_id);
+        return out[0 .. e2ee_policy.device_prop_prefix.len + device_id.len];
+    }
+
+    fn validDurableDeviceValue(key: []const u8, value: []const u8) bool {
+        const parsed = splitE2eeDeviceValue(value) orelse return false;
+        const canonical_device = key[e2ee_policy.device_prop_prefix.len..];
+        const directory = @import("../proto/e2ee_device_directory.zig");
+        if (directory.isStoredAlgorithm(parsed.algorithm)) {
+            const odd1 = directory.parseCanonical(parsed.public_key) orelse return false;
+            var derived_buf: [directory.device_id_len]u8 = undefined;
+            const derived = directory.deviceId(odd1, &derived_buf);
+            if (!std.ascii.eqlIgnoreCase(canonical_device, derived)) return false;
+        } else {
+            e2ee_policy.validateAdvertisement(
+                canonical_device,
+                parsed.algorithm,
+                parsed.public_key,
+            ) catch return false;
+        }
+        var canonical_buf: [e2ee_policy.max_device_value_len]u8 = undefined;
+        const canonical = e2ee_policy.deviceValue(parsed.algorithm, parsed.public_key, &canonical_buf) orelse return false;
+        return std.mem.eql(u8, canonical, value);
+    }
+
+    /// Sole local authoring transaction for user `e2ee.device.*` facts.
+    ///
+    /// The authenticated account supplies both entity and owner. The live PROP
+    /// mutation and exact signed ENTITY_PROP clock are allocation-complete before
+    /// Services crosses the DPROP1 durable cut. Only `.committed` publishes those
+    /// prepared live structures, after which notification and mesh fanout reuse
+    /// the exact tuple committed durably. A durable ambiguity permanently poisons
+    /// this server instance; retrying could publish the opposite of WAL replay.
+    fn commitLocalDurableDeviceProp(
+        self: *LinuxServer,
+        conn: *ConnState,
+        requested_entity: ?ircx_prop_store.Entity,
+        raw_key: []const u8,
+        value: []const u8,
+        present: bool,
+    ) DurableDeviceMutationOutcome {
+        if (self.durable_device_restart_required) return .restart_required;
+        const raw_account = conn.session.account() orelse return .not_logged_in;
+        const canonical_account = services_mod.canonicalAccount(raw_account) catch return .invalid_fact;
+        const account = canonical_account.asSlice();
+        if (requested_entity) |requested| {
+            if (requested.kind != .user or !std.ascii.eqlIgnoreCase(requested.id, account))
+                return .owner_mismatch;
+        }
+
+        var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+        const key = canonicalDevicePropKey(raw_key, &key_buf) orelse return .invalid_fact;
+        if (present and !validDurableDeviceValue(key, value)) return .invalid_fact;
+        if (!present and value.len != 0) return .invalid_fact;
+
+        const svc = self.account_services orelse return .durable_unavailable;
+        const ident = self.config.node_identity orelse return .signer_unavailable;
+        const origin_node = ident.shortId();
+        if (origin_node == 0) return .signer_unavailable;
+        const hlc = self.nextChannelPropHlc();
+        var pubkey_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+        var event = entity_prop_event.EntityPropEvent{
+            .present = present,
+            .kind = .user,
+            .origin_node = origin_node,
+            .hlc = hlc,
+            .entity = account,
+            .key = key,
+            .value = if (present) value else "",
+            .owner = account,
+        };
+        const transcript = entity_prop_event.originTranscript(self.allocator, event) catch return .signer_unavailable;
+        defer self.allocator.free(transcript);
+        entity_prop_event.signInPlace(&event, &ident.sign_kp, transcript, &pubkey_buf, &sig_buf) catch
+            return .signer_unavailable;
+
+        const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+        var prepared_set: ?ircx_prop_store.DefaultStore.PreparedSetProp = null;
+        defer if (prepared_set) |*prepared| prepared.deinit();
+        var prepared_delete: ?ircx_prop_store.DefaultStore.PreparedDeleteProp = null;
+        defer if (prepared_delete) |prepared| prepared.deinit();
+        if (present) {
+            prepared_set = self.props.prepareSetProp(entity, key, value, .{ .id = account, .access = .user }) catch
+                return .preadmission_failed;
+        } else {
+            prepared_delete = self.props.prepareDeleteProp(entity, key) catch
+                return .preadmission_failed;
+        }
+
+        var staged_clock = self.stageEntityPropClock(
+            .user,
+            account,
+            key,
+            account,
+            hlc,
+            present,
+            event.origin_node,
+            event.origin_pubkey,
+            event.origin_sig,
+        ) orelse return .preadmission_failed;
+        var clock_committed = false;
+        defer if (!clock_committed) staged_clock.discard(self.allocator);
+
+        switch (svc.commitLocalDurableDeviceFact(event)) {
+            .committed => {},
+            .disabled => return .durable_unavailable,
+            .stale => return .stale,
+            .replay => return .replay,
+            .equivocation => return .equivocation,
+            .preadmission => return .preadmission_failed,
+            .restart_required => {
+                self.durable_device_restart_required = true;
+                srvLog("CRITICAL: DPROP1 durable device-property outcome is ambiguous/fatal; stopping for OroStore reopen\n", .{});
+                self.traceLog(.warn, .storage, "CRITICAL DPROP1 durable outcome requires OroStore reopen");
+                if (self.shutdown) |run| self.requestStop(run);
+                return .restart_required;
+            },
+        }
+
+        if (prepared_set) |*prepared| {
+            _ = prepared.commit();
+        } else {
+            _ = prepared_delete.?.commit();
+        }
+        self.commitStagedEntityPropClock(staged_clock);
+        clock_committed = true;
+        self.notifyLocalPropChange(conn, entity, key, if (present) value else "");
+        self.announceEntityProp(
+            .user,
+            account,
+            key,
+            if (present) value else "",
+            account,
+            hlc,
+            present,
+            .{ .node = event.origin_node, .pubkey = event.origin_pubkey, .sig = event.origin_sig },
+        );
+        return .committed;
+    }
+
+    fn durableDeviceFailureReply(
+        self: *LinuxServer,
+        conn: *ConnState,
+        command: []const u8,
+        outcome: DurableDeviceMutationOutcome,
+    ) !void {
+        return switch (outcome) {
+            .committed => {},
+            .not_logged_in => self.failReply(conn, command, "NOT_LOGGED_IN", "Log in before managing E2EE device keys"),
+            .owner_mismatch => self.failReply(conn, command, "DEVICE_OWNER_MISMATCH", "Device keys may only be changed by their authenticated account"),
+            .invalid_fact => self.failReply(conn, command, "BAD_DEVICE_FACT", "Device property key or value is invalid"),
+            .signer_unavailable => self.failReply(conn, command, "SIGNER_UNAVAILABLE", "Signed device-property authority is unavailable"),
+            .durable_unavailable => self.failReply(conn, command, "DURABLE_UNAVAILABLE", "Durable device-property state is unavailable"),
+            .stale => self.failReply(conn, command, "STALE_FACT", "Durable device-property state is newer"),
+            .replay => self.failReply(conn, command, "REPLAY", "Device-property fact was already committed"),
+            .equivocation => self.failReply(conn, command, "EQUIVOCATION", "Conflicting device-property fact was rejected"),
+            .preadmission_failed => self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Device-property transaction could not be prepared"),
+            .restart_required => self.failReply(conn, command, "RESTART_REQUIRED", "Durable device-property outcome requires store reopen"),
+        };
+    }
+
+    fn durableDeviceNumericReply(
+        self: *LinuxServer,
+        conn: *ConnState,
+        entity: ircx_prop_store.Entity,
+        outcome: DurableDeviceMutationOutcome,
+    ) !void {
+        _ = self;
+        return switch (outcome) {
+            .committed => {},
+            .not_logged_in, .owner_mismatch => queueNumeric(conn, .ERR_NOACCESS, &.{entity.id}, "Device keys may only be changed by their authenticated account"),
+            .invalid_fact => queueNumeric(conn, .ERR_BADPROPERTY, &.{entity.id}, "Invalid device property"),
+            .stale, .replay, .equivocation => queueNumeric(conn, .ERR_SECURITY, &.{entity.id}, "Device property failed durable security admission"),
+            .signer_unavailable, .durable_unavailable, .preadmission_failed, .restart_required => queueNumeric(conn, .ERR_RESOURCE, &.{entity.id}, "Durable device-property authority is unavailable"),
+        };
+    }
+
     /// Sign + record + announce a freshly LOCALLY-authored user/member PROP fact.
     /// Shared by the PROP set and delete paths in `handleProp` so both fan a signed
     /// ENTITY_PROP out to the mesh and seed a local clock for later bursts.
@@ -14851,8 +15270,20 @@ pub const LinuxServer = struct {
         value: []const u8,
         owner: []const u8,
     ) void {
+        self.propagateLocalEntityPropAt(present, store_kind, entity, key, value, owner, self.nextChannelPropHlc());
+    }
+
+    fn propagateLocalEntityPropAt(
+        self: *LinuxServer,
+        present: bool,
+        store_kind: ircx_prop_store.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+    ) void {
         const kind = entity_prop_event.EntityKind.fromStoreKind(store_kind) orelse return;
-        const hlc = self.nextChannelPropHlc();
         var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
         var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
         const ps = self.signLocalEntityProp(present, kind, entity, key, value, owner, hlc, &pk_buf, &sig_buf);
@@ -14997,6 +15428,28 @@ pub const LinuxServer = struct {
     /// by the store on insert; a malformed id (rejected by `Entity.fromId`) simply
     /// fails to apply.
     fn applyRemoteEntityProp(self: *LinuxServer, ch: anytype) bool {
+        if (ch.kind.toStoreKind() == .user and account_identity.isReservedNamespace(ch.key)) {
+            self.remote_identity_props_quarantined +|= 1;
+            var quarantine_buf: [256]u8 = undefined;
+            const quarantine = std.fmt.bufPrint(
+                &quarantine_buf,
+                "quarantined remote ENTITY_PROP identity fact {s}/{s} from node {d}",
+                .{ ch.entity, ch.key, ch.origin_node },
+            ) catch "quarantined remote ENTITY_PROP identity fact";
+            self.traceLog(.warn, .s2s, quarantine);
+            return false;
+        }
+        if (ch.kind.toStoreKind() == .user and isReservedDevicePropPrefix(ch.key)) {
+            self.remote_device_props_quarantined +|= 1;
+            var warning_buf: [256]u8 = undefined;
+            const warning = std.fmt.bufPrint(
+                &warning_buf,
+                "quarantined remote ENTITY_PROP device fact {s}/{s} from node {d}",
+                .{ ch.entity, ch.key, ch.origin_node },
+            ) catch "quarantined remote ENTITY_PROP device fact";
+            self.traceLog(.warn, .s2s, warning);
+            return false;
+        }
         if (!self.entityPropOriginVerified(ch)) return false;
         // P1: an identity.key.*/identity.residence.* write is only authoritative
         // from the account's home — reject a non-home (forged) write fail-closed
@@ -15017,17 +15470,61 @@ pub const LinuxServer = struct {
             else => return false,
         };
         const owner = if (ch.owner.len != 0) ch.owner else "remote";
+
+        // No-partial-mutation commit: reserve EVERY allocation this fact could
+        // ever require — the prop-store write and the LWW clock write — before
+        // touching anything a later failure could leave half-applied.
+        // `prepareSetProp` is a real reservation (unlike `preflightSetProp`,
+        // which validates but disclaims reserving), and `stageEntityPropClock`
+        // is already allocation-complete. Neither mutates props, clocks, the
+        // KEYTRANS log, or the mesh HLC watermark. Only once BOTH have
+        // succeeded may the watermark — which never rolls back — advance, and
+        // only then do we run the commit sequence, which by construction
+        // cannot fail.
+        var prepared_set: ?ircx_prop_store.DefaultStore.PreparedSetProp = null;
+        defer if (prepared_set) |*prepared| prepared.deinit();
         if (ch.present) {
-            self.props.preflightSetProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch
-                return false;
+            prepared_set = self.props.prepareSetProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch return false;
         }
-        if (!self.observeRemotePropertyHlc(ch.hlc)) return false;
-        if (ch.present) {
-            _ = self.props.setProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch return false;
+
+        var staged = self.stageEntityPropClock(
+            ch.kind,
+            ch.entity,
+            ch.key,
+            owner,
+            ch.hlc,
+            ch.present,
+            ch.origin_node,
+            ch.origin_pubkey,
+            ch.origin_sig,
+        ) orelse return false;
+
+        // The mesh HLC watermark only ever moves forward, so it may advance
+        // only once every fallible step above has already succeeded —
+        // advancing it any earlier would pin the watermark forward for a
+        // remote fact that never actually committed.
+        if (!self.observeRemotePropertyHlc(ch.hlc)) {
+            staged.discard(self.allocator);
+            return false;
+        }
+
+        if (prepared_set) |*prepared| {
+            _ = prepared.commit();
         } else {
             self.props.deleteProp(entity, ch.key) catch {};
         }
-        return self.recordEntityPropClock(ch.kind, ch.entity, ch.key, owner, ch.hlc, ch.present, ch.origin_node, ch.origin_pubkey, ch.origin_sig);
+        self.commitStagedEntityPropClock(staged);
+        self.observeUserCredentialProp(
+            ch.present,
+            ch.kind.toStoreKind(),
+            ch.entity,
+            ch.key,
+            ch.value,
+            ch.hlc,
+            ch.origin_node,
+            ch.origin_pubkey,
+        );
+        return true;
     }
 
     /// Mesh counterpart of a local user/member PROP-notify: fan a remote
@@ -15076,6 +15573,7 @@ pub const LinuxServer = struct {
         var it = self.entity_prop_clocks.iterator();
         while (it.next()) |entry| {
             const clock = entry.value_ptr;
+            if (clock.kind == .user and account_identity.isReservedNamespace(clock.key)) continue;
             var present = clock.present;
             var value: []const u8 = "";
             var owner: []const u8 = clock.owner;
@@ -16776,50 +17274,8 @@ pub const LinuxServer = struct {
     /// would then verify it — defeating F1. Design C's premise (the replicated
     /// identity pubkey is authoritative) requires TWO preconditions:
     ///
-    ///  (1) NON-FORGEABLE account-key authority on ENTITY_PROP INGEST — LANDED as
-    ///      `accountIdentityPropAuthorized` (in `applyRemoteEntityProp`). An
-    ///      `identity.key.*`/`identity.residence.*` write for `entity=<account>`
-    ///      is accepted only from the account's authoritative home, via two
-    ///      non-forgeable anchors rooted in SASL (the analog of the nick-path
-    ///      `meshNickHomeNode`/`recordRelayHomeMismatch` gate): the LOCAL-SASL
-    ///      anchor (this node owns the account ⇒ reject every remote-origin write)
-    ///      and the FIRST-origin binding (a Byzantine peer cannot overwrite the
-    ///      genuine home's key at any hlc). A Byzantine node with no SASL session
-    ///      for the victim cannot write the victim's key.
-    ///
-    ///  (2) STORE-SIDE account blanking on trust — LANDED:
-    ///      `recvMembership`/`recvNickChange` now persist
-    ///      `if (account_trusted) ev.account else ""` at the applyMembership/
-    ///      renameNick sites, so a forged (untrusted) incumbent is stored
-    ///      account-less and can NEVER later let a TRUSTED newcomer
-    ///      `remote_same_account`-merge with it on a third node. Proven by the
-    ///      `residence_trust_dst` forged-incumbent (C1) invariant.
-    ///
-    /// With both landed, residence trust is F1-sound ON HOME AND WARM (already-
-    /// converged) NODES: a PROVEN same-account claim coexists (multi-device
-    /// restored), an UNPROVEN/forged claim takes the conservative UID path, and the
-    /// sticky-trust rule (§4.4) never re-gates a live established member
-    /// (`route_table.zig` same-node `.keep`). The bounded residual is a COLD node
-    /// that relinks through a Byzantine burst source before converging with an
-    /// honest peer: see `accountIdentityPropAuthorized` — that fail-open is STICKY
-    /// (not self-healing) on a genuinely cold process. Exact entity clocks now
-    /// survive USR2, so a hot upgrade does not re-arm this window; the fully-sound
-    /// cold-node anchor is the larger mesh-security design.
-    /// Owner: onyx-server-mesh / stack-architect.
-    fn accountKeyAuthorityGateAvailable() bool {
-        return true; // F1: (1) ENTITY_PROP identity-write authority gate AND (2) store-side account blank both landed.
-    }
-
-    /// RECEIVER-side residence-proof verify callback (Design C / F1). Verify a
-    /// remote claim's `{account, origin_node}` against the RECEIVER-OWNED
-    /// replicated `identity.residence.<origin>` proof and `identity.key.*`
-    /// pubkey — never a wire field. The callback returns trusted, untrusted, or
-    /// reject; positive legacy trust requires a live proof for exactly this
-    /// account+node and the account-key-authority gate.
-    /// S2S runs reactor-0-only, so this read never races a concurrent reactor's
-    /// prop mutation the RCU store does not already serialize. Any
-    /// decode/lookup/verify miss ⇒ false (conservative UID path).
-    /// A signed SESSION_REPLICA authority is also an exact residence proof for a
+    /// RECEIVER-side residence callback. Only signed SESSION_REPLICA_V2 authority
+    /// is an exact residence proof for a
     /// live local attachment of that SAME portable token. This is deliberately
     /// narrower than account equality: the local World owner, its exact token
     /// group, and one live accepted signed-origin entry must bind account, nick,
@@ -16900,32 +17356,10 @@ pub const LinuxServer = struct {
         // an account; otherwise that substitution could move the protected route.
         if (self.hasRetainedSessionReplicaNickAuthority(nick)) return .reject;
         if (account.len == 0) return .untrusted;
-        return if (self.legacyResidenceTrusted(account, origin_node)) .trusted else .untrusted;
-    }
-
-    fn legacyResidenceTrusted(self: *LinuxServer, account: []const u8, origin_node: u64) bool {
-        // Fail closed: the replicated identity key is not yet authenticated as
-        // account-authoritative on ENTITY_PROP ingest (see the doc above), so a
-        // proof that verifies against it cannot be trusted as F1-sound.
-        if (!accountKeyAuthorityGateAvailable()) return false;
-        const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-        var rkey_buf: [account_identity.residence_prop_prefix.len + account_identity.residence_node_hex_len]u8 = undefined;
-        const rkey = account_identity.residencePropKey(origin_node, &rkey_buf) orelse return false;
-        const proof_ev = self.props.getProp(entity, rkey) catch return false;
-        var wire_buf: [account_identity.max_residence_len]u8 = undefined;
-        const wire = decodeResidenceHex(proof_ev.value, &wire_buf) orelse return false;
-        const now_ms = self.grantNowU64();
-        // Try every enrolled identity key for the account: the proof must verify
-        // against at least one receiver-owned pubkey and bind {account, origin}.
-        var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-        const rows = self.props.listProps(entity, &views) catch return false;
-        for (rows) |kv| {
-            if (!account_identity.isPropKey(kv.key)) continue;
-            const claim = account_identity.parseClaimValue(kv.value) orelse continue;
-            _ = account_identity.verifyResidence(wire, claim.public_key, account, origin_node, now_ms) catch continue;
-            return true;
-        }
-        return false;
+        // E5E1: replicated identity.key/residence props are retired as an
+        // account-authority source. Only the exact negotiated SESSION_REPLICA_V2
+        // proof path above can return trusted.
+        return .untrusted;
     }
 
     /// Build the borrowed `ResidenceVerifier` the mesh links consult (Design C).
@@ -18905,6 +19339,31 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Convert the protocol builder's validated command body into one complete
+    /// IRC wire line. `buildKickBroadcastWith` intentionally omits framing (as
+    /// do the other protocol builders); this sole production boundary appends
+    /// CRLF exactly once before channel delivery.
+    fn buildKickWire(
+        out: []u8,
+        kicker_prefix: kick.Prefix,
+        channel: []const u8,
+        user: []const u8,
+        reason: []const u8,
+    ) kick.KickError![]const u8 {
+        if (out.len < 2) return error.OutputTooSmall;
+        const body = try kick.buildKickBroadcastWith(
+            .{ .require_utf8 = false },
+            out[0 .. out.len - 2],
+            kicker_prefix,
+            channel,
+            user,
+            reason,
+        );
+        out[body.len] = '\r';
+        out[body.len + 1] = '\n';
+        return out[0 .. body.len + 2];
+    }
+
     /// KICK <channel> <user> [:reason]. Kicker must be op-or-higher and may not
     /// kick a member who outranks them (tier rank). The target sees their own
     /// kick (broadcast before removal).
@@ -18959,7 +19418,7 @@ pub const LinuxServer = struct {
         // arm so a malformed/oversized event cannot strand an absent intent.
         const reason = utf8TruncateBytes(args.reason, self.config.kicklen);
         var msg_buf: [default_reply_bytes]u8 = undefined;
-        const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, reason) catch return;
+        const msg = buildKickWire(&msg_buf, kicker_prefix, args.channel, args.user, reason) catch return;
 
         const target_id = clientIdFromWorld(target);
         const target_conn = self.connFor(target_id);
@@ -19727,8 +20186,8 @@ pub const LinuxServer = struct {
     /// visible host — falling back to the placeholder/origin-server forms only
     /// when the origin never supplied identity), 312 with the actual home
     /// server, RPL_WHOISCHANNELS (319) from the mesh roster, RPL_WHOISACCOUNT
-    /// (330) when the member's account propagated, RPL_WHOISOPERATOR (313) when a
-    /// live propagated oper grant covers the nick, and 318. To an OPERATOR requester
+    /// (330) when the member's account propagated, and 318. Step 5 deliberately
+    /// does not project inactive OCG1 records into remote operator status. To an OPERATOR requester
     /// it ALSO surfaces the deanonymized identity a secured oper-info link propagated:
     /// the real host/IP (338), GeoIP/ASN (320, computed locally from that IP), and
     /// the TLS cert fingerprint (276). Idle/away/671 are per-connection state remote
@@ -19739,17 +20198,6 @@ pub const LinuxServer = struct {
         sink: *whois.WhoisLineSink,
         remote: RemoteWhois,
     ) !void {
-        var is_oper = false;
-        var is_admin = false;
-        var oper_title: ?[]const u8 = null;
-        // Cross-mesh oper grants are keyed by account and matched to the nick
-        // (same convention as isOverrideOper / the `*` status prefix).
-        if (self.oper_grants.lookup(remote.nick, self.grantNowU64())) |g| {
-            const status = remoteGrantWhoisStatus(g.privilege_bits);
-            is_oper = status.is_oper;
-            is_admin = status.is_admin;
-            if (is_oper and g.title.len > 0) oper_title = g.title;
-        }
         // Channels the remote user is in, resolved from the mesh rosters (they are
         // not in the local world member set). Gives the 319 line that was missing.
         var memberships: [32]whois.ChannelMembership = undefined;
@@ -19788,9 +20236,12 @@ pub const LinuxServer = struct {
             // 330 "is logged in as <account>" for a remote member whose account the
             // mesh propagated (cap_member_account) — matches a local user's WHOIS.
             .account = if (remote.account.len != 0) remote.account else null,
-            .is_oper = is_oper,
-            .is_admin = is_admin,
-            .oper_title = oper_title,
+            // OCG1 is compatibility telemetry only during Step 5. Remote
+            // operator projection remains inactive until the accepted OCG2
+            // activation step supplies an authoritative runtime source.
+            .is_oper = false,
+            .is_admin = false,
+            .oper_title = null,
             // Idle/signon are per-connection state the origin node doesn't replicate,
             // so suppress RPL_WHOISIDLE rather than render a bogus "idle 0, epoch".
             .show_idle = false,
@@ -25074,7 +25525,7 @@ pub const LinuxServer = struct {
         srvLog("onyx-server: UPGRADE resume refused inherited state: {s}\n", .{reason});
     }
 
-    pub fn adoptInheritedSessions(self: *LinuxServer) error{InvalidInheritedHandoff}!void {
+    pub fn adoptInheritedSessions(self: *LinuxServer) error{ InvalidInheritedHandoff, DurableDeviceActivationFailed }!void {
         if (comptime builtin.os.tag != .linux) return;
         const arena_fd = self.config.resume_arena_fd orelse {
             // A state-fd manifest without its arena is an incomplete handoff. A
@@ -25709,7 +26160,17 @@ pub const LinuxServer = struct {
             }
             property_checkpoint_bytes = c.fields[0].bytes;
         }
-        if (property_checkpoint_bytes == null) {
+        const durable_hot_plan = validateDurableDeviceBoot(self.config) catch |err| {
+            var reason_buf: [160]u8 = undefined;
+            const reason = std.fmt.bufPrint(
+                &reason_buf,
+                "invalid DPROP1 boot authority during hot adoption ({s})",
+                .{@errorName(err)},
+            ) catch "invalid DPROP1 boot authority during hot adoption";
+            self.abandonInheritedSessionState(caps, arena_fd, reason);
+            return error.DurableDeviceActivationFailed;
+        };
+        if (property_checkpoint_bytes == null and durable_hot_plan == .inactive) {
             self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory property-state checkpoint");
             return error.InvalidInheritedHandoff;
         }
@@ -25791,12 +26252,49 @@ pub const LinuxServer = struct {
                 self.abandonInheritedSessionState(caps, arena_fd, "invalid property-state checkpoint");
                 return error.InvalidInheritedHandoff;
             };
+        }
+        switch (durable_hot_plan) {
+            .inactive => {},
+            .purge_only, .authoritative => {
+                const base_props = if (property_replacement) |*replacement| &replacement.props else &self.props;
+                const base_channel = if (property_replacement) |*replacement| &replacement.channel_clocks else &self.channel_prop_clocks;
+                const base_entity = if (property_replacement) |*replacement| &replacement.entity_clocks else &self.entity_prop_clocks;
+                var reconciled = buildConfiguredDurableDeviceCandidate(
+                    self.allocator,
+                    base_props,
+                    base_channel,
+                    base_entity,
+                    durable_hot_plan,
+                ) catch |err| {
+                    var reason_buf: [160]u8 = undefined;
+                    const reason = std.fmt.bufPrint(
+                        &reason_buf,
+                        "DPROP1 hot property reconciliation failed ({s})",
+                        .{@errorName(err)},
+                    ) catch "DPROP1 hot property reconciliation failed";
+                    self.abandonInheritedSessionState(caps, arena_fd, reason);
+                    return error.DurableDeviceActivationFailed;
+                };
+                if (property_replacement) |*replacement| replacement.deinit();
+                property_replacement = reconciled;
+                reconciled = undefined;
+            },
+        }
+        if (property_replacement) |*replacement| {
             staged_mesh_clock.observeChecked(
-                property_replacement.?.max_hlc,
+                replacement.max_hlc,
                 self.meshWallMs(),
                 mesh_clock_mod.default_max_future_skew_ms,
-            ) catch {
-                self.abandonInheritedSessionState(caps, arena_fd, "property-state HLC is future-skewed or exhausted");
+            ) catch |err| {
+                var reason_buf: [176]u8 = undefined;
+                const reason = std.fmt.bufPrint(
+                    &reason_buf,
+                    "property-state HLC is future-skewed or exhausted ({s})",
+                    .{@errorName(err)},
+                ) catch "property-state HLC is future-skewed or exhausted";
+                self.abandonInheritedSessionState(caps, arena_fd, reason);
+                if (durable_hot_plan != .inactive)
+                    return error.DurableDeviceActivationFailed;
                 return error.InvalidInheritedHandoff;
             };
         }
@@ -25926,12 +26424,6 @@ pub const LinuxServer = struct {
         const prior_stage_retry_pending = self.session_replica_stage_retry_pending;
         const prior_stage_retry_cursor = self.session_replica_stage_retry_cursor;
         const prior_stage_retry_pass_failed = self.session_replica_stage_retry_pass_failed;
-        if (staged_mesh_clock.last_stamp > self.mesh_clock.last_stamp)
-            self.mesh_clock = staged_mesh_clock;
-        self.migration_offer_epoch = @max(
-            self.migration_offer_epoch,
-            staged_migration_offer_epoch,
-        );
         self.mesh_clock_lock.unlock();
         errdefer {
             lockSpin(&self.mesh_clock_lock);
@@ -26624,6 +27116,18 @@ pub const LinuxServer = struct {
         );
         self.webhook_store.publishUpgradeReplacement(&webhook_replacement);
         self.inherited_webhook_store_restored = true;
+        // DPROP1/PRPC and their causal boundary publish together only here.
+        // Both candidates are fully built and checked; these swaps/assignments
+        // allocate, persist, notify, gossip, and append transparency nowhere.
+        if (comptime builtin.is_test) {
+            if (durable_hot_plan != .inactive) {
+                if (test_dprop_commit_fail_index) |fail_index| {
+                    const alloc_index = test_dprop_commit_alloc_index orelse unreachable;
+                    fail_index.* = alloc_index.*;
+                }
+            }
+        }
+        lockSpin(&self.mesh_clock_lock);
         if (property_replacement) |*replacement| {
             replacement.swapInto(
                 &self.props,
@@ -26633,6 +27137,13 @@ pub const LinuxServer = struct {
             property_entities_restored = self.props.entity_count;
             property_clocks_restored = self.channel_prop_clocks.count() + self.entity_prop_clocks.count();
         }
+        if (staged_mesh_clock.last_stamp > self.mesh_clock.last_stamp)
+            self.mesh_clock = staged_mesh_clock;
+        self.migration_offer_epoch = @max(
+            self.migration_offer_epoch,
+            staged_migration_offer_epoch,
+        );
+        self.mesh_clock_lock.unlock();
         std.mem.swap(HistoryStore, &self.history, &history_replacement);
         std.mem.swap(search_index_mod.SearchIndex, &self.search_index, &search_replacement);
         self.event_history.publishCheckpoint(&event_history_replacement);
@@ -27028,6 +27539,20 @@ pub const LinuxServer = struct {
         conn.last_message_ms = if (snap.last_message_ms != 0) snap.last_message_ms else now;
         conn.last_activity_ms = now;
         conn.session.restore(snap);
+        // The carried oper block is profile history only: restore() deliberately
+        // clears it. Re-derive successor authority from the restored authenticated
+        // account and the live sealed local config, while keeping durable OCG2
+        // explicitly disabled at the frozen Step 5 boundary. A forged/nonconfigured
+        // carried `is_oper` therefore stays inert, while an exact configured-local
+        // account retains its current privilege projection across Helix.
+        const configured_binding = if (conn.session.account()) |account|
+            if (self.oper_registry) |*registry|
+                oper_session_provenance.configuredLocalBinding(registry, account)
+            else
+                null
+        else
+            null;
+        _ = conn.session.reconcileOperAuthority(configured_binding, .disabled, self.grantNowU64());
         self.applyOperAutoOverride(conn); // re-affirm +j across USR2 for auto_override admins
         self.injectSessionState(conn);
         // TLS client: rebuild the live engine BEFORE anything else can touch the
@@ -31371,8 +31896,15 @@ pub const LinuxServer = struct {
                 // always). The store's plain listProps hides ALL secrets, so list
                 // RAW and apply the daemon's per-tier gate per entry — an authorized
                 // requester sees their tier's keys, everyone else sees none.
-                var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-                const rows = self.props.listPropsRaw(entity, &views) catch views[0..0];
+                var user_views: [ircx_prop_store.user_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+                var default_views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+                const rows = switch (entity.kind) {
+                    .user => self.props.listPropsRaw(entity, &user_views),
+                    .channel, .member => self.props.listPropsRaw(entity, &default_views),
+                } catch {
+                    try queueNumeric(conn, .ERR_RESOURCE, &.{entity.id}, "Could not inspect complete property list");
+                    return;
+                };
                 for (rows) |ev| {
                     if (propIsSecret(entity, ev.key) and !self.maySeeSecretKey(id, conn, entity, ev.key)) continue;
                     try propEmitEntry(conn, ev);
@@ -31415,6 +31947,28 @@ pub const LinuxServer = struct {
                 try propEmitEnd(conn, q.entity);
             },
             .set => |m| {
+                var device_key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+                if (m.entity.kind == .user and isReservedDevicePropPrefix(m.key)) {
+                    const device_key = canonicalDevicePropKey(m.key, &device_key_buf) orelse {
+                        try queueNumeric(conn, .ERR_BADPROPERTY, &.{ m.entity.id, m.key }, "Invalid device property");
+                        return;
+                    };
+                    if (!validDurableDeviceValue(device_key, m.value)) {
+                        try queueNumeric(conn, .ERR_BADVALUE, &.{ m.entity.id, m.key }, "Invalid device property value");
+                        return;
+                    }
+                    const outcome = self.commitLocalDurableDeviceProp(conn, m.entity, device_key, m.value, true);
+                    if (outcome != .committed) {
+                        try self.durableDeviceNumericReply(conn, m.entity, outcome);
+                        return;
+                    }
+                    const canonical_account = services_mod.canonicalAccount(conn.session.account().?) catch unreachable;
+                    const entity = ircx_prop_store.Entity{ .kind = .user, .id = canonical_account.asSlice() };
+                    const ev = self.props.getPropRaw(entity, device_key) catch unreachable;
+                    try propEmitEntry(conn, ev);
+                    try propEmitEnd(conn, entity);
+                    return;
+                }
                 const access = self.propAccess(id, conn, m.entity) orelse {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{m.entity.id}, "Insufficient access to set property");
                     return;
@@ -31461,8 +32015,11 @@ pub const LinuxServer = struct {
                     }
                 } else {
                     // user/member props propagate over ENTITY_PROP with the same
-                    // signed multi-hop LWW guarantees.
-                    self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
+                    // signed multi-hop LWW guarantees. Exact credential keys
+                    // share the observation helper with E2EEKEY/IDENTITY.
+                    const hlc = self.nextChannelPropHlc();
+                    self.observeLocalUserCredentialProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, hlc);
+                    self.propagateLocalEntityPropAt(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner, hlc);
                 }
                 // Notify local IRCX clients that may see this entity (per-tier
                 // for secret channel keys); the setter's own echo follows.
@@ -31471,6 +32028,21 @@ pub const LinuxServer = struct {
                 try propEmitEnd(conn, m.entity);
             },
             .delete => |k| {
+                var device_key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+                if (k.entity.kind == .user and k.key.len != 0 and isReservedDevicePropPrefix(k.key)) {
+                    const device_key = canonicalDevicePropKey(k.key, &device_key_buf) orelse {
+                        try queueNumeric(conn, .ERR_BADPROPERTY, &.{ k.entity.id, k.key }, "Invalid device property");
+                        return;
+                    };
+                    const outcome = self.commitLocalDurableDeviceProp(conn, k.entity, device_key, "", false);
+                    if (outcome != .committed) {
+                        try self.durableDeviceNumericReply(conn, k.entity, outcome);
+                        return;
+                    }
+                    const canonical_account = services_mod.canonicalAccount(conn.session.account().?) catch unreachable;
+                    try propEmitEnd(conn, .{ .kind = .user, .id = canonical_account.asSlice() });
+                    return;
+                }
                 if (self.propAccess(id, conn, k.entity) == null) {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{k.entity.id}, "Insufficient access to delete property");
                     return;
@@ -31488,8 +32060,19 @@ pub const LinuxServer = struct {
                     return;
                 }
                 if (k.key.len == 0) {
-                    var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-                    const rows = self.props.listProps(k.entity, &views) catch views[0..0];
+                    var views: [ircx_prop_store.user_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+                    const rows = self.props.listPropsRaw(k.entity, &views) catch {
+                        try queueNumeric(conn, .ERR_RESOURCE, &.{k.entity.id}, "Could not inspect properties before clear");
+                        return;
+                    };
+                    if (k.entity.kind == .user) {
+                        for (rows) |ev| {
+                            if (isReservedDevicePropPrefix(ev.key)) {
+                                try queueNumeric(conn, .ERR_SECURITY, &.{k.entity.id}, "Delete device properties individually through durable authority");
+                                return;
+                            }
+                        }
+                    }
                     const owner = conn.session.displayName();
                     // Sign + announce each deletion while the rows (which borrow the
                     // store's key bytes) are still live, THEN clear the store —
@@ -31507,7 +32090,9 @@ pub const LinuxServer = struct {
                         }
                     } else {
                         for (rows) |ev| {
-                            self.propagateLocalEntityProp(false, k.entity.kind, k.entity.id, ev.key, "", owner);
+                            const hlc = self.nextChannelPropHlc();
+                            self.observeLocalUserCredentialProp(false, k.entity.kind, k.entity.id, ev.key, "", hlc);
+                            self.propagateLocalEntityPropAt(false, k.entity.kind, k.entity.id, ev.key, "", owner, hlc);
                             self.notifyLocalPropChange(conn, k.entity, ev.key, "");
                         }
                     }
@@ -31515,6 +32100,7 @@ pub const LinuxServer = struct {
                     try propEmitEnd(conn, k.entity);
                     return;
                 }
+                const existed = if (self.props.getProp(k.entity, k.key)) |_| true else |_| false;
                 self.props.deleteProp(k.entity, k.key) catch {};
                 if (k.entity.kind == .channel) {
                     const hlc = self.nextChannelPropHlc();
@@ -31526,7 +32112,11 @@ pub const LinuxServer = struct {
                         self.announceChannelProp(k.entity.id, k.key, "", owner, hlc, false, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
                     }
                 } else {
-                    self.propagateLocalEntityProp(false, k.entity.kind, k.entity.id, k.key, "", conn.session.displayName());
+                    const hlc = self.nextChannelPropHlc();
+                    if (existed) {
+                        self.observeLocalUserCredentialProp(false, k.entity.kind, k.entity.id, k.key, "", hlc);
+                    }
+                    self.propagateLocalEntityPropAt(false, k.entity.kind, k.entity.id, k.key, "", conn.session.displayName(), hlc);
                 }
                 self.notifyLocalPropChange(conn, k.entity, k.key, "");
                 try propEmitEnd(conn, k.entity);
@@ -31681,6 +32271,12 @@ pub const LinuxServer = struct {
         conn.session.sasl_router = null;
         conn.session.sasl_pending = null;
         self.retireMediaBeforeAccountMutation(id, conn, if (result.guest) null else account);
+        _ = self.clearOperAuthorityTransition(
+            id,
+            conn,
+            true,
+            if (result.guest) "anonymous authentication replaced operator authority" else "account authentication replaced operator authority",
+        );
         if (result.guest) {
             // ANONYMOUS is an account transition too: it clears account() and
             // therefore must retire the previous tracked portable authority.
@@ -31826,11 +32422,9 @@ pub const LinuxServer = struct {
     }
 
     /// Resolve remote DATA reserved-prefix authority from receiver-owned state.
-    /// The relay's account text is never consulted: `policy_account` must already
-    /// have been derived from a signed portable-session proof or an authenticated
-    /// remote residence, and the matching oper grant was itself verified on
-    /// ingestion. Network opers retain the same override as local opers; without
-    /// that grant, OWN/HST additionally requires authenticated channel rank.
+    /// During Step 5 no remote operator authority is active: OCG1 records are
+    /// compatibility telemetry only and OCG2 has no runtime consumer. OWN/HST
+    /// therefore require authenticated channel rank; SYS/ADM fail closed.
     fn remoteDataTagAuthorized(
         self: *LinuxServer,
         tag: []const u8,
@@ -31840,13 +32434,9 @@ pub const LinuxServer = struct {
     ) bool {
         if (tag.len < 3) return true;
         const prefix = tag[0..3];
-        const policy_is_oper = if (policy_account.len != 0)
-            if (self.oper_grants.lookup(policy_account, self.grantNowU64())) |grant|
-                grant.privilege_bits != 0
-            else
-                false
-        else
-            false;
+        _ = self;
+        _ = policy_account;
+        const policy_is_oper = false;
         if (std.ascii.eqlIgnoreCase(prefix, "SYS") or
             std.ascii.eqlIgnoreCase(prefix, "ADM")) return policy_is_oper;
         if (std.ascii.eqlIgnoreCase(prefix, "OWN") or
@@ -34134,95 +34724,19 @@ pub const LinuxServer = struct {
         const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(peer_pubkey) catch return false;
         const now: u64 = self.grantNowU64();
         const fields = oper_cred_share.verify(pk, bytes, now) catch return false;
-        // Whether this account ALREADY confers the derived `*` (+Y) before this
-        // grant lands. A live opered session is re-minted on a periodic cadence
-        // well inside the grant TTL (so its grant never lapses on a peer); each
-        // re-mint arrives here as a `superseded` upsert carrying identical
-        // privileges. Announcing +Y on every such refresh re-broadcasts
-        // `MODE #chan +Y <nick>` to every shared channel each cadence tick (the
-        // 30s "+Y" churn). Only a genuine transition should move the prefix;
-        // NAMES/WHO already render the derived `*` for anyone joining fresh.
-        const had_oper_override = if (self.oper_grants.lookup(fields.account, now)) |prev|
-            oper_mod.OperPrivileges.fromBits(prev.privilege_bits).has(.oper_override)
-        else
-            false;
         const accepted = self.oper_grants.upsert(fields) != .stale_ignored;
         if (accepted) {
             self.logMeshEvent(.oper_grant_in, fields.account, fields.issuer_node);
-            const now_oper_override = oper_mod.OperPrivileges.fromBits(fields.privilege_bits).has(.oper_override);
-            if (fields.privilege_bits == 0) {
-                // Revocation tombstone: drop oper from any connected sessions.
-                self.deElevateSessions(fields.account);
-            } else {
-                // Retroactively elevate any already-connected sessions of this
-                // account so recognition is immediate, not deferred to next login.
-                self.elevateGrantedSessions(fields.account);
-            }
-            // Account identity is not necessarily the displayed nick. Resolve
-            // every live local attachment and every residence-verified remote
-            // roster projection for this account, then move the derived prefix
-            // once per distinct display nick. Unchanged periodic re-mints never
-            // enter this branch; non-tombstone privilege narrowing gets -Y too.
-            if (had_oper_override != now_oper_override)
-                self.announceOperPrefixForAccount(fields.account, now_oper_override);
+            // OCG1 is compatibility telemetry only. It may converge in the
+            // legacy registry, but it cannot mutate session privilege or emit a
+            // derived operator prefix. OCG2 activation remains separately held.
         }
         return accepted;
     }
 
-    /// Elevate every already-registered local session for `account` that is not
-    /// yet an operator, or reconcile already-oper sessions on a live re-grant,
-    /// using the live grant registry. Every reactor's session projection is
-    /// mutated under the completion-wide World write lock; output to a foreign
-    /// socket crosses the reactor fabric rather than touching its SendQ/ring.
-    fn elevateGrantedSessions(self: *LinuxServer, account: []const u8) void {
-        const now: u64 = self.grantNowU64();
-        const grant = self.oper_grants.lookup(account, now) orelse return;
-        if (grant.privilege_bits == 0) return;
-        const privileges = oper_mod.OperPrivileges.fromBits(grant.privilege_bits);
-        for (self.reactors) |*reactor| for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
-            if (!slot.occupied) continue;
-            const c = &slot.value;
-            const id = slotClientId(reactor, slot_index, slot.gen);
-            if (c.s2s != null or c.s2s_secured != null) continue; // not a client
-            if (!c.session.registered()) continue;
-            const acct = c.session.account() orelse continue;
-            if (!std.ascii.eqlIgnoreCase(acct, account)) continue;
-            if (self.oper_registry) |reg| {
-                if (reg.lookup(acct) != null) {
-                    if (c.session.isOper()) continue; // configured oper authority wins over runtime grants
-                }
-            }
-            if (c.session.isOper()) {
-                const override_was_set = c.session.hasUmode(.override);
-                const had_override_priv = c.session.hasPriv(.oper_override);
-                c.session.setOperGrant(privileges, grant.class, grant.title);
-                const has_override_priv = c.session.hasPriv(.oper_override);
-                self.applyOperAutoOverride(c); // re-affirm +j if auto_override + still holds oper_override
-                if (override_was_set and had_override_priv and !has_override_priv) {
-                    if (c.session.setUmode(.override, false)) {
-                        const reason = "cleared override after oper_override privilege was removed";
-                        self.auditOverrideUse(c, "UMODE", c.session.displayName(), reason);
-                        // Tell the affected oper directly — they may not be
-                        // subscribed to the oper-action event feed, but they must
-                        // still learn WHY their override was removed.
-                        self.deliverNoticeTo(id, c, reason) catch {};
-                        var mode_buf: [default_reply_bytes]u8 = undefined;
-                        const nick = c.session.displayName();
-                        const line = formatMessage(&mode_buf, self.serverName(), "MODE", &.{ nick, "-j" }, null) catch "";
-                        if (line.len != 0) self.enqueueDelivery(id, line) catch {};
-                    }
-                }
-                continue;
-            }
-            // The caller owns the one account-wide prefix transition after all
-            // physical attachments converge; suppress per-attachment emission.
-            self.elevateOperFromAccountTo(id, c, false) catch continue;
-        };
-    }
-
-    /// Mint + store a signed grant for a locally-elevated operator so peer nodes
-    /// can recognize them. Stored locally too (self-trust); the S2S layer
-    /// broadcasts it to peers. Best-effort: silently no-ops without a node key.
+    /// Mint + store an inactive legacy OCG1 record for compatibility telemetry.
+    /// Stored locally and broadcast to peers, but never accepted as authority.
+    /// Best-effort: silently no-ops without a node key.
     fn mintOperGrant(self: *LinuxServer, account: []const u8, privileges: oper_mod.OperPrivileges, class_name: []const u8, title: []const u8) void {
         const now: u64 = self.grantNowU64();
         // Strictly-increasing incarnation so a later GRANT/REVOKE always wins,
@@ -34384,41 +34898,34 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         announce_prefix: bool,
     ) !void {
-        if (conn.session.isOper()) return;
+        // Account authentication is an authority replacement, never an
+        // additive privilege path.  Revoke the prior projection before looking
+        // up the newly-authenticated account so a same-account refresh, an
+        // account switch, or a missing/revoked binding cannot retain or union
+        // privileges from the previous grant.  ClientSession.loginAs() also
+        // clears at the identity boundary; keeping this guard here makes every
+        // direct reconciliation caller fail closed as well.
+        _ = self.clearOperAuthorityTransition(id, conn, announce_prefix, "operator authority recomputed");
         const account = conn.session.account() orelse return;
 
-        // Operator authority comes from either a local [oper] binding or a
-        // signed grant propagated from a peer node (cross-mesh recognition).
-        var privileges: oper_mod.OperPrivileges = undefined;
-        var class_name: []const u8 = undefined;
-        var title: []const u8 = undefined;
-        // Event-Spine auto-subscription on elevation: ONLY the categories the
-        // oper's binding presubscribes to (0 = none — they must `EVENT ADD`).
-        // A cross-mesh grant carries no presubscribe, so a remote oper defaults
-        // to no auto-subscription.
-        var presubscribe_bits: u64 = 0;
-        var from_local = false;
-        if (self.oper_registry) |registry| {
-            if (registry.elevate(.{ .name = account })) |grant| {
-                privileges = grant.privileges;
-                class_name = grant.class_name;
-                title = grant.title;
-                presubscribe_bits = grant.presubscribe_bits;
-                from_local = true;
-            } else |_| {}
-        }
-        if (!from_local) {
-            const now: u64 = self.grantNowU64();
-            const g = self.oper_grants.lookup(account, now) orelse return; // not an operator anywhere
-            if (g.privilege_bits == 0) return; // zero-privilege grant = revocation tombstone
-            privileges = oper_mod.OperPrivileges.fromBits(g.privilege_bits);
-            class_name = g.class;
-            title = g.title;
-        }
+        const application_now = self.grantNowU64();
+        const configured_binding = if (self.oper_registry) |*registry|
+            oper_session_provenance.configuredLocalBinding(registry, account)
+        else
+            null;
+        const presubscribe_bits = if (configured_binding) |*binding| binding.presubscribeBits() else 0;
 
-        // Capture the granted privilege set + class on the session so handlers
-        // can gate sensitive actions on specific privileges, not just is_oper.
-        conn.session.setOperGrant(privileges, class_name, title);
+        // Step 5 deliberately consumes only the sealed live-config capability.
+        // The durable Services image can already return a typed active OCG2
+        // record, so threading it here would activate OCG2 before the frozen
+        // transactional Step 6 boundary. Keep that source explicitly disabled.
+        const outcome = conn.session.reconcileOperAuthority(configured_binding, .disabled, application_now);
+        if (outcome != .replaced or !conn.session.isOper()) return;
+        const privileges = conn.session.oper_priv;
+        const class_name = conn.session.operClass();
+        const title = conn.session.operTitle();
+
+        if (!conn.session.isOper()) return;
         self.applyOperAutoOverride(conn); // [oper] auto_override → +j for oper_override holders
         // Opers are always in IRCX mode: SASL oper elevation auto-enables it, so
         // the IRCX command surface + PROP-change notifications "just work" without
@@ -34428,10 +34935,8 @@ pub const LinuxServer = struct {
         // and persist it so the operator is restored after a full restart (a USR2
         // keeps the session's oper status; a cold restart does not) without waiting
         // for a peer to re-propagate it.
-        if (from_local) {
-            self.mintOperGrant(account, privileges, class_name, title);
-            self.persistGrants();
-        }
+        self.mintOperGrant(account, privileges, class_name, title);
+        self.persistGrants();
         self.traceLog(.notice, .oper, "operator elevated via SASL account");
         // Wallops, oper notices, kills, etc. arrive as typed Event-Spine events,
         // but ONLY for the categories this oper presubscribed to (per the
@@ -34487,34 +34992,48 @@ pub const LinuxServer = struct {
         if (conn.session.hasPriv(.oper_override)) _ = conn.session.setUmode(.override, true);
     }
 
-    /// Drop operator status from every connected session of `account` (a
-    /// REVOKE / revocation-tombstone arriving from a peer). Config-bound opers
-    /// are left alone — their authority comes from `[[opers]]`, not a grant.
-    fn deElevateSessions(self: *LinuxServer, account: []const u8) void {
-        if (self.oper_registry) |reg| {
-            if (reg.lookup(account) != null) return; // configured oper; not grant-revocable
+    /// Revoke one live operator projection and publish every externally-visible
+    /// consequence exactly once. Account mutation callers invoke this BEFORE
+    /// loginAs/loginGuest/logout clears the session, preserving the old +a/+j
+    /// and derived +Y facts long enough to retract them from clients. The
+    /// actual authority cut happens first; all wire/event publication is
+    /// best-effort and can never keep privilege alive on delivery failure.
+    fn clearOperAuthorityTransition(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        announce_prefix: bool,
+        reason: []const u8,
+    ) bool {
+        if (!conn.session.isOper()) return false;
+        const had_admin = conn.session.hasUmode(.admin);
+        const had_override_mode = conn.session.hasUmode(.override);
+        const had_oper_prefix = conn.session.hasPriv(.oper_override);
+        const nick = conn.session.displayName();
+
+        conn.session.clearOper();
+
+        var modes_buf: [5]u8 = undefined;
+        var modes_len: usize = 0;
+        modes_buf[modes_len] = '-';
+        modes_len += 1;
+        modes_buf[modes_len] = 'o';
+        modes_len += 1;
+        if (had_admin) {
+            modes_buf[modes_len] = usermode.letterOf(.admin) orelse 'a';
+            modes_len += 1;
         }
-        for (self.reactors) |*reactor| for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
-            if (!slot.occupied) continue;
-            const c = &slot.value;
-            const id = slotClientId(reactor, slot_index, slot.gen);
-            if (c.s2s != null or c.s2s_secured != null) continue;
-            if (!c.session.registered() or !c.session.isOper()) continue;
-            const acct = c.session.account() orelse continue;
-            if (!std.ascii.eqlIgnoreCase(acct, account)) continue;
-            c.session.clearOper();
-            var msg_buf: [default_reply_bytes]u8 = undefined;
-            const nick = c.session.displayName();
-            const msg = formatMessage(&msg_buf, self.serverName(), "MODE", &.{ nick, "-o" }, null) catch continue;
-            self.enqueueDelivery(id, msg) catch {};
-            var notice_buf: [256]u8 = undefined;
-            const notice = std.fmt.bufPrint(
-                &notice_buf,
-                ":{s} NOTICE * :Your operator authority has been revoked.\r\n",
-                .{self.serverName()},
-            ) catch continue;
-            self.enqueueDelivery(id, notice) catch {};
-        };
+        if (had_override_mode) {
+            modes_buf[modes_len] = usermode.letterOf(.override) orelse 'j';
+            modes_len += 1;
+        }
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = formatMessage(&msg_buf, self.serverName(), "MODE", &.{ nick, modes_buf[0..modes_len] }, null) catch "";
+        if (msg.len != 0) self.enqueueDelivery(id, msg) catch {};
+        self.publishUserEvent(conn, "DEOPER", reason) catch {};
+        if (announce_prefix and had_oper_prefix)
+            self.announceOperPrefixAllChannels(nick, false);
+        return true;
     }
 
     /// Resolve a GRANT's privilege set: an explicit comma-separated privilege-name
@@ -34545,10 +35064,9 @@ pub const LinuxServer = struct {
         });
     }
 
-    /// GRANT <account> <class> [priv,priv,...] — give a registered account
-    /// operator authority network-wide. Requires the `oper_grant` privilege. Mints
-    /// a signed grant (recorded locally, propagated to secured peers, and honored
-    /// on the account's next login) and elevates already-connected sessions now.
+    /// GRANT <account> <class> [priv,priv,...] — retain an inactive legacy OCG1
+    /// record for compatibility telemetry. Requires `oper_grant`, but never
+    /// projects authority into a session; OCG2 activation is separately gated.
     pub fn handleGrant(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.hasPriv(.oper_grant)) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied (oper_grant required)");
@@ -34573,26 +35091,20 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "GRANT: unknown privilege name in list");
             return;
         };
-        const had_oper_override = if (self.oper_grants.lookup(account, self.grantNowU64())) |grant|
-            oper_mod.OperPrivileges.fromBits(grant.privilege_bits).has(.oper_override)
-        else
-            false;
         self.mintOperGrant(account, privs, class, "");
-        self.elevateGrantedSessions(account);
-        const has_oper_override = privs.has(.oper_override);
-        if (had_oper_override != has_oper_override)
-            self.announceOperPrefixForAccount(account, has_oper_override);
         self.persistGrants();
 
         var b: [256]u8 = undefined;
-        try self.noticeTo(conn, std.fmt.bufPrint(&b, "GRANT: {s} is now an operator (class {s})", .{ account, class }) catch "GRANT applied");
-        self.notifyObservers(.oper_up, observeSubject(conn, account));
+        try self.noticeTo(conn, std.fmt.bufPrint(
+            &b,
+            "GRANT: stored inactive legacy record for {s} (class {s}); no authority activated",
+            .{ account, class },
+        ) catch "GRANT: stored inactive legacy record; no authority activated");
     }
 
-    /// REVOKE <account> — remove operator authority from a runtime-granted account
-    /// network-wide: a zero-privilege tombstone supersedes the grant (propagated to
-    /// peers + honored on next login) and connected sessions are de-elevated now.
-    /// Configured `[[opers]]` accounts are not revocable this way.
+    /// REVOKE <account> — supersede an inactive legacy OCG1 record with a
+    /// zero-privilege tombstone. Configured `[[opers]]` accounts remain outside
+    /// this compatibility plane and cannot be revoked by this command.
     pub fn handleRevoke(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.hasPriv(.oper_grant)) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied (oper_grant required)");
@@ -34609,20 +35121,13 @@ pub const LinuxServer = struct {
                 return;
             }
         }
-        const had_oper_override = if (self.oper_grants.lookup(account, self.grantNowU64())) |grant|
-            oper_mod.OperPrivileges.fromBits(grant.privilege_bits).has(.oper_override)
-        else
-            false;
         self.mintOperGrant(account, oper_mod.OperPrivileges.empty, "revoked", "");
-        self.deElevateSessions(account);
-        if (had_oper_override) self.announceOperPrefixForAccount(account, false);
         self.persistGrants();
         var b: [256]u8 = undefined;
-        try self.noticeTo(conn, std.fmt.bufPrint(&b, "REVOKE: operator authority removed from {s}", .{account}) catch "REVOKE applied");
-        self.notifyObservers(.oper_up, observeSubject(conn, account));
+        try self.noticeTo(conn, std.fmt.bufPrint(&b, "REVOKE: stored inactive legacy tombstone for {s}", .{account}) catch "REVOKE: stored inactive legacy tombstone");
     }
 
-    /// GRANTS — list the live runtime operator grants (account, class, scope).
+    /// GRANTS — list non-tombstone inactive legacy OCG1 records.
     pub fn handleGrants(self: *LinuxServer, conn: *ConnState) !void {
         try self.noticeTo(conn, "Runtime operator grants:");
         const now: u64 = self.grantNowU64();
@@ -34639,7 +35144,7 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, std.fmt.bufPrint(&b, "End of grants ({d}).", .{count}) catch "End of grants.");
     }
 
-    /// Persist the active runtime operator grants to `[oper] grants_path` (tab-
+    /// Persist inactive non-tombstone legacy OCG1 records to `[oper] grants_path` (tab-
     /// separated account/privbits/class/title, one per line). Tombstones
     /// (privilege_bits == 0) are omitted, so a revoked account is simply absent
     /// and is not restored. No-op when no path is configured.
@@ -34665,9 +35170,9 @@ pub const LinuxServer = struct {
         writeFileAbs(self.allocator, self.config.oper_grants_path, out.items);
     }
 
-    /// Reload persisted runtime grants at boot: re-mint each into the registry so
-    /// previously-granted accounts elevate on their next login. Called once from
-    /// `start`. No-op without a configured path / readable file.
+    /// Reload persisted legacy OCG1 records at boot for compatibility telemetry.
+    /// Re-minting does not project session authority. Called once from `start`;
+    /// no-op without a configured path / readable file.
     fn loadGrants(self: *LinuxServer) void {
         if (self.config.oper_grants_path.len == 0) return;
         const io = self.config.crypto_io orelse return;
@@ -34688,7 +35193,7 @@ pub const LinuxServer = struct {
             self.mintOperGrant(account, oper_mod.OperPrivileges.fromBits(bits), class, title);
             restored += 1;
         }
-        if (restored != 0) srvLog("onyx-server: restored {d} runtime operator grant(s)\n", .{restored});
+        if (restored != 0) srvLog("onyx-server: restored {d} inactive legacy OCG1 record(s)\n", .{restored});
     }
 
     /// Restore the per-channel statistics snapshot persisted by a previous run,
@@ -34872,6 +35377,7 @@ pub const LinuxServer = struct {
     fn finishLogin(self: *LinuxServer, conn: *ConnState, account: []const u8) !void {
         const id = idFromToken(conn.token);
         self.retireMediaBeforeAccountMutation(id, conn, account);
+        _ = self.clearOperAuthorityTransition(id, conn, true, "account authentication replaced operator authority");
         // Re-login to a different account: drop the previous account's session
         // binding first (mirrors handleLogout / handleIdentify) so a stale
         // SessionStore entry can't keep this connection in the old delivery set.
@@ -34914,6 +35420,12 @@ pub const LinuxServer = struct {
             return;
         };
         self.retireMediaBeforeAccountMutation(idFromToken(conn.token), conn, account);
+        _ = self.clearOperAuthorityTransition(
+            idFromToken(conn.token),
+            conn,
+            true,
+            "account registration replaced operator authority",
+        );
         if (conn.session.account()) |old| {
             if (!std.ascii.eqlIgnoreCase(old, account))
                 _ = self.removeTrackedSession(old, monitorIdFromClient(idFromToken(conn.token)));
@@ -35037,6 +35549,12 @@ pub const LinuxServer = struct {
         }
         self.loginRecordSuccess(conn, account);
         self.retireMediaBeforeAccountMutation(idFromToken(conn.token), conn, account);
+        _ = self.clearOperAuthorityTransition(
+            idFromToken(conn.token),
+            conn,
+            true,
+            "account authentication replaced operator authority",
+        );
         // Re-IDENTIFY to a different account: drop the previous account's session
         // binding first (mirrors handleLogout), so a stale SessionStore entry can
         // never keep this connection in the old account's delivery/fan-out set.
@@ -35095,14 +35613,10 @@ pub const LinuxServer = struct {
                 try appendToConn(conn, line);
             } else |_| {}
         }
+        if (was_oper)
+            _ = self.clearOperAuthorityTransition(id, conn, true, "account logout revoked operator authority");
         conn.session.logout();
         var buf: [default_reply_bytes]u8 = undefined;
-        if (was_oper) {
-            conn.session.clearOper();
-            const nick = conn.session.displayName();
-            const mode = std.fmt.bufPrint(&buf, ":{s} MODE {s} :-o\r\n", .{ self.serverName(), nick }) catch return;
-            try appendToConn(conn, mode);
-        }
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now logged out\r\n", .{ self.serverName(), conn.session.displayName() }) catch return;
         try emitReplyLine(conn, line);
     }
@@ -35651,6 +36165,121 @@ pub const LinuxServer = struct {
         return @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
     }
 
+    fn localPropOriginNode(self: *const LinuxServer) u64 {
+        if (self.config.node_identity) |ident| return ident.shortId();
+        return self.config.node_id;
+    }
+
+    fn observationalCredentialKind(key: []const u8) ?key_transparency.CredentialKind {
+        if (e2ee_policy.isDevicePropKey(key)) return .e2ee_device;
+        if (account_identity.isPropKey(key)) return .identity;
+        return null;
+    }
+
+    fn observationalCredentialKeyId(key: []const u8) ?[]const u8 {
+        if (e2ee_policy.isDevicePropKey(key)) return key[e2ee_policy.device_prop_prefix.len..];
+        if (account_identity.isPropKey(key)) return key[account_identity.prop_prefix.len..];
+        return null;
+    }
+
+    fn observationalBindMaterial(
+        kind: key_transparency.CredentialKind,
+        value: []const u8,
+        identity_key_buf: *[account_identity.public_key_len]u8,
+    ) []const u8 {
+        if (kind == .identity) {
+            if (account_identity.parseClaimValue(value)) |claim| {
+                identity_key_buf.* = claim.public_key;
+                return identity_key_buf;
+            }
+        }
+        return value;
+    }
+
+    /// Best-effort observation of an exact `e2ee.device.*` or `identity.key.*`
+    /// user PROP after the mutation has already succeeded. Member, residence,
+    /// and unrelated keys are ignored. Never changes the caller's reply.
+    fn observeUserCredentialProp(
+        self: *LinuxServer,
+        present: bool,
+        store_kind: ircx_prop_store.EntityKind,
+        account: []const u8,
+        key: []const u8,
+        value: []const u8,
+        hlc: u64,
+        origin_node: u64,
+        origin_pubkey: []const u8,
+    ) void {
+        if (store_kind != .user) return;
+        const kind = observationalCredentialKind(key) orelse return;
+        const key_id = observationalCredentialKeyId(key) orelse return;
+        var identity_key_buf: [account_identity.public_key_len]u8 = undefined;
+        const material = if (present)
+            observationalBindMaterial(kind, value, &identity_key_buf)
+        else
+            "";
+        self.observeCredentialFact(
+            account,
+            kind,
+            if (present) .bind else .delete,
+            key_id,
+            material,
+            hlc,
+            origin_node,
+            origin_pubkey,
+        );
+    }
+
+    fn observeLocalUserCredentialProp(
+        self: *LinuxServer,
+        present: bool,
+        store_kind: ircx_prop_store.EntityKind,
+        account: []const u8,
+        key: []const u8,
+        value: []const u8,
+        hlc: u64,
+    ) void {
+        self.observeUserCredentialProp(
+            present,
+            store_kind,
+            account,
+            key,
+            value,
+            hlc,
+            self.localPropOriginNode(),
+            "",
+        );
+    }
+
+    /// Record one node-local observation after a PROP mutation has already
+    /// succeeded. Never rolls back the prop and never holds a prop lock.
+    fn observeCredentialFact(
+        self: *LinuxServer,
+        account: []const u8,
+        kind: key_transparency.CredentialKind,
+        action: key_transparency.Action,
+        key_id: []const u8,
+        material: []const u8,
+        hlc: u64,
+        origin_node: u64,
+        origin_pubkey: []const u8,
+    ) void {
+        const svc = self.account_services orelse return;
+        svc.observeKeyTransparencyFact(
+            account,
+            kind,
+            action,
+            key_id,
+            material,
+            key_transparency.observationTimestampMs(hlc),
+            .{
+                .hlc = hlc,
+                .origin_node = origin_node,
+                .origin_pubkey = origin_pubkey,
+            },
+        );
+    }
+
     const E2eeDeviceValue = struct {
         algorithm: []const u8,
         public_key: []const u8,
@@ -35931,29 +36560,14 @@ pub const LinuxServer = struct {
 
     fn renderE2eeGroupLineFromPrefix(
         prefix: []const u8,
+        from_account: []const u8,
         record: e2ee_group_control.Record,
         out: []u8,
     ) ServerError![]const u8 {
-        return if (record.kind == .welcome)
-            std.fmt.bufPrint(
-                out,
-                ":{s} {s} {s} {s} {s} {s} :{s}\r\n",
-                .{
-                    prefix,
-                    record.kind.wireTag(),
-                    record.channel,
-                    record.from_device,
-                    record.to_account.?,
-                    record.to_device.?,
-                    record.payload,
-                },
-            ) catch error.OutputTooSmall
-        else
-            std.fmt.bufPrint(
-                out,
-                ":{s} {s} {s} {s} :{s}\r\n",
-                .{ prefix, record.kind.wireTag(), record.channel, record.from_device, record.payload },
-            ) catch error.OutputTooSmall;
+        return e2ee_group_delivery.renderClientLine(prefix, from_account, record, out) catch |err| switch (err) {
+            error.OutputTooSmall => error.OutputTooSmall,
+            error.InvalidRecord => error.OutputTooSmall,
+        };
     }
 
     fn deliverE2eeGroupLine(
@@ -36069,6 +36683,7 @@ pub const LinuxServer = struct {
         var line_buf: [e2ee_group_max_line_bytes]u8 = undefined;
         const line = renderE2eeGroupLineFromPrefix(
             record.source_prefix,
+            record.account,
             control,
             &line_buf,
         ) catch return .rejected;
@@ -36178,10 +36793,10 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn e2eeDeviceCount(self: *LinuxServer, account: []const u8) usize {
+    fn e2eeDeviceCount(self: *LinuxServer, account: []const u8) !usize {
         const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-        var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-        const rows = self.props.listProps(entity, &views) catch return 0;
+        var views: [ircx_prop_store.user_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+        const rows = try self.props.listPropsRaw(entity, &views);
         var count: usize = 0;
         for (rows) |ev| {
             if (e2ee_policy.isDevicePropKey(ev.key)) count += 1;
@@ -36252,9 +36867,10 @@ pub const LinuxServer = struct {
         record: e2ee_group_control.Record,
         out: []u8,
     ) ServerError![]const u8 {
+        const from_account = conn.session.account() orelse return error.OutputTooSmall;
         var prefix_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
-        return renderE2eeGroupLineFromPrefix(prefix, record, out);
+        return renderE2eeGroupLineFromPrefix(prefix, from_account, record, out);
     }
 
     /// Operator-only process-local activation barrier:
@@ -36408,7 +37024,7 @@ pub const LinuxServer = struct {
         const source_prefix = clientPrefix(conn, &source_prefix_buf) catch
             return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "Could not bind group E2EE origin");
         var line_buf: [e2ee_group_max_line_bytes]u8 = undefined;
-        const line = renderE2eeGroupLineFromPrefix(source_prefix, record, &line_buf) catch
+        const line = renderE2eeGroupLineFromPrefix(source_prefix, account, record, &line_buf) catch
             return self.failReply(conn, "E2EEGROUP", "BAD_PAYLOAD", "Group E2EE control record is too large");
 
         // A standalone server has no mesh signing authority and preserves the
@@ -36521,8 +37137,10 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(sub, "STATUS")) {
             const account = conn.session.account() orelse
                 return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before managing E2EE device keys");
+            const count = self.e2eeDeviceCount(account) catch
+                return self.failReply(conn, "E2EEKEY", "TEMPORARILY_UNAVAILABLE", "Could not inspect the complete device directory");
             var b: [128]u8 = undefined;
-            const body = std.fmt.bufPrint(&b, "STATUS account={s} devices={d}", .{ account, self.e2eeDeviceCount(account) }) catch return;
+            const body = std.fmt.bufPrint(&b, "STATUS account={s} devices={d}", .{ account, count }) catch return;
             return self.e2eeKeyReply(conn, body);
         }
 
@@ -36530,10 +37148,9 @@ pub const LinuxServer = struct {
             const account = if (p.len >= 2) p[1] else (conn.session.account() orelse
                 return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before listing your E2EE device keys"));
             const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-            var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-            const rows = self.props.listProps(entity, &views) catch rows: {
-                break :rows views[0..0];
-            };
+            var views: [ircx_prop_store.user_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+            const rows = self.props.listPropsRaw(entity, &views) catch
+                return self.failReply(conn, "E2EEKEY", "TEMPORARILY_UNAVAILABLE", "Could not inspect the complete device directory");
             var count: usize = 0;
             for (rows) |ev| {
                 if (!e2ee_policy.isDevicePropKey(ev.key)) continue;
@@ -36554,59 +37171,42 @@ pub const LinuxServer = struct {
         }
 
         if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
-            const account = conn.session.account() orelse
+            _ = conn.session.account() orelse
                 return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before adding E2EE device keys");
             if (p.len < 4) return self.failReply(conn, "E2EEKEY", "NEED_MORE_PARAMS", "Usage: E2EEKEY ADD <device-id> <algorithm> <public-key>");
             var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
             const key = e2ee_policy.devicePropKey(p[1], &key_buf) orelse
                 return self.failReply(conn, "E2EEKEY", "BAD_DEVICE", "Device id must use A-Z, a-z, 0-9, dot, dash, or underscore");
+            e2ee_policy.validateAdvertisement(p[1], p[2], p[3]) catch |err| switch (err) {
+                error.InvalidDevice => return self.failReply(
+                    conn,
+                    "E2EEKEY",
+                    "BAD_DEVICE",
+                    "Device id must match the OGC1 directory identifier",
+                ),
+                error.InvalidKey => return self.failReply(conn, "E2EEKEY", "BAD_KEY", "Algorithm or public key is invalid"),
+            };
             var value_buf: [e2ee_policy.max_device_value_len]u8 = undefined;
             const value = e2ee_policy.deviceValue(p[2], p[3], &value_buf) orelse
                 return self.failReply(conn, "E2EEKEY", "BAD_KEY", "Algorithm or public key is invalid");
-            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-            const ev = self.props.setProp(entity, key, value, .{ .id = account, .access = .member }) catch
-                return self.failReply(conn, "E2EEKEY", "STORE_FAILED", "Could not store E2EE device key");
-            if (self.account_services) |svc| svc.recordExternalKeyTransparencyEvent(
-                account,
-                .e2ee_device,
-                .bind,
-                p[1],
-                value,
-                self.keyTransparencyTimestampMs(),
-            );
-            self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
-            self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
+            const outcome = self.commitLocalDurableDeviceProp(conn, null, key, value, true);
+            if (outcome != .committed)
+                return self.durableDeviceFailureReply(conn, "E2EEKEY", outcome);
             var b: [128]u8 = undefined;
             const body = std.fmt.bufPrint(&b, "ADDED id={s} alg={s}", .{ p[1], p[2] }) catch return;
             return self.e2eeKeyReply(conn, body);
         }
 
         if (std.ascii.eqlIgnoreCase(sub, "DEL") or std.ascii.eqlIgnoreCase(sub, "DELETE")) {
-            const account = conn.session.account() orelse
+            _ = conn.session.account() orelse
                 return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before deleting E2EE device keys");
             if (p.len < 2) return self.failReply(conn, "E2EEKEY", "NEED_MORE_PARAMS", "Usage: E2EEKEY DEL <device-id>");
             var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
             const key = e2ee_policy.devicePropKey(p[1], &key_buf) orelse
                 return self.failReply(conn, "E2EEKEY", "BAD_DEVICE", "Device id must use A-Z, a-z, 0-9, dot, dash, or underscore");
-            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-            var removed_value_buf: [e2ee_policy.max_device_value_len]u8 = undefined;
-            const removed_value: ?[]const u8 = if (self.props.getProp(entity, key)) |prior| blk: {
-                if (prior.value.len > removed_value_buf.len) break :blk null;
-                @memcpy(removed_value_buf[0..prior.value.len], prior.value);
-                break :blk removed_value_buf[0..prior.value.len];
-            } else |_| null;
-            self.props.deleteProp(entity, key) catch {};
-            if (removed_value) |material| if (self.account_services) |svc|
-                svc.recordExternalKeyTransparencyEvent(
-                    account,
-                    .e2ee_device,
-                    .delete,
-                    p[1],
-                    material,
-                    self.keyTransparencyTimestampMs(),
-                );
-            self.propagateLocalEntityProp(false, entity.kind, entity.id, key, "", account);
-            self.notifyLocalPropChange(conn, entity, key, "");
+            const outcome = self.commitLocalDurableDeviceProp(conn, null, key, "", false);
+            if (outcome != .committed)
+                return self.durableDeviceFailureReply(conn, "E2EEKEY", outcome);
             var b: [96]u8 = undefined;
             const body = std.fmt.bufPrint(&b, "DELETED id={s}", .{p[1]}) catch return;
             return self.e2eeKeyReply(conn, body);
@@ -36694,16 +37294,9 @@ pub const LinuxServer = struct {
             const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
             const ev = self.props.setProp(entity, key, value, .{ .id = account, .access = .member }) catch
                 return self.failReply(conn, "IDENTITY", "STORE_FAILED", "Could not store portable identity key");
-            const identity_claim = account_identity.parseClaimValue(value) orelse unreachable;
-            if (self.account_services) |svc| svc.recordExternalKeyTransparencyEvent(
-                account,
-                .identity,
-                .bind,
-                p[1],
-                &identity_claim.public_key,
-                self.keyTransparencyTimestampMs(),
-            );
-            self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
+            const hlc = self.nextChannelPropHlc();
+            self.observeLocalUserCredentialProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, hlc);
+            self.propagateLocalEntityPropAt(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner, hlc);
             self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
             var b: [128]u8 = undefined;
             const body = std.fmt.bufPrint(&b, "ADDED label={s}", .{p[1]}) catch return;
@@ -36797,25 +37390,13 @@ pub const LinuxServer = struct {
             const key = account_identity.propKey(p[1], &key_buf) orelse
                 return self.failReply(conn, "IDENTITY", "BAD_LABEL", "Identity label must use A-Z, a-z, 0-9, dot, dash, or underscore");
             const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-            const removed_public_key: ?[account_identity.public_key_len]u8 =
-                if (self.props.getProp(entity, key)) |prior|
-                    if (account_identity.parseClaimValue(prior.value)) |claim|
-                        claim.public_key
-                    else
-                        null
-                else |_|
-                    null;
+            const existed = if (self.props.getProp(entity, key)) |_| true else |_| false;
             self.props.deleteProp(entity, key) catch {};
-            if (removed_public_key) |material| if (self.account_services) |svc|
-                svc.recordExternalKeyTransparencyEvent(
-                    account,
-                    .identity,
-                    .delete,
-                    p[1],
-                    &material,
-                    self.keyTransparencyTimestampMs(),
-                );
-            self.propagateLocalEntityProp(false, entity.kind, entity.id, key, "", account);
+            const hlc = self.nextChannelPropHlc();
+            if (existed) {
+                self.observeLocalUserCredentialProp(false, entity.kind, entity.id, key, "", hlc);
+            }
+            self.propagateLocalEntityPropAt(false, entity.kind, entity.id, key, "", account, hlc);
             self.notifyLocalPropChange(conn, entity, key, "");
             var b: [96]u8 = undefined;
             const body = std.fmt.bufPrint(&b, "DELETED label={s}", .{p[1]}) catch return;
@@ -36852,10 +37433,15 @@ pub const LinuxServer = struct {
 
         if (std.ascii.eqlIgnoreCase(sub, "STATUS") or std.ascii.eqlIgnoreCase(sub, "ROOT")) {
             const status = svc.keyTransparencyStatus();
-            if (!status.enabled) return self.keyTransReply(conn, "STATUS disabled");
+            if (!status.enabled) return self.keyTransReply(conn, "STATUS disabled semantics=observational scope=node-local");
+            if (!status.available) return self.keyTransReply(conn, "STATUS unavailable semantics=observational scope=node-local");
             const root_hex = std.fmt.bytesToHex(status.root, .lower);
-            var b: [160]u8 = undefined;
-            const body = std.fmt.bufPrint(&b, "STATUS enabled entries={d} root={s}", .{ status.entries, &root_hex }) catch return;
+            var b: [220]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &b,
+                "STATUS enabled semantics=observational scope=node-local entries={d} root={s}",
+                .{ status.entries, &root_hex },
+            ) catch return;
             return self.keyTransReply(conn, body);
         }
 
@@ -36866,11 +37452,13 @@ pub const LinuxServer = struct {
             var proof = svc.keyTransparencyProof(self.allocator, position) catch |err| {
                 const code: []const u8 = switch (err) {
                     error.Disabled => "DISABLED",
+                    error.Unavailable => "TEMPORARILY_UNAVAILABLE",
                     error.IndexOutOfRange => "NO_SUCH_LEAF",
                     error.OutOfMemory => "INTERNAL_ERROR",
                 };
                 const reason: []const u8 = switch (err) {
                     error.Disabled => "Key transparency log is not enabled",
+                    error.Unavailable => "Key transparency log is unavailable",
                     error.IndexOutOfRange => "No key transparency leaf exists at that position",
                     error.OutOfMemory => "Could not allocate proof snapshot",
                 };
@@ -36910,7 +37498,127 @@ pub const LinuxServer = struct {
             return self.keyTransReply(conn, end);
         }
 
-        return self.failReply(conn, "KEYTRANS", "INVALID_SUBCOMMAND", "Usage: KEYTRANS [STATUS|ROOT|PROOF <position>]");
+        // EVENT/DEVICE are a public transparency surface: they reveal the
+        // canonical account, kind, action, key id, material hash, timestamp,
+        // and leaf. They never emit raw COSE keys, identity signatures, or
+        // passwords. Anyone who can walk positions can audit the log; that is
+        // the point, not a directory of live credentials.
+        if (std.ascii.eqlIgnoreCase(sub, "EVENT")) {
+            if (p.len < 2) return self.failReply(conn, "KEYTRANS", "NEED_MORE_PARAMS", "Usage: KEYTRANS EVENT <position>");
+            const position = std.fmt.parseInt(usize, p[1], 10) catch
+                return self.failReply(conn, "KEYTRANS", "BAD_POSITION", "Event position must be a decimal leaf index");
+            const snapshot = svc.keyTransparencyEvent(position) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.Disabled => "DISABLED",
+                    error.Unavailable => "TEMPORARILY_UNAVAILABLE",
+                    error.IndexOutOfRange => "NO_SUCH_LEAF",
+                };
+                const reason: []const u8 = switch (err) {
+                    error.Disabled => "Key transparency log is not enabled",
+                    error.Unavailable => "Key transparency log is unavailable",
+                    error.IndexOutOfRange => "No key transparency event exists at that position",
+                };
+                return self.failReply(conn, "KEYTRANS", code, reason);
+            };
+            const key_hash_hex = std.fmt.bytesToHex(snapshot.event.key_hash, .lower);
+            const leaf_hex = std.fmt.bytesToHex(snapshot.event.leaf, .lower);
+            var b: [default_reply_bytes]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &b,
+                "EVENT position={d} size={d} account={s} kind={s} action={s} key_id={s} key_hash={s} time={d} leaf={s}",
+                .{
+                    snapshot.position,
+                    snapshot.size,
+                    snapshot.event.account(),
+                    snapshot.event.kind.wireName(),
+                    snapshot.event.action.wireName(),
+                    snapshot.event.keyId(),
+                    &key_hash_hex,
+                    snapshot.event.timestamp_ms,
+                    &leaf_hex,
+                },
+            ) catch return;
+            return self.keyTransReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "DEVICE")) {
+            if (p.len < 3) return self.failReply(conn, "KEYTRANS", "NEED_MORE_PARAMS", "Usage: KEYTRANS DEVICE <account> <device-id>");
+            const snapshot = svc.keyTransparencyDevice(p[1], p[2]) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.Disabled => "DISABLED",
+                    error.Unavailable => "TEMPORARILY_UNAVAILABLE",
+                    error.InvalidName => "BAD_ACCOUNT",
+                    error.InvalidKeyId => "BAD_DEVICE",
+                    error.NotFound => "NO_SUCH_DEVICE",
+                };
+                const reason: []const u8 = switch (err) {
+                    error.Disabled => "Key transparency log is not enabled",
+                    error.Unavailable => "Key transparency log is unavailable",
+                    error.InvalidName => "Account must be a canonical services name",
+                    error.InvalidKeyId => "Device id contains unsupported bytes",
+                    error.NotFound => "No key transparency event exists for that account and device",
+                };
+                return self.failReply(conn, "KEYTRANS", code, reason);
+            };
+            const key_hash_hex = std.fmt.bytesToHex(snapshot.event.key_hash, .lower);
+            const leaf_hex = std.fmt.bytesToHex(snapshot.event.leaf, .lower);
+            var b: [default_reply_bytes]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &b,
+                "DEVICE account={s} id={s} observation={s} scope=node-local position={d} size={d} key_hash={s} time={d} leaf={s}",
+                .{
+                    snapshot.event.account(),
+                    snapshot.event.keyId(),
+                    snapshot.observation.wireName(),
+                    snapshot.position,
+                    snapshot.size,
+                    &key_hash_hex,
+                    snapshot.event.timestamp_ms,
+                    &leaf_hex,
+                },
+            ) catch return;
+            return self.keyTransReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "CONSISTENCY")) {
+            if (p.len < 2) return self.failReply(conn, "KEYTRANS", "NEED_MORE_PARAMS", "Usage: KEYTRANS CONSISTENCY <old-size>");
+            const old_size = std.fmt.parseInt(usize, p[1], 10) catch
+                return self.failReply(conn, "KEYTRANS", "BAD_SIZE", "Consistency size must be a decimal prefix length");
+            const cmp = svc.keyTransparencyConsistency(old_size) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.Disabled => "DISABLED",
+                    error.Unavailable => "TEMPORARILY_UNAVAILABLE",
+                    error.SizeAhead => "BAD_SIZE",
+                    error.UnknownCheckpoint => "UNKNOWN_CHECKPOINT",
+                    error.Corrupt => "CORRUPT",
+                    error.OutOfMemory => "INTERNAL_ERROR",
+                };
+                const reason: []const u8 = switch (err) {
+                    error.Disabled => "Observational key log is not enabled",
+                    error.Unavailable => "Observational key log is unavailable",
+                    error.SizeAhead => "Requested size is ahead of the current log",
+                    error.UnknownCheckpoint => "No durable checkpoint exists at that size",
+                    error.Corrupt => "Durable checkpoint is corrupt or does not match this log",
+                    error.OutOfMemory => "Could not compare checkpoint",
+                };
+                return self.failReply(conn, "KEYTRANS", code, reason);
+            };
+            const prefix: []const u8 = switch (cmp.prefix) {
+                .match => "match",
+                .mismatch => "mismatch",
+            };
+            const old_root_hex = std.fmt.bytesToHex(cmp.old_root, .lower);
+            const root_hex = std.fmt.bytesToHex(cmp.root, .lower);
+            var b: [360]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &b,
+                "CONSISTENCY old_size={d} old_root={s} size={d} root={s} prefix={s} scheme=checkpoint-comparison",
+                .{ cmp.old_size, &old_root_hex, cmp.size, &root_hex, prefix },
+            ) catch return;
+            return self.keyTransReply(conn, body);
+        }
+
+        return self.failReply(conn, "KEYTRANS", "INVALID_SUBCOMMAND", "Usage: KEYTRANS [STATUS|ROOT|PROOF <position>|EVENT <position>|DEVICE <account> <device-id>|CONSISTENCY <old-size>]");
     }
 
     // ── WEBAUTHN: passkey (FIDO2) registration + passwordless login ──────────
@@ -41831,7 +42539,18 @@ pub const LinuxServer = struct {
         const nonce_len = @min(conn.session.sasl_server_nonce.len, nonce_buf.len);
         @memcpy(nonce_buf[0..nonce_len], conn.session.sasl_server_nonce[0..nonce_len]);
         var desired_session = conn.session;
-        const profile = prepareMigratedSessionProfile(&desired_session, account, snap, conn.is_tls);
+        const configured_binding = if (self.oper_registry) |*registry|
+            oper_session_provenance.configuredLocalBinding(registry, account)
+        else
+            null;
+        const profile = prepareMigratedSessionProfile(
+            &desired_session,
+            account,
+            snap,
+            conn.is_tls,
+            configured_binding,
+            self.grantNowU64(),
+        );
 
         var old_nick_buf: [64]u8 = undefined;
         const old_nick_src = conn.session.displayName();
@@ -42166,6 +42885,8 @@ pub const LinuxServer = struct {
         authenticated_account: []const u8,
         snap: *const migration_relay.Snapshot,
         transport_secure: bool,
+        configured_binding: ?oper_session_provenance.ConfiguredLocalBinding,
+        authority_now_ms: u64,
     ) MigratedProfileResult {
         // restore() overwrites inline storage, so copy every live slice needed for
         // re-derivation before entering it. Negotiated caps live outside the fields
@@ -42178,18 +42899,8 @@ pub const LinuxServer = struct {
         const account_len = @min(authenticated_account.len, account_buf.len);
         @memcpy(account_buf[0..account_len], authenticated_account[0..account_len]);
 
-        const live_was_oper = session.isOper();
-        const live_priv_bits = session.oper_priv.toBits();
         const live_had_override = session.hasUmode(.override);
         const live_media_tx_denied = session.hasUmode(.media_tx_deny);
-        var live_class_buf: [64]u8 = undefined;
-        const live_class_src = session.operClass();
-        const live_class_len = @min(live_class_src.len, live_class_buf.len);
-        @memcpy(live_class_buf[0..live_class_len], live_class_src[0..live_class_len]);
-        var live_title_buf: [64]u8 = undefined;
-        const live_title_src = session.operTitle();
-        const live_title_len = @min(live_title_src.len, live_title_buf.len);
-        @memcpy(live_title_buf[0..live_title_len], live_title_src[0..live_title_len]);
 
         // The HMAC-authenticated caller account is canonical even for rolling-old
         // snapshots that omitted their account field. The current socket's real
@@ -42207,21 +42918,16 @@ pub const LinuxServer = struct {
             // A carried oper bit is profile history, not current authority. RESUME
             // runs after local authentication/elevation, so only the claimant's
             // verified live grant may retain +o or derive +a/+j.
-            .is_oper = live_was_oper,
+            .is_oper = false,
         });
 
-        // Privilege non-downgrade: SASL elevation precedes RESUME. Preserve that
-        // complete current grant. Preserve an already-authorized +j until the
-        // carried directional mode string explicitly removes it.
-        if (live_was_oper) {
-            session.setOperGrant(
-                oper_mod.OperPrivileges.fromBits(live_priv_bits),
-                live_class_buf[0..live_class_len],
-                live_title_buf[0..live_title_len],
-            );
-            if (live_had_override and session.hasPriv(.oper_override)) {
-                _ = session.setUmode(.override, true);
-            }
+        // A carried oper bit and the predecessor's in-memory projection are
+        // profile history, never authority. Recompute from the live sealed
+        // configured binding after restore; OCG2 remains explicitly disabled
+        // until the transactional activation step is accepted.
+        _ = session.reconcileOperAuthority(configured_binding, .disabled, authority_now_ms);
+        if (live_had_override and session.hasPriv(.oper_override)) {
+            _ = session.setUmode(.override, true);
         }
 
         return applyMigratedUmodesToSession(
@@ -44282,7 +44988,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
         }
-        // Report the live grant stored on the session (captured at elevation).
+        // Report the reconciled projection stored on the session.
         var buf: [default_reply_bytes]u8 = undefined;
         var n: usize = 0;
         var it = conn.session.oper_priv.set.iterator();
@@ -48698,12 +49404,10 @@ pub const LinuxServer = struct {
         return .regular;
     }
 
-    /// Whether `nick` is an IRC operator holding oper_override (the network-admin
-    /// override) — rendered as the `*` status prefix and in WHOIS. Covers both a
-    /// local session AND a cross-mesh oper grant propagated from a peer node
-    /// (keyed by account; matched to the nick), so a remote server's admins also
-    /// render with `*`. The grant path requires the secured Mooring mesh, over
-    /// which signed grants travel.
+    /// Whether `nick` is a locally projected IRC operator holding oper_override.
+    /// Step 5 consumes only configured-local session authority. Inactive OCG1
+    /// records may still relay, persist, and survive Helix, but never feed this
+    /// runtime decision or any downstream +Y/NAMES/WHOIS/KICK behavior.
     fn isOverrideOper(self: *LinuxServer, nick: []const u8) bool {
         for (self.reactors) |*reactor| {
             var it = reactor.clients.iterator();
@@ -48713,14 +49417,6 @@ pub const LinuxServer = struct {
                 if (!c.session.registered()) continue;
                 if (c.session.hasPriv(.oper_override) and std.ascii.eqlIgnoreCase(c.session.displayName(), nick)) return true;
             }
-        }
-        // Prefer the residence-verified remote account when the roster knows it;
-        // legacy peers without account propagation retain the historical
-        // account==nick fallback. This keeps later JOIN/NAMES rendering aligned
-        // with the live transition emitter for account != display nick.
-        const grant_account = self.trustedRemoteAccountForNick(nick) orelse nick;
-        if (self.oper_grants.lookup(grant_account, self.grantNowU64())) |g| {
-            if (g.privilege_bits != 0 and oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override)) return true;
         }
         return false;
     }
@@ -52820,6 +53516,81 @@ const test_multi_oper_bindings = [_]oper_mod.OperBinding{
     .{ .account_name = "oper", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}), .presubscribe_bits = test_presub_all_bits },
 };
 
+fn testAccountSwitchVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
+    return (std.mem.eql(u8, creds.authcid, "admin") or
+        std.mem.eql(u8, creds.authcid, "oper") or
+        std.mem.eql(u8, creds.authcid, "plain")) and
+        std.mem.eql(u8, creds.password, "onyx");
+}
+var test_account_switch_anchor: u8 = 0;
+const test_account_switch_checker = sasl.PlainChecker{
+    .ptr = &test_account_switch_anchor,
+    .verifyFn = testAccountSwitchVerify,
+};
+const test_account_switch_bindings = [_]oper_mod.OperBinding{
+    .{ .account_name = "admin", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full, .presubscribe_bits = test_presub_all_bits },
+    .{ .account_name = "oper", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}) },
+};
+const test_account_switch_narrow_admin_bindings = [_]oper_mod.OperBinding{
+    .{ .account_name = "admin", .class_name = "refreshed", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_kill}) },
+    .{ .account_name = "oper", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}) },
+};
+
+/// Server tests must establish operator authority through the same validated,
+/// sealed configured-local capability as production.  The temporary registry
+/// is consumed synchronously by reconcileOperAuthority; no authority pointer is
+/// retained in ClientSession after the projection is copied.
+fn reconcileTestOper(
+    session: *dispatch.ClientSession,
+    privileges: oper_mod.OperPrivileges,
+    class_name: []const u8,
+    title: []const u8,
+) !void {
+    if (session.account() == null) session.loginAs("test-oper");
+    const account = session.account().?;
+    const bindings = [_]oper_mod.OperBinding{.{
+        .account_name = account,
+        .class_name = class_name,
+        .privileges = privileges,
+        .title = title,
+    }};
+    const registry = try oper_mod.OperRegistry.init(&bindings);
+    const capability = oper_session_provenance.configuredLocalBinding(&registry, account) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        oper_session_provenance.ReconcileOutcome.replaced,
+        session.reconcileOperAuthority(capability, .disabled, 100),
+    );
+}
+
+fn prepareMigratedSessionProfileForTest(
+    session: *dispatch.ClientSession,
+    authenticated_account: []const u8,
+    snap: *const migration_relay.Snapshot,
+    transport_secure: bool,
+    privileges: oper_mod.OperPrivileges,
+    class_name: []const u8,
+    title: []const u8,
+) !LinuxServer.MigratedProfileResult {
+    const bindings = [_]oper_mod.OperBinding{.{
+        .account_name = authenticated_account,
+        .class_name = class_name,
+        .privileges = privileges,
+        .title = title,
+    }};
+    const registry = try oper_mod.OperRegistry.init(&bindings);
+    const capability = oper_session_provenance.configuredLocalBinding(&registry, authenticated_account) orelse
+        return error.TestUnexpectedResult;
+    return LinuxServer.prepareMigratedSessionProfile(
+        session,
+        authenticated_account,
+        snap,
+        transport_secure,
+        capability,
+        100,
+    );
+}
+
 fn testRuntimeGrantVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
     return (std.mem.eql(u8, creds.authcid, "admin") or std.mem.eql(u8, creds.authcid, "target")) and
         std.mem.eql(u8, creds.password, "onyx");
@@ -53280,6 +54051,28 @@ fn rejectUpgradePiecesForTest(
     const arena_dup: linux.fd_t = @intCast(dup_rc);
     server.config.resume_arena_fd = arena_dup;
     try std.testing.expectError(error.InvalidInheritedHandoff, server.adoptInheritedSessions());
+    return arena_dup;
+}
+
+fn rejectDurableUpgradePiecesForTest(
+    server: *Server,
+    pieces: []const helix_live.StatePiece,
+    arena_name: []const u8,
+) !linux.fd_t {
+    var prepared = try helix_live.prepare(std.testing.allocator, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = arena_name,
+        .pieces = pieces,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    server.config.resume_arena_fd = arena_dup;
+    try std.testing.expectError(error.DurableDeviceActivationFailed, server.adoptInheritedSessions());
     return arena_dup;
 }
 
@@ -53767,14 +54560,17 @@ test "UPGRADE seal + adopt carries the cross-mesh oper-grant registry (grants, t
     _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-oper-grants");
     current_reactor = null;
 
-    // The successor's registry converged BEFORE its io loop could process any
-    // peer grant re-mint: `applyMeshGrant` will see `had_oper_override=true`.
+    // The successor's inactive compatibility registry converges before its I/O
+    // loop, but the restored record remains telemetry and cannot project any
+    // runtime operator decision.
     const g = successor.oper_grants.lookup("trev", now) orelse return error.TestExpectedGrant;
     try std.testing.expectEqual(trev_bits, g.privilege_bits);
     try std.testing.expect(oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override));
     try std.testing.expectEqualStrings("netadmin", g.class);
     try std.testing.expectEqualStrings("ircx.us", g.issuer_node);
     try std.testing.expectEqual(@as(u64, 100), g.incarnation);
+    try std.testing.expect(!successor.isOverrideOper("trev"));
+    try std.testing.expect(!successor.remoteDataTagAuthorized("SYS.notice", false, null, "trev"));
     const tomb = successor.oper_grants.lookup("revoked_oper", now) orelse return error.TestExpectedGrant;
     try std.testing.expectEqual(@as(u64, 0), tomb.privilege_bits);
     try std.testing.expectEqual(@as(u64, 200), tomb.incarnation);
@@ -56199,33 +56995,6 @@ const LiveClient = struct {
     }
 };
 
-test "remoteGrantWhoisStatus maps grant privilege bits to WHOIS 313 flags" {
-    // No grant bits (revocation tombstone): no operator line at all.
-    const none = remoteGrantWhoisStatus(0);
-    try std.testing.expect(!none.is_oper and !none.is_admin);
-
-    // oper_override alone: "is an IRC operator".
-    const override_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits();
-    const oper_only = remoteGrantWhoisStatus(override_bits);
-    try std.testing.expect(oper_only.is_oper);
-    try std.testing.expect(!oper_only.is_admin);
-
-    // server_admin upgrades the wording to Network Administrator.
-    const admin_bits = oper_mod.OperPrivileges.initMany(&.{ .oper_override, .server_admin }).toBits();
-    const admin = remoteGrantWhoisStatus(admin_bits);
-    try std.testing.expect(admin.is_oper);
-    try std.testing.expect(admin.is_admin);
-
-    // server_admin without oper_override still renders the operator line.
-    const admin_only = remoteGrantWhoisStatus(oper_mod.OperPrivileges.initMany(&.{.server_admin}).toBits());
-    try std.testing.expect(admin_only.is_oper);
-    try std.testing.expect(admin_only.is_admin);
-
-    // Unrelated privileges (no override/admin) stay silent in WHOIS.
-    const plain = remoteGrantWhoisStatus(oper_mod.OperPrivileges.initMany(&.{.client_kill}).toBits());
-    try std.testing.expect(!plain.is_oper and !plain.is_admin);
-}
-
 test "rebroadcastLocalOpers re-mints an oper homed on a non-zero shard" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
@@ -56245,7 +57014,7 @@ test "rebroadcastLocalOpers re-mints an oper homed on a non-zero shard" {
         try conn.session.setNick("kain");
         conn.session.loginAs("kain");
         conn.session.registration.registered = true;
-        conn.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+        try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
 
         // The read-only scan must cover every reactor; the re-mint lands in the
         // local grant registry (and best-effort broadcasts to secured peers).
@@ -57205,13 +57974,14 @@ test "UPGRADE resume: peer RESYNC re-burst of unchanged remote state emits zero 
     defer alloc.free(quiet);
     try std.testing.expectEqualStrings("", quiet);
 
-    // GENUINE changes after adoption still surface exactly once.
+    // Genuine member/topic changes after adoption still surface exactly once.
+    // The OCG1 tombstone remains telemetry and cannot emit a derived -Y.
     fx.successor.world.lockWrite();
     const op_voice: u4 = @truncate(chanmode.MemberModes.fromModes(&.{ .op, .voice }).bits);
     try pair.b.sendMembership("#root", "trev", op_voice, 950, true, ResyncQuietFixture.trev_ident, "kain");
     try pair.b.sendTopic("#root", "calm seas", "trev", 2000, 951, true);
     try fx.feedAndDrain(alloc, 952);
-    // Revocation tombstone: a genuine transition OUT of oper_override.
+    // Revocation tombstone: retained compatibility telemetry only.
     try std.testing.expect(try fx.applyRemintedGrant(102, 0));
     fx.successor.world.unlockWrite();
 
@@ -57219,17 +57989,16 @@ test "UPGRADE resume: peer RESYNC re-burst of unchanged remote state emits zero 
     defer alloc.free(changed);
     try std.testing.expect(std.mem.indexOf(u8, changed, "MODE #root +v trev") != null);
     try std.testing.expect(std.mem.indexOf(u8, changed, "TOPIC #root :calm seas") != null);
-    try std.testing.expect(std.mem.indexOf(u8, changed, "MODE #root -Y trev") != null);
     // Exactly once each.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, changed, "TOPIC #root"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, changed, "-Y trev"));
+    try std.testing.expect(std.mem.indexOf(u8, changed, "-Y trev") == null);
     // And still no spurious re-JOIN anywhere in the whole exchange.
     try std.testing.expect(std.mem.indexOf(u8, changed, "JOIN") == null);
     try std.testing.expect(std.mem.indexOf(u8, changed, "NICK") == null);
     try std.testing.expect(std.mem.indexOf(u8, changed, "+Y") == null);
 }
 
-test "UPGRADE resume negative control: without the carried grant registry the RESYNC re-mint re-announces +Y" {
+test "UPGRADE resume without carried OCG1 registry still never projects +Y" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
@@ -57256,12 +58025,11 @@ test "UPGRADE resume negative control: without the carried grant registry the RE
     ));
     fx.successor.world.unlockWrite();
 
-    // The observed live bug reproduced: the unchanged oper's re-mint announces
-    // a spurious `MODE #root +Y trev`, and an un-carried topic re-announces —
-    // proving the quiet test above has teeth.
+    // The un-carried topic legitimately re-announces, but an OCG1 re-mint is
+    // inactive telemetry and cannot announce a derived operator prefix.
     const noisy = try copyTestSendQ(alloc, fx.alice);
     defer alloc.free(noisy);
-    try std.testing.expect(std.mem.indexOf(u8, noisy, "MODE #root +Y trev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, noisy, "MODE #root +Y trev") == null);
     try std.testing.expect(std.mem.indexOf(u8, noisy, "TOPIC #root :stormy weather") != null);
 }
 
@@ -57728,7 +58496,7 @@ test "periodic timer tick re-mints live oper grants inside the TTL" {
         const id = try addTestLocalClient(&server, "kain", "kain");
         const conn = server.connFor(id).?;
         conn.session.registration.registered = true;
-        conn.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+        try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
 
         // Seed a nearly-lapsed grant, as if minted almost a full TTL ago. With
         // no periodic re-mint, lookup starts returning null the moment it
@@ -58428,7 +59196,7 @@ test "enforceDnsbl fails open: no resolver, an unresolved IP, and opers all pass
         try std.testing.expect(!server.enforceDnsbl(conn));
 
         // Operators are exempt even if a verdict existed.
-        conn.session.setOperGrant(oper_mod.OperPrivileges.fromBits(~@as(u64, 0)), "netadmin", "Admin");
+        try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.fromBits(~@as(u64, 0)), "netadmin", "Admin");
         try std.testing.expect(!server.enforceDnsbl(conn));
     } else return error.SkipZigTest;
 }
@@ -58783,7 +59551,7 @@ test "KEYTRANS exposes credential transparency root and inclusion proof" {
     conn.send_len = 0;
     try server.handleKeyTrans(conn, &status);
     const root_hex = std.fmt.bytesToHex(kt.root(), .lower);
-    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS STATUS enabled entries=2 root=");
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS STATUS enabled semantics=observational scope=node-local entries=2 root=");
     try expectContains(conn.send_buf[0..conn.send_len], &root_hex);
 
     var proof = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
@@ -58800,6 +59568,1845 @@ test "KEYTRANS exposes credential transparency root and inclusion proof" {
     conn.send_len = 0;
     try server.handleKeyTrans(conn, &proof);
     try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NO_SUCH_LEAF");
+
+    var event_lv = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    event_lv.params[0] = "EVENT";
+    event_lv.params[1] = "1";
+    event_lv.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &event_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS EVENT position=1 size=2 account=alice kind=webauthn action=bind key_id=credAAA");
+    try expectContains(conn.send_buf[0..conn.send_len], "leaf=");
+
+    var consist = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    consist.params[0] = "CONSISTENCY";
+    consist.params[1] = "1";
+    consist.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &consist);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS UNKNOWN_CHECKPOINT");
+
+    consist.params[1] = "0";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &consist);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS CONSISTENCY old_size=0");
+    try expectContains(conn.send_buf[0..conn.send_len], "prefix=match scheme=checkpoint-comparison");
+
+    consist.params[1] = "9";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &consist);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS BAD_SIZE");
+
+    event_lv.params[1] = "9";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &event_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NO_SUCH_LEAF");
+
+    var need = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    need.params[0] = "EVENT";
+    need.param_count = 1;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &need);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NEED_MORE_PARAMS");
+
+    need.params[0] = "DEVICE";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &need);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NEED_MORE_PARAMS");
+}
+
+test "KEYTRANS DEVICE and EVENT survive store restart" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wal_name = "server-keytrans-restart.wal";
+    var first_root: [64]u8 = undefined;
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        try services.recordExternalKeyTransparencyEvent("Alice", .e2ee_device, .bind, "phone", "mls-x25519:abcd+/=", 11);
+        try services.recordExternalKeyTransparencyEvent("Alice", .e2ee_device, .delete, "phone", "mls-x25519:abcd+/=", 12);
+        first_root = std.fmt.bytesToHex(kt.root(), .lower);
+    }
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+    try std.testing.expectEqualStrings(&first_root, &std.fmt.bytesToHex(kt.root(), .lower));
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "kain", null);
+    const conn = server.connFor(id).?;
+
+    var device = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    device.params[0] = "DEVICE";
+    device.params[1] = "ALICE";
+    device.params[2] = "phone";
+    device.param_count = 3;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS DEVICE account=alice id=phone observation=delete scope=node-local position=1 size=2");
+
+    device.params[2] = "missing";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NO_SUCH_DEVICE");
+
+    var event_lv = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    event_lv.params[0] = "EVENT";
+    event_lv.params[1] = "0";
+    event_lv.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &event_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS EVENT position=0 size=2 account=alice kind=e2ee_device action=bind key_id=phone");
+
+    var consist = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    consist.params[0] = "CONSISTENCY";
+    consist.params[1] = "1";
+    consist.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &consist);
+    try expectContains(conn.send_buf[0..conn.send_len], "prefix=match scheme=checkpoint-comparison");
+
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+}
+
+test "KEYTRANS DEVICE reports bound then deleted and rejects a bad account" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-keytrans-device.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "phone", "pub", 1);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "kain", null);
+    const conn = server.connFor(id).?;
+
+    var device = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    device.params[0] = "DEVICE";
+    device.params[1] = "Alice";
+    device.params[2] = "phone";
+    device.param_count = 3;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS DEVICE account=alice id=phone observation=bind scope=node-local position=0 size=1");
+
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .delete, "phone", "pub", 2);
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "observation=delete scope=node-local position=1 size=2");
+
+    device.params[1] = "!!!";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS BAD_ACCOUNT");
+}
+
+test "KEYTRANS corrupt store is fail-closed and restore is idempotent" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const kt_store = @import("key_transparency_store.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-keytrans-corrupt.wal");
+    defer store.deinit();
+    {
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "phone", "pub", 1);
+        services.attachKeyTransparencyLog(&kt);
+        try std.testing.expectEqual(@as(usize, 1), kt.len());
+        var ev_key: [kt_store.event_key_len]u8 = undefined;
+        try store.family(.props).put(kt_store.eventKey(0, &ev_key), "junk");
+    }
+
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expect(kt.unusable);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "kain", null);
+    const conn = server.connFor(id).?;
+
+    var status = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    status.params[0] = "STATUS";
+    status.param_count = 1;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &status);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS STATUS unavailable");
+
+    var event_lv = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    event_lv.params[0] = "EVENT";
+    event_lv.params[1] = "0";
+    event_lv.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &event_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS TEMPORARILY_UNAVAILABLE");
+
+    var device = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    device.params[0] = "DEVICE";
+    device.params[1] = "alice";
+    device.params[2] = "phone";
+    device.param_count = 3;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS TEMPORARILY_UNAVAILABLE");
+
+    var consist = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    consist.params[0] = "CONSISTENCY";
+    consist.params[1] = "0";
+    consist.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &consist);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS TEMPORARILY_UNAVAILABLE");
+}
+
+test "DPROP1 startup authority union rejects partial and mismatched configurations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-dprop-boot-invariants.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc1)), "dprop-boot-invariants.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    try std.testing.expect((try validateDurableDeviceBoot(.{ .port = 0 })) == .inactive);
+    try std.testing.expect((try validateDurableDeviceBoot(.{ .port = 0, .durable_device_boot = .purge_only })) == .purge_only);
+    try std.testing.expectError(error.DurableDeviceActivationFailed, validateDurableDeviceBoot(.{
+        .port = 0,
+        .node_identity = &identity,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }));
+    services.attachDurableCredentialProps(&state);
+    try std.testing.expectError(error.DurableDeviceActivationFailed, validateDurableDeviceBoot(.{
+        .port = 0,
+        .node_id = identity.shortId() +% 1,
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }));
+    const valid = try validateDurableDeviceBoot(.{
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    });
+    try std.testing.expect(valid == .authoritative);
+    try std.testing.expect(valid.authoritative.state == &state);
+}
+
+test "DPROP1 shared cold-hot candidate is purge-first idempotent allocation-failure atomic" {
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc2)), "dprop-candidate.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    var pubkey: [entity_prop_event.pubkey_len]u8 = undefined;
+    var signature: [entity_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedEntityProp(
+        &identity.sign_kp,
+        .user,
+        "alice",
+        "e2ee.device.phone",
+        "mls-x25519:abcd+/=",
+        "alice",
+        17,
+        true,
+        &pubkey,
+        &signature,
+    );
+    var prepared = switch (try state.prepare(.{
+        .present = fact.present,
+        .kind = fact.kind,
+        .origin_node = fact.origin_node,
+        .hlc = fact.hlc,
+        .entity = fact.entity,
+        .key = fact.key,
+        .value = fact.value,
+        .owner = fact.owner,
+        .origin_pubkey = fact.origin_pubkey,
+        .origin_sig = fact.origin_sig,
+    })) {
+        .update => |update| update,
+        else => return error.TestUnexpectedResult,
+    };
+    prepared.commitInto(&state);
+
+    var base = ircx_prop_store.DefaultStore.init(std.testing.allocator);
+    defer base.deinit();
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    _ = try base.setProp(entity, "ordinary", "keep", .{ .id = "alice", .access = .user });
+    _ = try base.setProp(entity, "e2ee.device.stale", "mls-x25519:stale+/=", .{ .id = "alice", .access = .user });
+    var channels: prop_checkpoint.ChannelClockMap = .empty;
+    defer channels.deinit(std.testing.allocator);
+    var entities: prop_checkpoint.EntityClockMap = .empty;
+    defer entities.deinit(std.testing.allocator);
+    var purged = try buildConfiguredDurableDeviceCandidate(std.testing.allocator, &base, &channels, &entities, .purge_only);
+    defer purged.deinit();
+    try std.testing.expectEqualStrings("keep", (try purged.props.getProp(entity, "ordinary")).value);
+    try std.testing.expectError(error.PropMissing, purged.props.getProp(entity, "e2ee.device.stale"));
+    try std.testing.expect(purged.entity_clocks.count() == 0);
+    const plan = DurableDevicePlan{ .authoritative = .{
+        .state = &state,
+        .local_origin_node = identity.shortId(),
+        .local_origin_pubkey = identity.sign_kp.public_key,
+    } };
+    var first = try buildConfiguredDurableDeviceCandidate(std.testing.allocator, &base, &channels, &entities, plan);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("keep", (try first.props.getProp(entity, "ordinary")).value);
+    try std.testing.expectError(error.PropMissing, first.props.getProp(entity, "e2ee.device.stale"));
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try first.props.getProp(entity, "e2ee.device.phone")).value);
+    var second = try buildConfiguredDurableDeviceCandidate(
+        std.testing.allocator,
+        &first.props,
+        &first.channel_clocks,
+        &first.entity_clocks,
+        plan,
+    );
+    defer second.deinit();
+    const first_wire = try prop_checkpoint.encode(std.testing.allocator, &first.props, &first.channel_clocks, &first.entity_clocks);
+    defer std.testing.allocator.free(first_wire);
+    const second_wire = try prop_checkpoint.encode(std.testing.allocator, &second.props, &second.channel_clocks, &second.entity_clocks);
+    defer std.testing.allocator.free(second_wire);
+    try std.testing.expectEqualSlices(u8, first_wire, second_wire);
+
+    const Sweep = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            props: *const ircx_prop_store.DefaultStore,
+            channel_clocks: *const prop_checkpoint.ChannelClockMap,
+            entity_clocks: *const prop_checkpoint.EntityClockMap,
+            durable: *const durable_credential_props.State,
+            origin: u64,
+            public_key: [entity_prop_event.pubkey_len]u8,
+        ) !void {
+            const local_entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+            var candidate = buildConfiguredDurableDeviceCandidate(allocator, props, channel_clocks, entity_clocks, .{ .authoritative = .{
+                .state = @constCast(durable),
+                .local_origin_node = origin,
+                .local_origin_pubkey = public_key,
+            } }) catch |err| switch (err) {
+                // PROP's public API intentionally normalizes allocation failure
+                // to its capacity error. Translate only inside this deterministic
+                // allocator sweep so the harness advances to the next failpoint.
+                error.CapacityExceeded => return error.OutOfMemory,
+                else => return err,
+            };
+            defer candidate.deinit();
+            _ = try candidate.props.getProp(local_entity, "e2ee.device.phone");
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{
+        &base,
+        &channels,
+        &entities,
+        &state,
+        identity.shortId(),
+        identity.sign_kp.public_key,
+    });
+}
+
+test "DPROP1 cold activation publishes exact authority and stays observationally silent" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-dprop-cold-activate.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc3)), "dprop-cold-activate.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    var pubkey: [entity_prop_event.pubkey_len]u8 = undefined;
+    var signature: [entity_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedEntityProp(&identity.sign_kp, .user, "alice", "e2ee.device.phone", "mls-x25519:abcd+/=", "alice", 19, true, &pubkey, &signature);
+    var prepared = switch (try state.prepare(.{
+        .present = fact.present,
+        .kind = fact.kind,
+        .origin_node = fact.origin_node,
+        .hlc = fact.hlc,
+        .entity = fact.entity,
+        .key = fact.key,
+        .value = fact.value,
+        .owner = fact.owner,
+        .origin_pubkey = fact.origin_pubkey,
+        .origin_sig = fact.origin_sig,
+    })) {
+        .update => |update| update,
+        else => return error.TestUnexpectedResult,
+    };
+    prepared.commitInto(&state);
+    var transparency = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer transparency.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+    services.attachKeyTransparencyLog(&transparency);
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try server.props.getProp(entity, "e2ee.device.phone")).value);
+    try std.testing.expectEqual(@as(u64, 19), server.entityPropClock(.user, "alice", "e2ee.device.phone").?.hlc);
+    try std.testing.expect(server.mesh_clock.last_stamp >= 19);
+    try std.testing.expectEqual(@as(usize, 0), transparency.len());
+}
+
+fn commitDurableDeviceFactForBootTest(
+    state: *durable_credential_props.State,
+    identity: *const node_identity.NodeIdentity,
+    hlc: u64,
+) !void {
+    var pubkey: [entity_prop_event.pubkey_len]u8 = undefined;
+    var signature: [entity_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedEntityProp(
+        &identity.sign_kp,
+        .user,
+        "alice",
+        "e2ee.device.phone",
+        "mls-x25519:abcd+/=",
+        "alice",
+        hlc,
+        true,
+        &pubkey,
+        &signature,
+    );
+    var prepared = switch (try state.prepare(.{
+        .present = fact.present,
+        .kind = fact.kind,
+        .origin_node = fact.origin_node,
+        .hlc = fact.hlc,
+        .entity = fact.entity,
+        .key = fact.key,
+        .value = fact.value,
+        .owner = fact.owner,
+        .origin_pubkey = fact.origin_pubkey,
+        .origin_sig = fact.origin_sig,
+    })) {
+        .update => |update| update,
+        else => return error.TestUnexpectedResult,
+    };
+    prepared.commitInto(state);
+}
+
+test "DPROP1 hot activation without PRPC restores authority and is observationally silent" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const predecessor = createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var complete: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer complete.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &complete, &blobs);
+    var without_prpc: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer without_prpc.deinit(alloc);
+    for (complete.items) |piece| {
+        if (piece.kind == .mesh_checkpoint and prop_checkpoint.isUpgradeCheckpoint(piece.bytes)) continue;
+        try without_prpc.append(alloc, piece);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-hot-no-prpc.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc4)), "dprop-hot-no-prpc.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(alloc, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    var transparency = key_transparency.KeyTransparencyLog.init(alloc);
+    defer transparency.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+    services.attachKeyTransparencyLog(&transparency);
+    const successor = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    const sentinel = ircx_prop_store.Entity{ .kind = .user, .id = "sentinel" };
+    _ = try successor.props.setProp(sentinel, "ordinary", "keep", .{ .id = "sentinel", .access = .user });
+    try commitDurableDeviceFactForBootTest(&state, &identity, 29);
+    const changes_before = store.changeCount();
+    const transparency_before = transparency.len();
+
+    _ = try adoptUpgradePiecesForTest(successor, without_prpc.items, "onyx-test-dprop-hot-no-prpc");
+    current_reactor = null;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    try std.testing.expectEqualStrings("keep", (try successor.props.getProp(sentinel, "ordinary")).value);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try successor.props.getProp(entity, "e2ee.device.phone")).value);
+    try std.testing.expectEqual(@as(u64, 29), successor.entityPropClock(.user, "alice", "e2ee.device.phone").?.hlc);
+    try std.testing.expectEqual(changes_before, store.changeCount());
+    try std.testing.expectEqual(transparency_before, transparency.len());
+}
+
+test "DPROP1 hot carried conflict is purge-first authority-wins and final edge allocates nothing" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const predecessor = createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    _ = try predecessor.props.setProp(entity, "ordinary", "carried", .{ .id = "alice", .access = .user });
+    _ = try predecessor.props.setProp(entity, "e2ee.device.phone", "mls-x25519:carried-conflict+/=", .{ .id = "alice", .access = .user });
+    try std.testing.expect(predecessor.recordEntityPropClock(
+        .user,
+        "alice",
+        "e2ee.device.phone",
+        "alice",
+        31,
+        true,
+        7,
+        "",
+        "",
+    ));
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    const future_device_hlc = ((predecessor.meshWallMs() + mesh_clock_mod.default_max_future_skew_ms + 60_000) << mesh_clock_mod.seq_bits) | 1;
+    predecessor.entityPropClock(.user, "alice", "e2ee.device.phone").?.hlc = future_device_hlc;
+    const conflicting_prpc = try prop_checkpoint.encode(
+        alloc,
+        &predecessor.props,
+        &predecessor.channel_prop_clocks,
+        &predecessor.entity_prop_clocks,
+    );
+    defer alloc.free(conflicting_prpc);
+    try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .property, .{
+        .kind = .mesh_checkpoint,
+        .bytes = conflicting_prpc,
+        .min_supported = 2,
+    }));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-hot-conflict.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc6)), "dprop-hot-conflict.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(alloc, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    try commitDurableDeviceFactForBootTest(&state, &identity, 41);
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    const successor = createTestServer(failing.allocator(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        test_dprop_commit_fail_index = null;
+        test_dprop_commit_alloc_index = null;
+        failing.fail_index = std.math.maxInt(usize);
+        successor.deinit();
+        failing.allocator().destroy(successor);
+    }
+    test_dprop_commit_fail_index = &failing.fail_index;
+    test_dprop_commit_alloc_index = &failing.alloc_index;
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-dprop-hot-conflict");
+    current_reactor = null;
+
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectError(error.OutOfMemory, failing.allocator().alloc(u8, 1));
+    try std.testing.expect(failing.has_induced_failure);
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqualStrings("carried", (try successor.props.getProp(entity, "ordinary")).value);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try successor.props.getProp(entity, "e2ee.device.phone")).value);
+    try std.testing.expectEqual(@as(u64, 41), successor.entityPropClock(.user, "alice", "e2ee.device.phone").?.hlc);
+    try std.testing.expect(successor.mesh_clock.last_stamp < future_device_hlc);
+}
+
+test "DPROP1 hot unrelated future PRPC clock is fatal and leaves causal triplet exact" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const predecessor = createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    const unrelated = ircx_prop_store.Entity{ .kind = .user, .id = "bob" };
+    _ = try predecessor.props.setProp(unrelated, "BIO", "future ordinary", .{ .id = "bob", .access = .user });
+    try std.testing.expect(predecessor.recordEntityPropClock(.user, "bob", "BIO", "bob", 37, true, 9, "", ""));
+    const future_hlc = ((predecessor.meshWallMs() + mesh_clock_mod.default_max_future_skew_ms + 60_000) << mesh_clock_mod.seq_bits) | 1;
+    predecessor.entityPropClock(.user, "bob", "BIO").?.hlc = future_hlc;
+    const future_prpc = try prop_checkpoint.encode(
+        alloc,
+        &predecessor.props,
+        &predecessor.channel_prop_clocks,
+        &predecessor.entity_prop_clocks,
+    );
+    defer alloc.free(future_prpc);
+    try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .property, .{
+        .kind = .mesh_checkpoint,
+        .bytes = future_prpc,
+        .min_supported = 2,
+    }));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-hot-future.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc5)), "dprop-hot-future.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(alloc, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    try commitDurableDeviceFactForBootTest(&state, &identity, 29);
+    var transparency = key_transparency.KeyTransparencyLog.init(alloc);
+    defer transparency.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+    services.attachKeyTransparencyLog(&transparency);
+    const successor = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    const sentinel = ircx_prop_store.Entity{ .kind = .user, .id = "sentinel" };
+    _ = try successor.props.setProp(sentinel, "ordinary", "keep", .{ .id = "sentinel", .access = .user });
+    const triplet_before = try prop_checkpoint.encode(
+        alloc,
+        &successor.props,
+        &successor.channel_prop_clocks,
+        &successor.entity_prop_clocks,
+    );
+    defer alloc.free(triplet_before);
+    const clock_before = successor.mesh_clock;
+    const epoch_before = successor.migration_offer_epoch;
+    const changes_before = store.changeCount();
+    const transparency_before = transparency.len();
+
+    _ = try rejectDurableUpgradePiecesForTest(successor, pieces.items, "onyx-test-dprop-hot-future");
+    current_reactor = null;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    try std.testing.expectEqualStrings("keep", (try successor.props.getProp(sentinel, "ordinary")).value);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try successor.props.getProp(entity, "e2ee.device.phone")).value);
+    try std.testing.expectError(error.PropMissing, successor.props.getProp(unrelated, "BIO"));
+    const triplet_after = try prop_checkpoint.encode(
+        alloc,
+        &successor.props,
+        &successor.channel_prop_clocks,
+        &successor.entity_prop_clocks,
+    );
+    defer alloc.free(triplet_after);
+    try std.testing.expectEqualSlices(u8, triplet_before, triplet_after);
+    try std.testing.expectEqual(clock_before, successor.mesh_clock);
+    try std.testing.expectEqual(epoch_before, successor.migration_offer_epoch);
+    try std.testing.expectEqual(changes_before, store.changeCount());
+    try std.testing.expectEqual(transparency_before, transparency.len());
+}
+
+test "DPROP1 cold startup without mandatory signer rejects local device writes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wal_name = "server-kt-cold-obs.wal";
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const id = try addTestLocalClient(&server, "Alice", "alice");
+        const conn = server.connFor(id).?;
+        var add = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+        add.params[0] = "ADD";
+        add.params[1] = "phone";
+        add.params[2] = "mls-x25519";
+        add.params[3] = "abcd+/=";
+        add.param_count = 4;
+        try server.handleE2eeKey(conn, &add);
+        try std.testing.expectEqual(@as(usize, 0), kt.len());
+        try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY SIGNER_UNAVAILABLE");
+        try std.testing.expectError(error.PropMissing, server.props.getProp(.{ .kind = .user, .id = "Alice" }, "e2ee.device.phone"));
+    }
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expectError(error.PropMissing, server.props.getProp(.{ .kind = .user, .id = "Alice" }, "e2ee.device.phone"));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+}
+
+test "KEYTRANS local mutation does not rollback or false-fail when observation is unavailable" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-no-rollback.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "seed", "pub", 1);
+    const kt_store = @import("key_transparency_store.zig");
+    var ev_key: [kt_store.event_key_len]u8 = undefined;
+    try store.family(.props).put(kt_store.eventKey(0, &ev_key), "junk");
+
+    var kt2 = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt2.deinit();
+    var services2 = services_mod.Services.init(&store, null);
+    services2.attachKeyTransparencyLog(&kt2);
+    try std.testing.expect(kt2.unusable);
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd5)), "dprop-server-kt-unavailable.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    services2.attachDurableCredentialProps(&dprop);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services2, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    var add = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    add.params[0] = "ADD";
+    add.params[1] = "phone";
+    add.params[2] = "mls-x25519";
+    add.params[3] = "abcd+/=";
+    add.param_count = 4;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &add);
+    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY ADDED id=phone");
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+    try std.testing.expectEqualStrings(
+        "mls-x25519:abcd+/=",
+        (try server.props.getProp(.{ .kind = .user, .id = "Alice" }, "e2ee.device.phone")).value,
+    );
+    try std.testing.expectEqual(@as(usize, 0), kt2.len());
+}
+
+test "DPROP1 remote user device ENTITY_PROP is quarantined before all admission side effects" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-remote-once.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const before_stamp = server.mesh_clock.last_stamp;
+    var first = makeEntityPropChange(.user, "bob", "e2ee.device.phone", "mls-x25519:abcd+/=", 100, 0xA);
+    try std.testing.expect(!server.applyRemoteEntityProp(&first));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expectEqual(@as(u64, 1), server.remote_device_props_quarantined);
+    try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+    try std.testing.expectEqual(@as(usize, 0), server.entity_prop_clocks.count());
+    try std.testing.expectError(error.PropMissing, server.props.getProp(.{ .kind = .user, .id = "bob" }, "e2ee.device.phone"));
+
+    var malformed = makeEntityPropChange(.user, "bob", "E2EE.DEVICE.", "garbage", 101, 0xB);
+    try std.testing.expect(!server.applyRemoteEntityProp(&malformed));
+    try std.testing.expectEqual(@as(u64, 2), server.remote_device_props_quarantined);
+    try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+
+    // Non-device user facts retain their existing remote path.
+    var other = makeEntityPropChange(.user, "bob", "display.pronouns", "they", 200, 0xB);
+    try std.testing.expect(server.applyRemoteEntityProp(&other));
+    try std.testing.expectEqualStrings("they", (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "display.pronouns")).value);
+
+    var ident = makeEntityPropChange(.user, "bob", "identity.key.primary", "home-A-key-value", 250, 0xA);
+    try std.testing.expect(!server.applyRemoteEntityProp(&ident));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expect(!server.applyRemoteEntityProp(&ident));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expectEqual(@as(u64, 2), server.remote_identity_props_quarantined);
+}
+
+test "DPROP1 remote device quarantine persists as policy across restart" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wal_name = "server-kt-remote-replay.wal";
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        var first = makeEntityPropChange(.user, "bob", "e2ee.device.phone", "mls-x25519:abcd+/=", 100, 0xA);
+        try std.testing.expect(!server.applyRemoteEntityProp(&first));
+        try std.testing.expectEqual(@as(usize, 0), kt.len());
+    }
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expectError(error.PropMissing, server.props.getProp(.{ .kind = .user, .id = "bob" }, "e2ee.device.phone"));
+    var replay = makeEntityPropChange(.user, "bob", "e2ee.device.phone", "mls-x25519:abcd+/=", 100, 0xA);
+    try std.testing.expect(!server.applyRemoteEntityProp(&replay));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expectEqual(@as(u64, 1), server.remote_device_props_quarantined);
+}
+
+test "KEYTRANS generic local PROP observes exact user credential keys" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-observe.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd6)), "dprop-server-prop.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    services.attachDurableCredentialProps(&dprop);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+
+    var set_line = try irc_line.parseLine("PROP Alice e2ee.device.phone :mls-x25519:abcd+/=");
+    try server.handleProp(id, conn, &set_line);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+    try std.testing.expectEqual(key_transparency.Action.bind, (try kt.eventAt(0)).action);
+    const clock = server.entityPropClock(.user, "Alice", "e2ee.device.phone").?;
+    try std.testing.expectEqual(@as(i64, @intCast(clock.hlc)), (try kt.eventAt(0)).timestamp_ms);
+
+    conn.send_len = 0;
+    var del_line = try irc_line.parseLine("PROP Alice e2ee.device.phone :");
+    try server.handleProp(id, conn, &del_line);
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+    try std.testing.expectEqual(key_transparency.Action.delete, (try kt.eventAt(1)).action);
+    try expectContains(conn.send_buf[0..conn.send_len], " 819 ");
+}
+
+test "KEYTRANS generic local PROP identity.key is observed and residence is not" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-ident.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+
+    var ident = try irc_line.parseLine("PROP Alice identity.key.primary :home-A-key-value");
+    try server.handleProp(id, conn, &ident);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+    try std.testing.expectEqual(key_transparency.CredentialKind.identity, (try kt.eventAt(0)).kind);
+
+    var residence = try irc_line.parseLine("PROP Alice identity.residence.0000000000000001 :proof");
+    try server.handleProp(id, conn, &residence);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+
+    var unrelated = try irc_line.parseLine("PROP Alice STATUS :hello");
+    try server.handleProp(id, conn, &unrelated);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+}
+
+test "KEYTRANS generic local PROP rejects and member entities do not observe" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-reject.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const alice_id = try addTestLocalClient(&server, "Alice", "Alice");
+    const alice = server.connFor(alice_id).?;
+    alice.ircx = true;
+    const bob_id = try addTestLocalClient(&server, "Bob", "Bob");
+    const bob = server.connFor(bob_id).?;
+    bob.ircx = true;
+
+    var steal = try irc_line.parseLine("PROP Alice e2ee.device.phone :mls-x25519:abcd+/=");
+    try server.handleProp(bob_id, bob, &steal);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+
+    _ = try server.world.join("#room", worldIdFromClient(alice_id));
+    _ = try server.world.setMemberMode("#room", worldIdFromClient(alice_id), .op, true);
+    var member = try irc_line.parseLine("PROP #room:Alice e2ee.device.phone :mls-x25519:abcd+/=");
+    try server.handleProp(alice_id, alice, &member);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+}
+
+test "KEYTRANS generic local PROP missing delete does not observe" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-missing-del.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+    var del_line = try irc_line.parseLine("PROP Alice e2ee.device.missing :");
+    try server.handleProp(id, conn, &del_line);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+}
+
+test "DPROP1 remote device origin cannot bypass quarantine after cold restart" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wal_name = "server-kt-origin-restart.wal";
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        var first = makeEntityPropChange(.user, "bob", "e2ee.device.phone", "mls-x25519:abcd+/=", 100, 0xA);
+        try std.testing.expect(!server.applyRemoteEntityProp(&first));
+        try std.testing.expectEqual(@as(usize, 0), kt.len());
+    }
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expectError(error.PropMissing, server.props.getProp(.{ .kind = .user, .id = "bob" }, "e2ee.device.phone"));
+    var other_origin = makeEntityPropChange(.user, "bob", "e2ee.device.phone", "mls-x25519:abcd+/=", 100, 0xB);
+    try std.testing.expect(!server.applyRemoteEntityProp(&other_origin));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+}
+
+test "DPROP1 local device write converges exact signed durable live clock and transparency fact" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-converge.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd7)), "dprop-server-converge.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .node_identity = &ident,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.committed,
+        server.commitLocalDurableDeviceProp(conn, null, "E2EE.DEVICE.Phone", "mls-x25519:abcd+/=", true),
+    );
+    const fact = dprop.get("alice", "e2ee.device.phone") orelse return error.TestUnexpectedResult;
+    const clock = server.entityPropClock(.user, "alice", "e2ee.device.phone") orelse return error.TestUnexpectedResult;
+    const live = try server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, "e2ee.device.phone");
+    try std.testing.expectEqualStrings("alice", live.owner);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", live.value);
+    try std.testing.expectEqual(fact.hlc, clock.hlc);
+    try std.testing.expectEqual(fact.origin_node, clock.origin_node);
+    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, clock.origin_pubkey);
+    try std.testing.expectEqualSlices(u8, fact.origin_sig, clock.origin_sig);
+    try std.testing.expectEqual(entity_prop_event.VerifyOutcome.verified, try entity_prop_event.verifyOrigin(alloc, fact.event()));
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+}
+
+test "DPROP1 missing-row delete commits exact signed tombstone without creating live PROP" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-missing-delete.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd9)), "dprop-server-missing-delete.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+
+    var del = try irc_line.parseLine("PROP Alice SET E2EE.DEVICE.Missing");
+    try server.handleProp(id, conn, &del);
+    try expectContains(conn.send_buf[0..conn.send_len], " 819 ");
+    const fact = dprop.get("alice", "e2ee.device.missing") orelse return error.TestUnexpectedResult;
+    const clock = server.entityPropClock(.user, "alice", "e2ee.device.missing") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!fact.present);
+    try std.testing.expect(!clock.present);
+    try std.testing.expectEqual(fact.hlc, clock.hlc);
+    try std.testing.expectEqualSlices(u8, fact.origin_sig, clock.origin_sig);
+    try std.testing.expectEqual(entity_prop_event.VerifyOutcome.verified, try entity_prop_event.verifyOrigin(alloc, fact.event()));
+    try std.testing.expectError(error.PropMissing, server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, "e2ee.device.missing"));
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+    try std.testing.expectEqual(key_transparency.Action.delete, (try kt.eventAt(0)).action);
+}
+
+test "DPROP1 channel and member device-looking properties retain generic PROP behavior" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-generic-nonuser.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xda)), "dprop-server-generic-nonuser.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+    _ = try server.world.join("#room", worldIdFromClient(id));
+    _ = try server.world.setMemberMode("#room", worldIdFromClient(id), .op, true);
+
+    var channel_set = try irc_line.parseLine("PROP #room SET E2EE.DEVICE.Phone :channel-generic");
+    try server.handleProp(id, conn, &channel_set);
+    try std.testing.expectEqualStrings("channel-generic", (try server.props.getPropRaw(.{ .kind = .channel, .id = "#room" }, "e2ee.device.phone")).value);
+    conn.send_len = 0;
+    var member_set = try irc_line.parseLine("PROP #room:Alice SET E2EE.DEVICE.Phone :member-generic");
+    try server.handleProp(id, conn, &member_set);
+    try std.testing.expectEqualStrings("member-generic", (try server.props.getPropRaw(.{ .kind = .member, .id = "#room:Alice" }, "e2ee.device.phone")).value);
+    try std.testing.expectEqual(@as(usize, 0), dprop.count());
+}
+
+test "DPROP1 ambiguous durable cut is sticky requests stop and publishes no live state" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-ambiguous.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd8)), "dprop-server-ambiguous.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .node_identity = &ident,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    var run = std.atomic.Value(bool).init(true);
+    server.shutdown = &run;
+    store.setPreparedIoFault(.{ .sync = true });
+
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.restart_required,
+        server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:abcd+/=", true),
+    );
+    try std.testing.expect(server.durable_device_restart_required);
+    try std.testing.expect(!run.load(.acquire));
+    try std.testing.expect(store.preparedWritesPoisoned());
+    try std.testing.expectEqual(@as(usize, 0), dprop.count());
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expect(server.entityPropClock(.user, "alice", "e2ee.device.phone") == null);
+    try std.testing.expectError(error.PropMissing, server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, "e2ee.device.phone"));
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.restart_required,
+        server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:retry+/=", true),
+    );
+    try std.testing.expectEqual(@as(usize, 0), dprop.count());
+}
+
+test "DPROP1 transaction preparation signing clock and Services failures publish nothing" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-failure-lanes.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xdb)), "dprop-server-failure-lanes.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+
+    // PROP-store reservation collision: helper must stop before clock, durable,
+    // transparency, notification, or mesh publication.
+    {
+        var occupied = try server.props.prepareSetProp(entity, "ordinary", "held", .{ .id = "alice", .access = .user });
+        defer occupied.deinit();
+        try std.testing.expectEqual(
+            LinuxServer.DurableDeviceMutationOutcome.preadmission_failed,
+            server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:abcd+/=", true),
+        );
+    }
+
+    // Transcript/signing allocation failure is classified as signer unavailable.
+    const saved_allocator = server.allocator;
+    var signing_fail = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    server.allocator = signing_fail.allocator();
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.signer_unavailable,
+        server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:abcd+/=", true),
+    );
+    server.allocator = saved_allocator;
+
+    // The next allocator boundary is entity-clock staging, after transcript
+    // signing and PROP preparation have succeeded.
+    var clock_fail = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    server.allocator = clock_fail.allocator();
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.preadmission_failed,
+        server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:abcd+/=", true),
+    );
+    server.allocator = saved_allocator;
+
+    // Definite Services preadmission failure from an undersized record limit.
+    var small_store = try services_mod.OroStore.openWithConfig(
+        alloc,
+        std.testing.io,
+        tmp.dir,
+        "server-dprop-failure-small.wal",
+        .{ .max_record_bytes = 16 },
+    );
+    defer small_store.deinit();
+    var small_dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer small_dprop.deinit();
+    var small_services = services_mod.Services.init(&small_store, null);
+    small_services.attachDurableCredentialProps(&small_dprop);
+    server.account_services = &small_services;
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.preadmission_failed,
+        server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:abcd+/=", true),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), dprop.count());
+    try std.testing.expectEqual(@as(usize, 0), small_dprop.count());
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expect(server.entityPropClock(.user, "alice", "e2ee.device.phone") == null);
+    try std.testing.expectError(error.PropMissing, server.props.getPropRaw(entity, "e2ee.device.phone"));
+}
+
+test "DPROP1 PROP CLEAR scans beyond sixty four rows and preserves reserved device facts" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "Alice" };
+    var key_buf: [32]u8 = undefined;
+    for (0..127) |index| {
+        const key = try std.fmt.bufPrint(&key_buf, "a{d:0>3}", .{index});
+        _ = try server.props.setProp(entity, key, "ordinary", .{ .id = "Alice", .access = .user });
+    }
+    _ = try server.props.setProp(entity, "e2ee.device.phone", "mls-x25519:abcd+/=", .{ .id = "Alice", .access = .user });
+
+    var clear = try irc_line.parseLine("PROP Alice CLEAR");
+    try server.handleProp(id, conn, &clear);
+    try expectContains(conn.send_buf[0..conn.send_len], " 908 ");
+    try std.testing.expectEqualStrings("ordinary", (try server.props.getProp(entity, "a000")).value);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try server.props.getProp(entity, "e2ee.device.phone")).value);
+}
+
+test "DPROP1 user PROP and E2EEKEY enumerate all one hundred twenty eight capacity rows" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "Alice" };
+    var key_buf: [32]u8 = undefined;
+    for (0..127) |index| {
+        const key = try std.fmt.bufPrint(&key_buf, "a{d:0>3}", .{index});
+        _ = try server.props.setProp(entity, key, "ordinary", .{ .id = "Alice", .access = .user });
+    }
+    _ = try server.props.setProp(entity, "e2ee.device.phone", "mls-x25519:abcd+/=", .{ .id = "Alice", .access = .user });
+
+    var prop_list = try irc_line.parseLine("PROP Alice");
+    try server.handleProp(id, conn, &prop_list);
+    try std.testing.expectEqual(@as(usize, 128), std.mem.count(u8, conn.send_buf[0..conn.send_len], " 818 "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, conn.send_buf[0..conn.send_len], " 819 "));
+    try expectContains(conn.send_buf[0..conn.send_len], " a126 ");
+    try expectContains(conn.send_buf[0..conn.send_len], " e2ee.device.phone ");
+
+    var status = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    status.params[0] = "STATUS";
+    status.param_count = 1;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &status);
+    try expectContains(conn.send_buf[0..conn.send_len], "STATUS account=Alice devices=1");
+
+    var device_list = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    device_list.params[0] = "LIST";
+    device_list.param_count = 1;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &device_list);
+    try expectContains(conn.send_buf[0..conn.send_len], "DEVICE account=Alice id=phone alg=mls-x25519 key=abcd+/=");
+    try expectContains(conn.send_buf[0..conn.send_len], "END account=Alice devices=1");
+
+    conn.send_len = 0;
+    var clear = try irc_line.parseLine("PROP Alice CLEAR");
+    try server.handleProp(id, conn, &clear);
+    try expectContains(conn.send_buf[0..conn.send_len], " 908 ");
+    try std.testing.expectEqualStrings("ordinary", (try server.props.getProp(entity, "a000")).value);
+    try std.testing.expectEqualStrings("ordinary", (try server.props.getProp(entity, "a126")).value);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try server.props.getProp(entity, "e2ee.device.phone")).value);
+}
+
+test "DPROP1 reserved local PROP numerics and oper override remain fail closed" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const alice_id = try addTestLocalClient(&server, "Alice", "Alice");
+    const alice = server.connFor(alice_id).?;
+    alice.ircx = true;
+
+    var malformed = try irc_line.parseLine("PROP Alice SET E2EE.DEVICE. :garbage");
+    try server.handleProp(alice_id, alice, &malformed);
+    try expectContains(alice.send_buf[0..alice.send_len], " 905 ");
+    alice.send_len = 0;
+    var bad_value = try irc_line.parseLine("PROP Alice SET e2ee.device.phone :not-a-device-value");
+    try server.handleProp(alice_id, alice, &bad_value);
+    try expectContains(alice.send_buf[0..alice.send_len], " 906 ");
+    alice.send_len = 0;
+    var unavailable = try irc_line.parseLine("PROP Alice SET e2ee.device.phone :mls-x25519:abcd+/=");
+    try server.handleProp(alice_id, alice, &unavailable);
+    try expectContains(alice.send_buf[0..alice.send_len], " 907 ");
+
+    const bob_id = try addTestLocalClient(&server, "Bob", "Bob");
+    const bob = server.connFor(bob_id).?;
+    bob.ircx = true;
+    try reconcileTestOper(&bob.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+    _ = bob.session.setUmode(.override, true);
+    var steal = try irc_line.parseLine("PROP Alice SET e2ee.device.phone :mls-x25519:abcd+/=");
+    try server.handleProp(bob_id, bob, &steal);
+    try expectContains(bob.send_buf[0..bob.send_len], " 913 ");
+    bob.send_len = 0;
+    var erase = try irc_line.parseLine("PROP Alice SET e2ee.device.phone");
+    try server.handleProp(bob_id, bob, &erase);
+    try expectContains(bob.send_buf[0..bob.send_len], " 913 ");
+}
+
+test "DPROP1 stale durable admission maps generic PROP to ERR_SECURITY 908" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-stale-numeric.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xdc)), "dprop-server-stale-numeric.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+
+    var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+    const high = try buildSignedEntityProp(
+        &ident.sign_kp,
+        .user,
+        "alice",
+        "e2ee.device.phone",
+        "mls-x25519:existing+/=",
+        "alice",
+        std.math.maxInt(u64) - 1,
+        true,
+        &pk_buf,
+        &sig_buf,
+    );
+    try std.testing.expect(services.commitLocalDurableDeviceFact(.{
+        .present = high.present,
+        .kind = high.kind,
+        .origin_node = high.origin_node,
+        .hlc = high.hlc,
+        .entity = high.entity,
+        .key = high.key,
+        .value = high.value,
+        .owner = high.owner,
+        .origin_pubkey = high.origin_pubkey,
+        .origin_sig = high.origin_sig,
+    }) == .committed);
+
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+    var set = try irc_line.parseLine("PROP Alice SET e2ee.device.phone :mls-x25519:new+/=");
+    try server.handleProp(id, conn, &set);
+    try expectContains(conn.send_buf[0..conn.send_len], " 908 ");
+    try std.testing.expect(server.entityPropClock(.user, "alice", "e2ee.device.phone") == null);
+    try std.testing.expectError(error.PropMissing, server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, "e2ee.device.phone"));
+    try std.testing.expectEqualStrings("mls-x25519:existing+/=", dprop.get("alice", "e2ee.device.phone").?.value);
+}
+
+const RemotePropFailureVariant = enum {
+    absent_entity,
+    absent_key,
+    replacement,
+    delete,
+};
+
+/// Exercise the real server-owned allocator at every operation allocation
+/// boundary.  A fresh Server, PROP store, and durable KT store are created for
+/// every fail point; the failure is armed only after deterministic setup so a
+/// failed boot cannot masquerade as a rejected remote fact.
+fn runRemotePropFailureSweep(tmp: *std.testing.TmpDir, variant: RemotePropFailureVariant) !void {
+    var applied = false;
+    var saw_rejection = false;
+    var fail_index: usize = 0;
+    while (fail_index < 96) : (fail_index += 1) {
+        var name_buf: [72]u8 = undefined;
+        const wal_name = try std.fmt.bufPrint(&name_buf, "server-kt-atomic-{d}-{d}.wal", .{ @intFromEnum(variant), fail_index });
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var server = Server.init(failing.allocator(), .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        if (variant != .absent_entity) {
+            var seed = makeEntityPropChange(.user, "bob", "profile.atomic.phone", "seed-key", 100, 0xA);
+            try std.testing.expect(server.applyRemoteEntityProp(&seed));
+        }
+        const before_len = kt.len();
+        const before_root = kt.root();
+        const before_clocks = server.entity_prop_clocks.count();
+        const before_entities = server.props.entity_count;
+        const before_clock = if (variant == .absent_entity)
+            null
+        else
+            server.entityPropClock(.user, "bob", "profile.atomic.phone").?.*;
+        const before_stamp = server.mesh_clock.last_stamp;
+        const before_physical = server.mesh_clock.last_physical;
+
+        // Arm the same allocator that constructed Server and its PROP store;
+        // this gives a deterministic real failure in the remote operation.
+        failing.fail_index = failing.alloc_index + fail_index;
+        var fact = switch (variant) {
+            .absent_entity => makeEntityPropChange(.user, "carol", "profile.atomic.phone", "new-entity-key", 200, 0xC),
+            .absent_key => makeEntityPropChange(.user, "bob", "profile.atomic.tablet", "new-tablet-key", 200, 0xA),
+            .replacement => makeEntityPropChange(.user, "bob", "profile.atomic.phone", "replaced-key", 200, 0xA),
+            .delete => makeEntityPropChange(.user, "bob", "profile.atomic.phone", "", 200, 0xA),
+        };
+        if (variant == .delete) fact.present = false;
+        applied = server.applyRemoteEntityProp(&fact);
+        if (applied) break;
+        saw_rejection = true;
+        try std.testing.expect(!applied);
+        try std.testing.expectEqual(before_len, kt.len());
+        const after_root = kt.root();
+        try std.testing.expectEqualSlices(u8, &before_root, &after_root);
+        try std.testing.expectEqual(before_clocks, server.entity_prop_clocks.count());
+        try std.testing.expectEqual(before_entities, server.props.entity_count);
+        if (before_clock) |clock| {
+            const after_clock = server.entityPropClock(.user, "bob", "profile.atomic.phone").?;
+            try std.testing.expectEqual(clock.hlc, after_clock.hlc);
+            try std.testing.expectEqual(clock.present, after_clock.present);
+            try std.testing.expectEqual(clock.origin_node, after_clock.origin_node);
+            try std.testing.expectEqualSlices(u8, clock.owner, after_clock.owner);
+            try std.testing.expectEqualSlices(u8, clock.origin_pubkey, after_clock.origin_pubkey);
+            try std.testing.expectEqualSlices(u8, clock.origin_sig, after_clock.origin_sig);
+        } else {
+            try std.testing.expect(server.entityPropClock(.user, "carol", "profile.atomic.phone") == null);
+        }
+        try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+        try std.testing.expectEqual(before_physical, server.mesh_clock.last_physical);
+
+        switch (variant) {
+            .absent_entity => try std.testing.expectError(
+                error.PropMissing,
+                server.props.getProp(.{ .kind = .user, .id = "carol" }, "profile.atomic.phone"),
+            ),
+            .absent_key => {
+                try std.testing.expectEqualStrings(
+                    "seed-key",
+                    (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.atomic.phone")).value,
+                );
+                try std.testing.expectError(
+                    error.PropMissing,
+                    server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.atomic.tablet"),
+                );
+            },
+            .replacement, .delete => try std.testing.expectEqualStrings(
+                "seed-key",
+                (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.atomic.phone")).value,
+            ),
+        }
+    }
+    try std.testing.expect(saw_rejection);
+    try std.testing.expect(applied);
+}
+
+test "KEYTRANS remote apply allocation failure leaves props clocks and log unchanged" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A fresh allocator and server are used for every fail point.  The server
+    // is constructed with that allocator (rather than swapping only one field
+    // after construction), so both the PROP store and entity-clock staging see
+    // the same deterministic failure boundary.
+    try runRemotePropFailureSweep(&tmp, .absent_key);
+}
+
+test "KEYTRANS remote apply fresh server allocator is atomic for every prop mutation shape" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const variants = [_]RemotePropFailureVariant{ .absent_entity, .absent_key, .replacement, .delete };
+    for (variants) |variant| try runRemotePropFailureSweep(&tmp, variant);
+}
+
+test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure creating a brand-new entity leaves no stranded entity, props, clock, HLC, or log growth" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-entity-oom.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // "carol" has never appeared before: applying her first fact must either
+    // create the entity AND its prop together, or create neither — never an
+    // empty entity stranded by a later allocation failure (the defect this
+    // repair closes: `setProp` could previously insert the outer entity row
+    // and then fail inserting its first prop).
+    const before_len = kt.len();
+    const before_clocks = server.entity_prop_clocks.count();
+    const before_entities = server.props.entity_count;
+    const before_stamp = server.mesh_clock.last_stamp;
+    const saved_props_allocator = server.props.allocator;
+    var applied = false;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        server.props.allocator = failing.allocator();
+        var fact = makeEntityPropChange(.user, "carol", "profile.phone", "new-entity-value", 100, 0xC);
+        applied = server.applyRemoteEntityProp(&fact);
+        server.props.allocator = saved_props_allocator;
+        if (!applied) {
+            try std.testing.expectEqual(before_entities, server.props.entity_count);
+            try std.testing.expectEqual(before_clocks, server.entity_prop_clocks.count());
+            try std.testing.expectEqual(before_len, kt.len());
+            try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+            try std.testing.expectError(
+                error.PropMissing,
+                server.props.getProp(.{ .kind = .user, .id = "carol" }, "profile.phone"),
+            );
+            continue;
+        }
+        break;
+    }
+    try std.testing.expect(applied);
+    try std.testing.expectEqual(before_entities + 1, server.props.entity_count);
+    try std.testing.expectEqual(before_len, kt.len());
+    try std.testing.expectEqualStrings(
+        "new-entity-value",
+        (try server.props.getProp(.{ .kind = .user, .id = "carol" }, "profile.phone")).value,
+    );
+}
+
+test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure inserting a new key into an existing entity leaves its existing prop, clock, HLC, and log unchanged" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-key-oom.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var seed = makeEntityPropChange(.user, "bob", "profile.phone", "seed-value", 100, 0xA);
+    try std.testing.expect(server.applyRemoteEntityProp(&seed));
+    const before_len = kt.len();
+    const before_clocks = server.entity_prop_clocks.count();
+    const before_entities = server.props.entity_count;
+    const before_stamp = server.mesh_clock.last_stamp;
+    const saved_props_allocator = server.props.allocator;
+    var applied = false;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        server.props.allocator = failing.allocator();
+        var next = makeEntityPropChange(.user, "bob", "profile.tablet", "new-value", 200, 0xA);
+        applied = server.applyRemoteEntityProp(&next);
+        server.props.allocator = saved_props_allocator;
+        if (!applied) {
+            try std.testing.expectEqual(before_entities, server.props.entity_count);
+            try std.testing.expectEqual(before_clocks, server.entity_prop_clocks.count());
+            try std.testing.expectEqual(before_len, kt.len());
+            try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+            try std.testing.expectEqualStrings(
+                "seed-value",
+                (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone")).value,
+            );
+            try std.testing.expectError(
+                error.PropMissing,
+                server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.tablet"),
+            );
+            continue;
+        }
+        break;
+    }
+    try std.testing.expect(applied);
+    try std.testing.expectEqual(before_len, kt.len());
+    try std.testing.expectEqualStrings(
+        "seed-value",
+        (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone")).value,
+    );
+    try std.testing.expectEqualStrings(
+        "new-value",
+        (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.tablet")).value,
+    );
+}
+
+test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure replacing an existing value leaves the old value, clock, HLC, and log unchanged" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-replace-oom.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var seed = makeEntityPropChange(.user, "bob", "profile.phone", "seed-value", 100, 0xA);
+    try std.testing.expect(server.applyRemoteEntityProp(&seed));
+    const before_len = kt.len();
+    const before_clocks = server.entity_prop_clocks.count();
+    const before_entities = server.props.entity_count;
+    const before_stamp = server.mesh_clock.last_stamp;
+    const saved_props_allocator = server.props.allocator;
+    var applied = false;
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        server.props.allocator = failing.allocator();
+        var replace = makeEntityPropChange(.user, "bob", "profile.phone", "replaced-value", 200, 0xA);
+        applied = server.applyRemoteEntityProp(&replace);
+        server.props.allocator = saved_props_allocator;
+        if (!applied) {
+            try std.testing.expectEqual(before_entities, server.props.entity_count);
+            try std.testing.expectEqual(before_clocks, server.entity_prop_clocks.count());
+            try std.testing.expectEqual(before_len, kt.len());
+            try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+            try std.testing.expectEqualStrings(
+                "seed-value",
+                (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone")).value,
+            );
+            continue;
+        }
+        break;
+    }
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings(
+        "replaced-value",
+        (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone")).value,
+    );
+}
+
+test "KEYTRANS remote ENTITY_PROP apply: clock-stage allocation failure on a delete fact leaves the prop, clock, HLC, and log unchanged" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-delete-oom.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // A tombstone never touches the prop-store allocator (`deleteProp` only
+    // frees), so this exercises the OTHER fallible step: clock staging via
+    // `server.allocator`. Before this repair, `observeRemotePropertyHlc` ran
+    // BEFORE clock staging, so a staging failure here still left the HLC
+    // watermark advanced; asserting it unchanged is the regression proof.
+    var seed = makeEntityPropChange(.user, "bob", "profile.phone", "seed-value", 100, 0xA);
+    try std.testing.expect(server.applyRemoteEntityProp(&seed));
+    const before_len = kt.len();
+    const before_clocks = server.entity_prop_clocks.count();
+    const before_entities = server.props.entity_count;
+    const before_stamp = server.mesh_clock.last_stamp;
+    const saved_allocator = server.allocator;
+    var applied = false;
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        server.allocator = failing.allocator();
+        var tomb = makeEntityPropChange(.user, "bob", "profile.phone", "", 300, 0xA);
+        tomb.present = false;
+        applied = server.applyRemoteEntityProp(&tomb);
+        server.allocator = saved_allocator;
+        if (!applied) {
+            try std.testing.expectEqual(before_entities, server.props.entity_count);
+            try std.testing.expectEqual(before_clocks, server.entity_prop_clocks.count());
+            try std.testing.expectEqual(before_len, kt.len());
+            try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+            try std.testing.expectEqualStrings(
+                "seed-value",
+                (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone")).value,
+            );
+            continue;
+        }
+        break;
+    }
+    try std.testing.expect(applied);
+    try std.testing.expectError(
+        error.PropMissing,
+        server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone"),
+    );
 }
 
 test "E2EEKEY advertises account device keys through user props" {
@@ -58821,19 +61428,17 @@ test "E2EEKEY advertises account device keys through user props" {
     add.param_count = 4;
     conn.send_len = 0;
     try server.handleE2eeKey(conn, &add);
-    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY ADDED id=phone alg=mls-x25519");
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY DURABLE_UNAVAILABLE");
 
     const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
-    const ev = try server.props.getProp(entity, "e2ee.device.phone");
-    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", ev.value);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "e2ee.device.phone"));
 
     var list_lv = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
     list_lv.params[0] = "LIST";
     list_lv.param_count = 1;
     conn.send_len = 0;
     try server.handleE2eeKey(conn, &list_lv);
-    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DEVICE account=kain id=phone alg=mls-x25519 key=abcd+/=");
-    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY END account=kain devices=1");
+    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY END account=kain devices=0");
 
     var del = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
     del.params[0] = "DEL";
@@ -58841,8 +61446,176 @@ test "E2EEKEY advertises account device keys through user props" {
     del.param_count = 2;
     conn.send_len = 0;
     try server.handleE2eeKey(conn, &del);
-    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DELETED id=phone");
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY DURABLE_UNAVAILABLE");
     try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "e2ee.device.phone"));
+}
+
+fn testOgc1Advertisement() !struct {
+    encoded: [136]u8,
+    device_id: [27]u8,
+} {
+    const directory = @import("../proto/e2ee_device_directory.zig");
+    comptime {
+        if (directory.encoded_len != 136 or directory.device_id_len != 27)
+            @compileError("OGC1 advertisement test vector sizes drifted");
+    }
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(
+        @as([Ed25519.KeyPair.seed_length]u8, @splat(0x5a)),
+    );
+    const odd1 = directory.fromParts(
+        kp.public_key.toBytes(),
+        std.crypto.ecc.P256.basePoint.toUncompressedSec1(),
+    ) orelse return error.TestUnexpectedResult;
+    var encoded: [directory.encoded_len]u8 = undefined;
+    _ = directory.encodeCanonical(odd1, &encoded);
+    var device_id: [directory.device_id_len]u8 = undefined;
+    _ = directory.deviceId(odd1, &device_id);
+    return .{ .encoded = encoded, .device_id = device_id };
+}
+
+test "E2EEKEY ADD accepts onyx-ogc1-v1 only with the derived device id" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const directory = @import("../proto/e2ee_device_directory.zig");
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(id).?;
+    const advertisement = try testOgc1Advertisement();
+
+    var mismatched = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    mismatched.params[0] = "ADD";
+    mismatched.params[1] = "phone";
+    mismatched.params[2] = directory.stored_algorithm;
+    mismatched.params[3] = &advertisement.encoded;
+    mismatched.param_count = 4;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &mismatched);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY BAD_DEVICE");
+
+    var malformed = mismatched;
+    malformed.params[1] = &advertisement.device_id;
+    malformed.params[3] = "abcd+/=";
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &malformed);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY BAD_KEY");
+
+    var add = mismatched;
+    add.params[1] = &advertisement.device_id;
+    add.params[3] = &advertisement.encoded;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &add);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY DURABLE_UNAVAILABLE");
+
+    var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+    const key = e2ee_policy.devicePropKey(&advertisement.device_id, &key_buf).?;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, key));
+}
+
+test "DPROP1 E2EEKEY mixed-case ODD1 commits folded PROP lists and restores" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const dprop_boot = @import("durable_credential_props_boot.zig");
+    const directory = @import("../proto/e2ee_device_directory.zig");
+    const wal_name = "server-dprop-odd1-folded-restart.wal";
+    const folded_id = "ogc1-mpeycfzdqv8bz2wubf_ukd";
+    const folded_key = "e2ee.device." ++ folded_id;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xe1)), "dprop-odd1-folded.test");
+    defer ident.deinit();
+    const origin = ident.shortId();
+    const advertisement = try testOgc1Advertisement();
+
+    {
+        var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var dprop = try dprop_boot.load(alloc, &store, origin);
+        defer dprop.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachDurableCredentialProps(&dprop);
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .account_services = &services,
+            .node_identity = &ident,
+            .durable_device_boot = .{ .authoritative = .{
+                .state = &dprop,
+                .local_origin_node = origin,
+            } },
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const id = try addTestLocalClient(&server, "Alice", "alice");
+        const conn = server.connFor(id).?;
+        var add = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+        add.params[0] = "ADD";
+        add.params[1] = &advertisement.device_id;
+        add.params[2] = directory.stored_algorithm;
+        add.params[3] = &advertisement.encoded;
+        add.param_count = 4;
+        var unrelated = add;
+        unrelated.params[1] = "ogc1-aaaaaaaaaaaaaaaaaaaaaa";
+        try server.handleE2eeKey(conn, &unrelated);
+        try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY BAD_DEVICE");
+        try std.testing.expectEqual(@as(usize, 0), dprop.count());
+        conn.send_len = 0;
+        try server.handleE2eeKey(conn, &add);
+        try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY ADDED id=ogc1-MPEyCFzdqv8BZ2wUbf_uKD alg=onyx-ogc1-v1");
+        try std.testing.expectEqual(@as(usize, 1), dprop.count());
+        try std.testing.expect(dprop.get("alice", folded_key) != null);
+        const live = try server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, folded_key);
+        try std.testing.expectEqualStrings(directory.stored_algorithm ++ ":" ++ directory.kat_wire.*, live.value);
+
+        var list_cmd = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+        list_cmd.params[0] = "LIST";
+        list_cmd.param_count = 1;
+        conn.send_len = 0;
+        try server.handleE2eeKey(conn, &list_cmd);
+        try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DEVICE account=alice id=" ++ folded_id ++ " alg=onyx-ogc1-v1");
+        try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY END account=alice devices=1");
+    }
+
+    {
+        var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var dprop = try dprop_boot.load(alloc, &store, origin);
+        defer dprop.deinit();
+        try std.testing.expectEqual(@as(usize, 1), dprop.count());
+        var services = services_mod.Services.init(&store, null);
+        services.attachDurableCredentialProps(&dprop);
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .account_services = &services,
+            .node_identity = &ident,
+            .durable_device_boot = .{ .authoritative = .{
+                .state = &dprop,
+                .local_origin_node = origin,
+            } },
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const live = try server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, folded_key);
+        try std.testing.expectEqualStrings(directory.stored_algorithm ++ ":" ++ directory.kat_wire.*, live.value);
+        const id = try addTestLocalClient(&server, "Alice", "alice");
+        const conn = server.connFor(id).?;
+        var list_cmd = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+        list_cmd.params[0] = "LIST";
+        list_cmd.param_count = 1;
+        try server.handleE2eeKey(conn, &list_cmd);
+        try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DEVICE account=alice id=" ++ folded_id ++ " alg=onyx-ogc1-v1");
+        try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY END account=alice devices=1");
+    }
 }
 
 test "E2EEKEY and IDENTITY live mutations append verifiable key transparency events" {
@@ -58861,6 +61634,11 @@ test "E2EEKEY and IDENTITY live mutations append verifiable key transparency eve
     defer kt.deinit();
     var services = services_mod.Services.init(&store, null);
     services.attachKeyTransparencyLog(&kt);
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd4)), "dprop-server-keytrans.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    services.attachDurableCredentialProps(&dprop);
     const event_time_ms: i64 = 1_700_000_123_000;
     var sim_time = reactor_mod.SimReactor.init(event_time_ms);
 
@@ -58869,6 +61647,7 @@ test "E2EEKEY and IDENTITY live mutations append verifiable key transparency eve
         .port = 0,
         .account_services = &services,
         .reactor = sim_time.reactor(),
+        .node_identity = &ident,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -58878,8 +61657,6 @@ test "E2EEKEY and IDENTITY live mutations append verifiable key transparency eve
 
     const id = try addTestLocalClient(&server, "Alice", "Alice");
     const conn = server.connFor(id).?;
-    const e2ee_material = "mls-x25519:abcd+/=";
-
     var e2ee_add = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
     e2ee_add.params[0] = "ADD";
     e2ee_add.params[1] = "phone";
@@ -58901,10 +61678,9 @@ test "E2EEKEY and IDENTITY live mutations append verifiable key transparency eve
     e2ee_del.param_count = 2;
     try server.handleE2eeKey(conn, &e2ee_del);
     try std.testing.expectEqual(@as(usize, 2), kt.len());
-    // The legacy idempotent "DELETED" reply for an absent key remains, but no
-    // nonexistent credential change enters transparency.
+    // A missing-row delete is still a durable tombstone with a fresh HLC.
     try server.handleE2eeKey(conn, &e2ee_del);
-    try std.testing.expectEqual(@as(usize, 2), kt.len());
+    try std.testing.expectEqual(@as(usize, 3), kt.len());
 
     const Ed25519 = std.crypto.sign.Ed25519;
     const kp = try Ed25519.KeyPair.generateDeterministic(
@@ -58929,56 +61705,42 @@ test "E2EEKEY and IDENTITY live mutations append verifiable key transparency eve
     identity_add.params[3] = &sig_hex;
     identity_add.param_count = 4;
     try server.handleIdentity(conn, &identity_add);
-    try std.testing.expectEqual(@as(usize, 3), kt.len());
+    try std.testing.expectEqual(@as(usize, 4), kt.len());
 
     var identity_del = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
     identity_del.params[0] = "DEL";
     identity_del.params[1] = "primary";
     identity_del.param_count = 2;
     try server.handleIdentity(conn, &identity_del);
-    try std.testing.expectEqual(@as(usize, 4), kt.len());
+    try std.testing.expectEqual(@as(usize, 5), kt.len());
 
-    const expected = [_]key_transparency.Event{
-        .{
-            .account = "alice",
-            .kind = .e2ee_device,
-            .action = .bind,
-            .key_id = "phone",
-            .key_hash = key_transparency.materialHash(e2ee_material),
-            .timestamp_ms = event_time_ms,
-        },
-        .{
-            .account = "alice",
-            .kind = .e2ee_device,
-            .action = .delete,
-            .key_id = "phone",
-            .key_hash = key_transparency.materialHash(e2ee_material),
-            .timestamp_ms = event_time_ms,
-        },
-        .{
-            .account = "alice",
-            .kind = .identity,
-            .action = .bind,
-            .key_id = "primary",
-            .key_hash = key_transparency.materialHash(&identity_public),
-            .timestamp_ms = event_time_ms,
-        },
-        .{
-            .account = "alice",
-            .kind = .identity,
-            .action = .delete,
-            .key_id = "primary",
-            .key_hash = key_transparency.materialHash(&identity_public),
-            .timestamp_ms = event_time_ms,
-        },
-    };
+    const bind_e2ee = try kt.eventAt(0);
+    try std.testing.expectEqual(key_transparency.Action.bind, bind_e2ee.action);
+    try std.testing.expectEqual(key_transparency.CredentialKind.e2ee_device, bind_e2ee.kind);
+    const del_e2ee = try kt.eventAt(1);
+    try std.testing.expectEqual(key_transparency.Action.delete, del_e2ee.action);
+    const bind_id = try kt.eventAt(3);
+    try std.testing.expectEqual(key_transparency.CredentialKind.identity, bind_id.kind);
+    try std.testing.expectEqualSlices(u8, &key_transparency.factObservationHash(.{
+        .account = "alice",
+        .kind = .identity,
+        .action = .bind,
+        .key_id = "primary",
+        .hlc = @intCast(bind_id.timestamp_ms),
+        .origin_node = server.localPropOriginNode(),
+        .origin_pubkey = "",
+    }, &identity_public), &bind_id.key_hash);
+    const del_id = try kt.eventAt(4);
+    try std.testing.expectEqual(key_transparency.Action.delete, del_id.action);
+
     const root = kt.root();
-    for (expected, 0..) |event, position| {
+    for (0..kt.len()) |position| {
+        const owned = try kt.eventAt(position);
         var proof = try kt.proof(position);
         defer proof.deinit(alloc);
         try std.testing.expect(key_transparency.verifyInclusion(
             root,
-            event,
+            owned.asEvent(),
             proof,
             position,
             kt.len(),
@@ -59108,7 +61870,7 @@ test "E2EEGROUP local handler renders exact capable-member and targeted Welcome 
 
     var key_package = try irc_line.parseLine("E2EEGROUP #secure key-package phone :AQIDBA");
     try server.handleE2eeGroup(sender, &key_package);
-    const expected_key = ":Alice!alice@localhost E2EE.KEYPACKAGE #secure phone :AQIDBA\r\n";
+    const expected_key = ":Alice!alice@localhost E2EE.KEYPACKAGE #secure alice phone :AQIDBA\r\n";
     try expectContains(sender.send_buf[0..sender.send_len], expected_key);
     try expectContains(bob.send_buf[0..bob.send_len], expected_key);
     try expectContains(bob_phone.send_buf[0..bob_phone.send_len], expected_key);
@@ -59123,7 +61885,7 @@ test "E2EEGROUP local handler renders exact capable-member and targeted Welcome 
     bob_phone.send_offset = 0;
     var commit = try irc_line.parseLine("E2EEGROUP #secure commit phone :b3BhcXVl");
     try server.handleE2eeGroup(sender, &commit);
-    const expected_commit = ":Alice!alice@localhost E2EE.COMMIT #secure phone :b3BhcXVl\r\n";
+    const expected_commit = ":Alice!alice@localhost E2EE.COMMIT #secure alice phone :b3BhcXVl\r\n";
     try expectContains(sender.send_buf[0..sender.send_len], expected_commit);
     try expectContains(bob.send_buf[0..bob.send_len], expected_commit);
     try expectContains(bob_phone.send_buf[0..bob_phone.send_len], expected_commit);
@@ -59138,7 +61900,7 @@ test "E2EEGROUP local handler renders exact capable-member and targeted Welcome 
     // SessionStore lookup must use the canonical lowercase key stored at login.
     var welcome = try irc_line.parseLine("E2EEGROUP #secure welcome phone Bob tablet :d2VsY29tZQ");
     try server.handleE2eeGroup(sender, &welcome);
-    const expected_welcome = ":Alice!alice@localhost E2EE.WELCOME #secure phone Bob tablet :d2VsY29tZQ\r\n";
+    const expected_welcome = ":Alice!alice@localhost E2EE.WELCOME #secure alice phone Bob tablet :d2VsY29tZQ\r\n";
     try std.testing.expectEqual(@as(usize, 0), sender.send_len);
     try expectContains(bob.send_buf[0..bob.send_len], expected_welcome);
     try expectContains(bob_phone.send_buf[0..bob_phone.send_len], expected_welcome);
@@ -59244,7 +62006,7 @@ test "E2EEGROUP local handler fails closed and accepts the full payload bound" {
     var expected_buf: [e2ee_group_max_line_bytes]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        ":Alice!alice@localhost E2EE.COMMIT #secure phone :{s}\r\n",
+        ":Alice!alice@localhost E2EE.COMMIT #secure alice phone :{s}\r\n",
         .{&max_payload},
     );
     try std.testing.expectEqualSlices(u8, expected, target.send_buf[0..target.send_len]);
@@ -59306,7 +62068,7 @@ test "E2EEGROUP live operator quiesce is privileged observable non-mutating and 
     const target = server.connFor(target_id).?;
     for ([_]*ConnState{ oper, sender, target }) |conn|
         conn.session.registration.registered = true;
-    oper.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&oper.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     oper.session.addCap(.standard_replies);
     sender.ircx = true;
     sender.session.addCap(.standard_replies);
@@ -59518,7 +62280,7 @@ test "E2EEGROUP live operator quiesce is privileged observable non-mutating and 
     );
     try expectContains(
         target.send_buf[0..target.send_len],
-        ":Alice!alice@localhost E2EE.COMMIT #secure phone :AQIDBA\r\n",
+        ":Alice!alice@localhost E2EE.COMMIT #secure alice phone :AQIDBA\r\n",
     );
 }
 
@@ -59818,8 +62580,8 @@ test "E2EEGROUP mesh live path accepts once refloods exact wire retries and reti
     var retained: [2]attachment_delivery_spool.PendingRecord = undefined;
     const retained_rows = server.attachment_delivery_spool.collectPending(&retained);
     try std.testing.expectEqual(@as(usize, 2), retained_rows.len);
-    try expectContains(retained_rows[0].bytes, "E2EE.COMMIT #secure phone :AQIDBA");
-    try expectContains(retained_rows[1].bytes, "E2EE.COMMIT #secure phone :AQIDBA");
+    try expectContains(retained_rows[0].bytes, "E2EE.COMMIT #secure bob phone :AQIDBA");
+    try expectContains(retained_rows[1].bytes, "E2EE.COMMIT #secure bob phone :AQIDBA");
     try std.testing.expectEqual(@as(usize, 1), server.e2ee_group_mesh_authority.custodyLen());
     try std.testing.expect(server.e2ee_group_mesh_authority.containsCustody(
         egress.idb.shortId(),
@@ -59846,7 +62608,7 @@ test "E2EEGROUP mesh live path accepts once refloods exact wire retries and reti
     server.drainAttachmentSpoolForCurrentReactor();
     current_reactor = &server.reactors[0];
     try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
-    const delivered_line = ":Bob!bob@peer-b.test E2EE.COMMIT #secure phone :AQIDBA\r\n";
+    const delivered_line = ":Bob!bob@peer-b.test E2EE.COMMIT #secure bob phone :AQIDBA\r\n";
     try std.testing.expectEqual(
         @as(usize, 1),
         countOccurrences(local.send_buf[0..local.send_len], delivered_line),
@@ -61083,7 +63845,7 @@ test "P1: identity.key ENTITY_PROP ingest rejects a REMOTE write for a LOCALLY-h
     try std.testing.expect(!server.applyRemoteEntityProp(&forged_res));
 }
 
-test "P1: identity.key ENTITY_PROP ingest binds the key to its FIRST origin (a different peer cannot overwrite it)" {
+test "E5E1 identity ENTITY_PROP ingest rejects every remote origin before LWW" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "local");
     defer ident.deinit();
@@ -61093,29 +63855,29 @@ test "P1: identity.key ENTITY_PROP ingest binds the key to its FIRST origin (a d
     };
     defer server.deinit();
 
-    // kain is NOT local here (a third node). kain's real home A writes the key
-    // first — accepted, and the origin binding is recorded.
+    // Neither an asserted home nor a later competing origin may establish the
+    // retired replicated identity namespace.
     const home_a: u64 = 0xA;
     const byz_b: u64 = 0xB;
     const key_a = "home-A-key-value";
     var genuine = makeEntityPropChange(.user, "kain", "identity.key.primary", key_a, 100, home_a);
-    try std.testing.expect(server.applyRemoteEntityProp(&genuine));
+    try std.testing.expect(!server.applyRemoteEntityProp(&genuine));
     const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
-    try std.testing.expectEqualStrings(key_a, (try server.props.getProp(entity, "identity.key.primary")).value);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "identity.key.primary"));
 
     // A Byzantine peer B tries to OVERWRITE kain's key with its own, at a HIGHER
     // hlc so plain LWW would accept it — the origin binding rejects it.
     const key_b = "byzantine-B-value";
     var forged = makeEntityPropChange(.user, "kain", "identity.key.primary", key_b, 999, byz_b);
     try std.testing.expect(!server.applyRemoteEntityProp(&forged));
-    // A's key survives — B never gets its key trusted for kain.
-    try std.testing.expectEqualStrings(key_a, (try server.props.getProp(entity, "identity.key.primary")).value);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "identity.key.primary"));
 
-    // The SAME origin A may still update (key rotation from the genuine home).
+    // Even the same asserted origin cannot rotate through ENTITY_PROP.
     const key_a2 = "home-A-rotated-v2";
     var rotate = makeEntityPropChange(.user, "kain", "identity.key.primary", key_a2, 200, home_a);
-    try std.testing.expect(server.applyRemoteEntityProp(&rotate));
-    try std.testing.expectEqualStrings(key_a2, (try server.props.getProp(entity, "identity.key.primary")).value);
+    try std.testing.expect(!server.applyRemoteEntityProp(&rotate));
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "identity.key.primary"));
+    try std.testing.expectEqual(@as(u64, 3), server.remote_identity_props_quarantined);
 }
 
 test "P1: a NON-identity user prop is NOT origin-bound (regression: ordinary ENTITY_PROP LWW is unchanged)" {
@@ -63187,7 +65949,7 @@ test "threaded server: auxiliary direct events fan out exact-token attachments o
     );
 }
 
-test "threaded server: remote DATA reserved tags require trusted oper grant or channel rank" {
+test "threaded server: inactive OCG1 never authorizes remote DATA reserved tags" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -63214,14 +65976,13 @@ test "threaded server: remote DATA reserved tags require trusted oper grant or c
     // A mutable relay account claim cannot become `policy_account`; passing an
     // ungranted forged value demonstrates that mere text has no authority.
     try std.testing.expect(!server.remoteDataTagAuthorized("ADM.alert", true, member, "forged-oper-text"));
-    try std.testing.expect(server.remoteDataTagAuthorized("SYS.notice", false, null, "trusted-oper"));
-    try std.testing.expect(server.remoteDataTagAuthorized("ADM.alert", true, member, "trusted-oper"));
+    try std.testing.expect(!server.remoteDataTagAuthorized("SYS.notice", false, null, "trusted-oper"));
+    try std.testing.expect(!server.remoteDataTagAuthorized("ADM.alert", true, member, "trusted-oper"));
     try std.testing.expect(server.remoteDataTagAuthorized("OWN.state", true, channel_op, ""));
     try std.testing.expect(!server.remoteDataTagAuthorized("HST.state", true, member, ""));
     try std.testing.expect(!server.remoteDataTagAuthorized("OWN.state", false, null, ""));
-    // Network-oper override matches the local handleData policy even when the
-    // target is direct rather than a channel.
-    try std.testing.expect(server.remoteDataTagAuthorized("HST.state", false, null, "trusted-oper"));
+    // The stored OCG1 record also cannot bypass channel rank for a direct target.
+    try std.testing.expect(!server.remoteDataTagAuthorized("HST.state", false, null, "trusted-oper"));
 }
 
 test "session-sync exact-once matrix: authenticated inbound relay dedupes exact tokens and account mirror" {
@@ -64416,7 +67177,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"relay_v2\":{\"bridge_implemented\":true,\"authoring\":\"compat\",\"authoring_eligible\":false,\"activation_epoch\":0,\"roster_count\":0,\"roster_digest\":null}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh_admission\":{\"mode\":\"open\",\"secured_s2s\":false,\"require_secured\":false,\"require_signed_frames\":true,\"roots\":0,\"token_present\":false,\"min_revocation_epoch\":0}") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"available\":true,\"semantics\":\"observational\",\"scope\":\"node-local\",\"entries\":1,\"root\":\"") != null);
         const kt_root_hex = std.fmt.bytesToHex(kt.root(), .lower);
         try std.testing.expect(std.mem.indexOf(u8, text, &kt_root_hex) != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"history\":{\"targets\":2,\"entries\":3,\"tombstones\":1,\"root\":\"") != null);
@@ -64529,11 +67290,15 @@ test "oper-prefix dedup: collapses repeat +Y within the window, allows real tran
     try std.testing.expect(d.seenRecently("#root", "TREV", true, 1500)); // case-insensitive
     // A different sign (-Y) is a real transition, not a repeat.
     try std.testing.expect(!d.seenRecently("#root", "trev", false, 1600));
+    // Re-adding immediately after that removal is another real transition,
+    // while a repeated re-add remains collapsible.
+    try std.testing.expect(!d.seenRecently("#root", "trev", true, 1610));
+    try std.testing.expect(d.seenRecently("#root", "trev", true, 1620));
     // A different channel or nick is not a repeat.
     try std.testing.expect(!d.seenRecently("#other", "trev", true, 1600));
     try std.testing.expect(!d.seenRecently("#root", "kain", true, 1600));
     // After the window elapses, the same announcement fires again (real re-add).
-    try std.testing.expect(!d.seenRecently("#root", "trev", true, 1000 + oper_prefix_dedup_ms + 1));
+    try std.testing.expect(!d.seenRecently("#root", "trev", true, 1620 + oper_prefix_dedup_ms + 1));
 }
 
 test "remote QUIT dedup is recipient-local and case-insensitive" {
@@ -64958,7 +67723,7 @@ test "deliverRelay accepts a correctly signed origin message" {
     } else return error.SkipZigTest;
 }
 
-test "session replica residence rejects downgrade without widening rowless authority to a decoy" {
+test "E5E1 session replica residence rejects downgrade without widening exact token authority" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var local_ident = try node_identity.fromSeed(@as([32]u8, @splat(0x35)), "session-downgrade-local");
@@ -65034,6 +67799,10 @@ test "session replica residence rejects downgrade without widening rowless autho
     // With no retained v2 authority, the rolling legacy fold still applies.
     const legacy_id = try addTestLocalClient(&server, "Legacy", "legacy-acct");
     const legacy_change = DeltaStub{ .channel = "#legacy", .nick = "Legacy", .account = "legacy-acct" };
+    try std.testing.expectEqual(
+        s2s_link.S2sLink.ResidenceDecision.untrusted,
+        LinuxServer.residenceTrusted(&server, "legacy-acct", "Legacy", remote_a_node, false),
+    );
     try std.testing.expect(server.foldLegacySessionMembership(&downgraded, &legacy_change, "remote.test"));
     try std.testing.expect(server.world.isMember("#legacy", worldIdFromClient(legacy_id)));
 
@@ -66596,6 +69365,124 @@ fn buildSignedEntityProp(
     };
 }
 
+test "E5E1 remote identity namespace quarantine precedes signatures clocks stores and authority" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const baseline_hlc = server.nextMeshHlc();
+    const baseline_clock = server.mesh_clock;
+    const baseline_signatures = server.rejected_relay_signatures;
+    const baseline_authority = server.rejected_relay_home_mismatch;
+    const quarantined = [_]TestEntityPropFact{
+        .{ .kind = .user, .entity = "alice", .key = "identity.key.primary", .value = "bad", .owner = "alice", .hlc = baseline_hlc + 1, .present = true, .origin_node = 7, .origin_pubkey = "forged", .origin_sig = "forged" },
+        .{ .kind = .user, .entity = "alice", .key = "IDENTITY.KEY.", .value = "", .owner = "alice", .hlc = baseline_hlc + 2, .present = false, .origin_node = 7 },
+        .{ .kind = .user, .entity = "alice", .key = "Identity.Residence.0000000000000007", .value = "bad", .owner = "alice", .hlc = baseline_hlc + 3, .present = true, .origin_node = 7 },
+        .{ .kind = .user, .entity = "alice", .key = "identity.residence.abc", .value = "", .owner = "alice", .hlc = baseline_hlc + 4, .present = false, .origin_node = 7 },
+    };
+    for (quarantined) |fact| {
+        try std.testing.expect(!server.applyRemoteEntityProp(fact));
+        try std.testing.expect(server.entityPropClock(.user, fact.entity, fact.key) == null);
+        try std.testing.expectError(
+            error.PropMissing,
+            server.props.getPropRaw(.{ .kind = .user, .id = fact.entity }, fact.key),
+        );
+        try std.testing.expectEqual(baseline_clock.last_physical, server.mesh_clock.last_physical);
+        try std.testing.expectEqual(baseline_clock.last_stamp, server.mesh_clock.last_stamp);
+        try std.testing.expectEqual(baseline_signatures, server.rejected_relay_signatures);
+        try std.testing.expectEqual(baseline_authority, server.rejected_relay_home_mismatch);
+    }
+    try std.testing.expectEqual(@as(u64, quarantined.len), server.remote_identity_props_quarantined);
+
+    const near = TestEntityPropFact{ .kind = .user, .entity = "alice", .key = "identity.keyX.keep", .value = "ordinary", .owner = "alice", .hlc = baseline_hlc + 10, .present = true, .origin_node = 7 };
+    try std.testing.expect(server.applyRemoteEntityProp(near));
+    try std.testing.expectEqualStrings("ordinary", (try server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, near.key)).value);
+
+    const member = TestEntityPropFact{ .kind = .member, .entity = "#room:alice", .key = "identity.key.primary", .value = "member", .owner = "alice", .hlc = baseline_hlc + 11, .present = true, .origin_node = 7 };
+    try std.testing.expect(server.applyRemoteEntityProp(member));
+    try std.testing.expectEqualStrings("member", (try server.props.getPropRaw(.{ .kind = .member, .id = member.entity }, member.key)).value);
+}
+
+test "E5E1 local identity add residence and delete never export to plaintext or secured links" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var plain_local: s2s_link.S2sLink = undefined;
+    try plain_local.init(.{ .allocator = allocator, .local_node_id = 0xA1, .remote_node_id = 0xA2, .local_epoch_ms = 1000, .server_name = "e5e1-local.test", .config = .{ .require_signed_frames = false } });
+    defer plain_local.deinit();
+    var plain_remote: s2s_link.S2sLink = undefined;
+    try plain_remote.init(.{ .allocator = allocator, .local_node_id = 0xA2, .remote_node_id = 0xA1, .local_epoch_ms = 2000, .server_name = "e5e1-remote.test", .config = .{ .require_signed_frames = false } });
+    defer plain_remote.deinit();
+    try plain_local.start(10);
+    var round: usize = 0;
+    while (round < 32) : (round += 1) {
+        const local_wire = try allocator.dupe(u8, plain_local.outbound());
+        defer allocator.free(local_wire);
+        const remote_wire = try allocator.dupe(u8, plain_remote.outbound());
+        defer allocator.free(remote_wire);
+        plain_local.clearOutbound();
+        plain_remote.clearOutbound();
+        if (local_wire.len == 0 and remote_wire.len == 0) break;
+        if (local_wire.len != 0) try plain_remote.feed(local_wire, round + 11, 0xE5E1 +% round);
+        if (remote_wire.len != 0) try plain_local.feed(remote_wire, round + 11, 0x1E5E +% round);
+    }
+    try std.testing.expect(plain_local.established());
+
+    var secured = try SessionReplayTestPair.initWithSeeds(allocator, 0xB1, 0xB2);
+    defer secured.deinit();
+    secured.a.clearOutbound();
+    secured.b.clearOutbound();
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const plain_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const plain_conn = server.rx().clients.get(plain_id).?;
+    plain_conn.overflow_allocator = allocator;
+    plain_conn.token = try tokenFromId(plain_id);
+    plain_conn.send_armed = true;
+    plain_conn.sendq_cap = default_sendq_cap;
+    plain_conn.s2s = &plain_local;
+    const secured_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const secured_conn = server.rx().clients.get(secured_id).?;
+    secured_conn.overflow_allocator = allocator;
+    secured_conn.token = try tokenFromId(secured_id);
+    secured_conn.send_armed = true;
+    secured_conn.sendq_cap = default_sendq_cap;
+    secured_conn.s2s_secured = &secured.a;
+    defer {
+        plain_conn.s2s = null;
+        secured_conn.s2s_secured = null;
+        _ = server.rx().clients.free(plain_id);
+        _ = server.rx().clients.free(secured_id);
+    }
+
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    _ = try server.props.setProp(entity, "identity.key.primary", "local-key", .{ .id = "alice", .access = .user });
+    server.propagateLocalEntityPropAt(true, .user, "alice", "identity.key.primary", "local-key", "alice", 100);
+    _ = try server.props.setProp(entity, "identity.residence.0000000000000001", "local-proof", .{ .id = "alice", .access = .user });
+    server.propagateLocalEntityPropAt(true, .user, "alice", "identity.residence.0000000000000001", "local-proof", "alice", 101);
+    try server.props.deleteProp(entity, "identity.key.primary");
+    server.propagateLocalEntityPropAt(false, .user, "alice", "identity.key.primary", "", "alice", 102);
+
+    try std.testing.expect(server.entityPropClock(.user, "alice", "identity.key.primary") != null);
+    try std.testing.expect(server.entityPropClock(.user, "alice", "identity.residence.0000000000000001") != null);
+    try std.testing.expectEqual(@as(usize, 0), plain_conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), plain_conn.send_overflow.items.len);
+    try std.testing.expectEqual(@as(usize, 0), secured_conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), secured_conn.send_overflow.items.len);
+    try std.testing.expectEqual(@as(usize, 0), plain_local.outbound().len);
+    try std.testing.expectEqual(@as(usize, 0), secured.a.outbound().len);
+}
+
 test "remote property admission advances HLC only for accepted channel and entity facts" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -68109,7 +70996,8 @@ test "threaded server: EXTERNAL exact account nick auto-attaches one local token
     const claimant_id = try addTestLocalClient(&server, "bootstrap", "kain");
     const claimant = server.connFor(claimant_id).?;
     try claimant.session.setNick("kain");
-    claimant.session.setOperGrant(
+    try reconcileTestOper(
+        &claimant.session,
         oper_mod.OperPrivileges.initMany(&.{.oper_override}),
         "root",
         "Network Operator",
@@ -68152,7 +71040,7 @@ test "threaded server: EXTERNAL exact account nick auto-attaches one local token
         claimant.send_buf[0..claimant.send_len],
         " 353 kain = #root ",
         "kain",
-        "*kain",
+        "!kain",
     );
     // The physical row already existed: neither claimant nor owner gets a
     // duplicate logical JOIN, and neither side gets +Y churn.
@@ -68230,7 +71118,8 @@ test "threaded server: secured replica permits tokenless EXTERNAL exact account 
     const claimant_id = try addTestLocalClient(&server, "mesh-bootstrap", "kain");
     const claimant = server.connFor(claimant_id).?;
     try claimant.session.setNick("kain");
-    claimant.session.setOperGrant(
+    try reconcileTestOper(
+        &claimant.session,
         oper_mod.OperPrivileges.initMany(&.{.oper_override}),
         "root",
         "Network Operator",
@@ -68674,7 +71563,7 @@ test "threaded server: local resume joins an attached reusable session" {
 
     const observer_id = try addTestLocalClient(&server, "observer", null);
     const observer = server.connFor(observer_id).?;
-    observer.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&observer.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     try server.observe.set(
         LinuxServer.observeKey(observer),
         "*!*@203.0.113.77",
@@ -70235,7 +73124,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     try recvUntil(&admin, "handle=1 name=guard tier=verified signed=true commands=0 hooks=1 grants=(none) intents=(none)", 200);
 }
 
-test "threaded server: SASL oper elevation persists the grant to oper_grants_path" {
+test "threaded server: SASL oper elevation persists inactive OCG1 compatibility record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -70283,8 +73172,8 @@ test "threaded server: SASL oper elevation persists the grant to oper_grants_pat
     try writeAllFd(fd, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
     try recvUntil(&admin, " 381 Oper ", 200);
 
-    // The SASL oper elevation must have written the local grant to the file, so a
-    // cold restart's loadGrants restores it (a `<account>\t<bits>\t…` TSV row).
+    // Configured-local elevation still emits the legacy compatibility record,
+    // but loadGrants never treats this TSV row as session authority.
     const contents = std.Io.Dir.cwd().readFileAlloc(std.testing.io, grants_path, std.testing.allocator, .limited(4096)) catch |err| {
         std.debug.print("grants file not written: {any}\n", .{err});
         return error.TestUnexpectedResult;
@@ -70292,6 +73181,25 @@ test "threaded server: SASL oper elevation persists the grant to oper_grants_pat
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "admin\t") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "netadmin") != null);
+
+    // A cold-start consumer may reload that TSV row into its OCG1 registry, but
+    // the row remains compatibility telemetry rather than runtime authority.
+    var restored = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .oper_grants_path = grants_path,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer restored.deinit();
+    restored.loadGrants();
+    const loaded = restored.oper_grants.lookup("admin", restored.grantNowU64()) orelse
+        return error.TestExpectedGrant;
+    try std.testing.expect(oper_mod.OperPrivileges.fromBits(loaded.privilege_bits).has(.oper_override));
+    try std.testing.expect(!restored.isOverrideOper("admin"));
+    try std.testing.expect(!restored.remoteDataTagAuthorized("SYS.notice", false, null, "admin"));
 }
 
 test "threaded server: a joining network operator announces the derived +Y prefix to existing members" {
@@ -71184,6 +74092,44 @@ test "event routing: legacy oper category subscriptions are independent of the I
     try std.testing.expect(!LinuxServer.sessionWantsEvent(&ircx, .kill, .notice, "k killed s (flood)", "k killed s (flood)"));
 }
 
+test "KICK server wire boundary appends exactly one CRLF" {
+    var buf: [default_reply_bytes]u8 = undefined;
+    const wire = try LinuxServer.buildKickWire(
+        &buf,
+        .{ .nick = "Founder", .user = "founder", .host = "localhost" },
+        "#room",
+        "Member",
+        "bounded reason",
+    );
+    try std.testing.expectEqualStrings(
+        ":Founder!founder@localhost KICK #room Member :bounded reason\r\n",
+        wire,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, wire, "\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, wire[0 .. wire.len - 2], "\r\n") == null);
+
+    var reason: [400]u8 = @splat('r');
+    const max_wire = try LinuxServer.buildKickWire(
+        &buf,
+        .{ .nick = "Founder", .user = "founder", .host = "localhost" },
+        "#room",
+        "Member",
+        &reason,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, max_wire, "\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, max_wire[0 .. max_wire.len - 2], "\r\n") == null);
+    try std.testing.expectError(
+        error.OutputTooSmall,
+        LinuxServer.buildKickWire(
+            buf[0..1],
+            .{ .nick = "Founder", .user = "founder", .host = "localhost" },
+            "#room",
+            "Member",
+            "reason",
+        ),
+    );
+}
+
 test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to-end" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -71225,10 +74171,29 @@ test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to
     try writeAllFd(fd_a, "MODE #x +o B\r\n");
     try recvUntil(&a, "MODE #x +o B", 200);
 
-    // A KICKs B (founder outranks op).
+    // A KICKs B (founder outranks op). Both actor and target receive one
+    // independently delimited wire line before any later command can mask a
+    // missing terminator.
     a.reset();
+    b.reset();
     try writeAllFd(fd_a, "KICK #x B :bye\r\n");
-    try recvUntil(&a, "KICK #x B :bye", 200);
+    try recvUntil(&a, "KICK #x B :bye\r\n", 200);
+    try recvUntil(&b, "KICK #x B :bye\r\n", 200);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(a.written(), "KICK #x B :bye\r\n"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(b.written(), "KICK #x B :bye\r\n"));
+
+    // The next server reply starts on a fresh line and the kicked target is no
+    // longer projected into NAMES. This is the wire-level path the UI consumes
+    // to remove the target from its member roster.
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "NAMES #x\r\n");
+    try writeAllFd(fd_b, "NAMES #x\r\n");
+    try recvUntil(&a, " 366 A #x :End of /NAMES list\r\n", 200);
+    try recvUntil(&b, " 366 B #x :End of /NAMES list\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "KICK #x") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "KICK #x") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " B") == null);
 
     // WHOIS A -> 311 user line + 318 end.
     a.reset();
@@ -75097,7 +78062,7 @@ test "exploit: SHUN list drops a CRLF-smuggled stored reason (oper handler, end-
     defer server.deinit();
     const id = try addTestLocalClient(&server, "operator", null);
     const conn = server.connFor(id).?;
-    conn.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.client_moderate}), "ircop", "oper");
+    try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.initMany(&.{.client_moderate}), "ircop", "oper");
 
     // A shun reason is stored WITHOUT control-byte validation (shun.add checks
     // only length), so a CRLF in the reason reaches the list-emit path. Seed a
@@ -78523,7 +81488,7 @@ test "event spine: +U OPMODERATE POLICY fan-out reaches oper on another shard" {
         const oper_conn = server.rx().clients.get(oper_id).?;
         oper_conn.token = try tokenFromId(oper_id);
         try oper_conn.session.setNick("RemoteOper");
-        oper_conn.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+        try reconcileTestOper(&oper_conn.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
         oper_conn.session.setEventMask(event_spine.CategoryMask.only(.policy));
 
         current_reactor = &server.reactors[0];
@@ -79196,7 +82161,7 @@ test "cross-shard delivery poison: saturated special broadcasts poison only matc
     const observe_match = server.rx().clients.get(observe_match_id).?;
     observe_match.token = try tokenFromId(observe_match_id);
     try observe_match.session.setNick("ObserveMatch");
-    observe_match.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&observe_match.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     try server.observe.set(
         LinuxServer.observeKey(observe_match),
         "watch*!*@*",
@@ -79208,7 +82173,7 @@ test "cross-shard delivery poison: saturated special broadcasts poison only matc
     const observe_decoy = server.rx().clients.get(observe_decoy_id).?;
     observe_decoy.token = try tokenFromId(observe_decoy_id);
     try observe_decoy.session.setNick("ObserveDecoy");
-    observe_decoy.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&observe_decoy.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     try server.observe.set(
         LinuxServer.observeKey(observe_decoy),
         "watch*!*@*",
@@ -79220,14 +82185,14 @@ test "cross-shard delivery poison: saturated special broadcasts poison only matc
     const event_match = server.rx().clients.get(event_match_id).?;
     event_match.token = try tokenFromId(event_match_id);
     try event_match.session.setNick("EventMatch");
-    event_match.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&event_match.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     event_match.session.setEventMask(event_spine.CategoryMask.only(.policy));
 
     const event_decoy_id = try server.rx().clients.alloc(ConnState.init(-1));
     const event_decoy = server.rx().clients.get(event_decoy_id).?;
     event_decoy.token = try tokenFromId(event_decoy_id);
     try event_decoy.session.setNick("EventDecoy");
-    event_decoy.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&event_decoy.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     event_decoy.session.setEventMask(event_spine.CategoryMask.only(.kill));
 
     // Saturate only the destination shard's pool. Both special broadcast kinds
@@ -80748,6 +83713,189 @@ test "threaded server: MEMO IGNORE silently drops a blocked sender's memo" {
     try recvUntil(&a, "from bob :now allowed", 300);
 }
 
+fn testSaslPlainAccountLogin(conn: *ConnState, account: []const u8) !void {
+    var sink = QueueSink{ .conn = conn };
+    try processLine(conn, "CAP REQ :sasl", &sink);
+    try processLine(conn, "AUTHENTICATE PLAIN", &sink);
+    var raw: [96]u8 = undefined;
+    var raw_len: usize = 0;
+    raw[raw_len] = 0;
+    raw_len += 1;
+    @memcpy(raw[raw_len .. raw_len + account.len], account);
+    raw_len += account.len;
+    raw[raw_len] = 0;
+    raw_len += 1;
+    @memcpy(raw[raw_len .. raw_len + "onyx".len], "onyx");
+    raw_len += "onyx".len;
+    var encoded_buf: [std.base64.standard.Encoder.calcSize(raw.len)]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&encoded_buf, raw[0..raw_len]);
+    var line_buf: [160]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "AUTHENTICATE {s}", .{encoded});
+    try processLine(conn, line, &sink);
+    try std.testing.expectEqualStrings(account, conn.session.account() orelse return error.TestUnexpectedResult);
+}
+
+test "account-switch ratchet standard SASL then post-auth replacement never unions oper authority" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_account_switch_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_account_switch_bindings) catch unreachable,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "Switch", null);
+    const conn = server.connFor(id).?;
+    server.injectSessionState(conn);
+
+    // A full local operator authenticates first.
+    try testSaslPlainAccountLogin(conn, "admin");
+    try server.elevateOperFromAccount(conn);
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expect(conn.session.isAdmin());
+    try std.testing.expect(conn.session.hasPriv(.mesh_admin));
+    try std.testing.expectEqualStrings("netadmin", conn.session.operClass());
+    try std.testing.expectEqual(
+        oper_session_provenance.Source.configured_local,
+        std.meta.activeTag(conn.session.operProvenance()),
+    );
+
+    // Reconciliation itself must replace an already-live projection.  This
+    // directly guards the former `if (isOper()) return` ratchet independently
+    // of ClientSession.loginAs()'s own revoke-before-mutate defense.
+    server.oper_registry = oper_mod.OperRegistry.init(&test_account_switch_narrow_admin_bindings) catch unreachable;
+    try server.elevateOperFromAccount(conn);
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expect(conn.session.hasPriv(.client_kill));
+    try std.testing.expectEqual(@as(usize, 1), conn.session.oper_priv.count());
+    try std.testing.expect(!conn.session.hasPriv(.server_admin));
+    try std.testing.expectEqualStrings("refreshed", conn.session.operClass());
+    server.oper_registry = oper_mod.OperRegistry.init(&test_account_switch_bindings) catch unreachable;
+    try server.elevateOperFromAccount(conn);
+    try std.testing.expect(conn.session.isAdmin());
+    try std.testing.expect(conn.session.hasPriv(.mesh_admin));
+
+    // A -> non-oper must leave no privilege, class, title, admin, or override
+    // residue.  The server lookup itself clears again before returning absent.
+    try server.finishLogin(conn, "plain");
+    try std.testing.expect(!conn.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), conn.session.oper_priv.count());
+    try std.testing.expectEqualStrings("", conn.session.operClass());
+    try std.testing.expectEqualStrings("", conn.session.operTitle());
+    try std.testing.expect(!conn.session.hasUmode(.admin));
+    try std.testing.expect(!conn.session.hasUmode(.override));
+
+    // A -> B operator applies only B's one-bit grant; the former full grant is
+    // not unioned into it.
+    try server.finishLogin(conn, "admin");
+    try server.finishLogin(conn, "oper");
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expect(conn.session.hasPriv(.client_moderate));
+    try std.testing.expectEqual(@as(usize, 1), conn.session.oper_priv.count());
+    try std.testing.expect(!conn.session.hasPriv(.server_admin));
+    try std.testing.expect(!conn.session.hasPriv(.mesh_admin));
+    try std.testing.expectEqualStrings("ircop", conn.session.operClass());
+
+    // Same-account reauthentication is a new authority decision.  Change the
+    // configured binding, authenticate admin again, and prove the old full
+    // projection is replaced by the current one-bit policy.
+    server.oper_registry = oper_mod.OperRegistry.init(&test_account_switch_bindings) catch unreachable;
+    try server.finishLogin(conn, "admin");
+    try std.testing.expect(conn.session.isAdmin());
+    server.oper_registry = oper_mod.OperRegistry.init(&test_account_switch_narrow_admin_bindings) catch unreachable;
+    try server.finishLogin(conn, "admin");
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expect(conn.session.hasPriv(.client_kill));
+    try std.testing.expectEqual(@as(usize, 1), conn.session.oper_priv.count());
+    try std.testing.expect(!conn.session.hasPriv(.server_admin));
+    try std.testing.expect(!conn.session.hasPriv(.mesh_admin));
+    try std.testing.expectEqualStrings("refreshed", conn.session.operClass());
+}
+
+test "account-switch ratchet IRCX AUTH guest and logout clear exact oper authority" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .oper_registry = oper_mod.OperRegistry.init(&test_account_switch_bindings) catch unreachable,
+        .oper_auto_override = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const id = try addTestLocalClient(&server, "IrcxSwitch", null);
+    const conn = server.connFor(id).?;
+    const observer_id = try addTestLocalClient(&server, "Observer", null);
+    const observer = server.connFor(observer_id).?;
+    try observer.session.setIrcxEventSubscription(.user, "*");
+    try server.world.restoreMember("#ratchet", worldIdFromClient(id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#ratchet", worldIdFromClient(observer_id), world_model.MemberModes.empty());
+
+    try server.completeIrcxAuth(id, conn, .plain, .{ .account = "admin" });
+    try std.testing.expect(conn.session.isAdmin());
+    try std.testing.expect(conn.session.hasPriv(.mesh_admin));
+    try std.testing.expect(conn.session.hasUmode(.override));
+
+    resetTestSendQ(conn);
+    resetTestSendQ(observer);
+    try server.completeIrcxAuth(id, conn, .plain, .{ .account = "plain" });
+    try std.testing.expectEqualStrings("plain", conn.session.account().?);
+    try std.testing.expect(!conn.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), conn.session.oper_priv.count());
+    try expectContains(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -oaj\r\n");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -oaj\r\n"));
+    try expectContains(observer.send_buf[0..observer.send_len], " MODE #ratchet -Y IrcxSwitch\r\n");
+    try expectContains(observer.send_buf[0..observer.send_len], "USER DEOPER IrcxSwitch!");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], "USER DEOPER IrcxSwitch!"));
+
+    try server.completeIrcxAuth(id, conn, .plain, .{ .account = "admin" });
+    resetTestSendQ(conn);
+    resetTestSendQ(observer);
+    try server.completeIrcxAuth(id, conn, .plain, .{ .account = "oper" });
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expect(conn.session.hasPriv(.client_moderate));
+    try std.testing.expectEqual(@as(usize, 1), conn.session.oper_priv.count());
+    try std.testing.expect(!conn.session.hasPriv(.server_admin));
+    try std.testing.expectEqualStrings("ircop", conn.session.operClass());
+    try expectContains(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -oaj\r\n");
+    try expectContains(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch +or\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " MODE IrcxSwitch +ora") == null);
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " MODE IrcxSwitch +orj") == null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], " MODE #ratchet -Y IrcxSwitch\r\n"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], "USER DEOPER IrcxSwitch!"));
+
+    resetTestSendQ(conn);
+    resetTestSendQ(observer);
+    try server.completeIrcxAuth(id, conn, .anonymous, .{ .account = "guest", .guest = true });
+    try std.testing.expect(conn.session.account() == null);
+    try std.testing.expect(!conn.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), conn.session.oper_priv.count());
+    try expectContains(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -o\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, observer.send_buf[0..observer.send_len], " MODE #ratchet -Y IrcxSwitch\r\n") == null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], "USER DEOPER IrcxSwitch!"));
+
+    try server.completeIrcxAuth(id, conn, .plain, .{ .account = "admin" });
+    try std.testing.expect(conn.session.isOper());
+    resetTestSendQ(conn);
+    resetTestSendQ(observer);
+    try server.handleLogout(id, conn);
+    try std.testing.expect(conn.session.account() == null);
+    try std.testing.expect(!conn.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), conn.session.oper_priv.count());
+    try expectContains(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -oaj\r\n");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -oaj\r\n"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], " MODE #ratchet -Y IrcxSwitch\r\n"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], "USER DEOPER IrcxSwitch!"));
+}
+
 test "threaded server: oper SASL login auto-enables IRCX" {
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -81669,7 +84817,7 @@ test "migrated profile uses authenticated account and preserves local transport 
         .account = "",
         .host = "migrated-cloak.example",
     };
-    const result = LinuxServer.prepareMigratedSessionProfile(&session, "alice", &snap, false);
+    const result = LinuxServer.prepareMigratedSessionProfile(&session, "alice", &snap, false, null, 100);
 
     try std.testing.expect(!result.override_activated);
     try std.testing.expectEqualStrings("alice", session.account().?);
@@ -81683,7 +84831,8 @@ test "migrated profile uses authenticated account and preserves local transport 
 test "migrated profile honors mode direction and rederives transport account and admin modes" {
     var tls_admin = dispatch.ClientSession.init();
     tls_admin.loginAs("admin");
-    tls_admin.setOperGrant(
+    try reconcileTestOper(
+        &tls_admin,
         oper_mod.OperPrivileges.initMany(&.{.server_admin}),
         "netadmin",
         "Network Admin",
@@ -81695,7 +84844,15 @@ test "migrated profile honors mode direction and rederives transport account and
         .umodes = "+iBzxa-irza",
         .channels = &.{},
     };
-    _ = LinuxServer.prepareMigratedSessionProfile(&tls_admin, "admin", &tls_snap, true);
+    _ = try prepareMigratedSessionProfileForTest(
+        &tls_admin,
+        "admin",
+        &tls_snap,
+        true,
+        oper_mod.OperPrivileges.initMany(&.{.server_admin}),
+        "netadmin",
+        "Network Admin",
+    );
     try std.testing.expect(!tls_admin.hasUmode(.invisible));
     try std.testing.expect(tls_admin.hasUmode(.bot));
     try std.testing.expect(tls_admin.hasUmode(.secure_tls));
@@ -81713,7 +84870,7 @@ test "migrated profile honors mode direction and rederives transport account and
         // Stale profile history cannot recreate an oper grant revoked locally.
         .is_oper = true,
     };
-    _ = LinuxServer.prepareMigratedSessionProfile(&plaintext, "plain", &plain_snap, false);
+    _ = LinuxServer.prepareMigratedSessionProfile(&plaintext, "plain", &plain_snap, false, null, 100);
     try std.testing.expect(!plaintext.hasUmode(.secure_tls));
     try std.testing.expect(!plaintext.hasUmode(.cloaked));
     try std.testing.expect(!plaintext.hasUmode(.admin));
@@ -81730,7 +84887,7 @@ test "migrated profile never relaxes a local media transmit deny" {
         .umodes = "-M",
         .channels = &.{},
     };
-    _ = LinuxServer.prepareMigratedSessionProfile(&removed, "restricted", &remove_snap, false);
+    _ = LinuxServer.prepareMigratedSessionProfile(&removed, "restricted", &remove_snap, false, null, 100);
     try std.testing.expect(removed.hasUmode(.media_tx_deny));
 
     var omitted = dispatch.ClientSession.init();
@@ -81741,7 +84898,7 @@ test "migrated profile never relaxes a local media transmit deny" {
         .umodes = "+i",
         .channels = &.{},
     };
-    _ = LinuxServer.prepareMigratedSessionProfile(&omitted, "restricted", &omitted_snap, false);
+    _ = LinuxServer.prepareMigratedSessionProfile(&omitted, "restricted", &omitted_snap, false, null, 100);
     try std.testing.expect(omitted.hasUmode(.media_tx_deny));
 
     // A carried deny may still tighten an unrestricted claimant.
@@ -81752,7 +84909,7 @@ test "migrated profile never relaxes a local media transmit deny" {
         .umodes = "+M",
         .channels = &.{},
     };
-    _ = LinuxServer.prepareMigratedSessionProfile(&tightened, "restricted", &add_snap, false);
+    _ = LinuxServer.prepareMigratedSessionProfile(&tightened, "restricted", &add_snap, false, null, 100);
     try std.testing.expect(tightened.hasUmode(.media_tx_deny));
 }
 
@@ -81764,20 +84921,28 @@ test "migrated override mode is directional privilege gated and reports activati
         .umodes = "+ij",
         .channels = &.{},
     };
-    const denied = LinuxServer.prepareMigratedSessionProfile(&plain, "plain", &plain_snap, false);
+    const denied = LinuxServer.prepareMigratedSessionProfile(&plain, "plain", &plain_snap, false, null, 100);
     try std.testing.expect(plain.hasUmode(.invisible));
     try std.testing.expect(!plain.hasUmode(.override));
     try std.testing.expect(!denied.override_activated);
 
     var privileged = dispatch.ClientSession.init();
     privileged.loginAs("priv");
-    privileged.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+    try reconcileTestOper(&privileged, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
     const add_snap = migration_relay.Snapshot{
         .nick = "Priv",
         .umodes = "+j",
         .channels = &.{},
     };
-    const activated = LinuxServer.prepareMigratedSessionProfile(&privileged, "priv", &add_snap, false);
+    const activated = try prepareMigratedSessionProfileForTest(
+        &privileged,
+        "priv",
+        &add_snap,
+        false,
+        oper_mod.OperPrivileges.initMany(&.{.oper_override}),
+        "netadmin",
+        "",
+    );
     try std.testing.expect(privileged.hasUmode(.override));
     try std.testing.expect(activated.override_activated);
 
@@ -81786,12 +84951,20 @@ test "migrated override mode is directional privilege gated and reports activati
         .umodes = "-j",
         .channels = &.{},
     };
-    const removed = LinuxServer.prepareMigratedSessionProfile(&privileged, "priv", &remove_snap, false);
+    const removed = try prepareMigratedSessionProfileForTest(
+        &privileged,
+        "priv",
+        &remove_snap,
+        false,
+        oper_mod.OperPrivileges.initMany(&.{.oper_override}),
+        "netadmin",
+        "",
+    );
     try std.testing.expect(!privileged.hasUmode(.override));
     try std.testing.expect(!removed.override_activated);
 }
 
-test "threaded server: narrowing live GRANT clears armed override" {
+test "threaded server: legacy GRANT remains inactive and cannot arm override" {
     var server = Server.init(std.testing.allocator, runtimeGrantTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -81821,25 +84994,28 @@ test "threaded server: narrowing live GRANT clears armed override" {
     try recvUntil(&t, " 001 T ", 200);
     try std.testing.expect(std.mem.indexOf(u8, t.written(), " 381 T ") == null);
 
+    a.reset();
     t.reset();
     try writeAllFd(fd_a, "GRANT target netadmin\r\n");
-    try recvUntil(&t, " 381 T ", 300);
-
-    t.reset();
-    try writeAllFd(fd_t, "MODE T +j\r\n");
-    try recvUntil(&t, "MODE T +j", 200);
-
-    t.reset();
-    try writeAllFd(fd_a, "GRANT target ircop client_kill\r\n");
-    try recvUntil(&t, "MODE T -j", 300);
-    try expectContains(t.written(), "cleared override after oper_override privilege was removed");
+    try recvUntil(&a, "stored inactive legacy record for target", 300);
+    try writeAllFd(fd_t, "PING :grant-inactive\r\n");
+    try recvUntil(&t, "PONG", 200);
+    try std.testing.expect(std.mem.indexOf(u8, t.written(), " 381 T ") == null);
 
     t.reset();
     try writeAllFd(fd_t, "MODE T +j\r\n");
     try recvUntil(&t, " 481 T ", 200);
+
+    a.reset();
+    t.reset();
+    try writeAllFd(fd_a, "GRANT target ircop client_kill\r\n");
+    try recvUntil(&a, "stored inactive legacy record for target", 300);
+    try writeAllFd(fd_t, "PING :narrow-inactive\r\n");
+    try recvUntil(&t, "PONG", 200);
+    try std.testing.expect(std.mem.indexOf(u8, t.written(), "MODE T -j") == null);
 }
 
-test "threaded server: local GRANT and REVOKE announce one oper prefix transition using display nick" {
+test "threaded server: legacy GRANT and REVOKE never announce oper prefix transitions" {
     var server = Server.init(std.testing.allocator, runtimeGrantTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -81873,46 +85049,54 @@ test "threaded server: local GRANT and REVOKE announce one oper prefix transitio
     try recvUntil(&target, " 001 DisplayTarget ", 200);
     try recvUntil(&bystander, " 001 Watcher ", 200);
 
+    // Inactive compatibility records are not operator lifecycle transitions.
+    // Subscribe the grantor to that exact OBSERVE action and prove neither
+    // GRANT nor REVOKE manufactures an `oper` event.
+    try writeAllFd(fd_admin, "EVENT OBSERVE * oper\r\n");
+    try recvUntil(&admin, "OBSERVE: end of snapshot", 300);
+
     try writeAllFd(fd_target, "JOIN #grants\r\n");
     try recvUntil(&target, " 366 DisplayTarget #grants ", 200);
     try writeAllFd(fd_bystander, "JOIN #grants\r\n");
     try recvUntil(&bystander, " 366 Watcher #grants ", 200);
 
-    // First grant makes the account an oper without oper_override. It must not
-    // invent the derived `*` prefix.
+    // OCG1 records are retained for compatibility telemetry only. Neither a
+    // grant nor a tombstone can project session authority or derived +Y/-Y.
     admin.reset();
     bystander.reset();
     try writeAllFd(fd_admin, "GRANT target ircop client_kill\r\n");
-    try recvUntil(&admin, "GRANT: target is now an operator", 300);
+    try recvUntil(&admin, "stored inactive legacy record for target", 300);
+    try writeAllFd(fd_admin, "PING :grant-observe-inactive\r\n");
+    try recvUntil(&admin, "PONG", 200);
+    try std.testing.expect(std.mem.indexOf(u8, admin.written(), " OBSERVE oper ") == null);
     try writeAllFd(fd_bystander, "PING :first-grant\r\n");
     try recvUntil(&bystander, "PONG", 200);
     try std.testing.expect(std.mem.indexOf(u8, bystander.written(), "MODE #grants +Y") == null);
 
-    // A second GRANT reconciles an already-oper session and adds override.
-    // Local members see exactly one transition under the display nick, not the
-    // authenticated account name.
     admin.reset();
     bystander.reset();
     try writeAllFd(fd_admin, "GRANT target ircop client_kill,oper_override\r\n");
-    try recvUntil(&admin, "GRANT: target is now an operator", 300);
+    try recvUntil(&admin, "stored inactive legacy record for target", 300);
+    try writeAllFd(fd_admin, "PING :override-observe-inactive\r\n");
+    try recvUntil(&admin, "PONG", 200);
+    try std.testing.expect(std.mem.indexOf(u8, admin.written(), " OBSERVE oper ") == null);
     try writeAllFd(fd_bystander, "PING :override-added\r\n");
     try recvUntil(&bystander, "PONG", 200);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bystander.written(), "MODE #grants +Y DisplayTarget"));
-    try std.testing.expect(std.mem.indexOf(u8, bystander.written(), "+Y target") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bystander.written(), "MODE #grants +Y") == null);
 
-    // REVOKE is the genuine transition out and likewise produces one -Y before
-    // the session loses its oper authority.
     admin.reset();
     bystander.reset();
     try writeAllFd(fd_admin, "REVOKE target\r\n");
-    try recvUntil(&admin, "REVOKE: operator authority removed from target", 300);
+    try recvUntil(&admin, "stored inactive legacy tombstone for target", 300);
+    try writeAllFd(fd_admin, "PING :revoke-observe-inactive\r\n");
+    try recvUntil(&admin, "PONG", 200);
+    try std.testing.expect(std.mem.indexOf(u8, admin.written(), " OBSERVE oper ") == null);
     try writeAllFd(fd_bystander, "PING :override-revoked\r\n");
     try recvUntil(&bystander, "PONG", 200);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bystander.written(), "MODE #grants -Y DisplayTarget"));
-    try std.testing.expect(std.mem.indexOf(u8, bystander.written(), "-Y target") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bystander.written(), "MODE #grants -Y") == null);
 }
 
-test "mesh GRANT resolves display nick once and converges sibling attachments across reactors" {
+test "mesh OCG1 GRANT converges records but never authorizes sessions or prefixes" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     defer current_reactor = null;
     var server = Server.init(std.testing.allocator, .{
@@ -81934,8 +85118,16 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
     primary.session.registration.registered = true;
     const watcher_id = try addTestLocalClient(&server, "Watcher", null);
     const watcher = server.connFor(watcher_id).?;
+    const alternate_id = try addTestLocalClient(&server, "DisplayTablet", "target");
+    const alternate = server.connFor(alternate_id).?;
+    alternate.session.registration.registered = true;
     try server.world.restoreMember("#mesh-grant", worldIdFromClient(primary_id), world_model.MemberModes.empty());
-    try server.world.restoreMember("#mesh-grant", worldIdFromClient(watcher_id), world_model.MemberModes.empty());
+    try server.world.restoreMember(
+        "#mesh-grant",
+        worldIdFromClient(watcher_id),
+        world_model.MemberModes.fromModes(&.{.founder}),
+    );
+    try server.world.restoreMember("#mesh-grant", worldIdFromClient(alternate_id), world_model.MemberModes.empty());
 
     // A second physical attachment for the same account/session lives on the
     // sibling reactor. It intentionally does not claim a second World nick row;
@@ -81954,7 +85146,7 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
     var wire_buf: [oper_cred_share.max_grant_len]u8 = undefined;
     const override_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits();
     const add_len = try oper_cred_share.sign(signer, .{
-        .account = "target",
+        .account = "DisplayTarget",
         .privilege_bits = override_bits,
         .class = "netadmin",
         .title = "",
@@ -81964,17 +85156,49 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
         .expiry_ms = now + Server.oper_grant_ttl_ms,
     }, &wire_buf);
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..add_len], signer.public_key.toBytes()));
-    try std.testing.expect(primary.session.isOper());
-    try std.testing.expect(sibling.session.isOper());
-    try std.testing.expect(primary.session.hasPriv(.oper_override));
-    try std.testing.expect(sibling.session.hasPriv(.oper_override));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y DisplayTarget"));
-    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "+Y target") == null);
+    try std.testing.expect(!primary.session.isOper());
+    try std.testing.expect(!sibling.session.isOper());
+    try std.testing.expect(!alternate.session.isOper());
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y") == null);
+    try std.testing.expect(!server.isOverrideOper("DisplayTarget"));
+    const stored_add = server.oper_grants.lookup("DisplayTarget", now) orelse return error.TestExpectedGrant;
+    try std.testing.expectEqual(override_bits, stored_add.privilege_bits);
+
+    // A grant that arrives BEFORE a remote JOIN likewise remains telemetry.
+    // This catches the old later-JOIN path that consulted isOverrideOper and
+    // manufactured a synthetic +Y after the ordinary JOIN.
+    const remote_add_len = try oper_cred_share.sign(signer, .{
+        .account = "RemoteLegacy",
+        .privilege_bits = override_bits,
+        .class = "netadmin",
+        .title = "",
+        .issuer_node = "grant-origin.test",
+        .incarnation = 1,
+        .issued_ms = now,
+        .expiry_ms = now + Server.oper_grant_ttl_ms,
+    }, &wire_buf);
+    try std.testing.expect(server.applyMeshGrant(wire_buf[0..remote_add_len], signer.public_key.toBytes()));
+    resetTestSendQ(watcher);
+    const remote_join = .{
+        .channel = "#mesh-grant",
+        .nick = "RemoteLegacy",
+        .username = "remote",
+        .realname = "Remote Legacy",
+        .host = "remote.example",
+        .setter = "",
+        .account = "RemoteLegacy",
+        .kind = s2s_peer_mod.S2sPeer.MembershipDelta.Kind.joined,
+        .status = @as(u4, 0),
+        .prev_status = @as(u4, 0),
+    };
+    server.emitRemoteMembership(&remote_join, "origin.example");
+    try expectContains(watcher.send_buf[0..watcher.send_len], "RemoteLegacy!remote@remote.example JOIN :#mesh-grant");
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y RemoteLegacy") == null);
 
     // A higher-incarnation refresh with unchanged privileges is silent.
     resetTestSendQ(watcher);
     const refresh_len = try oper_cred_share.sign(signer, .{
-        .account = "target",
+        .account = "DisplayTarget",
         .privilege_bits = override_bits,
         .class = "netadmin",
         .title = "",
@@ -81986,12 +85210,11 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..refresh_len], signer.public_key.toBytes()));
     try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "+Y") == null);
 
-    // A nonzero narrowing grant removes only oper_override. Both attachments
-    // remain operators, retain client_kill, and their one shared display nick
-    // gets exactly one -Y transition.
+    // A higher-incarnation legacy record still converges without changing any
+    // live session projection.
     const kill_bits = oper_mod.OperPrivileges.initMany(&.{.client_kill}).toBits();
     const narrow_len = try oper_cred_share.sign(signer, .{
-        .account = "target",
+        .account = "DisplayTarget",
         .privilege_bits = kill_bits,
         .class = "ircop",
         .title = "",
@@ -82001,14 +85224,12 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
         .expiry_ms = now + Server.oper_grant_ttl_ms,
     }, &wire_buf);
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..narrow_len], signer.public_key.toBytes()));
-    try std.testing.expect(primary.session.isOper());
-    try std.testing.expect(sibling.session.isOper());
-    try std.testing.expect(primary.session.hasPriv(.client_kill));
-    try std.testing.expect(sibling.session.hasPriv(.client_kill));
-    try std.testing.expect(!primary.session.hasPriv(.oper_override));
-    try std.testing.expect(!sibling.session.hasPriv(.oper_override));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant -Y DisplayTarget"));
-    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "-Y target") == null);
+    try std.testing.expect(!primary.session.isOper());
+    try std.testing.expect(!sibling.session.isOper());
+    try std.testing.expect(!alternate.session.isOper());
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant -Y") == null);
+    const stored_narrow = server.oper_grants.lookup("DisplayTarget", now) orelse return error.TestExpectedGrant;
+    try std.testing.expectEqual(kill_bits, stored_narrow.privilege_bits);
 
     // Begin a new dedup horizon before the independent re-add/revoke scenario;
     // the test is about grant transition ownership, not waiting two wall seconds.
@@ -82016,7 +85237,7 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
     resetTestSendQ(watcher);
     const restored_bits = oper_mod.OperPrivileges.initMany(&.{ .client_kill, .oper_override }).toBits();
     const restore_len = try oper_cred_share.sign(signer, .{
-        .account = "target",
+        .account = "DisplayTarget",
         .privilege_bits = restored_bits,
         .class = "netadmin",
         .title = "",
@@ -82026,17 +85247,35 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
         .expiry_ms = now + Server.oper_grant_ttl_ms,
     }, &wire_buf);
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..restore_len], signer.public_key.toBytes()));
-    try std.testing.expect(primary.session.hasPriv(.client_kill));
-    try std.testing.expect(sibling.session.hasPriv(.client_kill));
-    try std.testing.expect(primary.session.hasPriv(.oper_override));
-    try std.testing.expect(sibling.session.hasPriv(.oper_override));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y DisplayTarget"));
+    try std.testing.expect(!primary.session.isOper());
+    try std.testing.expect(!sibling.session.isOper());
+    try std.testing.expect(!alternate.session.isOper());
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y") == null);
 
-    // The tombstone de-elevates both physical attachments and emits one -Y for
-    // their shared display identity.
+    // A preloaded active-looking OCG1 record cannot affect later snapshots,
+    // WHOIS, reserved DATA admission, or KICK immunity.
+    resetTestSendQ(watcher);
+    try server.sendNames(watcher, "#mesh-grant");
+    try expectContains(watcher.send_buf[0..watcher.send_len], "DisplayTarget");
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "*DisplayTarget") == null);
+    resetTestSendQ(watcher);
+    var whois_line = try irc_line.parseLine("WHOIS DisplayTarget");
+    try server.handleWhois(watcher, &whois_line);
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], " 313 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "*#mesh-grant") == null);
+    try std.testing.expect(!server.remoteDataTagAuthorized("SYS.notice", false, null, "DisplayTarget"));
+    try std.testing.expect(!server.remoteDataTagAuthorized("HST.state", false, null, "DisplayTarget"));
+    resetTestSendQ(watcher);
+    var kick_line = try irc_line.parseLine("KICK #mesh-grant DisplayTarget :legacy telemetry is not immunity");
+    try server.handleKick(watcher_id, watcher, &kick_line);
+    try std.testing.expect(!server.world.isMember("#mesh-grant", worldIdFromClient(primary_id)));
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "Cannot kick a network operator") == null);
+
+    // The tombstone supersedes the stored record but likewise has no live
+    // session or prefix side effect.
     resetTestSendQ(watcher);
     const revoke_len = try oper_cred_share.sign(signer, .{
-        .account = "target",
+        .account = "DisplayTarget",
         .privilege_bits = 0,
         .class = "revoked",
         .title = "",
@@ -82048,8 +85287,61 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..revoke_len], signer.public_key.toBytes()));
     try std.testing.expect(!primary.session.isOper());
     try std.testing.expect(!sibling.session.isOper());
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant -Y DisplayTarget"));
-    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "-Y target") == null);
+    try std.testing.expect(!alternate.session.isOper());
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant -Y") == null);
+    const stored_tombstone = server.oper_grants.lookup("DisplayTarget", now) orelse return error.TestExpectedGrant;
+    try std.testing.expectEqual(@as(u64, 0), stored_tombstone.privilege_bits);
+}
+
+test "remote WHOIS never projects an inactive OCG1 operator record" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const now = server.grantNowU64();
+    _ = server.oper_grants.upsert(.{
+        .account = "RemoteLegacy",
+        .privilege_bits = oper_mod.OperPrivileges.full.toBits(),
+        .class = "netadmin",
+        .title = "Legacy Network Administrator",
+        .issuer_node = "legacy-origin.test",
+        .incarnation = 1,
+        .issued_ms = now,
+        .expiry_ms = now + Server.oper_grant_ttl_ms,
+    });
+
+    const watcher_id = try addTestLocalClient(&server, "Watcher", null);
+    const watcher = server.connFor(watcher_id) orelse return error.TestUnexpectedResult;
+    watcher.session.registration.registered = true;
+    var storage: [default_reply_bytes * 2]u8 = undefined;
+    var lines_buf: [40]whois.WhoisLine = undefined;
+    var sink = whois.WhoisLineSink{ .lines = &lines_buf, .storage = &storage };
+    try server.sendRemoteWhois(watcher, &sink, .{
+        .nick = "RemoteLegacy",
+        .username = "remote",
+        .realname = "Remote Legacy",
+        .host = "remote.users.test",
+        .server = "remote.test",
+        .server_info = "Remote test server",
+        .account = "RemoteLegacy",
+        .real_host = "",
+        .certfp = "",
+    });
+
+    const reply = watcher.send_buf[0..watcher.send_len];
+    try expectContains(reply, " 311 Watcher RemoteLegacy remote remote.users.test ");
+    try expectContains(reply, " 318 Watcher RemoteLegacy ");
+    try std.testing.expect(std.mem.indexOf(u8, reply, " 313 Watcher RemoteLegacy ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "is an IRC operator") == null);
 }
 
 test "threaded server: IRCX EVENT subscription numerics" {
@@ -85455,6 +88747,101 @@ test "failed inherited client adoption does not advance HLC or queue carried out
     try std.testing.expectEqual(msg_seq_before, server.msg_seq);
     try std.testing.expectEqual(sqes_before, server.reactors[0].ring.inner.sq_ready());
     try std.testing.expectEqual(@as(usize, 0), server.reactors[0].clients.len());
+}
+
+test "current Helix adoption rederives only configured-local operator authority" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var cfg = operTestConfig(0);
+    cfg.oper_auto_override = true;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var admin_sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &admin_sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    var admin_fd_unconsumed = true;
+    defer if (admin_fd_unconsumed) closeFd(admin_sockets[0]);
+    defer closeFd(admin_sockets[1]);
+
+    // The carried grant block is deliberately forged and must be ignored. The
+    // matching authenticated account is re-projected exclusively from the live,
+    // sealed configured-local binding on the successor.
+    try std.testing.expect(server.adoptInheritedClient(.{
+        .fd = admin_sockets[0],
+        .nick = "HelixAdmin",
+        .realname = "Helix Admin",
+        .account = "admin",
+        .logged_in = true,
+        .is_oper = true,
+        .oper_priv_bits = oper_mod.OperPrivileges.initMany(&.{.client_kill}).toBits(),
+        .oper_class = "forged",
+        .oper_title = "Forged title",
+    }, null, null, true));
+    admin_fd_unconsumed = false;
+
+    const admin_wid = server.world.findNick("HelixAdmin") orelse return error.TestUnexpectedResult;
+    const admin = server.connFor(clientIdFromWorld(admin_wid)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(admin.session.isOper());
+    try std.testing.expectEqual(
+        oper_session_provenance.Source.configured_local,
+        std.meta.activeTag(admin.session.operProvenance()),
+    );
+    try std.testing.expectEqual(oper_mod.OperPrivileges.full.toBits(), admin.session.oper_priv.toBits());
+    try std.testing.expectEqualStrings("netadmin", admin.session.operClass());
+    try std.testing.expectEqualStrings("", admin.session.operTitle());
+    try std.testing.expect(admin.session.hasUmode(.override));
+    try std.testing.expect(server.isOverrideOper("HelixAdmin"));
+
+    var plain_sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &plain_sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    var plain_fd_unconsumed = true;
+    defer if (plain_fd_unconsumed) closeFd(plain_sockets[0]);
+    defer closeFd(plain_sockets[1]);
+
+    // A nonconfigured account remains non-oper even when every historical carry
+    // field falsely claims full authority.
+    try std.testing.expect(server.adoptInheritedClient(.{
+        .fd = plain_sockets[0],
+        .nick = "HelixPlain",
+        .realname = "Helix Plain",
+        .account = "plain",
+        .logged_in = true,
+        .is_oper = true,
+        .oper_priv_bits = oper_mod.OperPrivileges.full.toBits(),
+        .oper_class = "netadmin",
+        .oper_title = "Forged administrator",
+    }, null, null, true));
+    plain_fd_unconsumed = false;
+
+    const plain_wid = server.world.findNick("HelixPlain") orelse return error.TestUnexpectedResult;
+    const plain = server.connFor(clientIdFromWorld(plain_wid)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!plain.session.isOper());
+    try std.testing.expectEqual(
+        oper_session_provenance.Source.none,
+        std.meta.activeTag(plain.session.operProvenance()),
+    );
+    try std.testing.expectEqual(@as(u64, 0), plain.session.oper_priv.toBits());
+    try std.testing.expectEqualStrings("", plain.session.operClass());
+    try std.testing.expectEqualStrings("", plain.session.operTitle());
+    try std.testing.expect(!plain.session.hasUmode(.override));
+    try std.testing.expect(!server.isOverrideOper("HelixPlain"));
+
+    const watcher_id = try addTestLocalClient(&server, "HelixWatcher", null);
+    const watcher = server.connFor(watcher_id) orelse return error.TestUnexpectedResult;
+    watcher.session.registration.registered = true;
+    try server.world.restoreMember("#helix-oper", admin_wid, world_model.MemberModes.empty());
+    try server.world.restoreMember("#helix-oper", plain_wid, world_model.MemberModes.empty());
+    try server.world.restoreMember("#helix-oper", worldIdFromClient(watcher_id), world_model.MemberModes.empty());
+    try server.sendNames(watcher, "#helix-oper");
+    try expectContains(watcher.send_buf[0..watcher.send_len], "*HelixAdmin");
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "*HelixPlain") == null);
 }
 
 test "current Helix adoption resumes a fragmented binary WebSocket message" {
@@ -89038,7 +92425,7 @@ test "UPGRADE resume arena restores the multi-session registry (re-track + snaps
     try std.testing.expect(tok_c_ghost != attached_client.?);
 }
 
-test "UPGRADE resume: malformed .sessions capsule is startup-fatal" {
+test "DPROP1 UPGRADE late malformed sessions failure preserves causal triplet and MeshClock" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
@@ -89110,7 +92497,26 @@ test "UPGRADE resume: malformed .sessions capsule is startup-fatal" {
     if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
     const arena_dup: linux.fd_t = @intCast(dup_rc);
 
-    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-late-rollback.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc7)), "dprop-late-rollback.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(alloc, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -89127,6 +92533,16 @@ test "UPGRADE resume: malformed .sessions capsule is startup-fatal" {
     try std.testing.expect(try server.silence.add("OldOwner", "bad!*@example.test"));
     _ = try server.world.markRegistered("#old-world", true);
     try seedUpgradeAtomicPublicationSentinels(&server);
+    try commitDurableDeviceFactForBootTest(&state, &identity, 53);
+    const property_before = try prop_checkpoint.encode(
+        alloc,
+        &server.props,
+        &server.channel_prop_clocks,
+        &server.entity_prop_clocks,
+    );
+    defer alloc.free(property_before);
+    const mesh_clock_before = server.mesh_clock;
+    const migration_epoch_before = server.migration_offer_epoch;
     const old_generation = server.session_replica_store_generation;
     const old_ticket_key = server.tls_ticket_key;
     const old_previous_ticket_key = server.tls_previous_ticket_key;
@@ -89152,6 +92568,16 @@ test "UPGRADE resume: malformed .sessions capsule is startup-fatal" {
     try std.testing.expectEqual(old_ticket_key, server.tls_ticket_key);
     try std.testing.expectEqual(old_previous_ticket_key, server.tls_previous_ticket_key);
     try std.testing.expectEqual(old_msg_seq, server.msg_seq);
+    const property_after = try prop_checkpoint.encode(
+        alloc,
+        &server.props,
+        &server.channel_prop_clocks,
+        &server.entity_prop_clocks,
+    );
+    defer alloc.free(property_after);
+    try std.testing.expectEqualSlices(u8, property_before, property_after);
+    try std.testing.expectEqual(mesh_clock_before, server.mesh_clock);
+    try std.testing.expectEqual(migration_epoch_before, server.migration_offer_epoch);
     try std.testing.expectEqual(@as(usize, 0), server.reactors[0].clients.len());
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(inherited_pair[0], posix.F.GETFD, 0)));
     try expectUpgradeAtomicPublicationSentinels(&server, old_generation);

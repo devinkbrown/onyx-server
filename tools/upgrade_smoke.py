@@ -17,18 +17,19 @@ Usage: python3 tools/upgrade_smoke.py [path-to-onyx-binary]
 Exit code 0 = PASS.
 """
 import base64
+from dataclasses import dataclass
 import os
+from pathlib import Path
 import re
 import resource
+import shutil
 import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 
-PORT = 16720
-TLS_PORT = 16721
-WS_PORT = 16722
 HOST = "127.0.0.1"
 # Reactor shards for the daemon under test: >1 so the smoke proves the
 # multi-shard UPGRADE (all-shard seal + adopt), the topology eshmaki runs.
@@ -42,9 +43,84 @@ BOUNCE_ACCT = "bounce"
 BOUNCE_PASSWORD = "secretpass1"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "zig-out", "bin", "onyx")
-DB = "/tmp/mz_upgrade_accts.db"
-CONF = "/tmp/mz_upgrade.toml"
-LOG = "/tmp/mz_upgrade.log"
+
+
+@dataclass
+class SmokeRun:
+    """Private filesystem and listener reservations for one smoke invocation."""
+
+    directory: Path
+    scratch_parent: Path
+    config: Path
+    database: Path
+    log: Path
+    ports: tuple[int, int, int]
+    reservations: list[socket.socket]
+    process: subprocess.Popen | None = None
+
+    def release_ports(self) -> None:
+        while self.reservations:
+            self.reservations.pop().close()
+
+
+RUN: SmokeRun | None = None
+
+
+def make_private_run(root: Path) -> SmokeRun:
+    """Create a 0700 repo-local run directory and reserve three loopback ports.
+
+    The reservations remain bound until the child is about to exec.  This avoids
+    the usual bind-to-zero/close/use race between concurrent smoke invocations.
+    """
+    parent = root / ".upgrade-smoke"
+    parent.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(parent, 0o700)
+    directory = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+    os.chmod(directory, 0o700)
+    reservations: list[socket.socket] = []
+    try:
+        for _ in range(3):
+            reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            reservation.bind((HOST, 0))
+            reservations.append(reservation)
+        return SmokeRun(
+            directory=directory,
+            scratch_parent=parent,
+            config=directory / "onyx.toml",
+            database=directory / "accounts.db",
+            log=directory / "daemon.log",
+            ports=tuple(reservation.getsockname()[1] for reservation in reservations),
+            reservations=reservations,
+        )
+    except BaseException:
+        for reservation in reservations:
+            reservation.close()
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
+def write_private_text(path: Path, content: str) -> None:
+    """Write generated credentials/config with permissions independent of umask."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as file:
+        file.write(content)
+
+
+def open_private_log(path: Path):
+    """Create the daemon log owner-only even when the parent has a loose umask."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "w")
+
+
+def remove_private_run(run: SmokeRun) -> None:
+    """Remove only the per-invocation directory created by :func:`make_private_run`."""
+    parent = run.scratch_parent.resolve()
+    directory = run.directory.resolve()
+    if directory.parent != parent or not directory.name.startswith("run-"):
+        raise RuntimeError(f"refusing to remove non-smoke path: {run.directory}")
+    shutil.rmtree(directory)
 
 
 def recv_until(sock, needle, timeout=4.0):
@@ -65,7 +141,8 @@ def recv_until(sock, needle, timeout=4.0):
 
 
 def connect():
-    return socket.create_connection((HOST, PORT), timeout=4)
+    assert RUN is not None
+    return socket.create_connection((HOST, RUN.ports[0]), timeout=4)
 
 
 def tls_connect(port):
@@ -141,58 +218,110 @@ def ws_connect(port):
     return s
 
 
+class SmokeFailure(RuntimeError):
+    pass
+
+
 def fail(msg, proc=None):
-    print(f"FAIL: {msg}")
+    del proc
+    raise SmokeFailure(msg)
+
+
+def cleanup(_proc=None) -> None:
+    """Idempotently stop and remove the one globally-owned smoke invocation."""
+    global RUN
+    run, RUN = RUN, None
+    if run is None:
+        return
     try:
-        with open(LOG) as f:
-            print("--- daemon log ---")
-            print(f.read())
-    except OSError:
-        pass
-    cleanup(proc)
-    sys.exit(1)
-
-
-def cleanup(proc):
-    if proc and proc.poll() is None:
-        proc.terminate()
+        proc = run.process
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                finally:
+                    # A successful kill must always be reaped before the run
+                    # directory disappears; this avoids leaving a zombie child.
+                    proc.wait()
+    except OSError as error:
+        print(f"WARN: could not stop smoke daemon: {error}", file=sys.stderr)
+    finally:
+        run.release_ports()
         try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    for p in (CONF, LOG, DB, DB + ".wal"):
-        try:
-            os.remove(p)
-        except OSError:
+            remove_private_run(run)
+        except FileNotFoundError:
             pass
+        except OSError as error:
+            print(f"WARN: smoke artifacts retained at {run.directory}: {error}", file=sys.stderr)
 
 
-def main():
+_GATED_EXEC = (
+    "import os, sys\n"
+    "gate = int(sys.argv[1])\n"
+    "if os.read(gate, 1) != b'1': sys.exit(125)\n"
+    "os.close(gate)\n"
+    "argv = sys.argv[2:]\n"
+    "os.execv(argv[0], argv)\n"
+)
+
+
+def launch_gated(run: SmokeRun, argv: list[str], log_file, preexec_fn) -> subprocess.Popen:
+    """Exec ``argv`` only after this parent releases its port reservations."""
+    gate_read, gate_write = os.pipe()
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _GATED_EXEC, str(gate_read), *argv],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            preexec_fn=preexec_fn,
+            pass_fds=(gate_read,),
+        )
+        # The run owns the wrapper immediately.  From here, an interrupt in
+        # any descriptor/gate operation is safe for the outer cleanup boundary.
+        run.process = proc
+        os.close(gate_read)
+        gate_read = -1
+        run.release_ports()
+        os.write(gate_write, b"1")
+        return proc
+    finally:
+        if gate_read >= 0:
+            os.close(gate_read)
+        os.close(gate_write)
+
+
+def _run_smoke():
+    global RUN
     if not os.path.exists(BIN):
-        fail(f"binary not found: {BIN} (run `zig build` first)")
-    for p in (DB, DB + ".wal"):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
-    with open(CONF, "w") as f:
-        f.write(
+        print(f"FAIL: binary not found: {BIN} (run `zig build` first)")
+        return 1
+    RUN = make_private_run(Path(ROOT))
+    port, tls_port, ws_port = RUN.ports
+    db = RUN.database
+    config = RUN.config
+    log = RUN.log
+    write_private_text(
+        config,
+        (
             "[node]\nid = 1\n"
             # Multi-shard topology: the UPGRADE must seal + adopt clients on
             # EVERY reactor shard (H1 regression: shards 1..N-1 used to be
             # refused/dropped), so the smoke runs the sharded model.
             f"[limits]\nnum_shards = {NUM_SHARDS}\n"
-            f"[listen]\nirc = {PORT}\nws = {WS_PORT}\n"
-            f"[tls]\nenabled = true\nport = {TLS_PORT}\n"
-            f"[sasl]\naccount_db = \"{DB}\"\n"
+            f"[listen]\nirc = {port}\nws = {ws_port}\n"
+            f"[tls]\nenabled = true\nport = {tls_port}\n"
+            f"[sasl]\naccount_db = \"{db}\"\n"
             # An oper class must name a defined [[oper_groups]] group, or the
             # binding is skipped at boot ("unknown or empty class") and the 381
             # elevation never happens. UPGRADE requires the server_restart priv.
             "[[oper_groups]]\nname = \"netadmin\"\n"
             "privileges = [\"server_restart\", \"server_rehash\", \"server_admin\", \"mesh_admin\"]\n"
             f"[[opers]]\naccount = \"{ACCT}\"\nclass = \"netadmin\"\n"
-        )
-
+        ),
+    )
     def raise_stack_limit():
         # PRE-EXISTING (also at 746eff0): a Debug build with `[tls] enabled`
         # overflows the default 8 MiB stack inside LinuxServer.init and
@@ -204,13 +333,15 @@ def main():
         _, hard = resource.getrlimit(resource.RLIMIT_STACK)
         cap = want if hard == resource.RLIM_INFINITY else min(want, hard)
         resource.setrlimit(resource.RLIMIT_STACK, (cap, hard))
+        # The daemon creates the account DB and possible WAL after exec.  Do not
+        # let the caller's umask expose generated account material.
+        os.umask(0o077)
 
-    proc = subprocess.Popen(
-        [BIN, CONF],
-        stdout=open(LOG, "w"),
-        stderr=subprocess.STDOUT,
-        preexec_fn=raise_stack_limit,
-    )
+    try:
+        with open_private_log(log) as log_file:
+            proc = launch_gated(RUN, [BIN, str(config)], log_file, raise_stack_limit)
+    except BaseException:
+        raise
     time.sleep(2.5)
     if proc.poll() is not None:
         fail("daemon exited during boot", proc)
@@ -292,7 +423,7 @@ def main():
 
     # Conn T: a TLS client kept OPEN across the UPGRADE — its live TLS engine
     # state must ride the .tls_session capsule and resume on the successor.
-    t = tls_connect(TLS_PORT)
+    t = tls_connect(tls_port)
     t.sendall(b"NICK tlssurv\r\nUSER tlssurv 0 * :tlssurv\r\n")
     if " 001 " not in recv_until(t, b" 001 "):
         fail("conn T (TLS) did not register before UPGRADE", proc)
@@ -302,7 +433,7 @@ def main():
     # deliberately left MID-FRAME: half a masked PING frame is sent before the
     # swap, the rest after. The v2 .ws_session capsule must carry the partial
     # deframer bytes so the reassembled frame still executes on the successor.
-    w = ws_connect(WS_PORT)
+    w = ws_connect(ws_port)
     w.sendall(ws_frame(b"NICK wssurv"))
     w.sendall(ws_frame(b"USER wssurv 0 * :wssurv"))
     if " 001 " not in ws_recv_text(w, b" 001 "):
@@ -344,7 +475,7 @@ def main():
         fail("PID changed — execve should keep the same PID", proc)
     print(f"PASS: daemon survived UPGRADE (same PID {proc.pid})")
 
-    with open(LOG) as f:
+    with log.open() as f:
         log = f.read()
     if "adopting inherited listener fd" not in log:
         fail("successor did not adopt the inherited listener", proc)
@@ -509,9 +640,30 @@ def main():
     c.close()
     print("PASS: port stayed bound and serves IRC after UPGRADE")
 
-    cleanup(proc)
     print("\nALL CHECKS PASSED")
     return 0
+
+
+def main():
+    try:
+        return _run_smoke()
+    except SmokeFailure as error:
+        print(f"FAIL: {error}")
+        if RUN is not None:
+            try:
+                print("--- daemon log ---")
+                print(RUN.log.read_text())
+            except OSError:
+                pass
+        return 1
+    except KeyboardInterrupt:
+        print("FAIL: interrupted", file=sys.stderr)
+        return 130
+    except BaseException as error:
+        print(f"FAIL: unexpected smoke error: {error}", file=sys.stderr)
+        return 1
+    finally:
+        cleanup()
 
 
 if __name__ == "__main__":

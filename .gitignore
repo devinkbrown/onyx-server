@@ -19,3 +19,9 @@ dist/
 # Claude Code personal (uncommitted) settings
 .claude/settings.local.json
 .bogo/
+.work/
+.agent-work/
+.release/
+.upgrade-smoke/
+.zig-cache-*/
+.zig-global-cache*/

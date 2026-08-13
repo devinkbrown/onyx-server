@@ -19,6 +19,10 @@ const protocol_inventory = @import("../proto/protocol_inventory.zig");
 const sts_policy = @import("../proto/sts_policy.zig");
 const event_spine = @import("event_spine.zig");
 const oper = @import("oper.zig");
+const oper_session_provenance = @import("oper_session_provenance.zig");
+const oper_cred_share = @import("../proto/oper_cred_share.zig");
+const node_identity = @import("node_identity.zig");
+const node_short_id = @import("../crypto/node_short_id.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const labeled_response = @import("../proto/labeled_response.zig");
 const msgid = @import("../proto/msgid.zig");
@@ -41,7 +45,7 @@ const MAX_UID_BYTES: usize = 16;
 const MAX_REALNAME_BYTES: usize = 256;
 const MAX_ACCOUNT_BYTES: usize = 64;
 const MAX_CLASS_BYTES: usize = 32;
-const MAX_OPER_TITLE_BYTES: usize = 64;
+const MAX_OPER_TITLE_BYTES: usize = oper_session_provenance.max_title_len;
 const MAX_AWAY_BYTES: usize = 256;
 const MAX_HOST_BYTES: usize = 255;
 /// Per-category Event Spine subject-mask byte budget. A subscriber may scope an
@@ -902,6 +906,9 @@ pub const ClientSession = struct {
     oper_class_store: FixedString(MAX_CLASS_BYTES) = .{},
     /// Optional custom operator title (e.g. "Network Guardian"), shown in WHOIS.
     oper_title_store: FixedString(MAX_OPER_TITLE_BYTES) = .{},
+    /// Source of the current operator projection. This is never serialized as
+    /// session authority; Helix successors must recompute it from live policy.
+    oper_provenance: oper_session_provenance.Provenance = .none,
     /// Quarantined by a Warden `quarantine` action: the client stays connected
     /// but may not JOIN channels or send PRIVMSG/NOTICE (network silence / SHUN).
     restricted: bool = false,
@@ -973,6 +980,13 @@ pub const ClientSession = struct {
         return self.is_oper;
     }
 
+    /// Current operator authority source. A value of `.none` is the only
+    /// non-authoritative state and is restored by every account lifecycle
+    /// transition that clears operator status.
+    pub fn operProvenance(self: *const ClientSession) oper_session_provenance.Provenance {
+        return self.oper_provenance;
+    }
+
     /// Whether this operator holds a specific privilege. Non-opers never do.
     pub fn hasPriv(self: *const ClientSession, privilege: oper.Privilege) bool {
         return self.is_oper and self.oper_priv.has(privilege);
@@ -993,12 +1007,18 @@ pub const ClientSession = struct {
         return self.oper_title_store.slice();
     }
 
-    /// Record the operator grant captured at elevation.
-    pub fn setOperGrant(self: *ClientSession, privileges: oper.OperPrivileges, class_name: []const u8, title: []const u8) void {
+    fn setOperProjection(
+        self: *ClientSession,
+        privileges: oper.OperPrivileges,
+        class_name: []const u8,
+        title: []const u8,
+        provenance: oper_session_provenance.Provenance,
+    ) void {
         self.is_oper = true;
         self.oper_priv = privileges;
         self.oper_class_store.set(class_name[0..@min(class_name.len, MAX_CLASS_BYTES)]) catch {};
         self.oper_title_store.set(title[0..@min(title.len, MAX_OPER_TITLE_BYTES)]) catch {};
+        self.oper_provenance = provenance;
         // Network administrators carry the server-managed +a umode automatically:
         // the server_admin privilege is what `isAdmin()` keys on, so the visible
         // mode tracks it (set on elevation, cleared on logout below).
@@ -1009,6 +1029,56 @@ pub const ClientSession = struct {
         }
     }
 
+    fn applyProjectionVisitor(
+        ctx: *anyopaque,
+        data: oper_session_provenance.ProjectionData,
+    ) void {
+        const self: *ClientSession = @ptrCast(@alignCast(ctx));
+        const authenticated_account = self.account() orelse {
+            self.clearOper();
+            return;
+        };
+        if (!std.mem.eql(u8, authenticated_account, data.account())) {
+            self.clearOper();
+            return;
+        }
+        self.setOperProjection(data.privileges, data.className(), data.titleText(), data.provenance);
+    }
+
+    fn clearProjectionVisitor(ctx: *anyopaque, _: oper_session_provenance.ClearReason) void {
+        const self: *ClientSession = @ptrCast(@alignCast(ctx));
+        self.clearOper();
+    }
+
+    fn unavailableProjectionVisitor(ctx: *anyopaque) void {
+        const self: *ClientSession = @ptrCast(@alignCast(ctx));
+        self.clearOper();
+    }
+
+    /// Reconcile and apply authority through a synchronous visitor. No
+    /// replacement/projection value escapes this call, and the callback
+    /// re-verifies the exact signed OCG2 bytes/current registry before touching
+    /// session state.
+    pub fn reconcileOperAuthority(
+        self: *ClientSession,
+        configured_binding: ?oper_session_provenance.ConfiguredLocalBinding,
+        durable: oper_session_provenance.DurableOperLookup,
+        now_ms: u64,
+    ) oper_session_provenance.ReconcileOutcome {
+        return oper_session_provenance.reconcile(.{
+            .current = self.oper_provenance,
+            .authenticated_account = self.account(),
+            .configured_binding = configured_binding,
+            .durable = durable,
+            .now_ms = now_ms,
+        }, .{
+            .context = self,
+            .apply = applyProjectionVisitor,
+            .clear = clearProjectionVisitor,
+            .unavailable = unavailableProjectionVisitor,
+        });
+    }
+
     /// Drop operator status. Because oper is SASL-account-derived, ending the
     /// account login that granted it must also revoke +o, the privilege set,
     /// class/title, and the oper-notice event subscriptions.
@@ -1017,6 +1087,7 @@ pub const ClientSession = struct {
         self.oper_priv = .{};
         self.oper_class_store = .{};
         self.oper_title_store = .{};
+        self.oper_provenance = .none;
         self.event_mask = .{};
         self.clearEventSubjectMasks();
         self.clearIrcxEventSubscriptions();
@@ -1183,6 +1254,10 @@ pub const ClientSession = struct {
     /// Mark the session logged in as `account` (callers should pass the canonical
     /// lowercased form). Truncates to the account-name capacity.
     pub fn loginAs(self: *ClientSession, account_name: []const u8) void {
+        // An account switch or re-authentication cannot carry authority from
+        // the previous identity. Reconciliation may apply a fresh grant after
+        // this transition returns.
+        self.clearOper();
         self.account_store.set(account_name) catch {
             // Over-capacity: store the prefix that fits rather than failing login.
             self.account_store.set(account_name[0..@min(account_name.len, MAX_ACCOUNT_BYTES)]) catch return;
@@ -1198,6 +1273,7 @@ pub const ClientSession = struct {
     /// Record a non-privileged guest identity for SASL ANONYMOUS. This completes
     /// the SASL exchange but deliberately leaves account() null and +r unset.
     pub fn loginGuest(self: *ClientSession, guest_name: []const u8) void {
+        self.clearOper();
         self.account_store.set(guest_name) catch {
             self.account_store.set(guest_name[0..@min(guest_name.len, MAX_ACCOUNT_BYTES)]) catch return;
         };
@@ -1205,10 +1281,10 @@ pub const ClientSession = struct {
         self.sasl_guest = true;
         self.sasl_oper_elevation_allowed = false;
         self.umodes.remove(.registered);
-        self.clearOper();
     }
 
     pub fn logout(self: *ClientSession) void {
+        self.clearOper();
         self.logged_in = false;
         self.sasl_guest = false;
         self.sasl_oper_elevation_allowed = false;
@@ -1238,8 +1314,9 @@ pub const ClientSession = struct {
             .logged_in = self.logged_in,
             .away_active = self.away_active,
             .is_oper = self.is_oper,
-            // Carry the full oper grant so the successor restores privileges +
-            // the derived +a admin umode, not just the bare is_oper bool.
+            // Keep decoding/encoding the historical oper grant block for rolling
+            // compatibility. The successor treats it as profile history only and
+            // clears it until live authority reconciliation succeeds.
             .oper_priv_bits = self.oper_priv.toBits(),
             .oper_class = self.operClass(),
             .oper_title = self.operTitle(),
@@ -1254,10 +1331,9 @@ pub const ClientSession = struct {
     /// restored session is registered by definition — only registered clients are
     /// snapshotted. Best-effort: a field that fails validation is left empty.
     pub fn restore(self: *ClientSession, snap: session_snapshot.Snapshot) void {
-        // Restore the carried user-mode bitset FIRST, then let the derivations
-        // below (loginAs/logout → +r, setOperGrant → +a) re-assert the
-        // server-managed bits on top. A pre-v4 snapshot carries 0 — exactly
-        // the historical start-empty behavior (client-set modes were reset).
+        // Restore the carried user-mode bitset FIRST, then let loginAs/logout
+        // re-assert +r. A pre-v4 snapshot carries 0 — exactly the historical
+        // start-empty behavior (client-set modes were reset).
         self.umodes = .{ .bits = snap.umode_bits };
         self.client.identity.nick.set(snap.nick) catch {
             self.client.identity.nick.len = 0;
@@ -1279,22 +1355,16 @@ pub const ClientSession = struct {
         };
         if (snap.logged_in and snap.account.len > 0) self.loginAs(snap.account) else self.logout();
         if (snap.away_active) self.setAway(snap.away) else self.clearAway();
-        // Reconstitute the FULL operator grant (privileges + class + title), which
-        // also re-derives the server-managed +a admin umode — not just the bare
-        // is_oper bool. A pre-grant snapshot carries 0 bits, so this restores a bare
-        // oper exactly as before; a current snapshot restores admin/all privileges.
-        if (snap.is_oper) {
-            self.setOperGrant(oper.OperPrivileges.fromBits(snap.oper_priv_bits), snap.oper_class, snap.oper_title);
-        } else {
-            self.is_oper = false;
-            // Fail-closed: the umode bitset above was copied wholesale (so
-            // carried server-managed marks like +z/+x survive the handoff),
-            // but the +a admin umode is DERIVED from the oper grant — a
-            // non-oper snapshot must never surface it, even from a corrupt
-            // or forged predecessor blob. The oper branch re-derives it via
-            // setOperGrant; this branch strips it explicitly.
-            self.umodes.remove(.admin);
-        }
+        // A carried oper block is profile history, never successor authority.
+        // It has no provenance and may come from an older binary, so trusting it
+        // as configured-local would launder OCG2/legacy state across Helix. Keep
+        // the append-only wire block decodable, but require live reconciliation
+        // to reapply any current local or durable grant.
+        _ = snap.is_oper;
+        _ = snap.oper_priv_bits;
+        _ = snap.oper_class;
+        _ = snap.oper_title;
+        self.clearOper();
         // Re-enable the negotiated IRCv3 caps carried across the UPGRADE (by name),
         // so echo-message and friends keep working without a client reconnect.
         self.restoreNegotiatedCaps(snap.caps);
@@ -2321,6 +2391,60 @@ fn expectCodesInOrder(haystack: []const u8, codes: []const []const u8) !void {
     }
 }
 
+const dispatch_test_bindings = [_]oper.OperBinding{.{
+    .account_name = "alice",
+    .class_name = "netadmin",
+    .privileges = oper.OperPrivileges.full,
+    .title = "Network Admin",
+}};
+const dispatch_test_registry = oper.OperRegistry.init(&dispatch_test_bindings) catch unreachable;
+
+fn dispatchTestCapability() oper_session_provenance.ConfiguredLocalBinding {
+    return oper_session_provenance.configuredLocalBinding(&dispatch_test_registry, "alice").?;
+}
+
+fn dispatchTestOcg2Copy(
+    revision: u64,
+    title: []const u8,
+    issued_ms: u64,
+    expiry_ms: u64,
+) !oper_session_provenance.DurableOperGrantCopy {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xD1)));
+    const authority_pubkey = kp.public_key.toBytes();
+    const authority_node_id = node_short_id.shortId(node_identity.nodeIdFromPublicKey(authority_pubkey));
+    var wire: [oper_cred_share.ocg2_max_wire_len]u8 = undefined;
+    const wire_len = try oper_cred_share.signOcg2(kp, .{
+        .kind = .grant,
+        .account = "alice",
+        .revision = revision,
+        .privilege_bits = 1 << 3,
+        .class = "moderator",
+        .title = title,
+        .authority_node_id = authority_node_id,
+        .authority_pubkey = authority_pubkey,
+        .issued_ms = issued_ms,
+        .expiry_ms = expiry_ms,
+    }, issued_ms, &wire);
+    var digest: [oper_session_provenance.digest_len]u8 = undefined;
+    std.crypto.hash.Blake3.hash(wire[0..wire_len], &digest, .{});
+    return oper_session_provenance.DurableOperGrantCopy.copyFromVerified(
+        "alice",
+        "moderator",
+        title,
+        1 << 3,
+        revision,
+        digest,
+        authority_node_id,
+        authority_pubkey,
+        issued_ms,
+        expiry_ms,
+        .grant,
+        false,
+        wire[0..wire_len],
+    ) orelse error.TestUnexpectedResult;
+}
+
 test "session snapshot -> encode -> decode -> restore round-trips" {
     var s = ClientSession.init();
     try s.setNick("alice");
@@ -2329,7 +2453,7 @@ test "session snapshot -> encode -> decode -> restore round-trips" {
     s.setRealHost("10.0.0.7");
     s.setVisibleHost("cloak-ab12.onyx");
     s.setAway("brb");
-    s.is_oper = true;
+    _ = s.reconcileOperAuthority(dispatchTestCapability(), .disabled, 100);
     // Negotiated caps must survive the UPGRADE too (carried by name).
     s.addCap(.echo_message);
     s.addCap(.server_time);
@@ -2352,7 +2476,10 @@ test "session snapshot -> encode -> decode -> restore round-trips" {
     try std.testing.expectEqualStrings("10.0.0.7", s2.real_host_store.slice());
     try std.testing.expectEqualStrings("cloak-ab12.onyx", s2.host_store.slice());
     try std.testing.expectEqualStrings("brb", s2.awayMessage().?);
-    try std.testing.expect(s2.isOper());
+    try std.testing.expect(!s2.isOper());
+    try std.testing.expectEqual(oper_session_provenance.Source.none, std.meta.activeTag(s2.operProvenance()));
+    try std.testing.expectEqualStrings("", s2.operClass());
+    try std.testing.expect(!s2.hasUmode(.admin));
     try std.testing.expect(s2.registered());
     // Caps carried across the round-trip; an un-negotiated cap stays off.
     try std.testing.expect(s2.hasCap(.echo_message));
@@ -2375,7 +2502,8 @@ test "restore carries client umodes; a forged +a on a non-oper snapshot is strip
 
     // Fail-closed: a (corrupt/forged) snapshot claiming the server-managed +a
     // WITHOUT an oper grant must not surface it — restore strips it on the
-    // non-oper branch; only setOperGrant may derive it.
+    // non-oper branch; only a live configured binding or verified OCG2 visitor
+    // projection may derive it.
     var forged = s.snapshot();
     forged.umode_bits |= @as(u64, 1) << @intFromEnum(usermode.UserMode.admin);
     forged.is_oper = false;
@@ -2383,6 +2511,18 @@ test "restore carries client umodes; a forged +a on a non-oper snapshot is strip
     s3.restore(forged);
     try std.testing.expect(!s3.hasUmode(.admin));
     try std.testing.expect(s3.hasUmode(.invisible)); // client-set bits still land
+
+    // Even a legacy/full oper block is authorization history only. Rolling
+    // decode remains compatible, but successor authority starts empty.
+    forged.is_oper = true;
+    forged.oper_priv_bits = oper.OperPrivileges.full.toBits();
+    forged.oper_class = "netadmin";
+    forged.oper_title = "Network Admin";
+    var s4 = ClientSession.init();
+    s4.restore(forged);
+    try std.testing.expect(!s4.isOper());
+    try std.testing.expectEqual(oper_session_provenance.Source.none, std.meta.activeTag(s4.operProvenance()));
+    try std.testing.expect(!s4.hasUmode(.admin));
 }
 
 test "full registration handshake emits welcome numerics" {
@@ -2584,7 +2724,8 @@ test "NICK rejects nicks longer than the configured NICKLEN" {
 
 test "clearOper revokes operator status, privileges, and class" {
     var s = ClientSession.init();
-    s.setOperGrant(oper.OperPrivileges.full, "netadmin", "Network Admin");
+    s.loginAs("alice");
+    _ = s.reconcileOperAuthority(dispatchTestCapability(), .disabled, 100);
     try std.testing.expect(s.isOper());
     try std.testing.expect(s.hasPriv(.server_admin));
     try std.testing.expectEqualStrings("netadmin", s.operClass());
@@ -2594,6 +2735,73 @@ test "clearOper revokes operator status, privileges, and class" {
     try std.testing.expect(!s.hasPriv(.server_admin));
     try std.testing.expectEqualStrings("", s.operClass());
     try std.testing.expect(!s.hasIrcxEventSubscriptions());
+}
+
+test "OCG2PROV session authority clears on account switch guest and logout" {
+    var session = ClientSession.init();
+    session.loginAs("alice");
+    const first_title: [oper_session_provenance.max_title_len]u8 = @splat('T');
+    const first_copy = try dispatchTestOcg2Copy(4, &first_title, 100, 200);
+    _ = session.reconcileOperAuthority(null, .{ .active = first_copy }, 100);
+    try std.testing.expect(session.isOper());
+    try std.testing.expectEqual(oper_session_provenance.Source.ocg2, std.meta.activeTag(session.operProvenance()));
+    try std.testing.expectEqual(@as(usize, oper_session_provenance.max_title_len), session.operTitle().len);
+
+    var restored = ClientSession.init();
+    restored.restore(session.snapshot());
+    try std.testing.expect(!restored.isOper());
+    try std.testing.expectEqual(oper_session_provenance.Source.none, std.meta.activeTag(restored.operProvenance()));
+    try std.testing.expect(!restored.hasUmode(.admin));
+
+    // Re-authentication as the same account is still a lifecycle boundary:
+    // the old projection is cleared before a fresh reconciliation can apply a
+    // current grant, so stale provenance cannot survive credential refresh.
+    session.loginAs("alice");
+    try std.testing.expect(!session.isOper());
+    try std.testing.expectEqual(oper_session_provenance.Source.none, std.meta.activeTag(session.operProvenance()));
+
+    const second_title: [oper_session_provenance.max_title_len]u8 = @splat('U');
+    const second_copy = try dispatchTestOcg2Copy(5, &second_title, 101, 201);
+    _ = session.reconcileOperAuthority(null, .{ .active = second_copy }, 101);
+    try std.testing.expect(session.isOper());
+
+    session.loginAs("bob");
+    try std.testing.expect(!session.isOper());
+    try std.testing.expectEqual(oper_session_provenance.Source.none, std.meta.activeTag(session.operProvenance()));
+
+    session.loginGuest("guest");
+    try std.testing.expect(!session.isOper());
+    try std.testing.expectEqual(oper_session_provenance.Source.none, std.meta.activeTag(session.operProvenance()));
+    session.logout();
+    try std.testing.expect(!session.isOper());
+    try std.testing.expectEqual(oper_session_provenance.Source.none, std.meta.activeTag(session.operProvenance()));
+}
+
+test "OCG2PROV configured authority requires live registry capability" {
+    var session = ClientSession.init();
+    const forged = oper.OperGrant{
+        .account_name = "alice",
+        .class_name = "moderator",
+        .privileges = oper.OperPrivileges.full,
+    };
+    session.loginAs("alice");
+    _ = oper_session_provenance.reconcile(.{
+        .authenticated_account = "alice",
+        .configured_local = forged,
+    }, .{
+        .context = &session,
+        .apply = ClientSession.applyProjectionVisitor,
+        .clear = ClientSession.clearProjectionVisitor,
+        .unavailable = ClientSession.unavailableProjectionVisitor,
+    });
+    try std.testing.expect(!session.isOper());
+    session.loginAs("bob");
+    _ = session.reconcileOperAuthority(dispatchTestCapability(), .disabled, 100);
+    try std.testing.expect(!session.isOper());
+    session.loginAs("alice");
+    _ = session.reconcileOperAuthority(dispatchTestCapability(), .disabled, 100);
+    try std.testing.expect(session.isOper());
+    try std.testing.expectEqual(oper_session_provenance.Source.configured_local, std.meta.activeTag(session.operProvenance()));
 }
 
 test "event subject masks: default wildcard, set/overwrite/clear lifecycle" {
@@ -2640,7 +2848,8 @@ test "event subject masks: default wildcard, set/overwrite/clear lifecycle" {
     try std.testing.expectEqualStrings("#keepme*", s.eventSubjectMask(chan));
 
     // Dropping oper status also clears every subject scope.
-    s.setOperGrant(oper.OperPrivileges.full, "netadmin", "Net Admin");
+    s.loginAs("alice");
+    _ = s.reconcileOperAuthority(dispatchTestCapability(), .disabled, 100);
     try s.setEventSubjectMask(chan, "#foo*");
     s.clearOper();
     try std.testing.expectEqualStrings("*", s.eventSubjectMask(chan));
