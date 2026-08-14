@@ -363,6 +363,7 @@ const base64url = @import("../proto/base64url.zig");
 const account_register = @import("../proto/account_register.zig");
 const account_notify = @import("../proto/account_notify.zig");
 const sessions_mod = @import("sessions.zig");
+const session_sid = @import("session_sid.zig");
 const mooring_hs = @import("../crypto/mooring_handshake.zig");
 const trace = @import("../proto/trace.zig");
 
@@ -2748,6 +2749,9 @@ pub const ConnState = struct {
     /// expires across a USR2 upgrade (fail-closed — a stale challenge is never
     /// honored). Default `.none` = no ceremony in flight.
     webauthn_pending: WebauthnPending = .{},
+    /// Last `SESSION LIST` rows actually emitted to this connection. Legacy
+    /// `SESSION DROP #n` binds to this snapshot; Helix/account/logout clear it.
+    session_list_cache: session_sid.ListCache = .{},
 
     pub fn init(fd: linux.fd_t) ConnState {
         return .{ .fd = fd };
@@ -3944,6 +3948,9 @@ pub const LinuxServer = struct {
     activity_subs: activity_subscriptions.SubscriptionStore,
     /// Phase 3: per-account live session registry (multi-device / bouncer).
     sessions: sessions_mod.SessionStore,
+    /// Bumped on Helix session-registry adopt so leftover LIST ordinals cannot
+    /// revoke a successor identity. `0` is reserved (empty cache).
+    session_list_epoch: u64 = 1,
     /// Legacy one-shot replay state carried for rolling compatibility. Modern
     /// mesh session credentials are reusable multi-attachment capabilities.
     session_reclaim_replay: session_reclaim_mesh.ReplayRing(256) = .{},
@@ -5643,6 +5650,7 @@ pub const LinuxServer = struct {
                         slot.value.ws = null;
                     }
                     self.clearDeferredSessionMeshParts(&slot.value);
+                    slot.value.session_list_cache.reset();
                     if (slot.value.send_overflow.capacity > 0)
                         slot.value.send_overflow.deinit(slot.value.overflow_allocator);
                     if (slot.value.recv_overflow.capacity > 0)
@@ -9656,6 +9664,111 @@ pub const LinuxServer = struct {
         self.wakeShard(id.shard);
     }
 
+    /// Complete an attached DROP on this reactor only. Foreign owners are
+    /// fail-closed at dispatch until the reserved two-owner protocol lands.
+    fn revokeAttachedSessionOnLocalOwner(self: *LinuxServer, account: []const u8, expected: sessions_mod.Session) ListedSessionRevoke {
+        if (account.len > 64) return .stale;
+        const notice = ":onyx.local NOTICE * :SESSION: this session was revoked from another device\r\n";
+        const id = clientIdFromMonitor(expected.client);
+        if (id.shard != self.rx().shard_id) return .temporarily_unavailable;
+        {
+            const conn = self.rx().clients.get(id) orelse return .stale;
+            const conn_account = conn.session.account() orelse return .stale;
+            if (!std.ascii.eqlIgnoreCase(conn_account, account) or conn.closing) return .stale;
+
+            // Stage every fallible World mutation while the exact row still
+            // exists.  `closeConn` uses that row to discover a live sibling;
+            // removing it first would turn this into a false final QUIT.
+            var restores: std.ArrayListUnmanaged(world_model.MemberRestore) = .empty;
+            defer restores.deinit(self.allocator);
+            const nick = conn.session.displayName();
+            var successor: ?client_model.ClientId = null;
+            var first_eligible: ?client_model.ClientId = null;
+            const from_wid = worldIdFromClient(id);
+            const nick_owner = self.world.findNick(nick);
+            const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return .temporarily_unavailable;
+            defer self.allocator.free(rows);
+            var unattested_exact_sibling = false;
+            for (rows) |row| {
+                if (!row.attached or row.client == expected.client) continue;
+                if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, expected.token)) continue;
+                const candidate_id = clientIdFromMonitor(row.client);
+                if (candidate_id.shard != self.rx().shard_id) {
+                    unattested_exact_sibling = true;
+                    continue;
+                }
+                const candidate = self.connFor(candidate_id) orelse {
+                    unattested_exact_sibling = true;
+                    continue;
+                };
+                if (candidate.closing or candidate.s2s != null or candidate.s2s_secured != null) {
+                    unattested_exact_sibling = true;
+                    continue;
+                }
+                const candidate_account = candidate.session.account() orelse continue;
+                if (!std.ascii.eqlIgnoreCase(candidate_account, account)) continue;
+                if (!std.ascii.eqlIgnoreCase(candidate.session.displayName(), nick)) continue;
+                if (first_eligible == null) first_eligible = candidate_id;
+                if (nick_owner) |owner| {
+                    if (owner.eql(worldIdFromClient(candidate_id))) {
+                        successor = candidate_id;
+                        break;
+                    }
+                }
+            }
+            // If the target is still the rendered nick owner, any validated
+            // exact sibling can take it.  If another exact sibling owns the
+            // nick, it must be chosen: claiming onto an arbitrary earlier row
+            // would reject NickInUse and make a safe local revoke unavailable.
+            if (successor == null) if (nick_owner) |owner| {
+                if (owner.eql(from_wid)) successor = first_eligible;
+            };
+            // A same-token attached row whose owner cannot participate in this
+            // transaction is evidence that this is not a final-row close. It
+            // must not be downgraded to a QUIT-producing final revoke.
+            if (successor == null and (unattested_exact_sibling or first_eligible != null)) return .temporarily_unavailable;
+
+            var handoff: ?world_model.World.PreparedSessionRestore = null;
+            if (successor) |next| {
+                const to_wid = worldIdFromClient(next);
+                var channels = self.world.channels.iterator();
+                while (channels.next()) |entry| {
+                    const old_modes = self.world.memberModes(entry.key_ptr.*, from_wid);
+                    const next_modes = self.world.memberModes(entry.key_ptr.*, to_wid);
+                    if (old_modes == null and next_modes == null) continue;
+                    restores.append(self.allocator, .{
+                        .channel = entry.key_ptr.*,
+                        .modes = .{ .bits = (if (old_modes) |m| m.bits else 0) | (if (next_modes) |m| m.bits else 0) },
+                    }) catch return .temporarily_unavailable;
+                }
+                const exact = [_]world_model.ClientId{ from_wid, to_wid };
+                handoff = self.world.prepareSessionRestore(
+                    nick,
+                    to_wid,
+                    &exact,
+                    .{ .claim_exact = to_wid },
+                    restores.items,
+                ) catch return .temporarily_unavailable;
+            }
+            defer if (handoff) |*prepared| prepared.abort();
+
+            // The Store CAS is the linearization point.  A stale LIST selector
+            // aborts the inert World ticket, leaving nick/membership unchanged.
+            const handle = self.sessions.removeExact(account, expected) orelse return .stale;
+            if (handoff) |*prepared| {
+                prepared.commit();
+                conn.session_handoff_complete = true;
+            }
+            conn.session_handoff_checked = true;
+            lockSpin(&self.attachment_delivery_mu);
+            _ = self.attachment_delivery_spool.discardAttachment(expected.client);
+            self.attachment_delivery_mu.unlock();
+            self.finalizeRemovedSessionAuthority(handle);
+            self.enqueueDeliveryThenClose(id, notice, "session revoked") catch {};
+            return .removed;
+        }
+    }
+
     fn enqueueDeliveryMaybeClose(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, close_after: bool, close_reason: []const u8) DeliveryOutcome {
         return self.enqueueDeliveryMaybeCloseEx(id, bytes, .{
             .close_after = close_after,
@@ -13123,6 +13236,7 @@ pub const LinuxServer = struct {
             }
             self.stats.onClose(false, false);
             self.stats.onQuit();
+            conn.session_list_cache.reset();
             // Free any in-flight inbound multiline batch buffer.
             self.abortMultiline(conn);
             // Tear down the per-connection TLS engine, if any.
@@ -27504,6 +27618,7 @@ pub const LinuxServer = struct {
         attachment_remaps: *std.ArrayList(attachment_delivery_spool.AttachmentRemap),
     ) usize {
         if (cap.account.len == 0 or cap.sessions.len == 0) return 0;
+        self.bumpSessionListEpoch();
         // Validate first, apply second: one malformed entry rejects the whole
         // account BEFORE anything is written (fail-closed).
         var detached_count: usize = 0;
@@ -27718,6 +27833,7 @@ pub const LinuxServer = struct {
                 conn.ws = null;
             }
             self.clearDeferredSessionMeshParts(conn);
+            conn.session_list_cache.reset();
             conn.send_overflow.clearAndFree(conn.overflow_allocator);
             conn.recv_overflow.clearAndFree(conn.overflow_allocator);
             conn.fd = -1;
@@ -27731,6 +27847,7 @@ pub const LinuxServer = struct {
         };
         self.world.removeClient(worldIdFromClient(id));
         if (conn.session.account()) |acct| _ = self.removeTrackedSession(acct, monitorIdFromClient(id));
+        conn.session_list_cache.reset();
         conn.recv_overflow.clearAndFree(conn.overflow_allocator);
         conn.send_overflow.clearAndFree(conn.overflow_allocator);
         if (conn.tls) |t| {
@@ -27761,6 +27878,7 @@ pub const LinuxServer = struct {
         }
         conn.recv_overflow.clearAndFree(conn.overflow_allocator);
         conn.send_overflow.clearAndFree(conn.overflow_allocator);
+        conn.session_list_cache.reset();
         _ = self.rx().clients.free(id);
         if (close_fd) closeFd(fd);
     }
@@ -32546,6 +32664,7 @@ pub const LinuxServer = struct {
             // ANONYMOUS is an account transition too: it clears account() and
             // therefore must retire the previous tracked portable authority.
             if (conn.session.account()) |old| _ = self.removeTrackedSession(old, monitorIdFromClient(id));
+            conn.session_list_cache.reset();
             conn.session.loginGuest(account);
         } else {
             if (conn.session.account()) |old| {
@@ -35604,6 +35723,7 @@ pub const LinuxServer = struct {
 
     /// Mark `conn` logged in as the canonical (lowercased) `account`.
     fn loginSession(conn: *ConnState, account: []const u8) void {
+        conn.session_list_cache.reset();
         var buf: [account_register.MAX_ACCOUNT_BYTES]u8 = undefined;
         const n = @min(account.len, buf.len);
         const lower = std.ascii.lowerString(buf[0..n], account[0..n]);
@@ -35855,6 +35975,7 @@ pub const LinuxServer = struct {
         self.retireMediaBeforeAccountMutation(id, conn, null);
         // Drop this connection's live session before clearing the account binding
         // (the session is keyed by account; logout fully ends it, no reclaim).
+        conn.session_list_cache.reset();
         if (conn.session.account()) |acct| _ = self.removeTrackedSession(acct, monitorIdFromClient(id));
         // Whether an account session is actually being cleared decides if we emit
         // 901 RPL_LOGGEDOUT below (a no-op LOGOUT on an unauthenticated session
@@ -39313,6 +39434,18 @@ pub const LinuxServer = struct {
         return removed;
     }
 
+    /// SESSION DROP's compare-and-remove boundary. The SessionStore verifies
+    /// token/client/signon/attachment while exclusively locked; nothing after a
+    /// LIST snapshot may retarget a recycled runtime client id.
+    fn removeTrackedSessionExact(self: *LinuxServer, account: []const u8, expected: sessions_mod.Session) bool {
+        const handle = self.sessions.removeExact(account, expected) orelse return false;
+        lockSpin(&self.attachment_delivery_mu);
+        _ = self.attachment_delivery_spool.discardAttachment(expected.client);
+        self.attachment_delivery_mu.unlock();
+        self.finalizeRemovedSessionAuthority(handle);
+        return true;
+    }
+
     /// Remove every local authority row for an account without allocating. The
     /// fixed-size snapshot is drained repeatedly so configured account caps above
     /// `snapshot_capacity` are still complete; same-token rows naturally publish
@@ -39667,9 +39800,134 @@ pub const LinuxServer = struct {
         }
     }
 
+    fn bumpSessionListEpoch(self: *LinuxServer) void {
+        self.session_list_epoch +%= 1;
+        if (self.session_list_epoch == 0) self.session_list_epoch = 1;
+    }
+
+    /// Attached sessions on another reactor require the reserved two-owner
+    /// handoff protocol.  Do not remove their SessionStore row optimistically:
+    /// doing so before the target owner has accepted the handoff lets a normal
+    /// close recreate or corrupt the row.  Until that protocol is installed,
+    /// reject the operation with no mutation.
+    const ListedSessionRevoke = enum {
+        removed,
+        self_target,
+        stale,
+        temporarily_unavailable,
+    };
+
+    fn revokeListedSessionRow(
+        self: *LinuxServer,
+        account: []const u8,
+        caller_cid: sessions_mod.ClientId,
+        target: sessions_mod.Session,
+    ) ListedSessionRevoke {
+        if (target.client == caller_cid) return .self_target;
+        if (target.attached and clientIdFromMonitor(target.client).shard != self.rx().shard_id) {
+            // Queueing a close is explicitly not enough: the foreign owner can
+            // detach after the source-side removal and reinstate the exact row.
+            // Keep the physical row untouched until BEGIN/PREPARE/PREPARED and
+            // the allocation-free owner-side commit exist.
+            return .temporarily_unavailable;
+        }
+        if (target.attached)
+            return self.revokeAttachedSessionOnLocalOwner(account, target);
+        return if (self.removeTrackedSessionExact(account, target)) .removed else .stale;
+    }
+
+    fn handleSessionDrop(
+        self: *LinuxServer,
+        conn: *ConnState,
+        account: []const u8,
+        caller_cid: sessions_mod.ClientId,
+        raw: []const u8,
+    ) !void {
+        const target = session_sid.parseDropTarget(raw) catch {
+            try self.failReply(conn, "SESSION", "INVALID_INDEX", "DROP requires a session sid or a positive index from SESSION LIST");
+            return;
+        };
+        const account_sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch {
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the session list");
+            return;
+        };
+        defer self.allocator.free(account_sessions);
+
+        var buf: [default_reply_bytes]u8 = undefined;
+        switch (target) {
+            .ordinal => |idx| {
+                const cached = conn.session_list_cache.lookup(self.session_list_epoch, account, idx) catch {
+                    try self.failReply(conn, "SESSION", "STALE_LIST", "SESSION LIST snapshot is no longer valid; list again");
+                    return;
+                };
+                const current = session_sid.resolveCachedRow(account_sessions, cached) catch {
+                    try self.failReply(conn, "SESSION", "STALE_LIST", "SESSION LIST snapshot is no longer valid; list again");
+                    return;
+                };
+                switch (self.revokeListedSessionRow(account, caller_cid, current)) {
+                    .removed => {},
+                    .self_target => {
+                        try self.failReply(conn, "SESSION", "CANNOT_DROP_CURRENT", "Cannot drop this connection; use LOGOUT or disconnect");
+                        return;
+                    },
+                    .stale => {
+                        try self.failReply(conn, "SESSION", "STALE_LIST", "Session changed; list again");
+                        return;
+                    },
+                    .temporarily_unavailable => {
+                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "Cross-reactor session revoke is temporarily unavailable");
+                        return;
+                    },
+                }
+                // Keep ordinal numbering stable but erase the successfully
+                // revoked row's token/AID immediately.
+                conn.session_list_cache.invalidate(idx);
+                const ok_line = std.fmt.bufPrint(&buf, "SESSION DROP #{d} ok", .{idx}) catch "SESSION DROP ok";
+                try self.noticeTo(conn, ok_line);
+            },
+            .sid => |sid| {
+                const matched = session_sid.matchSid(account_sessions, sid);
+                const row = switch (matched) {
+                    .none => {
+                        try self.failReply(conn, "SESSION", "NO_SUCH_SESSION", "No session matches that sid");
+                        return;
+                    },
+                    .ambiguous => {
+                        try self.failReply(conn, "SESSION", "AMBIGUOUS_SID", "Session sid is ambiguous; refuse to revoke");
+                        return;
+                    },
+                    .unique => |value| value,
+                };
+                const current = session_sid.resolveCachedRow(account_sessions, row) catch {
+                    try self.failReply(conn, "SESSION", "STALE_LIST", "Session changed; list again");
+                    return;
+                };
+                switch (self.revokeListedSessionRow(account, caller_cid, current)) {
+                    .removed => {},
+                    .self_target => {
+                        try self.failReply(conn, "SESSION", "CANNOT_DROP_CURRENT", "Cannot drop this connection; use LOGOUT or disconnect");
+                        return;
+                    },
+                    .stale => {
+                        try self.failReply(conn, "SESSION", "STALE_LIST", "Session changed; list again");
+                        return;
+                    },
+                    .temporarily_unavailable => {
+                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "Cross-reactor session revoke is temporarily unavailable");
+                        return;
+                    },
+                }
+                conn.session_list_cache.invalidateExact(row);
+                const sid_hex = session_sid.formatSid(sid);
+                const ok_line = std.fmt.bufPrint(&buf, "SESSION DROP sid={s} ok", .{sid_hex}) catch "SESSION DROP ok";
+                try self.noticeTo(conn, ok_line);
+            },
+        }
+    }
+
     /// `SESSION [LIST|TOKEN|DROP]` — list the account's live sessions, reveal this
     /// session's reclaim token (to the owning session only), or revoke another
-    /// session by its LIST index (`SESSION DROP #<n>`).
+    /// session by sid or by the caller's last LIST ordinal (`SESSION DROP #<n>`).
     pub fn handleSession(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const account = conn.session.account() orelse {
             try self.noticeTo(conn, "SESSION: you are not logged in to an account");
@@ -39683,47 +39941,14 @@ pub const LinuxServer = struct {
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "DROP")) {
-            // SESSION DROP #<n> — revoke the n-th row from SESSION LIST (1-based).
-            // Never drops the caller's own current attachment (use LOGOUT for that).
+            // SESSION DROP <sid|#n> — sid revokes exactly one physical row;
+            // #n binds to the last LIST this connection emitted. Never drops the
+            // caller's own current attachment (use LOGOUT for that).
             if (parsed.param_count < 2) {
-                try self.failReply(conn, "SESSION", "NEED_MORE_PARAMS", "Usage: SESSION DROP #<n>");
+                try self.failReply(conn, "SESSION", "NEED_MORE_PARAMS", "Usage: SESSION DROP <sid|#n>");
                 return;
             }
-            const raw = parsed.paramSlice()[1];
-            const idx_txt = if (raw.len > 0 and raw[0] == '#') raw[1..] else raw;
-            const target_idx = std.fmt.parseInt(usize, idx_txt, 10) catch {
-                try self.failReply(conn, "SESSION", "INVALID_INDEX", "DROP requires a positive session index from SESSION LIST");
-                return;
-            };
-            if (target_idx == 0) {
-                try self.failReply(conn, "SESSION", "INVALID_INDEX", "DROP requires a positive session index from SESSION LIST");
-                return;
-            }
-            const account_sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch {
-                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the session list");
-                return;
-            };
-            defer self.allocator.free(account_sessions);
-            if (target_idx > account_sessions.len) {
-                try self.failReply(conn, "SESSION", "NO_SUCH_SESSION", "No session at that index");
-                return;
-            }
-            const target = account_sessions[target_idx - 1];
-            if (target.client == cid) {
-                try self.failReply(conn, "SESSION", "CANNOT_DROP_CURRENT", "Cannot drop this connection; use LOGOUT or disconnect");
-                return;
-            }
-            if (target.attached) {
-                const target_id = clientIdFromMonitor(target.client);
-                if (self.connFor(target_id)) |target_conn| {
-                    self.noticeTo(target_conn, "SESSION: this session was revoked from another device") catch {};
-                    self.closeConn(target_conn.token, "session revoked") catch {};
-                }
-            }
-            // Always retire the store row so detached ghosts cannot resume.
-            _ = self.removeTrackedSession(account, target.client);
-            const ok_line = std.fmt.bufPrint(&buf, "SESSION DROP #{d} ok", .{target_idx}) catch "SESSION DROP ok";
-            try self.noticeTo(conn, ok_line);
+            try self.handleSessionDrop(conn, account, cid, parsed.paramSlice()[1]);
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "TOKEN")) {
@@ -39767,21 +39992,50 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "SESSION: no token for this session");
             return;
         }
-        // LIST (default): never reveal tokens here.
-        var idx: usize = 0;
+        // LIST (default): never reveal tokens here. Bind #n to this emission.
+        // LIST failure must invalidate the previous selector image before any
+        // allocation can fail; a caller cannot reuse stale ordinals after OOM.
+        conn.session_list_cache.reset();
         const account_sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch {
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the session list");
             return;
         };
         defer self.allocator.free(account_sessions);
+        // Never let an old or precomputed image select a row that was not
+        // actually emitted. Any formatting/write/allocation failure leaves the
+        // cache empty and requires the client to LIST again.
+        var staged_cache = session_sid.ListCache{};
+        defer staged_cache.reset();
+        staged_cache.prepare(self.allocator, self.session_list_epoch, account, account_sessions.len) catch {
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not securely stage the complete session list");
+            return;
+        };
+        var emitted: usize = 0;
         for (account_sessions) |s| {
-            idx += 1;
             const current: []const u8 = if (s.client == cid) "*" else "-";
             const state: []const u8 = if (s.attached) "attached" else "detached";
-            const line = std.fmt.bufPrint(&buf, "SESSION LIST {s} #{d} signon={d} {s}", .{ current, idx, s.signon_ms, state }) catch continue;
+            const sid = session_sid.sidOf(s);
+            const next_idx = emitted + 1;
+            const line = if (sid) |id_bytes| blk: {
+                const sid_hex = session_sid.formatSid(id_bytes);
+                break :blk std.fmt.bufPrint(
+                    &buf,
+                    "SESSION LIST {s} #{d} signon={d} {s} sid={s}",
+                    .{ current, next_idx, s.signon_ms, state, sid_hex },
+                ) catch continue;
+            } else std.fmt.bufPrint(
+                &buf,
+                "SESSION LIST {s} #{d} signon={d} {s}",
+                .{ current, next_idx, s.signon_ms, state },
+            ) catch continue;
             try self.noticeTo(conn, line);
+            staged_cache.rows.appendAssumeCapacity(.{ .token = s.token, .client = s.client, .signon_ms = s.signon_ms, .attachment_id = s.attachment_id });
+            emitted += 1;
         }
         try self.noticeTo(conn, "SESSION: end of session list");
+        conn.session_list_cache.reset();
+        conn.session_list_cache = staged_cache;
+        staged_cache = .{};
     }
 
     /// `SESSION RESUME <token>` — attach this client to the caller's logical
@@ -57258,6 +57512,21 @@ fn addTestLocalClient(server: *Server, nick: []const u8, account: ?[]const u8) !
     } else return error.SkipZigTest;
 }
 
+/// Most legacy server fixtures predate physical attachment identifiers. SESSION
+/// SID tests must opt into the production-only stable row identity explicitly;
+/// a null attachment intentionally has no public SID.
+fn assignTestSessionAttachment(server: *Server, account: []const u8, id: client_model.ClientId, marker: u8) !void {
+    const cid = monitorIdFromClient(id);
+    const rows = try server.sessions.copySessionsAlloc(std.testing.allocator, account);
+    defer std.testing.allocator.free(rows);
+    const old = for (rows) |row| {
+        if (row.client == cid) break row;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(server.sessions.remove(account, cid));
+    const attachment = try sessions_mod.AttachmentId.fromBytes(@as([16]u8, @splat(marker)));
+    _ = try server.sessions.attachWithAttachment(account, cid, old.token, attachment, old.signon_ms);
+}
+
 test "remote QUIT marked mesh departures render once per local recipient across shared channels" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     defer current_reactor = null;
@@ -71811,7 +72080,10 @@ test "SESSION DROP removes a sibling attachment by LIST index" {
     const a_id = try addTestLocalClient(&server, "dropa", "dropacct");
     const b_id = try addTestLocalClient(&server, "dropb", "dropacct");
     const a_conn = server.connFor(a_id).?;
+    const b_conn = server.connFor(b_id).?;
     const b_cid = monitorIdFromClient(b_id);
+    try server.world.restoreMember("#drop-final", worldIdFromClient(a_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#drop-final", worldIdFromClient(b_id), world_model.MemberModes.empty());
 
     // LIST from A: both attachments appear; DROP B's index.
     a_conn.send_len = 0;
@@ -71839,13 +72111,427 @@ test "SESSION DROP removes a sibling attachment by LIST index" {
     try std.testing.expect(!server.sessions.containsClient("dropacct", b_cid));
     try std.testing.expect(server.sessions.containsClient("dropacct", monitorIdFromClient(a_id)));
 
-    // Cannot drop the caller's own current attachment.
+    // Cannot drop the caller's own current attachment. Bind to the original
+    // LIST snapshot rather than reindexing the leftover row as a fresh #1.
+    var a_idx: usize = 0;
+    for (rows, 0..) |row, i| {
+        if (row.client == monitorIdFromClient(a_id)) a_idx = i + 1;
+    }
+    try std.testing.expect(a_idx > 0);
     a_conn.send_len = 0;
-    var self_drop = try irc_line.parseLine("SESSION DROP #1");
+    var self_drop_buf: [32]u8 = undefined;
+    const self_drop_txt = try std.fmt.bufPrint(&self_drop_buf, "SESSION DROP #{d}", .{a_idx});
+    var self_drop = try irc_line.parseLine(self_drop_txt);
     try server.handleSession(a_id, a_conn, &self_drop);
-    // After B is gone only A remains at #1 — either CANNOT_DROP_CURRENT or ok only if
-    // index 1 were another row; with a single row it must refuse.
     try expectContains(a_conn.send_buf[0..a_conn.send_len], "CANNOT_DROP_CURRENT");
+
+    // B was the final exact-token row. Its later close must retain ordinary
+    // final-identity behavior (one QUIT), rather than treating an unrelated
+    // account attachment as a logical-session successor.
+    a_conn.send_len = 0;
+    // Model the target's revoke notice completing its SendQ drain. Until that
+    // completion, closeConn correctly preserves the slot to avoid UAF on the
+    // kernel-owned send buffer and cannot yet publish the final QUIT.
+    b_conn.send_armed = false;
+    b_conn.send_offset = b_conn.send_len;
+    try server.closeConn(b_conn.token, "session revoked");
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], " QUIT ");
+}
+
+fn sessionListSidForClient(haystack: []const u8, idx: usize) ![]const u8 {
+    var star_buf: [40]u8 = undefined;
+    var dash_buf: [40]u8 = undefined;
+    const star = try std.fmt.bufPrint(&star_buf, "SESSION LIST * #{d} ", .{idx});
+    const dash = try std.fmt.bufPrint(&dash_buf, "SESSION LIST - #{d} ", .{idx});
+    const line_start = std.mem.indexOf(u8, haystack, star) orelse
+        (std.mem.indexOf(u8, haystack, dash) orelse return error.TestUnexpectedResult);
+    const sid_at = std.mem.indexOfPos(u8, haystack, line_start, " sid=") orelse
+        return error.TestUnexpectedResult;
+    const hex_start = sid_at + " sid=".len;
+    const hex_end = hex_start + session_sid.sid_hex_len;
+    if (hex_end > haystack.len) return error.TestUnexpectedResult;
+    return haystack[hex_start..hex_end];
+}
+
+test "SESSION DROP #n cannot retarget after list snapshot mutation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const a_id = try addTestLocalClient(&server, "ordA", "ordacct");
+    const b_id = try addTestLocalClient(&server, "ordB", "ordacct");
+    const c_id = try addTestLocalClient(&server, "ordC", "ordacct");
+    try assignTestSessionAttachment(&server, "ordacct", a_id, 0xa1);
+    try assignTestSessionAttachment(&server, "ordacct", b_id, 0xb1);
+    try assignTestSessionAttachment(&server, "ordacct", c_id, 0xc1);
+    const a_conn = server.connFor(a_id).?;
+    const b_cid = monitorIdFromClient(b_id);
+    const c_cid = monitorIdFromClient(c_id);
+
+    a_conn.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(a_id, a_conn, &list_line);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "sid=");
+
+    const listed = try server.sessions.copySessionsAlloc(std.testing.allocator, "ordacct");
+    defer std.testing.allocator.free(listed);
+    var b_idx: usize = 0;
+    var c_idx: usize = 0;
+    for (listed, 0..) |row, i| {
+        if (row.client == b_cid) b_idx = i + 1;
+        if (row.client == c_cid) c_idx = i + 1;
+    }
+    try std.testing.expect(b_idx > 0 and c_idx > 0);
+    try std.testing.expect(c_idx > b_idx);
+
+    // Removing B shifts C into B's live ordinal. A fresh reindex would drop C.
+    try std.testing.expect(server.removeTrackedSession("ordacct", b_cid));
+    try std.testing.expect(!server.sessions.containsClient("ordacct", b_cid));
+    try std.testing.expect(server.sessions.containsClient("ordacct", c_cid));
+
+    a_conn.send_len = 0;
+    var stale_buf: [32]u8 = undefined;
+    const stale_txt = try std.fmt.bufPrint(&stale_buf, "SESSION DROP #{d}", .{b_idx});
+    var stale_line = try irc_line.parseLine(stale_txt);
+    try server.handleSession(a_id, a_conn, &stale_line);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "STALE_LIST");
+    try std.testing.expect(server.sessions.containsClient("ordacct", c_cid));
+    try std.testing.expect(server.sessions.containsClient("ordacct", monitorIdFromClient(a_id)));
+
+    // The original later ordinal still names C, not a newly inserted row.
+    const d_id = try addTestLocalClient(&server, "ordD", "ordacct");
+    const d_cid = monitorIdFromClient(d_id);
+    a_conn.send_len = 0;
+    var drop_c_buf: [32]u8 = undefined;
+    const drop_c_txt = try std.fmt.bufPrint(&drop_c_buf, "SESSION DROP #{d}", .{c_idx});
+    var drop_c_line = try irc_line.parseLine(drop_c_txt);
+    try server.handleSession(a_id, a_conn, &drop_c_line);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], " ok");
+    try std.testing.expect(!server.sessions.containsClient("ordacct", c_cid));
+    try std.testing.expect(server.sessions.containsClient("ordacct", d_cid));
+}
+
+test "SESSION DROP sid revokes exactly one physical attachment and leaves shared-token siblings live" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const a_id = try addTestLocalClient(&server, "sidA", "sidacct");
+    const b_id = try addTestLocalClient(&server, "sidB", "sidacct");
+    const c_id = try addTestLocalClient(&server, "sidC", "sidacct");
+    try assignTestSessionAttachment(&server, "sidacct", a_id, 0xa2);
+    try assignTestSessionAttachment(&server, "sidacct", b_id, 0xb2);
+    try assignTestSessionAttachment(&server, "sidacct", c_id, 0xc2);
+    const a_conn = server.connFor(a_id).?;
+    const b_conn = server.connFor(b_id).?;
+    const c_conn = server.connFor(c_id).?;
+    const a_cid = monitorIdFromClient(a_id);
+    const b_cid = monitorIdFromClient(b_id);
+    const c_cid = monitorIdFromClient(c_id);
+    const a_handle = server.sessions.resumeHandleForClient("sidacct", a_cid).?;
+    try std.testing.expect(server.sessions.joinTokenGroup("sidacct", b_cid, a_handle.token));
+    // Model the shared rendered identity: B is a same-token attachment with no
+    // separate nick lookup, and has overlapping channel authority to union.
+    server.world.unregisterNick(worldIdFromClient(b_id));
+    try b_conn.session.setNick("sidA");
+    try server.world.restoreMember("#sid-drop", worldIdFromClient(a_id), world_model.MemberModes.fromModes(&.{.op}));
+    try server.world.restoreMember("#sid-drop", worldIdFromClient(b_id), world_model.MemberModes.fromModes(&.{.voice}));
+    // C is a real channel observer, so the later no-QUIT assertion proves the
+    // shared logical identity did not flap out of the roster during DROP.
+    try server.world.restoreMember("#sid-drop", worldIdFromClient(c_id), world_model.MemberModes.empty());
+    const token_hex = std.fmt.bytesToHex(a_handle.token, .lower);
+    const sid_rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "sidacct");
+    defer std.testing.allocator.free(sid_rows);
+    const a_row = for (sid_rows) |row| {
+        if (row.client == a_cid) break row;
+    } else return error.TestUnexpectedResult;
+    const expected_sid = session_sid.formatSid(session_sid.sidOf(a_row).?);
+
+    c_conn.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(c_id, c_conn, &list_line);
+    const listed = c_conn.send_buf[0..c_conn.send_len];
+    try expectContains(listed, "sid=");
+    try std.testing.expect(std.mem.indexOf(u8, listed, &token_hex) == null);
+    try expectContains(listed, &expected_sid);
+
+    // Caller in the logical session cannot revoke it.
+    a_conn.send_len = 0;
+    var self_sid_buf: [64]u8 = undefined;
+    const self_sid_txt = try std.fmt.bufPrint(&self_sid_buf, "SESSION DROP sid={s}", .{expected_sid});
+    var self_sid_line = try irc_line.parseLine(self_sid_txt);
+    try server.handleSession(a_id, a_conn, &self_sid_line);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "CANNOT_DROP_CURRENT");
+    try std.testing.expect(server.sessions.containsClient("sidacct", a_cid));
+    try std.testing.expect(server.sessions.containsClient("sidacct", b_cid));
+
+    c_conn.send_len = 0;
+    var drop_sid_buf: [64]u8 = undefined;
+    const drop_sid_txt = try std.fmt.bufPrint(&drop_sid_buf, "SESSION DROP {s}", .{expected_sid});
+    var drop_sid_line = try irc_line.parseLine(drop_sid_txt);
+    try server.handleSession(c_id, c_conn, &drop_sid_line);
+    try expectContains(c_conn.send_buf[0..c_conn.send_len], "SESSION DROP sid=");
+    try expectContains(c_conn.send_buf[0..c_conn.send_len], " ok");
+    try std.testing.expect(!server.sessions.containsClient("sidacct", a_cid));
+    try std.testing.expect(server.sessions.containsClient("sidacct", b_cid));
+    try std.testing.expect(server.sessions.containsClient("sidacct", c_cid));
+    try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(b_id)), server.world.findNick("sidA"));
+    const union_modes = server.world.memberModes("#sid-drop", worldIdFromClient(b_id)).?;
+    try std.testing.expect(union_modes.isOperator());
+    try std.testing.expect(union_modes.contains(.voice));
+    // The prepared ticket atomically makes B the nick owner and installs the
+    // union before close; source membership remains until that connection's
+    // queued revoke notice drains and closeConn removes its physical World id.
+    try std.testing.expect(server.world.memberModes("#sid-drop", worldIdFromClient(a_id)) != null);
+
+    // Drain the close after the Store CAS. The handoff latch prevents closeConn
+    // from re-staging against the now-removed source row or emitting a false
+    // identity QUIT to the surviving observer.
+    c_conn.send_len = 0;
+    a_conn.send_armed = false;
+    a_conn.send_offset = a_conn.send_len;
+    try server.closeConn(a_conn.token, "session revoked");
+    try std.testing.expect(server.connFor(a_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, c_conn.send_buf[0..c_conn.send_len], " QUIT ") == null);
+    try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(b_id)), server.world.findNick("sidA"));
+    try std.testing.expect(server.world.memberModes("#sid-drop", worldIdFromClient(b_id)).?.isOperator());
+    try std.testing.expect(server.world.memberModes("#sid-drop", worldIdFromClient(a_id)) == null);
+}
+
+test "SESSION DROP fails closed on absent, stale, and account-switched ids" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const a_id = try addTestLocalClient(&server, "failA", "failacct");
+    const b_id = try addTestLocalClient(&server, "failB", "failacct");
+    try assignTestSessionAttachment(&server, "failacct", a_id, 0xa3);
+    try assignTestSessionAttachment(&server, "failacct", b_id, 0xb3);
+    const a_conn = server.connFor(a_id).?;
+    const b_cid = monitorIdFromClient(b_id);
+
+    a_conn.send_len = 0;
+    var missing = try irc_line.parseLine("SESSION DROP 0123456789abcdef0123456789abcdef");
+    try server.handleSession(a_id, a_conn, &missing);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "NO_SUCH_SESSION");
+
+    a_conn.send_len = 0;
+    var before_list = try irc_line.parseLine("SESSION DROP #1");
+    try server.handleSession(a_id, a_conn, &before_list);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "STALE_LIST");
+
+    a_conn.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(a_id, a_conn, &list_line);
+    const listed = try server.sessions.copySessionsAlloc(std.testing.allocator, "failacct");
+    defer std.testing.allocator.free(listed);
+    var b_idx: usize = 0;
+    for (listed, 0..) |row, i| {
+        if (row.client == b_cid) b_idx = i + 1;
+    }
+    try std.testing.expect(b_idx > 0);
+    const b_sid = try sessionListSidForClient(a_conn.send_buf[0..a_conn.send_len], b_idx);
+
+    server.bumpSessionListEpoch();
+    a_conn.send_len = 0;
+    var stale_epoch_buf: [32]u8 = undefined;
+    const stale_epoch_txt = try std.fmt.bufPrint(&stale_epoch_buf, "SESSION DROP #{d}", .{b_idx});
+    var stale_epoch = try irc_line.parseLine(stale_epoch_txt);
+    try server.handleSession(a_id, a_conn, &stale_epoch);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "STALE_LIST");
+    try std.testing.expect(server.sessions.containsClient("failacct", b_cid));
+
+    a_conn.send_len = 0;
+    try server.handleSession(a_id, a_conn, &list_line);
+    a_conn.session.loginAs("otheracct");
+    server.trackSession(a_id, a_conn);
+    a_conn.send_len = 0;
+    var switched_buf: [32]u8 = undefined;
+    const switched_txt = try std.fmt.bufPrint(&switched_buf, "SESSION DROP #{d}", .{b_idx});
+    var switched = try irc_line.parseLine(switched_txt);
+    try server.handleSession(a_id, a_conn, &switched);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "STALE_LIST");
+
+    // A real account rebind clears the cache before a later LOGIN can reuse it.
+    a_conn.session_list_cache.reset();
+    a_conn.session.loginAs("failacct");
+    a_conn.send_len = 0;
+    try server.handleSession(a_id, a_conn, &switched);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "STALE_LIST");
+
+    a_conn.send_len = 0;
+    var absent_sid_buf: [64]u8 = undefined;
+    const absent_sid_txt = try std.fmt.bufPrint(&absent_sid_buf, "SESSION DROP sid={s}", .{b_sid});
+    var absent_sid = try irc_line.parseLine(absent_sid_txt);
+    // B still exists; a SID must not cross the caller's current account.
+    a_conn.session.loginAs("otheracct");
+    try server.handleSession(a_id, a_conn, &absent_sid);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "NO_SUCH_SESSION");
+    try std.testing.expect(server.sessions.containsClient("failacct", b_cid));
+}
+
+test "SESSION DROP leaves an attached foreign-shard row untouched until the reserved handoff protocol exists" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const caller_id = try addTestLocalClient(&server, "drop-origin", "crossdrop");
+    const caller = server.connFor(caller_id).?;
+    const foreign_id: client_model.ClientId = .{ .shard = 1, .slot = 7, .gen = 1 };
+    const foreign_cid = monitorIdFromClient(foreign_id);
+    const foreign_token: sessions_mod.Token = @splat(0x77);
+    const foreign_aid = try sessions_mod.AttachmentId.fromBytes(@as([16]u8, @splat(0x78)));
+    _ = try server.sessions.attachWithAttachment("crossdrop", foreign_cid, foreign_token, foreign_aid, 1234);
+
+    caller.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(caller_id, caller, &list_line);
+    const rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "crossdrop");
+    defer std.testing.allocator.free(rows);
+    const foreign_index = for (rows, 0..) |row, index| {
+        if (row.client == foreign_cid) break index + 1;
+    } else return error.TestUnexpectedResult;
+    const before = for (rows) |row| {
+        if (row.client == foreign_cid) break row;
+    } else return error.TestUnexpectedResult;
+
+    caller.send_len = 0;
+    var drop_buf: [32]u8 = undefined;
+    const drop_text = try std.fmt.bufPrint(&drop_buf, "SESSION DROP #{d}", .{foreign_index});
+    var drop = try irc_line.parseLine(drop_text);
+    try server.handleSession(caller_id, caller, &drop);
+    try expectContains(caller.send_buf[0..caller.send_len], "TEMPORARILY_UNAVAILABLE");
+
+    // No fabric control was queued and no foreign ConnState exists in this
+    // reactor. The SessionStore selector must therefore remain byte-for-byte
+    // equivalent; the World has no foreign client registration to remove.
+    const after_rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "crossdrop");
+    defer std.testing.allocator.free(after_rows);
+    const after = for (after_rows) |row| {
+        if (row.client == foreign_cid) break row;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(before.client, after.client);
+    try std.testing.expectEqual(before.signon_ms, after.signon_ms);
+    try std.testing.expect(std.crypto.timing_safe.eql(sessions_mod.Token, before.token, after.token));
+    try std.testing.expect(before.attachment_id.?.eql(after.attachment_id.?));
+    try std.testing.expect(after.attached);
+    try std.testing.expect(server.sessions.containsClient("crossdrop", foreign_cid));
+}
+
+test "SESSION DROP never treats a local target with an unattested foreign token sibling as final" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const caller_id = try addTestLocalClient(&server, "drop-caller", "foreign-sibling");
+    const target_id = try addTestLocalClient(&server, "drop-target", "foreign-sibling");
+    const caller = server.connFor(caller_id).?;
+    const target_cid = monitorIdFromClient(target_id);
+    const token = server.sessions.resumeHandleForClient("foreign-sibling", target_cid).?.token;
+    const foreign_id: client_model.ClientId = .{ .shard = 1, .slot = 8, .gen = 1 };
+    const foreign_cid = monitorIdFromClient(foreign_id);
+    const foreign_aid = try sessions_mod.AttachmentId.fromBytes(@as([16]u8, @splat(0x79)));
+    _ = try server.sessions.attachWithAttachment("foreign-sibling", foreign_cid, token, foreign_aid, 2234);
+
+    caller.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(caller_id, caller, &list_line);
+    const rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "foreign-sibling");
+    defer std.testing.allocator.free(rows);
+    const target_index = for (rows, 0..) |row, index| {
+        if (row.client == target_cid) break index + 1;
+    } else return error.TestUnexpectedResult;
+
+    caller.send_len = 0;
+    var drop_buf: [32]u8 = undefined;
+    const drop_text = try std.fmt.bufPrint(&drop_buf, "SESSION DROP #{d}", .{target_index});
+    var drop = try irc_line.parseLine(drop_text);
+    try server.handleSession(caller_id, caller, &drop);
+    try expectContains(caller.send_buf[0..caller.send_len], "TEMPORARILY_UNAVAILABLE");
+    try std.testing.expect(server.sessions.containsClient("foreign-sibling", target_cid));
+    try std.testing.expect(server.sessions.containsClient("foreign-sibling", foreign_cid));
+    try std.testing.expect(server.connFor(target_id) != null);
+}
+
+test "SESSION DROP prefers the current nick-owning sibling among three local token attachments" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const source_id = try addTestLocalClient(&server, "Tri", "three-way");
+    const earlier_id = try addTestLocalClient(&server, "Earlier", "three-way");
+    const owner_id = try addTestLocalClient(&server, "Owner", "three-way");
+    const source_cid = monitorIdFromClient(source_id);
+    const earlier_cid = monitorIdFromClient(earlier_id);
+    const owner_cid = monitorIdFromClient(owner_id);
+    const token = server.sessions.resumeHandleForClient("three-way", source_cid).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup("three-way", earlier_cid, token));
+    try std.testing.expect(server.sessions.joinTokenGroup("three-way", owner_cid, token));
+
+    const earlier = server.connFor(earlier_id).?;
+    const owner = server.connFor(owner_id).?;
+    server.world.unregisterNick(worldIdFromClient(earlier_id));
+    server.world.unregisterNick(worldIdFromClient(owner_id));
+    try earlier.session.setNick("Tri");
+    try owner.session.setNick("Tri");
+    // Model two prior handoffs: the later sibling, not the first eligible row,
+    // is now authoritative for the rendered nick.
+    server.world.unregisterNick(worldIdFromClient(source_id));
+    try server.world.registerNick("Tri", worldIdFromClient(owner_id));
+    try server.world.restoreMember("#three-way", worldIdFromClient(source_id), world_model.MemberModes.fromModes(&.{.op}));
+
+    const rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "three-way");
+    defer std.testing.allocator.free(rows);
+    const source = for (rows) |row| {
+        if (row.client == source_cid) break row;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(LinuxServer.ListedSessionRevoke.removed, server.revokeAttachedSessionOnLocalOwner("three-way", source));
+    try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(owner_id)), server.world.findNick("Tri"));
+    try std.testing.expect(server.world.memberModes("#three-way", worldIdFromClient(owner_id)).?.isOperator());
+    try std.testing.expect(server.sessions.containsClient("three-way", earlier_cid));
+    try std.testing.expect(server.sessions.containsClient("three-way", owner_cid));
 }
 
 test "threaded server: EXTERNAL auto-resume latch excludes certificates and PLAIN" {

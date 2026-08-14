@@ -125,6 +125,10 @@ pub const LocalProjectionArmError = std.mem.Allocator.Error || error{
 
 pub const Session = struct {
     client: ClientId,
+    /// Reclaim credential for this logical session. Multiple physical rows may
+    /// share these bytes. The public LIST/DROP `sid` is derived from the token
+    /// plus this row's stable non-null attachment id (`session_sid.zig`)
+    /// and is never stored here or in Helix.
     token: Token,
     /// Stable identity of this physical attachment across reconnects, node
     /// moves, and Helix upgrades. Null marks a legacy row created through the
@@ -2733,6 +2737,32 @@ pub const SessionStore = struct {
         return true;
     }
 
+    /// Remove exactly the physical row observed by SESSION LIST. A recycled
+    /// client id, rotated token, reminted attachment, or changed signon cannot
+    /// turn a stale selector into a different revoke target.
+    pub fn removeExact(self: *SessionStore, account: []const u8, expected: Session) ?ResumeHandle {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const entry = self.accounts.getEntry(account) orelse return null;
+        const idx = entry.value_ptr.indexOfClient(expected.client) orelse return null;
+        const row = entry.value_ptr.items.items[idx];
+        const attachment_matches = if (expected.attachment_id) |attachment|
+            row.attachment_id != null and attachment.eql(row.attachment_id.?)
+        else
+            row.attachment_id == null;
+        if (row.signon_ms != expected.signon_ms or
+            !std.crypto.timing_safe.eql(Token, row.token, expected.token) or
+            !attachment_matches) return null;
+        const handle = ResumeHandle{ .token = row.token, .attachment_id = row.attachment_id, .portable = row.portable_resume };
+        self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
+        self.removeTokenRowLocked(entry.key_ptr.*, entry.value_ptr.items.items[idx], false);
+        self.removeAttachmentIndexLocked(entry.value_ptr.items.items[idx]);
+        freeSessionOwned(self.allocator, &entry.value_ptr.items.items[idx]);
+        _ = entry.value_ptr.items.swapRemove(idx);
+        if (entry.value_ptr.items.items.len == 0) self.dropAccount(entry);
+        return handle;
+    }
+
     /// Drop a client from whatever account holds it (disconnect path, when the
     /// caller may not know the account). Returns the account name match count (0/1).
     pub fn removeClient(self: *SessionStore, client: ClientId) usize {
@@ -3997,6 +4027,10 @@ test "idempotent current attach rejects stable identity rotation" {
     _ = try s.attach("bob", 10, tok(10), 1);
     _ = try s.attachWithAttachment("bob", 10, tok(10), reminted, 2);
     try testing.expect(s.clientHasAttachment("bob", 10, tok(10), reminted));
+}
+
+test {
+    _ = @import("session_sid.zig");
 }
 
 test "same attachment token rotation never rekeys receive projection work" {
