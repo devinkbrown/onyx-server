@@ -60,10 +60,12 @@ const shard = @import("shard.zig");
 const reactor_wake = @import("reactor_wake.zig");
 const deliver_handle = @import("deliver_handle.zig");
 const client = @import("client.zig");
+const session_drop_tx = @import("session_drop_tx.zig");
 
 pub const ClientId = client.ClientId;
 pub const DeliverBuf = deliver_handle.DeliverBuf;
 pub const DeliverMsg = deliver_handle.DeliverMsg;
+pub const SessionDropControl = session_drop_tx.Control;
 
 const ReactorWake = reactor_wake.ReactorWake;
 
@@ -82,12 +84,17 @@ pub const ReactorFabric = struct {
     pub const pool_slots: usize = capacity;
 
     const Mailbox = queue.BoundedMpmc(DeliverMsg, capacity);
+    const ControlMailbox = queue.BoundedMpmc(SessionDropControl, capacity);
     const Pool = deliver_handle.DeliverPool(pool_slots);
 
     allocator: std.mem.Allocator,
     /// One MPMC inbox per shard; index `i` is shard `i`'s inbox. Heap slice sized
     /// to the runtime shard count.
     inboxes: []Mailbox,
+    /// Dedicated transaction-control path. It never borrows delivery buffers or
+    /// shares delivery back-pressure, so a full chat fan-out cannot silently
+    /// discard a lifecycle commit/reject control.
+    controls: []ControlMailbox,
     /// One wake eventfd per shard; index `i` is shard `i`'s wake handle.
     wakes: []ReactorWake,
     /// One pooled-buffer allocator per shard; index `i` backs shard `i`'s handoffs.
@@ -99,6 +106,10 @@ pub const ReactorFabric = struct {
     /// back-pressure. Non-zero means a fan-out shed load rather than block the
     /// reactor; surfaced by the daemon so a silent drop can never hide.
     dropped: std.atomic.Value(u64) = .init(0),
+    /// Monotonic failed control admissions. A miss must wake or periodically
+    /// rescan the authoritative journal; it never implies terminal failure and
+    /// never poisons a client or asks one to duplicate a live transaction.
+    control_miss: std.atomic.Value(u64) = .init(0),
 
     /// Build a fabric for `num_shards` shards (>= 1, <= `shard.max_shards`).
     ///
@@ -113,6 +124,10 @@ pub const ReactorFabric = struct {
         const inboxes = try allocator.alloc(Mailbox, num_shards);
         errdefer allocator.free(inboxes);
         for (inboxes) |*ib| ib.* = Mailbox.init();
+
+        const controls = try allocator.alloc(ControlMailbox, num_shards);
+        errdefer allocator.free(controls);
+        for (controls) |*ib| ib.* = ControlMailbox.init();
 
         const wakes = try allocator.alloc(ReactorWake, num_shards);
         errdefer allocator.free(wakes);
@@ -132,6 +147,7 @@ pub const ReactorFabric = struct {
         return .{
             .allocator = allocator,
             .inboxes = inboxes,
+            .controls = controls,
             .wakes = wakes,
             .pools = pools,
         };
@@ -144,6 +160,7 @@ pub const ReactorFabric = struct {
         for (self.wakes) |*w| w.deinit();
         self.allocator.free(self.wakes);
         self.allocator.free(self.inboxes);
+        self.allocator.free(self.controls);
         self.* = undefined;
     }
 
@@ -184,6 +201,14 @@ pub const ReactorFabric = struct {
         return self.dropped.load(.monotonic);
     }
 
+    pub fn recordControlMiss(self: *ReactorFabric) u64 {
+        return self.control_miss.fetchAdd(1, .monotonic);
+    }
+
+    pub fn controlMissCount(self: *const ReactorFabric) u64 {
+        return self.control_miss.load(.monotonic);
+    }
+
     /// Enqueue `msg` for the reactor owning `target`. Returns false if that inbox
     /// is full (caller decides: drop, retry, or back-pressure). Callable from any
     /// thread (MPMC). Does NOT wake the target — call `wake` after a successful
@@ -196,6 +221,20 @@ pub const ReactorFabric = struct {
     /// the count written. Called only by that shard's owning reactor.
     pub fn drain(self: *ReactorFabric, target: u12, out: []DeliverMsg) usize {
         return self.inboxes[target].popBatch(out);
+    }
+
+    /// Enqueue a self-contained session-drop transaction control. No borrowed
+    /// pointers or credential slices cross this boundary.
+    pub fn sendControlTo(self: *ReactorFabric, target: u12, control: SessionDropControl) bool {
+        if (self.controls[target].push(control)) return true;
+        _ = self.recordControlMiss();
+        return false;
+    }
+
+    /// Drain controls addressed to this owner shard. The owner validates every
+    /// generational target and transaction id before acting.
+    pub fn drainControls(self: *ReactorFabric, target: u12, out: []SessionDropControl) usize {
+        return self.controls[target].popBatch(out);
     }
 
     /// Poke the wake eventfd of the reactor owning `target` so its io_uring loop
@@ -477,4 +516,51 @@ test "fabric drop counter accumulates and is observable" {
     try testing.expectEqual(@as(u64, 0), fabric.recordDrop(1));
     try testing.expectEqual(@as(u64, 1), fabric.recordDrop(3));
     try testing.expectEqual(@as(u64, 4), fabric.droppedCount());
+}
+
+test "session controls are isolated from delivery pressure and count full admission misses" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fabric = ReactorFabric.init(testing.allocator, 2) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fabric.deinit();
+
+    // A saturated delivery inbox must not consume the independent control ring.
+    var held: [ReactorFabric.capacity]*DeliverBuf = undefined;
+    for (&held) |*slot| {
+        slot.* = fabric.acquire(0, "x") orelse return error.TestExpectedEqual;
+        try testing.expect(fabric.sendTo(0, .{ .to = .{ .shard = 0, .slot = 1, .gen = 1 }, .buf = slot.* }));
+    }
+    const control = SessionDropControl.init(.{ .slot_plus_one = 1, .generation = 1 }) orelse return error.TestExpectedEqual;
+    try testing.expect(fabric.sendControlTo(0, control));
+
+    // Control fullness is independently observable and never poisons/drops a
+    // delivery.
+    for (1..ReactorFabric.capacity) |_| try testing.expect(fabric.sendControlTo(0, control));
+    try testing.expect(!fabric.sendControlTo(0, control));
+    try testing.expectEqual(@as(u64, 1), fabric.controlMissCount());
+
+    var controls: [ReactorFabric.capacity]SessionDropControl = undefined;
+    try testing.expectEqual(ReactorFabric.capacity, fabric.drainControls(0, &controls));
+    var messages: [ReactorFabric.capacity]DeliverMsg = undefined;
+    try testing.expectEqual(ReactorFabric.capacity, fabric.drain(0, &messages));
+    for (messages) |msg| fabric.release(0, msg.buf);
+}
+
+test "session controls route only to their addressed shard" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fabric = ReactorFabric.init(testing.allocator, 3) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fabric.deinit();
+
+    const control = SessionDropControl.init(.{ .slot_plus_one = 1, .generation = 1 }) orelse return error.TestExpectedEqual;
+    try testing.expect(fabric.sendControlTo(2, control));
+    var none: [1]SessionDropControl = undefined;
+    try testing.expectEqual(@as(usize, 0), fabric.drainControls(0, &none));
+    try testing.expectEqual(@as(usize, 0), fabric.drainControls(1, &none));
+    var received: [1]SessionDropControl = undefined;
+    try testing.expectEqual(@as(usize, 1), fabric.drainControls(2, &received));
 }

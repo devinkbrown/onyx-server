@@ -49,6 +49,7 @@ pub const Error = std.mem.Allocator.Error || error{
     InvalidAttachmentId,
     DuplicateAttachmentId,
     AttachmentIdMismatch,
+    SessionDropReserved,
 };
 
 pub const Config = struct {
@@ -123,6 +124,28 @@ pub const LocalProjectionArmError = std.mem.Allocator.Error || error{
     TooManyPendingChannels,
 };
 
+/// Transient owner-protocol identity. Zero is never a valid reservation and is
+/// therefore safe as the inline "not reserved" Session value.
+pub const DropReservationId = u64;
+
+/// Exact physical row selector used by the reserved cross-owner DROP protocol.
+/// It deliberately mirrors the LIST/CAS identity; a recyclable client handle
+/// alone can never reserve or remove a different later attachment.
+pub const ExactSelector = struct {
+    client: ClientId,
+    token: Token,
+    signon_ms: i64,
+    attachment_id: ?AttachmentId = null,
+};
+
+pub const ReserveDropResult = enum {
+    reserved,
+    already_reserved,
+    reserved_by_other,
+    stale,
+    invalid_id,
+};
+
 pub const Session = struct {
     client: ClientId,
     /// Reclaim credential for this logical session. Multiple physical rows may
@@ -164,7 +187,22 @@ pub const Session = struct {
     /// SRA3/local current projection journal for this physical attachment only.
     /// It must never be copied to siblings sharing the reusable token.
     attachment_channel_projections: ?*LocalChannelProjectionSet = null,
+    /// Ephemeral two-owner DROP reservation. Never serialized into Helix or a
+    /// replica; every lifecycle mutation must leave an owned reservation alone
+    /// until its owner commits or cancels.
+    drop_reservation: DropReservationId = 0,
 };
+
+fn sessionMatchesExact(session: Session, expected: ExactSelector) bool {
+    const attachment_matches = if (expected.attachment_id) |attachment|
+        session.attachment_id != null and attachment.eql(session.attachment_id.?)
+    else
+        session.attachment_id == null;
+    return session.client == expected.client and
+        session.signon_ms == expected.signon_ms and
+        attachment_matches and
+        std.crypto.timing_safe.eql(Token, session.token, expected.token);
+}
 
 fn sessionMatchesAttachment(session: Session, token: Token, attachment_id: AttachmentId) bool {
     const current = session.attachment_id orelse return false;
@@ -266,6 +304,7 @@ const TokenIndexEntry = struct {
     portable_rows: usize = 0,
     dirty_rows: usize = 0,
     projection_dirty_rows: usize = 0,
+    drop_reserved_rows: usize = 0,
     local_projections: LocalChannelProjectionSet = .{},
 
     fn deinit(self: *TokenIndexEntry, allocator: std.mem.Allocator) void {
@@ -566,6 +605,7 @@ pub const PreparedTokenBind = struct {
         if (self.index >= self.list.items.items.len) return false;
         const claimant = &self.list.items.items[self.index];
         if (claimant.client != self.client or
+            claimant.drop_reservation != 0 or
             !std.crypto.timing_safe.eql(Token, claimant.token, self.expected_token) or
             claimant.portable_resume != self.expected_portable or
             claimant.replica_dirty != self.expected_dirty or
@@ -585,6 +625,7 @@ pub const PreparedTokenBind = struct {
             return false;
         }
         const current_target = self.store.tokenGroupStateLocked(self.target_token);
+        if (self.store.tokenGroupHasDropReservationLocked(self.target_token)) return false;
         if (current_target.dirty != self.target_dirty or
             current_target.projection_dirty != self.target_projection_dirty or
             current_target.local_projections.revision != self.target_local_projection_revision)
@@ -768,6 +809,7 @@ pub const PreparedAttachmentRebind = struct {
         const claimant = &self.claimant_list.items.items[self.claimant_index];
         const ghost = &self.ghost_list.items.items[self.ghost_index];
         if (claimant.client != self.claimant_client or
+            claimant.drop_reservation != 0 or ghost.drop_reservation != 0 or
             ghost.client != self.ghost_client or ghost.attached or
             !sessionMatchesAttachment(ghost.*, self.token, self.attachment_id))
         {
@@ -1013,6 +1055,7 @@ pub const SessionStore = struct {
         if (session.portable_resume) group.portable_rows += 1;
         if (session.replica_dirty) group.dirty_rows += 1;
         if (session.replica_projection_dirty) group.projection_dirty_rows += 1;
+        if (session.drop_reservation != 0) group.drop_reserved_rows += 1;
         if (session.local_channel_projections) |set| {
             if (set.revision >= group.local_projections.revision)
                 group.local_projections = set.*;
@@ -1040,11 +1083,16 @@ pub const SessionStore = struct {
             std.debug.assert(entry.projection_dirty_rows != 0);
             entry.projection_dirty_rows -= 1;
         }
+        if (session.drop_reservation != 0) {
+            std.debug.assert(entry.drop_reserved_rows != 0);
+            entry.drop_reserved_rows -= 1;
+        }
         _ = entry.rows.swapRemove(index);
         if (entry.rows.items.len != 0) return;
         entry.portable_rows = 0;
         entry.dirty_rows = 0;
         entry.projection_dirty_rows = 0;
+        entry.drop_reserved_rows = 0;
         entry.local_projections = .{};
         if (keep_empty) return;
         entry.deinit(self.allocator);
@@ -1151,6 +1199,32 @@ pub const SessionStore = struct {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
+        // DROP freezes exact-token membership until its owner transaction
+        // either commits or cancels. Reject a distinct sibling attach before
+        // reserving index/list storage so ignored allocation failures cannot
+        // obscure the protocol conflict or publish a partially joined group.
+        const inherited = self.tokenGroupStateForAccountLocked(account, token) orelse
+            return error.TokenAccountMismatch;
+        if (inherited.drop_reserved)
+            return error.SessionDropReserved;
+        if (self.accounts.getPtr(account)) |existing_list| {
+            if (existing_list.indexOfClient(client)) |existing_index| {
+                const source = existing_list.items.items[existing_index];
+                if (source.drop_reservation != 0 or
+                    (!std.crypto.timing_safe.eql(Token, source.token, token) and
+                        self.tokenGroupHasDropReservationLocked(source.token)))
+                    return error.SessionDropReserved;
+            } else if (existing_list.items.items.len >= self.cfg.max_sessions_per_account) {
+                if (oldestDetached(existing_list)) |evict_index| {
+                    const victim = existing_list.items.items[evict_index];
+                    if (victim.drop_reservation != 0 or
+                        (!std.crypto.timing_safe.eql(Token, victim.token, token) and
+                            self.tokenGroupHasDropReservationLocked(victim.token)))
+                        return error.SessionDropReserved;
+                }
+            }
+        }
+
         var insert_attachment_index = false;
         if (attachment_id) |candidate| {
             if (self.attachmentOwnerLocked(candidate)) |owner| {
@@ -1170,8 +1244,6 @@ pub const SessionStore = struct {
         // An exact reusable token is a global capability. Bind it to exactly one
         // ASCII-casefolded account before ensureAccount can allocate/publish an
         // empty map entry or replacement can merge dirty/journal state.
-        const inherited = self.tokenGroupStateForAccountLocked(account, token) orelse
-            return error.TokenAccountMismatch;
         const account_preexisting = self.accounts.contains(account);
         const list = try self.ensureAccount(account);
         errdefer if (!account_preexisting) {
@@ -1184,6 +1256,7 @@ pub const SessionStore = struct {
         defer if (staged_token_entry) |*entry| entry.deinit(self.allocator);
         if (list.indexOfClient(client)) |idx| {
             const displaced = list.items.items[idx];
+            if (displaced.drop_reservation != 0) return error.SessionDropReserved;
             if (attachment_id) |requested| {
                 if (displaced.attachment_id) |current| {
                     if (!current.eql(requested)) return error.AttachmentIdMismatch;
@@ -1284,6 +1357,7 @@ pub const SessionStore = struct {
             // session. Never evict an attached session (that would drop a peer).
             if (oldestDetached(list)) |evict| {
                 const displaced = list.items.items[evict];
+                if (displaced.drop_reservation != 0) return error.SessionDropReserved;
                 evicted = .{
                     .client = displaced.client,
                     .token = displaced.token,
@@ -1352,6 +1426,7 @@ pub const SessionStore = struct {
 
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
+        if (self.sessionOrTokenGroupHasDropReservationLocked(list.items.items[idx])) return false;
         list.items.items[idx].attached = false;
         return true;
     }
@@ -1366,6 +1441,7 @@ pub const SessionStore = struct {
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
         const session = &list.items.items[idx];
+        if (self.sessionOrTokenGroupHasDropReservationLocked(session.*)) return false;
         const copied = if (snapshot) |bytes|
             if (bytes.len != 0) self.allocator.dupe(u8, bytes) catch {
                 // Transport loss still detaches the row, but snapshot replacement
@@ -1392,11 +1468,12 @@ pub const SessionStore = struct {
 
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
-        if (tokenIsSentinel(list.items.items[idx].token)) return false;
-        self.setTokenGroupPortableLocked(list.items.items[idx].token, true);
+        const session = list.items.items[idx];
+        if (tokenIsSentinel(session.token)) return false;
+        self.setTokenGroupPortableLocked(session.token, true);
         // The first portable credential exposes the reusable group. Every
         // current physical sibling therefore needs its own initial SRA3 OFFER.
-        _ = self.markTokenAttachmentReplicasDirtyLocked(list.items.items[idx].token);
+        _ = self.markTokenAttachmentReplicasDirtyLocked(session.token);
         return true;
     }
 
@@ -1409,11 +1486,11 @@ pub const SessionStore = struct {
 
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
-        if (tokenIsSentinel(list.items.items[idx].token)) {
+        const session = &list.items.items[idx];
+        if (tokenIsSentinel(session.token)) {
             list.items.items[idx].portable_resume = false;
             return !issued;
         }
-        const session = &list.items.items[idx];
         self.setPortableLocked(session, issued);
         if (issued and session.attachment_id != null)
             self.setAttachmentReplicaDirtyLocked(session, true);
@@ -1425,7 +1502,7 @@ pub const SessionStore = struct {
     /// observed portable token and arms every stable sibling exactly once. The
     /// maintained index makes this allocation-free and visits each indexed row
     /// at most once, so an OOM cannot expose a partially normalized registry.
-    pub fn normalizePortableGroupsAfterRestore(self: *SessionStore) std.mem.Allocator.Error!void {
+    pub fn normalizePortableGroupsAfterRestore(self: *SessionStore) Error!void {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
@@ -1517,13 +1594,15 @@ pub const SessionStore = struct {
         // Exact restore may discard only the fresh, clean bootstrap row created
         // for this reconnecting socket. Any existing authority/retry state needs
         // an explicit revoke/transfer transaction, never silent destruction.
-        if (!claimant.attached or claimant.attachment_id == null or claimant.snapshot != null or
+        if (claimant.drop_reservation != 0 or !claimant.attached or claimant.attachment_id == null or claimant.snapshot != null or
             claimant.portable_resume or claimant.replica_dirty or claimant.replica_projection_dirty or
             claimant.attachment_replica_dirty or claimant.attachment_replica_projection_dirty or
             claimant.local_channel_projections != null or claimant.attachment_channel_projections != null)
         {
             return null;
         }
+        if (self.tokenGroupHasDropReservationLocked(claimant.token) or
+            self.tokenGroupHasDropReservationLocked(token)) return null;
         if (!tokenIsSentinel(claimant.token)) {
             const claimant_group = self.tokenEntryLocked(claimant.token) orelse return null;
             if (claimant_group.rows.items.len != 1) return null;
@@ -1535,7 +1614,8 @@ pub const SessionStore = struct {
         if (!std.ascii.eqlIgnoreCase(ghost_locator.account, account)) return null;
         const target_list = self.accounts.getPtr(ghost_locator.account) orelse return null;
         const target_index = target_list.indexOfClient(ghost_locator.client) orelse return null;
-        if (!sessionMatchesAttachment(target_list.items.items[target_index], token, attachment_id)) return null;
+        if (!sessionMatchesAttachment(target_list.items.items[target_index], token, attachment_id) or
+            target_list.items.items[target_index].drop_reservation != 0) return null;
         if ((target_list == claimant_list and target_index == claimant_index) or
             target_list.items.items[target_index].attached)
         {
@@ -1577,6 +1657,7 @@ pub const SessionStore = struct {
 
         const target = self.tokenGroupStateForAccountLocked(account, token) orelse return null;
         if (kind == .join_existing and !target.found) return null;
+        if (self.tokenGroupHasDropReservationLocked(token)) return null;
 
         // Reject a duplicate runtime id even when case-variant account keys
         // exist. The ticket must represent a genuinely new claimant.
@@ -1618,6 +1699,10 @@ pub const SessionStore = struct {
             staged_account_list.?.* = .{};
             staged_account_list.?.items.ensureUnusedCapacity(self.allocator, 1) catch return null;
             list = staged_account_list.?;
+        }
+
+        if (evict_index) |index| {
+            if (self.sessionOrTokenGroupHasDropReservationLocked(list.items.items[index])) return null;
         }
 
         var staged_target_token_entry = self.reserveTokenRowInsertLocked(token) catch return null;
@@ -1737,7 +1822,10 @@ pub const SessionStore = struct {
         const list = account_entry.value_ptr;
         const index = list.indexOfClient(client) orelse return null;
         const claimant = list.items.items[index];
+        if (claimant.drop_reservation != 0) return null;
         if (tokenIsSentinel(token)) return null;
+        if (self.tokenGroupHasDropReservationLocked(claimant.token)) return null;
+        if (self.tokenGroupHasDropReservationLocked(token)) return null;
 
         // `adopt_verified` proves possession, not permission to relabel another
         // account's exact capability. Case variants remain one account, and
@@ -2728,6 +2816,7 @@ pub const SessionStore = struct {
 
         const entry = self.accounts.getEntry(account) orelse return false;
         const idx = entry.value_ptr.indexOfClient(client) orelse return false;
+        if (self.sessionOrTokenGroupHasDropReservationLocked(entry.value_ptr.items.items[idx])) return false;
         self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
         self.removeTokenRowLocked(entry.key_ptr.*, entry.value_ptr.items.items[idx], false);
         self.removeAttachmentIndexLocked(entry.value_ptr.items.items[idx]);
@@ -2746,6 +2835,7 @@ pub const SessionStore = struct {
         const entry = self.accounts.getEntry(account) orelse return null;
         const idx = entry.value_ptr.indexOfClient(expected.client) orelse return null;
         const row = entry.value_ptr.items.items[idx];
+        if (self.sessionOrTokenGroupHasDropReservationLocked(row)) return null;
         const attachment_matches = if (expected.attachment_id) |attachment|
             row.attachment_id != null and attachment.eql(row.attachment_id.?)
         else
@@ -2753,6 +2843,83 @@ pub const SessionStore = struct {
         if (row.signon_ms != expected.signon_ms or
             !std.crypto.timing_safe.eql(Token, row.token, expected.token) or
             !attachment_matches) return null;
+        const handle = ResumeHandle{ .token = row.token, .attachment_id = row.attachment_id, .portable = row.portable_resume };
+        self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
+        self.removeTokenRowLocked(entry.key_ptr.*, entry.value_ptr.items.items[idx], false);
+        self.removeAttachmentIndexLocked(entry.value_ptr.items.items[idx]);
+        freeSessionOwned(self.allocator, &entry.value_ptr.items.items[idx]);
+        _ = entry.value_ptr.items.swapRemove(idx);
+        if (entry.value_ptr.items.items.len == 0) self.dropAccount(entry);
+        return handle;
+    }
+
+    /// Reserve one exact physical row for the short-lived two-owner DROP
+    /// transaction. Reservation is idempotent for its owner and exclusive for
+    /// competitors; stale selectors never mutate a current row.
+    pub fn reserveDrop(self: *SessionStore, account: []const u8, expected: ExactSelector, id: DropReservationId) ReserveDropResult {
+        if (id == 0) return .invalid_id;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const entry = self.accounts.getEntry(account) orelse return .stale;
+        const idx = entry.value_ptr.indexOfClient(expected.client) orelse return .stale;
+        const row = &entry.value_ptr.items.items[idx];
+        if (!sessionMatchesExact(row.*, expected)) return .stale;
+        if (row.drop_reservation == 0) {
+            row.drop_reservation = id;
+            if (self.tokenEntryMutLocked(row.token)) |group| group.drop_reserved_rows += 1;
+            return .reserved;
+        }
+        return if (row.drop_reservation == id) .already_reserved else .reserved_by_other;
+    }
+
+    pub fn validateDropReservation(self: *const SessionStore, account: []const u8, expected: ExactSelector, id: DropReservationId) bool {
+        if (id == 0) return false;
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        const list = self.accounts.getPtr(account) orelse return false;
+        const idx = list.indexOfClient(expected.client) orelse return false;
+        const row = list.items.items[idx];
+        return row.drop_reservation == id and sessionMatchesExact(row, expected);
+    }
+
+    pub fn hasDropReservation(self: *const SessionStore, account: []const u8, expected: ExactSelector) bool {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        const list = self.accounts.getPtr(account) orelse return false;
+        const idx = list.indexOfClient(expected.client) orelse return false;
+        const row = list.items.items[idx];
+        return row.drop_reservation != 0 and sessionMatchesExact(row, expected);
+    }
+
+    /// Cancel is owner-only and idempotent for an already absent/stale row.
+    /// A competing transaction can never clear another owner's reservation.
+    pub fn cancelDropReservation(self: *SessionStore, account: []const u8, expected: ExactSelector, id: DropReservationId) bool {
+        if (id == 0) return false;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const entry = self.accounts.getEntry(account) orelse return false;
+        const idx = entry.value_ptr.indexOfClient(expected.client) orelse return false;
+        const row = &entry.value_ptr.items.items[idx];
+        if (!sessionMatchesExact(row.*, expected) or row.drop_reservation != id) return false;
+        row.drop_reservation = 0;
+        if (self.tokenEntryMutLocked(row.token)) |group| {
+            std.debug.assert(group.drop_reserved_rows != 0);
+            group.drop_reserved_rows -= 1;
+        }
+        return true;
+    }
+
+    /// Commit the exact row only when the owning transaction still holds its
+    /// reservation. Cleanup matches `removeExact`; no other reservation or
+    /// stale selector can remove/mutate the row.
+    pub fn commitDropReservation(self: *SessionStore, account: []const u8, expected: ExactSelector, id: DropReservationId) ?ResumeHandle {
+        if (id == 0) return null;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const entry = self.accounts.getEntry(account) orelse return null;
+        const idx = entry.value_ptr.indexOfClient(expected.client) orelse return null;
+        const row = entry.value_ptr.items.items[idx];
+        if (row.drop_reservation != id or !sessionMatchesExact(row, expected)) return null;
         const handle = ResumeHandle{ .token = row.token, .attachment_id = row.attachment_id, .portable = row.portable_resume };
         self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
         self.removeTokenRowLocked(entry.key_ptr.*, entry.value_ptr.items.items[idx], false);
@@ -2772,6 +2939,7 @@ pub const SessionStore = struct {
         var it = self.accounts.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.indexOfClient(client)) |idx| {
+                if (self.sessionOrTokenGroupHasDropReservationLocked(entry.value_ptr.items.items[idx])) return 0;
                 self.removeDirtyRowLocked(&entry.value_ptr.items.items[idx]);
                 self.removeTokenRowLocked(entry.key_ptr.*, entry.value_ptr.items.items[idx], false);
                 self.removeAttachmentIndexLocked(entry.value_ptr.items.items[idx]);
@@ -3194,6 +3362,7 @@ pub const SessionStore = struct {
         portable: bool = false,
         dirty: bool = false,
         projection_dirty: bool = false,
+        drop_reserved: bool = false,
         local_projections: LocalChannelProjectionSet = .{},
     };
 
@@ -3206,8 +3375,24 @@ pub const SessionStore = struct {
             .portable = entry.portable_rows != 0,
             .dirty = entry.dirty_rows != 0,
             .projection_dirty = entry.projection_dirty_rows != 0,
+            .drop_reserved = entry.drop_reserved_rows != 0,
             .local_projections = entry.local_projections,
         };
+    }
+
+    /// Reservation freezes token-wide state and membership changes for the
+    /// exact indexed group. This never scans unrelated accounts or tokens.
+    fn tokenGroupHasDropReservationLocked(self: *SessionStore, token: Token) bool {
+        const entry = self.tokenEntryLocked(token) orelse return false;
+        return entry.drop_reserved_rows != 0;
+    }
+
+    fn sessionOrTokenGroupHasDropReservationLocked(
+        self: *SessionStore,
+        session: Session,
+    ) bool {
+        return session.drop_reservation != 0 or
+            self.tokenGroupHasDropReservationLocked(session.token);
     }
 
     /// Return exact-token group state only when every matching row belongs to
@@ -3232,6 +3417,7 @@ pub const SessionStore = struct {
             .portable = entry.portable_rows != 0,
             .dirty = entry.dirty_rows != 0,
             .projection_dirty = entry.projection_dirty_rows != 0,
+            .drop_reserved = entry.drop_reserved_rows != 0,
             .local_projections = entry.local_projections,
         };
     }
@@ -3610,6 +3796,8 @@ fn sanitizeCopiedSession(session: *Session) void {
     session.snapshot = null;
     session.local_channel_projections = null;
     session.attachment_channel_projections = null;
+    // Cross-owner DROP tickets never survive an exported snapshot/Helix image.
+    session.drop_reservation = 0;
 }
 
 fn freeSessionOwned(allocator: std.mem.Allocator, session: *Session) void {
@@ -3663,6 +3851,7 @@ fn expectTokenIndexCoherent(store: *SessionStore) !void {
         var portable_rows: usize = 0;
         var dirty_rows: usize = 0;
         var projection_dirty_rows: usize = 0;
+        var drop_reserved_rows: usize = 0;
         const owner = entry.rows.items[0].account;
         for (entry.rows.items, 0..) |locator, locator_index| {
             try testing.expect(std.ascii.eqlIgnoreCase(owner, locator.account));
@@ -3672,6 +3861,7 @@ fn expectTokenIndexCoherent(store: *SessionStore) !void {
             if (session.portable_resume) portable_rows += 1;
             if (session.replica_dirty) dirty_rows += 1;
             if (session.replica_projection_dirty) projection_dirty_rows += 1;
+            if (session.drop_reservation != 0) drop_reserved_rows += 1;
             if (session.local_channel_projections) |set| {
                 try testing.expectEqualDeep(entry.local_projections, set.*);
             } else {
@@ -3685,6 +3875,7 @@ fn expectTokenIndexCoherent(store: *SessionStore) !void {
         try testing.expectEqual(portable_rows, entry.portable_rows);
         try testing.expectEqual(dirty_rows, entry.dirty_rows);
         try testing.expectEqual(projection_dirty_rows, entry.projection_dirty_rows);
+        try testing.expectEqual(drop_reserved_rows, entry.drop_reserved_rows);
     }
 
     var registry_rows: usize = 0;
@@ -3885,7 +4076,9 @@ test "exact rebind token-index work ignores unrelated registry cardinality" {
     try testing.expect(prepared.commit());
     prepared.finish();
     const complexity = s.tokenIndexComplexitySnapshot();
-    try testing.expectEqual(@as(usize, 3), complexity.lookups);
+    // Three identity/remap lookups plus the two O(1) source/target reservation
+    // guards required to freeze both token groups during exact rebind.
+    try testing.expectEqual(@as(usize, 5), complexity.lookups);
     try testing.expectEqual(@as(usize, 2), complexity.group_row_visits);
     try expectTokenIndexCoherent(&s);
 }
@@ -5837,6 +6030,25 @@ test "sentinel tracks independent accounts without becoming a token group" {
     try testing.expect(!alice.portable);
     try testing.expect(!bob.portable);
 
+    const reserved = ExactSelector{
+        .client = 1,
+        .token = sentinel,
+        .signon_ms = 10,
+        .attachment_id = null,
+    };
+    try testing.expectEqual(ReserveDropResult.reserved, s.reserveDrop("alice", reserved, 77));
+    try testing.expect(!s.markDetached("alice", 1));
+    try testing.expect(!s.markDetachedWithSnapshot("alice", 1, "reserved-sentinel"));
+    try testing.expect(!s.remove("alice", 1));
+    try testing.expect(s.removeExact("alice", .{
+        .client = 1,
+        .token = sentinel,
+        .signon_ms = 10,
+        .attachment_id = null,
+    }) == null);
+    try testing.expectEqual(@as(usize, 0), s.removeClient(1));
+    try testing.expect(s.cancelDropReservation("alice", reserved, 77));
+
     // The absence marker cannot be issued, joined, adopted, dirtied, or given
     // a channel-projection journal as though it were a reusable credential.
     try testing.expect(!s.markPortableResumeIssued("alice", 1));
@@ -6396,6 +6608,79 @@ const SessionMtCtx = struct {
         }
     }
 };
+
+test "drop reservation is exact exclusive and transient" {
+    var store = SessionStore.init(testing.allocator);
+    defer store.deinit();
+    const first = aid(0x91);
+    const second = aid(0x92);
+    const sibling = aid(0x93);
+    _ = try store.attachWithAttachment("alice", 10, tok(0x81), first, 100);
+    _ = try store.attachWithAttachment("alice", 11, tok(0x82), second, 101);
+    _ = try store.attachWithAttachment("alice", 12, tok(0x81), sibling, 102);
+    const selector = ExactSelector{ .client = 10, .token = tok(0x81), .signon_ms = 100, .attachment_id = first };
+
+    try testing.expectEqual(ReserveDropResult.invalid_id, store.reserveDrop("alice", selector, 0));
+    try testing.expectEqual(ReserveDropResult.stale, store.reserveDrop("alice", .{ .client = 10, .token = tok(0x81), .signon_ms = 99, .attachment_id = first }, 7));
+    try testing.expectEqual(ReserveDropResult.reserved, store.reserveDrop("alice", selector, 7));
+    try testing.expectEqual(ReserveDropResult.already_reserved, store.reserveDrop("alice", selector, 7));
+    try testing.expectEqual(ReserveDropResult.reserved_by_other, store.reserveDrop("alice", selector, 8));
+    try testing.expect(store.validateDropReservation("alice", selector, 7));
+    try testing.expect(store.hasDropReservation("alice", selector));
+    try testing.expect(!store.markDetached("alice", 10));
+    try testing.expect(!store.markDetachedWithSnapshot("alice", 10, "frozen"));
+    // Retry/portability journals are not identity or liveness mutations. They
+    // must remain writable while DROP holds the exact row; suppressing them
+    // after a live mutation would create permanent replica desynchronization.
+    try testing.expect(store.markPortableResumeIssued("alice", 12));
+    try testing.expect(store.restorePortableResumeIssued("alice", 12, true));
+    try testing.expect(store.markTokenReplicaProjectionDirty(tok(0x81)));
+    try testing.expect(store.markAttachmentReplicaProjectionDirty(tok(0x81), first));
+    _ = try store.armTokenLocalChannelProjection(tok(0x81), "#frozen", true, 0);
+    _ = try store.armAttachmentLocalChannelProjection(tok(0x81), first, "#frozen", true, 0);
+    try testing.expectError(
+        error.SessionDropReserved,
+        store.attachWithAttachment("alice", 13, tok(0x81), aid(0x94), 103),
+    );
+    try testing.expect(!store.containsClient("alice", 13));
+    try testing.expect(!store.markDetached("alice", 12));
+    try testing.expect(!store.markDetachedWithSnapshot("alice", 12, "sibling-frozen"));
+    try testing.expect(!store.remove("alice", 12));
+    try testing.expect(store.removeExact("alice", .{
+        .client = 12,
+        .token = tok(0x81),
+        .signon_ms = 102,
+        .attachment_id = sibling,
+    }) == null);
+    try testing.expectEqual(@as(usize, 0), store.removeClient(12));
+    try testing.expectError(
+        error.SessionDropReserved,
+        store.attachWithAttachment("alice", 12, tok(0x82), sibling, 104),
+    );
+    try testing.expectError(error.SessionDropReserved, store.attachWithAttachment("alice", 10, tok(0x83), first, 102));
+    try testing.expect(!store.joinTokenGroup("alice", 10, tok(0x82)));
+    try testing.expect(!store.joinTokenGroup("alice", 12, tok(0x82)));
+    try testing.expect(store.prepareTokenBind("alice", 11, tok(0x81), .join_existing) == null);
+    try testing.expect(store.prepareBootstrapTokenAttach("alice", 13, tok(0x81), .join_existing, 103) == null);
+    try testing.expect(store.removeExact("alice", .{ .client = 10, .token = tok(0x81), .signon_ms = 100, .attachment_id = first }) == null);
+    try testing.expect(!store.cancelDropReservation("alice", selector, 8));
+    try testing.expect(store.cancelDropReservation("alice", selector, 7));
+    try testing.expect(!store.hasDropReservation("alice", selector));
+
+    try testing.expectEqual(ReserveDropResult.reserved, store.reserveDrop("alice", selector, 9));
+    var copied: [3]Session = undefined;
+    const copied_rows = store.sessionsInto("alice", &copied);
+    const copied_first = for (copied_rows) |row| {
+        if (row.client == 10) break row;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(DropReservationId, 0), copied_first.drop_reservation);
+    try testing.expect(store.commitDropReservation("alice", .{ .client = 10, .token = tok(0x81), .signon_ms = 100, .attachment_id = second }, 9) == null);
+    const handle = store.commitDropReservation("alice", selector, 9) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.crypto.timing_safe.eql(Token, handle.token, tok(0x81)));
+    try testing.expect(!store.containsClient("alice", 10));
+    try testing.expect(store.containsClient("alice", 11));
+    try testing.expect(store.containsClient("alice", 12));
+}
 
 test "SessionStore concurrent writers and readers preserve sessions" {
     var s = SessionStore.init(testing.allocator);

@@ -346,6 +346,7 @@ const shard_mod = @import("shard.zig");
 const reactor_pool_mod = @import("reactor_pool.zig");
 const reuseport = @import("reuseport.zig");
 const reactor_fabric = @import("reactor_fabric.zig");
+const session_drop_tx = @import("session_drop_tx.zig");
 const deliver_handle = @import("deliver_handle.zig");
 const oper_mod = @import("oper.zig");
 const conn_class = @import("conn_class.zig");
@@ -3948,6 +3949,10 @@ pub const LinuxServer = struct {
     activity_subs: activity_subscriptions.SubscriptionStore,
     /// Phase 3: per-account live session registry (multi-device / bouncer).
     sessions: sessions_mod.SessionStore,
+    /// Authoritative bounded journal for cross-reactor SESSION DROP. Controls
+    /// carry only its generational ids and are disposable wake hints; every
+    /// transition is serialized by World's write lock.
+    session_drop_journal: session_drop_tx.Journal = session_drop_tx.Journal.init(),
     /// Bumped on Helix session-registry adopt so leftover LIST ordinals cannot
     /// revoke a successor identity. `0` is reserved (empty cache).
     session_list_epoch: u64 = 1,
@@ -5733,6 +5738,7 @@ pub const LinuxServer = struct {
         self.reset_store.deinit();
         self.totp.deinit();
         self.activity_subs.deinit();
+        self.session_drop_journal.deinit();
         self.sessions.deinit();
         if (self.pending_migrations) |*pm| pm.deinit();
         self.session_replica_store.deinit();
@@ -5869,6 +5875,7 @@ pub const LinuxServer = struct {
         // fabric record. Abort it before any already-mailboxed later event can
         // append, then sweep again for failures discovered while draining.
         self.abortPoisonedDeliveries();
+        self.drainSessionDropControls();
         self.drainFabric();
         self.drainAttachmentSpoolForCurrentReactor();
         if (self.rx() == &self.reactors[0]) self.retryRelayV2Outbox();
@@ -5888,6 +5895,19 @@ pub const LinuxServer = struct {
     /// buffer is still released so the pool never leaks.
     fn drainFabric(self: *LinuxServer) void {
         _ = self.drainFabricCount();
+    }
+
+    /// Drain the independent SESSION DROP control lane before ordinary byte
+    /// delivery. A control is only a wake hint: the bounded journal remains the
+    /// authority, so a late/duplicate control merely prompts the same sweep.
+    fn drainSessionDropControls(self: *LinuxServer) void {
+        const fabric = if (self.fabric) |*f| f else {
+            self.sweepSessionDropTransactions();
+            return;
+        };
+        var controls: [64]reactor_fabric.SessionDropControl = undefined;
+        while (fabric.drainControls(self.rx().shard_id, &controls) != 0) {}
+        self.sweepSessionDropTransactions();
     }
 
     /// Counted form used by the Helix final fixed point. A delivery drained on a
@@ -6103,6 +6123,9 @@ pub const LinuxServer = struct {
     /// Fired when the periodic timer elapses: run the timeout sweep and re-arm.
     fn onTimerTick(self: *LinuxServer) void {
         self.rx().timer_armed = false;
+        // The journal sweep is authoritative recovery for a missed control
+        // mailbox hint and for a requester/owner that vanished before cleanup.
+        self.sweepSessionDropTransactions();
         // A delivery gap is a stream-integrity failure, not ordinary timeout
         // work. Disconnect it before any timer-driven projection or retry can
         // enqueue a later event to that generation.
@@ -7192,6 +7215,7 @@ pub const LinuxServer = struct {
             // serialization instead of touching it outside the World lock.
             self.world.lockWrite();
             self.abortPoisonedDeliveries();
+            self.drainSessionDropControls();
             self.drainFabric();
             self.abortPoisonedDeliveries();
             self.world.unlockWrite();
@@ -7584,6 +7608,7 @@ pub const LinuxServer = struct {
         if (self.fabric == null) return;
         self.world.lockWrite();
         self.abortPoisonedDeliveries();
+        self.drainSessionDropControls();
         self.drainFabric();
         self.abortPoisonedDeliveries();
         self.world.unlockWrite();
@@ -13264,12 +13289,23 @@ pub const LinuxServer = struct {
             // detached (for reclaim/bouncer); an anonymous client is dropped.
             if (conn.session.account()) |acct| {
                 const resume_handle = self.sessions.resumeHandleForClient(acct, monitorIdFromClient(id));
+                if (resume_handle) |handle|
+                    self.cancelSessionDropsForToken(acct, handle.token);
                 if (!conn.session_detach_prepared) {
                     if (self.encodeMigrationSnapshot(id, conn)) |snapshot| {
                         defer self.allocator.free(snapshot);
-                        _ = self.sessions.markDetachedWithSnapshot(acct, monitorIdFromClient(id), snapshot);
+                        if (!self.sessions.markDetachedWithSnapshot(acct, monitorIdFromClient(id), snapshot)) {
+                            // Snapshot allocation failure already detaches while
+                            // preserving the prior image. Retry the allocation-
+                            // free detach to distinguish that safe degraded case
+                            // from a still-conflicting/missing row; only the
+                            // latter may be retired before ConnState is freed.
+                            if (!self.sessions.markDetached(acct, monitorIdFromClient(id)))
+                                _ = self.removeTrackedSession(acct, monitorIdFromClient(id));
+                        }
                     } else {
-                        _ = self.sessions.markDetached(acct, monitorIdFromClient(id));
+                        if (!self.sessions.markDetached(acct, monitorIdFromClient(id)))
+                            _ = self.removeTrackedSession(acct, monitorIdFromClient(id));
                     }
                 }
                 // Portable resume is opt-in: only a session whose MTOKEN was
@@ -25307,6 +25343,7 @@ pub const LinuxServer = struct {
     }
 
     const UpgradeContinuityBlocker = enum {
+        session_drop_transaction,
         relay_v2_deferred,
         webtransport_listener,
         acme_companion,
@@ -25321,6 +25358,9 @@ pub const LinuxServer = struct {
     /// mutation boundary for MediaRooms/signaling. Transport predicates take
     /// their own pump locks; bridge values are inspected under their owner lock.
     fn upgradeContinuityBlockerLocked(self: *LinuxServer) ?UpgradeContinuityBlocker {
+        // DROP reservations are RAM-only two-owner latches. Refuse rather than
+        // serializing a half-committed identity transfer into the successor.
+        if (self.session_drop_journal.activeCount() != 0) return .session_drop_transaction;
         // Deferred MESSAGE_V2 owns exact signed wire not yet published into
         // RVG2. Until it has a Helix capsule, exec must never discard it.
         if (self.relay_v2_deferred_len != 0) return .relay_v2_deferred;
@@ -25340,6 +25380,7 @@ pub const LinuxServer = struct {
 
     fn upgradeContinuityBlockerName(blocker: UpgradeContinuityBlocker) []const u8 {
         return switch (blocker) {
+            .session_drop_transaction => "SESSION DROP transaction",
             .relay_v2_deferred => "deferred MESSAGE_V2 authority",
             .webtransport_listener => "WebTransport listener",
             .acme_companion => "ACME renewal companion",
@@ -39805,11 +39846,6 @@ pub const LinuxServer = struct {
         if (self.session_list_epoch == 0) self.session_list_epoch = 1;
     }
 
-    /// Attached sessions on another reactor require the reserved two-owner
-    /// handoff protocol.  Do not remove their SessionStore row optimistically:
-    /// doing so before the target owner has accepted the handoff lets a normal
-    /// close recreate or corrupt the row.  Until that protocol is installed,
-    /// reject the operation with no mutation.
     const ListedSessionRevoke = enum {
         removed,
         self_target,
@@ -39817,23 +39853,287 @@ pub const LinuxServer = struct {
         temporarily_unavailable,
     };
 
+    const session_drop_timeout_ms: u64 = 5_000;
+
+    fn dropStoreSelector(row: sessions_mod.Session) sessions_mod.ExactSelector {
+        return .{
+            .client = row.client,
+            .token = row.token,
+            .signon_ms = row.signon_ms,
+            .attachment_id = row.attachment_id,
+        };
+    }
+
+    fn dropJournalSelector(row: sessions_mod.Session) session_drop_tx.ExactSelector {
+        return .{
+            .client = row.client,
+            .token = row.token,
+            .signon_ms = row.signon_ms,
+            .attachment_id = row.attachment_id,
+        };
+    }
+
+    fn dropJournalToStore(selector: session_drop_tx.ExactSelector) sessions_mod.ExactSelector {
+        return .{
+            .client = selector.client,
+            .token = selector.token,
+            .signon_ms = selector.signon_ms,
+            .attachment_id = selector.attachment_id,
+        };
+    }
+
+    fn hintSessionDropOwner(self: *LinuxServer, shard: u12, id: session_drop_tx.TxId) void {
+        if (shard == self.rx().shard_id) return;
+        const fabric = if (self.fabric) |*f| f else return;
+        const control = session_drop_tx.Control.init(id) orelse return;
+        // Full controls are counted by ReactorFabric but are not authoritative:
+        // every reactor timer scans the journal and recovers the same state.
+        if (!fabric.sendControlTo(shard, control)) {
+            const total = fabric.controlMissCount();
+            if (total == 1 or total % 1024 == 0) {
+                var buf: [144]u8 = undefined;
+                const line = std.fmt.bufPrint(
+                    &buf,
+                    "SESSION DROP control hint missed; journal sweep remains authoritative (total {d})",
+                    .{total},
+                ) catch "SESSION DROP control hint missed; journal sweep remains authoritative";
+                self.traceLog(.warn, .reactor, line);
+            }
+        }
+        self.wakeShard(shard);
+    }
+
+    fn finishSessionDropAbort(self: *LinuxServer, id: session_drop_tx.TxId, result: session_drop_tx.TerminalResult) void {
+        const before = self.session_drop_journal.get(id) orelse return;
+        switch (before.state) {
+            .committing => self.session_drop_journal.failCommitBeforeLinearization(id, result) catch {},
+            .target_pending, .successor_pending, .commit_pending => self.session_drop_journal.requestAbort(id, result) catch {},
+            else => {},
+        }
+        const entry = self.session_drop_journal.get(id) orelse return;
+        const reservation = session_drop_tx.reservationId(id);
+        if (entry.target_reserved) {
+            _ = self.sessions.cancelDropReservation(entry.accountName(), dropJournalToStore(entry.target), reservation);
+            _ = self.session_drop_journal.markReservationReleased(id, .target) catch {};
+        }
+        const after_target = self.session_drop_journal.get(id) orelse return;
+        if (after_target.successor_reserved) if (after_target.successor) |successor| {
+            _ = self.sessions.cancelDropReservation(after_target.accountName(), dropJournalToStore(successor), reservation);
+            _ = self.session_drop_journal.markReservationReleased(id, .successor) catch {};
+        };
+        const terminal = self.session_drop_journal.get(id) orelse return;
+        if (terminal.terminalResult() != null)
+            self.session_drop_journal.markResultConsumed(id) catch {};
+        _ = self.session_drop_journal.reapIfDone(id);
+    }
+
+    /// Timer/control recovery. Admission drives the transaction synchronously
+    /// while World is locked, but every pre-linearization phase is journaled so
+    /// a missed owner hint or vanished requester can still release reservations.
+    fn sweepSessionDropTransactions(self: *LinuxServer) void {
+        var ids_buf: [session_drop_tx.capacity]session_drop_tx.TxId = undefined;
+        const ids = self.session_drop_journal.activeIdsInto(&ids_buf);
+        const now = self.nowU64();
+        for (ids) |id| {
+            const entry = self.session_drop_journal.get(id) orelse continue;
+            if (entry.state.isPrecommit() and now >= entry.deadline_ms) {
+                _ = self.session_drop_journal.expire(id, now) catch {};
+            } else if (entry.state.isPrecommit() and self.connFor(entry.requester) == null) {
+                self.session_drop_journal.requestAbort(id, .requester_gone) catch {};
+            }
+            const current = self.session_drop_journal.get(id) orelse continue;
+            if (current.state == .abort_pending or current.state == .aborted)
+                self.finishSessionDropAbort(id, current.result orelse .cancelled);
+        }
+    }
+
+    /// A normal close/logout/rebind must never free ConnState while a token-group
+    /// reservation prevented its Store row from detaching. Cancel every
+    /// pre-linearization DROP that freezes this logical token, release its exact
+    /// reservations, then let the caller retry the owner mutation in the same
+    /// World-locked turn. A committing transaction cannot interleave here.
+    fn cancelSessionDropsForToken(self: *LinuxServer, account: []const u8, token: sessions_mod.Token) void {
+        var ids_buf: [session_drop_tx.capacity]session_drop_tx.TxId = undefined;
+        const ids = self.session_drop_journal.activeIdsInto(&ids_buf);
+        for (ids) |tx| {
+            const entry = self.session_drop_journal.get(tx) orelse continue;
+            if (!std.ascii.eqlIgnoreCase(entry.accountName(), account)) continue;
+            const target_matches = std.crypto.timing_safe.eql(sessions_mod.Token, entry.target.token, token);
+            const successor_matches = if (entry.successor) |successor|
+                std.crypto.timing_safe.eql(sessions_mod.Token, successor.token, token)
+            else
+                false;
+            if (!target_matches and !successor_matches) continue;
+            if (!entry.state.isPrecommit()) continue;
+            self.finishSessionDropAbort(tx, .cancelled);
+        }
+    }
+
     fn revokeListedSessionRow(
         self: *LinuxServer,
         account: []const u8,
-        caller_cid: sessions_mod.ClientId,
+        caller_id: client_model.ClientId,
         target: sessions_mod.Session,
+        reply: session_drop_tx.ReplyKey,
     ) ListedSessionRevoke {
+        const caller_cid = monitorIdFromClient(caller_id);
         if (target.client == caller_cid) return .self_target;
-        if (target.attached and clientIdFromMonitor(target.client).shard != self.rx().shard_id) {
-            // Queueing a close is explicitly not enough: the foreign owner can
-            // detach after the source-side removal and reinstate the exact row.
-            // Keep the physical row untouched until BEGIN/PREPARE/PREPARED and
-            // the allocation-free owner-side commit exist.
-            return .temporarily_unavailable;
-        }
         if (target.attached)
-            return self.revokeAttachedSessionOnLocalOwner(account, target);
+            return self.revokeAttachedSessionReserved(account, caller_id, target, reply);
         return if (self.removeTrackedSessionExact(account, target)) .removed else .stale;
+    }
+
+    /// Reserved cross-reactor DROP. World serialization protects the journal,
+    /// connection generations, and prepared identity handoff; SessionStore's
+    /// exact token-group reservation freezes every row whose liveness could
+    /// change the successor decision. The Store CAS is the linearization point.
+    fn revokeAttachedSessionReserved(
+        self: *LinuxServer,
+        account: []const u8,
+        requester: client_model.ClientId,
+        expected: sessions_mod.Session,
+        reply: session_drop_tx.ReplyKey,
+    ) ListedSessionRevoke {
+        if (account.len > session_drop_tx.account_capacity) return .stale;
+        const target_id = clientIdFromMonitor(expected.client);
+        const target_conn = self.connFor(target_id) orelse
+            return if (target_id.shard == self.rx().shard_id) .stale else .temporarily_unavailable;
+        const target_account = target_conn.session.account() orelse return .stale;
+        if (!std.ascii.eqlIgnoreCase(target_account, account) or target_conn.closing)
+            return .stale;
+        const target_nick = target_conn.session.displayName();
+        const tx = self.session_drop_journal.begin(.{
+            .requester = requester,
+            .account = account,
+            .target = dropJournalSelector(expected),
+            .target_nick = target_nick,
+            .reply = reply,
+            .deadline_ms = self.nowU64() +| session_drop_timeout_ms,
+        }) catch return .temporarily_unavailable;
+        var completed = false;
+        defer if (!completed) self.finishSessionDropAbort(tx, .temporarily_unavailable);
+
+        self.hintSessionDropOwner(target_id.shard, tx);
+        const reservation = session_drop_tx.reservationId(tx);
+        switch (self.sessions.reserveDrop(account, dropStoreSelector(expected), reservation)) {
+            .reserved, .already_reserved => {},
+            .stale => return .stale,
+            .reserved_by_other, .invalid_id => return .temporarily_unavailable,
+        }
+        self.session_drop_journal.markTargetReserved(tx) catch return .temporarily_unavailable;
+
+        const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch
+            return .temporarily_unavailable;
+        defer self.allocator.free(rows);
+        var successor_row: ?sessions_mod.Session = null;
+        var first_eligible: ?sessions_mod.Session = null;
+        var unattested = false;
+        const from_wid = worldIdFromClient(target_id);
+        const nick_owner = self.world.findNick(target_nick);
+        for (rows) |row| {
+            if (!row.attached or row.client == expected.client) continue;
+            if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, expected.token)) continue;
+            const candidate_id = clientIdFromMonitor(row.client);
+            const candidate = self.connFor(candidate_id) orelse {
+                unattested = true;
+                continue;
+            };
+            const candidate_account = candidate.session.account() orelse {
+                unattested = true;
+                continue;
+            };
+            if (candidate.closing or candidate.s2s != null or candidate.s2s_secured != null or
+                !std.ascii.eqlIgnoreCase(candidate_account, account) or
+                !std.ascii.eqlIgnoreCase(candidate.session.displayName(), target_nick))
+            {
+                unattested = true;
+                continue;
+            }
+            if (first_eligible == null) first_eligible = row;
+            if (nick_owner) |owner| if (owner.eql(worldIdFromClient(candidate_id))) {
+                successor_row = row;
+                break;
+            };
+        }
+        if (successor_row == null) if (nick_owner) |owner| {
+            if (owner.eql(from_wid)) successor_row = first_eligible;
+        };
+        if (successor_row == null and (unattested or first_eligible != null))
+            return .temporarily_unavailable;
+
+        if (successor_row) |successor| {
+            self.session_drop_journal.setSuccessorPending(tx, dropJournalSelector(successor)) catch
+                return .temporarily_unavailable;
+            const successor_id = clientIdFromMonitor(successor.client);
+            self.hintSessionDropOwner(successor_id.shard, tx);
+            switch (self.sessions.reserveDrop(account, dropStoreSelector(successor), reservation)) {
+                .reserved, .already_reserved => {},
+                .stale => return .stale,
+                .reserved_by_other, .invalid_id => return .temporarily_unavailable,
+            }
+            self.session_drop_journal.markSuccessorReserved(tx) catch return .temporarily_unavailable;
+        } else {
+            self.session_drop_journal.markCommitPending(tx) catch return .temporarily_unavailable;
+        }
+
+        var restores: std.ArrayListUnmanaged(world_model.MemberRestore) = .empty;
+        defer restores.deinit(self.allocator);
+        var handoff: ?world_model.World.PreparedSessionRestore = null;
+        if (successor_row) |successor| {
+            const successor_id = clientIdFromMonitor(successor.client);
+            const to_wid = worldIdFromClient(successor_id);
+            var channels = self.world.channels.iterator();
+            while (channels.next()) |entry| {
+                const old_modes = self.world.memberModes(entry.key_ptr.*, from_wid);
+                const next_modes = self.world.memberModes(entry.key_ptr.*, to_wid);
+                if (old_modes == null and next_modes == null) continue;
+                restores.append(self.allocator, .{
+                    .channel = entry.key_ptr.*,
+                    .modes = .{ .bits = (if (old_modes) |m| m.bits else 0) | (if (next_modes) |m| m.bits else 0) },
+                }) catch return .temporarily_unavailable;
+            }
+            const exact = [_]world_model.ClientId{ from_wid, to_wid };
+            handoff = self.world.prepareSessionRestore(
+                target_nick,
+                to_wid,
+                &exact,
+                .{ .claim_exact = to_wid },
+                restores.items,
+            ) catch return .temporarily_unavailable;
+        }
+        defer if (handoff) |*prepared| prepared.abort();
+
+        self.session_drop_journal.beginCommit(tx) catch return .temporarily_unavailable;
+        const handle = self.sessions.commitDropReservation(account, dropStoreSelector(expected), reservation) orelse {
+            self.session_drop_journal.failCommitBeforeLinearization(tx, .stale_list) catch {};
+            return .stale;
+        };
+        _ = self.session_drop_journal.markReservationReleased(tx, .target) catch {};
+        if (handoff) |*prepared| {
+            prepared.commit();
+            handoff = null;
+            target_conn.session_handoff_complete = true;
+        }
+        target_conn.session_handoff_checked = true;
+
+        if (successor_row) |successor| {
+            _ = self.sessions.cancelDropReservation(account, dropStoreSelector(successor), reservation);
+            _ = self.session_drop_journal.markReservationReleased(tx, .successor) catch {};
+        }
+        lockSpin(&self.attachment_delivery_mu);
+        _ = self.attachment_delivery_spool.discardAttachment(expected.client);
+        self.attachment_delivery_mu.unlock();
+        self.finalizeRemovedSessionAuthority(handle);
+        const notice = ":onyx.local NOTICE * :SESSION: this session was revoked from another device\r\n";
+        self.enqueueDeliveryThenClose(target_id, notice, "session revoked") catch {};
+        // Nothing after the Store CAS may report failure: these journal
+        // transitions are allocation-free invariants of the already-committed
+        // path, and the client-visible result must follow the linearization.
+        self.session_drop_journal.markCommitted(tx) catch unreachable;
+        self.session_drop_journal.markResultConsumed(tx) catch unreachable;
+        _ = self.session_drop_journal.reapIfDone(tx);
+        completed = true;
+        return .removed;
     }
 
     fn handleSessionDrop(
@@ -39864,7 +40164,7 @@ pub const LinuxServer = struct {
                     try self.failReply(conn, "SESSION", "STALE_LIST", "SESSION LIST snapshot is no longer valid; list again");
                     return;
                 };
-                switch (self.revokeListedSessionRow(account, caller_cid, current)) {
+                switch (self.revokeListedSessionRow(account, clientIdFromMonitor(caller_cid), current, .{ .ordinal = idx })) {
                     .removed => {},
                     .self_target => {
                         try self.failReply(conn, "SESSION", "CANNOT_DROP_CURRENT", "Cannot drop this connection; use LOGOUT or disconnect");
@@ -39902,7 +40202,7 @@ pub const LinuxServer = struct {
                     try self.failReply(conn, "SESSION", "STALE_LIST", "Session changed; list again");
                     return;
                 };
-                switch (self.revokeListedSessionRow(account, caller_cid, current)) {
+                switch (self.revokeListedSessionRow(account, clientIdFromMonitor(caller_cid), current, .{ .sid = sid })) {
                     .removed => {},
                     .self_target => {
                         try self.failReply(conn, "SESSION", "CANNOT_DROP_CURRENT", "Cannot drop this connection; use LOGOUT or disconnect");
@@ -57284,6 +57584,25 @@ test "UPGRADE continuity gate accepts idle state and refuses every media or comp
 
     try std.testing.expect(blocker(&server) == null);
 
+    const drop_tx = try server.session_drop_journal.begin(.{
+        .requester = .{ .shard = 0, .slot = 1, .gen = 1 },
+        .account = "upgrade-drop",
+        .target = .{
+            .client = 2,
+            .token = @splat(0x61),
+            .signon_ms = 10,
+            .attachment_id = try sessions_mod.AttachmentId.fromBytes(@as([16]u8, @splat(0x62))),
+        },
+        .target_nick = "UpgradeDrop",
+        .reply = .{ .ordinal = 1 },
+        .deadline_ms = 100,
+    });
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.session_drop_transaction, blocker(&server).?);
+    try server.session_drop_journal.requestAbort(drop_tx, .cancelled);
+    try server.session_drop_journal.markResultConsumed(drop_tx);
+    try std.testing.expect(server.session_drop_journal.reapIfDone(drop_tx));
+    try std.testing.expect(blocker(&server) == null);
+
     try server.media_rooms.join("#media-gate", "alice", .voice);
     try std.testing.expectEqual(Server.UpgradeContinuityBlocker.media_rooms, blocker(&server).?);
     try std.testing.expect(server.media_rooms.leaveAll("#media-gate", "alice"));
@@ -72312,6 +72631,136 @@ test "SESSION DROP sid revokes exactly one physical attachment and leaves shared
     try std.testing.expect(server.world.memberModes("#sid-drop", worldIdFromClient(a_id)) == null);
 }
 
+test "SESSION DROP crosses two live reactors and preserves an exact-token sibling identity" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+    server.fabric = reactor_fabric.ReactorFabric.init(server.allocator, server.reactors.len) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const previous = current_reactor;
+    defer current_reactor = previous;
+
+    // The requester and surviving attachment are live shard-0 ConnStates. The
+    // exact row being revoked is a real live shard-1 ConnState, not a fabricated
+    // SessionStore row with an unreachable ClientId.
+    current_reactor = &server.reactors[0];
+    const requester_id = try addTestLocalClient(&server, "CrossObserver", "crossdrop-live");
+    const sibling_id = try addTestLocalClient(&server, "CrossSibling", "crossdrop-live");
+    const requester = server.connFor(requester_id) orelse return error.TestUnexpectedResult;
+    const sibling = server.connFor(sibling_id) orelse return error.TestUnexpectedResult;
+
+    current_reactor = &server.reactors[1];
+    const target_id = try addTestLocalClient(&server, "CrossTarget", "crossdrop-live");
+    try std.testing.expectEqual(@as(u12, 1), target_id.shard);
+    try assignTestSessionAttachment(&server, "crossdrop-live", target_id, 0xd1);
+    const target = server.connFor(target_id) orelse return error.TestUnexpectedResult;
+    const target_cid = monitorIdFromClient(target_id);
+    const target_handle = server.sessions.resumeHandleForClient("crossdrop-live", target_cid) orelse
+        return error.TestUnexpectedResult;
+
+    // Model two physical attachments beneath one rendered identity. CrossTarget
+    // remains the current World nick owner until the reserved commit hands the
+    // exact identity and unioned modes to CrossSibling on the other reactor.
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        "crossdrop-live",
+        monitorIdFromClient(sibling_id),
+        target_handle.token,
+    ));
+    server.world.unregisterNick(worldIdFromClient(sibling_id));
+    try sibling.session.setNick("CrossTarget");
+    try server.world.restoreMember(
+        "#crossdrop-live",
+        worldIdFromClient(target_id),
+        world_model.MemberModes.fromModes(&.{.op}),
+    );
+    try server.world.restoreMember(
+        "#crossdrop-live",
+        worldIdFromClient(sibling_id),
+        world_model.MemberModes.fromModes(&.{.voice}),
+    );
+    try server.world.restoreMember(
+        "#crossdrop-live",
+        worldIdFromClient(requester_id),
+        world_model.MemberModes.empty(),
+    );
+
+    requester.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(requester_id, requester, &list_line);
+    const rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "crossdrop-live");
+    defer std.testing.allocator.free(rows);
+    const target_row = for (rows) |row| {
+        if (row.client == target_cid) break row;
+    } else return error.TestUnexpectedResult;
+    const target_sid = session_sid.formatSid(session_sid.sidOf(target_row) orelse
+        return error.TestUnexpectedResult);
+    try expectContains(requester.send_buf[0..requester.send_len], &target_sid);
+
+    requester.send_len = 0;
+    var drop_buf: [64]u8 = undefined;
+    const drop_text = try std.fmt.bufPrint(&drop_buf, "SESSION DROP sid={s}", .{target_sid});
+    var drop = try irc_line.parseLine(drop_text);
+    try server.handleSession(requester_id, requester, &drop);
+
+    try expectContains(requester.send_buf[0..requester.send_len], "SESSION DROP sid=");
+    try expectContains(requester.send_buf[0..requester.send_len], " ok");
+    try std.testing.expect(!server.sessions.containsClient("crossdrop-live", target_cid));
+    try std.testing.expect(server.sessions.clientHasToken(
+        "crossdrop-live",
+        monitorIdFromClient(sibling_id),
+        target_handle.token,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), server.session_drop_journal.activeCount());
+    try std.testing.expectEqual(
+        @as(?world_model.ClientId, worldIdFromClient(sibling_id)),
+        server.world.findNick("CrossTarget"),
+    );
+    const inherited_modes = server.world.memberModes("#crossdrop-live", worldIdFromClient(sibling_id)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(inherited_modes.isOperator());
+    try std.testing.expect(inherited_modes.contains(.voice));
+
+    // The target owner consumes the cross-reactor close delivery. This proves
+    // both close scheduling and the actual owner-side closure path.
+    current_reactor = &server.reactors[1];
+    server.drainSessionDropControls();
+    server.drainFabric();
+    try std.testing.expect(target.closing);
+    try std.testing.expectEqualStrings("session revoked", target.close_reason);
+    try expectContains(target.send_buf[0..target.send_len], "this session was revoked from another device");
+
+    requester.send_len = 0;
+    target.send_armed = false;
+    target.send_offset = target.send_len;
+    try server.closeConn(target.token, "session revoked");
+    try std.testing.expect(server.connFor(target_id) == null);
+
+    // Closing the removed physical row must not tear down the shared rendered
+    // identity. Drain any cross-shard observer delivery and prove no false QUIT.
+    current_reactor = &server.reactors[0];
+    server.drainFabric();
+    try std.testing.expect(std.mem.indexOf(u8, requester.send_buf[0..requester.send_len], " QUIT ") == null);
+    try std.testing.expectEqual(
+        @as(?world_model.ClientId, worldIdFromClient(sibling_id)),
+        server.world.findNick("CrossTarget"),
+    );
+    try std.testing.expect(server.world.memberModes("#crossdrop-live", worldIdFromClient(sibling_id)) != null);
+    try std.testing.expectEqual(@as(usize, 0), server.session_drop_journal.activeCount());
+}
+
 test "SESSION DROP fails closed on absent, stale, and account-switched ids" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
@@ -72444,6 +72893,58 @@ test "SESSION DROP leaves an attached foreign-shard row untouched until the rese
     try std.testing.expect(before.attachment_id.?.eql(after.attachment_id.?));
     try std.testing.expect(after.attached);
     try std.testing.expect(server.sessions.containsClient("crossdrop", foreign_cid));
+}
+
+test "closing a token sibling cancels reserved DROP before detaching its row" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(&server, "freeze-a", "freeze-acct");
+    const sibling_id = try addTestLocalClient(&server, "freeze-b", "freeze-acct");
+    const target_cid = monitorIdFromClient(target_id);
+    const sibling_cid = monitorIdFromClient(sibling_id);
+    const token = server.sessions.resumeHandleForClient("freeze-acct", target_cid).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup("freeze-acct", sibling_cid, token));
+
+    var rows_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+    const target = for (server.sessions.sessionsInto("freeze-acct", &rows_buf)) |row| {
+        if (row.client == target_cid) break row;
+    } else return error.TestUnexpectedResult;
+    const tx = try server.session_drop_journal.begin(.{
+        .requester = target_id,
+        .account = "freeze-acct",
+        .target = LinuxServer.dropJournalSelector(target),
+        .target_nick = "freeze-a",
+        .reply = .{ .ordinal = 1 },
+        .deadline_ms = server.nowU64() + 5_000,
+    });
+    try std.testing.expectEqual(
+        sessions_mod.ReserveDropResult.reserved,
+        server.sessions.reserveDrop("freeze-acct", LinuxServer.dropStoreSelector(target), session_drop_tx.reservationId(tx)),
+    );
+    try server.session_drop_journal.markTargetReserved(tx);
+
+    const sibling = server.connFor(sibling_id).?;
+    sibling.send_armed = false;
+    sibling.send_offset = sibling.send_len;
+    try server.closeConn(sibling.token, "test sibling close");
+
+    try std.testing.expect(server.connFor(sibling_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), server.session_drop_journal.activeCount());
+    try std.testing.expect(!server.sessions.hasDropReservation("freeze-acct", LinuxServer.dropStoreSelector(target)));
+    const after = server.sessions.sessionsInto("freeze-acct", &rows_buf);
+    const sibling_row = for (after) |row| {
+        if (row.client == sibling_cid) break row;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(!sibling_row.attached);
 }
 
 test "SESSION DROP never treats a local target with an unattested foreign token sibling as final" {
