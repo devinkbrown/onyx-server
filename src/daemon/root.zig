@@ -159,6 +159,9 @@ pub const durable_credential_props_boot = @import("durable_credential_props_boot
 pub const durable_oper_authority = @import("durable_oper_authority.zig");
 pub const durable_oper_authority_boot = @import("durable_oper_authority_boot.zig");
 pub const oper_session_provenance = @import("oper_session_provenance.zig");
+/// Allocation-free, projection-free coordinator for staged OCG2 observation.
+/// The module deliberately exposes no session, mesh, minting, or grant surface.
+pub const ocg2_runtime = @import("ocg2_runtime.zig");
 
 // Compile the inactive issuer leaf without publishing the module or its Impl.
 comptime {
@@ -326,6 +329,7 @@ test {
     _ = durable_oper_authority;
     _ = durable_oper_authority_boot;
     _ = oper_session_provenance;
+    _ = ocg2_runtime;
     _ = @import("ocg2_authority_issuer.zig");
     _ = @import("ocg2_reconcile_schedule.zig");
     _ = @import("ocg2_reconcile_workset.zig");

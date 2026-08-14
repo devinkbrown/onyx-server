@@ -27,8 +27,26 @@ const durable_oper_authority_boot = @import("durable_oper_authority_boot.zig");
 const node_identity = @import("node_identity.zig");
 const store_mod = @import("store.zig");
 
+/// Deliberately staged OCG2 runtime authority. `observe` is the historical
+/// enabled-only behavior: boot and verify the durable image without allowing it
+/// to alter live sessions or mint authority records.
+pub const Ocg2RuntimeMode = enum {
+    disabled,
+    observe,
+    project,
+    mint,
+};
+
+/// Runtime stages implemented by this binary. Keep CLI preflight and normal
+/// boot on this single predicate; reserved privilege-changing modes must never
+/// pass validation only to fail during service restart.
+pub fn ocg2RuntimeModeSupported(mode: Ocg2RuntimeMode) bool {
+    return mode == .disabled or mode == .observe;
+}
+
 pub const Ocg2BootConfig = struct {
     enabled: bool = false,
+    mode: Ocg2RuntimeMode = .disabled,
     authority: ?durable_oper_authority.Config = null,
 };
 
@@ -38,6 +56,7 @@ pub const Ocg2IdentityError = error{
     Ocg2Disabled,
     MissingNodeIdentity,
     Ocg2AuthorityPublicKeyMismatch,
+    Ocg2MintingRequiresAuthority,
 };
 
 pub const Ocg2ActivationSource = enum { initialized, restored };
@@ -49,7 +68,13 @@ pub const Ocg2Activation = struct {
 
 pub fn mapOcg2BootConfig(cfg: config_format.Config) Ocg2BootConfig {
     if (!cfg.oper_ocg2.enabled) return .{};
-    return .{ .enabled = true, .authority = .{
+    const mode: Ocg2RuntimeMode = if (cfg.oper_ocg2.minting_enabled)
+        .mint
+    else if (cfg.oper_ocg2.projection_enabled)
+        .project
+    else
+        .observe;
+    return .{ .enabled = true, .mode = mode, .authority = .{
         .authority_node_id = cfg.oper_ocg2.authority_node_id,
         .authority_pubkey = cfg.oper_ocg2.authority_public_key.?,
     } };
@@ -65,7 +90,10 @@ pub fn validateOcg2LocalIdentity(
     if (!cfg.enabled) return error.Ocg2Disabled;
     const local = identity orelse return error.MissingNodeIdentity;
     const authority = cfg.authority orelse return error.Ocg2Disabled;
-    if (local.shortId() != authority.authority_node_id) return .receiver;
+    if (local.shortId() != authority.authority_node_id) {
+        if (cfg.mode == .mint) return error.Ocg2MintingRequiresAuthority;
+        return .receiver;
+    }
     if (!std.crypto.timing_safe.eql(
         [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8,
         local.sign_kp.public_key,
@@ -1400,17 +1428,56 @@ test "missing required [node].id is rejected" {
     try testing.expectError(error.ParseError, loadFromText(allocator, text, .{ .port = 6680 }, .{}));
 }
 
-fn testOcg2BootConfig(seed: u8) !Ocg2BootConfig {
+fn testOcg2BootConfig(seed: u8, mode: Ocg2RuntimeMode) !Ocg2BootConfig {
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(seed)), "ocg2-test");
     defer identity.deinit();
-    return .{ .enabled = true, .authority = .{
+    return .{ .enabled = true, .mode = mode, .authority = .{
         .authority_node_id = identity.shortId(),
         .authority_pubkey = identity.sign_kp.public_key,
     } };
 }
 
+test "OCG2 config boot mapping exposes disabled observe project and mint modes" {
+    const disabled = mapOcg2BootConfig(.{});
+    try testing.expect(!disabled.enabled);
+    try testing.expectEqual(Ocg2RuntimeMode.disabled, disabled.mode);
+    try testing.expect(disabled.authority == null);
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC0)), "ocg2-test");
+    defer identity.deinit();
+    const root = config_format.Config.OperOcg2{
+        .enabled = true,
+        .authority_node_id = identity.shortId(),
+        .authority_public_key = identity.sign_kp.public_key,
+    };
+
+    var cfg = config_format.Config{ .oper_ocg2 = root };
+    const observe = mapOcg2BootConfig(cfg);
+    try testing.expect(observe.enabled);
+    try testing.expectEqual(Ocg2RuntimeMode.observe, observe.mode);
+    try testing.expectEqual(identity.shortId(), observe.authority.?.authority_node_id);
+    try testing.expectEqualSlices(u8, &identity.sign_kp.public_key, &observe.authority.?.authority_pubkey);
+
+    cfg.oper_ocg2.projection_enabled = true;
+    const project = mapOcg2BootConfig(cfg);
+    try testing.expect(project.enabled);
+    try testing.expectEqual(Ocg2RuntimeMode.project, project.mode);
+
+    cfg.oper_ocg2.minting_enabled = true;
+    const mint = mapOcg2BootConfig(cfg);
+    try testing.expect(mint.enabled);
+    try testing.expectEqual(Ocg2RuntimeMode.mint, mint.mode);
+}
+
+test "OCG2 runtime support predicate admits only disabled and observe" {
+    try testing.expect(ocg2RuntimeModeSupported(.disabled));
+    try testing.expect(ocg2RuntimeModeSupported(.observe));
+    try testing.expect(!ocg2RuntimeModeSupported(.project));
+    try testing.expect(!ocg2RuntimeModeSupported(.mint));
+}
+
 test "OCG2 boot identity classification keeps receivers public-only and exact authority full-key bound" {
-    const config = try testOcg2BootConfig(0xC1);
+    const config = try testOcg2BootConfig(0xC1, .observe);
     var authority_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC1)), "ocg2-test");
     defer authority_identity.deinit();
     try testing.expectEqual(Ocg2LocalRole.authority, try validateOcg2LocalIdentity(config, &authority_identity));
@@ -1427,11 +1494,28 @@ test "OCG2 boot identity classification keeps receivers public-only and exact au
     );
 }
 
+test "OCG2 config boot permits projection on both roles and restricts minting to authority" {
+    const project = try testOcg2BootConfig(0xC5, .project);
+    const mint = try testOcg2BootConfig(0xC5, .mint);
+    var authority_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC5)), "ocg2-test");
+    defer authority_identity.deinit();
+    var receiver_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC6)), "ocg2-test");
+    defer receiver_identity.deinit();
+
+    try testing.expectEqual(Ocg2LocalRole.authority, try validateOcg2LocalIdentity(project, &authority_identity));
+    try testing.expectEqual(Ocg2LocalRole.receiver, try validateOcg2LocalIdentity(project, &receiver_identity));
+    try testing.expectEqual(Ocg2LocalRole.authority, try validateOcg2LocalIdentity(mint, &authority_identity));
+    try testing.expectError(
+        error.Ocg2MintingRequiresAuthority,
+        validateOcg2LocalIdentity(mint, &receiver_identity),
+    );
+}
+
 test "OCG2 store activation cold restores and rejects key change and partial state" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const config = try testOcg2BootConfig(0xC3);
-    const wrong = try testOcg2BootConfig(0xC4);
+    const config = try testOcg2BootConfig(0xC3, .observe);
+    const wrong = try testOcg2BootConfig(0xC4, .observe);
     var store = try store_mod.OroStore.openWithConfig(
         testing.allocator,
         testing.io,

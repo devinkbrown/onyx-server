@@ -666,6 +666,27 @@ allow_anonymous = false
 # event_history_path = "/var/lib/onyx-server/event_history.bin"
 
 
+# --- [oper.ocg2] — staged durable operator authority ------------------------
+[oper.ocg2]
+# Load and validate the durable OCG2 authority image. Default false. Enabling
+# this alone is deliberately observational: it preserves the existing live
+# operator/session behavior while the durable image is verified at runtime.
+enabled = false
+# Reserved activation flag for verified OCG2 session projection. Default false
+# and requires enabled=true. This build intentionally rejects project mode at
+# boot until the complete privilege-changing lifecycle is available.
+projection_enabled = false
+# Reserved activation flag for authority-node OCG2 minting. Default false and
+# requires both enabled=true and projection_enabled=true. This build rejects
+# mint mode at boot. Never distribute private authority material here.
+minting_enabled = false
+# Required when enabled=true. The node id must be the exact short id derived
+# from authority_public_key. Use a quoted 16-digit hexadecimal value when the
+# unsigned id is larger than TOML's signed 64-bit integer range.
+# authority_node_id = 1
+# authority_public_key = "env:ONYX_OCG2_AUTHORITY_PUBLIC_KEY"
+
+
 # --- [[opers]] — operator bindings (SASL-only) -------------------------------
 # Operators are granted by ACCOUNT, never by password. Each block binds a SASL
 # account to a privilege class; the account auto-elevates on login.

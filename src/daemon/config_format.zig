@@ -262,6 +262,13 @@ pub const Config = struct {
     /// node identity when that identity is the configured authority.
     pub const OperOcg2 = struct {
         enabled: bool = false,
+        /// Allow verified durable OCG2 records to affect live operator-session
+        /// projection. Kept separate from `enabled` so existing deployments can
+        /// load and observe the durable image without changing session authority.
+        projection_enabled: bool = false,
+        /// Allow the configured authority node to mint new OCG2 records. This
+        /// is the final activation stage and requires projection to be enabled.
+        minting_enabled: bool = false,
         authority_node_id: u64 = 0,
         authority_public_key: ?[crypto_sign.public_key_len]u8 = null,
     };
@@ -1049,6 +1056,9 @@ pub const TomlError = error{
     Ocg2RequiresAccountStore,
     Ocg2StorageRecordLimitTooSmall,
     Ocg2StorageWalLimitTooSmall,
+    Ocg2ProjectionRequiresEnabled,
+    Ocg2MintingRequiresEnabled,
+    Ocg2MintingRequiresProjection,
 } || std.mem.Allocator.Error;
 
 /// Conservative fail-closed hint for normal boot: if a supplied config appears
@@ -1098,6 +1108,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         while (fields.next()) |entry| {
             const key = entry.key_ptr.*;
             if (!std.mem.eql(u8, key, "enabled") and
+                !std.mem.eql(u8, key, "projection_enabled") and
+                !std.mem.eql(u8, key, "minting_enabled") and
                 !std.mem.eql(u8, key, "authority_node_id") and
                 !std.mem.eql(u8, key, "authority_public_key"))
                 return error.UnknownOcg2Field;
@@ -1106,6 +1118,14 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.get("oper.ocg2.enabled")) |value| {
         if (value.* != .boolean) return error.ParseError;
         cfg.oper_ocg2.enabled = value.boolean;
+    }
+    if (doc.get("oper.ocg2.projection_enabled")) |value| {
+        if (value.* != .boolean) return error.ParseError;
+        cfg.oper_ocg2.projection_enabled = value.boolean;
+    }
+    if (doc.get("oper.ocg2.minting_enabled")) |value| {
+        if (value.* != .boolean) return error.ParseError;
+        cfg.oper_ocg2.minting_enabled = value.boolean;
     }
     if (doc.get("oper.ocg2.authority_node_id")) |value| {
         cfg.oper_ocg2.authority_node_id = switch (value.*) {
@@ -1427,6 +1447,13 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         @as(usize, @intFromBool(cfg.sasl.oauth_jwks_file != null)) +
         @as(usize, @intFromBool(cfg.sasl.oauth_pubkey != null));
     if (oauth_key_sources > 1) return error.ParseError;
+
+    if (cfg.oper_ocg2.minting_enabled and !cfg.oper_ocg2.enabled)
+        return error.Ocg2MintingRequiresEnabled;
+    if (cfg.oper_ocg2.minting_enabled and !cfg.oper_ocg2.projection_enabled)
+        return error.Ocg2MintingRequiresProjection;
+    if (cfg.oper_ocg2.projection_enabled and !cfg.oper_ocg2.enabled)
+        return error.Ocg2ProjectionRequiresEnabled;
 
     if (cfg.oper_ocg2.enabled) {
         if (cfg.oper_ocg2.authority_node_id == 0) return error.MissingOcg2AuthorityNodeId;
@@ -2606,6 +2633,148 @@ test "OCG2 config freezes exact public authority tuple and account store depende
     var high_cfg = try parseToml(allocator, high_id_text, .{});
     defer high_cfg.deinit(allocator);
     try testing.expectEqual(high_node_id, high_cfg.oper_ocg2.authority_node_id);
+}
+
+test "parseToml: OCG2 activation flags default off and accept staged projection and minting" {
+    const allocator = testing.allocator;
+    var defaults = try parseToml(
+        allocator,
+        "[node]\nid = 1\n[listen]\nirc = 6680\n",
+        .{},
+    );
+    defer defaults.deinit(allocator);
+    try testing.expect(!defaults.oper_ocg2.enabled);
+    try testing.expect(!defaults.oper_ocg2.projection_enabled);
+    try testing.expect(!defaults.oper_ocg2.minting_enabled);
+
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xB2)));
+    const public_key = kp.public_key.toBytes();
+    const authority_node_id = node_short_id.shortId(node_identity.nodeIdFromPublicKey(public_key));
+    const public_hex = std.fmt.bytesToHex(public_key, .lower);
+
+    const projection_text = try std.fmt.allocPrint(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sasl]
+        \\account_db = "accounts.oro"
+        \\[oper.ocg2]
+        \\enabled = true
+        \\projection_enabled = true
+        \\authority_node_id = "{x:0>16}"
+        \\authority_public_key = "{s}"
+        \\
+    , .{ authority_node_id, &public_hex });
+    defer allocator.free(projection_text);
+    var projection = try parseToml(allocator, projection_text, .{});
+    defer projection.deinit(allocator);
+    try testing.expect(projection.oper_ocg2.enabled);
+    try testing.expect(projection.oper_ocg2.projection_enabled);
+    try testing.expect(!projection.oper_ocg2.minting_enabled);
+
+    const minting_text = try std.fmt.allocPrint(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sasl]
+        \\account_db = "accounts.oro"
+        \\[oper.ocg2]
+        \\enabled = true
+        \\projection_enabled = true
+        \\minting_enabled = true
+        \\authority_node_id = "{x:0>16}"
+        \\authority_public_key = "{s}"
+        \\
+    , .{ authority_node_id, &public_hex });
+    defer allocator.free(minting_text);
+    var minting = try parseToml(allocator, minting_text, .{});
+    defer minting.deinit(allocator);
+    try testing.expect(minting.oper_ocg2.enabled);
+    try testing.expect(minting.oper_ocg2.projection_enabled);
+    try testing.expect(minting.oper_ocg2.minting_enabled);
+}
+
+test "parseToml: OCG2 activation flags reject unsafe combinations types and unknown fields" {
+    const allocator = testing.allocator;
+    try testing.expectError(
+        error.Ocg2ProjectionRequiresEnabled,
+        parseToml(allocator,
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[oper.ocg2]
+            \\projection_enabled = true
+            \\
+        , .{}),
+    );
+    try testing.expectError(
+        error.Ocg2MintingRequiresEnabled,
+        parseToml(allocator,
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[oper.ocg2]
+            \\projection_enabled = true
+            \\minting_enabled = true
+            \\
+        , .{}),
+    );
+
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xB3)));
+    const public_key = kp.public_key.toBytes();
+    const authority_node_id = node_short_id.shortId(node_identity.nodeIdFromPublicKey(public_key));
+    const public_hex = std.fmt.bytesToHex(public_key, .lower);
+    const mint_without_projection = try std.fmt.allocPrint(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sasl]
+        \\account_db = "accounts.oro"
+        \\[oper.ocg2]
+        \\enabled = true
+        \\minting_enabled = true
+        \\authority_node_id = "{x:0>16}"
+        \\authority_public_key = "{s}"
+        \\
+    , .{ authority_node_id, &public_hex });
+    defer allocator.free(mint_without_projection);
+    try testing.expectError(
+        error.Ocg2MintingRequiresProjection,
+        parseToml(allocator, mint_without_projection, .{}),
+    );
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[oper.ocg2]
+        \\projection_enabled = "yes"
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[oper.ocg2]
+        \\minting_enabled = 1
+        \\
+    , .{}));
+    try testing.expectError(error.UnknownOcg2Field, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[oper.ocg2]
+        \\projection = true
+        \\
+    , .{}));
 }
 
 test "parseToml: [accounts] pbkdf2 rounds project with bounded policy range" {

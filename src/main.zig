@@ -257,6 +257,13 @@ pub fn main(init: std.process.Init) !void {
                         };
                     }
                     if (l.ocg2.enabled) {
+                        if (!onyx_server.daemon.config_boot.ocg2RuntimeModeSupported(l.ocg2.mode)) {
+                            std.debug.print(
+                                "config ERROR in {s}: OCG2 {s} mode is reserved; this release exposes observation only\n",
+                                .{ path, @tagName(l.ocg2.mode) },
+                            );
+                            std.process.exit(1);
+                        }
                         var check_identity = if (l.parsed.node.secret_key) |secret|
                             onyx_server.daemon.node_identity.fromConfig(secret, l.parsed.mesh.realm) catch |err| {
                                 std.debug.print("config ERROR in {s}: OCG2 local node secret: {s}\n", .{ path, @errorName(err) });
@@ -526,6 +533,13 @@ pub fn main(init: std.process.Init) !void {
     }
     var ocg2_role: ?onyx_server.daemon.config_boot.Ocg2LocalRole = null;
     if (ocg2_requested) {
+        if (!onyx_server.daemon.config_boot.ocg2RuntimeModeSupported(held.?.ocg2.mode)) {
+            std.debug.print(
+                "onyx-server: fatal — OCG2 {s} mode is configured but this release exposes observation only\n",
+                .{@tagName(held.?.ocg2.mode)},
+            );
+            return error.Ocg2RuntimeModeUnavailable;
+        }
         ocg2_role = onyx_server.daemon.config_boot.validateOcg2LocalIdentity(
             held.?.ocg2,
             srv_cfg.node_identity,
@@ -551,9 +565,14 @@ pub fn main(init: std.process.Init) !void {
     var durable_device_state: ?onyx_server.daemon.durable_credential_props.State = null;
     defer if (durable_device_state) |*state| state.deinit();
     // Process-owned inactive OCG2 image. Services borrows it only after exact
-    // marker/snapshot activation; Server/session/mesh/Helix receive no pointer.
+    // marker/snapshot activation. The bounded observer below may borrow Services,
+    // but it exposes no session, mesh, minting, or projection capability.
     var durable_oper_state: ?onyx_server.daemon.durable_oper_authority.State = null;
     defer if (durable_oper_state) |*state| state.deinit();
+    // Runtime carries bounded 256-entry scratch inventories, so allocate it only
+    // for explicit observe mode. Disabled deployments pay neither heap nor stack.
+    var ocg2_observer: ?*onyx_server.daemon.ocg2_runtime.Runtime = null;
+    defer if (ocg2_observer) |observer| onyx_server.daemon.ocg2_runtime.destroy(observer);
     var account_services: onyx_server.daemon.services.Services = undefined;
     var account_checker: onyx_server.daemon.sasl_bridge.ServicesPlainChecker = undefined;
     var external_bridge: onyx_server.daemon.sasl_bridge.ServicesExternalLookup = undefined;
@@ -625,10 +644,46 @@ pub fn main(init: std.process.Init) !void {
                         std.debug.print("onyx-server: fatal — OCG2 Services activation failed ({s})\n", .{@errorName(err)});
                         return err;
                     };
-                    std.debug.print(
-                        "onyx-server: OCG2 inactive authority image {s} ({s}; no runtime privilege consumer)\n",
-                        .{ @tagName(activation.source), @tagName(ocg2_role.?) },
-                    );
+                    switch (h.ocg2.mode) {
+                        .disabled => return error.Ocg2RuntimeActivationFailed,
+                        .observe => {
+                            const observer = try onyx_server.daemon.ocg2_runtime.createObserve(
+                                allocator,
+                                &account_services,
+                            );
+                            ocg2_observer = observer;
+                            // Pair the wall sample with the immediately-following
+                            // monotonic origin. Later timer ticks advance elapsed
+                            // from this exact point, not from allocation/boot work.
+                            const initial_realtime_ms: u64 = @intCast(@max(
+                                @as(i64, 0),
+                                onyx_server.substrate.platform.realtimeMillis(),
+                            ));
+                            const origin_ms: u64 = @intCast(@max(
+                                @as(i64, 0),
+                                onyx_server.substrate.platform.monotonicMillis(),
+                            ));
+                            const initial = observer.tick(initial_realtime_ms, 0);
+                            switch (initial) {
+                                .complete => |summary| std.debug.print(
+                                    "onyx-server: OCG2 observe runtime primed ({s}; {s}; {d} durable record(s); no privilege consumer)\n",
+                                    .{ @tagName(activation.source), @tagName(ocg2_role.?), summary.baseline_count },
+                                ),
+                                .retryable => |reason| {
+                                    std.debug.print("onyx-server: fatal — OCG2 observe runtime could not establish its initial durable horizon ({s})\n", .{@tagName(reason)});
+                                    return error.Ocg2RuntimeActivationFailed;
+                                },
+                                .failed => |reason| {
+                                    std.debug.print("onyx-server: fatal — OCG2 observe runtime failed during initial inspection ({s})\n", .{@tagName(reason)});
+                                    return error.Ocg2RuntimeActivationFailed;
+                                },
+                                .disabled => return error.Ocg2RuntimeActivationFailed,
+                            }
+                            srv_cfg.ocg2_runtime = observer;
+                            srv_cfg.ocg2_runtime_monotonic_origin_ms = origin_ms;
+                        },
+                        .project, .mint => unreachable,
+                    }
                 }
                 // Seed config-declared oper certfp bindings so SASL EXTERNAL works
                 // certfp-only without a prior runtime CERTADD. Coexists with (never

@@ -355,6 +355,7 @@ const config_format = @import("config_format.zig");
 const tls_certs = @import("tls_certs.zig");
 const x509_verify = @import("../crypto/x509_verify.zig");
 const services_mod = @import("services.zig");
+const ocg2_runtime_mod = @import("ocg2_runtime.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const webauthn = @import("../crypto/webauthn.zig");
 const webauthn_creds_mod = @import("webauthn_creds.zig");
@@ -2148,6 +2149,13 @@ pub const Config = struct {
     /// Account services (REGISTER/IDENTIFY/DROP/…) backed by the WAL store. Null =
     /// account management disabled. Borrowed; outlives the server (owned by main).
     account_services: ?*services_mod.Services = null,
+    /// Projection-free OCG2 observer, synchronously primed by the process owner
+    /// with elapsed=0 before Server construction. Null keeps it wholly inert.
+    /// Borrowed; owner must outlive the server.
+    ocg2_runtime: ?*ocg2_runtime_mod.Runtime = null,
+    /// Exact monotonic millisecond sample paired with the process owner's
+    /// elapsed=0 prime. Required iff `ocg2_runtime` is present.
+    ocg2_runtime_monotonic_origin_ms: ?u64 = null,
     /// Boot-only DPROP1 authority. Production leaves this inactive unless main
     /// has opened the configured account OroStore, loaded the reserved snapshot
     /// strictly, and attached the exact same State to Services.
@@ -4164,6 +4172,13 @@ pub const LinuxServer = struct {
     grant_incarnation: u64 = 0,
     /// Account services backend (borrowed; owned by main).
     account_services: ?*services_mod.Services = null,
+    /// Projection-free OCG2 observer (borrowed; owned and primed by main).
+    ocg2_runtime: ?*ocg2_runtime_mod.Runtime = null,
+    /// Exact monotonic origin paired with the observer's elapsed=0 prime.
+    ocg2_runtime_monotonic_origin_ms: ?u64 = null,
+    /// A terminal observer failure is reported once; later timer turns remain
+    /// silent while the fail-closed Runtime stays terminal.
+    ocg2_runtime_terminal_logged: bool = false,
     /// Web Push delivery worker (borrowed; owned by main; null = disabled).
     webpush_worker: ?*webpush_mod.Worker = null,
     /// Monotonic millis captured at init, for STATS u uptime.
@@ -4343,6 +4358,8 @@ pub const LinuxServer = struct {
         const runtime_features = try runtimeDisabledFeatures(allocator, raw_config);
         errdefer if (runtime_features.owned_disabled_features) |owned| allocator.free(owned);
         var config = runtime_features.config;
+        if ((config.ocg2_runtime == null) != (config.ocg2_runtime_monotonic_origin_ms == null))
+            return error.InvalidOcg2RuntimeClock;
         // A secured mesh identifies nodes by the self-certified short id of the
         // configured key.  `[node].id` predates that identity and is still useful
         // for plaintext deployments, but letting it remain the runtime mesh id
@@ -4686,6 +4703,8 @@ pub const LinuxServer = struct {
             .transcript = transcript_mod.TranscriptLog.initConfig(allocator, config.transcript_config),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
+            .ocg2_runtime = config.ocg2_runtime,
+            .ocg2_runtime_monotonic_origin_ms = config.ocg2_runtime_monotonic_origin_ms,
             .mesh_clock = initial_mesh_clock,
             .reactor = config.reactor,
             .start_ms = if (config.reactor) |r| r.nowMillis() else platform.monotonicMillis(),
@@ -6040,6 +6059,39 @@ pub const LinuxServer = struct {
         _ = self.prunePendingReplicasWithoutStoreAuthority(now_wall);
     }
 
+    /// Advance the projection-free OCG2 observer from reactor 0 only. Main
+    /// primes the borrowed Runtime synchronously with elapsed=0 and supplies the
+    /// exact monotonic origin used for that prime; timer turns then advance only
+    /// the elapsed component while sampling wall time independently. Retryable
+    /// results are intentionally quiet and naturally retry next cadence. A
+    /// terminal Runtime (or an impossible local monotonic rollback) is logged
+    /// once and never driven again.
+    fn tickOcg2Runtime(self: *LinuxServer) bool {
+        if (self.rx() != &self.reactors[0]) return false;
+        if (self.ocg2_runtime_terminal_logged) return false;
+        const runtime = self.ocg2_runtime orelse return false;
+        const origin_ms = self.ocg2_runtime_monotonic_origin_ms orelse return false;
+        const now_ms = self.nowU64();
+        if (now_ms < origin_ms) {
+            // CLOCK_MONOTONIC cannot precede a sample captured earlier in this
+            // process. Treat a violated seam (including a broken injected test
+            // clock) as a one-way authority failure, never as elapsed=0.
+            _ = runtime.failMonotonicRollback();
+            self.ocg2_runtime_terminal_logged = true;
+            srvLog("onyx-server: OCG2 observer stopped: monotonic clock preceded its primed origin\n", .{});
+            return false;
+        }
+
+        switch (runtime.tick(self.meshWallMs(), now_ms - origin_ms)) {
+            .disabled, .complete, .retryable => {},
+            .failed => |failure| {
+                self.ocg2_runtime_terminal_logged = true;
+                srvLog("onyx-server: OCG2 observer stopped: {s}\n", .{@tagName(std.meta.activeTag(failure))});
+            },
+        }
+        return true;
+    }
+
     /// Fired when the periodic timer elapses: run the timeout sweep and re-arm.
     fn onTimerTick(self: *LinuxServer) void {
         self.rx().timer_armed = false;
@@ -6073,6 +6125,7 @@ pub const LinuxServer = struct {
         if (self.rx() == &self.reactors[0] and self.config.nick_delay_ms != 0) _ = self.nick_delay.sweep(self.nowMs());
         // Prune the throttle's expired/empty per-IP state on the same cadence.
         if (self.rx() == &self.reactors[0]) {
+            _ = self.tickOcg2Runtime();
             if (self.conn_throttle) |*t| t.prune(self.nowMs());
             // Evict unlocked, decayed-to-floor login-throttle records too.
             _ = self.login_throttle.sweep(self.nowMs());
@@ -46468,6 +46521,19 @@ pub const LinuxServer = struct {
         self.publishOperEventSubject(.policy, .notice, msg, channel) catch {};
     }
 
+    fn ocg2RehashHasRestartOnlyIntent(
+        runtime_present: bool,
+        config: config_format.Config.OperOcg2,
+    ) bool {
+        return runtime_present or config.enabled or config.projection_enabled or
+            config.minting_enabled or config.authority_node_id != 0 or
+            config.authority_public_key != null;
+    }
+
+    fn ocg2RehashHasUnsupportedRuntimeMode(config: config_format.Config.OperOcg2) bool {
+        return config.projection_enabled or config.minting_enabled;
+    }
+
     /// REHASH — oper-only configuration reload. Re-reads and re-parses the
     /// configured file and swaps in a freshly-built oper registry (account→class
     /// bindings). Existing sessions keep their current oper state; new SASL logins
@@ -46493,6 +46559,11 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "REHASH: config parse error; keeping current config");
             return;
         };
+        if (ocg2RehashHasUnsupportedRuntimeMode(parsed.oper_ocg2)) {
+            parsed.deinit(self.allocator);
+            try self.noticeTo(conn, "REHASH: OCG2 project/mint mode is unsupported by this release; keeping current config");
+            return;
+        }
         // Build the new oper bindings (strings borrow `parsed`, kept alive below).
         const bindings = buildOperBindingsFromConfig(self.allocator, parsed) catch {
             parsed.deinit(self.allocator);
@@ -46538,6 +46609,14 @@ pub const LinuxServer = struct {
         // tickets issued before this REHASH still resume for one more window) and
         // a fresh current key is generated. No-op when resumption is off.
         if (self.config.tls_enable_resumption) self.rotateTicketKey();
+
+        // OCG2 owns a process-lifetime durable State + observer and cannot be
+        // rebuilt transactionally by this partial live reload. Be explicit
+        // whenever either the running process or the newly parsed file carries
+        // OCG2 intent; accepting the rest of REHASH must never imply that its
+        // authority tuple or activation stage changed live.
+        if (ocg2RehashHasRestartOnlyIntent(self.ocg2_runtime != null, self.reload_parsed.?.oper_ocg2))
+            try self.noticeTo(conn, "REHASH: [oper.ocg2] settings are restart-only and were not applied");
 
         var note_buf: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(
@@ -96311,6 +96390,107 @@ test "session-foundation locked rows: capture OOM is failure-atomic and retryabl
     ).?;
     try std.testing.expectEqualSlices(u8, &target.token, &rebound.token);
     try std.testing.expect(server.world.isMember("#row-alloc", worldIdFromClient(claimant_id)));
+}
+
+test "OCG2 server runtime requires an exact paired monotonic origin" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "server-ocg2-clock-pair.wal",
+    );
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    const runtime = try ocg2_runtime_mod.createObserve(std.testing.allocator, &services);
+    defer ocg2_runtime_mod.destroy(runtime);
+
+    const missing_origin = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(missing_origin);
+    try std.testing.expectError(error.InvalidOcg2RuntimeClock, missing_origin.initInPlace(
+        std.testing.allocator,
+        .{ .host = "127.0.0.1", .port = 0, .ocg2_runtime = runtime },
+    ));
+
+    const server_missing_runtime = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server_missing_runtime);
+    try std.testing.expectError(error.InvalidOcg2RuntimeClock, server_missing_runtime.initInPlace(
+        std.testing.allocator,
+        .{ .host = "127.0.0.1", .port = 0, .ocg2_runtime_monotonic_origin_ms = 1 },
+    ));
+}
+
+test "OCG2 REHASH reports every restart-only authority intent" {
+    try std.testing.expect(!LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{}));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(true, .{}));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{ .enabled = true }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{ .projection_enabled = true }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{ .minting_enabled = true }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{ .authority_node_id = 1 }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{
+        .authority_public_key = @as([crypto_sign.public_key_len]u8, @splat(1)),
+    }));
+    try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{}));
+    try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .enabled = true }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .projection_enabled = true }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .minting_enabled = true }));
+}
+
+test "OCG2 server runtime is inert by default and reactor zero owns terminal cadence" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    const defaults = Config{ .host = "127.0.0.1", .port = 0 };
+    try std.testing.expectEqual(@as(?*ocg2_runtime_mod.Runtime, null), defaults.ocg2_runtime);
+    try std.testing.expectEqual(@as(?u64, null), defaults.ocg2_runtime_monotonic_origin_ms);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "server-ocg2-terminal.wal",
+    );
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    const runtime = try ocg2_runtime_mod.createObserve(std.testing.allocator, &services);
+    defer ocg2_runtime_mod.destroy(runtime);
+    try std.testing.expectEqual(
+        ocg2_runtime_mod.Failure.authority_disabled,
+        runtime.tick(1, 0).failed,
+    );
+    const origin_ms: u64 = @intCast(@max(@as(i64, 0), platform.monotonicMillis()));
+
+    const server = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .account_services = &services,
+        .ocg2_runtime = runtime,
+        .ocg2_runtime_monotonic_origin_ms = origin_ms,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    if (server.reactors.len < 2) return error.SkipZigTest;
+
+    current_reactor = &server.reactors[1];
+    try std.testing.expect(!server.tickOcg2Runtime());
+    try std.testing.expect(!server.ocg2_runtime_terminal_logged);
+
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.tickOcg2Runtime());
+    try std.testing.expect(server.ocg2_runtime_terminal_logged);
+    try std.testing.expect(!server.tickOcg2Runtime());
 }
 
 test {
