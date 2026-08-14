@@ -40416,27 +40416,36 @@ pub const LinuxServer = struct {
         // deterministic post-decode failure (e.g. nick re-registration) simply
         // re-preserves the ghost until its TTL — no worse than the old
         // unconditional discard, and self-heals once the conflict clears.
-        const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, token, bytes, .join_existing) else false;
+        const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshotReplacingAttachment(
+            id,
+            conn,
+            account,
+            token,
+            bytes,
+            .join_existing,
+            matched.client,
+        ) else false;
         if (snapshot != null and !restored) {
             conn.preserve_resume_credential_once = true;
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
             return;
         }
-        // Bind BEFORE removing the ghost so joinTokenGroup can verify the local
-        // credential exists and inherit its portable-replication state. The old
-        // detached attachment is then replaced by this live one; the TOKEN itself
-        // remains reusable for additional clients.
-        if (snapshot == null and !self.sessions.joinTokenGroup(account, cid, token)) {
+        // Bind and transfer retained deliveries BEFORE removing the ghost so the
+        // prepared ticket can verify local authority and inherit its portable
+        // replication state. The old detached attachment is then replaced by
+        // this live one; the TOKEN remains reusable for additional clients.
+        if (snapshot == null and !self.bindTokenReplacingAttachment(
+            account,
+            cid,
+            token,
+            .join_existing,
+            matched.client,
+        )) {
             conn.preserve_resume_credential_once = true;
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session registry changed during resume; retry the same token");
             return;
         }
         if (snapshot == null) self.bindDeferredSessionMeshAnnouncements(id, conn, token);
-        self.transferAttachmentDeliveries(matched.client, cid) catch {
-            conn.preserve_resume_credential_once = true;
-            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "pending delivery state conflicted during resume; token remains valid");
-            return;
-        };
         _ = self.removeTrackedSession(account, matched.client);
         conn.preserve_resume_credential_once = false;
         self.finishDeferredSessionAutojoin(id, conn, true);
@@ -40552,15 +40561,12 @@ pub const LinuxServer = struct {
                 .join_existing
             else
                 .{ .adopt_verified = true };
-            if (self.restoreStagedMigration(id, conn, account, migrate_token, staged_bind)) {
-                if (ghost) |g| {
-                    self.transferAttachmentDeliveries(g, cid) catch {
-                        conn.preserve_resume_credential_once = true;
-                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "pending delivery state conflicted during mesh resume; token remains valid");
-                        return;
-                    };
-                    _ = self.removeTrackedSession(account, g);
-                }
+            const staged_transfer: ?RestoreAttachmentTransfer = if (ghost) |g|
+                .{ .old_client = g, .new_client = cid }
+            else
+                null;
+            if (self.restoreStagedMigration(id, conn, account, migrate_token, staged_bind, staged_transfer)) {
+                if (ghost) |g| _ = self.removeTrackedSession(account, g);
                 conn.preserve_resume_credential_once = false;
                 _ = self.markPortableResumeIssuedForConn(id, conn, account);
                 self.finishDeferredSessionAutojoin(id, conn, true);
@@ -40591,13 +40597,14 @@ pub const LinuxServer = struct {
                 // ordinary local SESSION RESUME path.
                 const local_snapshot = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, migrate_token) catch null;
                 defer if (local_snapshot) |bytes| self.allocator.free(bytes);
-                const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshot(
+                const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshotReplacingAttachment(
                     id,
                     conn,
                     account,
                     migrate_token,
                     bytes,
                     .join_existing,
+                    ghost.?,
                 ) else false;
 
                 if (local_snapshot != null and !restored) {
@@ -40607,16 +40614,17 @@ pub const LinuxServer = struct {
                 }
 
                 if (ghost) |g| {
-                    if (local_snapshot == null and !self.sessions.joinTokenGroup(account, cid, migrate_token)) {
+                    if (local_snapshot == null and !self.bindTokenReplacingAttachment(
+                        account,
+                        cid,
+                        migrate_token,
+                        .join_existing,
+                        g,
+                    )) {
                         conn.preserve_resume_credential_once = true;
                         try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during resume; retry the same token");
                         return;
                     }
-                    self.transferAttachmentDeliveries(g, cid) catch {
-                        conn.preserve_resume_credential_once = true;
-                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "pending delivery state conflicted during mesh reclaim; token remains valid");
-                        return;
-                    };
                     _ = self.removeTrackedSession(account, g);
                 } else unreachable;
                 if (local_snapshot == null) self.bindDeferredSessionMeshAnnouncements(id, conn, migrate_token);
@@ -42705,6 +42713,7 @@ pub const LinuxServer = struct {
         account: []const u8,
         session_token: session_migrate.Token,
         bind_kind: sessions_mod.TokenBindKind,
+        attachment_transfer: ?RestoreAttachmentTransfer,
     ) bool {
         const pm = if (self.pending_migrations) |*p| p else return false;
         const entry = pm.getLive(
@@ -42716,7 +42725,22 @@ pub const LinuxServer = struct {
         var snap = migration_relay.Snapshot.decode(self.allocator, entry.snapshot) catch return false;
         defer snap.deinit(self.allocator);
 
-        return self.restoreAndBindMigrationSnapshot(id, conn, account, session_token, bind_kind, &snap);
+        if (attachment_transfer == null)
+            return self.restoreAndBindMigrationSnapshot(id, conn, account, session_token, bind_kind, &snap);
+        if (!self.migrationRestorePreflight(id, conn, account, &snap)) return false;
+
+        const cid = monitorIdFromClient(id);
+        var token_ticket = self.sessions.prepareTokenBind(account, cid, session_token, bind_kind) orelse return false;
+        defer token_ticket.deinit();
+        return self.restoreAndBindMigrationSnapshotWithTicket(
+            id,
+            conn,
+            account,
+            session_token,
+            &snap,
+            &token_ticket,
+            attachment_transfer,
+        );
     }
 
     fn restoreEncodedMigrationSnapshot(
@@ -42731,6 +42755,72 @@ pub const LinuxServer = struct {
         var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return false;
         defer snap.deinit(self.allocator);
         return self.restoreAndBindMigrationSnapshot(id, conn, account, session_token, bind_kind, &snap);
+    }
+
+    /// Restore one detached physical attachment and move its retained delivery
+    /// ownership inside the same prepared SessionStore/World transaction. A
+    /// conflicting event-id rendering therefore aborts before the claimant's
+    /// token, identity, membership, or output becomes visible.
+    fn restoreEncodedMigrationSnapshotReplacingAttachment(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        session_token: sessions_mod.Token,
+        bytes: []const u8,
+        bind_kind: sessions_mod.TokenBindKind,
+        old_client: sessions_mod.ClientId,
+    ) bool {
+        var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return false;
+        defer snap.deinit(self.allocator);
+        if (!self.migrationRestorePreflight(id, conn, account, &snap)) return false;
+
+        const new_client = monitorIdFromClient(id);
+        var token_ticket = self.sessions.prepareTokenBind(
+            account,
+            new_client,
+            session_token,
+            bind_kind,
+        ) orelse return false;
+        defer token_ticket.deinit();
+        return self.restoreAndBindMigrationSnapshotWithTicket(
+            id,
+            conn,
+            account,
+            session_token,
+            &snap,
+            &token_ticket,
+            .{ .old_client = old_client, .new_client = new_client },
+        );
+    }
+
+    /// Join an existing reusable-token group while replacing one detached
+    /// attachment's durable delivery ownership. The retained SessionStore
+    /// ticket prevents registry drift between spool conflict preflight and the
+    /// allocation-free token commit, including the degraded no-snapshot path.
+    fn bindTokenReplacingAttachment(
+        self: *LinuxServer,
+        account: []const u8,
+        new_client: sessions_mod.ClientId,
+        session_token: sessions_mod.Token,
+        bind_kind: sessions_mod.TokenBindKind,
+        old_client: sessions_mod.ClientId,
+    ) bool {
+        var token_ticket = self.sessions.prepareTokenBind(
+            account,
+            new_client,
+            session_token,
+            bind_kind,
+        ) orelse return false;
+        defer token_ticket.deinit();
+
+        self.transferAttachmentDeliveries(old_client, new_client) catch return false;
+        if (!token_ticket.commit()) {
+            token_ticket.abort();
+            return false;
+        }
+        token_ticket.finish();
+        return true;
     }
 
     fn restoreBootstrapLiveMigrationSnapshot(
@@ -72384,6 +72474,100 @@ test "threaded server: session reclaim local restore failure leaves the ghost re
     try std.testing.expect(!b_conn.resume_autojoin_deferred);
 }
 
+test "threaded server: explicit detached session resume spool conflict aborts before identity commit" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "atomic-resume";
+    const ghost_id = try addTestLocalClient(&server, "Ghost", account);
+    const ghost_cid = monitorIdFromClient(ghost_id);
+    const ghost_token = server.sessions.resumeHandleForClient(account, ghost_cid).?.token;
+    const encoded = try (migration_relay.Snapshot{
+        .nick = "Ghost",
+        .umodes = "+i",
+        .channels = &.{"#resume-target"},
+        .channel_modes = &.{world_model.MemberModes.fromModes(&.{.op}).bits},
+        .account = account,
+    }).encode(allocator);
+    defer allocator.free(encoded);
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot(account, ghost_cid, encoded));
+    server.world.unregisterNick(worldIdFromClient(ghost_id));
+
+    const claimant_id = try addTestLocalClient(&server, "Fresh", account);
+    const claimant = server.connFor(claimant_id).?;
+    const claimant_cid = monitorIdFromClient(claimant_id);
+    const claimant_token = server.sessions.resumeHandleForClient(account, claimant_cid).?.token;
+    try server.world.restoreMember(
+        "#claimant-old",
+        worldIdFromClient(claimant_id),
+        world_model.MemberModes.empty(),
+    );
+
+    const event_id: attachment_delivery_spool.EventId = @splat(0x7a);
+    _ = try server.attachment_delivery_spool.reserveBatch(&.{
+        .{
+            .client = ghost_cid,
+            .event_id = event_id,
+            .bytes = ":source!u@h PRIVMSG Ghost :retained\r\n",
+        },
+        .{
+            .client = claimant_cid,
+            .event_id = event_id,
+            .bytes = ":source!u@h PRIVMSG Fresh :conflict\r\n",
+        },
+    });
+    const spool_before = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
+    defer allocator.free(spool_before);
+
+    const token_hex = std.fmt.bytesToHex(ghost_token, .lower);
+    var line_buf: [64]u8 = undefined;
+    var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{token_hex},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+
+    try expectContains(claimant.send_buf[0..claimant.send_len], "WARN SESSION TEMPORARILY_UNAVAILABLE");
+    try std.testing.expectEqualStrings("Fresh", claimant.session.displayName());
+    try std.testing.expect(server.sessions.clientHasToken(account, claimant_cid, claimant_token));
+    try std.testing.expect(!server.sessions.clientHasToken(account, claimant_cid, ghost_token));
+    try std.testing.expect(server.sessions.findDetachedTokenSessionInAccount(account, ghost_token) != null);
+    try std.testing.expect(server.world.isMember("#claimant-old", worldIdFromClient(claimant_id)));
+    try std.testing.expect(!server.world.isMember("#resume-target", worldIdFromClient(claimant_id)));
+    const spool_after_failure = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
+    defer allocator.free(spool_after_failure);
+    try std.testing.expectEqualSlices(u8, spool_before, spool_after_failure);
+
+    // Remove only the claimant-side conflict and retry the same still-valid
+    // credential. The selected ghost must disappear, and its retained delivery
+    // must move to the newly restored physical attachment exactly once.
+    _ = server.attachment_delivery_spool.discardAttachment(claimant_cid);
+    claimant.send_len = 0;
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "SESSION RESUME: session restored");
+    try std.testing.expectEqualStrings("Ghost", claimant.session.displayName());
+    try std.testing.expect(server.sessions.clientHasToken(account, claimant_cid, ghost_token));
+    try std.testing.expect(server.sessions.resumeHandleForClient(account, ghost_cid) == null);
+    try std.testing.expect(!server.attachment_delivery_spool.contains(ghost_cid, event_id));
+    try std.testing.expect(server.attachment_delivery_spool.contains(claimant_cid, event_id));
+    var retained_buf: [1]attachment_delivery_spool.PendingRecord = undefined;
+    const retained = server.attachment_delivery_spool.collectPending(&retained_buf);
+    try std.testing.expectEqual(@as(usize, 1), retained.len);
+    try std.testing.expectEqual(claimant_cid, retained[0].client);
+    try std.testing.expectEqual(event_id, retained[0].event_id);
+    try std.testing.expectEqualStrings(":source!u@h PRIVMSG Ghost :retained\r\n", retained[0].bytes);
+}
+
 test "SESSION DROP removes a sibling attachment by LIST index" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
@@ -74375,6 +74559,7 @@ test "threaded server: session migration restore cannot switch the authenticated
         "alice",
         token,
         .{ .adopt_verified = true },
+        null,
     ));
     try std.testing.expectEqualStrings("alice", claimant.session.account().?);
     try std.testing.expect(server.pending_migrations.?.has(token));
@@ -74422,6 +74607,7 @@ test "atomic RESUME staged capsule adopts a rowless verified token" {
         "stage-acct",
         target_token,
         .{ .adopt_verified = true },
+        null,
     ));
     try std.testing.expect(server.sessions.clientHasToken(
         "stage-acct",
