@@ -467,6 +467,10 @@ pub const Config = struct {
     pub const Sessions = struct {
         max_accounts: u64 = 65536,
         max_per_account: u32 = 64,
+        /// Rollout gate for attachment-bound composite SESSION credentials.
+        /// Off keeps issuance on the legacy token shape while current readers
+        /// remain capable of accepting already-issued composite credentials.
+        resume_composite_issuance: bool = false,
         /// Replicate detached state only for sessions that requested a portable
         /// resume credential. Runtime kill switch for rolling deploys.
         migrate_on_detach: bool = true,
@@ -1360,6 +1364,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // Session registry capsules encode the per-account count as u16. Keep the
     // runtime cap inside that durable/hot-upgrade representation.
     cfg.sessions.max_per_account = @intCast(try uintField(doc, "sessions.max_per_account", cfg.sessions.max_per_account, 1, std.math.maxInt(u16)));
+    if (doc.getBool("sessions.resume_composite_issuance")) |b|
+        cfg.sessions.resume_composite_issuance = b;
     if (doc.getBool("sessions.migrate_on_detach")) |b| cfg.sessions.migrate_on_detach = b;
     cfg.sessions.max_pending_migrations = @intCast(try uintField(doc, "sessions.max_pending_migrations", cfg.sessions.max_pending_migrations, 16, 1_000_000));
 
@@ -2888,7 +2894,7 @@ test "parseToml: [bouncer] memo limits project with bounded policy ranges" {
     , .{}));
 }
 
-test "parseToml: [sessions] registry sizing parses, defaults, and rejects out-of-range" {
+test "parseToml: [sessions] registry and composite issuance parse with safe defaults" {
     const allocator = testing.allocator;
     const text =
         \\[node]
@@ -2898,6 +2904,7 @@ test "parseToml: [sessions] registry sizing parses, defaults, and rejects out-of
         \\[sessions]
         \\max_accounts = 2048
         \\max_per_account = 9
+        \\resume_composite_issuance = false
         \\migrate_on_detach = false
         \\max_pending_migrations = 128
         \\
@@ -2906,6 +2913,7 @@ test "parseToml: [sessions] registry sizing parses, defaults, and rejects out-of
     defer cfg.deinit(allocator);
     try testing.expectEqual(@as(u64, 2048), cfg.sessions.max_accounts);
     try testing.expectEqual(@as(u32, 9), cfg.sessions.max_per_account);
+    try testing.expect(!cfg.sessions.resume_composite_issuance);
     try testing.expect(!cfg.sessions.migrate_on_detach);
     try testing.expectEqual(@as(u32, 128), cfg.sessions.max_pending_migrations);
 
@@ -2913,8 +2921,21 @@ test "parseToml: [sessions] registry sizing parses, defaults, and rejects out-of
     defer omitted.deinit(allocator);
     try testing.expectEqual(@as(u64, 65536), omitted.sessions.max_accounts);
     try testing.expectEqual(@as(u32, 64), omitted.sessions.max_per_account);
+    try testing.expect(!omitted.sessions.resume_composite_issuance);
     try testing.expect(omitted.sessions.migrate_on_detach);
     try testing.expectEqual(@as(u32, 4096), omitted.sessions.max_pending_migrations);
+
+    var enabled = try parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sessions]
+        \\resume_composite_issuance = true
+        \\
+    , .{});
+    defer enabled.deinit(allocator);
+    try testing.expect(enabled.sessions.resume_composite_issuance);
 
     // Zero and above-max are hard parse errors, never a silent clamp.
     try testing.expectError(error.ParseError, parseToml(allocator,

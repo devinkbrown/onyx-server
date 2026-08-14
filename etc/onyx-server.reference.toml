@@ -527,6 +527,10 @@ clone_refuse_penalty = 25.0           # added when a clone is refused (0..1000)
 [sessions]
 max_accounts = 65536   # distinct accounts tracked (1..2^32); default 65536
 max_per_account = 64   # live sessions per account (1..65535); default 64
+# Rollout gate for attachment-bound composite SESSION TOKEN/MTOKEN issuance.
+# Keep false until every intended client accepts the composite credential shape;
+# current servers can still read already-issued composite credentials while off.
+resume_composite_issuance = false
 migrate_on_detach = true       # offer portable live/detached state + reconnect anti-entropy
 max_pending_migrations = 4096  # cap reusable signed replicas/compat tombstones (16..1000000)
 

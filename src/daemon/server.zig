@@ -96,6 +96,8 @@ const route_report = @import("../proto/route_report.zig");
 const ripple_report = @import("../proto/ripple_report.zig");
 const link_health_mod = @import("link_health.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
+const session_reclaim_attachment = @import("../proto/session_reclaim_attachment.zig");
+const session_resume_credential = @import("../proto/session_resume_credential.zig");
 const session_portability = @import("../proto/session_portability.zig");
 const migration_relay = @import("helix/migration_relay.zig");
 const session_migrate = @import("helix/session_migrate.zig");
@@ -1941,6 +1943,10 @@ pub const Config = struct {
     /// Multi-session/bouncer registry sizing.
     session_max_accounts: u64 = 65536,
     session_max_per_account: u32 = 64,
+    /// Reader-first rollout barrier for SRM2 composite issuance. Decoders are
+    /// always enabled; operators explicitly enable writers only after every
+    /// node in the rolling mesh understands srm2l/srm2m.
+    session_resume_composite_issuance: bool = false,
     session_migrate_on_detach: bool = true,
     session_max_pending_migrations: u32 = 4096,
     /// Runtime memo offline-mailbox limits. Configurable via `[bouncer]`.
@@ -4076,6 +4082,14 @@ pub const LinuxServer = struct {
     /// concurrent overwrite is at worst a momentary cosmetic mix in MAP.
     mesh_peer_names: [32][64]u8 = @splat(@as([64]u8, @splat(0))),
     mesh_peer_name_lens: [32]u8 = @splat(0),
+    /// Security-sensitive reactor-0 publication paired with the cosmetic name
+    /// snapshot above. Exact mesh reclaim readers copy under this mutex instead
+    /// of traversing another reactor's mutable SlotMap or borrowing link memory.
+    mesh_peer_identity_mu: std.atomic.Mutex = .unlocked,
+    mesh_peer_node_ids: [32]u64 = @splat(0),
+    mesh_peer_public_keys: [32][crypto_sign.public_key_len]u8 =
+        @splat(@as([crypto_sign.public_key_len]u8, @splat(0))),
+    mesh_peer_public_key_present: [32]bool = @splat(false),
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Onyx Server media SFU control plane): who is in each call.
@@ -8819,6 +8833,12 @@ pub const LinuxServer = struct {
             self.markPeerHealth(link.remoteName(), .established);
             self.updatePartitionTransitions();
             if (self.resolveS2sCollision(conn, link.remoteName())) return; // this link lost the dedup
+            // Publish only after collision resolution. If the new secured link
+            // won, resolveS2sCollision marked the old route dedup-closing and
+            // this immediately replaces its authenticated key in the trust
+            // snapshot; if there was no collision it makes the peer trusted
+            // without waiting for the periodic timer.
+            self.publishPeerCount();
 
             // Replay the retained Store for both current and rolling-old peers.
             // Old peers receive an exact-once legacy translation of current
@@ -9029,6 +9049,7 @@ pub const LinuxServer = struct {
             self.markPeerHealth(link.remoteName(), .established);
             self.updatePartitionTransitions();
             if (self.resolveS2sCollision(conn, link.remoteName())) return; // this link lost the dedup
+            self.publishPeerCount();
         }
         const out = link.outbound();
         if (out.len != 0) {
@@ -10160,6 +10181,48 @@ pub const LinuxServer = struct {
         lockSpin(&self.attachment_delivery_mu);
         defer self.attachment_delivery_mu.unlock();
         _ = try self.attachment_delivery_spool.transferAttachment(old_client, new_client);
+    }
+
+    const PreparedResumeAttachmentTransfer = struct {
+        server: *LinuxServer,
+        prepared: attachment_delivery_spool.PreparedAttachmentTransfer,
+        locked: bool = true,
+
+        fn commit(self: *PreparedResumeAttachmentTransfer) void {
+            _ = self.prepared.commit();
+        }
+
+        fn release(self: *PreparedResumeAttachmentTransfer) void {
+            if (self.locked) {
+                self.server.attachment_delivery_mu.unlock();
+                self.locked = false;
+            }
+        }
+
+        fn deinit(self: *PreparedResumeAttachmentTransfer) void {
+            self.prepared.deinit();
+            self.release();
+            self.* = undefined;
+        }
+    };
+
+    /// Prepare the delivery half of an exact attachment rebind and retain the
+    /// spool mutation lock until the joint SessionStore/World/spool cut has
+    /// committed or aborted. The returned ticket is logically non-copyable.
+    fn prepareResumeAttachmentTransfer(
+        self: *LinuxServer,
+        old_client: sessions_mod.ClientId,
+        new_client: sessions_mod.ClientId,
+    ) attachment_delivery_spool.TransferError!PreparedResumeAttachmentTransfer {
+        lockSpin(&self.attachment_delivery_mu);
+        errdefer self.attachment_delivery_mu.unlock();
+        return .{
+            .server = self,
+            .prepared = try self.attachment_delivery_spool.prepareAttachmentTransfer(
+                old_client,
+                new_client,
+            ),
+        };
     }
 
     const PreparedAttachmentDeliveryBatch = struct {
@@ -13214,6 +13277,7 @@ pub const LinuxServer = struct {
             if (conn.recv_overflow.capacity > 0) conn.recv_overflow.deinit(conn.overflow_allocator);
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
+                const publish_peer_snapshot = !conn.s2s_dedup;
                 const dropped_node = link.peerShortId();
                 if (!conn.s2s_dedup and link.remoteName().len != 0) {
                     self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
@@ -13238,9 +13302,15 @@ pub const LinuxServer = struct {
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
                 self.stats.onClose(true, was_est);
+                // The removed slot must be absent before recomputing. A dedup
+                // loser never republishes: the collision winner already
+                // replaced the route at establishment, and teardown must not
+                // perturb that survivor's snapshot.
+                if (publish_peer_snapshot) self.publishPeerCount();
                 return;
             }
             if (conn.s2s) |link| {
+                const publish_peer_snapshot = !conn.s2s_dedup;
                 const dropped_node = link.remoteNodeId();
                 if (!conn.s2s_dedup and link.remoteName().len != 0) {
                     self.logMeshEvent(.peer_down, link.remoteName(), "link dropped");
@@ -13261,6 +13331,7 @@ pub const LinuxServer = struct {
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
                 self.stats.onClose(true, was_est);
+                if (publish_peer_snapshot) self.publishPeerCount();
                 return;
             }
             self.stats.onClose(false, false);
@@ -13901,6 +13972,7 @@ pub const LinuxServer = struct {
                     conn.closing = true;
                     return;
                 }
+                self.armBoundedExactResumeHoldIfNeeded(id, conn);
                 if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
                 try self.deliverMemo(conn); // hand over any offline messages
                 // OBSERVE: push a connect record to watching operators.
@@ -13937,6 +14009,21 @@ pub const LinuxServer = struct {
                 => conn.closing = true,
                 else => return err,
             };
+            return;
+        }
+
+        // An authenticated E2EE socket admitted only for a bounded exact-resume
+        // attempt is isolated from ordinary IRC participation until it proves a
+        // physical attachment. SESSION/CAP/QUIT remain available; PING returned
+        // above so clients can keep the handshake transport alive.
+        if (conn.resume_autojoin_deferred and
+            conn.session.hasCap(.onyx_e2ee) and
+            !self.attachmentHasReusableSession(id) and
+            !std.ascii.eqlIgnoreCase(parsed.command, "SESSION") and
+            !std.ascii.eqlIgnoreCase(parsed.command, "CAP") and
+            !std.ascii.eqlIgnoreCase(parsed.command, "QUIT"))
+        {
+            try self.failReply(conn, "SESSION", "RESUME_PENDING", "complete exact SESSION RESUME before IRC participation");
             return;
         }
 
@@ -23693,6 +23780,30 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// Arm the resume/autojoin hold before E2EE eligibility is enforced. This is
+    /// required when no-evict bootstrap tracking leaves an at-cap reconnect
+    /// intentionally untracked: exact resume must get a bounded chance to replace
+    /// its selected detached row, while all ordinary participation stays gated.
+    fn armBoundedExactResumeHoldIfNeeded(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+    ) void {
+        const account = conn.session.account() orelse return;
+        if (self.attachmentHasReusableSession(id)) return;
+        var rows_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+        var has_detached_attachment = false;
+        for (self.sessions.sessionsInto(account, &rows_buf)) |row| {
+            if (!row.attached and row.attachment_id != null) {
+                has_detached_attachment = true;
+                break;
+            }
+        }
+        if (!has_detached_attachment and !conn.session.hasCap(.onyx_session_sync)) return;
+        conn.resume_autojoin_deferred = true;
+        conn.resume_autojoin_deadline_ms = self.nowMs() + 2_000;
+    }
+
     fn finishDeferredSessionAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, restored: bool) void {
         if (!conn.resume_autojoin_deferred) return;
         conn.resume_autojoin_deferred = false;
@@ -23711,6 +23822,23 @@ pub const LinuxServer = struct {
             const conn = entry.value;
             if (conn.resume_autojoin_deferred) {
                 if (now < conn.resume_autojoin_deadline_ms) continue;
+                if (conn.session.hasCap(.onyx_e2ee) and
+                    conn.session.account() != null and
+                    !self.attachmentHasReusableSession(entry.id))
+                {
+                    conn.resume_autojoin_deferred = false;
+                    conn.resume_autojoin_deadline_ms = 0;
+                    conn.preserve_resume_credential_once = false;
+                    retainCloseReason(conn, "E2EE exact session resume expired");
+                    conn.closing = true;
+                    self.failReply(
+                        conn,
+                        "E2EEGROUP",
+                        "SESSION_UNAVAILABLE",
+                        "exact session resume window expired",
+                    ) catch {};
+                    continue;
+                }
                 self.finishDeferredSessionAutojoin(entry.id, conn, false);
                 continue;
             }
@@ -24531,6 +24659,7 @@ pub const LinuxServer = struct {
                     }) else -1,
                     .snapshot = if (!s.attached) (s.snapshot orelse &.{}) else &.{},
                     .portable_resume = s.portable_resume,
+                    .attachment_id = if (s.attachment_id) |attachment_id| attachment_id.raw else null,
                 };
             }
             const cap = session_capsule.SessionCapsule{
@@ -27781,6 +27910,9 @@ pub const LinuxServer = struct {
         var detached_count: usize = 0;
         for (cap.sessions, 0..) |entry, entry_index| {
             if (entry.token.len != @sizeOf(sessions_mod.Token)) return 0;
+            if (entry.attachment_id) |raw| {
+                _ = sessions_mod.AttachmentId.fromBytes(raw) catch return 0;
+            }
             if (attachmentClientNeedsRemap(attachment_clients, entry.client)) {
                 for (attachment_remaps.items) |mapping| {
                     if (mapping.old_client == entry.client) return 0;
@@ -27828,6 +27960,27 @@ pub const LinuxServer = struct {
                     entry.client,
                     cid,
                 ) orelse return 0;
+                // Pass 2 installs a compatibility row because the connection
+                // capsule does not carry physical attachment identity. Refresh
+                // that inert candidate row from HSSN v4 before it can become
+                // live. A legacy v1-v3 row has no id; when successor crypto is
+                // available, mint one now so the first reader upgrade creates
+                // current identity and the next v4 upgrade preserves it.
+                const outcome = self.restoreInheritedSessionAttachment(
+                    cap.account,
+                    cid,
+                    token,
+                    entry.attachment_id,
+                    entry.signon_unix,
+                ) orelse return 0;
+                // Refreshing an already-adopted live client reports the
+                // displaced pre-refresh row as `evicted`; it is the same
+                // physical candidate, not a capacity eviction or retired
+                // authority. Verify that exact identity instead of feeding it
+                // to the ordinary eviction finalizer.
+                const displaced = outcome.evicted orelse return 0;
+                if (displaced.client != cid or
+                    !std.crypto.timing_safe.eql(sessions_mod.Token, displaced.token, token)) return 0;
                 continue;
             }
             const synthetic: client_model.ClientId = .{
@@ -27844,7 +27997,13 @@ pub const LinuxServer = struct {
                 return 0;
             }
             const cid = monitorIdFromClient(synthetic);
-            const outcome = self.sessions.attachReportingEviction(cap.account, cid, token, entry.signon_unix) catch {
+            const outcome = self.restoreInheritedSessionAttachment(
+                cap.account,
+                cid,
+                token,
+                entry.attachment_id,
+                entry.signon_unix,
+            ) orelse {
                 for (applied[0..applied_n]) |rc| _ = self.sessions.remove(cap.account, rc);
                 return 0;
             };
@@ -27887,6 +28046,56 @@ pub const LinuxServer = struct {
         }
         remaps_committed = true;
         return cap.sessions.len;
+    }
+
+    /// Install the exact HSSN v4 attachment id, or mint the first stable id for
+    /// a genuine legacy v1-v3 row. The latter is reader-first compatible: old
+    /// predecessors never issued SRM2, while this successor's next v4 seal will
+    /// preserve the freshly minted id byte-for-byte. Without configured crypto,
+    /// retain the compatibility row without inventing weak identity.
+    fn restoreInheritedSessionAttachment(
+        self: *LinuxServer,
+        account: []const u8,
+        client: sessions_mod.ClientId,
+        token: sessions_mod.Token,
+        encoded_attachment_id: ?[session_capsule.attachment_id_len]u8,
+        signon_ms: i64,
+    ) ?sessions_mod.AttachOutcome {
+        if (encoded_attachment_id) |raw| {
+            const attachment_id = sessions_mod.AttachmentId.fromBytes(raw) catch return null;
+            return self.sessions.attachWithAttachmentReportingEviction(
+                account,
+                client,
+                token,
+                attachment_id,
+                signon_ms,
+            ) catch null;
+        }
+
+        const io = self.config.crypto_io orelse
+            return self.sessions.attachReportingEviction(
+                account,
+                client,
+                token,
+                signon_ms,
+            ) catch null;
+        // AttachmentId.mint already bounds zero-entropy retries. Bound global
+        // collision retries independently so hostile/injected entropy cannot
+        // spin adoption forever.
+        for (0..4) |_| {
+            const attachment_id = sessions_mod.AttachmentId.mint(io) catch return null;
+            return self.sessions.attachWithAttachmentReportingEviction(
+                account,
+                client,
+                token,
+                attachment_id,
+                signon_ms,
+            ) catch |err| switch (err) {
+                error.DuplicateAttachmentId => continue,
+                else => return null,
+            };
+        }
+        return null;
     }
 
     fn attachmentClientNeedsRemap(
@@ -32848,6 +33057,7 @@ pub const LinuxServer = struct {
         }
         if (oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(id, conn);
+        self.armBoundedExactResumeHoldIfNeeded(id, conn);
         if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(id, conn);
@@ -35934,6 +36144,7 @@ pub const LinuxServer = struct {
         self.restoreAccountSilence(conn, account);
         try self.elevateOperFromAccount(conn);
         self.trackSession(id, conn);
+        self.armBoundedExactResumeHoldIfNeeded(id, conn);
         if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(id, conn);
@@ -36004,6 +36215,7 @@ pub const LinuxServer = struct {
         }
         if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
+        self.armBoundedExactResumeHoldIfNeeded(idFromToken(conn.token), conn);
         if (!try self.enforceE2eeSessionEligibility(idFromToken(conn.token), conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(idFromToken(conn.token), conn);
@@ -36117,6 +36329,7 @@ pub const LinuxServer = struct {
         try emitReplyLine(conn, line);
         try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
+        self.armBoundedExactResumeHoldIfNeeded(idFromToken(conn.token), conn);
         if (!try self.enforceE2eeSessionEligibility(idFromToken(conn.token), conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(idFromToken(conn.token), conn);
@@ -36164,7 +36377,11 @@ pub const LinuxServer = struct {
         try emitReplyLine(conn, line);
     }
 
-    fn closeDroppedAccountConnections(self: *LinuxServer, account: []const u8) void {
+    fn closeDroppedAccountConnections(
+        self: *LinuxServer,
+        account: []const u8,
+        except: ?client_model.ClientId,
+    ) void {
         // Account deletion revokes the identity, not merely its resumable rows.
         // ConnState is owner-reactor storage: inspect it under the World lock but
         // route teardown through the owner seam so foreign SendQ/ring state is
@@ -36179,6 +36396,7 @@ pub const LinuxServer = struct {
                 const live_account = slot.value.session.account() orelse continue;
                 if (!std.ascii.eqlIgnoreCase(live_account, account)) continue;
                 const id = slotClientId(reactor, slot_index, slot.gen);
+                if (except) |retained| if (id.eql(retained)) continue;
                 self.enqueueCloseOnOwner(id, "Account dropped") catch {};
             }
         }
@@ -36210,10 +36428,13 @@ pub const LinuxServer = struct {
         self.promoteSuccessorsForDroppedFounder(account);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} dropped\r\n", .{ self.serverName(), conn.session.displayName(), account }) catch return;
-        try emitReplyLine(conn, line);
-        // This may synchronously free `conn` when its fd has no kernel ownership;
-        // it must remain the final operation in this handler.
-        self.closeDroppedAccountConnections(account);
+        const requester = idFromToken(conn.token);
+        // Account deletion closes every authenticated socket, but the requester
+        // must observe the committed result first. Queue its notice and terminal
+        // close as one ordered owner operation; an immediate local close would
+        // discard the just-appended SendQ before the kernel could transmit it.
+        try self.enqueueDeliveryThenClose(requester, line, "Account dropped");
+        self.closeDroppedAccountConnections(account, requester);
     }
 
     /// `SETPASS <current-password> <new-password>` — change the logged-in account's
@@ -39570,6 +39791,44 @@ pub const LinuxServer = struct {
         return toHexLower(raw[0..n], out_hex);
     }
 
+    /// Mint an origin-signed, attachment-scoped SRM2 exact-restore claim. The
+    /// first rollout binds destination to the issuer: another trusted node may
+    /// verify and redirect to it, but may not restore a local same-token row.
+    fn meshExactReclaimClaim(
+        self: *LinuxServer,
+        account: []const u8,
+        token: sessions_mod.Token,
+        attachment_id: sessions_mod.AttachmentId,
+        out_hex: []u8,
+    ) ?[]const u8 {
+        const identity = self.config.node_identity orelse return null;
+        const io = self.config.crypto_io orelse return null;
+        const now_u64 = self.meshWallMs();
+        const now: i64 = @intCast(@min(now_u64, @as(u64, std.math.maxInt(i64))));
+        var nonce_bytes: [8]u8 = undefined;
+        io.random(&nonce_bytes);
+        const nonce = std.mem.readInt(u64, &nonce_bytes, .big);
+        if (nonce == 0) return null;
+        const wire = session_reclaim_attachment.encodeClaim(
+            self.allocator,
+            .{
+                .kind = .exact_restore,
+                .account = account,
+                .group_token = token,
+                .attachment_id = attachment_id,
+                .origin_node = identity.shortId(),
+                .destination_node = identity.shortId(),
+                .issued_at_ms = now,
+                .expires_at_ms = now + @as(i64, @intCast(mesh_reclaim_ttl_ms)),
+                .nonce = nonce,
+            },
+            &identity.sign_kp,
+        ) catch return null;
+        defer self.allocator.free(wire);
+        if (wire.len * 2 > out_hex.len) return null;
+        return toHexLower(wire, out_hex);
+    }
+
     /// Register a live session for the client's account (once; keeps the token
     /// stable). No-op if the client is not logged in. Called after account login.
     fn finalizeRemovedSessionAuthority(self: *LinuxServer, handle: sessions_mod.ResumeHandle) void {
@@ -39668,16 +39927,42 @@ pub const LinuxServer = struct {
         const cid = monitorIdFromClient(id);
         if (self.sessions.containsClient(account, cid)) return true;
         const signon: i64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-        const outcome = self.sessions.attachReportingEviction(account, cid, self.genSessionToken(), signon) catch |err| {
+        const io = self.config.crypto_io orelse {
+            // Compatibility-only deployments still need LIST/fan-out tracking.
+            // The sentinel row has no bearer and no stable attachment id, so it
+            // cannot enter either exact resume path.
+            const legacy = self.sessions.attachReportingEviction(
+                account,
+                cid,
+                @splat(0),
+                signon,
+            ) catch |err| {
+                srvLog("onyx-server: compatibility session tracking failed for account '{s}': {s}\n", .{ account, @errorName(err) });
+                return false;
+            };
+            self.finalizeAttachEviction(legacy);
+            return true;
+        };
+        const token = self.genSessionToken();
+        if (tokenIsNull(token)) {
+            srvLog("onyx-server: session tracking failed for account '{s}': invalid generated token\n", .{account});
+            return false;
+        }
+        _ = self.sessions.mintBootstrapAttachmentNoEvict(
+            account,
+            cid,
+            token,
+            signon,
+            io,
+        ) catch |err| {
             // Surface, never swallow: at the per-account cap with every slot
-            // still attached there is nothing to evict, so this session goes
+            // occupied there is no safe row to evict, so this session goes
             // UNTRACKED (no reclaim token, no session-sync fan-out, absent from
-            // SESSION LIST). Log so the condition is observable; the eviction
-            // policy itself is a separate config/warden concern.
+            // SESSION LIST). An immediately following exact RESUME may still
+            // replace its selected detached row without destroying a sibling.
             srvLog("onyx-server: session tracking failed for account '{s}': {s}\n", .{ account, @errorName(err) });
             return false;
         };
-        self.finalizeAttachEviction(outcome);
         return true;
     }
 
@@ -39697,6 +39982,12 @@ pub const LinuxServer = struct {
     ) !bool {
         if (!conn.session.hasCap(.onyx_e2ee)) return true;
         if (self.attachmentHasReusableSession(id)) return true;
+        // At the account cap, initial no-evict tracking intentionally leaves a
+        // reconnecting socket untracked so its exact RESUME can replace the
+        // selected detached row. Honor only the existing bounded autojoin hold;
+        // expiry returns here and closes an E2EE socket that never proves it.
+        if (conn.resume_autojoin_deferred and conn.resume_autojoin_deadline_ms > self.nowMs())
+            return true;
         // No authenticated account ⇒ no reusable SessionStore attachment is
         // expected (guest / anonymous best-effort). Fail closed only for
         // account sockets that negotiated the durable-delivery promise without
@@ -40403,13 +40694,28 @@ pub const LinuxServer = struct {
             self.finishDeferredSessionAutojoin(id, conn, false);
             if (self.sessions.resumeHandleForClient(account, cid)) |handle| {
                 if (!tokenIsNull(handle.token)) {
-                    const hex = std.fmt.bytesToHex(handle.token, .lower);
-                    const line = std.fmt.bufPrint(&buf, "SESSION TOKEN {s}", .{hex}) catch return;
+                    const token_hex = std.fmt.bytesToHex(handle.token, .lower);
+                    const attachment_id = handle.attachment_id;
+                    const exact_issuance = self.config.session_resume_composite_issuance and
+                        attachment_id != null;
+                    const line = if (exact_issuance) blk: {
+                        const aid = attachment_id.?;
+                        const credential = session_resume_credential.encodeLocal(handle.token, aid) catch return;
+                        break :blk std.fmt.bufPrint(
+                            &buf,
+                            "SESSION TOKEN {s}",
+                            .{credential},
+                        ) catch return;
+                    } else std.fmt.bufPrint(&buf, "SESSION TOKEN {s}", .{token_hex}) catch return;
                     try self.noticeTo(conn, line);
                     // Also offer a mesh-sealed token usable to reclaim/redirect from
                     // ANY node in the mesh (only when a mesh shared key is set).
                     var mbuf: [1024]u8 = undefined;
-                    if (self.meshReclaimToken(account, &hex, &mbuf)) |mhex| {
+                    const mesh_authority = if (exact_issuance)
+                        self.meshExactReclaimClaim(account, handle.token, attachment_id.?, &mbuf)
+                    else
+                        self.meshReclaimToken(account, &token_hex, &mbuf);
+                    if (mesh_authority) |mhex| {
                         // Set the replication gate before emitting the credential: if
                         // the connection drops after the write is queued, detach must
                         // still ship the snapshot that this token can unlock.
@@ -40421,7 +40727,23 @@ pub const LinuxServer = struct {
                         _ = self.shipSessionMigration(id, conn, account, handle.token);
                         var lb: [1152]u8 = undefined;
                         const expires_unix = (self.meshWallMs() + mesh_reclaim_ttl_ms) / 1000;
-                        const mline = std.fmt.bufPrint(&lb, "SESSION MTOKEN {s} expires={d}", .{ mhex, expires_unix }) catch return;
+                        const mline = if (exact_issuance) blk: {
+                            var credential_buf: [1200]u8 = undefined;
+                            const credential = session_resume_credential.encodeMesh(
+                                &credential_buf,
+                                mhex,
+                                attachment_id.?,
+                            ) catch return;
+                            break :blk std.fmt.bufPrint(
+                                &lb,
+                                "SESSION MTOKEN {s} expires={d}",
+                                .{ credential, expires_unix },
+                            ) catch return;
+                        } else std.fmt.bufPrint(
+                            &lb,
+                            "SESSION MTOKEN {s} expires={d}",
+                            .{ mhex, expires_unix },
+                        ) catch return;
                         try self.noticeTo(conn, mline);
                     }
                     return;
@@ -40492,6 +40814,59 @@ pub const LinuxServer = struct {
         conn.resume_autojoin_deadline_ms = self.nowMs() + 2_000;
     }
 
+    fn handleExactLocalResume(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        token: sessions_mod.Token,
+        attachment_id: sessions_mod.AttachmentId,
+        cross_server: bool,
+    ) !void {
+        const outcome = self.restoreExactAttachment(id, conn, account, token, attachment_id);
+        switch (outcome) {
+            .missing => {
+                try self.failReply(conn, "SESSION", "NO_ATTACHMENT", "No exact session attachment matches that credential");
+                return;
+            },
+            .busy => {
+                try self.failReply(conn, "SESSION", "ATTACHMENT_IN_USE", "Exact session attachment is already active");
+                return;
+            },
+            .retryable => {
+                self.markSessionResumeRetryable(conn);
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "exact session restore failed; credential remains valid");
+                return;
+            },
+            .already_attached => {
+                self.finishDeferredSessionAutojoin(id, conn, true);
+                try self.noticeTo(conn, "SESSION RESUME: already attached to this exact session");
+                return;
+            },
+            .restored, .reclaimed => {},
+        }
+
+        conn.preserve_resume_credential_once = false;
+        self.finishDeferredSessionAutojoin(id, conn, outcome == .restored);
+        if (self.refreshPortableSessionReplicas(id, conn, account, token))
+            self.flushDeferredSessionMeshAnnouncements(id, conn);
+        const action: []const u8 = if (outcome == .restored) "restored" else "reclaimed";
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &line_buf,
+            "SESSION RESUME: exact session {s}{s}",
+            .{ action, if (cross_server) " (cross-server)" else "" },
+        ) catch return;
+        try self.noticeTo(conn, line);
+        var event_buf: [default_reply_bytes]u8 = undefined;
+        const event = std.fmt.bufPrint(
+            &event_buf,
+            "SESSION exact-{s}{s} account={s}",
+            .{ action, if (cross_server) " cross-server" else "", account },
+        ) catch return;
+        self.publishOperEvent(.service, .notice, event) catch {};
+    }
+
     pub fn handleSessionResume(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, parsed: *const irc_line.LineView) !void {
         // Preservation belongs to exactly one retryable attempt. Clear any prior
         // WARN latch before parsing this attempt; only a retryable outcome below
@@ -40505,23 +40880,44 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
             return;
         }
-        // A token longer than the local 16-byte form is a mesh-sealed token:
-        // reclaim/redirect it across the mesh.
-        if (params[1].len != 2 * @sizeOf(sessions_mod.Token)) {
-            try self.handleMeshReclaim(id, conn, account, params[1]);
+        const raw_credential = params[1];
+        if (std.mem.startsWith(u8, raw_credential, session_resume_credential.local_prefix ++ ".") or
+            std.mem.startsWith(u8, raw_credential, session_resume_credential.mesh_prefix ++ "."))
+        {
+            const credential = session_resume_credential.decode(raw_credential) catch {
+                try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME credential is malformed or noncanonical");
+                return;
+            };
+            switch (credential) {
+                .local => |exact| {
+                    try self.handleExactLocalResume(
+                        id,
+                        conn,
+                        account,
+                        exact.group_token,
+                        exact.attachment_id,
+                        false,
+                    );
+                },
+                .mesh => |exact| try self.handleMeshExactReclaim(
+                    id,
+                    conn,
+                    account,
+                    exact.sealed_hex,
+                    exact.attachment_id,
+                ),
+            }
             return;
         }
-        var token: sessions_mod.Token = undefined;
-        _ = std.fmt.hexToBytes(&token, params[1]) catch {
-            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME token is not valid hex");
+        const token = sessionTokenFromHex(raw_credential) orelse {
+            if (raw_credential.len == 2 * @sizeOf(sessions_mod.Token)) {
+                try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
+                return;
+            }
+            // Unprefixed non-local credentials are the rolling SRM1 path.
+            try self.handleMeshReclaim(id, conn, account, raw_credential);
             return;
         };
-        if (tokenIsNull(token)) {
-            // The all-zero sentinel marks sessions tracked without a CSPRNG; it
-            // is never a credential, so it must never match a ghost.
-            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
-            return;
-        }
         if (self.sessions.clientHasToken(account, cid, token)) {
             self.finishDeferredSessionAutojoin(id, conn, true);
             try self.noticeTo(conn, "SESSION RESUME: already attached to this session");
@@ -40557,62 +40953,158 @@ pub const LinuxServer = struct {
             return;
         }
 
-        const matched = self.sessions.findDetachedTokenSessionInAccount(account, token) orelse {
+        _ = self.sessions.findDetachedTokenSessionInAccount(account, token) orelse {
             try self.failReply(conn, "SESSION", "NO_SESSION", "No session matches that token");
             return;
         };
         const snapshot = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, token) catch null;
         defer if (snapshot) |bytes| self.allocator.free(bytes);
-        // Restore FIRST, consume the ghost only AFTER a successful restore: a
-        // transient decode-stage failure (a corrupt/truncated snapshot rejected
-        // by Snapshot.decode BEFORE any conn mutation) must leave the detached
-        // ghost (and its snapshot) reclaimable, not irrecoverably discarded. A
-        // deterministic post-decode failure (e.g. nick re-registration) simply
-        // re-preserves the ghost until its TTL — no worse than the old
-        // unconditional discard, and self-heals once the conflict clears.
-        const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshotReplacingAttachment(
+        // Bare legacy tokens carry no stable physical selector. They may clone
+        // group state into this freshly minted attachment, but must never consume
+        // a detached sibling or transfer its attachment-specific spool.
+        const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshot(
             id,
             conn,
             account,
             token,
             bytes,
             .join_existing,
-            matched.client,
         ) else false;
         if (snapshot != null and !restored) {
             self.markSessionResumeRetryable(conn);
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
             return;
         }
-        // Bind and transfer retained deliveries BEFORE removing the ghost so the
-        // prepared ticket can verify local authority and inherit its portable
-        // replication state. The old detached attachment is then replaced by
-        // this live one; the TOKEN remains reusable for additional clients.
-        if (snapshot == null and !self.bindTokenReplacingAttachment(
-            account,
-            cid,
-            token,
-            .join_existing,
-            matched.client,
-        )) {
+        if (snapshot == null and !self.sessions.joinTokenGroup(account, cid, token)) {
             self.markSessionResumeRetryable(conn);
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session registry changed during resume; retry the same token");
             return;
         }
         if (snapshot == null) self.bindDeferredSessionMeshAnnouncements(id, conn, token);
-        _ = self.removeTrackedSession(account, matched.client);
         conn.preserve_resume_credential_once = false;
         self.finishDeferredSessionAutojoin(id, conn, true);
         if (self.refreshPortableSessionReplicas(id, conn, account, token))
             self.flushDeferredSessionMeshAnnouncements(id, conn);
         if (restored) {
-            try self.noticeTo(conn, "SESSION RESUME: session restored");
+            try self.noticeTo(conn, "SESSION RESUME: legacy session state cloned into a new attachment");
         } else {
-            try self.noticeTo(conn, "SESSION RESUME: session reclaimed");
+            try self.noticeTo(conn, "SESSION RESUME: legacy session attached as a new attachment");
         }
         var event_buf: [default_reply_bytes]u8 = undefined;
-        const event = std.fmt.bufPrint(&event_buf, "SESSION {s} account={s}", .{ if (restored) "restored" else "reclaimed", account }) catch return;
+        const event = std.fmt.bufPrint(&event_buf, "SESSION legacy-create-new account={s}", .{account}) catch return;
         self.publishOperEvent(.service, .notice, event) catch {};
+    }
+
+    const TrustedReclaimRoute = union(enum) {
+        local,
+        remote: struct {
+            name: [64]u8,
+            len: u8,
+
+            fn slice(self: *const @This()) []const u8 {
+                return self.name[0..self.len];
+            }
+        },
+    };
+
+    fn trustedReclaimRoute(
+        self: *LinuxServer,
+        origin_node: u64,
+        signer: session_reclaim_attachment.SignedClaim,
+    ) ?TrustedReclaimRoute {
+        const identity = self.config.node_identity orelse return null;
+        if (origin_node == identity.shortId()) {
+            if (!std.mem.eql(u8, &signer.signer, &identity.sign_kp.public_key)) return null;
+            return .local;
+        }
+        lockSpin(&self.mesh_peer_identity_mu);
+        defer self.mesh_peer_identity_mu.unlock();
+        const count = @min(
+            @as(usize, @intCast(self.net_peer_count.load(.acquire))),
+            self.mesh_peer_node_ids.len,
+        );
+        for (0..count) |i| {
+            if (self.mesh_peer_node_ids[i] != origin_node or
+                !self.mesh_peer_public_key_present[i] or
+                !std.mem.eql(u8, &self.mesh_peer_public_keys[i], &signer.signer)) continue;
+            const len = self.mesh_peer_name_lens[i];
+            if (len == 0) return null;
+            var remote: @FieldType(TrustedReclaimRoute, "remote") = .{
+                .name = @splat(0),
+                .len = len,
+            };
+            @memcpy(remote.name[0..len], self.mesh_peer_names[i][0..len]);
+            return .{ .remote = remote };
+        }
+        return null;
+    }
+
+    fn handleMeshExactReclaim(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        claim_hex: []const u8,
+        attachment_id: sessions_mod.AttachmentId,
+    ) !void {
+        if (claim_hex.len % 2 != 0 or
+            claim_hex.len / 2 < session_reclaim_attachment.min_claim_wire_len or
+            claim_hex.len / 2 > session_reclaim_attachment.max_claim_wire_len)
+        {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "malformed exact mesh credential");
+            return;
+        }
+        var raw: [session_reclaim_attachment.max_claim_wire_len]u8 = undefined;
+        const wire = std.fmt.hexToBytes(raw[0 .. claim_hex.len / 2], claim_hex) catch {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "exact mesh credential is not valid hex");
+            return;
+        };
+        const signed = session_reclaim_attachment.decodeClaim(wire) catch {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "malformed exact mesh claim");
+            return;
+        };
+        session_reclaim_attachment.verifyClaim(signed) catch {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "exact mesh claim failed verification");
+            return;
+        };
+        const claim = signed.claim;
+        const now: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+        session_reclaim_attachment.validateAt(claim, now, .{}) catch {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "exact mesh claim expired or is not yet valid");
+            return;
+        };
+        if (claim.kind != .exact_restore or
+            claim.origin_node != claim.destination_node or
+            !std.ascii.eqlIgnoreCase(claim.account, account) or
+            !claim.attachment_id.eql(attachment_id))
+        {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "exact mesh claim does not match this session");
+            return;
+        }
+        const route = self.trustedReclaimRoute(claim.origin_node, signed) orelse {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "exact mesh claim signer is not a trusted route");
+            return;
+        };
+        switch (route) {
+            .local => try self.handleExactLocalResume(
+                id,
+                conn,
+                account,
+                claim.group_token,
+                attachment_id,
+                true,
+            ),
+            .remote => |remote_route| {
+                self.markSessionResumeRetryable(conn);
+                var buf: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(
+                    &buf,
+                    "SESSION REDIRECT: exact session lives on {s}; reconnect there to reclaim",
+                    .{remote_route.slice()},
+                ) catch return;
+                try self.noticeTo(conn, line);
+            },
+        }
     }
 
     /// Cross-server reclaim: `SESSION RESUME <mesh-token>` where the token is a
@@ -40715,12 +41207,7 @@ pub const LinuxServer = struct {
                 .join_existing
             else
                 .{ .adopt_verified = true };
-            const staged_transfer: ?RestoreAttachmentTransfer = if (ghost) |g|
-                .{ .old_client = g, .new_client = cid }
-            else
-                null;
-            if (self.restoreStagedMigration(id, conn, account, migrate_token, staged_bind, staged_transfer)) {
-                if (ghost) |g| _ = self.removeTrackedSession(account, g);
+            if (self.restoreStagedMigration(id, conn, account, migrate_token, staged_bind, null)) {
                 conn.preserve_resume_credential_once = false;
                 _ = self.markPortableResumeIssuedForConn(id, conn, account);
                 self.finishDeferredSessionAutojoin(id, conn, true);
@@ -40734,10 +41221,10 @@ pub const LinuxServer = struct {
             // Restore failed mid-way: fall through to the legacy decision so the
             // client still gets a coherent (redirect/deny) answer.
         }
-        var peer_names: [32][]const u8 = undefined;
-        const peer_count = self.readPeerNames(&peer_names);
+        const peer_names = self.readPeerNames();
         var origin_reachable = origin_is_self;
-        for (peer_names[0..peer_count]) |name| {
+        for (0..peer_names.count) |i| {
+            const name = peer_names.name(i);
             if (std.ascii.eqlIgnoreCase(name, fields.origin_node)) {
                 origin_reachable = true;
                 break;
@@ -40745,20 +41232,18 @@ pub const LinuxServer = struct {
         }
         switch (session_reclaim_mesh.decide(fields, ghost != null, origin_is_self, origin_reachable, false, now)) {
             .grant_local => {
-                // This node owns the detached session. Prefer the local detached
-                // snapshot first: the client may have followed a redirect back to
-                // the origin, and should get the same full-state restore as the
-                // ordinary local SESSION RESUME path.
+                // Legacy SRM1 has only group authority. Clone its state into the
+                // claimant's fresh attachment; never consume a detached sibling
+                // or transfer attachment-specific durable delivery ownership.
                 const local_snapshot = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, migrate_token) catch null;
                 defer if (local_snapshot) |bytes| self.allocator.free(bytes);
-                const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshotReplacingAttachment(
+                const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshot(
                     id,
                     conn,
                     account,
                     migrate_token,
                     bytes,
                     .join_existing,
-                    ghost.?,
                 ) else false;
 
                 if (local_snapshot != null and !restored) {
@@ -40768,18 +41253,12 @@ pub const LinuxServer = struct {
                 }
 
                 if (ghost) |g| {
-                    if (local_snapshot == null and !self.bindTokenReplacingAttachment(
-                        account,
-                        cid,
-                        migrate_token,
-                        .join_existing,
-                        g,
-                    )) {
+                    _ = g;
+                    if (local_snapshot == null and !self.sessions.joinTokenGroup(account, cid, migrate_token)) {
                         self.markSessionResumeRetryable(conn);
                         try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during resume; retry the same token");
                         return;
                     }
-                    _ = self.removeTrackedSession(account, g);
                 } else unreachable;
                 if (local_snapshot == null) self.bindDeferredSessionMeshAnnouncements(id, conn, migrate_token);
                 conn.preserve_resume_credential_once = false;
@@ -42911,6 +43390,80 @@ pub const LinuxServer = struct {
         return self.restoreAndBindMigrationSnapshot(id, conn, account, session_token, bind_kind, &snap);
     }
 
+    const ExactAttachmentResumeOutcome = enum {
+        already_attached,
+        restored,
+        reclaimed,
+        missing,
+        busy,
+        retryable,
+    };
+
+    /// Replace only the detached physical attachment selected by the composite
+    /// credential. The retained exact ticket freezes token/id ownership while
+    /// the common World/output restore planner and durable delivery remap are
+    /// prepared; no sibling selection or token-only fallback is permitted.
+    fn restoreExactAttachment(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        session_token: sessions_mod.Token,
+        attachment_id: sessions_mod.AttachmentId,
+    ) ExactAttachmentResumeOutcome {
+        const cid = monitorIdFromClient(id);
+        if (self.sessions.clientHasAttachment(account, cid, session_token, attachment_id))
+            return .already_attached;
+        const target = self.sessions.findAttachmentSessionInAccount(
+            account,
+            session_token,
+            attachment_id,
+        ) orelse return .missing;
+        if (target.attached) return .busy;
+
+        var ticket = self.sessions.prepareExactAttachmentRebind(
+            account,
+            cid,
+            session_token,
+            attachment_id,
+        ) orelse return .retryable;
+        defer ticket.deinit();
+        const remap = ticket.remap();
+        var delivery_ticket = self.prepareResumeAttachmentTransfer(
+            remap.old_client,
+            remap.new_client,
+        ) catch return .retryable;
+        defer delivery_ticket.deinit();
+        if (ticket.snapshot()) |bytes| {
+            var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return .retryable;
+            defer snap.deinit(self.allocator);
+            if (!self.migrationRestorePreflight(id, conn, account, &snap)) return .retryable;
+            if (!self.restoreAndBindMigrationSnapshotWithTicket(
+                id,
+                conn,
+                account,
+                session_token,
+                &snap,
+                &ticket,
+                .{ .prepared_exact = &delivery_ticket },
+            )) return .retryable;
+            return .restored;
+        }
+
+        if (!ticket.commit()) {
+            ticket.abort();
+            return .retryable;
+        }
+        delivery_ticket.commit();
+        // SessionStore remains exclusively retained by `ticket`; release ADS1
+        // before finish or any helper can reacquire SessionStore. This preserves
+        // the global SessionStore -> attachment_delivery_mu lock order.
+        delivery_ticket.release();
+        ticket.finish();
+        self.bindDeferredSessionMeshAnnouncements(id, conn, session_token);
+        return .reclaimed;
+    }
+
     /// Restore one detached physical attachment and move its retained delivery
     /// ownership inside the same prepared SessionStore/World transaction. A
     /// conflicting event-id rendering therefore aborts before the claimant's
@@ -42944,7 +43497,7 @@ pub const LinuxServer = struct {
             session_token,
             &snap,
             &token_ticket,
-            .{ .old_client = old_client, .new_client = new_client },
+            .{ .legacy = .{ .old_client = old_client, .new_client = new_client } },
         );
     }
 
@@ -43040,7 +43593,10 @@ pub const LinuxServer = struct {
             session_token,
             &snap,
             &ticket,
-            .{ .old_client = source.client, .new_client = monitorIdFromClient(id) },
+            .{ .legacy = .{
+                .old_client = source.client,
+                .new_client = monitorIdFromClient(id),
+            } },
         );
     }
 
@@ -43423,9 +43979,12 @@ pub const LinuxServer = struct {
         );
     }
 
-    const RestoreAttachmentTransfer = struct {
-        old_client: sessions_mod.ClientId,
-        new_client: sessions_mod.ClientId,
+    const RestoreAttachmentTransfer = union(enum) {
+        legacy: struct {
+            old_client: sessions_mod.ClientId,
+            new_client: sessions_mod.ClientId,
+        },
+        prepared_exact: *PreparedResumeAttachmentTransfer,
     };
 
     /// Complete a restore with either an ordinary token-bind ticket or the
@@ -43797,10 +44356,20 @@ pub const LinuxServer = struct {
         // profile, and output plan has succeeded. The spool transfer performs
         // conflict preflight before its allocation-free commit; after it
         // succeeds, both retained tickets have no-fail commits remaining.
-        if (attachment_transfer) |transfer|
-            self.transferAttachmentDeliveries(transfer.old_client, transfer.new_client) catch return false;
+        if (attachment_transfer) |transfer| switch (transfer) {
+            .legacy => |legacy| self.transferAttachmentDeliveries(
+                legacy.old_client,
+                legacy.new_client,
+            ) catch return false,
+            .prepared_exact => {},
+        };
         var bootstrap_eviction: ?sessions_mod.EvictedSession = null;
         if (@TypeOf(token_ticket.*) == sessions_mod.PreparedTokenBind) {
+            if (!token_ticket.commit()) {
+                token_ticket.abort();
+                return false;
+            }
+        } else if (@TypeOf(token_ticket.*) == sessions_mod.PreparedAttachmentRebind) {
             if (!token_ticket.commit()) {
                 token_ticket.abort();
                 return false;
@@ -43812,6 +44381,16 @@ pub const LinuxServer = struct {
             @compileError("unsupported session restore ticket type");
         }
         world_ticket.commit();
+        if (attachment_transfer) |transfer| switch (transfer) {
+            .legacy => {},
+            .prepared_exact => |prepared| {
+                prepared.commit();
+                // Do not carry ADS1 into token_ticket.finish() or any later
+                // SessionStore helper: teardown takes these locks in the
+                // opposite temporal phase under the documented global order.
+                prepared.release();
+            },
+        };
         conn.session = desired_session;
         if (!conn.session_mesh_announce_pending) {
             conn.session_mesh_announce_pending = true;
@@ -48160,37 +48739,82 @@ pub const LinuxServer = struct {
     /// consistent (count, names) pair.
     fn publishPeerCount(self: *LinuxServer) void {
         var seen: [32][]const u8 = undefined;
+        var seen_node_ids: [32]u64 = @splat(0);
+        var seen_public_keys: [32][crypto_sign.public_key_len]u8 =
+            @splat(@as([crypto_sign.public_key_len]u8, @splat(0)));
+        var seen_public_key_present: [32]bool = @splat(false);
         var n: usize = 0;
         var it = self.rx().clients.iterator();
         outer: while (it.next()) |entry| {
+            // A collision loser remains established until its final close, but
+            // it is no longer a route. Excluding it lets the winner replace the
+            // authenticated node/key atomically at collision commitment.
+            if (entry.value.closing or entry.value.s2s_dedup) continue;
             const name = establishedPeerName(entry.value) orelse continue;
             for (seen[0..n]) |s| {
                 if (std.mem.eql(u8, s, name)) continue :outer;
             }
             if (n < seen.len) {
                 seen[n] = name;
+                if (entry.value.s2s_secured) |link| {
+                    if (link.remoteNodeId()) |node_id| seen_node_ids[n] = node_id;
+                    if (link.peerNodeKey()) |key| {
+                        seen_public_keys[n] = key;
+                        seen_public_key_present[n] = true;
+                    }
+                }
                 n += 1;
             }
         }
+        lockSpin(&self.mesh_peer_identity_mu);
+        defer self.mesh_peer_identity_mu.unlock();
         for (seen[0..n], 0..) |nm, i| {
             const len = @min(nm.len, self.mesh_peer_names[i].len);
             @memcpy(self.mesh_peer_names[i][0..len], nm[0..len]);
             self.mesh_peer_name_lens[i] = @intCast(len);
+            self.mesh_peer_node_ids[i] = seen_node_ids[i];
+            self.mesh_peer_public_keys[i] = seen_public_keys[i];
+            self.mesh_peer_public_key_present[i] = seen_public_key_present[i];
+        }
+        for (n..self.mesh_peer_names.len) |i| {
+            self.mesh_peer_name_lens[i] = 0;
+            self.mesh_peer_node_ids[i] = 0;
+            self.mesh_peer_public_keys[i] = @splat(0);
+            self.mesh_peer_public_key_present[i] = false;
         }
         const count: u32 = @intCast(n);
         protocol_inventory.setMeshPeerCount(count);
         self.net_peer_count.store(count, .release);
     }
 
-    /// Copy the published peer names into `out` (cross-shard safe). Returns the
-    /// count written, capped at `out.len` and the snapshot capacity.
-    fn readPeerNames(self: *LinuxServer, out: [][]const u8) usize {
-        const n = @min(@as(usize, @intCast(self.net_peer_count.load(.acquire))), @min(out.len, self.mesh_peer_names.len));
-        for (0..n) |i| {
-            const len = self.mesh_peer_name_lens[i];
-            out[i] = self.mesh_peer_names[i][0..len];
+    const PeerNameSnapshot = struct {
+        names: [32][64]u8 = @splat(@as([64]u8, @splat(0))),
+        lens: [32]u8 = @splat(0),
+        count: usize = 0,
+
+        fn name(self: *const PeerNameSnapshot, index: usize) []const u8 {
+            return self.names[index][0..self.lens[index]];
         }
-        return n;
+    };
+
+    /// Return a caller-owned, internally consistent copy of the published peer
+    /// names. The old API returned slices borrowed from mutable shared storage;
+    /// a same-count route replacement could rewrite those bytes after unlock
+    /// while MAP/SRM1 was still reading them on another shard.
+    fn readPeerNames(self: *LinuxServer) PeerNameSnapshot {
+        var snapshot = PeerNameSnapshot{};
+        lockSpin(&self.mesh_peer_identity_mu);
+        defer self.mesh_peer_identity_mu.unlock();
+        snapshot.count = @min(
+            @as(usize, @intCast(self.net_peer_count.load(.acquire))),
+            snapshot.names.len,
+        );
+        for (0..snapshot.count) |i| {
+            const len = @min(@as(usize, self.mesh_peer_name_lens[i]), snapshot.names[i].len);
+            @memcpy(snapshot.names[i][0..len], self.mesh_peer_names[i][0..len]);
+            snapshot.lens[i] = @intCast(len);
+        }
+        return snapshot;
     }
 
     /// MAP — network topology: this server with each established S2S peer (both
@@ -48205,9 +48829,9 @@ pub const LinuxServer = struct {
         // Peer names come from the reactor-0-published snapshot, not this shard's
         // own connection set — otherwise MAP run on a non-zero shard (the peer
         // links live only on reactor 0) would list no peers.
-        var names: [32][]const u8 = undefined;
-        const np = self.readPeerNames(&names);
-        for (names[0..np]) |rname| {
+        const names = self.readPeerNames();
+        for (0..names.count) |i| {
+            const rname = names.name(i);
             var pbuf: [160]u8 = undefined;
             const pdetail = std.fmt.bufPrint(&pbuf, "  `- {s}", .{rname}) catch continue;
             try queueNumeric(conn, .RPL_MAP, &.{}, pdetail);
@@ -51681,6 +52305,244 @@ fn resetTestSendQ(conn: *ConnState) void {
     conn.send_len = 0;
     conn.send_offset = 0;
     if (conn.send_overflow.items.len != 0) conn.send_overflow.clearRetainingCapacity();
+}
+
+test "secured establishment immediately publishes authenticated trust route" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var initiator_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "session-replay-test");
+    defer initiator_identity.deinit();
+    var responder_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x62)), "session-replay-test");
+    defer responder_identity.deinit();
+    const initiator_prekey = try initiator_identity.signedPrekey(1, 10, 1000, LinuxServer.s2s_bands, LinuxServer.s2s_features);
+    const responder_prekey = try responder_identity.signedPrekey(2, 10, 1000, LinuxServer.s2s_bands, LinuxServer.s2s_features);
+    var initiator = try secured_s2s_link.SecuredLink.init(.{
+        .allocator = allocator,
+        .role = .initiator,
+        .identity = &initiator_identity,
+        .local_prekey = initiator_prekey,
+        .cfg = .{
+            .realm = initiator_identity.realm,
+            .supported_bands = LinuxServer.s2s_bands,
+            .supported_features = LinuxServer.s2s_features,
+            .mesh_pass = "session-replay-secret",
+            .now_ms = 20,
+        },
+        .rng = std.testing.io,
+        .server_name = "replay-a.test",
+    });
+    defer initiator.deinit();
+    var responder = try secured_s2s_link.SecuredLink.init(.{
+        .allocator = allocator,
+        .role = .responder,
+        .identity = &responder_identity,
+        .local_prekey = responder_prekey,
+        .cfg = .{
+            .realm = responder_identity.realm,
+            .supported_bands = LinuxServer.s2s_bands,
+            .supported_features = LinuxServer.s2s_features,
+            .mesh_pass = "session-replay-secret",
+            .now_ms = 20,
+        },
+        .rng = std.testing.io,
+        .server_name = "replay-b.test",
+    });
+    defer responder.deinit();
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = responder_identity.shortId(),
+        .server_name = "replay-b.test",
+        .node_identity = &responder_identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.send_armed = true; // retain deterministic handshake output in SendQ
+    conn.s2s_secured = &responder;
+    defer {
+        if (server.rx().clients.get(id)) |live| {
+            live.s2s_secured = null; // stack-owned by `pair`
+            live.send_armed = false;
+            _ = server.rx().clients.free(id);
+        }
+    }
+
+    var rounds: usize = 0;
+    while (!responder.established() and rounds < 64) : (rounds += 1) {
+        var progressed = false;
+        // A secured responder speaks first with its prekey preamble. Move that
+        // output through the daemon SendQ, then return the initiator response
+        // through the real secured drive path where establishment publishes.
+        if (responder.outbound().len != 0) {
+            if (!server.flushMeshBurstStage(conn)) return error.TestUnexpectedResult;
+        }
+        {
+            const to_peer = try copyTestSendQ(allocator, conn);
+            defer allocator.free(to_peer);
+            resetTestSendQ(conn);
+            if (to_peer.len != 0) {
+                progressed = true;
+                try initiator.feed(to_peer, @intCast(rounds + 21));
+            }
+        }
+        {
+            const to_server = try allocator.dupe(u8, initiator.outbound());
+            defer allocator.free(to_server);
+            initiator.clearOutbound();
+            if (to_server.len != 0) {
+                progressed = true;
+                server.driveS2sSecured(conn, &responder, to_server);
+                if (conn.closing) return error.TestUnexpectedResult;
+            }
+        }
+        if (!progressed) return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(responder.established());
+
+    // No timer/adoption publication is invoked: the establishment transition
+    // itself must make the authenticated peer immediately available to SRM2.
+    try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
+    lockSpin(&server.mesh_peer_identity_mu);
+    defer server.mesh_peer_identity_mu.unlock();
+    try std.testing.expectEqual(initiator_identity.shortId(), server.mesh_peer_node_ids[0]);
+    try std.testing.expect(server.mesh_peer_public_key_present[0]);
+    try std.testing.expectEqualSlices(u8, &initiator_identity.sign_kp.public_key, &server.mesh_peer_public_keys[0]);
+    try std.testing.expectEqualStrings(
+        "replay-a.test",
+        server.mesh_peer_names[0][0..server.mesh_peer_name_lens[0]],
+    );
+}
+
+test "secured establish collision winner teardown trust lifecycle" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var old_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x63, 0x64);
+    defer old_pair.deinit();
+    var winner_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x65, 0x66);
+    defer winner_pair.deinit();
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        // Lexically smaller than replay-b.test, so the initiator is the
+        // deterministic reciprocal-dial survivor.
+        .server_name = "aaa.test",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const old_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const old_conn = server.rx().clients.get(old_id).?;
+    old_conn.s2s_secured = &old_pair.a;
+    old_conn.s2s_initiator = false;
+    const winner_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const winner = server.rx().clients.get(winner_id).?;
+    winner.s2s_secured = &winner_pair.a;
+    winner.s2s_initiator = true;
+    defer {
+        if (server.rx().clients.get(old_id)) |live| live.s2s_secured = null;
+        if (server.rx().clients.get(winner_id)) |live| live.s2s_secured = null;
+        _ = server.rx().clients.free(old_id);
+        _ = server.rx().clients.free(winner_id);
+    }
+
+    // Seed the old route, then resolve the reciprocal-dial collision exactly as
+    // the secured establishment path does before its immediate publication.
+    winner.closing = true;
+    server.publishPeerCount();
+    winner.closing = false;
+    try std.testing.expectEqual(old_pair.idb.shortId(), server.mesh_peer_node_ids[0]);
+    try std.testing.expect(!server.resolveS2sCollision(winner, "replay-b.test"));
+    try std.testing.expect(old_conn.s2s_dedup);
+    server.publishPeerCount();
+
+    // The still-established loser remains in the slab until close, but is no
+    // longer a route. Publication must select the winner's authenticated key.
+    try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
+    try std.testing.expectEqual(winner_pair.idb.shortId(), server.mesh_peer_node_ids[0]);
+    try std.testing.expectEqualSlices(u8, &winner_pair.idb.sign_kp.public_key, &server.mesh_peer_public_keys[0]);
+
+    const winning_names = server.readPeerNames();
+    winner.closing = true;
+    server.publishPeerCount();
+    try std.testing.expectEqual(@as(u32, 0), server.net_peer_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), server.mesh_peer_name_lens[0]);
+    // The caller-owned pre-teardown view cannot race the same storage rewrite.
+    try std.testing.expectEqualStrings("replay-b.test", winning_names.name(0));
+}
+
+test "non-dedup S2S close immediately removes published peer" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var sender: s2s_link.S2sLink = undefined;
+    try sender.init(.{
+        .allocator = allocator,
+        .local_node_id = 71,
+        .remote_node_id = 72,
+        .local_epoch_ms = 100,
+        .server_name = "closing-peer.test",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer sender.deinit();
+    const receiver = try allocator.create(s2s_link.S2sLink);
+    var receiver_owned_by_server = false;
+    try receiver.init(.{
+        .allocator = allocator,
+        .local_node_id = 72,
+        .remote_node_id = 71,
+        .local_epoch_ms = 101,
+        .server_name = "local.test",
+        .config = .{ .require_signed_frames = false },
+    });
+    errdefer if (!receiver_owned_by_server) {
+        receiver.deinit();
+        allocator.destroy(receiver);
+    };
+    try sender.start(102);
+    try pumpLinkPair(&sender, receiver, allocator);
+    try std.testing.expect(receiver.established());
+
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.s2s = receiver; // closeConn owns the heap link from here
+    receiver_owned_by_server = true;
+    server.publishPeerCount();
+    try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
+    const before_close = server.readPeerNames();
+    try std.testing.expectEqualStrings("closing-peer.test", before_close.name(0));
+
+    try server.closeConn(conn.token, "test peer close");
+    try std.testing.expect(server.rx().clients.get(id) == null);
+    try std.testing.expectEqual(@as(u32, 0), server.net_peer_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), server.mesh_peer_name_lens[0]);
+    // Caller-owned copy remains stable after the shared same/zero-count rewrite.
+    try std.testing.expectEqualStrings("closing-peer.test", before_close.name(0));
 }
 
 test "session replica live publication pairs a newer lease and detached publication invalidates it" {
@@ -55346,6 +56208,49 @@ fn encodeUpgradeStreamWithWidenedHeaderForTest(
     return stream.toOwnedSlice(allocator);
 }
 
+/// Encode a complete manifested stream while stamping the `.sessions` piece as
+/// a genuine rolling v3 capsule. The caller supplies a v3 HSSN body; this keeps
+/// the compatibility fixture honest at both the outer and inner version seams.
+fn encodeUpgradeStreamWithLegacyV3SessionsForTest(
+    allocator: std.mem.Allocator,
+    pieces: []const helix_live.StatePiece,
+) ![]u8 {
+    var stream: std.ArrayList(u8) = .empty;
+    errdefer stream.deinit(allocator);
+    var accumulator = handoff_manifest.Accumulator.init();
+    for (pieces) |piece| {
+        var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
+        var cap = helix_capsule.make(piece.kind, &fields);
+        if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+        if (piece.kind == .sessions) {
+            cap.header.version = 3;
+            cap.header.min_supported = 1;
+            cap.header.max_supported = 3;
+        }
+        try accumulator.add(.{
+            .header = .{
+                .schema_id = cap.header.schema_id,
+                .kind = @intFromEnum(cap.header.kind),
+                .version = cap.header.version,
+                .min_supported = cap.header.min_supported,
+                .max_supported = cap.header.max_supported,
+            },
+            .bytes = piece.bytes,
+        });
+        const encoded = try helix_capsule.encode(allocator, cap);
+        defer allocator.free(encoded);
+        try stream.appendSlice(allocator, encoded);
+    }
+    var manifest_buf: [handoff_manifest.encoded_len]u8 = undefined;
+    const manifest_wire = try accumulator.encode(&manifest_buf);
+    var manifest_fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = manifest_wire }};
+    const manifest_cap = helix_capsule.make(.handoff_manifest, &manifest_fields);
+    const manifest_encoded = try helix_capsule.encode(allocator, manifest_cap);
+    defer allocator.free(manifest_encoded);
+    try stream.appendSlice(allocator, manifest_encoded);
+    return stream.toOwnedSlice(allocator);
+}
+
 fn adoptUpgradeStreamForTest(
     server: *Server,
     stream: []const u8,
@@ -55873,12 +56778,17 @@ test "UPGRADE arena without an oper-grant checkpoint (pre-checkpoint predecessor
     try std.testing.expectEqual(@as(u64, 0), successor.grant_incarnation);
 }
 
-test "UPGRADE nonempty ADS1 follows detached HSSN owner across two hops and drains FIFO once" {
+test "UPGRADE legacy v3 session mints stable AID and nonempty ADS1 follows it across two hops" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
-    const config = Config{ .host = "127.0.0.1", .port = 0, .tls_port = 0 };
+    const config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    };
     const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -55918,19 +56828,50 @@ test "UPGRADE nonempty ADS1 follows detached HSSN owner across two hops and drai
             return error.TestUnexpectedResult,
     );
 
+    // Model the deployed pre-SRM2 predecessor exactly: HSSN v3 ended after the
+    // portable-resume byte and its outer capsule was stamped 3/1/3. The current
+    // sealer wrote one null v4 presence byte for this deliberately bare row;
+    // remove it and lower the inner version byte to construct the genuine v3
+    // body without duplicating the codec in this integration test.
+    var legacy_v3_hssn: ?[]u8 = null;
+    defer if (legacy_v3_hssn) |bytes| alloc.free(bytes);
+    for (predecessor_pieces.items) |*piece| {
+        if (piece.kind != .sessions) continue;
+        try std.testing.expect(piece.bytes.len > session_capsule.magic.len + 1);
+        try std.testing.expectEqual(@as(u8, session_capsule.version), piece.bytes[session_capsule.magic.len]);
+        try std.testing.expectEqual(@as(u8, 0), piece.bytes[piece.bytes.len - 1]);
+        const bytes = try alloc.dupe(u8, piece.bytes[0 .. piece.bytes.len - 1]);
+        bytes[session_capsule.magic.len] = 3;
+        legacy_v3_hssn = bytes;
+        piece.bytes = bytes;
+        break;
+    }
+    try std.testing.expect(legacy_v3_hssn != null);
+    const legacy_stream = try encodeUpgradeStreamWithLegacyV3SessionsForTest(
+        alloc,
+        predecessor_pieces.items,
+    );
+    defer alloc.free(legacy_stream);
+
     const successor = createTestServer(alloc, config) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer alloc.destroy(successor);
     defer successor.deinit();
-    _ = try adoptUpgradePiecesForTest(
+    _ = try adoptUpgradeStreamForTest(
         successor,
-        predecessor_pieces.items,
+        legacy_stream,
         "onyx-test-ads1-two-hop-first",
     );
     current_reactor = null;
     const first_successor_client = successor.sessions.findDetachedTokenInAccount("alice", token) orelse
+        return error.TestUnexpectedResult;
+    const first_successor_handle = successor.sessions.resumeHandleForClient(
+        "alice",
+        first_successor_client,
+    ) orelse return error.TestUnexpectedResult;
+    const minted_attachment_id = first_successor_handle.attachment_id orelse
         return error.TestUnexpectedResult;
     try std.testing.expect(first_successor_client != old_client);
     try std.testing.expectEqual(
@@ -55977,6 +56918,12 @@ test "UPGRADE nonempty ADS1 follows detached HSSN owner across two hops and drai
     current_reactor = null;
     const second_successor_client = second_successor.sessions.findDetachedTokenInAccount("alice", token) orelse
         return error.TestUnexpectedResult;
+    const second_successor_handle = second_successor.sessions.resumeHandleForClient(
+        "alice",
+        second_successor_client,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(second_successor_handle.attachment_id != null);
+    try std.testing.expect(second_successor_handle.attachment_id.?.eql(minted_attachment_id));
     try std.testing.expectEqual(
         @as(usize, 2),
         second_successor.attachment_delivery_spool.pendingCountFor(second_successor_client),
@@ -63159,6 +64106,7 @@ test "E2EEGROUP guest CAP REQ onyx/e2ee after registration stays open" {
         .host = "127.0.0.1",
         .port = 0,
         .crypto_io = std.testing.io,
+        .session_max_per_account = 2,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -66852,7 +67800,7 @@ test "session replica lifecycle keeps one-of-N authority and last nonportable si
     try expectTestSessionReplicaRevoked(server, token);
 }
 
-test "session replica lifecycle revokes portable authority evicted by attach cap" {
+test "session tracking at cap preserves detached portable authority for exact resume" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x94)), "local");
     defer ident.deinit();
@@ -66877,8 +67825,10 @@ test "session replica lifecycle revokes portable authority evicted by attach cap
     try std.testing.expect(server.sessions.markDetached("cap-acct", monitorIdFromClient(old_id)));
     try publishTestSessionReplicaAuthority(server, token, "cap-acct", "Evicted");
 
-    _ = try addTestLocalClient(server, "Replacement", "cap-acct");
-    try expectTestSessionReplicaRevoked(server, token);
+    const replacement_id = try addTestLocalClient(server, "Replacement", "cap-acct");
+    try std.testing.expect(server.session_replica_store.getOrigin(token, server.config.node_id) != null);
+    try std.testing.expect(server.sessions.resumeHandleForClient("cap-acct", monitorIdFromClient(old_id)) != null);
+    try std.testing.expect(server.sessions.resumeHandleForClient("cap-acct", monitorIdFromClient(replacement_id)) == null);
 }
 
 test "session replica lifecycle revokes portable authority replaced on same-client attach" {
@@ -72364,7 +73314,13 @@ test "threaded server: login defers autojoin and restores only after exact SESSI
     defer store.deinit();
     var services = services_mod.Services.init(&store, null);
 
-    var cfg = Config{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io };
+    var cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
+    };
     cfg.chanlimit = 96;
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -72413,7 +73369,7 @@ test "threaded server: login defers autojoin and restores only after exact SESSI
     const token_start = (std.mem.indexOf(u8, a.written(), token_marker) orelse return error.TestUnexpectedResult) + token_marker.len;
     const token_tail = a.written()[token_start..];
     const token_len = std.mem.indexOfScalar(u8, token_tail, '\r') orelse return error.TestUnexpectedResult;
-    var token_buf: [64]u8 = undefined;
+    var token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(token_buf[0..token_len], token_tail[0..token_len]);
     const resume_token = token_buf[0..token_len];
 
@@ -72433,9 +73389,9 @@ test "threaded server: login defers autojoin and restores only after exact SESSI
     // Same-account authentication alone must not consume an arbitrary device
     // ghost. The exact credential is the ownership proof.
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "NICK :trev") == null);
-    var resume_line: [128]u8 = undefined;
+    var resume_line: [160]u8 = undefined;
     try writeAllFd(fd_b, try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{resume_token}));
-    try recvUntil(&b, "SESSION RESUME: session restored", 200);
+    try recvUntil(&b, "SESSION RESUME: exact session restored", 200);
     try recvUntil(&b, "NICK :trev", 200);
     try recvUntil(&b, "JOIN #root", 200);
     try recvUntil(&b, "JOIN #ops", 200);
@@ -72513,6 +73469,7 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -72547,7 +73504,7 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
     const token_start = (std.mem.indexOf(u8, a.written(), token_marker) orelse return error.TestUnexpectedResult) + token_marker.len;
     const token_tail = a.written()[token_start..];
     const token_len = std.mem.indexOfScalar(u8, token_tail, '\r') orelse return error.TestUnexpectedResult;
-    var token_buf: [64]u8 = undefined;
+    var token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(token_buf[0..token_len], token_tail[0..token_len]);
     const resume_token = token_buf[0..token_len];
     closeFd(fd_a);
@@ -72563,9 +73520,9 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
     try saslPlainPrelude(fd_b, "admin", "onyx");
     try writeAllFd(fd_b, "NICK TempOper\r\nUSER webchat 0 * :Webchat\r\n");
     try recvUntil(&b, " 381 TempOper ", 200);
-    var resume_line: [128]u8 = undefined;
+    var resume_line: [160]u8 = undefined;
     try writeAllFd(fd_b, try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{resume_token}));
-    try recvUntil(&b, "SESSION RESUME: session restored", 200);
+    try recvUntil(&b, "SESSION RESUME: exact session restored", 200);
     try recvUntil(&b, "NICK :trev", 200);
     try recvUntil(&b, "JOIN #ops", 200);
 
@@ -72834,6 +73791,496 @@ test "SESSION RESUME retry latch clears on terminal and already-attached attempt
     try std.testing.expect(!claimant.resume_autojoin_deferred);
 }
 
+test "SESSION RESUME composite rejects malformed terminal and forged exact authority without downgrade" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xd1)), "resume-security");
+    defer identity.deinit();
+    var foreign_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xd2)), "resume-security-foreign");
+    defer foreign_identity.deinit();
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .server_name = "resume-security.test",
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "resume-security";
+    const target_id = try addTestLocalClient(&server, "SecurityTarget", account);
+    const claimant_id = try addTestLocalClient(&server, "SecurityClaimant", account);
+    const target_handle = server.sessions.resumeHandleForClient(
+        account,
+        monitorIdFromClient(target_id),
+    ) orelse return error.TestUnexpectedResult;
+    const target_aid = target_handle.attachment_id orelse return error.TestUnexpectedResult;
+    const claimant = server.connFor(claimant_id) orelse return error.TestUnexpectedResult;
+
+    // A recognized SRM2 prefix is strict: malformed authority is terminal and
+    // cannot fall through into either bare local-token or SRM1 parsing.
+    var malformed = try irc_line.parseLine("SESSION RESUME srm2l.not-a-token.not-an-attachment");
+    try server.handleSessionResume(claimant_id, claimant, account, &malformed);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION INVALID_TOKEN");
+    try std.testing.expect(server.sessions.findAttachmentSessionInAccount(
+        account,
+        target_handle.token,
+        target_aid,
+    ) != null);
+
+    // A correctly encoded exact selector for a live attachment is terminal,
+    // and an unknown physical id is distinctly terminal. Neither arms retry.
+    claimant.send_len = 0;
+    const live_credential = try session_resume_credential.encodeLocal(target_handle.token, target_aid);
+    var line_buf: [1600]u8 = undefined;
+    var live_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{live_credential},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &live_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION ATTACHMENT_IN_USE");
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+
+    claimant.send_len = 0;
+    const absent_aid = sessions_mod.AttachmentId.fromBytes(@as([16]u8, @splat(0xee))) catch unreachable;
+    const absent_credential = try session_resume_credential.encodeLocal(target_handle.token, absent_aid);
+    var absent_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{absent_credential},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &absent_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION NO_ATTACHMENT");
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+
+    const now: i64 = @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+    const base_claim = session_reclaim_attachment.Claim{
+        .kind = .exact_restore,
+        .account = account,
+        .group_token = target_handle.token,
+        .attachment_id = target_aid,
+        .origin_node = identity.shortId(),
+        .destination_node = identity.shortId(),
+        .issued_at_ms = now,
+        .expires_at_ms = now + @as(i64, @intCast(LinuxServer.mesh_reclaim_ttl_ms)),
+        .nonce = 7,
+    };
+    const local_wire = try session_reclaim_attachment.encodeClaim(
+        std.testing.allocator,
+        base_claim,
+        &identity.sign_kp,
+    );
+    defer std.testing.allocator.free(local_wire);
+    var local_hex_buf: [session_reclaim_attachment.max_claim_wire_len * 2]u8 = undefined;
+    const local_hex = LinuxServer.toHexLower(local_wire, &local_hex_buf);
+
+    // The textual attachment suffix is independently bound to the signed
+    // claim, so replacing only the suffix fails before target selection.
+    claimant.send_len = 0;
+    var mesh_text_buf: [1600]u8 = undefined;
+    const suffix_tampered = try session_resume_credential.encodeMesh(
+        &mesh_text_buf,
+        local_hex,
+        absent_aid,
+    );
+    var suffix_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{suffix_tampered},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &suffix_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION INVALID_TOKEN");
+
+    // A valid signature for another account cannot be replayed by this account.
+    var wrong_account_claim = base_claim;
+    wrong_account_claim.account = "other-account";
+    const wrong_account_wire = try session_reclaim_attachment.encodeClaim(
+        std.testing.allocator,
+        wrong_account_claim,
+        &identity.sign_kp,
+    );
+    defer std.testing.allocator.free(wrong_account_wire);
+    var wrong_account_hex_buf: [session_reclaim_attachment.max_claim_wire_len * 2]u8 = undefined;
+    const wrong_account_hex = LinuxServer.toHexLower(wrong_account_wire, &wrong_account_hex_buf);
+    const wrong_account_text = try session_resume_credential.encodeMesh(
+        &mesh_text_buf,
+        wrong_account_hex,
+        target_aid,
+    );
+    claimant.send_len = 0;
+    var wrong_account_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{wrong_account_text},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &wrong_account_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION INVALID_TOKEN");
+
+    // A cryptographically valid claim from a node without an authenticated
+    // secured route is untrusted, even when all payload fields otherwise match.
+    var foreign_claim = base_claim;
+    foreign_claim.origin_node = foreign_identity.shortId();
+    foreign_claim.destination_node = foreign_identity.shortId();
+    const foreign_wire = try session_reclaim_attachment.encodeClaim(
+        std.testing.allocator,
+        foreign_claim,
+        &foreign_identity.sign_kp,
+    );
+    defer std.testing.allocator.free(foreign_wire);
+    var foreign_hex_buf: [session_reclaim_attachment.max_claim_wire_len * 2]u8 = undefined;
+    const foreign_hex = LinuxServer.toHexLower(foreign_wire, &foreign_hex_buf);
+    const foreign_text = try session_resume_credential.encodeMesh(
+        &mesh_text_buf,
+        foreign_hex,
+        target_aid,
+    );
+    claimant.send_len = 0;
+    var foreign_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{foreign_text},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &foreign_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION INVALID_TOKEN");
+
+    // The synchronized reactor-0 publication is the only remote trust source.
+    // Route results own a fixed name copy, survive publication replacement, and
+    // disappear immediately when the authenticated key or live count changes.
+    const foreign_signed = try session_reclaim_attachment.decodeClaim(foreign_wire);
+    lockSpin(&server.mesh_peer_identity_mu);
+    server.mesh_peer_node_ids[0] = foreign_identity.shortId();
+    server.mesh_peer_public_keys[0] = foreign_identity.sign_kp.public_key;
+    server.mesh_peer_public_key_present[0] = true;
+    const published_name = "foreign-resume.test";
+    @memcpy(server.mesh_peer_names[0][0..published_name.len], published_name);
+    server.mesh_peer_name_lens[0] = @intCast(published_name.len);
+    server.net_peer_count.store(1, .release);
+    server.mesh_peer_identity_mu.unlock();
+    const published_route = server.trustedReclaimRoute(
+        foreign_identity.shortId(),
+        foreign_signed,
+    ) orelse return error.TestUnexpectedResult;
+    switch (published_route) {
+        .local => return error.TestUnexpectedResult,
+        .remote => |remote| try std.testing.expectEqualStrings(published_name, remote.slice()),
+    }
+    lockSpin(&server.mesh_peer_identity_mu);
+    @memset(&server.mesh_peer_names[0], 0);
+    server.mesh_peer_public_keys[0] = identity.sign_kp.public_key;
+    server.mesh_peer_identity_mu.unlock();
+    switch (published_route) {
+        .local => return error.TestUnexpectedResult,
+        .remote => |remote| try std.testing.expectEqualStrings(published_name, remote.slice()),
+    }
+    try std.testing.expect(server.trustedReclaimRoute(
+        foreign_identity.shortId(),
+        foreign_signed,
+    ) == null);
+    lockSpin(&server.mesh_peer_identity_mu);
+    server.mesh_peer_public_keys[0] = foreign_identity.sign_kp.public_key;
+    server.net_peer_count.store(0, .release);
+    server.mesh_peer_identity_mu.unlock();
+    try std.testing.expect(server.trustedReclaimRoute(
+        foreign_identity.shortId(),
+        foreign_signed,
+    ) == null);
+}
+
+test "SESSION RESUME exact selector moves only its sibling and durable spool" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .session_max_per_account = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "selected-sibling";
+    const first_id = try addTestLocalClient(&server, "SelectedOne", account);
+    const second_id = try addTestLocalClient(&server, "SelectedTwo", account);
+    const claimant_id = try addTestLocalClient(&server, "SelectedClaimant", account);
+    const first_cid = monitorIdFromClient(first_id);
+    const second_cid = monitorIdFromClient(second_id);
+    const claimant_cid = monitorIdFromClient(claimant_id);
+    try std.testing.expect(!server.sessions.containsClient(account, claimant_cid));
+    const first_handle = server.sessions.resumeHandleForClient(account, first_cid) orelse
+        return error.TestUnexpectedResult;
+    const first_aid = first_handle.attachment_id orelse return error.TestUnexpectedResult;
+    const second_aid = (server.sessions.resumeHandleForClient(account, second_cid) orelse
+        return error.TestUnexpectedResult).attachment_id orelse return error.TestUnexpectedResult;
+    try std.testing.expect(server.sessions.joinTokenGroup(account, second_cid, first_handle.token));
+
+    const first_conn = server.connFor(first_id) orelse return error.TestUnexpectedResult;
+    first_conn.session.addCap(.message_tags);
+    first_conn.send_armed = true;
+    first_conn.sendq_cap = 0;
+    try server.deliverTagged(first_id, .{
+        .time_value = "",
+        .account = null,
+        .msgid = "0123456789ABCDEFGHJKMNPQSA",
+    }, ":source!u@h PRIVMSG SelectedOne :selected-first\r\n");
+    const second_conn = server.connFor(second_id) orelse return error.TestUnexpectedResult;
+    second_conn.session.addCap(.message_tags);
+    second_conn.send_armed = true;
+    second_conn.sendq_cap = 0;
+    try server.deliverTagged(second_id, .{
+        .time_value = "",
+        .account = null,
+        .msgid = "0123456789ABCDEFGHJKMNPQSB",
+    }, ":source!u@h PRIVMSG SelectedTwo :selected-second\r\n");
+    try std.testing.expect(server.sessions.markDetached(account, first_cid));
+    try std.testing.expect(server.sessions.markDetached(account, second_cid));
+
+    const claimant = server.connFor(claimant_id) orelse return error.TestUnexpectedResult;
+    const credential = try session_resume_credential.encodeLocal(first_handle.token, first_aid);
+    var line_buf: [1600]u8 = undefined;
+    var line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{credential},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "SESSION RESUME: exact session reclaimed");
+
+    const rebound = server.sessions.findAttachmentSessionInAccount(
+        account,
+        first_handle.token,
+        first_aid,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rebound.attached);
+    try std.testing.expectEqual(claimant_cid, rebound.client);
+    const untouched = server.sessions.findAttachmentSessionInAccount(
+        account,
+        first_handle.token,
+        second_aid,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!untouched.attached);
+    try std.testing.expectEqual(second_cid, untouched.client);
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.pendingCountFor(first_cid));
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.pendingCountFor(claimant_cid));
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.pendingCountFor(second_cid));
+    try std.testing.expect(server.attachment_delivery_mu.tryLock());
+    server.attachment_delivery_mu.unlock();
+}
+
+test "ReleaseSafe SESSION TOKEN reader-first issuance gate defaults legacy and explicitly enables SRM2" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xd3)), "resume-issuance-gate");
+    defer identity.deinit();
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .server_name = "resume-issuance.test",
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "resume-issuance-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "IssuanceGate", "issuance-account");
+    const conn = server.connFor(id) orelse return error.TestUnexpectedResult;
+    var token_line = try irc_line.parseLine("SESSION TOKEN");
+    try server.handleSession(id, conn, &token_line);
+    const legacy_local = testSessionTokenFromReply(conn.send_buf[0..conn.send_len], "SESSION TOKEN ") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, session_resume_credential.token_hex_len), legacy_local.len);
+    try std.testing.expect(!std.mem.startsWith(u8, legacy_local, "srm2"));
+    const legacy_mesh = testSessionTokenFromReply(conn.send_buf[0..conn.send_len], "SESSION MTOKEN ") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(!std.mem.startsWith(u8, legacy_mesh, "srm2"));
+
+    server.config.session_resume_composite_issuance = true;
+    conn.send_len = 0;
+    conn.send_offset = 0;
+    try server.handleSession(id, conn, &token_line);
+    const exact_local = testSessionTokenFromReply(conn.send_buf[0..conn.send_len], "SESSION TOKEN ") orelse
+        return error.TestUnexpectedResult;
+    const decoded_local = switch (try session_resume_credential.decode(exact_local)) {
+        .local => |value| value,
+        .mesh => return error.TestUnexpectedResult,
+    };
+    const handle = server.sessions.resumeHandleForClient(
+        "issuance-account",
+        monitorIdFromClient(id),
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(handle.token, decoded_local.group_token);
+    try std.testing.expect(decoded_local.attachment_id.eql(handle.attachment_id orelse
+        return error.TestUnexpectedResult));
+    _ = try expectFreshMeshSessionToken(
+        conn.send_buf[0..conn.send_len],
+        "resume-issuance-secret",
+        "issuance-account",
+        exact_local,
+    );
+}
+
+test "E2EE at-cap exact resume hold isolates succeeds on proof and closes on expiry" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .session_max_per_account = 1,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "e2ee-cap-success";
+    const ghost_id = try addTestLocalClient(&server, "E2eeGhost", account);
+    const ghost_cid = monitorIdFromClient(ghost_id);
+    const handle = server.sessions.resumeHandleForClient(account, ghost_cid) orelse
+        return error.TestUnexpectedResult;
+    const aid = handle.attachment_id orelse return error.TestUnexpectedResult;
+    try std.testing.expect(server.sessions.markDetached(account, ghost_cid));
+    const claimant_id = try addTestLocalClient(&server, "E2eeClaimant", account);
+    const claimant = server.connFor(claimant_id) orelse return error.TestUnexpectedResult;
+    claimant.session.registration.registered = true;
+    claimant.session.addCap(.onyx_e2ee);
+    try std.testing.expect(!server.sessions.containsClient(account, monitorIdFromClient(claimant_id)));
+    server.armBoundedExactResumeHoldIfNeeded(claimant_id, claimant);
+    try std.testing.expect(claimant.resume_autojoin_deferred);
+    try std.testing.expect(try server.enforceE2eeSessionEligibility(claimant_id, claimant));
+
+    claimant.send_len = 0;
+    try server.processLiveLine(claimant_id, claimant, "JOIN #must-not-join");
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION RESUME_PENDING");
+    try std.testing.expect(!server.world.isMember("#must-not-join", worldIdFromClient(claimant_id)));
+
+    const credential = try session_resume_credential.encodeLocal(handle.token, aid);
+    var command_buf: [1600]u8 = undefined;
+    var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &command_buf,
+        "SESSION RESUME {s}",
+        .{credential},
+    ));
+    claimant.send_len = 0;
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "exact session reclaimed");
+    try std.testing.expect(!claimant.resume_autojoin_deferred);
+    try std.testing.expect(!claimant.closing);
+    try std.testing.expect(server.sessions.clientHasAttachment(
+        account,
+        monitorIdFromClient(claimant_id),
+        handle.token,
+        aid,
+    ));
+
+    const expiry_account = "e2ee-cap-expiry";
+    const expiry_ghost_id = try addTestLocalClient(&server, "ExpiryGhost", expiry_account);
+    try std.testing.expect(server.sessions.markDetached(
+        expiry_account,
+        monitorIdFromClient(expiry_ghost_id),
+    ));
+    const expiry_id = try addTestLocalClient(&server, "ExpiryClaimant", expiry_account);
+    const expiry = server.connFor(expiry_id) orelse return error.TestUnexpectedResult;
+    expiry.session.registration.registered = true;
+    expiry.session.addCap(.onyx_e2ee);
+    server.armBoundedExactResumeHoldIfNeeded(expiry_id, expiry);
+    try std.testing.expect(try server.enforceE2eeSessionEligibility(expiry_id, expiry));
+    expiry.resume_autojoin_deadline_ms = server.nowMs() - 1;
+    server.sweepDeferredSessionAutojoins();
+    try std.testing.expect(expiry.closing);
+    try std.testing.expect(!expiry.resume_autojoin_deferred);
+    try expectContains(expiry.send_buf[0..expiry.send_len], "FAIL E2EEGROUP SESSION_UNAVAILABLE");
+}
+
+test "SESSION RESUME legacy local and SRM1 create new without stripping ghost spool" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "legacy-resume.test",
+        .crypto_io = std.testing.io,
+        .mesh_pass = "legacy-resume-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const Helpers = struct {
+        fn exercise(
+            srv: *Server,
+            account: []const u8,
+            target_nick: []const u8,
+            claimant_nick: []const u8,
+            use_mesh: bool,
+        ) !void {
+            const target_id = try addTestLocalClient(srv, target_nick, account);
+            const claimant_id = try addTestLocalClient(srv, claimant_nick, account);
+            const target_cid = monitorIdFromClient(target_id);
+            const claimant_cid = monitorIdFromClient(claimant_id);
+            const handle = srv.sessions.resumeHandleForClient(account, target_cid) orelse
+                return error.TestUnexpectedResult;
+            const aid = handle.attachment_id orelse return error.TestUnexpectedResult;
+            const target = srv.connFor(target_id) orelse return error.TestUnexpectedResult;
+            target.session.addCap(.message_tags);
+            target.send_armed = true;
+            target.sendq_cap = 0;
+            try srv.deliverTagged(target_id, .{
+                .time_value = "",
+                .account = null,
+                .msgid = if (use_mesh) "0123456789ABCDEFGHJKMNPQSD" else "0123456789ABCDEFGHJKMNPQSC",
+            }, if (use_mesh)
+                ":source!u@h PRIVMSG LegacyMesh :mesh-ghost\r\n"
+            else
+                ":source!u@h PRIVMSG LegacyLocal :local-ghost\r\n");
+            try std.testing.expect(srv.sessions.markDetached(account, target_cid));
+
+            const token_hex = std.fmt.bytesToHex(handle.token, .lower);
+            var credential_buf: [1024]u8 = undefined;
+            const presented = if (use_mesh) blk: {
+                break :blk try testLegacyMeshResumeCredential(
+                    &credential_buf,
+                    "legacy-resume-secret",
+                    account,
+                    &token_hex,
+                    "legacy-resume.test",
+                );
+            } else &token_hex;
+            var command_buf: [1200]u8 = undefined;
+            var line = try irc_line.parseLine(try std.fmt.bufPrint(
+                &command_buf,
+                "SESSION RESUME {s}",
+                .{presented},
+            ));
+            const claimant = srv.connFor(claimant_id) orelse return error.TestUnexpectedResult;
+            try srv.handleSessionResume(claimant_id, claimant, account, &line);
+            try expectContains(
+                claimant.send_buf[0..claimant.send_len],
+                if (use_mesh) "session reclaimed (cross-server)" else "legacy session attached as a new attachment",
+            );
+            const ghost = srv.sessions.findAttachmentSessionInAccount(
+                account,
+                handle.token,
+                aid,
+            ) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(!ghost.attached);
+            try std.testing.expectEqual(target_cid, ghost.client);
+            try std.testing.expect(srv.sessions.clientHasToken(account, claimant_cid, handle.token));
+            try std.testing.expectEqual(@as(usize, 1), srv.attachment_delivery_spool.pendingCountFor(target_cid));
+            try std.testing.expectEqual(@as(usize, 0), srv.attachment_delivery_spool.pendingCountFor(claimant_cid));
+        }
+    };
+
+    try Helpers.exercise(&server, "legacy-local-account", "LegacyLocal", "LocalClaimant", false);
+    try Helpers.exercise(&server, "legacy-mesh-account", "LegacyMesh", "MeshClaimant", true);
+}
+
 test "expired SESSION RESUME retry hold clears TOKEN latch and restores UPGRADE readiness" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
@@ -72928,7 +74375,9 @@ test "threaded server: explicit detached session resume spool conflict aborts be
     const account = "atomic-resume";
     const ghost_id = try addTestLocalClient(&server, "Ghost", account);
     const ghost_cid = monitorIdFromClient(ghost_id);
-    const ghost_token = server.sessions.resumeHandleForClient(account, ghost_cid).?.token;
+    const ghost_handle = server.sessions.resumeHandleForClient(account, ghost_cid).?;
+    const ghost_token = ghost_handle.token;
+    const ghost_attachment_id = ghost_handle.attachment_id.?;
     const encoded = try (migration_relay.Snapshot{
         .nick = "Ghost",
         .umodes = "+i",
@@ -72966,12 +74415,12 @@ test "threaded server: explicit detached session resume spool conflict aborts be
     const spool_before = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
     defer allocator.free(spool_before);
 
-    const token_hex = std.fmt.bytesToHex(ghost_token, .lower);
-    var line_buf: [64]u8 = undefined;
+    const exact_credential = try session_resume_credential.encodeLocal(ghost_token, ghost_attachment_id);
+    var line_buf: [128]u8 = undefined;
     var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(
         &line_buf,
         "SESSION RESUME {s}",
-        .{token_hex},
+        .{exact_credential},
     ));
     try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
 
@@ -72992,7 +74441,7 @@ test "threaded server: explicit detached session resume spool conflict aborts be
     _ = server.attachment_delivery_spool.discardAttachment(claimant_cid);
     claimant.send_len = 0;
     try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
-    try expectContains(claimant.send_buf[0..claimant.send_len], "SESSION RESUME: session restored");
+    try expectContains(claimant.send_buf[0..claimant.send_len], "SESSION RESUME: exact session restored");
     try std.testing.expectEqualStrings("Ghost", claimant.session.displayName());
     try std.testing.expect(server.sessions.clientHasToken(account, claimant_cid, ghost_token));
     try std.testing.expect(server.sessions.resumeHandleForClient(account, ghost_cid) == null);
@@ -75060,7 +76509,7 @@ test "atomic RESUME staged capsule adopts a rowless verified token" {
     try std.testing.expect(claimant.session_mesh_announce_requires_authority);
 }
 
-test "atomic RESUME staged capsule joins then removes an existing ghost" {
+test "atomic legacy SRM1 staged capsule joins without consuming an existing ghost" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const mesh_key = "atomic-staged-ghost-key";
@@ -75080,7 +76529,10 @@ test "atomic RESUME staged capsule joins then removes an existing ghost" {
     const claimant_id = try addTestLocalClient(&server, "Before", "ghost-stage-acct");
     const claimant = server.connFor(claimant_id).?;
     const ghost_cid = monitorIdFromClient(ghost_id);
-    const target_token = server.sessions.resumeHandleForClient("ghost-stage-acct", ghost_cid).?.token;
+    const ghost_handle = server.sessions.resumeHandleForClient("ghost-stage-acct", ghost_cid) orelse
+        return error.TestUnexpectedResult;
+    const target_token = ghost_handle.token;
+    const ghost_attachment_id = ghost_handle.attachment_id orelse return error.TestUnexpectedResult;
     const channels = [_][]const u8{"#ghost-staged"};
     const encoded = try (migration_relay.Snapshot{
         .nick = "RestoredGhost",
@@ -75134,7 +76586,16 @@ test "atomic RESUME staged capsule joins then removes an existing ghost" {
         monitorIdFromClient(claimant_id),
         target_token,
     ));
-    try std.testing.expect(server.sessions.resumeHandleForClient("ghost-stage-acct", ghost_cid) == null);
+    const retained_ghost = server.sessions.resumeHandleForClient("ghost-stage-acct", ghost_cid) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(retained_ghost.attachment_id != null);
+    try std.testing.expect(retained_ghost.attachment_id.?.eql(ghost_attachment_id));
+    const claimant_handle = server.sessions.resumeHandleForClient(
+        "ghost-stage-acct",
+        monitorIdFromClient(claimant_id),
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(claimant_handle.attachment_id != null);
+    try std.testing.expect(!claimant_handle.attachment_id.?.eql(ghost_attachment_id));
     try std.testing.expectEqualStrings("RestoredGhost", claimant.session.displayName());
     try std.testing.expect(server.world.isMember("#ghost-staged", worldIdFromClient(claimant_id)));
     try std.testing.expect(server.pending_migrations.?.has(target_token));
@@ -78703,6 +80164,7 @@ test "threaded server: same-account same-nick second client attaches, not 433-dr
     var services = services_mod.Services.init(&store, null);
     var cfg = operTestConfig(0);
     cfg.crypto_io = std.testing.io;
+    cfg.session_resume_composite_issuance = true;
     cfg.account_services = &services;
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -78751,9 +80213,11 @@ test "threaded server: same-account same-nick second client attaches, not 433-dr
     const start = (std.mem.indexOf(u8, k1.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
     const tail = k1.written()[start..];
     const token_len = std.mem.indexOfScalar(u8, tail, '\r') orelse return error.TestUnexpectedResult;
-    var token_buf: [64]u8 = undefined;
+    var token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(token_buf[0..token_len], tail[0..token_len]);
     const token = token_buf[0..token_len];
+    const exact = (try session_resume_credential.decode(token)).local;
+    const legacy_group_token = std.fmt.bytesToHex(exact.group_token, .lower);
 
     // Same account and nick but a distinct token cannot consume the DM.
     k1.reset();
@@ -78768,7 +80232,7 @@ test "threaded server: same-account same-nick second client attaches, not 433-dr
     // event reaches both transports once while both remain connected.
     var resume_buf: [128]u8 = undefined;
     k2.reset();
-    try writeAllFd(fd_k2, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{token}));
+    try writeAllFd(fd_k2, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{legacy_group_token}));
     try recvUntil(&k2, "attached to live session", 200);
     k1.reset();
     k2.reset();
@@ -78793,6 +80257,7 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
 
     var cfg = operTestConfig(0);
     cfg.crypto_io = std.testing.io;
+    cfg.session_resume_composite_issuance = true;
     cfg.account_services = &services;
     // Use an ordinary authenticated account: the oper-test "admin" identity is
     // deliberately kick-immune, which would test +Y protection instead of
@@ -78839,9 +80304,11 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     const start = (std.mem.indexOf(u8, one.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
     const tail = one.written()[start..];
     const token_len = std.mem.indexOfScalar(u8, tail, '\r') orelse return error.TestUnexpectedResult;
-    var token_buf: [64]u8 = undefined;
+    var token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(token_buf[0..token_len], tail[0..token_len]);
     const token = token_buf[0..token_len];
+    const exact = (try session_resume_credential.decode(token)).local;
+    const legacy_group_token = std.fmt.bytesToHex(exact.group_token, .lower);
 
     // The second socket reaches 001 but must NOT inherit by account+nick alone:
     // it starts with a distinct generated token. Only presenting the SAME
@@ -78856,7 +80323,7 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     var resume_buf: [128]u8 = undefined;
     one.reset();
     two.reset();
-    try writeAllFd(fd_two, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{token}));
+    try writeAllFd(fd_two, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{legacy_group_token}));
     try recvUntil(&two, "attached to live session", 200);
     try recvUntil(&two, "JOIN #shared", 200);
     try recvUntil(&two, " 353 kain = #shared ", 200);
@@ -78969,7 +80436,14 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     two.reset();
     try writeAllFd(fd_two, "SESSION TOKEN\r\n");
     try recvUntil(&two, "SESSION TOKEN ", 200);
-    try expectContains(two.written(), token);
+    const handoff_credential = testSessionTokenFromReply(two.written(), "SESSION TOKEN ") orelse
+        return error.TestUnexpectedResult;
+    const handoff_local = switch (try session_resume_credential.decode(handoff_credential)) {
+        .local => |value| value,
+        .mesh => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(exact.group_token, handoff_local.group_token);
+    try std.testing.expect(!handoff_local.attachment_id.eql(exact.attachment_id));
 }
 
 test "threaded server: draft/multiline batch reassembles + splits to recipient" {
@@ -84912,7 +86386,7 @@ test "threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admissio
     server.fabric.?.release(1, reclaimed);
 }
 
-test "different-token session eviction retires old spool rows without leaking to newcomer" {
+test "tracking at cap preserves detached spool and leaves newcomer untracked" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -84940,9 +86414,9 @@ test "different-token session eviction retires old spool rows without leaking to
 
     const new_id = try addTestLocalClient(&server, "NewToken", "shared-account");
     const new_conn = server.connFor(new_id) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
-    try std.testing.expect(!server.sessions.containsClient("shared-account", monitorIdFromClient(old_id)));
-    try std.testing.expect(server.sessions.containsClient("shared-account", monitorIdFromClient(new_id)));
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
+    try std.testing.expect(server.sessions.containsClient("shared-account", monitorIdFromClient(old_id)));
+    try std.testing.expect(!server.sessions.containsClient("shared-account", monitorIdFromClient(new_id)));
     try std.testing.expect(std.mem.indexOf(u8, new_conn.send_buf[0..new_conn.send_len], "old-token-secret") == null);
 }
 
@@ -92214,8 +93688,28 @@ fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
 
         try expectMeshPeerVisible(&c1, "node2.test", 160);
         try expectMeshPeerVisible(&c2, "node1.test", 160);
-        const node1_collapses = countMeshLogDetail(&node1, "duplicate link collapsed");
-        const node2_collapses = countMeshLogDetail(&node2, "duplicate link collapsed");
+        // Immediate peer publication deliberately precedes the asynchronous
+        // reciprocal-dial loser close. Wait for that one initial convergence
+        // to settle before freezing the no-further-churn baseline.
+        var node1_collapses = countMeshLogDetail(&node1, "duplicate link collapsed");
+        var node2_collapses = countMeshLogDetail(&node2, "duplicate link collapsed");
+        var stable_rounds: usize = 0;
+        var settle_rounds: usize = 0;
+        while (stable_rounds < 3 and settle_rounds < 20) : (settle_rounds += 1) {
+            testSleepMs(100);
+            try expectMeshPeerVisible(&c1, "node2.test", 8);
+            try expectMeshPeerVisible(&c2, "node1.test", 8);
+            const next1 = countMeshLogDetail(&node1, "duplicate link collapsed");
+            const next2 = countMeshLogDetail(&node2, "duplicate link collapsed");
+            if (next1 == node1_collapses and next2 == node2_collapses) {
+                stable_rounds += 1;
+            } else {
+                node1_collapses = next1;
+                node2_collapses = next2;
+                stable_rounds = 0;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 3), stable_rounds);
 
         // Hold through several accelerated auto-connect sweeps. A reciprocal mesh
         // used to establish, hit the next redial/collision pass, and then disappear.
@@ -92583,6 +94077,7 @@ test "threaded server: one reusable session stays live and participatory across 
         .server_name = "session-node2.test",
         .node_identity = &ident2,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-session-shared-secret",
         .mesh_trust_roots = &roots_for_node2,
         .require_secured = true,
@@ -92626,6 +94121,7 @@ test "threaded server: one reusable session stays live and participatory across 
         .server_name = "session-node1.test",
         .node_identity = &ident1,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-session-shared-secret",
         .mesh_trust_roots = &roots_for_node1,
         .require_secured = true,
@@ -92705,26 +94201,38 @@ test "threaded server: one reusable session stays live and participatory across 
     try recvUntil(a, "SESSION MTOKEN ", 200);
     const local_token_reply = testSessionTokenFromReply(a.written(), "SESSION TOKEN ") orelse
         return error.TestUnexpectedResult;
-    if (local_token_reply.len > 64) return error.TestUnexpectedResult;
-    var local_token_buf: [64]u8 = undefined;
+    if (local_token_reply.len > session_resume_credential.local_text_len) return error.TestUnexpectedResult;
+    var local_token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(local_token_buf[0..local_token_reply.len], local_token_reply);
     const local_token = local_token_buf[0..local_token_reply.len];
-    const mesh_token_reply = try expectFreshMeshSessionToken(
+    const exact_mesh_token = try expectFreshMeshSessionToken(
         a.written(),
         "mesh-session-shared-secret",
         "nova",
         local_token,
     );
-    if (mesh_token_reply.len > 1024) return error.TestUnexpectedResult;
     var token_buf: [1024]u8 = undefined;
-    @memcpy(token_buf[0..mesh_token_reply.len], mesh_token_reply);
-    const mesh_token = token_buf[0..mesh_token_reply.len];
+    const mesh_token = try testLegacyMeshResumeCredential(
+        &token_buf,
+        "mesh-session-shared-secret",
+        "nova",
+        local_token,
+        "session-node1.test",
+    );
 
     // Attach B on the other node. Retrying the same credential while the signed
     // replica is in flight must be safe: no nonce burn and no source disconnect.
     try saslPlainPreludeWithCaps(fd_b, "nova", "pw", "echo-message message-tags server-time draft/chathistory onyx/session-sync");
     try writeAllFd(fd_b, "NICK DeviceB\r\nUSER nova 0 * :Mesh attachment B\r\n");
     try recvUntil(b, " 001 DeviceB ", 200);
+    var exact_resume_line: [1200]u8 = undefined;
+    b.reset();
+    try writeAllFd(fd_b, try std.fmt.bufPrint(
+        &exact_resume_line,
+        "SESSION RESUME {s}\r\n",
+        .{exact_mesh_token},
+    ));
+    try recvUntil(b, "SESSION REDIRECT: exact session lives on session-node1.test", 200);
     var resume_line: [1200]u8 = undefined;
     const resume_cmd = try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{mesh_token});
     var attached_b = false;
@@ -93123,24 +94631,82 @@ fn expectFreshMeshSessionToken(
     bytes: []const u8,
     mesh_key: []const u8,
     account: []const u8,
-    stable_token_hex: []const u8,
+    local_credential: []const u8,
 ) ![]const u8 {
-    const sealed_hex = testSessionTokenFromReply(bytes, "SESSION MTOKEN ") orelse
+    // SRM2 authority is asymmetric and origin-signed. The mesh shared secret is
+    // intentionally irrelevant to validating this credential.
+    _ = mesh_key;
+    const local = switch (try session_resume_credential.decode(local_credential)) {
+        .local => |value| value,
+        .mesh => return error.TestUnexpectedResult,
+    };
+    const mesh_credential = testSessionTokenFromReply(bytes, "SESSION MTOKEN ") orelse
         return error.TestUnexpectedResult;
-    if (sealed_hex.len % 2 != 0 or sealed_hex.len / 2 > 512)
+    const mesh = switch (try session_resume_credential.decode(mesh_credential)) {
+        .mesh => |value| value,
+        .local => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(mesh.attachment_id.eql(local.attachment_id));
+    if (mesh.sealed_hex.len % 2 != 0 or
+        mesh.sealed_hex.len / 2 > session_reclaim_attachment.max_claim_wire_len)
         return error.TestUnexpectedResult;
-    var raw: [512]u8 = undefined;
-    const sealed = std.fmt.hexToBytes(raw[0 .. sealed_hex.len / 2], sealed_hex) catch
+    var raw: [session_reclaim_attachment.max_claim_wire_len]u8 = undefined;
+    const wire = std.fmt.hexToBytes(raw[0 .. mesh.sealed_hex.len / 2], mesh.sealed_hex) catch
         return error.TestUnexpectedResult;
+    const signed = try session_reclaim_attachment.decodeClaim(wire);
+    try session_reclaim_attachment.verifyClaim(signed);
+    const now = @max(@as(i64, 0), platform.realtimeMillis());
+    try session_reclaim_attachment.validateAt(signed.claim, now, .{});
+    try std.testing.expectEqual(session_reclaim_attachment.ClaimKind.exact_restore, signed.claim.kind);
+    try std.testing.expectEqualStrings(account, signed.claim.account);
+    try std.testing.expectEqual(local.group_token, signed.claim.group_token);
+    try std.testing.expect(signed.claim.attachment_id.eql(local.attachment_id));
+    try std.testing.expectEqual(signed.claim.origin_node, signed.claim.destination_node);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(LinuxServer.mesh_reclaim_ttl_ms)),
+        signed.claim.expires_at_ms - signed.claim.issued_at_ms,
+    );
+    try std.testing.expect(signed.claim.expires_at_ms >= now);
+    return mesh_credential;
+}
+
+/// Explicitly mint the SRM1 compatibility credential used by integration
+/// scenarios whose contract is create-new attachment on another mesh node.
+/// Current SESSION MTOKEN issuance is SRM2 exact-restore and must redirect to
+/// its signed origin instead of silently changing these scenarios' semantics.
+fn testLegacyMeshResumeCredential(
+    out_hex: []u8,
+    mesh_key: []const u8,
+    account: []const u8,
+    local_or_group_credential: []const u8,
+    origin_node: []const u8,
+) ![]const u8 {
+    var token_hex: [session_resume_credential.token_hex_len]u8 = undefined;
+    if (std.mem.startsWith(u8, local_or_group_credential, "srm2l.")) {
+        const local = switch (try session_resume_credential.decode(local_or_group_credential)) {
+            .local => |value| value,
+            .mesh => return error.TestUnexpectedResult,
+        };
+        token_hex = std.fmt.bytesToHex(local.group_token, .lower);
+    } else {
+        if (local_or_group_credential.len != token_hex.len) return error.TestUnexpectedResult;
+        var group: session_migrate.Token = undefined;
+        _ = std.fmt.hexToBytes(&group, local_or_group_credential) catch
+            return error.TestUnexpectedResult;
+        @memcpy(&token_hex, local_or_group_credential);
+    }
     const now: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
-    const fields = try session_reclaim_mesh.open(mesh_key, sealed, now);
-    try std.testing.expectEqualStrings(account, fields.account);
-    try std.testing.expectEqualStrings(stable_token_hex, fields.session_id);
-    try std.testing.expect(fields.origin_node.len != 0);
-    try std.testing.expect(fields.expiry_ms >= fields.issued_ms);
-    try std.testing.expectEqual(LinuxServer.mesh_reclaim_ttl_ms, fields.expiry_ms - fields.issued_ms);
-    try std.testing.expect(fields.expiry_ms >= now);
-    return sealed_hex;
+    var raw: [512]u8 = undefined;
+    const len = try session_reclaim_mesh.seal(mesh_key, .{
+        .account = account,
+        .session_id = &token_hex,
+        .origin_node = origin_node,
+        .issued_ms = now,
+        .expiry_ms = now + LinuxServer.mesh_reclaim_ttl_ms,
+        .nonce = now | 1,
+    }, &raw);
+    if (len * 2 > out_hex.len) return error.TestUnexpectedResult;
+    return LinuxServer.toHexLower(raw[0..len], out_hex);
 }
 
 fn expectLiveSessionToken(
@@ -93149,14 +94715,41 @@ fn expectLiveSessionToken(
     mesh_key: []const u8,
     account: []const u8,
 ) !void {
+    const expected_local = switch (try session_resume_credential.decode(expected)) {
+        .local => |value| value,
+        .mesh => return error.TestUnexpectedResult,
+    };
     client.reset();
     try writeAllFd(client.fd, "SESSION TOKEN\r\n");
     const deadline = platform.monotonicMillis() + 1_000;
     while (platform.monotonicMillis() < deadline) {
         try client.readAvailable();
         if (testSessionTokenFromReply(client.written(), "SESSION TOKEN ")) |token| {
-            try std.testing.expectEqualStrings(expected, token);
-            _ = try expectFreshMeshSessionToken(client.written(), mesh_key, account, expected);
+            if (std.mem.startsWith(u8, token, "srm2l.")) {
+                const current = switch (try session_resume_credential.decode(token)) {
+                    .local => |value| value,
+                    .mesh => return error.TestUnexpectedResult,
+                };
+                try std.testing.expectEqual(expected_local.group_token, current.group_token);
+                _ = try expectFreshMeshSessionToken(client.written(), mesh_key, account, token);
+            } else {
+                if (token.len != @sizeOf(session_migrate.Token) * 2)
+                    return error.TestUnexpectedResult;
+                var current_group: session_migrate.Token = undefined;
+                _ = std.fmt.hexToBytes(&current_group, token) catch return error.TestUnexpectedResult;
+                try std.testing.expectEqual(expected_local.group_token, current_group);
+                const mesh_hex = testSessionTokenFromReply(client.written(), "SESSION MTOKEN ") orelse
+                    return error.TestUnexpectedResult;
+                if (mesh_hex.len % 2 != 0 or mesh_hex.len / 2 > 512)
+                    return error.TestUnexpectedResult;
+                var raw: [512]u8 = undefined;
+                const sealed = std.fmt.hexToBytes(raw[0 .. mesh_hex.len / 2], mesh_hex) catch
+                    return error.TestUnexpectedResult;
+                const now: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+                const fields = try session_reclaim_mesh.open(mesh_key, sealed, now);
+                try std.testing.expectEqualStrings(account, fields.account);
+                try std.testing.expectEqualStrings(token, fields.session_id);
+            }
             return;
         }
         testSleepMs(10);
@@ -93299,6 +94892,7 @@ test "threaded server: four-client reusable session survives sequential Helix up
         .server_name = "helix-session-node2.test",
         .node_identity = &ident2,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-helix-shared-secret",
         .mesh_trust_roots = &roots_for_node2,
         .require_secured = true,
@@ -93327,6 +94921,7 @@ test "threaded server: four-client reusable session survives sequential Helix up
         .server_name = "helix-session-node1.test",
         .node_identity = &ident1,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-helix-shared-secret",
         .mesh_trust_roots = &roots_for_node1,
         .require_secured = true,
@@ -93373,20 +94968,24 @@ test "threaded server: four-client reusable session survives sequential Helix up
     try recvUntil(clients[0], "SESSION MTOKEN ", 500);
     const local_token_reply = testSessionTokenFromReply(clients[0].written(), "SESSION TOKEN ") orelse
         return error.TestUnexpectedResult;
-    if (local_token_reply.len > 64) return error.TestUnexpectedResult;
-    var local_token_buf: [64]u8 = undefined;
+    if (local_token_reply.len > session_resume_credential.local_text_len) return error.TestUnexpectedResult;
+    var local_token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(local_token_buf[0..local_token_reply.len], local_token_reply);
     const local_token = local_token_buf[0..local_token_reply.len];
-    const mesh_token_reply = try expectFreshMeshSessionToken(
+    _ = try expectFreshMeshSessionToken(
         clients[0].written(),
         node1_config.mesh_pass,
         "nova",
         local_token,
     );
-    if (mesh_token_reply.len > 1024) return error.TestUnexpectedResult;
     var mesh_token_buf: [1024]u8 = undefined;
-    @memcpy(mesh_token_buf[0..mesh_token_reply.len], mesh_token_reply);
-    const mesh_token = mesh_token_buf[0..mesh_token_reply.len];
+    const mesh_token = try testLegacyMeshResumeCredential(
+        &mesh_token_buf,
+        node1_config.mesh_pass,
+        "nova",
+        local_token,
+        "helix-session-node1.test",
+    );
     var resume_buf: [1200]u8 = undefined;
     const resume_command = try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{mesh_token});
 
@@ -93467,19 +95066,24 @@ test "threaded server: four-client reusable session survives sequential Helix up
         testSessionTokenFromReply(clients[0].written(), "SESSION TOKEN ") orelse
             return error.TestUnexpectedResult,
     );
-    const fresh_mesh_reply = try expectFreshMeshSessionToken(
+    _ = try expectFreshMeshSessionToken(
         clients[0].written(),
         node1_config.mesh_pass,
         "nova",
         local_token,
     );
-    if (fresh_mesh_reply.len > 1024) return error.TestUnexpectedResult;
     var fresh_mesh_buf: [1024]u8 = undefined;
-    @memcpy(fresh_mesh_buf[0..fresh_mesh_reply.len], fresh_mesh_reply);
+    const fresh_mesh_reply = try testLegacyMeshResumeCredential(
+        &fresh_mesh_buf,
+        node1_config.mesh_pass,
+        "nova",
+        local_token,
+        "helix-session-node1.test",
+    );
     const fresh_resume = try std.fmt.bufPrint(
         &resume_buf,
         "SESSION RESUME {s}\r\n",
-        .{fresh_mesh_buf[0..fresh_mesh_reply.len]},
+        .{fresh_mesh_reply},
     );
     for (clients) |client| client.reset();
 
@@ -93553,6 +95157,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         .server_name = "session-line-node3.test",
         .node_identity = &ident3,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-session-line-secret",
         .mesh_trust_roots = &roots_for_node3,
         .require_secured = true,
@@ -93582,6 +95187,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         .server_name = "session-line-node2.test",
         .node_identity = &ident2,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-session-line-secret",
         .mesh_trust_roots = &roots_for_node2,
         .require_secured = true,
@@ -93614,6 +95220,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         .server_name = "session-line-node1.test",
         .node_identity = &ident1,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-session-line-secret",
         .mesh_trust_roots = &roots_for_node1,
         .require_secured = true,
@@ -93797,20 +95404,24 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     try recvUntil(a, "SESSION MTOKEN ", 200);
     const local_token_reply = testSessionTokenFromReply(a.written(), "SESSION TOKEN ") orelse
         return error.TestUnexpectedResult;
-    if (local_token_reply.len > 64) return error.TestUnexpectedResult;
-    var local_token_buf: [64]u8 = undefined;
+    if (local_token_reply.len > session_resume_credential.local_text_len) return error.TestUnexpectedResult;
+    var local_token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(local_token_buf[0..local_token_reply.len], local_token_reply);
     const local_token = local_token_buf[0..local_token_reply.len];
-    const mesh_token_reply = try expectFreshMeshSessionToken(
+    _ = try expectFreshMeshSessionToken(
         a.written(),
         "mesh-session-line-secret",
         "nova",
         local_token,
     );
-    if (mesh_token_reply.len > 1024) return error.TestUnexpectedResult;
     var token_buf: [1024]u8 = undefined;
-    @memcpy(token_buf[0..mesh_token_reply.len], mesh_token_reply);
-    const mesh_token = token_buf[0..mesh_token_reply.len];
+    const mesh_token = try testLegacyMeshResumeCredential(
+        &token_buf,
+        "mesh-session-line-secret",
+        "nova",
+        local_token,
+        "session-line-node1.test",
+    );
     var resume_buf: [1200]u8 = undefined;
     const resume_cmd = try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{mesh_token});
 
@@ -94140,8 +95751,10 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     );
     try recvUntil(&d, "JOIN :#mesh-retained", 600);
     try Helpers.expectOnce(&d, "JOIN :#mesh-retained");
-    var retained_session_token: session_migrate.Token = undefined;
-    _ = std.fmt.hexToBytes(&retained_session_token, local_token) catch return error.TestUnexpectedResult;
+    const retained_session_token = switch (try session_resume_credential.decode(local_token)) {
+        .local => |value| value.group_token,
+        .mesh => return error.TestUnexpectedResult,
+    };
     var retained_store_projected = false;
     for (0..100) |_| {
         if (node3.sessionReplicaChannelFromOriginForTest(

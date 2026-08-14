@@ -50,7 +50,23 @@ pub const Error = std.mem.Allocator.Error || error{
     DuplicateAttachmentId,
     AttachmentIdMismatch,
     SessionDropReserved,
+    ClientAlreadyTracked,
+    InvalidToken,
 };
+
+pub const BootstrapAttachError = Error || attachment_id_mod.MintError;
+
+pub const BootstrapAttachment = struct {
+    session: Session,
+    attachment_id: AttachmentId,
+};
+
+const AttachMode = enum {
+    compatibility,
+    bootstrap_no_evict,
+};
+
+const attachment_mint_attempts: usize = 4;
 
 pub const Config = struct {
     max_accounts: usize = 65536,
@@ -769,18 +785,53 @@ pub const PreparedAttachmentRebind = struct {
     const State = enum { prepared, committed, aborted, finished };
 
     store: *SessionStore,
-    claimant_list: *SessionList,
-    claimant_account: []const u8,
+    /// A compatibility bootstrap may already exist, but exact resume also
+    /// supports a genuinely untracked claimant so a full account never needs
+    /// to evict the detached authority it is about to reclaim.
+    claimant_list: ?*SessionList,
+    claimant_account: ?[]const u8,
     ghost_list: *SessionList,
     /// Store-owned source account key, stable while the retained lock is held.
     ghost_account: []const u8,
-    claimant_index: usize,
+    claimant_index: ?usize,
     ghost_index: usize,
     claimant_client: ClientId,
     ghost_client: ClientId,
     token: Token,
     attachment_id: AttachmentId,
+    /// Complete folded-account view captured while the retained lock excludes
+    /// concurrent sibling changes. This gives the generic restore planner the
+    /// same stable input shape as token-bind tickets.
+    locked_account_rows: []TokenBindRowSnapshot,
+    target_local_projections: LocalChannelProjectionSet,
+    result_portable: bool,
     state: State = .prepared,
+
+    pub fn accountRows(self: *const PreparedAttachmentRebind) []const TokenBindRowSnapshot {
+        std.debug.assert(self.state == .prepared or self.state == .committed);
+        if (self.state != .prepared and self.state != .committed) return &.{};
+        return self.locked_account_rows;
+    }
+
+    pub fn resultPortable(self: *const PreparedAttachmentRebind) bool {
+        std.debug.assert(self.state == .prepared or self.state == .committed);
+        return self.result_portable;
+    }
+
+    /// Preview the exact target attachment's pending local-channel journal.
+    /// The detached snapshot may be older than these accepted intents, so the
+    /// generic restore planner must overlay this same image before commit.
+    pub fn mergedLocalChannelProjectionsInto(
+        self: *const PreparedAttachmentRebind,
+        out: []LocalChannelProjection,
+    ) []const LocalChannelProjection {
+        std.debug.assert(self.state == .prepared);
+        const source = self.target_local_projections.slice();
+        std.debug.assert(out.len >= source.len);
+        if (out.len < source.len) return out[0..0];
+        @memcpy(out[0..source.len], source);
+        return out[0..source.len];
+    }
 
     /// Borrowed exact restore bytes. The retained store lock keeps them stable
     /// until commit/abort; commit consumes/frees the stored snapshot.
@@ -794,34 +845,52 @@ pub const PreparedAttachmentRebind = struct {
         return .{ .old_client = self.ghost_client, .new_client = self.claimant_client };
     }
 
-    /// Replace the claimant bootstrap row with the exact detached row, retaining
-    /// its token, stable id, signon, portability and retry journals. The stored
-    /// snapshot is retired only at this no-fail commit boundary.
+    /// Replace an optional clean bootstrap row, or remap the detached row in
+    /// place for an untracked claimant. Both paths retain token, stable id,
+    /// signon, portability and retry journals. The stored snapshot is retired
+    /// only at this no-fail commit boundary.
     pub fn commit(self: *PreparedAttachmentRebind) bool {
         if (self.state != .prepared) return false;
-        if (self.claimant_index >= self.claimant_list.items.items.len or
-            self.ghost_index >= self.ghost_list.items.items.len or
-            (self.claimant_list == self.ghost_list and self.claimant_index == self.ghost_index))
-        {
-            return false;
-        }
-
-        const claimant = &self.claimant_list.items.items[self.claimant_index];
+        if (self.ghost_index >= self.ghost_list.items.items.len) return false;
         const ghost = &self.ghost_list.items.items[self.ghost_index];
-        if (claimant.client != self.claimant_client or
-            claimant.drop_reservation != 0 or ghost.drop_reservation != 0 or
-            ghost.client != self.ghost_client or ghost.attached or
+        if (ghost.drop_reservation != 0 or ghost.client != self.ghost_client or ghost.attached or
             !sessionMatchesAttachment(ghost.*, self.token, self.attachment_id))
         {
             return false;
         }
+
+        const claimant_list = self.claimant_list orelse {
+            // No row is inserted: exact physical authority is simply rebound to
+            // the new runtime handle in place, so account-cap and allocation
+            // pressure cannot destroy a sibling or strand the target.
+            freeSnapshot(self.store.allocator, ghost);
+            ghost.client = self.claimant_client;
+            ghost.attached = true;
+            const ghost_locator = self.store.attachment_index.getPtr(self.attachment_id.raw) orelse unreachable;
+            ghost_locator.* = .{ .account = self.ghost_account, .client = self.claimant_client };
+            self.store.remapTokenRowLocatorLocked(
+                self.token,
+                self.ghost_account,
+                self.ghost_client,
+                self.ghost_account,
+                self.claimant_client,
+            );
+            self.state = .committed;
+            return true;
+        };
+        const claimant_index = self.claimant_index orelse return false;
+        const claimant_account = self.claimant_account orelse return false;
+        if (claimant_index >= claimant_list.items.items.len or
+            (claimant_list == self.ghost_list and claimant_index == self.ghost_index)) return false;
+        const claimant = &claimant_list.items.items[claimant_index];
+        if (claimant.client != self.claimant_client or claimant.drop_reservation != 0) return false;
         const claimant_attachment_id = claimant.attachment_id orelse return false;
 
         // Remove both rows from exact scheduler counts before ownership moves.
         // The replacement contributes the ghost's flags once, below.
         self.store.removeDirtyRowLocked(claimant);
         self.store.removeDirtyRowLocked(ghost);
-        self.store.removeTokenRowLocked(self.claimant_account, claimant.*, false);
+        self.store.removeTokenRowLocked(claimant_account, claimant.*, false);
 
         var replacement = ghost.*;
         replacement.client = self.claimant_client;
@@ -838,16 +907,16 @@ pub const PreparedAttachmentRebind = struct {
         const removed_claimant_index = self.store.attachment_index.remove(claimant_attachment_id.raw);
         std.debug.assert(removed_claimant_index);
         const ghost_locator = self.store.attachment_index.getPtr(self.attachment_id.raw) orelse unreachable;
-        ghost_locator.* = .{ .account = self.claimant_account, .client = self.claimant_client };
+        ghost_locator.* = .{ .account = claimant_account, .client = self.claimant_client };
         self.store.remapTokenRowLocatorLocked(
             self.token,
             self.ghost_account,
             self.ghost_client,
-            self.claimant_account,
+            claimant_account,
             self.claimant_client,
         );
 
-        self.claimant_list.items.items[self.claimant_index] = replacement;
+        claimant_list.items.items[claimant_index] = replacement;
         _ = self.ghost_list.items.swapRemove(self.ghost_index);
         self.store.addDirtyRowLocked(&replacement);
         if (self.ghost_list.items.items.len == 0) {
@@ -862,6 +931,7 @@ pub const PreparedAttachmentRebind = struct {
         if (self.state == .finished) return;
         std.debug.assert(self.state == .committed);
         if (self.state != .committed) return;
+        self.destroyLockedAccountRows();
         self.state = .finished;
         self.store.lock.unlockExclusive();
     }
@@ -870,6 +940,7 @@ pub const PreparedAttachmentRebind = struct {
         if (self.state == .aborted or self.state == .finished) return;
         std.debug.assert(self.state == .prepared);
         if (self.state != .prepared) return;
+        self.destroyLockedAccountRows();
         self.state = .aborted;
         self.store.lock.unlockExclusive();
     }
@@ -878,12 +949,18 @@ pub const PreparedAttachmentRebind = struct {
         switch (self.state) {
             .prepared => self.abort(),
             .committed => {
+                self.destroyLockedAccountRows();
                 self.state = .finished;
                 self.store.lock.unlockExclusive();
                 std.debug.assert(false);
             },
             .aborted, .finished => {},
         }
+    }
+
+    fn destroyLockedAccountRows(self: *PreparedAttachmentRebind) void {
+        if (self.locked_account_rows.len != 0) self.store.allocator.free(self.locked_account_rows);
+        self.locked_account_rows = &.{};
     }
 };
 
@@ -1167,7 +1244,7 @@ pub const SessionStore = struct {
     /// at the per-account cap. Keeping the legacy `attach` wrapper makes pure
     /// callers simple while letting the live daemon close the mesh lifecycle.
     pub fn attachReportingEviction(self: *SessionStore, account: []const u8, client: ClientId, token: Token, signon_ms: i64) Error!AttachOutcome {
-        return self.attachReportingEvictionInternal(account, client, token, null, signon_ms);
+        return self.attachReportingEvictionInternal(account, client, token, null, signon_ms, .compatibility);
     }
 
     pub fn attachWithAttachmentReportingEviction(
@@ -1185,7 +1262,62 @@ pub const SessionStore = struct {
             token,
             attachment_id,
             signon_ms,
+            .compatibility,
         );
+    }
+
+    /// Publish a fresh, clean bootstrap row for an exact attachment rebind.
+    /// Unlike compatibility attach, this never refreshes an existing client and
+    /// never evicts a detached row at the account cap. The supplied token and
+    /// stable physical id must both be nonzero. On success the row satisfies
+    /// `prepareExactAttachmentRebind`'s claimant preconditions.
+    pub fn attachBootstrapWithAttachmentNoEvict(
+        self: *SessionStore,
+        account: []const u8,
+        client: ClientId,
+        token: Token,
+        attachment_id: AttachmentId,
+        signon_ms: i64,
+    ) Error!Session {
+        if (tokenIsSentinel(token)) return error.InvalidToken;
+        if (attachment_id.isZero()) return error.InvalidAttachmentId;
+        return (try self.attachReportingEvictionInternal(
+            account,
+            client,
+            token,
+            attachment_id,
+            signon_ms,
+            .bootstrap_no_evict,
+        )).session;
+    }
+
+    /// Mint and atomically publish a stable bootstrap attachment. A globally
+    /// colliding random id is retried a bounded number of times; zero entropy
+    /// and allocator/capacity failures publish no row and evict no authority.
+    pub fn mintBootstrapAttachmentNoEvict(
+        self: *SessionStore,
+        account: []const u8,
+        client: ClientId,
+        token: Token,
+        signon_ms: i64,
+        io: std.Io,
+    ) BootstrapAttachError!BootstrapAttachment {
+        if (tokenIsSentinel(token)) return error.InvalidToken;
+        for (0..attachment_mint_attempts) |_| {
+            const candidate = try AttachmentId.mint(io);
+            const session = self.attachBootstrapWithAttachmentNoEvict(
+                account,
+                client,
+                token,
+                candidate,
+                signon_ms,
+            ) catch |err| switch (err) {
+                error.DuplicateAttachmentId => continue,
+                else => return err,
+            };
+            return .{ .session = session, .attachment_id = candidate };
+        }
+        return error.DuplicateAttachmentId;
     }
 
     fn attachReportingEvictionInternal(
@@ -1195,6 +1327,7 @@ pub const SessionStore = struct {
         token: Token,
         attachment_id: ?AttachmentId,
         signon_ms: i64,
+        mode: AttachMode,
     ) Error!AttachOutcome {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
@@ -1209,12 +1342,14 @@ pub const SessionStore = struct {
             return error.SessionDropReserved;
         if (self.accounts.getPtr(account)) |existing_list| {
             if (existing_list.indexOfClient(client)) |existing_index| {
+                if (mode == .bootstrap_no_evict) return error.ClientAlreadyTracked;
                 const source = existing_list.items.items[existing_index];
                 if (source.drop_reservation != 0 or
                     (!std.crypto.timing_safe.eql(Token, source.token, token) and
                         self.tokenGroupHasDropReservationLocked(source.token)))
                     return error.SessionDropReserved;
             } else if (existing_list.items.items.len >= self.cfg.max_sessions_per_account) {
+                if (mode == .bootstrap_no_evict) return error.TooManySessions;
                 if (oldestDetached(existing_list)) |evict_index| {
                     const victim = existing_list.items.items[evict_index];
                     if (victim.drop_reservation != 0 or
@@ -1255,6 +1390,7 @@ pub const SessionStore = struct {
         var staged_token_entry = try self.reserveTokenRowInsertLocked(token);
         defer if (staged_token_entry) |*entry| entry.deinit(self.allocator);
         if (list.indexOfClient(client)) |idx| {
+            if (mode == .bootstrap_no_evict) return error.ClientAlreadyTracked;
             const displaced = list.items.items[idx];
             if (displaced.drop_reservation != 0) return error.SessionDropReserved;
             if (attachment_id) |requested| {
@@ -1353,6 +1489,7 @@ pub const SessionStore = struct {
         errdefer if (projection_storage) |storage| self.allocator.destroy(storage);
         var evicted: ?EvictedSession = null;
         if (list.items.items.len >= self.cfg.max_sessions_per_account) {
+            if (mode == .bootstrap_no_evict) return error.TooManySessions;
             // At cap: evict the oldest *detached* ghost to make room for the live
             // session. Never evict an attached session (that would drop a peer).
             if (oldestDetached(list)) |evict| {
@@ -1572,9 +1709,10 @@ pub const SessionStore = struct {
     }
 
     /// Prepare exact physical-attachment restoration. The selected id must own
-    /// one detached row under the caller's exact account and token, while the
-    /// reconnecting runtime client must already have its separate bootstrap row.
-    /// No token-only or newest-sibling fallback is performed.
+    /// one detached row under the caller's folded account and exact token. The
+    /// reconnecting runtime client may be untracked (preferred at account cap)
+    /// or may own one separate, clean compatibility bootstrap row. No token-only
+    /// or newest-sibling fallback is performed.
     pub fn prepareExactAttachmentRebind(
         self: *SessionStore,
         account: []const u8,
@@ -1587,26 +1725,36 @@ pub const SessionStore = struct {
         var keep_locked = false;
         defer if (!keep_locked) self.lock.unlockExclusive();
 
-        const claimant_entry = self.accounts.getEntry(account) orelse return null;
-        const claimant_list = claimant_entry.value_ptr;
-        const claimant_index = claimant_list.indexOfClient(claimant_client) orelse return null;
-        const claimant = claimant_list.items.items[claimant_index];
-        // Exact restore may discard only the fresh, clean bootstrap row created
-        // for this reconnecting socket. Any existing authority/retry state needs
-        // an explicit revoke/transfer transaction, never silent destruction.
-        if (claimant.drop_reservation != 0 or !claimant.attached or claimant.attachment_id == null or claimant.snapshot != null or
-            claimant.portable_resume or claimant.replica_dirty or claimant.replica_projection_dirty or
-            claimant.attachment_replica_dirty or claimant.attachment_replica_projection_dirty or
-            claimant.local_channel_projections != null or claimant.attachment_channel_projections != null)
-        {
-            return null;
+        var claimant_list: ?*SessionList = null;
+        var claimant_account: ?[]const u8 = null;
+        var claimant_index: ?usize = null;
+        var claimant_it = self.accounts.iterator();
+        while (claimant_it.next()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
+            const index = entry.value_ptr.indexOfClient(claimant_client) orelse continue;
+            if (claimant_list != null) return null;
+            claimant_list = entry.value_ptr;
+            claimant_account = entry.key_ptr.*;
+            claimant_index = index;
         }
-        if (self.tokenGroupHasDropReservationLocked(claimant.token) or
-            self.tokenGroupHasDropReservationLocked(token)) return null;
-        if (!tokenIsSentinel(claimant.token)) {
-            const claimant_group = self.tokenEntryLocked(claimant.token) orelse return null;
-            if (claimant_group.rows.items.len != 1) return null;
+        if (claimant_list) |list| {
+            const claimant = list.items.items[claimant_index.?];
+            // Existing authority/retry state needs an explicit revoke/transfer
+            // transaction, never silent destruction as a bootstrap side effect.
+            if (claimant.drop_reservation != 0 or !claimant.attached or claimant.attachment_id == null or claimant.snapshot != null or
+                claimant.portable_resume or claimant.replica_dirty or claimant.replica_projection_dirty or
+                claimant.attachment_replica_dirty or claimant.attachment_replica_projection_dirty or
+                claimant.local_channel_projections != null or claimant.attachment_channel_projections != null)
+            {
+                return null;
+            }
+            if (self.tokenGroupHasDropReservationLocked(claimant.token)) return null;
+            if (!tokenIsSentinel(claimant.token)) {
+                const claimant_group = self.tokenEntryLocked(claimant.token) orelse return null;
+                if (claimant_group.rows.items.len != 1) return null;
+            }
         }
+        if (self.tokenGroupHasDropReservationLocked(token)) return null;
         // The maintained stable-id index makes exact reconnect independent of
         // global account/session cardinality. Folded account and token checks
         // still fail closed at the located row.
@@ -1616,17 +1764,73 @@ pub const SessionStore = struct {
         const target_index = target_list.indexOfClient(ghost_locator.client) orelse return null;
         if (!sessionMatchesAttachment(target_list.items.items[target_index], token, attachment_id) or
             target_list.items.items[target_index].drop_reservation != 0) return null;
-        if ((target_list == claimant_list and target_index == claimant_index) or
+        if ((claimant_list != null and target_list == claimant_list.? and target_index == claimant_index.?) or
             target_list.items.items[target_index].attached)
         {
             return null;
         }
 
+        const ghost = target_list.items.items[target_index];
+        const group_local_projections = if (ghost.local_channel_projections) |set| set.* else LocalChannelProjectionSet{};
+        const attachment_local_projections = if (ghost.attachment_channel_projections) |set| set.* else LocalChannelProjectionSet{};
+        var target_local_projections: LocalChannelProjectionSet = .{};
+        if (!mergeLocalProjectionSets(
+            &target_local_projections,
+            &group_local_projections,
+            &attachment_local_projections,
+        )) return null;
+
+        // Freeze the complete folded-account row image for the generic restore
+        // planner. Allocation happens before the ticket is published; failure
+        // releases the lock without consuming either bootstrap or ghost.
+        var locked_row_count: usize = 0;
+        var count_it = self.accounts.iterator();
+        while (count_it.next()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
+            locked_row_count = std.math.add(
+                usize,
+                locked_row_count,
+                entry.value_ptr.items.items.len,
+            ) catch return null;
+        }
+        const locked_account_rows = self.allocator.alloc(
+            TokenBindRowSnapshot,
+            locked_row_count,
+        ) catch return null;
+        var rows_transferred = false;
+        defer if (!rows_transferred) self.allocator.free(locked_account_rows);
+        var locked_row_index: usize = 0;
+        var rows_it = self.accounts.iterator();
+        while (rows_it.next()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
+            for (entry.value_ptr.items.items) |row| {
+                locked_account_rows[locked_row_index] = .{
+                    .client = row.client,
+                    .token = row.token,
+                    .attachment_id = row.attachment_id,
+                    .attached = row.attached,
+                    .portable_resume = row.portable_resume,
+                };
+                locked_row_index += 1;
+            }
+        }
+        std.debug.assert(locked_row_index == locked_account_rows.len);
+        const RowOrder = struct {
+            fn lessThan(_: void, a: TokenBindRowSnapshot, b: TokenBindRowSnapshot) bool {
+                return a.client < b.client;
+            }
+        };
+        std.mem.sort(TokenBindRowSnapshot, locked_account_rows, {}, RowOrder.lessThan);
+        for (locked_account_rows[1..], 1..) |row, row_index| {
+            if (locked_account_rows[row_index - 1].client == row.client) return null;
+        }
+
         keep_locked = true;
+        rows_transferred = true;
         return .{
             .store = self,
             .claimant_list = claimant_list,
-            .claimant_account = claimant_entry.key_ptr.*,
+            .claimant_account = claimant_account,
             .ghost_list = target_list,
             .ghost_account = ghost_locator.account,
             .claimant_index = claimant_index,
@@ -1635,6 +1839,9 @@ pub const SessionStore = struct {
             .ghost_client = target_list.items.items[target_index].client,
             .token = token,
             .attachment_id = attachment_id,
+            .locked_account_rows = locked_account_rows,
+            .target_local_projections = target_local_projections,
+            .result_portable = ghost.portable_resume,
         };
     }
 
@@ -4333,6 +4540,169 @@ test "prepared exact attachment rebind aborts cleanly then commits without alloc
         attachment_intent.generation,
         s.attachmentLocalChannelProjection(resume_token, stable, "#only-this-client").?.generation,
     );
+    try expectTokenIndexCoherent(&s);
+}
+
+test "stable bootstrap attachment retries collisions and never evicts at capacity" {
+    const ScriptedRandom = struct {
+        calls: usize = 0,
+
+        fn random(userdata: ?*anyopaque, out: []u8) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.calls += 1;
+            @memset(out, if (self.calls == 1) 0xa1 else 0xa2);
+        }
+    };
+
+    var vtable = std.testing.io.vtable.*;
+    vtable.random = ScriptedRandom.random;
+    var scripted = ScriptedRandom{};
+    const scripted_io = std.Io{ .userdata = &scripted, .vtable = &vtable };
+
+    var unique = SessionStore.init(testing.allocator);
+    defer unique.deinit();
+    _ = try unique.attachWithAttachment("seed", 1, tok(0x91), aid(0xa1), 1);
+    const bootstrap = try unique.mintBootstrapAttachmentNoEvict(
+        "alice",
+        2,
+        tok(0x92),
+        2,
+        scripted_io,
+    );
+    try testing.expectEqual(@as(usize, 2), scripted.calls);
+    try testing.expect(bootstrap.attachment_id.eql(aid(0xa2)));
+    try testing.expect(bootstrap.session.attachment_id.?.eql(aid(0xa2)));
+    try testing.expect(unique.clientHasAttachment("alice", 2, tok(0x92), aid(0xa2)));
+    try testing.expectError(
+        error.ClientAlreadyTracked,
+        unique.attachBootstrapWithAttachmentNoEvict("alice", 2, tok(0x93), aid(0xa3), 3),
+    );
+    try testing.expectError(
+        error.InvalidToken,
+        unique.attachBootstrapWithAttachmentNoEvict("alice", 3, @splat(0), aid(0xa3), 3),
+    );
+    try expectTokenIndexCoherent(&unique);
+
+    var capped = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 1 });
+    defer capped.deinit();
+    const preserved_token = tok(0xb1);
+    const preserved_id = aid(0xb1);
+    _ = try capped.attachWithAttachment("alice", 10, preserved_token, preserved_id, 10);
+    try testing.expect(capped.markDetachedWithSnapshot("alice", 10, "preserved"));
+    try testing.expectError(
+        error.TooManySessions,
+        capped.attachBootstrapWithAttachmentNoEvict("alice", 20, tok(0xb2), aid(0xb2), 20),
+    );
+    try testing.expect(capped.findDetachedAttachmentSessionInAccount(
+        "alice",
+        preserved_token,
+        preserved_id,
+    ) != null);
+    const preserved = (try capped.copyDetachedAttachmentSnapshotInAccount(
+        testing.allocator,
+        "alice",
+        preserved_token,
+        preserved_id,
+    )) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(preserved);
+    try testing.expectEqualStrings("preserved", preserved);
+    try testing.expect(!capped.containsAttachment(aid(0xb2)));
+    try testing.expect(!capped.containsToken(tok(0xb2)));
+    try expectTokenIndexCoherent(&capped);
+}
+
+test "exact attachment ticket previews frozen rows and journal then preserves sibling under OOM" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.initWithConfig(failing.allocator(), .{ .max_sessions_per_account = 4 });
+    defer s.deinit();
+
+    const token = tok(0xc1);
+    const exact_id = aid(0xc1);
+    const sibling_id = aid(0xc2);
+    const bootstrap_token = tok(0xc3);
+    const bootstrap_id = aid(0xc3);
+    _ = try s.attachWithAttachment("alice", 1, token, exact_id, 1);
+    _ = try s.attachWithAttachment("alice", 2, token, sibling_id, 2);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    _ = try s.armTokenLocalChannelProjection(token, "#resume", true, 7);
+    _ = try s.armAttachmentLocalChannelProjection(token, exact_id, "#exact", false, 0);
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "exact"));
+    _ = try s.attachBootstrapWithAttachmentNoEvict(
+        "alice",
+        3,
+        bootstrap_token,
+        bootstrap_id,
+        3,
+    );
+
+    var aborted = s.prepareExactAttachmentRebind("alice", 3, token, exact_id) orelse
+        return error.TestUnexpectedResult;
+    defer aborted.deinit();
+    try testing.expectEqual(@as(usize, 3), aborted.accountRows().len);
+    try testing.expect(aborted.resultPortable());
+    var preview_buf: [local_channel_projection_capacity]LocalChannelProjection = undefined;
+    const preview = aborted.mergedLocalChannelProjectionsInto(&preview_buf);
+    try testing.expectEqual(@as(usize, 2), preview.len);
+    try testing.expectEqualStrings("#exact", preview[0].channel());
+    try testing.expect(!preview[0].present);
+    try testing.expectEqualStrings("#resume", preview[1].channel());
+    aborted.abort();
+    try testing.expect(s.clientHasAttachment("alice", 1, token, exact_id));
+    try testing.expect(s.clientHasAttachment("alice", 2, token, sibling_id));
+    try testing.expect(s.clientHasAttachment("alice", 3, bootstrap_token, bootstrap_id));
+
+    var committed = s.prepareExactAttachmentRebind("alice", 3, token, exact_id) orelse
+        return error.TestUnexpectedResult;
+    defer committed.deinit();
+    failing.fail_index = failing.alloc_index;
+    try testing.expect(committed.commit());
+    committed.finish();
+    try testing.expect(!failing.has_induced_failure);
+
+    try testing.expect(s.clientHasAttachment("alice", 3, token, exact_id));
+    try testing.expect(s.clientHasAttachment("alice", 2, token, sibling_id));
+    try testing.expect(!s.containsClient("alice", 1));
+    try testing.expect(!s.containsAttachment(bootstrap_id));
+    try testing.expect(!s.containsToken(bootstrap_token));
+    try testing.expect(s.tokenLocalChannelProjection(token, "#resume") != null);
+    try expectTokenIndexCoherent(&s);
+}
+
+test "exact attachment rebind remaps an untracked claimant in place at account cap" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.initWithConfig(failing.allocator(), .{ .max_sessions_per_account = 2 });
+    defer s.deinit();
+
+    const token = tok(0xd1);
+    const exact_id = aid(0xd1);
+    const sibling_id = aid(0xd2);
+    _ = try s.attachWithAttachment("alice", 1, token, exact_id, 10);
+    _ = try s.attachWithAttachment("alice", 2, token, sibling_id, 20);
+    try testing.expect(s.markDetachedWithSnapshot("alice", 1, "at-cap"));
+
+    var prepared = s.prepareExactAttachmentRebind("alice", 3, token, exact_id) orelse
+        return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    try testing.expectEqual(@as(usize, 2), prepared.accountRows().len);
+    try testing.expectEqualStrings("at-cap", prepared.snapshot().?);
+    try testing.expectEqual(@as(ClientId, 1), prepared.remap().old_client);
+    try testing.expectEqual(@as(ClientId, 3), prepared.remap().new_client);
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expect(prepared.commit());
+    prepared.finish();
+    try testing.expect(!failing.has_induced_failure);
+
+    var rows: [2]Session = undefined;
+    const current = s.sessionsInto("alice", &rows);
+    try testing.expectEqual(@as(usize, 2), current.len);
+    try testing.expect(!s.containsClient("alice", 1));
+    try testing.expect(s.clientHasAttachment("alice", 3, token, exact_id));
+    try testing.expect(s.clientHasAttachment("alice", 2, token, sibling_id));
+    const rebound = s.findAttachmentSessionInAccount("alice", token, exact_id) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 10), rebound.signon_ms);
+    try testing.expect(rebound.attached);
     try expectTokenIndexCoherent(&s);
 }
 
