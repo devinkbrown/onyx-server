@@ -21771,7 +21771,7 @@ pub const LinuxServer = struct {
                 if (have == null or !std.mem.eql(u8, have.?, want)) continue;
             }
             if (!historyMessageVisibleTo(&conn.session, message)) continue;
-            try writeHistoryReplayLine(&writer, &conn.session, target, message);
+            try writeHistoryReplayLine(&writer, &conn.session, if (use_batch) ref else null, target, message);
         }
         if (use_batch) try writer.print("BATCH -{s}\r\n", .{ref});
         return writer.buffered();
@@ -21875,10 +21875,20 @@ pub const LinuxServer = struct {
         return if (now > ttl_ms) now - ttl_ms else 0;
     }
 
-    fn writeHistoryReplayLine(writer: anytype, session: *const dispatch.ClientSession, target: []const u8, message: lotus.Message) !void {
+    fn writeHistoryReplayLine(
+        writer: anytype,
+        session: *const dispatch.ClientSession,
+        batch_ref: ?[]const u8,
+        target: []const u8,
+        message: lotus.Message,
+    ) !void {
         var timestamp_buf: [24]u8 = undefined;
         const timestamp = try chathistory_cmd.formatTimestamp(message.timestamp, &timestamp_buf);
-        try writer.print("@time={s};msgid={s}", .{ timestamp, message.msgid });
+        if (batch_ref) |ref| {
+            try writer.print("@batch={s};time={s};msgid={s}", .{ ref, timestamp, message.msgid });
+        } else {
+            try writer.print("@time={s};msgid={s}", .{ timestamp, message.msgid });
+        }
         if (historyEntryIsTagmsg(message.command)) {
             const raw = message.client_tags orelse return;
             var tag_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
@@ -22027,10 +22037,17 @@ pub const LinuxServer = struct {
         for (targets) |target| {
             var line_buf: [192]u8 = undefined;
             const detail = chathistory_targets.formatTargetLine(&line_buf, target) catch continue;
-            try writer.print(":{s} CHATHISTORY TARGETS {s}\r\n", .{ self.serverName(), detail });
+            if (use_batch) {
+                try writer.print("@batch=1 :{s} CHATHISTORY TARGETS {s}\r\n", .{ self.serverName(), detail });
+            } else {
+                try writer.print(":{s} CHATHISTORY TARGETS {s}\r\n", .{ self.serverName(), detail });
+            }
         }
         if (use_batch) try writer.print("BATCH -1\r\n", .{});
-        try appendToConn(conn, writer.buffered());
+        appendHistoryReplay(conn, writer.buffered()) catch {
+            self.poisonOwnedDelivery(conn);
+            return;
+        };
     }
 
     pub fn handleChathistory(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView, line: []const u8) !void {
@@ -50095,6 +50112,68 @@ fn setCloexec(fd: linux.fd_t, enabled: bool) bool {
     return linux.errno(linux.fcntl(fd, posix.F.SETFD, flags)) == .SUCCESS;
 }
 
+fn validCapturedBatchRef(ref: []const u8) bool {
+    if (ref.len == 0 or ref.len > labeled_response.MAX_BATCH_REF_LEN) return false;
+    for (ref) |ch| switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn isApplicableHistoryBatchType(batch_type: []const u8) bool {
+    return std.mem.eql(u8, batch_type, "chathistory") or
+        std.mem.eql(u8, batch_type, chathistory_cmd.targets_batch_type);
+}
+
+/// A labeled CHATHISTORY response already has its protocol-defined batch. Keep
+/// that one batch, validate all membership before emitting anything to the
+/// connection, and put the command label on its opening BATCH line.
+fn emitLabeledApplicableHistoryBatch(
+    sink: *FrameBufSink,
+    label: []const u8,
+    captured: []const u8,
+) error{OutputTooSmall}!bool {
+    var it = CrlfReplyIterator{ .bytes = captured };
+    const opening = it.next() orelse return false;
+    if (opening.len < 2 or !std.mem.endsWith(u8, opening, "\r\n")) return error.OutputTooSmall;
+    const parsed_open = irc_line.parseLine(opening) catch return error.OutputTooSmall;
+    if (!std.ascii.eqlIgnoreCase(parsed_open.command, "BATCH")) return false;
+
+    // A captured non-history batch still follows the generic labeled-response
+    // contract. A malformed BATCH opening fails closed rather than being nested.
+    if (parsed_open.param_count < 2 or parsed_open.params[0].len < 2 or
+        parsed_open.params[0][0] != '+' or !validCapturedBatchRef(parsed_open.params[0][1..]))
+    {
+        return error.OutputTooSmall;
+    }
+    if (!isApplicableHistoryBatchType(parsed_open.params[1])) return false;
+    const ref = parsed_open.params[0][1..];
+
+    var labeled_open_buf: [labeled_response.MAX_WIRE_LINE]u8 = undefined;
+    const labeled_open = labeled_response.tagLine(label, opening, &labeled_open_buf) catch
+        return error.OutputTooSmall;
+    try sink.appendLine(labeled_open);
+
+    while (it.next()) |line| {
+        if (line.len < 2 or !std.mem.endsWith(u8, line, "\r\n")) return error.OutputTooSmall;
+        const parsed = irc_line.parseLine(line) catch return error.OutputTooSmall;
+        if (std.ascii.eqlIgnoreCase(parsed.command, "BATCH")) {
+            if (parsed.tags_raw != null or parsed.param_count != 1 or parsed.params[0].len != ref.len + 1 or
+                parsed.params[0][0] != '-' or !std.mem.eql(u8, parsed.params[0][1..], ref) or it.next() != null)
+            {
+                return error.OutputTooSmall;
+            }
+            try sink.appendLine(line);
+            return true;
+        }
+        const member_ref = batchTagValue(&parsed) orelse return error.OutputTooSmall;
+        if (!std.mem.eql(u8, member_ref, ref)) return error.OutputTooSmall;
+        try sink.appendLine(line);
+    }
+    return error.OutputTooSmall;
+}
+
 /// Reframe a captured labeled command's plaintext replies under `label` and
 /// emit them on the wire (through the normal WS/TLS seam). Bulk commands receive
 /// a bounded larger capture in dispatchRegistered; any remaining capture
@@ -50112,8 +50191,11 @@ fn emitLabeledIssuer(
     const frame_buf = allocator.alloc(u8, @max(capacity, default_reply_bytes)) catch return error.OutputTooSmall;
     defer allocator.free(frame_buf);
     var sink = FrameBufSink{ .buf = frame_buf };
-    var it = CrlfReplyIterator{ .bytes = capture.captured() };
-    labeled_response.emitIterator(&sink, label, labeled_batch_ref, &it) catch return error.OutputTooSmall;
+    const emitted_existing_batch = try emitLabeledApplicableHistoryBatch(&sink, label, capture.captured());
+    if (!emitted_existing_batch) {
+        var it = CrlfReplyIterator{ .bytes = capture.captured() };
+        labeled_response.emitIterator(&sink, label, labeled_batch_ref, &it) catch return error.OutputTooSmall;
+    }
     return LinuxServer.appendHistoryReplay(conn, sink.written());
 }
 
@@ -58891,11 +58973,92 @@ test "emitLabeledIssuer: multi-line response is a labeled BATCH" {
     cap.append(":onyx 311 me nick u h * :n\r\n");
     cap.append(":onyx 318 me nick :End\r\n");
     try emitLabeledIssuer(&conn, "w1", &cap, std.testing.allocator);
-    const out = conn.send_buf[0..conn.send_len];
-    try expectContains(out, "@label=w1 BATCH +suzu-label labeled-response\r\n");
-    try expectContains(out, "@batch=suzu-label :onyx 311 me nick u h * :n\r\n");
-    try expectContains(out, "@batch=suzu-label :onyx 318 me nick :End\r\n");
-    try expectContains(out, "BATCH -suzu-label\r\n");
+    try std.testing.expectEqualStrings(
+        "@label=w1 BATCH +suzu-label labeled-response\r\n" ++
+            "@batch=suzu-label :onyx 311 me nick u h * :n\r\n" ++
+            "@batch=suzu-label :onyx 318 me nick :End\r\n" ++
+            "BATCH -suzu-label\r\n",
+        conn.send_buf[0..conn.send_len],
+    );
+}
+
+test "emitLabeledIssuer: labels an existing CHATHISTORY batch without nesting" {
+    var conn = ConnState.init(-1);
+    var cb: [512]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    const captured =
+        "BATCH +history chathistory #secure\r\n" ++
+        "@batch=history;time=2026-08-14T10:11:12.013Z;msgid=m1;+onyx/e2ee=mls :alice PRIVMSG #secure :ONYXROOM1.payload\r\n" ++
+        "BATCH -history\r\n";
+    cap.append(captured);
+    try emitLabeledIssuer(&conn, "hist-1", &cap, std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@label=hist-1 BATCH +history chathistory #secure\r\n" ++
+            "@batch=history;time=2026-08-14T10:11:12.013Z;msgid=m1;+onyx/e2ee=mls :alice PRIVMSG #secure :ONYXROOM1.payload\r\n" ++
+            "BATCH -history\r\n",
+        conn.send_buf[0..conn.send_len],
+    );
+}
+
+test "emitLabeledIssuer: labels an existing CHATHISTORY TARGETS batch without nesting" {
+    var conn = ConnState.init(-1);
+    var cb: [384]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(
+        "BATCH +targets draft/chathistory-targets\r\n" ++
+            "@batch=targets :onyx CHATHISTORY TARGETS #secure timestamp=2026-08-14T10:11:12.013Z\r\n" ++
+            "BATCH -targets\r\n",
+    );
+    try emitLabeledIssuer(&conn, "targets-1", &cap, std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@label=targets-1 BATCH +targets draft/chathistory-targets\r\n" ++
+            "@batch=targets :onyx CHATHISTORY TARGETS #secure timestamp=2026-08-14T10:11:12.013Z\r\n" ++
+            "BATCH -targets\r\n",
+        conn.send_buf[0..conn.send_len],
+    );
+}
+
+test "emitLabeledIssuer: rejects malformed CHATHISTORY batch atomically" {
+    var conn = ConnState.init(-1);
+    var cb: [512]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(
+        "BATCH +history chathistory #secure\r\n" ++
+            "@batch=wrong;time=2026-08-14T10:11:12.013Z;msgid=m1 :alice PRIVMSG #secure :hello\r\n" ++
+            "BATCH -history\r\n",
+    );
+    try std.testing.expectError(error.OutputTooSmall, emitLabeledIssuer(&conn, "hist-1", &cap, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
+}
+
+test "emitLabeledIssuer: rejects unsafe CHATHISTORY batch references atomically" {
+    var conn = ConnState.init(-1);
+    var cb: [512]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(
+        "BATCH +bad;ref chathistory #secure\r\n" ++
+            "@batch=bad;ref;time=2026-08-14T10:11:12.013Z;msgid=m1 :alice PRIVMSG #secure :hello\r\n" ++
+            "BATCH -bad;ref\r\n",
+    );
+    try std.testing.expectError(error.OutputTooSmall, emitLabeledIssuer(&conn, "hist-1", &cap, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
+}
+
+test "emitLabeledIssuer: rejects an applicable batch when SendQ cannot fit it" {
+    var conn = ConnState.init(-1);
+    conn.sendq_cap = 8;
+    var cb: [256]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(
+        "BATCH +history chathistory #secure\r\n" ++
+            "@batch=history;time=2026-08-14T10:11:12.013Z;msgid=m1 :alice PRIVMSG #secure :hello\r\n" ++
+            "BATCH -history\r\n",
+    );
+    try std.testing.expectError(error.OutputTooSmall, emitLabeledIssuer(&conn, "hist-1", &cap, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
 }
 
 test "emitLabeledIssuer: a command that replies nothing yields a bare ACK" {
@@ -67125,9 +67288,12 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     const recorded = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
     try std.testing.expectEqual(@as(usize, 1), recorded.len);
     try std.testing.expectEqualStrings(max_envelope, recorded[0].text);
+    alice.session.addCap(.batch);
     var replay_buf: [default_reply_bytes * 4]u8 = undefined;
     const replay = try server.renderHistoryReplay(alice, &replay_buf, "e2ee-max", "#e2eebody", recorded, null);
     try expectContains(replay, max_envelope);
+    try expectContains(replay, "@batch=e2ee-max;time=");
+    try expectContains(replay, ";+onyx/e2ee=mls :");
 
     // Aggregate replay must not retain the old 32 KiB all-or-nothing ceiling:
     // every selected row is individually legal, and CHATHISTORY, rewind, and
@@ -67149,6 +67315,8 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     defer server.allocator.free(large_replay);
     try std.testing.expect(large_replay.len > default_reply_bytes * 4);
     try expectContains(large_replay, max_envelope);
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, large_replay, "@batch=e2ee-many;time="));
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, large_replay, ";+onyx/e2ee=mls :"));
     const replay_lines = std.mem.count(u8, large_replay, "\n");
     try std.testing.expectEqual(
         large_replay.len + replay_lines * 256,
@@ -67179,8 +67347,10 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     try emitLabeledIssuer(alice, "e2ee-label", &label_capture, std.testing.allocator);
     const labeled_wire = try copyTestSendQ(std.testing.allocator, alice);
     defer std.testing.allocator.free(labeled_wire);
-    try expectContains(labeled_wire, "@label=e2ee-label BATCH +suzu-label labeled-response\r\n");
-    try expectContains(labeled_wire, "BATCH -suzu-label\r\n");
+    try expectContains(labeled_wire, "@label=e2ee-label BATCH +e2ee-many chathistory #e2ee-replay-max\r\n");
+    try expectContains(labeled_wire, "BATCH -e2ee-many\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, labeled_wire, "labeled-response") == null);
+    try std.testing.expect(std.mem.indexOf(u8, labeled_wire, "suzu-label") == null);
     try expectContains(labeled_wire, max_envelope);
 
     const mesh_before = (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len;
@@ -87471,6 +87641,7 @@ test "threaded server: CHATHISTORY records + replays channel messages" {
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-one", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-two", 200);
     try recvUntil(&a, "BATCH -1", 200);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, a.written(), "@batch=1;time="));
 }
 
 test "threaded server: SEARCH returns matching channel messages in a chathistory BATCH" {
@@ -88227,6 +88398,8 @@ test "threaded server: CHATHISTORY TARGETS lists active channels and DMs" {
     try recvUntil(&a, "CHATHISTORY TARGETS b timestamp=", 200);
     try recvUntil(&a, "CHATHISTORY TARGETS #t2 timestamp=", 200);
     const written = a.written();
+    try expectContains(written, "@batch=1 :");
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, written, "@batch=1 :"));
     const i_t1 = std.mem.indexOf(u8, written, "CHATHISTORY TARGETS #t1 timestamp=").?;
     const i_dm = std.mem.indexOf(u8, written, "CHATHISTORY TARGETS b timestamp=").?;
     const i_t2 = std.mem.indexOf(u8, written, "CHATHISTORY TARGETS #t2 timestamp=").?;
