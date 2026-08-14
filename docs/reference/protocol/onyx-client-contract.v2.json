@@ -48,10 +48,10 @@
     },
     "group_message_crypto": {
       "envelope_helpers": "implemented",
-      "store_seal": "activation_hold",
-      "store_open": "activation_hold",
-      "outbound": "required rooms reject plaintext; no production path seals and tags ONYXROOM1",
-      "inbound": "ONYXROOM1 remains ciphertext in the store and renders as a locked placeholder"
+      "store_seal": "production_wired_required_rooms",
+      "store_open": "production_wired_ephemeral_session",
+      "outbound": "required rooms seal through the private connection-owned runtime, tag onyx/e2ee=mls, and fail closed without a live session; plaintext is not queued or scheduled at rest",
+      "inbound": "ONYXROOM1 remains ciphertext in store text; a matching live session may attach transient plaintext after exact async ownership revalidation, otherwise it renders locked"
     }
   },
   "eligibility": {

@@ -366,7 +366,14 @@ const mooring_hs = @import("../crypto/mooring_handshake.zig");
 const trace = @import("../proto/trace.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
-const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .max_text = 512 });
+// History must retain every room ciphertext that the delivery and signed-mesh
+// paths admit.  Keep this sourced from the protocol ceiling so a future wire
+// limit change cannot silently re-introduce delivery-without-replay loss.
+const HistoryStore = lotus.Lotus(.{
+    .max_targets = 512,
+    .max_per_target = 256,
+    .max_text = e2ee_policy.max_room_envelope_wire_len,
+});
 const relay_v2_deferred_capacity: usize = 256;
 const relay_v2_initial_retry_ms: u64 = 1000;
 const relay_v2_retry_frame_budget: usize = 32;
@@ -21757,6 +21764,36 @@ pub const LinuxServer = struct {
         return writer.buffered();
     }
 
+    /// Render a complete bounded replay without imposing the old fixed 32 KiB
+    /// aggregate ceiling.  One admitted history row can contain a 4096-byte
+    /// room envelope plus replay-visible client tags and prefixes, so several
+    /// valid rows legitimately exceed that legacy scratch buffer.  Query row
+    /// counts are already bounded (64 for CHATHISTORY/rewind, 50 for SEARCH);
+    /// reserve two ordinary reply frames per row to cover the largest legal
+    /// line, plus batch framing.  The caller owns and must free the allocation.
+    fn renderHistoryReplayOwned(
+        self: *LinuxServer,
+        conn: *ConnState,
+        ref: []const u8,
+        target: []const u8,
+        messages: []const lotus.Message,
+        topic_filter: ?[]const u8,
+    ) ![]u8 {
+        const max_replay_rows: usize = 64;
+        if (messages.len > max_replay_rows) return error.OutputTooSmall;
+        const capacity = std.math.add(
+            usize,
+            default_reply_bytes,
+            try std.math.mul(usize, messages.len, default_reply_bytes * 2),
+        ) catch return error.OutputTooSmall;
+        const scratch = try self.allocator.alloc(u8, capacity);
+        errdefer self.allocator.free(scratch);
+        const rendered = try self.renderHistoryReplay(conn, scratch, ref, target, messages, topic_filter);
+        const owned = try self.allocator.dupe(u8, rendered);
+        self.allocator.free(scratch);
+        return owned;
+    }
+
     /// The EPHEMERAL TTL for a channel in milliseconds (0 = not ephemeral).
     /// Read straight from the IRCX EPHEMERAL prop (a plain, mesh-propagated
     /// channel property), parsed as a whole-second TTL.
@@ -21851,11 +21888,11 @@ pub const LinuxServer = struct {
         const found = self.history.after(channel, marker_ms, buf.len, buf[0..]) catch return;
         if (found.len == 0) return;
         if (!historyReplayHasVisible(conn, found)) return;
-        var out_buf: [default_reply_bytes * 4]u8 = undefined;
-        const replay = self.renderHistoryReplay(conn, &out_buf, "rewind", channel, found, null) catch {
+        const replay = self.renderHistoryReplayOwned(conn, "rewind", channel, found, null) catch {
             self.failReply(conn, "CHATHISTORY", "REPLAY_TOO_LARGE", "Bouncer rewind is too large; request fewer messages") catch {};
             return;
         };
+        defer self.allocator.free(replay);
         try appendToConn(conn, replay);
     }
 
@@ -22049,11 +22086,11 @@ pub const LinuxServer = struct {
             },
         }
 
-        var out_buf: [default_reply_bytes * 4]u8 = undefined;
-        const replay = self.renderHistoryReplay(conn, &out_buf, "1", target, found, topic_filter) catch {
+        const replay = self.renderHistoryReplayOwned(conn, "1", target, found, topic_filter) catch {
             try self.failReply(conn, "CHATHISTORY", "REPLAY_TOO_LARGE", "History replay is too large; request fewer messages");
             return;
         };
+        defer self.allocator.free(replay);
         try appendToConn(conn, replay);
     }
 
@@ -22189,11 +22226,11 @@ pub const LinuxServer = struct {
             ordered[k] = found_buf[found_len - 1 - k];
         }
 
-        var out_buf: [default_reply_bytes * 4]u8 = undefined;
-        const replay = self.renderHistoryReplay(conn, &out_buf, "search", target, ordered[0..found_len], null) catch {
+        const replay = self.renderHistoryReplayOwned(conn, "search", target, ordered[0..found_len], null) catch {
             try self.failReply(conn, "SEARCH", "RESULTS_TOO_LARGE", "Too many results; narrow the query");
             return;
         };
+        defer self.allocator.free(replay);
         try appendToConn(conn, replay);
     }
 
@@ -66996,12 +67033,34 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     try expectContains(bob.send_buf[0..bob.send_len], max_envelope);
     var hbuf: [8]lotus.Message = undefined;
     const recorded = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
-    // Live local delivery is bounded by the signed mesh body limit. The
-    // pre-existing Lotus CHATHISTORY store intentionally retains only 512-byte
-    // bodies, so its best-effort append drops this deliverable 4096-byte body.
-    try std.testing.expectEqual(@as(usize, 0), recorded.len);
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+    try std.testing.expectEqualStrings(max_envelope, recorded[0].text);
+    var replay_buf: [default_reply_bytes * 4]u8 = undefined;
+    const replay = try server.renderHistoryReplay(alice, &replay_buf, "e2ee-max", "#e2eebody", recorded, null);
+    try expectContains(replay, max_envelope);
 
-    const mesh_before = server.history.totalStoredCount();
+    // Aggregate replay must not retain the old 32 KiB all-or-nothing ceiling:
+    // every selected row is individually legal, and CHATHISTORY, rewind, and
+    // SEARCH all share this owned renderer.
+    for (0..8) |index| {
+        var replay_id_buf: [32]u8 = undefined;
+        const replay_id = try std.fmt.bufPrint(&replay_id_buf, "max-{d}", .{index});
+        _ = try server.history.append("#e2ee-replay-max", .{
+            .msgid = replay_id,
+            .sender = "alice!u@host",
+            .text = max_envelope,
+            .timestamp = 100 + index,
+            .client_tags = "+onyx/e2ee=mls",
+        });
+    }
+    var max_replay_rows: [8]lotus.Message = undefined;
+    const max_rows = try server.history.latest("#e2ee-replay-max", max_replay_rows.len, &max_replay_rows);
+    const large_replay = try server.renderHistoryReplayOwned(alice, "e2ee-many", "#e2ee-replay-max", max_rows, null);
+    defer server.allocator.free(large_replay);
+    try std.testing.expect(large_replay.len > default_reply_bytes * 4);
+    try expectContains(large_replay, max_envelope);
+
+    const mesh_before = (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len;
     resetTestSendQ(alice);
     resetTestSendQ(bob);
     server.deliverRelay(.{
@@ -67017,7 +67076,7 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     });
     try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "mesh tagged plaintext") == null);
     try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "mesh tagged plaintext") == null);
-    try std.testing.expectEqual(mesh_before, server.history.totalStoredCount());
+    try std.testing.expectEqual(mesh_before, (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len);
 
     resetTestSendQ(alice);
     resetTestSendQ(bob);
@@ -67033,7 +67092,7 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
         .hlc = 12,
     });
     try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], envelope) == null);
-    try std.testing.expectEqual(mesh_before, server.history.totalStoredCount());
+    try std.testing.expectEqual(mesh_before, (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len);
 
     resetTestSendQ(alice);
     resetTestSendQ(bob);
@@ -67050,7 +67109,7 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     });
     try std.testing.expectEqual(@as(usize, 0), alice.send_len);
     try std.testing.expectEqual(@as(usize, 0), bob.send_len);
-    try std.testing.expectEqual(mesh_before, server.history.totalStoredCount());
+    try std.testing.expectEqual(mesh_before, (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len);
 
     server.deliverRelay(.{
         .verb = .privmsg,
@@ -67065,7 +67124,7 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     });
     try std.testing.expectEqual(@as(usize, 0), alice.send_len);
     try std.testing.expectEqual(@as(usize, 0), bob.send_len);
-    try std.testing.expectEqual(mesh_before, server.history.totalStoredCount());
+    try std.testing.expectEqual(mesh_before, (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len);
 
     resetTestSendQ(alice);
     resetTestSendQ(bob);
@@ -67083,7 +67142,8 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     try expectContains(alice.send_buf[0..alice.send_len], max_envelope);
     try expectContains(bob.send_buf[0..bob.send_len], max_envelope);
     const after_mesh = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
-    try std.testing.expectEqual(@as(usize, 0), after_mesh.len);
+    try std.testing.expectEqual(mesh_before + 1, after_mesh.len);
+    try std.testing.expectEqualStrings(max_envelope, after_mesh[0].text);
 
     _ = try server.world.setChannelExtFlag("#e2eebody", .noformat, true);
     resetTestSendQ(alice);
@@ -67092,7 +67152,8 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
     try expectContains(bob.send_buf[0..bob.send_len], max_envelope);
     const after_noformat = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
-    try std.testing.expectEqual(@as(usize, 0), after_noformat.len);
+    try std.testing.expectEqual(mesh_before + 2, after_noformat.len);
+    try std.testing.expectEqualStrings(max_envelope, after_noformat[0].text);
 
     resetTestSendQ(alice);
     resetTestSendQ(bob);

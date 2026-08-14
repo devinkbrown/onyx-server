@@ -94,6 +94,9 @@ pub const Error = std.mem.Allocator.Error || error{
     SenderTooLong,
     CommandTooLong,
     ClientTagsTooLong,
+    /// Retaining this mutation would make the canonical checkpoint exceed the
+    /// concrete store's configured byte limit. The store is unchanged.
+    CheckpointCapacityExceeded,
     TextTooLong,
     OutputTooSmall,
     NotFound,
@@ -175,10 +178,25 @@ pub fn Lotus(comptime params: Params) type {
             fn entryMut(self: *TargetLog, logical_index: usize) *StoredMessage {
                 return &self.entries[self.slot(logical_index)];
             }
+
+            fn removeAt(self: *TargetLog, allocator: std.mem.Allocator, logical_index: usize) void {
+                std.debug.assert(logical_index < self.len);
+                self.entryMut(logical_index).deinit(allocator);
+                var index = logical_index;
+                while (index + 1 < self.len) : (index += 1) {
+                    self.entries[self.slot(index)] = self.entries[self.slot(index + 1)];
+                }
+                self.len -= 1;
+            }
         };
 
         const QueryBound = union(enum) {
             before: u64,
+        };
+
+        const EvictionCandidate = struct {
+            target: []const u8,
+            index: usize,
         };
 
         pub const DeterministicEntry = struct {
@@ -215,11 +233,16 @@ pub fn Lotus(comptime params: Params) type {
 
         allocator: std.mem.Allocator,
         targets: std.StringHashMap(TargetLog),
+        /// Canonical checkpoint body bytes for the currently retained state.
+        /// Kept incrementally so normal ingestion does not need to rescan every
+        /// ring merely to enforce the aggregate durable-state budget.
+        checkpoint_body_len: usize,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
                 .targets = std.StringHashMap(TargetLog).init(allocator),
+                .checkpoint_body_len = 0,
             };
         }
 
@@ -282,16 +305,40 @@ pub fn Lotus(comptime params: Params) type {
         }
 
         fn appendState(self: *Self, target: []const u8, msg: InputMessage, tombstone: bool) Error!AppendResult {
+            if (self.targets.get(target) == null and self.targets.count() >= params.max_targets)
+                return error.TargetLimitExceeded;
+            const new_entry_len = try checkpointEntryBodyLen(msg);
+            const minimum_body_len = try checkpointBodyLenAdd(checkpoint_target_prefix_len + target.len, new_entry_len);
+            if (!checkpointBodyFits(minimum_body_len, params.max_checkpoint_bytes))
+                return error.CheckpointCapacityExceeded;
             var stored = try StoredMessage.init(self.allocator, msg);
             errdefer stored.deinit(self.allocator);
             stored.tombstone = tombstone;
 
-            if (self.targets.getPtr(target)) |log| {
-                const evicted = log.appendTake(self.allocator, stored);
+            if (self.targets.get(target) != null) {
+                var evicted = false;
+                {
+                    const log = self.targets.getPtr(target).?;
+                    if (log.len == params.max_per_target) {
+                        self.checkpoint_body_len -= checkpointStoredEntryBodyLen(log.entry(0));
+                        log.removeAt(self.allocator, 0);
+                        evicted = true;
+                    }
+                }
+                while (!self.appendFitsCheckpoint(target, new_entry_len)) {
+                    // Aggregate pressure is store-wide: retain the newest
+                    // history fairly across targets by evicting the same
+                    // deterministic global oldest candidate used for a newly
+                    // inserted target. Per-target ring eviction above remains
+                    // bounded by the configured 256-entry ring.
+                    self.evictGlobalOldest(target);
+                    evicted = true;
+                }
+                const log = self.targets.getPtr(target).?;
+                _ = log.appendTake(self.allocator, stored);
+                self.checkpoint_body_len += new_entry_len;
                 return .{ .evicted = evicted, .target_len = log.len };
             }
-
-            if (self.targets.count() >= params.max_targets) return error.TargetLimitExceeded;
 
             const owned_target = try self.allocator.dupe(u8, target);
             errdefer self.allocator.free(owned_target);
@@ -299,9 +346,18 @@ pub fn Lotus(comptime params: Params) type {
             var log = try TargetLog.init(self.allocator);
             errdefer log.deinit(self.allocator);
 
-            try self.targets.put(owned_target, log);
+            // No allocation may follow global eviction: a failed insert must
+            // never turn a valid append into history loss.
+            try self.targets.ensureTotalCapacity(self.targets.count() + 1);
+            var evicted = false;
+            while (!self.appendFitsCheckpoint(target, new_entry_len)) {
+                self.evictGlobalOldest(target);
+                evicted = true;
+            }
+            self.targets.putAssumeCapacity(owned_target, log);
             const inserted = self.targets.getPtr(owned_target).?;
-            const evicted = inserted.appendTake(self.allocator, stored);
+            _ = inserted.appendTake(self.allocator, stored);
+            self.checkpoint_body_len += checkpoint_target_prefix_len + target.len + new_entry_len;
             return .{ .evicted = evicted, .target_len = inserted.len };
         }
 
@@ -347,10 +403,12 @@ pub fn Lotus(comptime params: Params) type {
         pub fn edit(self: *Self, target: []const u8, msgid: []const u8, new_text: []const u8) Error!void {
             try validateText(new_text);
             const entry = try self.findNewest(target, msgid);
+            const new_body_len = try self.bodyLenAfterEdit(entry, new_text.len);
             const owned_text = try self.allocator.dupe(u8, new_text);
             self.allocator.free(entry.text);
             entry.text = owned_text;
             entry.hash = hashText(new_text);
+            self.checkpoint_body_len = new_body_len;
         }
 
         /// Resolve a message's server timestamp by its msgid within `target`, or
@@ -434,6 +492,10 @@ pub fn Lotus(comptime params: Params) type {
                     body_len = try checkpointLenAdd(body_len, if (message.client_tags) |tags| tags.len else 0, params.max_checkpoint_bytes);
                 }
             }
+            // Append and edit admission maintain this exact value. Keeping the
+            // check here makes corruption fail closed as well, without changing
+            // the v1 wire format.
+            if (body_len != self.checkpoint_body_len) return error.InvalidField;
             const prefix_len = try checkpointLenAdd(checkpoint_header_len, body_len, params.max_checkpoint_bytes);
             const total_len = try checkpointLenAdd(prefix_len, checkpoint_checksum_len, params.max_checkpoint_bytes);
             const out = try allocator.alloc(u8, total_len);
@@ -497,17 +559,21 @@ pub fn Lotus(comptime params: Params) type {
             return out;
         }
 
-        /// Decode without publishing any state. The encoded resource authority
-        /// must match this concrete Lotus instantiation exactly.
+        /// Decode without publishing any state. Resource authority must match
+        /// this concrete Lotus instantiation exactly, except that an older
+        /// positive text ceiling may be restored into a larger current store.
+        /// This preserves v1 checkpoint framing while allowing a history text
+        /// capacity increase without stranding existing checkpoints.
         pub fn decodeCheckpoint(allocator: std.mem.Allocator, bytes: []const u8) CheckpointError!Self {
             if (bytes.len > params.max_checkpoint_bytes) return error.CheckpointTooLarge;
             if (bytes.len < checkpoint_header_len + checkpoint_checksum_len) return error.Truncated;
             if (!std.mem.eql(u8, bytes[0..checkpoint_magic.len], &checkpoint_magic)) return error.BadMagic;
             if (bytes[4] != checkpoint_version) return error.UnsupportedVersion;
             if (bytes[5] != 0 or readU16(bytes[6..8]) != 0) return error.InvalidField;
+            const encoded_max_text: usize = readU32(bytes[16..20]);
             if (readU32(bytes[8..12]) != params.max_targets or
                 readU32(bytes[12..16]) != params.max_per_target or
-                readU32(bytes[16..20]) != params.max_text or
+                encoded_max_text == 0 or encoded_max_text > params.max_text or
                 readU32(bytes[20..24]) != params.max_target or
                 readU32(bytes[24..28]) != params.max_msgid or
                 readU32(bytes[28..32]) != params.max_sender or
@@ -558,7 +624,7 @@ pub fn Lotus(comptime params: Params) type {
                     const command_len: usize = try reader.takeU32();
                     const tags_len: usize = try reader.takeU32();
                     if (msgid_len > params.max_msgid or sender_len > params.max_sender or
-                        text_len > params.max_text or command_len > params.max_command or
+                        text_len > encoded_max_text or text_len > params.max_text or command_len > params.max_command or
                         tags_len > params.max_client_tags)
                         return error.CapacityExceeded;
                     const has_tags = flags & checkpoint_flag_has_tags != 0;
@@ -681,6 +747,63 @@ pub fn Lotus(comptime params: Params) type {
             if (msg.client_tags) |tags| {
                 if (tags.len > params.max_client_tags) return error.ClientTagsTooLong;
             }
+        }
+
+        fn appendFitsCheckpoint(self: *const Self, target: []const u8, new_entry_len: usize) bool {
+            var body_len = self.checkpoint_body_len;
+            if (self.targets.get(target) == null) {
+                body_len = std.math.add(usize, body_len, checkpoint_target_prefix_len) catch return false;
+                body_len = std.math.add(usize, body_len, target.len) catch return false;
+            }
+            body_len = std.math.add(usize, body_len, new_entry_len) catch return false;
+            return checkpointBodyFits(body_len, params.max_checkpoint_bytes);
+        }
+
+        fn evictGlobalOldest(self: *Self, incoming_target: []const u8) void {
+            const candidate = self.globalOldest() orelse unreachable;
+            const log = self.targets.getPtr(candidate.target).?;
+            self.checkpoint_body_len -= checkpointStoredEntryBodyLen(log.entry(candidate.index));
+            log.removeAt(self.allocator, candidate.index);
+            if (log.len != 0 or std.mem.eql(u8, candidate.target, incoming_target)) return;
+
+            var removed = self.targets.fetchRemove(candidate.target).?;
+            self.checkpoint_body_len -= checkpoint_target_prefix_len + removed.key.len;
+            self.allocator.free(removed.key);
+            removed.value.deinit(self.allocator);
+        }
+
+        fn globalOldest(self: *const Self) ?EvictionCandidate {
+            var oldest: ?EvictionCandidate = null;
+            var targets = self.targets.iterator();
+            while (targets.next()) |target_entry| {
+                const target = target_entry.key_ptr.*;
+                const log = target_entry.value_ptr;
+                var index: usize = 0;
+                while (index < log.len) : (index += 1) {
+                    if (oldest) |current| {
+                        const current_entry = self.targets.get(current.target).?.entry(current.index);
+                        const entry = log.entry(index);
+                        if (!isOlder(target, index, entry, current.target, current.index, current_entry)) continue;
+                    }
+                    oldest = .{ .target = target, .index = index };
+                }
+            }
+            return oldest;
+        }
+
+        fn bodyLenAfterEdit(self: *const Self, entry: *const StoredMessage, new_text_len: usize) Error!usize {
+            const old_entry_len = checkpointStoredEntryBodyLen(entry);
+            const without_old = std.math.sub(usize, self.checkpoint_body_len, old_entry_len) catch return error.CheckpointCapacityExceeded;
+            const new_entry_len = try checkpointEntryBodyLenFromLengths(
+                entry.msgid.len,
+                entry.sender.len,
+                new_text_len,
+                entry.command.len,
+                if (entry.client_tags) |tags| tags.len else 0,
+            );
+            const body_len = try checkpointBodyLenAdd(without_old, new_entry_len);
+            try validateCheckpointBodyBudget(body_len, params.max_checkpoint_bytes);
+            return body_len;
         }
 
         fn collectNewest(log: *const TargetLog, n: usize, out: []Message, bound: ?QueryBound) []const Message {
@@ -811,6 +934,66 @@ fn checkpointLenAdd(current: usize, additional: usize, max: usize) CheckpointErr
     const result = std.math.add(usize, current, additional) catch return error.CheckpointTooLarge;
     if (result > max or result > std.math.maxInt(u32)) return error.CheckpointTooLarge;
     return result;
+}
+
+fn checkpointBodyLenAdd(current: usize, additional: usize) Error!usize {
+    return std.math.add(usize, current, additional) catch error.CheckpointCapacityExceeded;
+}
+
+fn checkpointEntryBodyLen(msg: InputMessage) Error!usize {
+    return checkpointEntryBodyLenFromLengths(
+        msg.msgid.len,
+        msg.sender.len,
+        msg.text.len,
+        msg.command.len,
+        if (msg.client_tags) |tags| tags.len else 0,
+    );
+}
+
+fn checkpointStoredEntryBodyLen(message: *const StoredMessage) usize {
+    return checkpoint_entry_prefix_len + message.msgid.len + message.sender.len + message.text.len + message.command.len + if (message.client_tags) |tags| tags.len else 0;
+}
+
+fn checkpointEntryBodyLenFromLengths(msgid_len: usize, sender_len: usize, text_len: usize, command_len: usize, tags_len: usize) Error!usize {
+    var len = checkpoint_entry_prefix_len;
+    len = try checkpointBodyLenAdd(len, msgid_len);
+    len = try checkpointBodyLenAdd(len, sender_len);
+    len = try checkpointBodyLenAdd(len, text_len);
+    len = try checkpointBodyLenAdd(len, command_len);
+    return checkpointBodyLenAdd(len, tags_len);
+}
+
+fn validateCheckpointBodyBudget(body_len: usize, max_checkpoint_bytes: usize) Error!void {
+    const with_header = std.math.add(usize, checkpoint_header_len, body_len) catch return error.CheckpointCapacityExceeded;
+    const total = std.math.add(usize, with_header, checkpoint_checksum_len) catch return error.CheckpointCapacityExceeded;
+    if (total > max_checkpoint_bytes or total > std.math.maxInt(u32)) return error.CheckpointCapacityExceeded;
+}
+
+fn checkpointBodyFits(body_len: usize, max_checkpoint_bytes: usize) bool {
+    const with_header = std.math.add(usize, checkpoint_header_len, body_len) catch return false;
+    const total = std.math.add(usize, with_header, checkpoint_checksum_len) catch return false;
+    return total <= max_checkpoint_bytes and total <= std.math.maxInt(u32);
+}
+
+fn isOlder(
+    target: []const u8,
+    index: usize,
+    entry: *const StoredMessage,
+    other_target: []const u8,
+    other_index: usize,
+    other: *const StoredMessage,
+) bool {
+    if (entry.timestamp != other.timestamp) return entry.timestamp < other.timestamp;
+    switch (std.mem.order(u8, target, other_target)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    switch (std.mem.order(u8, entry.msgid, other.msgid)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => return index < other_index,
+    }
 }
 
 fn checkpointChecksum(prefix: []const u8, out: *[checkpoint_checksum_len]u8) void {
@@ -1548,6 +1731,99 @@ test "checkpoint round trip is canonical exact and independently owned" {
     try std.testing.expect(iterator.next() == null);
 }
 
+test "checkpoint restores an older smaller text ceiling into a larger Lotus" {
+    const Older = Lotus(.{
+        .max_targets = 2,
+        .max_per_target = 4,
+        .max_text = 512,
+        .max_target = 16,
+        .max_msgid = 16,
+        .max_sender = 16,
+        .max_command = 16,
+        .max_client_tags = 128,
+    });
+    const Current = Lotus(.{
+        .max_targets = 2,
+        .max_per_target = 4,
+        .max_text = 4096,
+        .max_target = 16,
+        .max_msgid = 16,
+        .max_sender = 16,
+        .max_command = 16,
+        .max_client_tags = 128,
+    });
+    const Smaller = Lotus(.{
+        .max_targets = 2,
+        .max_per_target = 4,
+        .max_text = 256,
+        .max_target = 16,
+        .max_msgid = 16,
+        .max_sender = 16,
+        .max_command = 16,
+        .max_client_tags = 128,
+    });
+
+    var older = Older.init(std.testing.allocator);
+    defer older.deinit();
+    var ciphertext: [512]u8 = @splat('x');
+    _ = try older.append("#secure", .{
+        .msgid = "cipher",
+        .sender = "alice",
+        .text = &ciphertext,
+        .timestamp = 1,
+        .command = "PRIVMSG",
+    });
+    _ = try older.append("#secure", .{
+        .msgid = "typing",
+        .sender = "alice",
+        .text = "",
+        .timestamp = 2,
+        .command = "TAGMSG",
+        .client_tags = "+typing=active",
+    });
+    try older.redact("#secure", "typing");
+
+    const wire = try older.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(wire);
+    var restored = try Current.decodeCheckpoint(std.testing.allocator, wire);
+    defer restored.deinit();
+
+    var iterator = restored.deterministicIterator();
+    const first = iterator.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("#secure", first.target);
+    try std.testing.expectEqualStrings("cipher", first.message.msgid);
+    try std.testing.expectEqualSlices(u8, &ciphertext, first.message.text);
+    try std.testing.expect(!first.message.tombstone);
+    const second = iterator.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("typing", second.message.msgid);
+    try std.testing.expect(second.message.tombstone);
+    try std.testing.expectEqualStrings("+typing=active", second.message.client_tags.?);
+    try std.testing.expect(iterator.next() == null);
+
+    try std.testing.expectError(error.ConfigMismatch, Smaller.decodeCheckpoint(std.testing.allocator, wire));
+
+    const zero_text_limit = try std.testing.allocator.dupe(u8, wire);
+    defer std.testing.allocator.free(zero_text_limit);
+    writeU32(zero_text_limit[16..20], 0);
+    rewriteCheckpointChecksum(zero_text_limit);
+    try std.testing.expectError(error.ConfigMismatch, Current.decodeCheckpoint(std.testing.allocator, zero_text_limit));
+
+    var current = Current.init(std.testing.allocator);
+    defer current.deinit();
+    var large_ciphertext: [4096]u8 = @splat('z');
+    _ = try current.append("#secure", .{
+        .msgid = "large",
+        .sender = "alice",
+        .text = &large_ciphertext,
+        .timestamp = 3,
+    });
+    const inconsistent_wire = try current.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(inconsistent_wire);
+    writeU32(inconsistent_wire[16..20], 512);
+    rewriteCheckpointChecksum(inconsistent_wire);
+    try std.testing.expectError(error.CapacityExceeded, Current.decodeCheckpoint(std.testing.allocator, inconsistent_wire));
+}
+
 test "checkpoint decoder rejects truncation corruption bounds and trailing bytes" {
     const Store = Lotus(.{
         .max_targets = 2,
@@ -1796,8 +2072,71 @@ test "checkpoint and append bounds fail closed" {
     try std.testing.expectError(error.TextTooLong, store.append("#a", .{ .msgid = "m", .sender = "a", .text = "long", .timestamp = 1 }));
     try std.testing.expectError(error.CommandTooLong, store.append("#a", .{ .msgid = "m", .sender = "a", .text = "x", .timestamp = 1, .command = "LONG-CMD-X" }));
     try std.testing.expectError(error.ClientTagsTooLong, store.append("#a", .{ .msgid = "m", .sender = "a", .text = "x", .timestamp = 1, .client_tags = "+x=12" }));
-    _ = try store.append("#a", .{ .msgid = "m", .sender = "a", .text = "xxx", .timestamp = 1 });
-    try std.testing.expectError(error.CheckpointTooLarge, store.encodeCheckpoint(std.testing.allocator));
+    try std.testing.expectError(error.CheckpointCapacityExceeded, store.append("#a", .{ .msgid = "m", .sender = "a", .text = "xxx", .timestamp = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), store.totalStoredCount());
+    const empty_wire = try store.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(empty_wire);
+    try std.testing.expect(empty_wire.len <= 128);
+}
+
+test "aggregate checkpoint retention evicts the deterministic global oldest entry" {
+    // This deliberately uses 256 rows and the production 4096-byte text
+    // ceiling. The smaller test budget reaches the aggregate boundary without
+    // allocating a 64 MiB fixture; the same incremental accounting is used by
+    // the production 64 MiB Lotus instantiation.
+    const Store = Lotus(.{
+        .max_targets = 512,
+        .max_per_target = 256,
+        .max_text = 4096,
+        .max_target = 16,
+        .max_msgid = 16,
+        .max_sender = 16,
+        .max_command = 16,
+        .max_client_tags = 16,
+        .max_checkpoint_bytes = 1_070_000,
+    });
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    const payload: [4096]u8 = @splat('x');
+    var msgid_buf: [16]u8 = undefined;
+
+    for (0..256) |index| {
+        const msgid = try std.fmt.bufPrint(&msgid_buf, "a-{d}", .{index});
+        _ = try store.append("#a", .{ .msgid = msgid, .sender = "a", .text = &payload, .timestamp = index });
+    }
+    try std.testing.expectEqual(@as(usize, 256), try store.storedCount("#a"));
+
+    const appended = try store.append("#b", .{ .msgid = "b-0", .sender = "b", .text = &payload, .timestamp = 256 });
+    try std.testing.expect(appended.evicted);
+    try std.testing.expectEqual(@as(usize, 255), try store.storedCount("#a"));
+    try std.testing.expectEqual(@as(usize, 1), try store.storedCount("#b"));
+    var oldest = store.deterministicIterator();
+    const first = oldest.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("#a", first.target);
+    try std.testing.expectEqualStrings("a-1", first.message.msgid);
+
+    // Exercise aggregate pressure on an existing target. The stale row lives
+    // elsewhere, so target-local eviction would incorrectly discard newer #a.
+    _ = try store.append("#c", .{ .msgid = "c-old", .sender = "c", .text = &payload, .timestamp = 0 });
+    try std.testing.expectEqual(@as(usize, 1), try store.storedCount("#c"));
+    _ = try store.append("#a", .{ .msgid = "a-new", .sender = "a", .text = &payload, .timestamp = 999 });
+    try std.testing.expectEqual(@as(usize, 0), try store.storedCount("#c"));
+    var newest_a_buf: [1]Message = undefined;
+    const newest_a = try store.latest("#a", 1, &newest_a_buf);
+    try std.testing.expectEqualStrings("a-new", newest_a[0].msgid);
+
+    try std.testing.expectEqual(
+        ExactOnceResult.exact_duplicate,
+        try store.ingestExactOnce("#b", .{ .msgid = "b-0", .sender = "b", .text = &payload, .timestamp = 256 }),
+    );
+    try std.testing.expectEqual(
+        ExactOnceResult.equivocation,
+        try store.ingestExactOnce("#b", .{ .msgid = "b-0", .sender = "b", .text = "different", .timestamp = 256 }),
+    );
+
+    const wire = try store.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(wire);
+    try std.testing.expect(wire.len <= 1_070_000);
 }
 
 fn firstCheckpointEntryOffset(bytes: []const u8) usize {
