@@ -1429,6 +1429,7 @@ pub const ServerError = error{
     ClientNotFound,
     BadCompletion,
     OutputTooSmall,
+    InvalidNamesRoster,
     TextTooLong,
     TokenOutOfRange,
     UnknownOpKind,
@@ -9671,18 +9672,21 @@ pub const LinuxServer = struct {
             const tok = try tokenFromId(id);
             return self.closeConn(tok, close_reason);
         }
+        // A close is an authority decision, not merely an ordered mailbox item.
+        // Publish the exact-generation atomic before the owner can consume a
+        // positive RECV CQE that raced ahead of this control message. The owner
+        // checks delivery_gap before parsing bytes, so successful enqueue and
+        // mailbox congestion have the same fail-closed command boundary.
+        if (self.poisonDeliveryGeneration(id) == .target_gone) return;
         const fabric = if (self.fabric) |*f| f else {
-            _ = self.poisonDeliveryGeneration(id);
             return;
         };
         const buf = fabric.acquire(id.shard, "") orelse {
-            _ = self.poisonDeliveryGeneration(id);
             self.noteCrossShardDrop(fabric, 1);
             return;
         };
         if (!fabric.sendTo(id.shard, .{ .to = id, .buf = buf, .close_after = true, .close_reason = close_reason })) {
             fabric.release(id.shard, buf);
-            _ = self.poisonDeliveryGeneration(id);
             self.noteCrossShardDrop(fabric, 1);
             return;
         }
@@ -13945,6 +13949,7 @@ pub const LinuxServer = struct {
         self.dispatchRegistered(id, conn, &parsed, line) catch |err| switch (err) {
             error.ControlByte,
             error.OutputTooSmall,
+            error.InvalidNamesRoster,
             error.TextTooLong,
             error.NoSpaceLeft,
             error.OversizeLine,
@@ -13958,6 +13963,17 @@ pub const LinuxServer = struct {
         // leaving a visible channel member that encrypted fan-out must omit.
         if (std.ascii.eqlIgnoreCase(parsed.command, "CAP") and
             !try self.enforceE2eeSessionEligibility(id, conn)) return;
+    }
+
+    fn labeledBulkCaptureCapacity(conn: *const ConnState, names: bool) ?usize {
+        const inline_queued = conn.send_len - conn.send_offset;
+        const queued = std.math.add(usize, inline_queued, conn.send_overflow.items.len) catch return null;
+        if (queued >= conn.sendq_cap) return null;
+        const remaining = conn.sendq_cap - queued;
+        // NAMES completeness is bounded by the configured SendQ itself: do not
+        // reintroduce the former ~520 KiB truncation through labeled-response.
+        // Historical finite-row bulk commands retain their 65-arena command cap.
+        return if (names) remaining else @min(default_reply_bytes * 65, remaining);
     }
 
     fn dispatchRegistered(
@@ -13992,11 +14008,21 @@ pub const LinuxServer = struct {
 
         if (want_label) |label| {
             var cap_buf: [default_reply_bytes]u8 = undefined;
+            const names_label = std.ascii.eqlIgnoreCase(parsed.command, "NAMES");
             const bulk_label = std.ascii.eqlIgnoreCase(parsed.command, "CHATHISTORY") or
                 std.ascii.eqlIgnoreCase(parsed.command, "SEARCH") or
                 std.ascii.eqlIgnoreCase(parsed.command, "JOIN");
-            const bulk_buf = if (bulk_label)
-                self.allocator.alloc(u8, default_reply_bytes * 65) catch {
+            const dynamic_capture_cap = if (bulk_label or names_label) cap: {
+                const capacity = labeledBulkCaptureCapacity(conn, names_label) orelse {
+                    self.poisonOwnedDelivery(conn);
+                    return;
+                };
+                // The labeled emitter performs exact transport-framing
+                // reservation after the plaintext command capture is complete.
+                break :cap capacity;
+            } else 0;
+            const bulk_buf = if (bulk_label or names_label)
+                self.allocator.alloc(u8, dynamic_capture_cap) catch {
                     self.poisonOwnedDelivery(conn);
                     return;
                 }
@@ -17809,40 +17835,109 @@ pub const LinuxServer = struct {
         return self.flushMeshBurstStage(conn);
     }
 
-    /// Append a peer's remote channel members into the NAMES buffer (deduped,
-    /// auditorium-filtered). Returns the new count. `members` is a borrowed
-    /// roster from either link type. Each member renders with its PROPAGATED
-    /// real username + visible (cloaked) host; only a roster entry whose origin
-    /// never supplied identity falls back to the `mesh@<server>` placeholder.
+    const NamesRosterEntry = struct {
+        prefixes: chanmode.PrefixList,
+        nick: []const u8,
+        user: []const u8,
+        host: []const u8,
+
+        fn asMember(self: *const NamesRosterEntry) names_reply.Member {
+            return .{
+                .prefixes = self.prefixes.asSlice(),
+                .nick = self.nick,
+                .user = self.user,
+                .host = self.host,
+            };
+        }
+    };
+
+    const NamesNickContext = struct {
+        pub fn hash(_: @This(), nick: []const u8) u64 {
+            var hasher = std.hash.Wyhash.init(0x4e41_4d45_535f_4e49);
+            for (nick) |ch| {
+                const folded = [1]u8{std.ascii.toLower(ch)};
+                hasher.update(&folded);
+            }
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+            return std.ascii.eqlIgnoreCase(a, b);
+        }
+    };
+
+    const NamesNickSet = std.HashMapUnmanaged(
+        []const u8,
+        void,
+        NamesNickContext,
+        std.hash_map.default_max_load_percentage,
+    );
+
+    /// Add one representable logical IRC identity to a dynamically bounded NAMES
+    /// roster. The entry limit is derived from this request's remaining plaintext
+    /// output budget: every accepted member consumes at least one token byte and
+    /// one separator byte, so a larger unique roster could not possibly complete
+    /// before the SendQ/capture ceiling anyway. Any invalid identity aborts the
+    /// still-private roster build: silently skipping an admitted mesh row and
+    /// then emitting 366 would falsely certify a complete channel image.
+    fn appendNamesRosterEntry(
+        self: *LinuxServer,
+        entries: *std.ArrayListUnmanaged(NamesRosterEntry),
+        seen: *NamesNickSet,
+        max_entries: usize,
+        nick: []const u8,
+        user: []const u8,
+        host: []const u8,
+        modes: world_model.MemberModes,
+        is_override_oper: bool,
+    ) ServerError!bool {
+        var prefixes = modes.allPrefixes();
+        if (is_override_oper) prefixes.prependOper();
+        const candidate = NamesRosterEntry{
+            .prefixes = prefixes,
+            .nick = nick,
+            .user = user,
+            .host = host,
+        };
+        names_reply.validateMember(candidate.asMember()) catch return error.InvalidNamesRoster;
+        if (seen.contains(nick)) return false;
+        if (entries.items.len >= max_entries) return error.OutputTooSmall;
+        try entries.ensureUnusedCapacity(self.allocator, 1);
+        const seen_result = try seen.getOrPut(self.allocator, nick);
+        if (seen_result.found_existing) return false;
+        entries.appendAssumeCapacity(candidate);
+        return true;
+    }
+
+    /// Append a peer's remote channel members into the NAMES roster (deduped,
+    /// auditorium-filtered). `members` is a borrowed roster from either link
+    /// type. Each member renders with its PROPAGATED real username + visible
+    /// (cloaked) host; only a roster entry whose origin never supplied identity
+    /// falls back to the `mesh@<server>` placeholder.
     fn addRemoteMembers(
         self: *LinuxServer,
-        members_buf: []names_reply.Member,
-        prefix_buf: []chanmode.PrefixList,
-        count_in: usize,
+        entries: *std.ArrayListUnmanaged(NamesRosterEntry),
+        seen: *NamesNickSet,
+        max_entries: usize,
         is_auditorium: bool,
         viewer_rank: auditorium.Rank,
         remote_name: []const u8,
         members: anytype,
-    ) usize {
-        var count = count_in;
+    ) ServerError!void {
         for (members) |rm| {
-            if (count >= members_buf.len) break;
-            if (nameAlreadyListed(members_buf[0..count], rm.nick)) continue;
             const modes = world_model.MemberModes{ .bits = @as(u8, rm.status) };
             if (is_auditorium and !auditorium.visibleTo(viewer_rank, auditoriumRank(modes))) continue;
-            prefix_buf[count] = modes.allPrefixes();
-            // Remote network operators (oper_override via a propagated grant)
-            // render with the `*` prefix too, so admin status is uniform mesh-wide.
-            if (self.isOverrideOper(rm.nick)) prefix_buf[count].prependOper();
-            members_buf[count] = .{
-                .prefixes = prefix_buf[count].asSlice(),
-                .nick = rm.nick,
-                .user = if (rm.username.len != 0) rm.username else world_projection.remote_user_placeholder,
-                .host = if (rm.host.len != 0) rm.host else if (remote_name.len != 0) remote_name else default_host,
-            };
-            count += 1;
+            _ = try self.appendNamesRosterEntry(
+                entries,
+                seen,
+                max_entries,
+                rm.nick,
+                if (rm.username.len != 0) rm.username else world_projection.remote_user_placeholder,
+                if (rm.host.len != 0) rm.host else if (remote_name.len != 0) remote_name else default_host,
+                modes,
+                self.isOverrideOper(rm.nick),
+            );
         }
-        return count;
     }
 
     /// Total members of `channel` across the WHOLE mesh: the local member count plus
@@ -23271,11 +23366,14 @@ pub const LinuxServer = struct {
         modes: world_model.MemberModes,
     ) bool {
         if (conn.reply_capture != null) return false;
-        // sendNames renders into one default_reply_bytes arena (plus at most 32
-        // CRLF terminators); JOIN and the two topic numerics are each bounded by
-        // the same line builder. Six arenas leave a strict whole-batch ceiling
-        // with room for server-time tags and future bounded numeric growth.
-        const capture_storage = self.allocator.alloc(u8, default_reply_bytes * 6) catch return false;
+        // Size the isolated bootstrap from this connection's actual remaining
+        // SendQ rather than a fixed six-arena estimate. Large complete NAMES
+        // bursts can legitimately exceed that legacy ceiling; the capture and
+        // SendQ checks still bound memory and abort before World publication.
+        const inline_queued = conn.send_len - conn.send_offset;
+        const queued = std.math.add(usize, inline_queued, conn.send_overflow.items.len) catch return false;
+        if (queued >= conn.sendq_cap) return false;
+        const capture_storage = self.allocator.alloc(u8, conn.sendq_cap - queued) catch return false;
         defer self.allocator.free(capture_storage);
         var capture = ReplyCapture{ .buf = capture_storage };
 
@@ -23599,6 +23697,10 @@ pub const LinuxServer = struct {
         if (!conn.resume_autojoin_deferred) return;
         conn.resume_autojoin_deferred = false;
         conn.resume_autojoin_deadline_ms = 0;
+        // The one-shot TOKEN preservation is meaningful only inside this bounded
+        // retry window. Expiry (or any explicit finish) releases both latches so
+        // a stale WARN cannot refuse every later Helix UPGRADE indefinitely.
+        conn.preserve_resume_credential_once = false;
         if (!restored) self.applyAutojoin(id, conn);
     }
 
@@ -23607,8 +23709,22 @@ pub const LinuxServer = struct {
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const conn = entry.value;
-            if (!conn.resume_autojoin_deferred or now < conn.resume_autojoin_deadline_ms) continue;
-            self.finishDeferredSessionAutojoin(entry.id, conn, false);
+            if (conn.resume_autojoin_deferred) {
+                if (now < conn.resume_autojoin_deadline_ms) continue;
+                self.finishDeferredSessionAutojoin(entry.id, conn, false);
+                continue;
+            }
+            // A manual RESUME retry can arm credential preservation without an
+            // account-autojoin hold. It owns the same bounded deadline and must
+            // expire independently, otherwise no autojoin sweep can ever clear
+            // it and every later UPGRADE remains refused.
+            if (conn.preserve_resume_credential_once and
+                conn.resume_autojoin_deadline_ms != 0 and
+                now >= conn.resume_autojoin_deadline_ms)
+            {
+                conn.preserve_resume_credential_once = false;
+                conn.resume_autojoin_deadline_ms = 0;
+            }
         }
     }
 
@@ -36048,6 +36164,26 @@ pub const LinuxServer = struct {
         try emitReplyLine(conn, line);
     }
 
+    fn closeDroppedAccountConnections(self: *LinuxServer, account: []const u8) void {
+        // Account deletion revokes the identity, not merely its resumable rows.
+        // ConnState is owner-reactor storage: inspect it under the World lock but
+        // route teardown through the owner seam so foreign SendQ/ring state is
+        // never mutated here. Local close errors still leave `closing` set by
+        // closeConn's retry path; cross-shard mailbox exhaustion poisons the
+        // exact generation and is swept closed by its owner.
+        for (self.reactors) |*reactor| {
+            var slot_index: usize = 0;
+            while (slot_index < reactor.clients.slots.items.len) : (slot_index += 1) {
+                const slot = &reactor.clients.slots.items[slot_index];
+                if (!slot.occupied) continue;
+                const live_account = slot.value.session.account() orelse continue;
+                if (!std.ascii.eqlIgnoreCase(live_account, account)) continue;
+                const id = slotClientId(reactor, slot_index, slot.gen);
+                self.enqueueCloseOnOwner(id, "Account dropped") catch {};
+            }
+        }
+    }
+
     /// `DROP <account> <password>` — delete an account (requires its password).
     pub fn handleDrop(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "DROP", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
@@ -36068,15 +36204,16 @@ pub const LinuxServer = struct {
         // Account deletion is an authorization boundary, not just a services
         // record mutation. Retire every local reusable-session authority now so
         // a previously issued MTOKEN cannot resurrect the deleted account from a
-        // mesh replica. This deliberately does not mutate live ConnState objects
-        // across reactor ownership; account-notify/live login teardown remains a
-        // separate pre-existing DROP semantic.
+        // mesh replica.
         _ = self.removeAllTrackedSessions(account);
         // Hand any channels this account founded to their configured successors.
         self.promoteSuccessorsForDroppedFounder(account);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} dropped\r\n", .{ self.serverName(), conn.session.displayName(), account }) catch return;
         try emitReplyLine(conn, line);
+        // This may synchronously free `conn` when its fd has no kernel ownership;
+        // it must remain the final operation in this handler.
+        self.closeDroppedAccountConnections(account);
     }
 
     /// `SETPASS <current-password> <new-password>` — change the logged-in account's
@@ -40254,6 +40391,7 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(sub, "TOKEN")) {
             if (conn.preserve_resume_credential_once) {
                 conn.preserve_resume_credential_once = false;
+                if (!conn.resume_autojoin_deferred) conn.resume_autojoin_deadline_ms = 0;
                 try self.warnReply(conn, "SESSION", "RESUME_CREDENTIAL_PRESERVED", "retryable resume did not consume the stored credential; repeat SESSION TOKEN to replace it");
                 return;
             }
@@ -40344,7 +40482,23 @@ pub const LinuxServer = struct {
     /// only a detached attachment exists we replace that ghost. Every successful
     /// attachment carries the same token so later reconnects can land on any live
     /// sibling instead of racing for one-shot ownership.
+    fn markSessionResumeRetryable(self: *LinuxServer, conn: *ConnState) void {
+        conn.preserve_resume_credential_once = true;
+        // A WARN means the exact credential is still authoritative and the
+        // client is expected to retry it. Preservation itself owns this bounded
+        // deadline even for a later manual RESUME with no autojoin hold; when a
+        // hold exists the same deadline also prevents seating a temporary
+        // account-room identity before the next attempt.
+        conn.resume_autojoin_deadline_ms = self.nowMs() + 2_000;
+    }
+
     pub fn handleSessionResume(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, parsed: *const irc_line.LineView) !void {
+        // Preservation belongs to exactly one retryable attempt. Clear any prior
+        // WARN latch before parsing this attempt; only a retryable outcome below
+        // may arm it again. Terminal and already-attached results therefore can
+        // never leave SESSION TOKEN stuck behind a stale preservation warning.
+        conn.preserve_resume_credential_once = false;
+        if (!conn.resume_autojoin_deferred) conn.resume_autojoin_deadline_ms = 0;
         const cid = monitorIdFromClient(id);
         const params = parsed.paramSlice();
         if (params.len < 2 or params[1].len == 0) {
@@ -40380,18 +40534,18 @@ pub const LinuxServer = struct {
         if (self.sessions.findAttachedTokenSessionInAccount(account, token, cid)) |source| {
             const source_id = clientIdFromMonitor(source.client);
             const source_conn = self.connFor(source_id) orelse {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live session attachment is converging; retry the same token");
                 return;
             };
             const snapshot = self.encodeMigrationSnapshot(source_id, source_conn) orelse {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the live session; retry the same token");
                 return;
             };
             defer self.allocator.free(snapshot);
             if (!self.restoreEncodedMigrationSnapshot(id, conn, account, token, snapshot, .join_existing)) {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live session attach failed; token remains valid");
                 return;
             }
@@ -40426,7 +40580,7 @@ pub const LinuxServer = struct {
             matched.client,
         ) else false;
         if (snapshot != null and !restored) {
-            conn.preserve_resume_credential_once = true;
+            self.markSessionResumeRetryable(conn);
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
             return;
         }
@@ -40441,7 +40595,7 @@ pub const LinuxServer = struct {
             .join_existing,
             matched.client,
         )) {
-            conn.preserve_resume_credential_once = true;
+            self.markSessionResumeRetryable(conn);
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session registry changed during resume; retry the same token");
             return;
         }
@@ -40515,18 +40669,18 @@ pub const LinuxServer = struct {
         if (self.sessions.findAttachedTokenSessionInAccount(account, migrate_token, cid)) |source| {
             const source_id = clientIdFromMonitor(source.client);
             const source_conn = self.connFor(source_id) orelse {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live mesh attachment is converging; retry the same token");
                 return;
             };
             const snapshot = self.encodeMigrationSnapshot(source_id, source_conn) orelse {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the live mesh session; retry the same token");
                 return;
             };
             defer self.allocator.free(snapshot);
             if (!self.restoreEncodedMigrationSnapshot(id, conn, account, migrate_token, snapshot, .join_existing)) {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session attach failed; token remains valid");
                 return;
             }
@@ -40608,7 +40762,7 @@ pub const LinuxServer = struct {
                 ) else false;
 
                 if (local_snapshot != null and !restored) {
-                    conn.preserve_resume_credential_once = true;
+                    self.markSessionResumeRetryable(conn);
                     try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
                     return;
                 }
@@ -40621,7 +40775,7 @@ pub const LinuxServer = struct {
                         .join_existing,
                         g,
                     )) {
-                        conn.preserve_resume_credential_once = true;
+                        self.markSessionResumeRetryable(conn);
                         try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during resume; retry the same token");
                         return;
                     }
@@ -40646,7 +40800,7 @@ pub const LinuxServer = struct {
                 // owning node ships the migration capsule from its own grant_local
                 // path (above) when it consumes the ghost, so the peer the client
                 // lands on already has the staged capsule to restore from.
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 const line = std.fmt.bufPrint(&buf, "SESSION REDIRECT: session lives on {s}; reconnect there to reclaim", .{node}) catch return;
                 try self.noticeTo(conn, line);
             },
@@ -40654,7 +40808,7 @@ pub const LinuxServer = struct {
             .deny_replay => unreachable, // reusable credentials are never probed as consumed
             .deny_unknown => try self.failReply(conn, "SESSION", "NO_SESSION", "no matching session on origin node"),
             .deny_unreachable => {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "ORIGIN_UNREACHABLE", "origin is disconnected; retry this resume credential when the mesh converges");
             },
         }
@@ -50389,17 +50543,67 @@ pub const LinuxServer = struct {
         // prefixes (all of them when the requester negotiated multi-prefix, else
         // only the highest) and optionally nick!user@host (userhost-in-names).
         //
-        // Cap is intentionally large: a mesh channel with many locals + remotes
-        // used to silently truncate at 128, so each side of the mesh saw a
-        // different partial roster and clients permanently desynced after 366
-        // closed the (incomplete) burst. 512 covers realistic federation sizes
-        // without a heap alloc on the completion path; beyond that we still emit
-        // what we collected and close cleanly rather than inventing a second
-        // partial burst later.
-        const max_members: usize = 512;
-        var members_buf: [max_members]names_reply.Member = undefined;
-        var prefix_buf: [max_members]chanmode.PrefixList = undefined;
-        var count: usize = 0;
+        // Bound collection by the exact plaintext room remaining in the current
+        // destination. A NAMES entry has a non-empty nick and consumes at least a
+        // token byte plus a separator; accepting more unique identities than
+        // this two-byte bound could never produce a complete burst. Unlike the
+        // old fixed 512 stack array, this scales to every roster that can actually
+        // fit the caller's configured SendQ or transactional reply capture.
+        const plaintext_budget = if (conn.reply_capture) |capture|
+            capture.buf.len - capture.len
+        else budget: {
+            const inline_queued = conn.send_len - conn.send_offset;
+            const queued = std.math.add(usize, inline_queued, conn.send_overflow.items.len) catch
+                return error.OutputTooSmall;
+            if (queued >= conn.sendq_cap) return error.OutputTooSmall;
+            break :budget conn.sendq_cap - queued;
+        };
+        if (plaintext_budget == 0) return error.OutputTooSmall;
+
+        const caps = names_reply.RequesterCaps{
+            .multi_prefix = conn.session.hasCap(.multi_prefix) or conn.ircx,
+            .userhost_in_names = conn.session.hasCap(.userhost_in_names),
+        };
+        const srv = self.serverName();
+        const requester = conn.session.displayName();
+        const end_text = "End of /NAMES list";
+        const minimum_end_len = std.math.add(
+            usize,
+            1 + srv.len + 1 + 3 + 1 + requester.len + 1 + channel.len + 2 + end_text.len,
+            2,
+        ) catch return error.OutputTooSmall;
+        if (minimum_end_len > plaintext_budget) return error.OutputTooSmall;
+
+        // Exact current-topology candidate bound: local physical rows, every
+        // established peer's retained channel roster, and at most one synthetic
+        // resume claimant. The dedupe index collapses physical/mesh aliases, but
+        // its allocation can never grow beyond this authoritative source image.
+        var topology_upper = self.world.memberCount(channel);
+        if (projection != null)
+            topology_upper = std.math.add(usize, topology_upper, 1) catch
+                return error.OutputTooSmall;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const remote_count = if (slot.value.s2s_secured) |link|
+                    if (link.established()) link.channelMembers(channel).len else 0
+                else if (slot.value.s2s) |link|
+                    if (link.established()) link.channelMembers(channel).len else 0
+                else
+                    0;
+                topology_upper = std.math.add(usize, topology_upper, remote_count) catch
+                    return error.OutputTooSmall;
+            }
+        }
+        // Each emitted identity costs at least its non-empty nick plus either a
+        // separator or a strictly-larger 353 header. Reserve the complete 366
+        // first, then use the checked two-byte minimum to constrain heap growth.
+        const output_member_limit = (plaintext_budget - minimum_end_len) / 2;
+        const max_entries = @min(topology_upper, output_member_limit);
+        var roster: std.ArrayListUnmanaged(NamesRosterEntry) = .empty;
+        defer roster.deinit(self.allocator);
+        var seen: NamesNickSet = .empty;
+        defer seen.deinit(self.allocator);
 
         // +x AUDITORIUM: regular members are hidden from each other; only ops and
         // voiced members are visible (plus the viewer always sees themselves).
@@ -50416,24 +50620,11 @@ pub const LinuxServer = struct {
         if (self.world.memberIterator(channel)) |members_src| {
             var it = members_src;
             while (it.next()) |member| {
-                if (count >= max_members) break;
                 const projected = if (projection) |image| image.contains(member.*) else false;
                 const nick = if (projected)
                     projection.?.nick
                 else
                     self.world.nickOf(member.*) orelse continue;
-                // Multiple sockets attached to one logical session are distinct
-                // delivery endpoints but one IRC identity. Keep every endpoint in
-                // World for fan-out/participation, while rendering the nick once in
-                // NAMES so clients do not manufacture duplicate users.
-                var duplicate = false;
-                for (members_buf[0..count]) |listed| {
-                    if (std.ascii.eqlIgnoreCase(listed.nick, nick)) {
-                        duplicate = true;
-                        break;
-                    }
-                }
-                if (duplicate) continue;
                 const modes = if (projected)
                     projection.?.modes
                 else
@@ -50442,19 +50633,22 @@ pub const LinuxServer = struct {
                     const is_self = projected or if (viewer_wid) |vw| member.*.eql(vw) else false;
                     if (!is_self and !auditorium.visibleTo(viewer_rank, auditoriumRank(modes))) continue;
                 }
-                prefix_buf[count] = modes.allPrefixes();
-                // Network operators (oper_override) render with the `*` prefix above
-                // founder. Derived from live oper status, not a stored channel mode.
-                if ((projected and projection.?.is_override_oper) or self.isOverrideOper(nick))
-                    prefix_buf[count].prependOper();
-                members_buf[count] = .{
-                    .prefixes = prefix_buf[count].asSlice(),
-                    .nick = nick,
-                    .user = if (projected) projection.?.user else usernameOf(self, member.*),
-                    .host = default_host,
-                };
-                count += 1;
-                if (projected) projected_member_seen = true;
+                // Multiple sockets attached to one logical session are distinct
+                // delivery endpoints but one IRC identity. Keep every endpoint in
+                // World for fan-out/participation, while rendering the nick once in
+                // NAMES so clients do not manufacture duplicate users.
+                const added = try self.appendNamesRosterEntry(
+                    &roster,
+                    &seen,
+                    max_entries,
+                    nick,
+                    if (projected) projection.?.user else usernameOf(self, member.*),
+                    default_host,
+                    modes,
+                    (projected and projection.?.is_override_oper) or self.isOverrideOper(nick),
+                );
+                if (projected and (added or seen.contains(nick)))
+                    projected_member_seen = true;
             }
         }
 
@@ -50463,18 +50657,17 @@ pub const LinuxServer = struct {
         // add several physical exact-token rows, which ordinary NAMES dedupes by
         // nick in the same way.
         if (projection) |projected| synthetic: {
-            if (projected_member_seen or count >= max_members) break :synthetic;
-            if (nameAlreadyListed(members_buf[0..count], projected.nick)) break :synthetic;
-            prefix_buf[count] = projected.modes.allPrefixes();
-            if (projected.is_override_oper or self.isOverrideOper(projected.nick))
-                prefix_buf[count].prependOper();
-            members_buf[count] = .{
-                .prefixes = prefix_buf[count].asSlice(),
-                .nick = projected.nick,
-                .user = projected.user,
-                .host = default_host,
-            };
-            count += 1;
+            if (projected_member_seen or seen.contains(projected.nick)) break :synthetic;
+            _ = try self.appendNamesRosterEntry(
+                &roster,
+                &seen,
+                max_entries,
+                projected.nick,
+                projected.user,
+                default_host,
+                projected.modes,
+                projected.is_override_oper or self.isOverrideOper(projected.nick),
+            );
         }
 
         // World projection (#6): merge remote members announced by established S2S
@@ -50487,42 +50680,61 @@ pub const LinuxServer = struct {
         // shard-0 clients (the multi-shard NAMES gap). The whole completion runs
         // under `world.lockWrite`, so this cross-reactor read is race-free — the
         // same pattern `findRemoteWhois`/`relayToPeers` already rely on.
-        outer: for (self.reactors) |*reactor| {
+        for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (count >= max_members) break :outer;
                 if (!slot.occupied) continue;
                 if (slot.value.s2s_secured) |link| {
-                    if (link.established()) count = self.addRemoteMembers(&members_buf, &prefix_buf, count, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
+                    if (link.established()) try self.addRemoteMembers(&roster, &seen, max_entries, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
                 } else if (slot.value.s2s) |link| {
-                    if (link.established()) count = self.addRemoteMembers(&members_buf, &prefix_buf, count, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
+                    if (link.established()) try self.addRemoteMembers(&roster, &seen, max_entries, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
                 }
             }
         }
 
-        const caps = names_reply.RequesterCaps{
-            .multi_prefix = conn.session.hasCap(.multi_prefix) or conn.ircx,
-            .userhost_in_names = conn.session.hasCap(.userhost_in_names),
-        };
-
         // 353 visibility symbol: '@' for secret (+s), '=' otherwise.
         const channel_status: u8 = if (self.world.channelHasFlag(channel, .secret)) '@' else '=';
-        const srv = self.serverName();
-        const requester = conn.session.displayName();
 
-        // Stream 353 lines in chunks that fit the reply arena + line sink. A
-        // single writeNamesReplies call used to fail closed to a bare 366 when
-        // the channel's rendered roster exceeded default_reply_bytes or 32
-        // lines (userhost-in-names + mesh remotes) — late partial / empty NAMES
-        // desync on both sides of the mesh. Chunk, emit every 353 that fits,
-        // and ALWAYS terminate with exactly one 366.
+        // Render the WHOLE burst into isolated bounded storage before touching
+        // the live socket/capture. This prevents a SendQ limit or allocation
+        // failure after an early 353 from leaving a client with a partial roster.
+        // The pessimistic size assumes every member needs its own 353 line; the
+        // actual writer folds multiple tokens per standards-compliant line.
+        const header_len = 1 + srv.len + 1 + 3 + 1 + requester.len + 3 + channel.len + 2;
+        var storage_upper = minimum_end_len;
+        for (roster.items) |*entry| {
+            const member = entry.asMember();
+            var token_len = (if (member.prefixes.len == 0) @as(usize, 0) else if (caps.multi_prefix) member.prefixes.len else 1) + member.nick.len;
+            if (caps.userhost_in_names) {
+                token_len = std.math.add(usize, token_len, 1 + member.user.len + 1 + member.host.len) catch
+                    return error.OutputTooSmall;
+            }
+            if (header_len > names_reply.DEFAULT_MAX_LINE_BYTES or
+                token_len > names_reply.DEFAULT_MAX_LINE_BYTES - header_len)
+                return error.OutputTooSmall;
+            const line_upper = std.math.add(usize, header_len + 2, token_len) catch
+                return error.OutputTooSmall;
+            storage_upper = std.math.add(usize, storage_upper, line_upper) catch
+                return error.OutputTooSmall;
+        }
+        const burst_storage = try self.allocator.alloc(u8, @min(storage_upper, plaintext_budget));
+        defer self.allocator.free(burst_storage);
+        var burst = ReplyCapture{ .buf = burst_storage };
+
+        // Render 353 lines in fixed-size view pages. The owned roster itself is
+        // dynamically complete; only this scratch view remains stack-bounded.
+        // Binary shrinking handles worst-case userhost-in-names tokens or the
+        // line-sink bound without truncating the next page.
         var out_buf: [default_reply_bytes]u8 = undefined;
         var lines_buf: [64]names_reply.NamesLine = undefined;
+        var page_buf: [128]names_reply.Member = undefined;
         var offset: usize = 0;
-        while (offset < count) {
-            // Greedy: try the remaining tail; on capacity error binary-shrink.
-            var end = count;
+        while (offset < roster.items.len) {
+            const page_len = @min(page_buf.len, roster.items.len - offset);
+            for (roster.items[offset .. offset + page_len], 0..) |*entry, i|
+                page_buf[i] = entry.asMember();
+            var end = page_len;
             var progressed = false;
-            while (end > offset) {
+            while (end > 0) {
                 var sink = names_reply.NamesLineSink{ .lines = &lines_buf };
                 if (names_reply.writeNamReplyLines(
                     &out_buf,
@@ -50530,46 +50742,52 @@ pub const LinuxServer = struct {
                     requester,
                     channel,
                     channel_status,
-                    members_buf[offset..end],
+                    page_buf[0..end],
                     caps,
                     &sink,
                 )) |_| {
                     for (sink.slice()) |line| {
-                        try appendToConn(conn, line.bytes);
-                        try appendToConn(conn, "\r\n");
+                        burst.append(line.bytes);
+                        burst.append("\r\n");
                     }
-                    offset = end;
+                    if (burst.overflowed) return error.OutputTooSmall;
+                    offset += end;
                     progressed = true;
                     break;
                 } else |err| switch (err) {
                     error.OutputTooSmall, error.TooManyRecipients => {
-                        const mid = offset + (end - offset) / 2;
-                        if (mid == offset) {
-                            // Single member cannot be rendered into this arena —
-                            // skip it rather than aborting the rest of the list.
-                            offset += 1;
-                            progressed = true;
-                            break;
-                        }
+                        const mid = end / 2;
+                        if (mid == 0) return error.OutputTooSmall;
                         end = mid;
                     },
-                    else => {
-                        // Validation of server/nick/channel failed — close out.
-                        try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
-                        return;
-                    },
+                    else => return error.OutputTooSmall,
                 }
             }
             if (!progressed) break;
         }
 
         var end_buf: [default_reply_bytes]u8 = undefined;
-        const end_line = names_reply.buildEndOfNamesLine(&end_buf, srv, requester, channel, "End of /NAMES list") catch {
-            try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
-            return;
+        const end_line = names_reply.buildEndOfNamesLine(&end_buf, srv, requester, channel, end_text) catch {
+            return error.OutputTooSmall;
         };
-        try appendToConn(conn, end_line);
-        try appendToConn(conn, "\r\n");
+        burst.append(end_line);
+        burst.append("\r\n");
+        if (burst.overflowed) return error.OutputTooSmall;
+
+        if (conn.reply_capture == null) {
+            const raw_bound = resumeBootstrapRawBound(conn, burst.captured()) orelse
+                return error.OutputTooSmall;
+            try reserveRawAppendToConn(conn, raw_bound);
+            appendToConn(conn, burst.captured()) catch |err| {
+                // Raw capacity is reserved, but userspace TLS/WS framing can
+                // still fail after producing an earlier record. JOIN ignores a
+                // NAMES error, so make that unexpected partial stream terminal.
+                self.poisonOwnedDelivery(conn);
+                return err;
+            };
+            return;
+        }
+        try appendToConn(conn, burst.captured());
     }
 };
 
@@ -50741,15 +50959,6 @@ fn sanitizeTopicClientTags(
 
 fn sessionCanUseTagmsg(session: *const dispatch.ClientSession) bool {
     return session.hasCap(.message_tags) or session.hasCap(.typing) or session.hasCap(.react) or session.hasCap(.reply);
-}
-
-/// True if `nick` (ASCII case-insensitive) is already among the listed members —
-/// used to dedupe remote mesh members against local ones in NAMES.
-fn nameAlreadyListed(members: []const names_reply.Member, nick: []const u8) bool {
-    for (members) |m| {
-        if (std.ascii.eqlIgnoreCase(m.nick, nick)) return true;
-    }
-    return false;
 }
 
 fn clientIdFromWorld(id: world_model.ClientId) client_model.ClientId {
@@ -66496,6 +66705,13 @@ test "session replica lifecycle DROP revokes every distinct local token" {
 
     const a_id = try addTestLocalClient(server, "DropA", "drop-acct");
     const b_id = try addTestLocalClient(server, "DropB", "drop-acct");
+    try reconcileTestOper(
+        &server.connFor(b_id).?.session,
+        oper_mod.OperPrivileges.full,
+        "drop-test-oper",
+        "Drop Test Operator",
+    );
+    try std.testing.expect(server.connFor(b_id).?.session.isOper());
     const a_token = (server.sessions.resumeHandleForClient("drop-acct", monitorIdFromClient(a_id)) orelse return error.TestUnexpectedResult).token;
     const b_token = (server.sessions.resumeHandleForClient("drop-acct", monitorIdFromClient(b_id)) orelse return error.TestUnexpectedResult).token;
     try std.testing.expect(!std.crypto.timing_safe.eql(session_migrate.Token, a_token, b_token));
@@ -66513,6 +66729,93 @@ test "session replica lifecycle DROP revokes every distinct local token" {
     try std.testing.expectEqual(@as(usize, 0), server.sessions.sessionsInto("drop-acct", &rows).len);
     try expectTestSessionReplicaRevoked(server, a_token);
     try expectTestSessionReplicaRevoked(server, b_token);
+    // DROP revokes the live identity as well as SessionStore/mesh authority.
+    // Depending on whether closeConn must retry a logical-session handoff, the
+    // fixture slot is either gone or already terminally closing. In both cases
+    // the command boundary refuses more input, including SESSION TOKEN; even the
+    // explicitly elevated sibling cannot retain usable operator authority.
+    const a_after = server.connFor(a_id);
+    const b_after = server.connFor(b_id);
+    try std.testing.expect(a_after == null or a_after.?.closing);
+    try std.testing.expect(b_after == null or b_after.?.closing);
+}
+
+test "multi-reactor DROP poison wins a raced authenticated recv before owner close" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var account_store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "drop-cross-reactor-race.wal");
+    defer account_store.deinit();
+    var services = services_mod.Services.init(&account_store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("drop-race", "correct horse battery staple", &scratch);
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x99)), "local");
+    defer ident.deinit();
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .node_id = ident.shortId(),
+        .node_identity = &ident,
+        .crypto_io = std.testing.io,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    current_reactor = &server.reactors[0];
+    const issuer_id = try addTestLocalClient(server, "DropIssuer", "drop-race");
+    server.connFor(issuer_id).?.session.registration.registered = true;
+
+    current_reactor = &server.reactors[1];
+    const target_id = try addTestLocalClient(server, "DropRemote", "drop-race");
+    const target = server.connFor(target_id).?;
+    target.session.registration.registered = true;
+    try reconcileTestOper(
+        &target.session,
+        oper_mod.OperPrivileges.full,
+        "drop-race-oper",
+        "Drop Race Operator",
+    );
+    try std.testing.expect(target.session.isOper());
+    const raced_command = "SESSION TOKEN\r\n";
+    @memcpy(target.recv_buf[0..raced_command.len], raced_command);
+    // Retain the slot after poison observation so the test can prove that the
+    // positive RECV did not execute even though the close control remains queued.
+    target.send_armed = true;
+
+    current_reactor = &server.reactors[0];
+    var line = irc_line.LineView{ .raw = "", .command = "DROP" };
+    line.params[0] = "drop-race";
+    line.params[1] = "correct horse battery staple";
+    line.param_count = 2;
+    try server.handleDrop(server.connFor(issuer_id).?, &line);
+    try std.testing.expect(target.delivery_gap.load(.acquire));
+    try std.testing.expect(!target.closing);
+
+    // The owner sees the raced positive CQE before drainFabric sees the queued
+    // close. The source-published exact-generation poison must still win before
+    // IRC parsing, so no replacement token or operator command can run.
+    current_reactor = &server.reactors[1];
+    try server.handleRecv(.{
+        .token = target.token,
+        .res = @intCast(raced_command.len),
+        .more = false,
+    });
+    try std.testing.expect(target.delivery_abort_started);
+    try std.testing.expect(target.closing);
+    try std.testing.expect(target.session.isOper()); // retained only on terminal storage
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expect(std.mem.indexOf(u8, target.send_buf[0..target.send_len], "MTOKEN") == null);
+    try std.testing.expect(server.sessions.resumeHandleForClient("drop-race", monitorIdFromClient(target_id)) == null);
+    _ = server.drainFabric();
 }
 
 test "session replica lifecycle keeps one-of-N authority and last nonportable sibling revokes" {
@@ -72472,6 +72775,141 @@ test "threaded server: session reclaim local restore failure leaves the ghost re
     try server.handleSession(b_id, b_conn, &token_line);
     try expectContains(b_conn.send_buf[0..b_conn.send_len], "SESSION TOKEN ");
     try std.testing.expect(!b_conn.resume_autojoin_deferred);
+}
+
+test "SESSION RESUME retry latch clears on terminal and already-attached attempts" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "resume-latch";
+    const ghost_id = try addTestLocalClient(&server, "LatchGhost", account);
+    const claimant_id = try addTestLocalClient(&server, "LatchClaimant", account);
+    const claimant = server.connFor(claimant_id).?;
+    const ghost_cid = monitorIdFromClient(ghost_id);
+    const claimant_cid = monitorIdFromClient(claimant_id);
+    const token = server.sessions.resumeHandleForClient(account, ghost_cid).?.token;
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot(account, ghost_cid, "corrupt-resume-image"));
+    const token_hex = std.fmt.bytesToHex(token, .lower);
+    var line_buf: [64]u8 = undefined;
+    var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(&line_buf, "SESSION RESUME {s}", .{token_hex}));
+
+    // A retryable restore re-arms an already-expired autojoin hold. The sweep
+    // immediately after WARN must not release the temporary identity.
+    claimant.resume_autojoin_deferred = true;
+    claimant.resume_autojoin_deadline_ms = server.nowMs() - 1;
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try std.testing.expect(claimant.preserve_resume_credential_once);
+    try std.testing.expect(claimant.resume_autojoin_deadline_ms > server.nowMs());
+    server.sweepDeferredSessionAutojoins();
+    try std.testing.expect(claimant.resume_autojoin_deferred);
+
+    // A terminal next attempt owns its own latch state; it cannot inherit the
+    // prior WARN and block the following SESSION TOKEN request.
+    claimant.send_len = 0;
+    var terminal_line = try irc_line.parseLine("SESSION RESUME 00000000000000000000000000000000");
+    try server.handleSessionResume(claimant_id, claimant, account, &terminal_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "INVALID_TOKEN");
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+
+    // Recreate a retryable outcome, then model convergence attaching this exact
+    // physical client before its next request. The idempotent already-attached
+    // result must clear the sticky latch and finish the deferred autojoin hold.
+    claimant.send_len = 0;
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try std.testing.expect(claimant.preserve_resume_credential_once);
+    const attached = try server.sessions.attachReportingEviction(account, claimant_cid, token, 2);
+    server.finalizeAttachEviction(attached);
+    claimant.send_len = 0;
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "already attached to this session");
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+    try std.testing.expect(!claimant.resume_autojoin_deferred);
+}
+
+test "expired SESSION RESUME retry hold clears TOKEN latch and restores UPGRADE readiness" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "ExpiryClient", "expiry-acct");
+    const conn = server.connFor(id).?;
+    conn.resume_autojoin_deferred = true;
+    conn.resume_autojoin_deadline_ms = server.nowMs() - 1;
+    conn.preserve_resume_credential_once = true;
+
+    // The bounded in-flight handshake blocks an upgrade, but expiry releases
+    // both predecessor-only latches rather than leaving UPGRADE stuck forever.
+    try std.testing.expect(!server.prepareSessionReplicaUpgradeBoundary());
+    server.sweepDeferredSessionAutojoins();
+    try std.testing.expect(!conn.resume_autojoin_deferred);
+    try std.testing.expectEqual(@as(i64, 0), conn.resume_autojoin_deadline_ms);
+    try std.testing.expect(!conn.preserve_resume_credential_once);
+    try std.testing.expect(server.prepareSessionReplicaUpgradeBoundary());
+
+    // Expiry is also a coherent TOKEN boundary: the next explicit request gets
+    // the current credential, not a stale retry-preservation warning.
+    conn.send_len = 0;
+    conn.send_offset = 0;
+    conn.send_overflow.clearAndFree(conn.overflow_allocator);
+    var token_line = try irc_line.parseLine("SESSION TOKEN");
+    try server.handleSession(id, conn, &token_line);
+    try expectContains(conn.send_buf[0..conn.send_len], "SESSION TOKEN ");
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], "RESUME_CREDENTIAL_PRESERVED") == null);
+}
+
+test "manual SESSION RESUME retry preservation expires without autojoin deferral and restores UPGRADE readiness" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "manual-retry-expiry";
+    const ghost_id = try addTestLocalClient(&server, "ManualGhost", account);
+    const claimant_id = try addTestLocalClient(&server, "ManualClaimant", account);
+    const claimant = server.connFor(claimant_id).?;
+    const ghost_cid = monitorIdFromClient(ghost_id);
+    const token = server.sessions.resumeHandleForClient(account, ghost_cid).?.token;
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot(account, ghost_cid, "corrupt-manual-resume-image"));
+    try std.testing.expect(!claimant.resume_autojoin_deferred);
+
+    const token_hex = std.fmt.bytesToHex(token, .lower);
+    var line_buf: [64]u8 = undefined;
+    var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(&line_buf, "SESSION RESUME {s}", .{token_hex}));
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "WARN SESSION TEMPORARILY_UNAVAILABLE");
+    try std.testing.expect(claimant.preserve_resume_credential_once);
+    try std.testing.expect(!claimant.resume_autojoin_deferred);
+    try std.testing.expect(claimant.resume_autojoin_deadline_ms > server.nowMs());
+    try std.testing.expect(!server.prepareSessionReplicaUpgradeBoundary());
+
+    // A manual retry has no autojoin hold for the old sweep to visit. Its own
+    // preservation deadline must still release the predecessor-only UPGRADE gate.
+    claimant.resume_autojoin_deadline_ms = server.nowMs() - 1;
+    server.sweepDeferredSessionAutojoins();
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+    try std.testing.expectEqual(@as(i64, 0), claimant.resume_autojoin_deadline_ms);
+    try std.testing.expect(server.prepareSessionReplicaUpgradeBoundary());
 }
 
 test "threaded server: explicit detached session resume spool conflict aborts before identity commit" {
@@ -81533,6 +81971,212 @@ test "threaded server: NAMES honors multi-prefix cap" {
     // the highest.
     try writeAllFd(fd_a, "NAMES #m\r\n");
     try recvUntil(&a, "!+A", 200);
+}
+
+test "session resume projection: large channel NAMES is complete and chunked past 512 members" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_clients = 1024,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const channel = "#large-names";
+    const member_count: usize = 513;
+    for (0..member_count) |i| {
+        var nick_buf: [64]u8 = undefined;
+        const nick = try std.fmt.bufPrint(&nick_buf, "RosterMember{d:0>4}LongNick", .{i});
+        const id = try addTestLocalClient(&server, nick, null);
+        try server.world.restoreMember(channel, worldIdFromClient(id), world_model.MemberModes.empty());
+    }
+    const viewer_id = try addTestLocalClient(&server, "NamesViewer", null);
+    const viewer = server.connFor(viewer_id).?;
+
+    const Inspection = struct {
+        namreply_lines: usize = 0,
+        end_lines: usize = 0,
+        member_tokens: usize = 0,
+
+        fn inspect(wire: []const u8) !@This() {
+            var result = @This(){};
+            var lines = std.mem.splitSequence(u8, wire, "\r\n");
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                try std.testing.expect(line.len <= names_reply.DEFAULT_MAX_LINE_BYTES);
+                const parsed = try irc_line.parseLine(line);
+                if (std.mem.eql(u8, parsed.command, "353")) {
+                    result.namreply_lines += 1;
+                    const params = parsed.paramSlice();
+                    try std.testing.expect(params.len != 0);
+                    var tokens = std.mem.splitScalar(u8, params[params.len - 1], ' ');
+                    while (tokens.next()) |token| {
+                        if (token.len != 0) result.member_tokens += 1;
+                    }
+                } else if (std.mem.eql(u8, parsed.command, "366")) {
+                    result.end_lines += 1;
+                }
+            }
+            return result;
+        }
+    };
+
+    // Ordinary NAMES must include the 513th member, span several legal 353
+    // lines, and close the complete burst with exactly one 366.
+    try server.sendNames(viewer, channel);
+    const ordinary_len = viewer.send_len - viewer.send_offset + viewer.send_overflow.items.len;
+    const ordinary = try allocator.alloc(u8, ordinary_len);
+    defer allocator.free(ordinary);
+    const ordinary_inline_len = viewer.send_len - viewer.send_offset;
+    @memcpy(ordinary[0..ordinary_inline_len], viewer.send_buf[viewer.send_offset..viewer.send_len]);
+    @memcpy(ordinary[ordinary_inline_len..], viewer.send_overflow.items);
+    const ordinary_inspection = try Inspection.inspect(ordinary);
+    try std.testing.expect(ordinary_inspection.namreply_lines > 1);
+    try std.testing.expectEqual(member_count, ordinary_inspection.member_tokens);
+    try std.testing.expectEqual(@as(usize, 1), ordinary_inspection.end_lines);
+    try expectContains(ordinary, "RosterMember0512LongNick");
+
+    viewer.send_len = 0;
+    viewer.send_offset = 0;
+    viewer.send_overflow.clearAndFree(viewer.overflow_allocator);
+
+    // SESSION RESUME renders against a not-yet-committed claimant projection.
+    // Even when the World roster already exceeds the old cap, the synthetic
+    // restored identity must be present before the same single 366 boundary.
+    const projected_nick = "ProjectedResume";
+    try server.sendNamesWithProjection(viewer, channel, .{
+        .exact_world_ids = &.{},
+        .nick = projected_nick,
+        .user = "resume-user",
+        .modes = world_model.MemberModes.fromModes(&.{.op}),
+        .is_override_oper = false,
+    });
+    const projected_len = viewer.send_len - viewer.send_offset + viewer.send_overflow.items.len;
+    const projected = try allocator.alloc(u8, projected_len);
+    defer allocator.free(projected);
+    const projected_inline_len = viewer.send_len - viewer.send_offset;
+    @memcpy(projected[0..projected_inline_len], viewer.send_buf[viewer.send_offset..viewer.send_len]);
+    @memcpy(projected[projected_inline_len..], viewer.send_overflow.items);
+    const projected_inspection = try Inspection.inspect(projected);
+    try std.testing.expect(projected_inspection.namreply_lines > 1);
+    try std.testing.expectEqual(member_count + 1, projected_inspection.member_tokens);
+    try std.testing.expectEqual(@as(usize, 1), projected_inspection.end_lines);
+    try expectContains(projected, "RosterMember0512LongNick");
+    try expectContains(projected, "@ProjectedResume");
+
+    // Capacity refusal is whole-burst atomic: an undersized SendQ gets neither
+    // an early 353 nor a misleading 366 that would close a partial roster.
+    viewer.send_len = 0;
+    viewer.send_offset = 0;
+    viewer.send_overflow.clearAndFree(viewer.overflow_allocator);
+    viewer.sendq_cap = 256;
+    try std.testing.expectError(error.OutputTooSmall, server.sendNames(viewer, channel));
+    try std.testing.expectEqual(@as(usize, 0), viewer.send_len);
+    try std.testing.expectEqual(@as(usize, 0), viewer.send_overflow.items.len);
+}
+
+test "NAMES rejects an admitted malformed remote member without partial 353 or 366" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{
+        .allocator = allocator,
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 1000,
+        .server_name = "peer.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer peer.deinit();
+    const link = try allocator.create(s2s_link.S2sLink);
+    try link.init(.{
+        .allocator = allocator,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_epoch_ms = 1001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+    try peer.start(50);
+    try pumpLinkPair(&peer, link, allocator);
+    try std.testing.expect(link.established());
+
+    // The resumed-roster seam models a previously admitted route row. The route
+    // table intentionally accepts opaque non-empty identity strings, so this
+    // malformed host reaches the NAMES boundary beside a valid remote member.
+    try link.primeResumedMember("#malformed-names", "ValidRemote", 1, 0, 100, .{
+        .username = "valid",
+        .host = "valid.example",
+    }, 100);
+    try link.primeResumedMember("#malformed-names", "MalformedRemote", 1, 0, 101, .{
+        .username = "bad",
+        .host = "bad host",
+    }, 101);
+    try std.testing.expectEqual(@as(usize, 2), link.channelMembers("#malformed-names").len);
+
+    const viewer_id = try addTestLocalClient(&server, "NamesViewer", null);
+    const viewer = server.connFor(viewer_id).?;
+    viewer.session.registration.registered = true;
+    try server.world.restoreMember("#malformed-names", worldIdFromClient(viewer_id), world_model.MemberModes.empty());
+
+    // Exercise the production CQE -> handleRecv -> processLiveLine firewall.
+    // Keep a synthetic SEND ownership reference so the connection remains
+    // inspectable after its per-connection roster fault is classified.
+    const command = "NAMES #malformed-names\r\n";
+    @memcpy(viewer.recv_buf[0..command.len], command);
+    viewer.recv_armed = true;
+    viewer.send_armed = true;
+    var handler = CompletionHandler{ .server = &server };
+    handler.onCompletion(.{ .recv = .{
+        .token = viewer.token,
+        .res = @intCast(command.len),
+        .more = false,
+    } });
+    try std.testing.expect(handler.err == null);
+    try std.testing.expect(viewer.closing);
+    try std.testing.expectEqual(@as(usize, 0), viewer.send_len);
+    try std.testing.expectEqual(@as(usize, 0), viewer.send_overflow.items.len);
+    viewer.send_armed = false;
+}
+
+test "labeled NAMES capture follows remaining SendQ beyond legacy 65 arenas" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var conn = ConnState.init(-1);
+    const legacy_cap = default_reply_bytes * 65;
+    conn.sendq_cap = legacy_cap + 128 * 1024;
+    conn.send_len = 1024;
+    conn.send_offset = 256;
+    const remaining = conn.sendq_cap - (conn.send_len - conn.send_offset);
+
+    try std.testing.expect(remaining > legacy_cap);
+    try std.testing.expectEqual(
+        remaining,
+        LinuxServer.labeledBulkCaptureCapacity(&conn, true).?,
+    );
+    try std.testing.expectEqual(
+        legacy_cap,
+        LinuxServer.labeledBulkCaptureCapacity(&conn, false).?,
+    );
+    conn.sendq_cap = conn.send_len - conn.send_offset;
+    try std.testing.expect(LinuxServer.labeledBulkCaptureCapacity(&conn, true) == null);
 }
 
 test "threaded server: IRCX NAMESX includes derived oper prefix in NAMES" {
