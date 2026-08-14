@@ -21979,6 +21979,15 @@ pub const LinuxServer = struct {
         try self.failReply(conn, "CHATHISTORY", "INVALID_PARAMS", reason);
     }
 
+    fn chathistoryCommandLine(line: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+        if (trimmed.len == 0) return null;
+        if (trimmed[0] != '@') return trimmed;
+        const tag_end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse return null;
+        const command_line = std.mem.trimStart(u8, trimmed[tag_end + 1 ..], " ");
+        return if (command_line.len == 0) null else command_line;
+    }
+
     fn handleChathistoryTargets(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
         const query = chathistory_targets.TargetsQuery.parse(line) catch |err| {
             try self.chathistoryTargetsFail(conn, err);
@@ -22029,12 +22038,18 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "CHATHISTORY", "NEED_REGISTRATION", "You must negotiate the draft/chathistory capability");
             return;
         }
-        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
-        if (std.ascii.startsWithIgnoreCase(trimmed, "CHATHISTORY TARGETS")) {
-            try self.handleChathistoryTargets(id, conn, trimmed);
+        // Module handlers receive the original wire line so they can inspect
+        // tags through `parsed`. The CHATHISTORY grammar itself begins at the
+        // command, not at an optional `@tags` prefix.
+        const command_line = chathistoryCommandLine(line) orelse {
+            try self.failReply(conn, "CHATHISTORY", "INVALID_PARAMS", "Invalid CHATHISTORY parameters");
+            return;
+        };
+        if (std.ascii.startsWithIgnoreCase(command_line, "CHATHISTORY TARGETS")) {
+            try self.handleChathistoryTargets(id, conn, command_line);
             return;
         }
-        const req = chathistory_cmd.parse(trimmed) catch |err| {
+        const req = chathistory_cmd.parse(command_line) catch |err| {
             // IRCv3 chathistory: malformed requests get a typed standard reply,
             // `FAIL CHATHISTORY <code> :<reason>`, never silence.
             const code = @tagName(chathistory_cmd.failCode(err));
@@ -67541,6 +67556,10 @@ test "topics: CHATHISTORY topic filter is extracted from the command's message t
     // inline parser exposes an @-stripped, +-preserving `tags_raw`, and
     // `handleChathistory` reads the filter from it via `topic_tag.labelFromTags`.
     const tagged = try irc_line.parseLine("@+onyx/topic=general CHATHISTORY LATEST #t * 50");
+    try std.testing.expectEqualStrings(
+        "CHATHISTORY LATEST #t * 50",
+        LinuxServer.chathistoryCommandLine("@+onyx/topic=general CHATHISTORY LATEST #t * 50\r\n").?,
+    );
     var tbuf: [topic_tag.max_label_len]u8 = undefined;
     const filter = if (tagged.tags_raw) |tr| topic_tag.labelFromTags(tr, &tbuf) else null;
     try std.testing.expectEqualStrings("general", filter.?);
@@ -67553,6 +67572,11 @@ test "topics: CHATHISTORY topic filter is extracted from the command's message t
     // No tag → null → the funnel replays everything (backward-compatible).
     const plain = try irc_line.parseLine("CHATHISTORY LATEST #t * 50");
     try std.testing.expect((if (plain.tags_raw) |tr| topic_tag.labelFromTags(tr, &tbuf) else null) == null);
+    try std.testing.expectEqualStrings(
+        "CHATHISTORY LATEST #t * 50",
+        LinuxServer.chathistoryCommandLine("CHATHISTORY LATEST #t * 50\r\n").?,
+    );
+    try std.testing.expect(LinuxServer.chathistoryCommandLine("@label=only") == null);
 }
 
 test "threaded server: +onyx/topic tag rides fanout + echo; untagged is unchanged" {
