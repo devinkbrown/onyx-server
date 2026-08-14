@@ -148,6 +148,12 @@ const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
 const account_identity = @import("../proto/account_identity.zig");
 const e2ee_policy = @import("../proto/e2ee_policy.zig");
+
+comptime {
+    if (e2ee_policy.max_room_envelope_wire_len != message_relay.max_text_len)
+        @compileError("required-room ciphertext limit must match the signed mesh relay body limit");
+}
+
 const e2ee_group_control = @import("../proto/e2ee_group_control.zig");
 const e2ee_group_delivery = @import("../proto/e2ee_group_delivery.zig");
 const topic_tag = @import("../proto/topic_tag.zig");
@@ -48547,22 +48553,6 @@ pub const LinuxServer = struct {
             self.spamtrapCheck(conn.session.displayName(), .nick, target, conn.session.isOper());
         }
 
-        var prefix_buf: [256]u8 = undefined;
-        var msg_buf: [default_reply_bytes]u8 = undefined;
-        const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), command, &.{target}, text);
-
-        // Allocate one event identity before any local/mesh fan-out. The same
-        // authenticated `(origin,hlc)` deterministically yields msgid + time on
-        // every node, so all attachments can reference and order one event.
-        const event_hlc = self.nextMeshHlc();
-        const event_time_ms = mesh_clock_mod.MeshClock.physicalOf(event_hlc);
-        var msgid_buf: [msgid_mod.id_len]u8 = undefined;
-        var message_id = msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
-
-        // IRCv3 echo-message: a sender that negotiated the cap also receives its
-        // own message back, byte-identical to what recipients see (`msg`).
-        const echo = conn.session.hasCap(.echo_message);
-
         // RFC 1459: NOTICE must NEVER generate an error
         // reply (prevents NOTICE/error ping-pong between bots and servers). All
         // delivery-failure numerics below are suppressed for NOTICE.
@@ -48606,6 +48596,29 @@ pub const LinuxServer = struct {
                 if (!is_notice) try self.failReply(conn, command, "E2EE_REQUIRED", "Channel requires encrypted messages");
                 return;
             }
+        }
+
+        // Required-room admission happened above, before we format an IRC line
+        // or allocate an event identity. In particular, an oversized tagged
+        // plaintext candidate produces E2EE_REQUIRED (or silent NOTICE), not an
+        // OutputTooSmall error or a partially admitted event.
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), command, &.{target}, text);
+
+        // Allocate one event identity before any local/mesh fan-out. The same
+        // authenticated `(origin,hlc)` deterministically yields msgid + time on
+        // every node, so all attachments can reference and order one event.
+        const event_hlc = self.nextMeshHlc();
+        const event_time_ms = mesh_clock_mod.MeshClock.physicalOf(event_hlc);
+        var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+        var message_id = msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
+
+        // IRCv3 echo-message: a sender that negotiated the cap also receives its
+        // own message back, byte-identical to what recipients see (`msg`).
+        const echo = conn.session.hasCap(.echo_message);
+
+        if (world_model.isChannelName(chan)) {
             const speech = try self.channelSpeechGate(id, conn, target, chan, text, is_notice, min_rank, true);
             if (speech == .deny) return;
             const opmod_route = speech == .opmoderate;
@@ -66872,6 +66885,18 @@ fn testMinRoomEnvelope(out: []u8) []const u8 {
     return out[0..need];
 }
 
+fn testMaxRoomEnvelope(out: []u8) []const u8 {
+    var body: [e2ee_policy.max_room_envelope_decoded_len]u8 = @splat(0);
+    body[0] = e2ee_policy.room_envelope_version;
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const need = e2ee_policy.room_envelope_prefix.len + encoder.calcSize(body.len);
+    std.debug.assert(need == e2ee_policy.max_room_envelope_wire_len);
+    std.debug.assert(out.len >= need);
+    @memcpy(out[0..e2ee_policy.room_envelope_prefix.len], e2ee_policy.room_envelope_prefix);
+    _ = encoder.encode(out[e2ee_policy.room_envelope_prefix.len..need], &body);
+    return out[0..need];
+}
+
 test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -66895,6 +66920,9 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
 
     var envelope_buf: [96]u8 = undefined;
     const envelope = testMinRoomEnvelope(&envelope_buf);
+    var max_envelope_buf: [e2ee_policy.max_room_envelope_wire_len]u8 = undefined;
+    const max_envelope = testMaxRoomEnvelope(&max_envelope_buf);
+    try std.testing.expect(e2ee_policy.isCanonicalRoomEnvelope(max_envelope));
     try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=mls", envelope, false));
     try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=1", envelope, false));
     try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=mls", "plain", false));
@@ -66943,16 +66971,35 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "ONYXROOM1") == null);
     try std.testing.expectEqual(history_before, server.history.totalStoredCount());
 
+    const format_oversize = try std.testing.allocator.alloc(u8, 40_001);
+    defer std.testing.allocator.free(format_oversize);
+    @memcpy(format_oversize[0..e2ee_policy.room_envelope_prefix.len], e2ee_policy.room_envelope_prefix);
+    @memset(format_oversize[e2ee_policy.room_envelope_prefix.len..], 'A');
     resetTestSendQ(alice);
     resetTestSendQ(bob);
-    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", envelope, "+onyx/e2ee=mls");
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", format_oversize, "+onyx/e2ee=mls");
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "ONYXROOM1") == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "NOTICE", "#e2eebody", format_oversize, "+onyx/e2ee=mls");
+    try std.testing.expectEqual(@as(usize, 0), alice.send_len);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "ONYXROOM1") == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", max_envelope, "+onyx/e2ee=mls");
     try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
-    try expectContains(bob.send_buf[0..bob.send_len], envelope);
+    try expectContains(bob.send_buf[0..bob.send_len], max_envelope);
     var hbuf: [8]lotus.Message = undefined;
     const recorded = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
-    try std.testing.expectEqual(@as(usize, 1), recorded.len);
-    try std.testing.expectEqualStrings(envelope, recorded[0].text);
-    try std.testing.expectEqualStrings("PRIVMSG", recorded[0].command);
+    // Live local delivery is bounded by the signed mesh body limit. The
+    // pre-existing Lotus CHATHISTORY store intentionally retains only 512-byte
+    // bodies, so its best-effort append drops this deliverable 4096-byte body.
+    try std.testing.expectEqual(@as(usize, 0), recorded.len);
 
     const mesh_before = server.history.totalStoredCount();
     resetTestSendQ(alice);
@@ -66997,24 +67044,55 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
         .source_prefix = "Remote!r@peer",
         .account = "",
         .tags = "+onyx/e2ee=mls",
-        .text = envelope,
+        .text = oversize,
         .origin_node = 4242,
         .hlc = 13,
     });
-    try expectContains(alice.send_buf[0..alice.send_len], envelope);
-    try expectContains(bob.send_buf[0..bob.send_len], envelope);
+    try std.testing.expectEqual(@as(usize, 0), alice.send_len);
+    try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+    try std.testing.expectEqual(mesh_before, server.history.totalStoredCount());
+
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "#e2eebody",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+onyx/e2ee=mls",
+        .text = format_oversize,
+        .origin_node = 4242,
+        .hlc = 14,
+    });
+    try std.testing.expectEqual(@as(usize, 0), alice.send_len);
+    try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+    try std.testing.expectEqual(mesh_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "#e2eebody",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+onyx/e2ee=mls",
+        .text = max_envelope,
+        .origin_node = 4242,
+        .hlc = 15,
+    });
+    try expectContains(alice.send_buf[0..alice.send_len], max_envelope);
+    try expectContains(bob.send_buf[0..bob.send_len], max_envelope);
     const after_mesh = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
-    try std.testing.expectEqual(@as(usize, 2), after_mesh.len);
+    try std.testing.expectEqual(@as(usize, 0), after_mesh.len);
 
     _ = try server.world.setChannelExtFlag("#e2eebody", .noformat, true);
     resetTestSendQ(alice);
     resetTestSendQ(bob);
-    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", envelope, "+onyx/e2ee=mls");
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", max_envelope, "+onyx/e2ee=mls");
     try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
-    try expectContains(bob.send_buf[0..bob.send_len], envelope);
+    try expectContains(bob.send_buf[0..bob.send_len], max_envelope);
     const after_noformat = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
-    try std.testing.expectEqual(@as(usize, 3), after_noformat.len);
-    try std.testing.expectEqualStrings(envelope, after_noformat[0].text);
+    try std.testing.expectEqual(@as(usize, 0), after_noformat.len);
 
     resetTestSendQ(alice);
     resetTestSendQ(bob);

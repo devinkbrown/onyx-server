@@ -9,7 +9,6 @@
 //! key identifiers/values stored as user PROP metadata.
 const std = @import("std");
 const e2ee_device_directory = @import("e2ee_device_directory.zig");
-const multiline = @import("multiline.zig");
 
 pub const policy_prop = "encryption-policy";
 pub const encrypted_tag_key = "+onyx/e2ee";
@@ -20,10 +19,10 @@ pub const room_envelope_prefix = "ONYXROOM1 ";
 pub const room_envelope_version: u8 = 1;
 /// version u8 + epoch u32be + nonce12 + GCM tag16.
 pub const min_room_envelope_decoded_len: usize = 1 + 4 + 12 + 16;
-/// Wire ceiling for `ONYXROOM1 ` + unpadded base64url. Matches the server's
-/// default draft/multiline body budget (the largest PRIVMSG/NOTICE the
-/// daemon will assemble). The client 48KiB decoded cap is not a server limit.
-pub const max_room_envelope_wire_len: usize = multiline.default_max_bytes;
+/// Wire ceiling for `ONYXROOM1 ` + unpadded base64url. This is the signed mesh
+/// relay body limit: required-room ciphertext must remain deliverable on every
+/// peer, rather than merely fitting a local draft/multiline aggregation buffer.
+pub const max_room_envelope_wire_len: usize = 4096;
 /// Largest decoded body whose unpadded encoding still fits in
 /// `max_room_envelope_wire_len` after the prefix.
 pub const max_room_envelope_decoded_len: usize = maxDecodedForWire(max_room_envelope_wire_len);
@@ -371,9 +370,7 @@ test "canonical ONYXROOM1 envelope accepts min and rejects every malformed shape
     try std.testing.expect(!isCanonicalRoomEnvelope(oversize));
 }
 
-test "daemon-bound room envelope ceiling matches multiline budget" {
-    try std.testing.expectEqual(multiline.default_max_bytes, max_room_envelope_wire_len);
-
+test "daemon-bound room envelope ceiling is canonical at its exact wire limit" {
     const encoder = std.base64.url_safe_no_pad.Encoder;
     const decoded = try std.testing.allocator.alloc(u8, max_room_envelope_decoded_len);
     defer std.testing.allocator.free(decoded);
