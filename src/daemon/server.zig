@@ -13777,7 +13777,18 @@ pub const LinuxServer = struct {
 
         if (want_label) |label| {
             var cap_buf: [default_reply_bytes]u8 = undefined;
-            var capture = ReplyCapture{ .buf = &cap_buf };
+            const bulk_label = std.ascii.eqlIgnoreCase(parsed.command, "CHATHISTORY") or
+                std.ascii.eqlIgnoreCase(parsed.command, "SEARCH") or
+                std.ascii.eqlIgnoreCase(parsed.command, "JOIN");
+            const bulk_buf = if (bulk_label)
+                self.allocator.alloc(u8, default_reply_bytes * 65) catch {
+                    self.poisonOwnedDelivery(conn);
+                    return;
+                }
+            else
+                null;
+            defer if (bulk_buf) |storage| self.allocator.free(storage);
+            var capture = ReplyCapture{ .buf = bulk_buf orelse &cap_buf };
             conn.reply_capture = &capture;
             const outcome = self.dispatchModules(id, conn, parsed, line) catch |err| {
                 conn.reply_capture = null;
@@ -13785,7 +13796,9 @@ pub const LinuxServer = struct {
             };
             conn.reply_capture = null; // restore the wire path before re-emitting
             if (outcome == .handled) {
-                try emitLabeledIssuer(conn, label, &capture);
+                emitLabeledIssuer(conn, label, &capture, self.allocator) catch {
+                    self.poisonOwnedDelivery(conn);
+                };
                 return;
             }
             // not_found: the spine emitted nothing into the capture; fall through
@@ -21794,6 +21807,52 @@ pub const LinuxServer = struct {
         return owned;
     }
 
+    /// Enqueue a rendered replay one complete IRC line at a time.  The replay
+    /// may legitimately exceed the daemon's 8 KiB logical-record boundary even
+    /// though each individual IRC line is legal.  Treating the whole batch as a
+    /// single append makes the connection firewall close an otherwise healthy
+    /// reader; line-wise appends preserve the exact byte stream while allowing
+    /// SendQ overflow and TLS/WebSocket framing to operate on bounded records.
+    fn appendHistoryReplay(conn: *ConnState, replay: []const u8) !void {
+        const websocket_open = if (conn.ws) |ws| ws.phase == .open else false;
+        const userspace_tls = if (conn.tls) |tls| tls.handshakeDone() and !conn.tls_tx_offloaded else false;
+        const raw_bound = linewiseReplayRawBound(replay, websocket_open, userspace_tls) orelse
+            return error.OutputTooSmall;
+        try reserveRawAppendToConn(conn, raw_bound);
+        var rest = replay;
+        while (std.mem.indexOfScalar(u8, rest, '\n')) |newline| {
+            const line = rest[0 .. newline + 1];
+            if (line.len > default_reply_bytes) return error.OutputTooSmall;
+            rest = rest[newline + 1 ..];
+        }
+        if (rest.len != 0) return error.OutputTooSmall;
+
+        rest = replay;
+        while (std.mem.indexOfScalar(u8, rest, '\n')) |newline| {
+            const line = rest[0 .. newline + 1];
+            try appendToConn(conn, line);
+            rest = rest[newline + 1 ..];
+        }
+    }
+
+    /// Conservative SendQ reservation for a replay emitted one line per append.
+    /// Userspace TLS creates at least one record for every append, so its record
+    /// count is the number of IRC lines rather than ceil(total/16KiB).
+    fn linewiseReplayRawBound(replay: []const u8, websocket_open: bool, userspace_tls: bool) ?usize {
+        const lines = std.mem.count(u8, replay, "\n");
+        var bytes = replay.len;
+        if (websocket_open) {
+            const terminators = std.math.mul(usize, lines, 2) catch return null;
+            if (terminators > bytes) return null;
+            bytes -= terminators;
+            bytes = std.math.add(usize, bytes, std.math.mul(usize, lines, 10) catch return null) catch return null;
+        }
+        if (userspace_tls) {
+            bytes = std.math.add(usize, bytes, std.math.mul(usize, lines, 256) catch return null) catch return null;
+        }
+        return bytes;
+    }
+
     /// The EPHEMERAL TTL for a channel in milliseconds (0 = not ephemeral).
     /// Read straight from the IRCX EPHEMERAL prop (a plain, mesh-propagated
     /// channel property), parsed as a whole-second TTL.
@@ -21893,7 +21952,10 @@ pub const LinuxServer = struct {
             return;
         };
         defer self.allocator.free(replay);
-        try appendToConn(conn, replay);
+        appendHistoryReplay(conn, replay) catch {
+            self.poisonOwnedDelivery(conn);
+            return;
+        };
     }
 
     /// CHATHISTORY <sub> <target> <criteria...> <limit> — IRCv3 history replay.
@@ -22091,7 +22153,10 @@ pub const LinuxServer = struct {
             return;
         };
         defer self.allocator.free(replay);
-        try appendToConn(conn, replay);
+        appendHistoryReplay(conn, replay) catch {
+            self.poisonOwnedDelivery(conn);
+            return;
+        };
     }
 
     /// A CHATHISTORY entry is a draft/event-playback EVENT (rather than an
@@ -22231,7 +22296,10 @@ pub const LinuxServer = struct {
             return;
         };
         defer self.allocator.free(replay);
-        try appendToConn(conn, replay);
+        appendHistoryReplay(conn, replay) catch {
+            self.poisonOwnedDelivery(conn);
+            return;
+        };
     }
 
     /// AND semantics: whether `msgid` is in the index hit list for every word in
@@ -50013,19 +50081,25 @@ fn setCloexec(fd: linux.fd_t, enabled: bool) bool {
 }
 
 /// Reframe a captured labeled command's plaintext replies under `label` and
-/// emit them on the wire (through the normal WS/TLS seam). A capture overflow,
-/// or framing that will not fit the scratch buffer, degrades to delivering the
-/// captured reply unwrapped rather than dropping it — only reachable when a
-/// single command emits more than one full inline buffer to the issuer.
-fn emitLabeledIssuer(conn: *ConnState, label: []const u8, capture: *const ReplyCapture) ServerError!void {
-    if (capture.overflowed) return appendToConn(conn, capture.captured());
-    var frame_buf: [default_reply_bytes]u8 = undefined;
-    var sink = FrameBufSink{ .buf = &frame_buf };
+/// emit them on the wire (through the normal WS/TLS seam). Bulk commands receive
+/// a bounded larger capture in dispatchRegistered; any remaining capture
+/// overflow fails closed before a truncated IRC line can reach the transport.
+fn emitLabeledIssuer(
+    conn: *ConnState,
+    label: []const u8,
+    capture: *const ReplyCapture,
+    allocator: std.mem.Allocator,
+) ServerError!void {
+    if (capture.overflowed) return error.OutputTooSmall;
+    const lines = std.mem.count(u8, capture.captured(), "\n");
+    const framing_slack = std.math.mul(usize, lines + 3, 256) catch return error.OutputTooSmall;
+    const capacity = std.math.add(usize, capture.captured().len, framing_slack) catch return error.OutputTooSmall;
+    const frame_buf = allocator.alloc(u8, @max(capacity, default_reply_bytes)) catch return error.OutputTooSmall;
+    defer allocator.free(frame_buf);
+    var sink = FrameBufSink{ .buf = frame_buf };
     var it = CrlfReplyIterator{ .bytes = capture.captured() };
-    labeled_response.emitIterator(&sink, label, labeled_batch_ref, &it) catch {
-        return appendToConn(conn, capture.captured());
-    };
-    return appendToConn(conn, sink.written());
+    labeled_response.emitIterator(&sink, label, labeled_batch_ref, &it) catch return error.OutputTooSmall;
+    return LinuxServer.appendHistoryReplay(conn, sink.written());
 }
 
 /// Guarded choke point for the inline reply-line builders that embed
@@ -56959,6 +57033,9 @@ fn addTestLocalClient(server: *Server, nick: []const u8, account: ?[]const u8) !
         const id = try server.rx().clients.alloc(ConnState.init(-1));
         const conn = server.rx().clients.get(id).?;
         conn.token = try tokenFromId(id);
+        // Match the production accept path: tests that exercise a real SendQ
+        // overflow must have an allocator for the heap-backed tail.
+        conn.overflow_allocator = server.allocator;
         try conn.session.setNick(nick);
         if (account) |acct| conn.session.loginAs(acct);
         try server.world.registerNick(nick, worldIdFromClient(id));
@@ -58788,7 +58865,7 @@ test "emitLabeledIssuer: single captured line is tagged with the label" {
     var cb: [256]u8 = undefined;
     var cap = ReplyCapture{ .buf = &cb };
     cap.append(":onyx 351 me v :info\r\n");
-    try emitLabeledIssuer(&conn, "lbl1", &cap);
+    try emitLabeledIssuer(&conn, "lbl1", &cap, std.testing.allocator);
     try std.testing.expectEqualStrings("@label=lbl1 :onyx 351 me v :info\r\n", conn.send_buf[0..conn.send_len]);
 }
 
@@ -58798,7 +58875,7 @@ test "emitLabeledIssuer: multi-line response is a labeled BATCH" {
     var cap = ReplyCapture{ .buf = &cb };
     cap.append(":onyx 311 me nick u h * :n\r\n");
     cap.append(":onyx 318 me nick :End\r\n");
-    try emitLabeledIssuer(&conn, "w1", &cap);
+    try emitLabeledIssuer(&conn, "w1", &cap, std.testing.allocator);
     const out = conn.send_buf[0..conn.send_len];
     try expectContains(out, "@label=w1 BATCH +suzu-label labeled-response\r\n");
     try expectContains(out, "@batch=suzu-label :onyx 311 me nick u h * :n\r\n");
@@ -58810,20 +58887,18 @@ test "emitLabeledIssuer: a command that replies nothing yields a bare ACK" {
     var conn = ConnState.init(-1);
     var cb: [64]u8 = undefined;
     var cap = ReplyCapture{ .buf = &cb };
-    try emitLabeledIssuer(&conn, "pong7", &cap);
+    try emitLabeledIssuer(&conn, "pong7", &cap, std.testing.allocator);
     try std.testing.expectEqualStrings("@label=pong7 ACK\r\n", conn.send_buf[0..conn.send_len]);
 }
 
-test "emitLabeledIssuer: capture overflow delivers the reply unwrapped" {
+test "emitLabeledIssuer: capture overflow fails closed without a partial line" {
     var conn = ConnState.init(-1);
     var cb: [16]u8 = undefined;
     var cap = ReplyCapture{ .buf = &cb };
     cap.append(":onyx 351 me v :a really long info line that overflows\r\n");
     try std.testing.expect(cap.overflowed);
-    try emitLabeledIssuer(&conn, "x", &cap);
-    const out = conn.send_buf[0..conn.send_len];
-    try std.testing.expect(std.mem.indexOf(u8, out, "@label=") == null);
-    try std.testing.expectEqualStrings(cap.captured(), out);
+    try std.testing.expectError(error.OutputTooSmall, emitLabeledIssuer(&conn, "x", &cap, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
 }
 
 test "threaded server: a labeled WHOIS is reframed under the @label via SerpentRegistry" {
@@ -67059,6 +67134,39 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
     defer server.allocator.free(large_replay);
     try std.testing.expect(large_replay.len > default_reply_bytes * 4);
     try expectContains(large_replay, max_envelope);
+    const replay_lines = std.mem.count(u8, large_replay, "\n");
+    try std.testing.expectEqual(
+        large_replay.len + replay_lines * 256,
+        LinuxServer.linewiseReplayRawBound(large_replay, false, true).?,
+    );
+    try std.testing.expectEqual(
+        large_replay.len - replay_lines * 2 + replay_lines * 10 + replay_lines * 256,
+        LinuxServer.linewiseReplayRawBound(large_replay, true, true).?,
+    );
+    resetTestSendQ(alice);
+    try LinuxServer.appendHistoryReplay(alice, large_replay);
+    try std.testing.expectEqual(large_replay.len, alice.send_len + alice.send_overflow.items.len);
+    try std.testing.expectEqualSlices(u8, large_replay[0..alice.send_len], alice.send_buf[0..alice.send_len]);
+    try std.testing.expectEqualSlices(u8, large_replay[alice.send_len..], alice.send_overflow.items);
+
+    resetTestSendQ(alice);
+    const original_sendq_cap = alice.sendq_cap;
+    alice.sendq_cap = large_replay.len - 1;
+    try std.testing.expectError(error.OutputTooSmall, LinuxServer.appendHistoryReplay(alice, large_replay));
+    try std.testing.expectEqual(@as(usize, 0), alice.send_len);
+    try std.testing.expectEqual(@as(usize, 0), alice.send_overflow.items.len);
+    alice.sendq_cap = original_sendq_cap;
+
+    const label_storage = try std.testing.allocator.alloc(u8, large_replay.len);
+    defer std.testing.allocator.free(label_storage);
+    var label_capture = ReplyCapture{ .buf = label_storage };
+    label_capture.append(large_replay);
+    try emitLabeledIssuer(alice, "e2ee-label", &label_capture, std.testing.allocator);
+    const labeled_wire = try copyTestSendQ(std.testing.allocator, alice);
+    defer std.testing.allocator.free(labeled_wire);
+    try expectContains(labeled_wire, "@label=e2ee-label BATCH +suzu-label labeled-response\r\n");
+    try expectContains(labeled_wire, "BATCH -suzu-label\r\n");
+    try expectContains(labeled_wire, max_envelope);
 
     const mesh_before = (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len;
     resetTestSendQ(alice);

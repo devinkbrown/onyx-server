@@ -210,7 +210,9 @@ fn validateLabel(label: []const u8) LabeledError!void {
 
 fn validTagKey(key: []const u8) bool {
     if (key.len == 0) return false;
-    for (key) |ch| {
+    const start: usize = if (key[0] == '+') 1 else 0;
+    if (start == key.len) return false;
+    for (key[start..]) |ch| {
         switch (ch) {
             'a'...'z', 'A'...'Z', '0'...'9', '-', '.', '/', '_' => {},
             else => return false,
@@ -355,6 +357,19 @@ test "existing message tags are preserved after the label or batch tag" {
     const line = try tagLine("needs escaping; \\r\n", "@time=2026-06-04T00:00:00.000Z NOTICE me :ok", &out);
     try std.testing.expectEqualStrings(
         "@label=needs\\sescaping\\:\\s\\\\r\\n;time=2026-06-04T00:00:00.000Z NOTICE me :ok\r\n",
+        line,
+    );
+}
+
+test "client-only message tags remain valid when batch-tagged" {
+    var out: [192]u8 = undefined;
+    const line = try batchTagLine(
+        "history",
+        "@time=2026-06-04T00:00:00.000Z;+onyx/e2ee=mls :nick!u@h PRIVMSG #room :cipher\r\n",
+        &out,
+    );
+    try std.testing.expectEqualStrings(
+        "@batch=history;time=2026-06-04T00:00:00.000Z;+onyx/e2ee=mls :nick!u@h PRIVMSG #room :cipher\r\n",
         line,
     );
 }
