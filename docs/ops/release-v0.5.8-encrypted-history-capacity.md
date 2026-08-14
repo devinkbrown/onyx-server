@@ -1,6 +1,6 @@
 # v0.5.8 encrypted-room history capacity follow-up
 
-**Status:** source-staged; not production-verified until the deployment record below is completed.
+**Status:** production-verified on both nodes (2026-08-14).
 
 ## Scope
 
@@ -45,10 +45,29 @@ is complete and correctly batch-framed.
 
 ## Deployment record
 
-Fill only after both nodes are upgraded and independently verified:
+- Final source/binary version: `35598f7` / `Onyx Server 0.5.8+35598f7`.
+- Artifact SHA-256:
+  `ed6f2213f8458f20caec3b31567fcbbdcc4476749a23dc6fe374899729ee6a98`.
+- Final-source gates: `zig fmt --check`, `zig build test`, and
+  `zig build test -Doptimize=ReleaseSafe` all exited zero. The focused
+  CHATHISTORY suite passed 81/81, and independent blocker review found no P0/P1.
+- Local `eshmaki.me`: active with unchanged PID `828697`; the journal recorded
+  the `35598f7` banner, Helix resume, six restored client connections, and the
+  resumed secured link to `ircx.us`.
+- Remote `ircx.us`: active with unchanged PID `1245448`; the journal recorded
+  the `35598f7` banner, Helix resume, three restored TLS client connections, and
+  the resumed secured link to `eshmaki.me`.
+- Secured mesh: both metrics endpoints reported `links_active=1`, `peers_up=1`,
+  and `partitioned=0`; Era2 acceptance and bidirectional plaintext-to-TLS guest
+  chat smoke both passed.
+- Live maximum-envelope proof: eight distinct exact 4096-byte `ONYXROOM1`
+  messages delivered from the local node to the remote node and replayed
+  completely from remote TLS in one labeled-response `CHATHISTORY` batch larger
+  than 32 KiB. This also proved tagged CHATHISTORY parsing and client-only E2EE
+  tag preservation.
+- Rollback binaries retained on both nodes, including the pre-wave `659a7c2`
+  backup and the intermediate `d50e5e7` backup from the tagged-command follow-up.
 
-- Artifact SHA-256: pending
-- Local node banner and service state: pending
-- `ircx.us` node banner and service state: pending
-- Secured mesh health: pending
-- Live maximum-envelope history proof: pending
+The first local `659a7c2` rollout attempt was correctly refused while session
+replicas were converging; a later verified retry succeeded. No restart or PID
+change was used for either final `35598f7` upgrade.
