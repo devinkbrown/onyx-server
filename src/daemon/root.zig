@@ -162,6 +162,10 @@ pub const oper_session_provenance = @import("oper_session_provenance.zig");
 /// Allocation-free, projection-free coordinator for staged OCG2 observation.
 /// The module deliberately exposes no session, mesh, minting, or grant surface.
 pub const ocg2_runtime = @import("ocg2_runtime.zig");
+/// Transactional, allocation-bounded OCG2 projection queue.  The leaf is
+/// exported for the integrator but owns no session, mesh, issuer, or minting
+/// capability.
+pub const ocg2_projection_runtime = @import("ocg2_projection_runtime.zig");
 
 // Compile the inactive issuer leaf without publishing the module or its Impl.
 comptime {
@@ -330,6 +334,7 @@ test {
     _ = durable_oper_authority_boot;
     _ = oper_session_provenance;
     _ = ocg2_runtime;
+    _ = ocg2_projection_runtime;
     _ = @import("ocg2_authority_issuer.zig");
     _ = @import("ocg2_reconcile_schedule.zig");
     _ = @import("ocg2_reconcile_workset.zig");
