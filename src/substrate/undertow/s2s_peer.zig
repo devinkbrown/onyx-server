@@ -2855,6 +2855,22 @@ pub const S2sPeer = struct {
         });
     }
 
+    /// Reap stale compatibility-roster rows while retaining the derived PART
+    /// transitions first. The daemon drains the same ordered identity queue as
+    /// ordinary MEMBERSHIP and signed-session reconciliation, so incremental
+    /// clients cannot keep a zombie that NAMES has already forgotten.
+    pub fn pruneStaleMembers(self: *S2sPeer, now_ms: i64, window_ms: i64) route_table.Error!usize {
+        return self.routes.pruneStaleObserved(now_ms, window_ms, .{
+            .ctx = self,
+            .part_fn = queueReconciledSessionPart,
+            .rename_fn = rejectStaleMemberRename,
+        });
+    }
+
+    fn rejectStaleMemberRename(_: *anyopaque, _: []const u8, _: []const u8, _: *const route_table.Member) std.mem.Allocator.Error!void {
+        unreachable;
+    }
+
     fn queueReconciledSessionPart(ctx: *anyopaque, channel: []const u8, member: *const route_table.Member) std.mem.Allocator.Error!void {
         const self: *S2sPeer = @ptrCast(@alignCast(ctx));
         try self.queueMembershipValues(channel, member.nick, member.username, member.realname, member.host, "", member.account, .parted, member.status, member.status);

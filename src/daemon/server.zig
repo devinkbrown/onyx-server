@@ -6301,10 +6301,22 @@ pub const LinuxServer = struct {
             if (!slot.occupied) continue;
             if (slot.value.s2s_secured) |link| {
                 if (!link.established()) continue;
-                if (link.inner) |inner| _ = inner.peer.routes.pruneStale(now_ms, window);
+                if (link.inner) |inner| {
+                    _ = inner.peer.pruneStaleMembers(now_ms, window) catch {
+                        // Earlier per-row transactions may already have queued
+                        // departures before a later allocation failed.
+                        self.drainIdentityTransitions(inner);
+                        continue;
+                    };
+                    self.drainIdentityTransitions(inner);
+                }
             } else if (slot.value.s2s) |link| {
                 if (!link.established()) continue;
-                _ = link.peer.routes.pruneStale(now_ms, window);
+                _ = link.peer.pruneStaleMembers(now_ms, window) catch {
+                    self.drainIdentityTransitions(link);
+                    continue;
+                };
+                self.drainIdentityTransitions(link);
             }
         }
     }
@@ -17361,10 +17373,29 @@ pub const LinuxServer = struct {
         return conn.mesh_nick_hlc;
     }
 
+    /// Exact reusable-session token held by the local nick owner. Account
+    /// equality alone is insufficient here: only the exact signed session may
+    /// collapse a remote UID sidecar into this canonical local identity.
+    fn localNickSessionToken(ctx: *anyopaque, nick: []const u8) ?s2s_link.S2sLink.SessionToken {
+        const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+        const wid = self.world.findNick(nick) orelse return null;
+        const id = clientIdFromWorld(wid);
+        const conn = self.connFor(id) orelse return null;
+        const account = conn.session.account() orelse return null;
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return null;
+        return handle.token;
+    }
+
     /// Build the borrowed `LocalNickResolver` the mesh links consult; `self` must
     /// outlive every link (it does — links are torn down before server shutdown).
     fn localNickResolver(self: *LinuxServer) s2s_link.S2sLink.LocalNickResolver {
-        return .{ .ctx = self, .held_fn = localNickHeld, .account_fn = localNickAccount, .hlc_fn = localNickHlc };
+        return .{
+            .ctx = self,
+            .held_fn = localNickHeld,
+            .account_fn = localNickAccount,
+            .hlc_fn = localNickHlc,
+            .session_token_fn = localNickSessionToken,
+        };
     }
 
     /// The `identity.key.*` / `identity.residence.*` account-identity props are
@@ -23400,9 +23431,14 @@ pub const LinuxServer = struct {
     /// this probe NEVER restores or consumes the newest ghost implicitly.
     fn restoreDetachedBeforeAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8) bool {
         const cid = monitorIdFromClient(id);
-        const candidate = self.sessions.copyNewestDetachedSnapshotInAccount(self.allocator, account, cid) catch return false;
-        const detached = candidate orelse return false;
-        defer self.allocator.free(detached.snapshot);
+        const candidate = self.sessions.copyNewestDetachedSnapshotInAccount(self.allocator, account, cid) catch null;
+        const has_local_candidate = candidate != null;
+        if (candidate) |detached| self.allocator.free(detached.snapshot);
+        // A portable resume may exist only on a peer, so the local SessionStore
+        // cannot always predict it before the post-001 SESSION RESUME command.
+        // Any client that negotiated the session-sync contract gets the same
+        // bounded window; SESSION TOKEN releases a genuinely fresh login at once.
+        if (!has_local_candidate and !conn.session.hasCap(.onyx_session_sync)) return false;
 
         conn.resume_autojoin_deferred = true;
         conn.resume_autojoin_deadline_ms = self.nowMs() + 2_000;
@@ -39691,15 +39727,17 @@ pub const LinuxServer = struct {
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "TOKEN")) {
-            // Onyx sends RESUME then TOKEN in-order after 001. Reaching TOKEN with
-            // the deferral still set means no resume succeeded; release autojoin
-            // now instead of waiting for the timer.
-            self.finishDeferredSessionAutojoin(id, conn, false);
             if (conn.preserve_resume_credential_once) {
                 conn.preserve_resume_credential_once = false;
                 try self.warnReply(conn, "SESSION", "RESUME_CREDENTIAL_PRESERVED", "retryable resume did not consume the stored credential; repeat SESSION TOKEN to replace it");
                 return;
             }
+            // Onyx sends RESUME then TOKEN in-order after 001. Reaching TOKEN with
+            // the deferral still set means no resume succeeded; release autojoin
+            // now instead of waiting for the timer. A retryable RESUME failure is
+            // handled above and deliberately preserves both the credential and
+            // deferral, preventing a temporary nick from joining account rooms.
+            self.finishDeferredSessionAutojoin(id, conn, false);
             if (self.sessions.resumeHandleForClient(account, cid)) |handle| {
                 if (!tokenIsNull(handle.token)) {
                     const hex = std.fmt.bytesToHex(handle.token, .lower);
@@ -71104,6 +71142,28 @@ fn expectSingleNamesNick(
     try std.testing.expectEqual(@as(usize, 1), matches);
 }
 
+/// Assert the complete (possibly split across several 353 replies) roster has
+/// exactly one entry, with the expected status spelling, and no generated mesh
+/// UID. The terminating 366 must already have been received by the caller.
+fn expectExactSingleNamesRoster(bytes: []const u8, header: []const u8, expected_entry: []const u8) !void {
+    var lines = std.mem.splitSequence(u8, bytes, "\r\n");
+    var entries_seen: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, header) == null) continue;
+        const trailing_at = std.mem.indexOf(u8, line, " :") orelse return error.TestUnexpectedResult;
+        var entries = std.mem.tokenizeScalar(u8, line[trailing_at + 2 ..], ' ');
+        while (entries.next()) |entry| {
+            entries_seen += 1;
+            try std.testing.expectEqualStrings(expected_entry, entry);
+            var nick_at: usize = 0;
+            while (nick_at < entry.len and std.mem.indexOfScalar(u8, "*!.@+", entry[nick_at]) != null)
+                nick_at += 1;
+            try std.testing.expect(!mesh_uid_alloc.validate(entry[nick_at..]));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries_seen);
+}
+
 fn waitMillis(ms: i64) void {
     const deadline = platform.monotonicMillis() + ms;
     while (platform.monotonicMillis() < deadline) {}
@@ -71418,6 +71478,40 @@ test "threaded server: login defers autojoin and restores only after exact SESSI
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "TempResume") == null);
 }
 
+test "threaded server: session-sync fresh login defers autojoin until SESSION TOKEN" {
+    var cfg = operTestConfig(0);
+    cfg.sasl_checker = test_dm_relay_checker;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try server.autojoins.add("nova", "#autohome");
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+    try saslPlainPreludeWithCaps(fd, "nova", "pw", "onyx/session-sync");
+    try writeAllFd(fd, "NICK TempPortable\r\nUSER web 0 * :Portable resume\r\n");
+    try recvUntil(&client, " 001 TempPortable ", 200);
+    testSleepMs(50);
+    try client.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), "JOIN #autohome") == null);
+
+    client.reset();
+    try writeAllFd(fd, "SESSION TOKEN\r\n");
+    try recvUntil(&client, "JOIN #autohome", 200);
+}
+
 test "threaded server: SASL-opered login keeps privileges across explicit detached-session restore" {
     // Regression: SASL registration elevates the live session FIRST, then the
     // client explicitly restores its detached ghost. The ghost's migration
@@ -71688,14 +71782,18 @@ test "threaded server: session reclaim local restore failure leaves the ghost re
     // Onyx immediately asks for TOKEN after RESUME. The first request after a
     // retryable failure must not overwrite the old stored credential. A second
     // explicit request is the user's escape hatch to replace it.
+    b_conn.resume_autojoin_deferred = true;
+    b_conn.resume_autojoin_deadline_ms = platform.monotonicMillis() + 10_000;
     b_conn.send_len = 0;
     var token_line = try irc_line.parseLine("SESSION TOKEN");
     try server.handleSession(b_id, b_conn, &token_line);
     try expectContains(b_conn.send_buf[0..b_conn.send_len], "WARN SESSION RESUME_CREDENTIAL_PRESERVED");
     try std.testing.expect(std.mem.indexOf(u8, b_conn.send_buf[0..b_conn.send_len], ":SESSION TOKEN ") == null);
+    try std.testing.expect(b_conn.resume_autojoin_deferred);
     b_conn.send_len = 0;
     try server.handleSession(b_id, b_conn, &token_line);
     try expectContains(b_conn.send_buf[0..b_conn.send_len], "SESSION TOKEN ");
+    try std.testing.expect(!b_conn.resume_autojoin_deferred);
 }
 
 test "SESSION DROP removes a sibling attachment by LIST index" {
@@ -91722,6 +91820,18 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     try std.testing.expect(std.mem.indexOf(u8, a.written(), ":DeviceB!") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), ":DeviceC!") == null);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), ":DeviceC!") == null);
+
+    // Incremental transition silence is not enough: the converged NAMES image
+    // must also collapse every receiver-derived UID/temporary alias into the
+    // one signed logical identity on every node.
+    for ([_]*LiveClient{ a, b, c }) |client| {
+        client.reset();
+        try writeAllFd(client.fd, "NAMES #mesh-line\r\n");
+        try recvUntil(client, " 366 Nova #mesh-line ", 800);
+        try expectExactSingleNamesRoster(client.written(), " 353 Nova = #mesh-line ", "!Nova");
+        try std.testing.expect(std.mem.indexOf(u8, client.written(), "DeviceB") == null);
+        try std.testing.expect(std.mem.indexOf(u8, client.written(), "DeviceC") == null);
+    }
 
     // State changes after every original attachment is live must converge from
     // the exact-token signed snapshot, including across node 2's forwarding hop.
