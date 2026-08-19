@@ -383,6 +383,8 @@ const relay_v2_deferred_capacity: usize = 256;
 const relay_v2_initial_retry_ms: u64 = 1000;
 const relay_v2_retry_frame_budget: usize = 32;
 const relay_v2_retry_byte_budget: usize = 256 * 1024;
+const relay_v2_unknown_home_retry_limit: u8 = 8;
+const relay_v2_unknown_home_retry_ttl_ms: u64 = 30_000;
 const e2ee_group_initial_retry_ms: u64 = 1000;
 const e2ee_group_retry_frame_budget: usize = 32;
 const RelayV2RetryWork = struct {
@@ -394,6 +396,20 @@ const E2eeGroupRetryWork = struct {
     peer: u64,
     relay_id: e2ee_group_relay.RelayId,
     wire: []u8,
+};
+const RelayV2DeferredReason = enum {
+    transient,
+    unknown_home_authority,
+};
+const DeferredRelayV2 = struct {
+    inbound: s2s_link.InboundMessageV2,
+    reason: RelayV2DeferredReason,
+    first_deferred_ms: u64,
+    retries: u8 = 0,
+
+    fn deinit(self: *DeferredRelayV2, allocator: std.mem.Allocator) void {
+        self.inbound.deinit(allocator);
+    }
 };
 
 /// Test-only deterministic ACK fault target. Live reactor threads and the
@@ -3618,7 +3634,7 @@ pub const LinuxServer = struct {
     /// and decoded owned fields without consuming RVG2; timer/session-replica
     /// turns retry them locally, so correctness never depends on a sender
     /// defeating its outbound reflection cache and retransmitting.
-    relay_v2_deferred: [relay_v2_deferred_capacity]s2s_link.InboundMessageV2 = undefined,
+    relay_v2_deferred: [relay_v2_deferred_capacity]DeferredRelayV2 = undefined,
     relay_v2_deferred_len: usize = 0,
     /// Count of inbound relayed MESSAGEs dropped in `deliverRelay` because their
     /// self-contained origin signature failed (bad Ed25519 signature, or a pubkey
@@ -3630,13 +3646,16 @@ pub const LinuxServer = struct {
     /// Count of inbound relayed MESSAGEs whose sender nick is homed on a KNOWN
     /// mesh node that is NOT the frame's `origin_node` (a keyed-but-Byzantine peer
     /// asserting a prefix for a user this receiver homes on a *different* node).
-    /// Such a message is dropped LOCALLY (never rendered / folded into local
-    /// state) but is still re-forwarded, so a downstream node with fresher routing
-    /// makes its own decision. Distinct from `rejected_relay_signatures`: the
+    /// Such a message is dropped fail-closed (never rendered / folded into local
+    /// state and never propagated). Distinct from `rejected_relay_signatures`: the
     /// signature check binds `origin_node` to the signing key, this binds the
     /// *sender identity* to its home node (and also guards the legacy unsigned
     /// path, where `origin_node` is otherwise fully spoofable).
     rejected_relay_home_mismatch: u64 = 0,
+    /// Count of legacy relay-v1 messages dropped because sender-home authority was
+    /// unknown at this node and no signed/portable bypass proof existed. Distinct
+    /// from known-home mismatch for observability.
+    rejected_relay_unknown_home_v1: u64 = 0,
     /// Remote user `e2ee.device.*` facts are never an authority source. Count
     /// their pre-admission quarantine separately so operators can distinguish a
     /// credential-injection attempt from an ordinary bad origin signature.
@@ -10884,9 +10903,16 @@ pub const LinuxServer = struct {
         return if (best) |claim| claim.node_id else null;
     }
 
-    /// Inbound sender-identity binding: true when the relayed message's sender nick
-    /// is homed on a mesh node this receiver KNOWS, and that home is NOT the frame's
-    /// claimed `origin_node`. `source_prefix` IS covered by relay-v1's signed
+    const RelaySenderHome = union(enum) {
+        unknown,
+        match,
+        mismatch: u64,
+    };
+
+    /// Inbound sender-identity binding: classify whether the relayed message's
+    /// sender nick is homed on a mesh node this receiver KNOWS, and if known
+    /// whether that home matches the frame's claimed `origin_node`.
+    /// `source_prefix` IS covered by relay-v1's signed
     /// transcript; the separately encoded `source_nick` is not, so deliverRelay
     /// ignores it and re-derives the nick from that signed prefix. A keyed origin
     /// can still deliberately sign a prefix for a nick it does not own: the
@@ -10894,13 +10920,10 @@ pub const LinuxServer = struct {
     /// receiver's route table homes that user elsewhere,
     /// so the claim is rejected here. Deliberately account-INDEPENDENT: `account` is
     /// origin-controlled/unsigned and must never wave a mismatched sender through.
-    /// An UNKNOWN nick (route not yet learned) returns false — the message follows
-    /// the existing deliver+re-forward path so cross-node delivery is not stranded
-    /// by convergence lag. See the TODO in `deliverRelay` for the stricter
-    /// fail-closed-on-unknown + transcript-signing hardening left as follow-up.
-    fn relaySenderHomeMismatch(self: *LinuxServer, source_nick: []const u8, origin_node: u64) bool {
-        const home = self.meshNickHomeNode(source_nick) orelse return false;
-        return home != origin_node;
+    fn relaySenderHome(self: *LinuxServer, source_nick: []const u8, origin_node: u64) RelaySenderHome {
+        const home = self.meshNickHomeNode(source_nick) orelse return .unknown;
+        if (home == origin_node) return .match;
+        return .{ .mismatch = home };
     }
 
     /// Resolve the residence-trusted account for `nick` at one exact mesh node.
@@ -11150,6 +11173,17 @@ pub const LinuxServer = struct {
             "dropped relayed {s} from {s} claiming origin {d}: nick is homed on node {d}",
             .{ msg.verb.commandWord(), msg.source_nick, msg.origin_node, home_node },
         ) catch "dropped relayed message: sender nick homed on a different node";
+        self.traceLog(.warn, .s2s, line);
+    }
+
+    fn recordRelayUnknownHomeV1(self: *LinuxServer, msg: s2s_link.RelayMessage) void {
+        self.rejected_relay_unknown_home_v1 +|= 1;
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "dropped relayed {s} from {s} claiming origin {d}: sender home unknown and no portable proof",
+            .{ msg.verb.commandWord(), msg.source_nick, msg.origin_node },
+        ) catch "dropped relayed message: sender home unknown without portable proof";
         self.traceLog(.warn, .s2s, line);
     }
 
@@ -11740,25 +11774,42 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn deferRelayV2(self: *LinuxServer, item: *s2s_link.InboundMessageV2) bool {
+    fn deferRelayV2(
+        self: *LinuxServer,
+        item: *s2s_link.InboundMessageV2,
+        reason: RelayV2DeferredReason,
+    ) bool {
         for (self.relay_v2_deferred[0..self.relay_v2_deferred_len]) |*pending| {
-            if (std.mem.eql(u8, pending.wire, item.wire)) {
+            if (std.mem.eql(u8, pending.inbound.wire, item.wire)) {
+                if (reason == .unknown_home_authority) pending.reason = .unknown_home_authority;
                 item.deinit(self.allocator);
                 return true;
             }
         }
         if (self.relay_v2_deferred_len == relay_v2_deferred_capacity) return false;
-        self.relay_v2_deferred[self.relay_v2_deferred_len] = item.*;
+        self.relay_v2_deferred[self.relay_v2_deferred_len] = .{
+            .inbound = item.*,
+            .reason = reason,
+            .first_deferred_ms = self.meshWallMs(),
+            .retries = 0,
+        };
         self.relay_v2_deferred_len += 1;
         item.* = undefined;
         return true;
+    }
+
+    fn relayV2UnknownHomeRetryExpired(_: *LinuxServer, pending: *const DeferredRelayV2, now_ms: u64) bool {
+        if (pending.reason != .unknown_home_authority) return false;
+        if (pending.retries >= relay_v2_unknown_home_retry_limit) return true;
+        return now_ms >= pending.first_deferred_ms and
+            now_ms - pending.first_deferred_ms >= relay_v2_unknown_home_retry_ttl_ms;
     }
 
     const RelayV2DeliveryOutcome = union(enum) {
         accepted: relay_v2_replay_guard.RelayId,
         duplicate: relay_v2_replay_guard.RelayId,
         permanent,
-        retry,
+        retry: RelayV2DeferredReason,
     };
 
     fn sendRelayV2AckToPeer(
@@ -12059,16 +12110,30 @@ pub const LinuxServer = struct {
     }
 
     fn retryDeferredRelayV2(self: *LinuxServer) void {
+        const now_ms = self.meshWallMs();
         var index: usize = 0;
         while (index < self.relay_v2_deferred_len) {
             const pending = &self.relay_v2_deferred[index];
-            switch (self.deliverRelayV2(pending.owned.msg, pending.wire, pending.via_peer)) {
-                .retry => {
+            switch (self.deliverRelayV2(
+                pending.inbound.owned.msg,
+                pending.inbound.wire,
+                pending.inbound.via_peer,
+            )) {
+                .retry => |reason| {
+                    pending.reason = reason;
+                    pending.retries +|= 1;
+                    if (self.relayV2UnknownHomeRetryExpired(pending, now_ms)) {
+                        pending.deinit(self.allocator);
+                        self.relay_v2_deferred_len -= 1;
+                        if (index != self.relay_v2_deferred_len)
+                            self.relay_v2_deferred[index] = self.relay_v2_deferred[self.relay_v2_deferred_len];
+                        continue;
+                    }
                     index += 1;
                     continue;
                 },
-                .accepted => |id| _ = self.sendRelayV2AckToPeer(pending.via_peer, id),
-                .duplicate => |id| _ = self.sendRelayV2AckToPeer(pending.via_peer, id),
+                .accepted => |id| _ = self.sendRelayV2AckToPeer(pending.inbound.via_peer, id),
+                .duplicate => |id| _ = self.sendRelayV2AckToPeer(pending.inbound.via_peer, id),
                 .permanent => {},
             }
             pending.deinit(self.allocator);
@@ -12096,7 +12161,7 @@ pub const LinuxServer = struct {
                     item.deinit(self.allocator);
                 },
                 .permanent => item.deinit(self.allocator),
-                .retry => if (!self.deferRelayV2(item)) {
+                .retry => |reason| if (!self.deferRelayV2(item, reason)) {
                     // Do not keep consuming a feed after the exact deferred
                     // authority is full. Closing forces retained sender replay;
                     // silently accepting or evicting would create an event gap.
@@ -12125,12 +12190,12 @@ pub const LinuxServer = struct {
         // today's mutable route or policy state. Re-ack an exact retained
         // duplicate before target/session resolution; unseen events still run
         // every first-admission check below before RVG2 can advance.
-        switch (self.probeRelayV2(msg, via_peer) catch return .retry) {
+        switch (self.probeRelayV2(msg, via_peer) catch return .{ .retry = .transient }) {
             .duplicate => |id| return if (self.retainRelayV2DuplicateIngress(
                 id,
                 wire,
                 via_peer,
-            ) catch return .retry) .{ .duplicate = id } else .permanent,
+            ) catch return .{ .retry = .transient }) .{ .duplicate = id } else .permanent,
             .unseen => {},
             .equivocation,
             .retired,
@@ -12140,13 +12205,13 @@ pub const LinuxServer = struct {
             => return .permanent,
         }
         const source_nick = msg.sourceNick() orelse return .permanent;
-        if (!self.relayV2OriginKnown(msg)) return .retry;
+        if (!self.relayV2OriginKnown(msg)) return .{ .retry = .transient };
         const latest_physical = std.math.add(
             u64,
             self.meshWallMs(),
             mesh_clock_mod.default_max_future_skew_ms,
         ) catch std.math.maxInt(u64);
-        if (mesh_clock_mod.MeshClock.physicalOf(msg.hlc) > latest_physical) return .retry;
+        if (mesh_clock_mod.MeshClock.physicalOf(msg.hlc) > latest_physical) return .{ .retry = .transient };
         var safe_tag_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
         const safe_tags = clientOnlyTags(msg.tags, &safe_tag_buf);
         const clean_msg = s2s_link.RelayMessage{
@@ -12177,11 +12242,29 @@ pub const LinuxServer = struct {
                 sender_route,
                 &sender_account_buf,
             ) != null;
-            if (receiver_owns_route and replica_proof == null) return .retry;
+            if (receiver_owns_route and replica_proof == null) return .{ .retry = .transient };
         }
-        const local_sender_allowed = !((self.nickIsLiveLocal(source_nick) or
-            self.relaySenderHomeMismatch(source_nick, msg.origin_node)) and
-            replica_proof == null);
+        const signed_member_modes: ?world_model.MemberModes = if (msg.sender_member_modes) |bits|
+            .{ .bits = bits }
+        else
+            null;
+        const sender_home = self.relaySenderHome(source_nick, msg.origin_node);
+        // replica_proof is a portable session — it may override residence.
+        // signed_member_modes is only the origin's assertion of mode bits: it
+        // may skip the unknown-home retry (no residence yet), but must never
+        // launder a known-home mismatch.
+        if (replica_proof == null) {
+            switch (sender_home) {
+                .mismatch => |home| {
+                    self.recordRelayHomeMismatch(clean_msg, home);
+                    return .permanent;
+                },
+                .unknown => if (signed_member_modes == null)
+                    return .{ .retry = .unknown_home_authority },
+                .match => {},
+            }
+        }
+        const local_sender_allowed = !(self.nickIsLiveLocal(source_nick) and replica_proof == null);
         const residence_account: ?[]const u8 = if (replica_proof == null)
             self.trustedRemoteAccountAtNode(source_nick, msg.origin_node)
         else
@@ -12192,10 +12275,6 @@ pub const LinuxServer = struct {
             account
         else
             "";
-        const signed_member_modes: ?world_model.MemberModes = if (msg.sender_member_modes) |bits|
-            .{ .bits = bits }
-        else
-            null;
         const is_data_family = switch (msg.verb) {
             .data, .request, .reply => true,
             else => false,
@@ -12222,7 +12301,7 @@ pub const LinuxServer = struct {
                 proof.trusted_account,
                 proof.token,
                 &sender_ids,
-            ) catch return .retry;
+            ) catch return .{ .retry = .transient };
         }
 
         switch (msg.scope_kind) {
@@ -12239,7 +12318,7 @@ pub const LinuxServer = struct {
                     // newly converging multi-hop route. Do not turn missing
                     // receiver-owned membership authority into either a +n
                     // bypass or a consumed-and-lost denial.
-                    return .retry;
+                    return .{ .retry = .transient };
                 }
                 const effective_sender_modes = if (replica_proof) |proof|
                     proof.modes
@@ -12321,10 +12400,10 @@ pub const LinuxServer = struct {
                     null,
                     &recipient_account_buf,
                     &recipient_ids,
-                ) catch return .retry;
+                ) catch return .{ .retry = .transient };
                 switch (target_resolution) {
                     .ready => |target| exact_target = target,
-                    .pending => return .retry,
+                    .pending => return .{ .retry = .transient },
                     .transit => {},
                 }
                 if (exact_target) |target| {
@@ -12378,10 +12457,10 @@ pub const LinuxServer = struct {
                         msg.target,
                         &recipient_account_buf,
                         &recipient_ids,
-                    ) catch return .retry;
+                    ) catch return .{ .retry = .transient };
                     switch (target_resolution) {
                         .ready => |target| exact_target = target,
-                        .pending => return .retry,
+                        .pending => return .{ .retry = .transient },
                         .transit => {},
                     }
                 }
@@ -12423,7 +12502,7 @@ pub const LinuxServer = struct {
         // it to render the complete attachment batch before live RVG2 authority
         // moves; `admitMessage` below still performs the signature/origin checks
         // and must return the same identity before publication.
-        const predicted_relay_id = message_relay_v2.relayId(self.allocator, msg) catch return .retry;
+        const predicted_relay_id = message_relay_v2.relayId(self.allocator, msg) catch return .{ .retry = .transient };
         var msgid_buf: [msgid_mod.id_len]u8 = undefined;
         var time_buf: [40]u8 = undefined;
         const stable_msgid = msgid_mod.fromStableId(predicted_relay_id, &msgid_buf);
@@ -12455,7 +12534,7 @@ pub const LinuxServer = struct {
                             var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
                             if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
                         }
-                        delivery_ids.append(self.allocator, id) catch return .retry;
+                        delivery_ids.append(self.allocator, id) catch return .{ .retry = .transient };
                     }
                 }
             },
@@ -12466,7 +12545,7 @@ pub const LinuxServer = struct {
                         var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
                         if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
                     }
-                    delivery_ids.append(self.allocator, id) catch return .retry;
+                    delivery_ids.append(self.allocator, id) catch return .{ .retry = .transient };
                 }
                 for (sender_ids.items) |sender_id| {
                     var already_recipient = false;
@@ -12480,7 +12559,7 @@ pub const LinuxServer = struct {
                         var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
                         if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
                     }
-                    delivery_ids.append(self.allocator, sender_id) catch return .retry;
+                    delivery_ids.append(self.allocator, sender_id) catch return .{ .retry = .transient };
                 }
             },
         }
@@ -12488,10 +12567,10 @@ pub const LinuxServer = struct {
             delivery_ids.items,
             tags,
             line,
-        ) catch return .retry;
+        ) catch return .{ .retry = .transient };
         defer prepared_delivery.deinit();
 
-        const outbox_peers = self.collectRelayV2OutboxPeers(via_peer, true) catch return .retry;
+        const outbox_peers = self.collectRelayV2OutboxPeers(via_peer, true) catch return .{ .retry = .transient };
         defer self.allocator.free(outbox_peers);
         const outbox_reservation = RelayV2OutboxReservation{
             .peers = outbox_peers,
@@ -12499,7 +12578,7 @@ pub const LinuxServer = struct {
             .wire = wire,
             .unbound_excluded_peer = via_peer,
         };
-        const relay_id = switch (self.admitRelayV2Detailed(msg, history_row, outbox_reservation, &prepared_delivery) catch return .retry) {
+        const relay_id = switch (self.admitRelayV2Detailed(msg, history_row, outbox_reservation, &prepared_delivery) catch return .{ .retry = .transient }) {
             .accepted => |id| id,
             .duplicate => |id| return .{ .duplicate = id },
             .rejected => return .permanent,
@@ -12572,9 +12651,8 @@ pub const LinuxServer = struct {
         return .{ .accepted = relay_id };
     }
 
-    /// Deliver an inbound relayed user message to LOCAL recipients (channel
-    /// members or a local nick), then re-forward to other peers for multi-hop
-    /// (loop-guarded by the per-peer seen-set + origin id).
+    /// Deliver an inbound legacy relayed user message to LOCAL recipients only.
+    /// Multi-hop propagation is owned exclusively by accepted MESSAGE_V2 objects.
     fn deliverRelay(self: *LinuxServer, msg: s2s_link.RelayMessage) void {
         // Decode enforces this for wire traffic, but tests and in-process paths
         // can call deliverRelay directly. Keep the semantic trust boundary here
@@ -12718,14 +12796,20 @@ pub const LinuxServer = struct {
         // standalone `source_nick` field is unsigned but ignored above (we derive
         // it from the signed prefix). `account`, `tags`, and `min_rank` are also
         // unsigned/hop-mutable and cannot establish nick ownership.
-        // If this receiver homes that nick on a KNOWN node other than the claimed
-        // `origin_node`, the claim is a cross-node impersonation: drop it locally
-        // (never render / fold into history) but still re-forward so a downstream
-        // node with fresher routing decides for itself. Account is NOT consulted —
-        // it is origin-controlled and unsigned.
-        if (self.relaySenderHomeMismatch(clean_msg.source_nick, clean_msg.origin_node) and replica_modes == null) {
-            self.recordRelayHomeMismatch(clean_msg, self.meshNickHomeNode(clean_msg.source_nick) orelse clean_msg.origin_node);
-            return;
+        // Legacy v1 is fail-closed on sender-home uncertainty unless a signed
+        // portable proof supplies authority.
+        if (replica_modes == null) {
+            switch (self.relaySenderHome(clean_msg.source_nick, clean_msg.origin_node)) {
+                .match => {},
+                .mismatch => |home| {
+                    self.recordRelayHomeMismatch(clean_msg, home);
+                    return;
+                },
+                .unknown => {
+                    self.recordRelayUnknownHomeV1(clean_msg);
+                    return;
+                },
+            }
         }
 
         if (world_model.isChannelName(clean_msg.target)) {
@@ -12733,9 +12817,7 @@ pub const LinuxServer = struct {
             // policy (+n/+m/+M/+b/+Z) against the REMOTE sender before delivering
             // to local members. A mode/ban that has desynced across the mesh (or
             // a hostile/buggy peer) must not let a remote actor bypass local
-            // policy. Channels without those flags always deliver. The multi-hop
-            // re-forward below is unaffected (a downstream node re-checks its own
-            // policy), so a transient desync here does not strand the message.
+            // policy. Channels without those flags always deliver.
             // Typed DATA/REQUEST/REPLY never used the room-text pairing; keep
             // the legacy relay path ungated so comic-chat frames still fan out.
             if (!is_data_family and !self.messageSatisfiesEncryptionPolicy(
@@ -12767,8 +12849,7 @@ pub const LinuxServer = struct {
             var nf_text_buf: [default_reply_bytes]u8 = undefined;
             // +V NOCOMICDATA: re-enforce the local channel's comic-chat-DATA ban
             // against a remote sender (the local handleData rejects non-op DATA
-            // here with 531; on the receive side we silently drop, still
-            // re-forwarding for multi-hop so a downstream node re-checks).
+            // here with 531; on the receive side we silently drop).
             if (is_data_family and self.world.channelHasExtFlag(clean_msg.target, .nocomicdata) and
                 (replica_modes orelse self.relaySenderModes(clean_msg.target, clean_msg.source_nick)).rank() < 2)
             {
@@ -12967,8 +13048,7 @@ pub const LinuxServer = struct {
     /// <recipient> :<text>` line to the LOCAL recipient nick when it shares the
     /// channel, re-enforcing the same membership invariant the local handler does
     /// (both sender and recipient must be on the channel). The global seen-set is
-    /// already observed by the caller (`deliverRelay`). Multi-hop re-forward is
-    /// scoped to the recipient's owning node so a WHISPER can traverse the mesh.
+    /// already observed by the caller (`deliverRelay`).
     fn deliverRelayWhisper(
         self: *LinuxServer,
         msg: s2s_link.RelayMessage,
@@ -12976,17 +13056,24 @@ pub const LinuxServer = struct {
     ) void {
         // Origin spoof guard: a peer must not assert a prefix for a nick that is
         // live & local here — UNLESS it is the SAME account (a legitimate
-        // multi-client / one-nick sibling on a peer; see deliverRelay). Still
-        // re-forward for multi-hop; only a DIFFERENT account's assertion is dropped.
+        // multi-client / one-nick sibling on a peer; see deliverRelay).
         if (self.nickIsLiveLocal(msg.source_nick) and replica_proof == null) {
             return;
         }
-        // Sender-identity binding (see deliverRelay): a nick homed on a KNOWN node
-        // other than the claimed origin is a cross-node impersonation — drop the
-        // local WHISPER (never render it to the recipient) but still re-forward.
-        if (self.relaySenderHomeMismatch(msg.source_nick, msg.origin_node) and replica_proof == null) {
-            self.recordRelayHomeMismatch(msg, self.meshNickHomeNode(msg.source_nick) orelse msg.origin_node);
-            return;
+        // Sender-identity binding (see deliverRelay): enforce known-home match and
+        // fail closed on unknown residence without signed portable proof.
+        if (replica_proof == null) {
+            switch (self.relaySenderHome(msg.source_nick, msg.origin_node)) {
+                .match => {},
+                .mismatch => |home| {
+                    self.recordRelayHomeMismatch(msg, home);
+                    return;
+                },
+                .unknown => {
+                    self.recordRelayUnknownHomeV1(msg);
+                    return;
+                },
+            }
         }
         // WHISPER is stricter than ordinary channel speech: both endpoints must
         // share the named channel even when +n is unset. A valid relay signature
@@ -71747,7 +71834,7 @@ test "deliverRelay rejects unsafe direct callers before delivery and dedup obser
     try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :valid event survived\r\n");
 }
 
-test "deliverRelay re-forward preserves the signature for the next hop" {
+test "legacy relay signature payload stays self-verifiable" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -71755,18 +71842,15 @@ test "deliverRelay re-forward preserves the signature for the next hop" {
         };
         defer server.deinit();
 
-        // No local recipient for #relay here: deliverRelay's job is the re-forward
-        // path. We assert the message that WOULD be re-forwarded (clean_msg) keeps the
-        // original signature, by re-verifying the encoded copy at std-allocator level.
+        // Re-encode/decode the signed payload and verify the original author
+        // signature still self-certifies the claimed origin.
         var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x51)));
         defer kp.deinit();
         var pk_buf: [message_relay.pubkey_len]u8 = undefined;
         var sig_buf: [message_relay.sig_len]u8 = undefined;
         const msg = try buildSignedRelay(&kp, "#relay", "Remote!r@elsewhere", "multi-hop authored once", 9, &pk_buf, &sig_buf);
 
-        // The relayed clean_msg copies origin_pubkey/origin_sig verbatim; an encode
-        // round-trip (what a real re-forward does over the wire) still verifies as the
-        // ORIGINAL origin at the next hop.
+        // The encoded/decoded wire copy preserves origin_pubkey/origin_sig verbatim.
         const wire = try message_relay.encode(std.testing.allocator, msg);
         defer std.testing.allocator.free(wire);
         var hop2 = try message_relay.decode(std.testing.allocator, wire);
@@ -71781,7 +71865,7 @@ test "deliverRelay re-forward preserves the signature for the next hop" {
     } else return error.SkipZigTest;
 }
 
-test "deliverRelay binds sender nick to its home node: cross-node impersonation is dropped, legit delivered, unknown passes" {
+test "deliverRelay binds sender nick to home: legit delivers, mismatch and unknown drop" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .node_id = 2 }) catch |err| switch (err) {
@@ -71827,6 +71911,7 @@ test "deliverRelay binds sender nick to its home node: cross-node impersonation 
     server.deliverRelay(base);
     try expectContains(target.send_buf[0..target.send_len], ":ricky!ricky@h PRIVMSG Target :legit cross-node line\r\n");
     try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_home_mismatch);
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_unknown_home_v1);
 
     // (2) Impersonation: a keyed peer authors a frame claiming origin_node 777 while
     // asserting "ricky" (whom THIS node homes on node 1). It must be dropped locally
@@ -71839,21 +71924,397 @@ test "deliverRelay binds sender nick to its home node: cross-node impersonation 
     server.deliverRelay(spoof);
     try std.testing.expectEqual(@as(usize, 0), target.send_len);
     try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch);
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_unknown_home_v1);
     try std.testing.expect(std.mem.indexOf(u8, target.send_buf[0..target.send_len], "IMPERSONATED") == null);
 
-    // (3) Unknown sender (no route home) still delivers — the binding rejects only a
-    // KNOWN-and-different home, never strands convergence-lagged / legacy traffic.
+    // (3) Unknown sender-home (no route home) is now fail-closed for legacy relay
+    // unless signed portable authority exists.
     target.send_len = 0;
     var unknown = base;
     unknown.source_nick = "ghostly";
     unknown.source_prefix = "ghostly!g@elsewhere";
     unknown.origin_node = 555;
     unknown.hlc = 1003;
-    unknown.text = "unknown sender still flows";
+    unknown.text = "unknown sender must drop";
     try std.testing.expectEqual(@as(?s2s_link.NodeId, null), server.meshNickHomeNode("ghostly"));
     server.deliverRelay(unknown);
-    try expectContains(target.send_buf[0..target.send_len], ":ghostly!g@elsewhere PRIVMSG Target :unknown sender still flows\r\n");
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
     try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch); // unchanged
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_unknown_home_v1);
+}
+
+test "MESSAGE_V2 unknown home retries then converges and delivers once" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x31)), "relay-v2-unknown-home");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x32)), "relay-v2-unknown-home");
+    defer origin.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(target_id));
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_prefix = "ghost!u@origin.test",
+        .text = "unknown home waits for authority",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+
+    const first = server.deliverRelayV2(msg, wire, origin.shortId());
+    const first_reason = switch (first) {
+        .retry => |reason| reason,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RelayV2DeferredReason.unknown_home_authority, first_reason);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.len());
+
+    // Converge sender home at the signed origin, then admit once.
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{
+        .allocator = alloc,
+        .local_node_id = origin.shortId(),
+        .remote_node_id = local.shortId(),
+        .local_epoch_ms = 1000,
+        .server_name = "origin.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer peer.deinit();
+    const link = try alloc.create(s2s_link.S2sLink);
+    try link.init(.{
+        .allocator = alloc,
+        .local_node_id = local.shortId(),
+        .remote_node_id = origin.shortId(),
+        .local_epoch_ms = 1001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+
+    try peer.start(50);
+    try peer.sendMembership("#room", "ghost", 0, 100, true, .{ .username = "ghost", .host = "h" }, "");
+    try pumpLinkPair(&peer, link, alloc);
+    try std.testing.expect(link.established());
+    try std.testing.expectEqual(@as(?s2s_link.NodeId, origin.shortId()), server.meshNickHomeNode("ghost"));
+
+    const second = server.deliverRelayV2(msg, wire, origin.shortId());
+    switch (second) {
+        .accepted => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try expectContains(target.send_buf[0..target.send_len], ":ghost!u@origin.test PRIVMSG #room :unknown home waits for authority\r\n");
+    const delivered_len = target.send_len;
+
+    const third = server.deliverRelayV2(msg, wire, origin.shortId());
+    switch (third) {
+        .duplicate => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(delivered_len, target.send_len);
+}
+
+test "MESSAGE_V2 unknown home convergence to different node drops permanently" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x33)), "relay-v2-unknown-mismatch");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x34)), "relay-v2-unknown-mismatch");
+    defer origin.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(target_id));
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_prefix = "ghost!u@origin.test",
+        .text = "different home must drop",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+
+    const first = server.deliverRelayV2(msg, wire, origin.shortId());
+    switch (first) {
+        .retry => |reason| try std.testing.expectEqual(RelayV2DeferredReason.unknown_home_authority, reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+
+    var other_peer: s2s_link.S2sLink = undefined;
+    try other_peer.init(.{
+        .allocator = alloc,
+        .local_node_id = 0xDEAD_BEEF,
+        .remote_node_id = local.shortId(),
+        .local_epoch_ms = 2000,
+        .server_name = "other.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer other_peer.deinit();
+    const other_link = try alloc.create(s2s_link.S2sLink);
+    try other_link.init(.{
+        .allocator = alloc,
+        .local_node_id = local.shortId(),
+        .remote_node_id = 0xDEAD_BEEF,
+        .local_epoch_ms = 2001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = other_link;
+
+    try other_peer.start(50);
+    try other_peer.sendMembership("#room", "ghost", 0, 100, true, .{ .username = "ghost", .host = "h" }, "");
+    try pumpLinkPair(&other_peer, other_link, alloc);
+    try std.testing.expect(other_link.established());
+    try std.testing.expectEqual(@as(?s2s_link.NodeId, 0xDEAD_BEEF), server.meshNickHomeNode("ghost"));
+
+    const second = server.deliverRelayV2(msg, wire, origin.shortId());
+    try std.testing.expect(second == .permanent);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch);
+}
+
+test "MESSAGE_V2 deferred unknown-home expires without delivery" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x35)), "relay-v2-unknown-expiry");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x36)), "relay-v2-unknown-expiry");
+    defer origin.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(target_id));
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_prefix = "ghost!u@origin.test",
+        .text = "deferred unknown home should expire",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+    const owned = try message_relay_v2.decode(alloc, wire);
+    var inbound = s2s_link.InboundMessageV2{
+        .owned = owned,
+        .wire = try alloc.dupe(u8, wire),
+        .via_peer = origin.shortId(),
+    };
+    try std.testing.expect(server.deferRelayV2(&inbound, .unknown_home_authority));
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_deferred_len);
+    server.relay_v2_deferred[0].first_deferred_ms = server.meshWallMs() - (relay_v2_unknown_home_retry_ttl_ms + 1);
+    server.retryDeferredRelayV2();
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_deferred_len);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+}
+
+test "MESSAGE_V2 signed member modes bypass unknown-home retry" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x37)), "relay-v2-membermode-bypass");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x38)), "relay-v2-membermode-bypass");
+    defer origin.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(target_id));
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_prefix = "ghost!u@origin.test",
+        .text = "signed member modes bypass unknown home",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+        .sender_member_modes = 0,
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+
+    const out = server.deliverRelayV2(msg, wire, origin.shortId());
+    switch (out) {
+        .accepted => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try expectContains(target.send_buf[0..target.send_len], ":ghost!u@origin.test PRIVMSG #room :signed member modes bypass unknown home\r\n");
+}
+
+test "MESSAGE_V2 known-home mismatch with signed member modes still drops permanently" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x39)), "relay-v2-mismatch-membermode");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x3a)), "relay-v2-mismatch-membermode");
+    defer origin.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(target_id));
+
+    var other_peer: s2s_link.S2sLink = undefined;
+    try other_peer.init(.{
+        .allocator = alloc,
+        .local_node_id = 0xDEAD_BEEF,
+        .remote_node_id = local.shortId(),
+        .local_epoch_ms = 2000,
+        .server_name = "other.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer other_peer.deinit();
+    const other_link = try alloc.create(s2s_link.S2sLink);
+    try other_link.init(.{
+        .allocator = alloc,
+        .local_node_id = local.shortId(),
+        .remote_node_id = 0xDEAD_BEEF,
+        .local_epoch_ms = 2001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = other_link;
+
+    try other_peer.start(50);
+    try other_peer.sendMembership("#room", "ghost", 0, 100, true, .{ .username = "ghost", .host = "h" }, "");
+    try pumpLinkPair(&other_peer, other_link, alloc);
+    try std.testing.expect(other_link.established());
+    try std.testing.expectEqual(@as(?s2s_link.NodeId, 0xDEAD_BEEF), server.meshNickHomeNode("ghost"));
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_prefix = "ghost!u@origin.test",
+        .text = "member modes must not launder a home mismatch",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+        .sender_member_modes = 0,
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+
+    const out = server.deliverRelayV2(msg, wire, origin.shortId());
+    try std.testing.expect(out == .permanent);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch);
 }
 
 // ---------------------------------------------------------------------------
