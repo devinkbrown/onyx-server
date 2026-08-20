@@ -40093,67 +40093,93 @@ pub const LinuxServer = struct {
 
     const ExternalResumeCandidate = union(enum) {
         none,
+        /// Retained for callers/tests that still name the old fail-closed path.
+        /// Selection no longer emits this: N-node meshes pick one canonical
+        /// logical session instead of disconnecting WeeChat/legacy clients.
         ambiguous,
         blocked,
         local: sessions_mod.Token,
         mesh: sessions_mod.Token,
     };
 
-    fn mergeExternalResumeCandidate(
-        current: *ExternalResumeCandidate,
+    /// Mesh-wide total order for tokenless EXTERNAL auto-attach. Any number of
+    /// secured peers may advertise the same account+nick; the claimant joins
+    /// exactly one canonical logical session rather than minting another token
+    /// or failing closed on accumulation.
+    const CanonicalExternalPick = struct {
         token: sessions_mod.Token,
         source: enum { local, mesh },
-    ) void {
-        if (tokenIsNull(token) or current.* == .ambiguous or current.* == .blocked) return;
-        switch (current.*) {
-            .none => current.* = switch (source) {
-                .local => .{ .local = token },
-                .mesh => .{ .mesh = token },
-            },
-            .local => |existing| {
-                if (!std.crypto.timing_safe.eql(sessions_mod.Token, existing, token))
-                    current.* = .ambiguous;
-            },
-            .mesh => |existing| {
-                if (!std.crypto.timing_safe.eql(sessions_mod.Token, existing, token))
-                    current.* = .ambiguous;
-            },
-            .ambiguous => unreachable,
-            .blocked => unreachable,
+        /// 3 = live local attachment, 2 = live mesh attachment lease, 1 = detached/portable only.
+        liveness: u8,
+        recency_ms: i64,
+        revision: ?session_replica_v2.Revision,
+
+        fn beats(self: CanonicalExternalPick, other: CanonicalExternalPick) bool {
+            if (self.liveness != other.liveness) return self.liveness > other.liveness;
+            if (self.recency_ms != other.recency_ms) return self.recency_ms > other.recency_ms;
+            if (self.revision) |self_rev| {
+                if (other.revision) |other_rev| {
+                    const ord = self_rev.compare(other_rev);
+                    if (ord != .eq) return ord == .gt;
+                } else return true;
+            } else if (other.revision != null) return false;
+            return std.mem.order(u8, &self.token, &other.token) == .gt;
         }
+    };
+
+    fn considerCanonicalExternalPick(best: *?CanonicalExternalPick, next: CanonicalExternalPick) void {
+        if (tokenIsNull(next.token)) return;
+        if (best.*) |*current| {
+            if (std.crypto.timing_safe.eql(sessions_mod.Token, current.token, next.token)) {
+                // Same logical session seen from local + mesh: keep the stronger
+                // liveness and prefer a local restore path when either side has one.
+                if (next.liveness > current.liveness) current.liveness = next.liveness;
+                if (next.source == .local) current.source = .local;
+                if (next.recency_ms > current.recency_ms) current.recency_ms = next.recency_ms;
+                if (next.revision) |rev| {
+                    if (current.revision == null or rev.compare(current.revision.?) == .gt)
+                        current.revision = rev;
+                }
+                return;
+            }
+            if (next.beats(current.*)) best.* = next;
+            return;
+        }
+        best.* = next;
     }
 
-    fn blockExternalResumeCandidate(
-        current: *ExternalResumeCandidate,
+    fn tokenHasLiveMeshAttachmentLease(
+        self: *const LinuxServer,
         token: sessions_mod.Token,
-    ) void {
-        switch (current.*) {
-            .local => |existing| {
-                if (std.crypto.timing_safe.eql(sessions_mod.Token, existing, token)) return;
-            },
-            .mesh => |existing| {
-                if (std.crypto.timing_safe.eql(sessions_mod.Token, existing, token)) return;
-            },
-            .ambiguous, .blocked => return,
-            .none => {},
+        now_ms: i64,
+    ) bool {
+        var it = self.session_replica_store.attachment_leases.iterator();
+        while (it.next()) |slot| {
+            if (!std.crypto.timing_safe.eql(sessions_mod.Token, slot.key_ptr.token, token)) continue;
+            const lease = slot.value_ptr.*;
+            if (lease.conflicted or now_ms > lease.expires_at_ms) continue;
+            return true;
         }
-        current.* = .blocked;
+        return false;
     }
 
-    /// Select an exact reusable session for a certificate-authenticated legacy
-    /// client that cannot send SESSION RESUME. Account and nick comparisons are
-    /// byte-exact: SASL canonicalizes the authenticated account, while the
-    /// requested nick is the user's explicit registration input. Multiple rows
-    /// carrying one token are one logical session; multiple distinct tokens are
-    /// ambiguous and fail closed.
+    /// Select the canonical reusable session for a certificate-authenticated
+    /// legacy client that cannot send SESSION RESUME. Account and nick
+    /// comparisons are byte-exact. Multiple rows carrying one token are one
+    /// logical session. Distinct tokens for the same account+nick — whether
+    /// from two peers or twenty — collapse to one deterministic pick:
+    /// live local attachments beat live mesh leases beat detached/portable
+    /// replicas; within a tier, newer signon/issued time and higher replica
+    /// revision win; token bytes break remaining ties.
     fn externalResumeCandidate(
         self: *LinuxServer,
         claimant: sessions_mod.ClientId,
         account: []const u8,
         nick: []const u8,
     ) ExternalResumeCandidate {
-        var candidate: ExternalResumeCandidate = .none;
-        const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return .ambiguous;
+        var best: ?CanonicalExternalPick = null;
+        var saw_unstaged_mesh_match = false;
+        const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return .blocked;
         defer self.allocator.free(rows);
         for (rows) |row| {
             if (row.client == claimant or tokenIsNull(row.token)) continue;
@@ -40162,36 +40188,48 @@ pub const LinuxServer = struct {
                 const sibling_account = sibling.session.account() orelse continue;
                 if (!std.mem.eql(u8, sibling_account, account) or
                     !std.mem.eql(u8, sibling.session.displayName(), nick)) continue;
-            } else {
-                // Prove the exact physical ghost that the retained bootstrap
-                // ticket will later restore. In particular, equal-sign-on
-                // siblings use the ticket's client-id tie break rather than a
-                // separate array-order selector.
-                const signon: i64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-                var proof_ticket = self.sessions.prepareBootstrapTokenAttach(
-                    account,
-                    claimant,
-                    row.token,
-                    .join_existing,
-                    signon,
-                ) orelse return .ambiguous;
-                defer proof_ticket.deinit();
-                const source = proof_ticket.detachedSource() orelse continue;
-                var snapshot = migration_relay.Snapshot.decode(self.allocator, source.snapshot) catch
-                    return .ambiguous;
-                const matches = std.mem.eql(u8, snapshot.account, account) and
-                    std.mem.eql(u8, snapshot.nick, nick);
-                snapshot.deinit(self.allocator);
-                if (!matches) continue;
+                considerCanonicalExternalPick(&best, .{
+                    .token = row.token,
+                    .source = .local,
+                    .liveness = 3,
+                    .recency_ms = row.signon_ms,
+                    .revision = null,
+                });
+                continue;
             }
-            mergeExternalResumeCandidate(&candidate, row.token, .local);
-            if (candidate == .ambiguous) return candidate;
+            // Prove the exact physical ghost that the retained bootstrap
+            // ticket will later restore. In particular, equal-sign-on
+            // siblings use the ticket's client-id tie break rather than a
+            // separate array-order selector.
+            const signon: i64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+            var proof_ticket = self.sessions.prepareBootstrapTokenAttach(
+                account,
+                claimant,
+                row.token,
+                .join_existing,
+                signon,
+            ) orelse return .blocked;
+            defer proof_ticket.deinit();
+            const source = proof_ticket.detachedSource() orelse continue;
+            var snapshot = migration_relay.Snapshot.decode(self.allocator, source.snapshot) catch
+                return .blocked;
+            const matches = std.mem.eql(u8, snapshot.account, account) and
+                std.mem.eql(u8, snapshot.nick, nick);
+            snapshot.deinit(self.allocator);
+            if (!matches) continue;
+            considerCanonicalExternalPick(&best, .{
+                .token = row.token,
+                .source = .local,
+                .liveness = 1,
+                .recency_ms = row.signon_ms,
+                .revision = null,
+            });
         }
 
         // Current secured-mesh replicas are end-to-end signed before entering
         // this Store and staged into PendingMigrations for transactional restore.
         // Scan the bounded ordered token index so selection is deterministic and
-        // independent of hash-map iteration order.
+        // independent of hash-map iteration order / mesh size.
         const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
         var after: ?session_replica_v2.Token = null;
         var page_buf: [32]session_replica_v2.Token = undefined;
@@ -40206,11 +40244,11 @@ pub const LinuxServer = struct {
                 else
                     null;
                 const staged_entry = staged orelse {
-                    blockExternalResumeCandidate(&candidate, token);
+                    saw_unstaged_mesh_match = true;
                     continue;
                 };
                 const staged_revision = staged_entry.replica_revision orelse {
-                    blockExternalResumeCandidate(&candidate, token);
+                    saw_unstaged_mesh_match = true;
                     continue;
                 };
                 if (!std.mem.eql(u8, staged_entry.account, account) or
@@ -40218,20 +40256,37 @@ pub const LinuxServer = struct {
                     staged_entry.replica_expires_at_ms != entry.expires_at_ms or
                     !std.mem.eql(u8, staged_entry.snapshot, entry.snapshot))
                 {
-                    blockExternalResumeCandidate(&candidate, token);
+                    saw_unstaged_mesh_match = true;
                     continue;
                 }
-                mergeExternalResumeCandidate(&candidate, token, .mesh);
-                if (candidate == .ambiguous) return candidate;
+                const live_lease = self.tokenHasLiveMeshAttachmentLease(token, now_wall);
+                considerCanonicalExternalPick(&best, .{
+                    .token = token,
+                    .source = .mesh,
+                    .liveness = if (live_lease) 2 else 1,
+                    .recency_ms = entry.issued_at_ms,
+                    .revision = entry.revision,
+                });
             }
             after = page[page.len - 1];
         }
-        return candidate;
+
+        const pick = best orelse {
+            // Matching mesh authority exists but is not staged locally yet.
+            // Do not mint a competing token; ask the client to retry.
+            if (saw_unstaged_mesh_match) return .blocked;
+            return .none;
+        };
+        return switch (pick.source) {
+            .local => .{ .local = pick.token },
+            .mesh => .{ .mesh = pick.token },
+        };
     }
 
     /// Compatibility attach for WeeChat and other clients that possess a bound
     /// certificate but do not implement SESSION RESUME. This never runs for a
-    /// password/session-token login and never guesses among logical sessions.
+    /// password/session-token login. Across any mesh size it attaches to the
+    /// single canonical account+nick logical session when one exists.
     const ExternalResumeOutcome = enum { fresh, resumed, blocked };
 
     fn autoResumeExternalSession(
@@ -40247,6 +40302,15 @@ pub const LinuxServer = struct {
         const cid = monitorIdFromClient(id);
         switch (candidate) {
             .none => {
+                // Concurrent EXTERNAL registrations across the mesh can both
+                // observe an empty candidate set. Re-scan before minting so the
+                // second claimant joins the first logical session instead of
+                // poisoning every later tokenless login with a second token.
+                const raced = self.externalResumeCandidate(cid, account, nick);
+                switch (raced) {
+                    .none, .ambiguous => {},
+                    .blocked, .local, .mesh => return try self.autoResumeExternalSession(id, conn, raced),
+                }
                 // The first EXTERNAL attachment has no earlier logical session
                 // to select. Make its fresh token portable and publish the exact
                 // signed image proactively; a later tokenless EXTERNAL attach on
@@ -40298,8 +40362,13 @@ pub const LinuxServer = struct {
                 return .fresh;
             },
             .ambiguous => {
-                try self.warnReply(conn, "SESSION", "AMBIGUOUS_SESSION", "multiple certificate-matching sessions exist; present an exact resume credential");
-                return .blocked;
+                // Legacy enum arm: selection is total-ordered now. Re-resolve so
+                // a stale caller still joins the canonical session.
+                const resolved = self.externalResumeCandidate(cid, account, nick);
+                if (resolved == .ambiguous or resolved == .none) {
+                    return try self.autoResumeExternalSession(id, conn, .none);
+                }
+                return try self.autoResumeExternalSession(id, conn, resolved);
             },
             .blocked => {
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "signed session authority is not ready locally; retry without replacing it");
@@ -75617,7 +75686,7 @@ test "threaded server: EXTERNAL auto-resume latch excludes certificates and PLAI
     try std.testing.expect(!external.sasl_external_authenticated);
 }
 
-test "threaded server: EXTERNAL exact account nick auto-attaches one local token and ambiguity fails closed" {
+test "threaded server: EXTERNAL exact account nick auto-attaches one local token and picks canonical among many" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -75704,25 +75773,150 @@ test "threaded server: EXTERNAL exact account nick auto-attaches one local token
         " MODE #root +Y kain",
     ));
 
+    // A second distinct live token (for example minted on another mesh peer
+    // before replicas converged) must not disconnect WeeChat: pick the newest
+    // live local attachment as the canonical logical session.
     const other_id = try addTestLocalClient(&server, "other-bootstrap", "kain");
     const other = server.connFor(other_id).?;
     try other.session.setNick("kain");
     const other_token = server.sessions.resumeHandleForClient("kain", monitorIdFromClient(other_id)).?.token;
+    try std.testing.expect(!std.crypto.timing_safe.eql(sessions_mod.Token, other_token, owner_token));
     const fresh_id = try addTestLocalClient(&server, "fresh-bootstrap", "kain");
     const fresh = server.connFor(fresh_id).?;
     try fresh.session.setNick("kain");
     fresh.sasl_external_authenticated = true;
+    try std.testing.expect(server.removeTrackedSession("kain", monitorIdFromClient(fresh_id)));
     try std.testing.expectEqual(
-        LinuxServer.ExternalResumeOutcome.blocked,
+        LinuxServer.ExternalResumeOutcome.resumed,
         try server.autoResumeExternalSession(
             fresh_id,
             fresh,
             server.externalResumeCandidate(monitorIdFromClient(fresh_id), "kain", "kain"),
         ),
     );
-    const fresh_token = server.sessions.resumeHandleForClient("kain", monitorIdFromClient(fresh_id)).?.token;
-    try std.testing.expect(!std.crypto.timing_safe.eql(sessions_mod.Token, fresh_token, owner_token));
-    try std.testing.expect(!std.crypto.timing_safe.eql(sessions_mod.Token, fresh_token, other_token));
+    try std.testing.expect(server.sessions.clientHasToken("kain", monitorIdFromClient(fresh_id), other_token));
+    try expectContains(fresh.send_buf[0..fresh.send_len], "certificate-authenticated session restored");
+}
+
+test "threaded server: EXTERNAL prefers live local over competing mesh replicas" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.pending_migrations = session_migrate.PendingMigrations.init(std.testing.allocator);
+
+    const owner_id = try addTestLocalClient(&server, "kain", "kain");
+    const owner_token = server.sessions.resumeHandleForClient("kain", monitorIdFromClient(owner_id)).?.token;
+    try server.world.restoreMember(
+        "#root",
+        worldIdFromClient(owner_id),
+        world_model.MemberModes.fromModes(&.{.founder}),
+    );
+
+    var origin = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x71)));
+    defer origin.deinit();
+    const mesh_token: session_migrate.Token = @splat(0x5c);
+    try applyTestRemoteSessionReplicaSnapshot(
+        &server,
+        &origin,
+        mesh_token,
+        "kain",
+        "kain",
+        99,
+        "+i",
+        &.{"#root"},
+        &.{world_model.MemberModes.fromModes(&.{.founder}).bits},
+    );
+    const entry = server.session_replica_store.bestLiveIdentity(
+        mesh_token,
+        @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64)))),
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(server.stageSessionReplicaV2Entry(mesh_token, entry));
+
+    const claimant_id = try addTestLocalClient(&server, "local-wins", "kain");
+    const claimant = server.connFor(claimant_id).?;
+    try claimant.session.setNick("kain");
+    claimant.sasl_external_authenticated = true;
+    try std.testing.expect(server.removeTrackedSession("kain", monitorIdFromClient(claimant_id)));
+    switch (server.externalResumeCandidate(monitorIdFromClient(claimant_id), "kain", "kain")) {
+        .local => |token| try std.testing.expect(std.crypto.timing_safe.eql(sessions_mod.Token, token, owner_token)),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(
+        LinuxServer.ExternalResumeOutcome.resumed,
+        try server.autoResumeExternalSession(
+            claimant_id,
+            claimant,
+            server.externalResumeCandidate(monitorIdFromClient(claimant_id), "kain", "kain"),
+        ),
+    );
+    try std.testing.expect(server.sessions.clientHasToken("kain", monitorIdFromClient(claimant_id), owner_token));
+}
+
+test "threaded server: EXTERNAL picks highest-revision staged mesh replica among many" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.pending_migrations = session_migrate.PendingMigrations.init(std.testing.allocator);
+
+    var origin_a = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x72)));
+    defer origin_a.deinit();
+    var origin_b = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x73)));
+    defer origin_b.deinit();
+    const older: session_migrate.Token = @splat(0x61);
+    const newer: session_migrate.Token = @splat(0x62);
+    try applyTestRemoteSessionReplicaSnapshot(
+        &server,
+        &origin_a,
+        older,
+        "kain",
+        "kain",
+        3,
+        "+i",
+        &.{},
+        &.{},
+    );
+    try applyTestRemoteSessionReplicaSnapshot(
+        &server,
+        &origin_b,
+        newer,
+        "kain",
+        "kain",
+        30,
+        "+i",
+        &.{"#root"},
+        &.{world_model.MemberModes.fromModes(&.{.founder}).bits},
+    );
+    const now_wall: i64 = @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+    const older_entry = server.session_replica_store.bestLiveIdentity(older, now_wall) orelse
+        return error.TestUnexpectedResult;
+    const newer_entry = server.session_replica_store.bestLiveIdentity(newer, now_wall) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(server.stageSessionReplicaV2Entry(older, older_entry));
+    try std.testing.expect(server.stageSessionReplicaV2Entry(newer, newer_entry));
+
+    const claimant_id = try addTestLocalClient(&server, "mesh-pick", "kain");
+    const claimant = server.connFor(claimant_id).?;
+    try claimant.session.setNick("kain");
+    claimant.sasl_external_authenticated = true;
+    try std.testing.expect(server.removeTrackedSession("kain", monitorIdFromClient(claimant_id)));
+    switch (server.externalResumeCandidate(monitorIdFromClient(claimant_id), "kain", "kain")) {
+        .mesh => |token| try std.testing.expect(std.crypto.timing_safe.eql(sessions_mod.Token, token, newer)),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "threaded server: secured replica permits tokenless EXTERNAL exact account nick resume" {

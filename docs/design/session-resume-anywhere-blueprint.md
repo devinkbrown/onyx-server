@@ -39,18 +39,24 @@ Account authentication normally does not select a device session. The client mus
 present the exact local or portable session credential. The narrow compatibility
 exception is a possession-verified SASL EXTERNAL login: a client such as WeeChat that
 cannot send `SESSION RESUME` may attach automatically when its authenticated account
-and requested nick identify exactly one logical session. Multiple distinct matching
-tokens, malformed state, or allocation pressure fail closed without choosing a
-session. Merely presenting a certificate, or authenticating with PLAIN, SCRAM, or a
-session token, never enables this lookup.
+and requested nick identify a reusable logical session. Across any number of secured
+mesh peers, that selection is a total order over matching tokens (live local
+attachments, then live mesh attachment leases, then detached/portable replicas;
+newer signon/issued time and higher replica revision within a tier; token bytes as
+the final tie-break). Explicit `SESSION RESUME` remains exact-credential and never
+auto-picks. Malformed state, unstaged mesh authority, or allocation pressure still
+fail closed without minting a competing token. Merely presenting a certificate, or
+authenticating with PLAIN, SCRAM, or a session token, never enables this lookup.
 
 The first EXTERNAL attachment proactively publishes its signed portable session state
 without revealing a reclaim credential to the client. A later EXTERNAL attachment can
-therefore select the same unique account-and-nick session on another secured mesh node.
-Explicit local and portable credentials remain reusable capabilities: successful use
-adds an attachment and does not rotate, consume, or invalidate the credential.
-`SESSION MTOKEN` includes `expires=<unix-seconds>` so clients can discard stale
-portable state without decoding the sealed value.
+therefore select the same unique account-and-nick session on another secured mesh
+node, and concurrent EXTERNAL registrations re-scan before minting so an N-node mesh
+converges on one logical session instead of one token per peer. Explicit local and
+portable credentials remain reusable capabilities: successful use adds an attachment
+and does not rotate, consume, or invalidate the credential. `SESSION MTOKEN` includes
+`expires=<unix-seconds>` so clients can discard stale portable state without decoding
+the sealed value.
 
 ## Lifecycle
 
