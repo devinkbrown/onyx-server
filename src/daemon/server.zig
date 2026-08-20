@@ -6342,53 +6342,9 @@ pub const LinuxServer = struct {
             // coalesce it into the pending secured burst instead.
             if (slot.value.s2s_secured != null and slot.value.session_replica_replay_pending) {
                 slot.value.session_replica_resync_burst_pending = true;
-                // Establishment still waits for authority-before-membership, but a
-                // long retained-object replay on an already-burst link must not
-                // starve the peer's last-seen refresh past `stale_member_ttl_ms`
-                // (nicklist desync: live locals vanish from the peer's NAMES).
-                // Membership-only reaffirmation is HLC-idempotent and safe once
-                // the one-shot establish burst has already completed. Also resume
-                // a prior membership-only drain left pending on SendQ backpressure.
-                if (slot.value.s2s_burst_done and
-                    (slot.value.mesh_burst_stage == .idle or
-                        (slot.value.mesh_burst_stage == .membership and slot.value.mesh_burst_stage_encoded)))
-                {
-                    self.refreshPeerMembershipLastSeen(&slot.value);
-                }
                 continue;
             }
             _ = self.sendMeshStateBurstTo(&slot.value);
-        }
-    }
-
-    /// Membership-only anti-entropy for an already-established secured peer whose
-    /// full mesh burst is deferred behind a long session-replica replay. Encodes
-    /// PRESENT members + presence, then drains the secured outbound buffer so the
-    /// peer's RouteTable last-seen stamps stay inside `stale_member_ttl_ms`.
-    /// Never advances into mode/prop/oper families — always returns to idle after
-    /// a successful membership drain (or resumes that drain on SendQ stall).
-    /// Best-effort: `session_replica_resync_burst_pending` remains set so the full
-    /// burst still runs after replay finishes.
-    fn refreshPeerMembershipLastSeen(self: *LinuxServer, conn: *ConnState) void {
-        if (conn.closing or conn.s2s_secured == null) return;
-        if (conn.mesh_burst_stage == .membership and conn.mesh_burst_stage_encoded) {
-            if (self.flushMeshBurstStage(conn)) {
-                conn.mesh_burst_stage_encoded = false;
-                conn.mesh_burst_stage = .idle;
-            }
-            return;
-        }
-        if (conn.mesh_burst_stage != .idle) return;
-        conn.mesh_burst_stage = .membership;
-        if (!self.sendMembershipBurstTo(conn)) {
-            conn.mesh_burst_stage = .idle;
-            conn.mesh_burst_stage_encoded = false;
-            return;
-        }
-        conn.mesh_burst_stage_encoded = true;
-        if (self.flushMeshBurstStage(conn)) {
-            conn.mesh_burst_stage_encoded = false;
-            conn.mesh_burst_stage = .idle;
         }
     }
 
