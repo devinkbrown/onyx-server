@@ -6342,9 +6342,53 @@ pub const LinuxServer = struct {
             // coalesce it into the pending secured burst instead.
             if (slot.value.s2s_secured != null and slot.value.session_replica_replay_pending) {
                 slot.value.session_replica_resync_burst_pending = true;
+                // Establishment still waits for authority-before-membership, but a
+                // long retained-object replay on an already-burst link must not
+                // starve the peer's last-seen refresh past `stale_member_ttl_ms`
+                // (nicklist desync: live locals vanish from the peer's NAMES).
+                // Membership-only reaffirmation is HLC-idempotent and safe once
+                // the one-shot establish burst has already completed. Also resume
+                // a prior membership-only drain left pending on SendQ backpressure.
+                if (slot.value.s2s_burst_done and
+                    (slot.value.mesh_burst_stage == .idle or
+                        (slot.value.mesh_burst_stage == .membership and slot.value.mesh_burst_stage_encoded)))
+                {
+                    self.refreshPeerMembershipLastSeen(&slot.value);
+                }
                 continue;
             }
             _ = self.sendMeshStateBurstTo(&slot.value);
+        }
+    }
+
+    /// Membership-only anti-entropy for an already-established secured peer whose
+    /// full mesh burst is deferred behind a long session-replica replay. Encodes
+    /// PRESENT members + presence, then drains the secured outbound buffer so the
+    /// peer's RouteTable last-seen stamps stay inside `stale_member_ttl_ms`.
+    /// Never advances into mode/prop/oper families — always returns to idle after
+    /// a successful membership drain (or resumes that drain on SendQ stall).
+    /// Best-effort: `session_replica_resync_burst_pending` remains set so the full
+    /// burst still runs after replay finishes.
+    fn refreshPeerMembershipLastSeen(self: *LinuxServer, conn: *ConnState) void {
+        if (conn.closing or conn.s2s_secured == null) return;
+        if (conn.mesh_burst_stage == .membership and conn.mesh_burst_stage_encoded) {
+            if (self.flushMeshBurstStage(conn)) {
+                conn.mesh_burst_stage_encoded = false;
+                conn.mesh_burst_stage = .idle;
+            }
+            return;
+        }
+        if (conn.mesh_burst_stage != .idle) return;
+        conn.mesh_burst_stage = .membership;
+        if (!self.sendMembershipBurstTo(conn)) {
+            conn.mesh_burst_stage = .idle;
+            conn.mesh_burst_stage_encoded = false;
+            return;
+        }
+        conn.mesh_burst_stage_encoded = true;
+        if (self.flushMeshBurstStage(conn)) {
+            conn.mesh_burst_stage_encoded = false;
+            conn.mesh_burst_stage = .idle;
         }
     }
 
@@ -18987,7 +19031,12 @@ pub const LinuxServer = struct {
             self.sendTopicReply(conn, join_target) catch {};
             // draft/no-implicit-names: a capable client suppresses the automatic
             // NAMES burst on JOIN (it can still request NAMES explicitly).
-            if (!conn.session.hasCap(.no_implicit_names)) self.sendNames(conn, join_target) catch {};
+            // Fail-closed like explicit NAMES / resume bootstrap: never certify a
+            // successful JOIN with a swallowed empty roster (nicklist desync —
+            // client arms an implicit NAMES burst and will not re-poll while it
+            // believes the burst is in flight). InvalidNamesRoster / OutputTooSmall
+            // propagate to processLiveLine which marks conn.closing.
+            if (!conn.session.hasCap(.no_implicit_names)) try self.sendNames(conn, join_target);
 
             self.pushMarkreadOnJoin(conn, join_target) catch {};
 
@@ -84284,6 +84333,83 @@ test "NAMES rejects an admitted malformed remote member without partial 353 or 3
     try std.testing.expectEqual(@as(usize, 0), viewer.send_len);
     try std.testing.expectEqual(@as(usize, 0), viewer.send_overflow.items.len);
     viewer.send_armed = false;
+}
+
+test "JOIN auto-NAMES rejects malformed remote roster without empty nicklist" {
+    // Nicklist desync: JOIN used to `catch {}` sendNames failures, so a channel
+    // with one InvalidHost mesh row joined successfully and emitted neither 353
+    // nor 366. The client armed an implicit NAMES burst and suppressed re-poll
+    // while believing the burst was in flight — empty nicklist until TTL expiry.
+    // Fail-closed like explicit NAMES: close the connection, emit no partial roster.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{
+        .allocator = allocator,
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 1000,
+        .server_name = "peer.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer peer.deinit();
+    const link = try allocator.create(s2s_link.S2sLink);
+    try link.init(.{
+        .allocator = allocator,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_epoch_ms = 1001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+    try peer.start(50);
+    try pumpLinkPair(&peer, link, allocator);
+    try std.testing.expect(link.established());
+
+    try link.primeResumedMember("#join-malformed-names", "ValidRemote", 1, 0, 100, .{
+        .username = "valid",
+        .host = "valid.example",
+    }, 100);
+    try link.primeResumedMember("#join-malformed-names", "MalformedRemote", 1, 0, 101, .{
+        .username = "bad",
+        .host = "bad host",
+    }, 101);
+
+    const joiner_id = try addTestLocalClient(&server, "JoinViewer", null);
+    const joiner = server.connFor(joiner_id).?;
+    joiner.session.registration.registered = true;
+
+    const command = "JOIN #join-malformed-names\r\n";
+    @memcpy(joiner.recv_buf[0..command.len], command);
+    joiner.recv_armed = true;
+    joiner.send_armed = true;
+    var handler = CompletionHandler{ .server = &server };
+    handler.onCompletion(.{ .recv = .{
+        .token = joiner.token,
+        .res = @intCast(command.len),
+        .more = false,
+    } });
+    try std.testing.expect(handler.err == null);
+    try std.testing.expect(joiner.closing);
+    // No certified NAMES image: neither a 353 nor a lone 366 may escape.
+    const out = joiner.send_buf[joiner.send_offset..joiner.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, out, " 353 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " 366 ") == null);
+    joiner.send_armed = false;
 }
 
 test "labeled NAMES capture follows remaining SendQ beyond legacy 65 arenas" {
