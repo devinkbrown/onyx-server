@@ -77899,9 +77899,10 @@ test "threaded server: STATS m reports per-command usage to an oper" {
     // with a positive count and a trailing remote field of 0.
     admin.reset();
     try writeAllFd(fd_admin, "STATS m\r\n");
-    const stats_m = try recvUntil(&admin, " 212 Oper NICK ", 200);
+    try recvUntil(&admin, " 212 Oper NICK ", 200);
     // Discrete params — not a single space-joined "count bytes 0" middle field.
     // Shape: `212 Oper NICK <count> <bytes> 0` before the empty trailing.
+    const stats_m = admin.written();
     const nick_row = std.mem.indexOf(u8, stats_m, " 212 Oper NICK ") orelse return error.TestUnexpectedResult;
     const after_nick = stats_m[nick_row + " 212 Oper NICK ".len ..];
     const sp1 = std.mem.indexOfScalar(u8, after_nick, ' ') orelse return error.TestUnexpectedResult;
