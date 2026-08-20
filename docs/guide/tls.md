@@ -80,12 +80,17 @@ Set `request_client_cert = true` when using SASL EXTERNAL. The TLS engine reques
 
 Legacy clients such as WeeChat may use that binding for mesh-wide session resume
 without implementing the `SESSION RESUME` command. After SASL EXTERNAL succeeds, an
-exact account-and-requested-nick match attaches to the one matching logical session;
-multiple distinct session tokens fail closed. The first EXTERNAL login proactively
-offers signed portable state to secured peers, and a resumed attachment inherits the
-shared nick, channels, member modes, and message routing without emitting another
-logical JOIN or derived operator-prefix grant. A configured client certificate alone
-is insufficient: the connection must complete SASL EXTERNAL successfully.
+exact account-and-requested-nick match attaches to the canonical logical session for
+that identity across any number of secured mesh peers. When several distinct session
+tokens still match (for example after a race minted one token per node before
+replicas converged), selection is deterministic rather than fail-closed: live local
+attachments beat live mesh attachment leases beat detached/portable replicas; within
+a tier, newer signon/issued time and higher replica revision win. The first EXTERNAL
+login proactively offers signed portable state to secured peers, and a resumed
+attachment inherits the shared nick, channels, member modes, and message routing
+without emitting another logical JOIN or derived operator-prefix grant. A configured
+client certificate alone is insufficient: the connection must complete SASL EXTERNAL
+successfully.
 
 For WeeChat, configure every server profile that can reach the node. Profile
 names are local identifiers: `ircx` and `ircx.us` are distinct profiles even when
