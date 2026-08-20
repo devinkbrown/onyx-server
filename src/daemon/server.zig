@@ -21588,14 +21588,17 @@ pub const LinuxServer = struct {
             },
             'm', 'M' => {
                 // Command usage (RPL_STATSCOMMANDS 212): one line per dispatched
-                // verb with its hit count, total bytes, and remote count (always 0
-                // here — these are local-client command totals).
+                // verb as `<command> <count> <bytes> <remote>` — four discrete
+                // middle params (never a space-joined blob). Remote is always 0
+                // here; these are local-client command totals.
                 const Ctx = struct { c: *ConnState };
                 try self.command_usage.forEach(Ctx{ .c = conn }, struct {
                     fn emit(cx: Ctx, row: command_usage.CommandUsage.Row) anyerror!void {
-                        var buf: [48]u8 = undefined;
-                        const counts = std.fmt.bufPrint(&buf, "{d} {d} 0", .{ row.count, row.bytes }) catch return;
-                        try queueNumeric(cx.c, .RPL_STATSCOMMANDS, &.{ row.name, counts }, "");
+                        var count_buf: [20]u8 = undefined;
+                        var bytes_buf: [20]u8 = undefined;
+                        const count_s = try std.fmt.bufPrint(&count_buf, "{d}", .{row.count});
+                        const bytes_s = try std.fmt.bufPrint(&bytes_buf, "{d}", .{row.bytes});
+                        try queueNumeric(cx.c, .RPL_STATSCOMMANDS, &.{ row.name, count_s, bytes_s, "0" }, "");
                     }
                 }.emit);
             },
@@ -77891,11 +77894,26 @@ test "threaded server: STATS m reports per-command usage to an oper" {
     try writeAllFd(fd_admin, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
     try recvUntil(&admin, " 381 Oper ", 200);
 
-    // STATS m: 212 RPL_STATSCOMMANDS rows, terminated by 219; NICK was dispatched
-    // during registration so it appears in the table.
+    // STATS m: 212 RPL_STATSCOMMANDS as `<cmd> <count> <bytes> <remote>`, then
+    // 219. NICK was dispatched during registration so it appears in the table
+    // with a positive count and a trailing remote field of 0.
     admin.reset();
     try writeAllFd(fd_admin, "STATS m\r\n");
-    try recvUntil(&admin, " 212 Oper NICK ", 200);
+    const stats_m = try recvUntil(&admin, " 212 Oper NICK ", 200);
+    // Discrete params — not a single space-joined "count bytes 0" middle field.
+    // Shape: `212 Oper NICK <count> <bytes> 0` before the empty trailing.
+    const nick_row = std.mem.indexOf(u8, stats_m, " 212 Oper NICK ") orelse return error.TestUnexpectedResult;
+    const after_nick = stats_m[nick_row + " 212 Oper NICK ".len ..];
+    const sp1 = std.mem.indexOfScalar(u8, after_nick, ' ') orelse return error.TestUnexpectedResult;
+    const count_tok = after_nick[0..sp1];
+    try std.testing.expect(count_tok.len > 0);
+    for (count_tok) |ch| try std.testing.expect(ch >= '0' and ch <= '9');
+    const rest = after_nick[sp1 + 1 ..];
+    const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse return error.TestUnexpectedResult;
+    const bytes_tok = rest[0..sp2];
+    try std.testing.expect(bytes_tok.len > 0);
+    for (bytes_tok) |ch| try std.testing.expect(ch >= '0' and ch <= '9');
+    try std.testing.expect(std.mem.startsWith(u8, rest[sp2 + 1 ..], "0"));
     try recvUntil(&admin, " 219 Oper m ", 200);
 
     // STATS i: 215 allow blocks (connection classes) for the configured registry.
