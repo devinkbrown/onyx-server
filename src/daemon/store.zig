@@ -1434,7 +1434,11 @@ test "checksum mismatch is detected and rejected" {
 
     var file = try tmp.dir.openFile(std.testing.io, "bad.wal", .{ .mode = .read_write, .allow_directory = false });
     defer file.close(std.testing.io);
-    try file.writePositionalAll(std.testing.io, &.{0xAA}, 6);
+    var corrupted: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try file.readPositionalAll(std.testing.io, &corrupted, 6));
+    corrupted[0] ^= 0xFF;
+    try file.writePositionalAll(std.testing.io, &corrupted, 6);
+    try file.sync(std.testing.io);
 
     try std.testing.expectError(StoreError.ChecksumMismatch, openTestStore(tmp, "bad.wal"));
 }
