@@ -11665,6 +11665,18 @@ pub const LinuxServer = struct {
             null;
         var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
         var signature: [message_relay_v2.sig_len]u8 = undefined;
+        // Direct scopes have no channel modes to carry, but still need an
+        // origin-signed residence assertion to cross a topology where roster
+        // rows are deliberately link-local (A-B-C: A cannot otherwise know a
+        // node-C sender). Reuse the authenticated zero-mode sentinel already
+        // understood by the receiver's unknown-home gate. A known conflicting
+        // home still fails closed; only absence of multi-hop roster authority
+        // is bridged. This function is the local-authoring boundary, so callers
+        // cannot inject the assertion into an inbound message.
+        const effective_sender_member_modes: ?u8 = if (scope_kind == .direct)
+            sender_member_modes orelse 0
+        else
+            sender_member_modes;
         var msg = message_relay_v2.RelayMessage{
             .verb = verb,
             .target = target,
@@ -11677,7 +11689,7 @@ pub const LinuxServer = struct {
             .recipient = recipient,
             .scope_kind = scope_kind,
             .sender_route_id = sender_route,
-            .sender_member_modes = sender_member_modes,
+            .sender_member_modes = effective_sender_member_modes,
             .recipient_route_id = recipient_route,
             .origin_node = self.config.node_id,
             .hlc = hlc,
@@ -12786,8 +12798,9 @@ pub const LinuxServer = struct {
         // it from the signed prefix). `account`, `tags`, and `min_rank` are also
         // unsigned/hop-mutable and cannot establish nick ownership.
         // Legacy v1 is fail-closed on sender-home uncertainty unless a signed
-        // portable proof supplies authority.
-        if (replica_modes == null) {
+        // portable proof supplies authority or the self-certifying origin has
+        // authored the daemon's exact synthetic webhook identity.
+        if (replica_modes == null and !verified_webhook) {
             switch (self.relaySenderHome(clean_msg.source_nick, clean_msg.origin_node)) {
                 .match => {},
                 .mismatch => |home| {
