@@ -151,6 +151,10 @@ pub const FrameType = enum(u8) {
     /// distinct frame tag domain-separates this signed receipt from MESSAGE_V2
     /// acknowledgments even though both RelayId types are 16 bytes.
     E2EE_GROUP_ACK = 0x27,
+    /// Authenticated completion marker for one peer-originated full MEMBERSHIP
+    /// snapshot. A receiver may repair rows omitted since the preceding marker;
+    /// without this proof, elapsed wall time alone never authorizes roster loss.
+    MEMBERSHIP_SYNC = 0x28,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -197,6 +201,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.MEDIA_WS_DATAGRAM) => .MEDIA_WS_DATAGRAM,
             @intFromEnum(FrameType.E2EE_GROUP) => .E2EE_GROUP,
             @intFromEnum(FrameType.E2EE_GROUP_ACK) => .E2EE_GROUP_ACK,
+            @intFromEnum(FrameType.MEMBERSHIP_SYNC) => .MEMBERSHIP_SYNC,
             else => null,
         };
     }
@@ -397,6 +402,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .MEDIA_WS_DATAGRAM, .token = "MEDIA_WS_DATAGRAM", .family = .media, .auth = .secured_signed, .summary = "Origin-only cascade of an already-validated browser Cadence WS media datagram." },
     .{ .frame_type = .E2EE_GROUP, .token = "E2EE_GROUP", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured opaque E2EEGROUP control with immutable origin signature and RelayId." },
     .{ .frame_type = .E2EE_GROUP_ACK, .token = "E2EE_GROUP_ACK", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured immediate-hop receipt for an admitted E2EEGROUP RelayId." },
+    .{ .frame_type = .MEMBERSHIP_SYNC, .token = "MEMBERSHIP_SYNC", .family = .membership, .auth = .signable, .summary = "Authenticated completion marker for a full peer membership snapshot." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {

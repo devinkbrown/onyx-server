@@ -489,11 +489,12 @@ pub const InboundOperEventV2 = struct {
     }
 };
 
-/// NICK/MEMBERSHIP frames on a negotiated v2 link are residence-dependent.
+/// NICK/MEMBERSHIP frames and their snapshot completion marker on a negotiated
+/// v2 link are residence-dependent.
 /// They must remain in original wire order until the daemon has applied every
 /// SESSION_REPLICA object from the same socket read to its authoritative Store.
 const DeferredResidenceFrame = struct {
-    const Kind = enum { membership, nick_change };
+    const Kind = enum { membership, nick_change, membership_sync };
 
     kind: Kind,
     payload: []u8,
@@ -549,6 +550,10 @@ pub const S2sPeer = struct {
     /// Heartbeat / explicit RTT probes stamp an 8-byte little-endian monotonic
     /// send time into the PING payload; the matching PONG echoes it.
     last_rtt_ms: ?u32 = null,
+    /// Receiver-local completion time of the preceding authenticated full
+    /// membership snapshot. Rows not refreshed after this boundary may be
+    /// repaired only when the peer completes its next snapshot.
+    last_membership_sync_ms: ?i64 = null,
     config: Config,
     /// This node's Ed25519 signing keypair (set on secured links), or null on the
     /// legacy unsigned (plaintext) path. When set, in-scope outbound frames are
@@ -1300,6 +1305,10 @@ pub const S2sPeer = struct {
             .MESSAGE_V2_ACK => try self.recvMessageV2Ack(frame.payload),
             .E2EE_GROUP => try self.recvE2eeGroup(frame.payload),
             .E2EE_GROUP_ACK => try self.recvE2eeGroupAck(frame.payload),
+            .MEMBERSHIP_SYNC => if (self.supportsSessionReplicaV2())
+                self.deferResidenceFrame(.membership_sync, frame.payload)
+            else
+                self.recvMembershipSync(frame.payload, now_ms),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
             .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
             .ENTITY_PROP => try self.recvEntityProp(frame.payload),
@@ -1472,6 +1481,7 @@ pub const S2sPeer = struct {
         const frame_type: s2s_frame.FrameType = switch (kind) {
             .membership => .MEMBERSHIP,
             .nick_change => .NICKCHANGE,
+            .membership_sync => .MEMBERSHIP_SYNC,
         };
         // Authenticate the outer hop before allocating, then validate the small
         // family codec and retain only its inner payload. An attacker can no
@@ -1480,6 +1490,7 @@ pub const S2sPeer = struct {
         switch (kind) {
             .membership => _ = membership_event.decode(payload) catch return,
             .nick_change => _ = nick_event.decode(payload) catch return,
+            .membership_sync => if (payload.len != 0) return,
         }
         if (self.deferred_residence_frames.items.len >= self.config.max_session_replica_frames) {
             self.dropped_session_replica_frames +|= 1;
@@ -1510,6 +1521,7 @@ pub const S2sPeer = struct {
             switch (frame.kind) {
                 .membership => self.applyMembershipPayload(frame.payload, now_ms) catch {},
                 .nick_change => self.applyNickChangePayload(frame.payload) catch {},
+                .membership_sync => self.applyMembershipSyncPayload(frame.payload, now_ms),
             }
         }
         self.deferred_residence_frames.clearRetainingCapacity();
@@ -3444,6 +3456,39 @@ pub const S2sPeer = struct {
         var buf: [membership_event.max_encoded_len]u8 = undefined;
         const wire = try membership_event.encode(ev, &buf);
         try self.emitSignable(sink, .MEMBERSHIP, wire);
+    }
+
+    /// End one full local MEMBERSHIP snapshot. The empty marker is signed on
+    /// signing-capable links and ordered after every membership frame in the
+    /// snapshot, allowing the receiver to repair omissions without a TTL guess.
+    pub fn sendMembershipSync(self: *S2sPeer, sink: ByteSink) !void {
+        try self.emitSignable(sink, .MEMBERSHIP_SYNC, "");
+    }
+
+    /// Complete one peer-originated membership generation. The first marker
+    /// merely establishes a receiver-local boundary. Each later marker proves
+    /// that a complete snapshot was received since the preceding boundary, so
+    /// rows whose PRESENT stamp predates that boundary were genuinely omitted.
+    fn recvMembershipSync(self: *S2sPeer, frame_payload: []const u8, now_ms: u64) void {
+        const payload = self.verifiedPayload(.MEMBERSHIP_SYNC, frame_payload) orelse return;
+        self.applyMembershipSyncPayload(payload, now_ms);
+    }
+
+    fn applyMembershipSyncPayload(self: *S2sPeer, payload: []const u8, now_ms: u64) void {
+        if (payload.len != 0) return;
+        const now: i64 = @intCast(@min(now_ms, @as(u64, std.math.maxInt(i64))));
+        if (self.last_membership_sync_ms) |previous| {
+            if (now > previous) {
+                // Keep the old boundary on allocation failure so the next
+                // authenticated marker retries every row not yet repaired.
+                // Strictly older than the preceding boundary. A PRESENT received
+                // just after that marker may share its millisecond timestamp;
+                // equality is ambiguous and survives one extra generation rather
+                // than risking a false PART.
+                _ = self.pruneStaleMembers(now, now - previous) catch return;
+            }
+        }
+        self.last_membership_sync_ms = now;
     }
 
     /// Emit a CHANNEL_MODE_FLAGS aggregate to the peer. Best-effort; only
@@ -7189,6 +7234,97 @@ test "signing peers round-trip a signed MEMBERSHIP frame" {
     try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
 }
 
+test "signing peer rejects an unsigned MEMBERSHIP_SYNC completion marker" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x41);
+    const kp_b = try signingKeyFor(0x42);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x41E);
+
+    // B negotiated signing, so a raw empty control marker is a downgrade and
+    // cannot establish the inbound deletion boundary.
+    try emitFrame(allocator, a_to_b.sink(), .MEMBERSHIP_SYNC, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x41F);
+    try std.testing.expect(b.last_membership_sync_ms == null);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
+}
+
+test "MEMBERSHIP_SYNC same-millisecond boundary never false-parts a later PRESENT" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x51);
+    const kp_b = try signingKeyFor(0x52);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x51E);
+
+    try a.sendMembershipSync(a_to_b.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, 100, 0x51F);
+    try std.testing.expectEqual(@as(?i64, 100), b.last_membership_sync_ms);
+
+    // This PRESENT is ordered after the marker but shares its millisecond.
+    try a.sendMembership(a_to_b.sink(), "#room", "Live", 0, 50, true, .{ .username = "u", .host = "h" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, 100, 0x520);
+    const joined = try b.takeMembershipChanges();
+    defer allocator.free(joined);
+    try std.testing.expectEqual(@as(usize, 1), joined.len);
+    for (joined) |*change| change.deinit(allocator);
+
+    // A later-read marker cannot tell before/after within t=100, so it must keep
+    // the row. The next omitted generation supplies an unambiguous boundary.
+    try a.sendMembershipSync(a_to_b.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, 101, 0x521);
+    try std.testing.expectEqual(@as(usize, 1), b.channelMembers("#room").len);
+    var changes = try b.takeMembershipChanges();
+    try std.testing.expectEqual(@as(usize, 0), changes.len);
+    allocator.free(changes);
+
+    try a.sendMembershipSync(a_to_b.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, 102, 0x522);
+    try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#room").len);
+    changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*change| change.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.parted, changes[0].kind);
+}
+
 /// A local resolver stub for the account-aware collision tests: it reports one
 /// held nick with a fixed account and last-claim HLC.
 const ReclaimResolverStub = struct {
@@ -9006,7 +9142,7 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .OPER_EVENT,          .OBSERVE_EVENT,          .KILL,                     .WARD,                             .RESYNC,
         .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .MEMO_PUSH,                        .SESSION_REPLICA_OFFER,
         .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE, .OPER_EVENT_V2,
-        .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,      .E2EE_GROUP,               .E2EE_GROUP_ACK,
+        .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,      .E2EE_GROUP,               .E2EE_GROUP_ACK,                   .MEMBERSHIP_SYNC,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug

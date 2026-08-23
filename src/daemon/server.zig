@@ -1120,12 +1120,9 @@ const session_attachment_lease_refresh_interval_ms: i64 = 30 * 1000;
 /// distinct portable tokens per housekeeping turn so a large account cannot
 /// monopolize the event loop.
 const session_replica_dirty_retry_batch: usize = 8;
-/// Staleness window for reaping never-retracted remote member projections from
-/// each peer's RouteTable. The resync re-burst refreshes every PRESENT member's
-/// local last-seen stamp to ~now every `membership_resync_interval_ms`; this window
-/// is 3x that, so a live member (refreshed every 30s) is never pruned and only a
-/// truly-departed member whose PART/QUIT was lost (collision-rename, USR2 churn,
-/// abrupt drop) ages out instead of lingering as a zombie in NAMES/WHOIS forever.
+/// Legacy plaintext-peer staleness window. Secured links never infer departure
+/// from elapsed time: authenticated MEMBERSHIP_SYNC generations repair omissions
+/// in the inbound peer direction (see S2sPeer.recvMembershipSync).
 const stale_member_ttl_ms: i64 = 90_000;
 /// Max members per netsplit/netjoin IRCv3 BATCH chunk; a larger channel splits
 /// across multiple batches so members past a fixed cap are never silently lost.
@@ -6357,25 +6354,17 @@ pub const LinuxServer = struct {
     /// feed path stamps onto each member (`applyMembership`'s `now_ms`), so the
     /// staleness compare stays in one clock domain (see `RouteTable.pruneStale`).
     /// Walks the same `self.rx().clients.slots` as `resyncMeshStateToPeers` (peer
-    /// links live on reactor 0) and reaches `routes` directly. Like
-    /// `resyncMeshStateToPeers`, it gates on `link.established()`; the simpler
-    /// `clearDroppedPeerRouteOrigin` does not.
+    /// links live on reactor 0). Secured links are deliberately excluded: their
+    /// remote roster is inbound state, while this connection's replay/burst flags
+    /// describe outbound state and cannot safely authorize deletion. They repair
+    /// omissions only from peer-originated authenticated MEMBERSHIP_SYNC markers.
+    /// The simpler `clearDroppedPeerRouteOrigin` does not use this lifecycle gate.
     fn pruneStaleMeshMembers(self: *LinuxServer, now_ms: i64) void {
         const window: i64 = stale_member_ttl_ms;
         for (self.rx().clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |link| {
-                if (!link.established()) continue;
-                if (link.inner) |inner| {
-                    _ = inner.peer.pruneStaleMembers(now_ms, window) catch {
-                        // Earlier per-row transactions may already have queued
-                        // departures before a later allocation failed.
-                        self.drainIdentityTransitions(inner);
-                        continue;
-                    };
-                    self.drainIdentityTransitions(inner);
-                }
-            } else if (slot.value.s2s) |link| {
+            if (slot.value.s2s_secured != null) continue;
+            if (slot.value.s2s) |link| {
                 if (!link.established()) continue;
                 _ = link.peer.pruneStaleMembers(now_ms, window) catch {
                     self.drainIdentityTransitions(link);
@@ -14867,6 +14856,7 @@ pub const LinuxServer = struct {
         // keyed), so it must be recency-comparable, never monotonic (was the
         // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
         const hlc = self.nextMeshHlc();
+        var generation_complete = true;
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
             var members = self.world.memberIterator(cv.name) orelse continue;
@@ -14877,7 +14867,10 @@ pub const LinuxServer = struct {
                 // token-less anti-entropy until its exact signed Store row is
                 // accepted. The dedicated deferred flush preserves strict
                 // OFFER -> NICK -> MEMBERSHIP ordering and then clears this gate.
-                if (mconn.session_mesh_announce_pending) continue;
+                if (mconn.session_mesh_announce_pending) {
+                    generation_complete = false;
+                    continue;
+                }
                 const nick = mconn.session.displayName();
                 const status: u4 = @truncate((self.world.memberModes(cv.name, member.*) orelse world_model.MemberModes.empty()).bits);
                 const ident = membershipIdentityOf(mconn);
@@ -14911,7 +14904,10 @@ pub const LinuxServer = struct {
                 const mc = &slot.value;
                 if (mc.s2s != null or mc.s2s_secured != null) continue; // skip peer links
                 if (!mc.session.registered()) continue;
-                if (mc.session_mesh_announce_pending) continue;
+                if (mc.session_mesh_announce_pending) {
+                    generation_complete = false;
+                    continue;
+                }
                 const pnick = mc.session.displayName();
                 if (std.mem.eql(u8, pnick, "*")) continue;
                 const pident = membershipIdentityOf(mc);
@@ -14921,6 +14917,19 @@ pub const LinuxServer = struct {
                     link.sendMembership(presence_channel, pnick, 0, hlc, true, pident, "") catch return false;
                 }
             }
+        }
+        // A pending live attachment was intentionally omitted until its signed
+        // Store authority is publishable. Flush the complete PRESENT prefix but
+        // leave this retryable stage uncommitted; certifying it as a complete
+        // generation could false-PART the receiver's existing row.
+        if (!generation_complete) return false;
+        // Ordered after every PRESENT record above. On secured links this is an
+        // authenticated inbound-generation proof; rolling-old peers skip the
+        // unknown tag and therefore fail safe by retaining rows until upgraded.
+        if (conn.s2s_secured) |link| {
+            link.sendMembershipSync() catch return false;
+        } else if (conn.s2s) |link| {
+            link.sendMembershipSync() catch return false;
         }
         return true;
     }
@@ -54399,6 +54408,162 @@ test "v2 Store hot-adoption is SQ-inert until authority-first link activation" {
     try std.testing.expect(conn.session_replica_resync_burst_pending);
     server.releaseMeshBurstAfterSessionReplicaReplay(conn, conn.s2s_secured.?);
     try std.testing.expect(!conn.session_replica_resync_burst_pending);
+}
+
+test "secured roster repair follows inbound membership generations across asymmetric replay" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "roster-gc-barrier.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "roster-gc-barrier-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer = server.rx().clients.get(peer_id).?;
+    peer.overflow_allocator = allocator;
+    peer.token = try tokenFromId(peer_id);
+    peer.send_armed = true;
+    peer.s2s_secured = &pair.a;
+    peer.s2s_burst_done = true;
+    defer {
+        peer.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+
+    const pending_id = try addTestLocalClient(&server, "PendingLocal", null);
+    const pending = server.connFor(pending_id).?;
+    _ = try server.world.join("#roster-gc-barrier", worldIdFromClient(pending_id));
+
+    // Seed B's existing view through the actual daemon burst path.
+    try std.testing.expect(server.sendMembershipBurstTo(peer));
+    const initial_daemon_burst = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(initial_daemon_burst);
+    pair.a.clearOutbound();
+    try pair.b.feed(initial_daemon_burst, 80);
+    pair.b.processDeferredResidenceFrames(80);
+    server.discardIdentityTransitions(&pair.b);
+    try std.testing.expectEqual(@as(usize, 1), pair.b.channelMembers("#roster-gc-barrier").len);
+
+    // The same live attachment now awaits signed Store authority. It is omitted,
+    // so the daemon must withhold the marker and leave the stage retryable; B's
+    // existing row cannot be repaired away before deferred reannouncement.
+    pending.session_mesh_announce_pending = true;
+    try std.testing.expect(!server.sendMembershipBurstTo(peer));
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+    try std.testing.expectEqual(@as(usize, 1), pair.b.channelMembers("#roster-gc-barrier").len);
+
+    // Once authority is ready, the complete daemon burst reaffirms the row before
+    // its marker, producing neither a repair PART nor a replacement JOIN.
+    pending.session_mesh_announce_pending = false;
+    try std.testing.expect(server.sendMembershipBurstTo(peer));
+    const daemon_burst = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(daemon_burst);
+    pair.a.clearOutbound();
+    try pair.b.feed(daemon_burst, 90);
+    pair.b.processDeferredResidenceFrames(90);
+    try std.testing.expectEqual(@as(?i64, 90), pair.b.inner.?.peer.last_membership_sync_ms);
+    try std.testing.expectEqual(@as(usize, 1), pair.b.channelMembers("#roster-gc-barrier").len);
+    try std.testing.expect(pair.b.inner.?.peer.peekNextMembershipTransition() == null);
+
+    try pair.b.sendMembership(
+        "#roster-gc-barrier",
+        "RemoteLive",
+        0,
+        100,
+        true,
+        .{ .username = "remote", .host = "peer.test" },
+        "",
+    );
+    const wire = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(wire);
+    pair.b.clearOutbound();
+    try pair.a.feed(wire, 100);
+    pair.a.processDeferredResidenceFrames(100);
+    server.discardIdentityTransitions(&pair.a);
+    try std.testing.expectEqual(@as(usize, 1), pair.a.channelMembers("#roster-gc-barrier").len);
+
+    try pair.b.sendMembershipSync();
+    const first_marker = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(first_marker);
+    pair.b.clearOutbound();
+    try pair.a.feed(first_marker, 100);
+    pair.a.processDeferredResidenceFrames(100);
+    server.discardIdentityTransitions(&pair.a);
+
+    // A's outbound authority/replay state is already settled, while B sends no
+    // completed inbound generation for longer than the historical TTL. A must
+    // retain B's live member: local egress state cannot authorize inbound loss.
+    peer.session_replica_replay_pending = false;
+    peer.session_replica_resync_burst_pending = false;
+    peer.s2s_burst_done = true;
+    const refreshed_at = pair.a.channelMembers("#roster-gc-barrier")[0].last_refreshed_ms;
+    const stale_now = refreshed_at + stale_member_ttl_ms + 1;
+    server.pruneStaleMeshMembers(stale_now);
+    try std.testing.expectEqual(@as(usize, 1), pair.a.channelMembers("#roster-gc-barrier").len);
+
+    // B eventually completes a full generation containing RemoteLive. Its
+    // reaffirmation refreshes the inbound row before the authenticated marker.
+    try pair.b.sendMembership(
+        "#roster-gc-barrier",
+        "RemoteLive",
+        0,
+        101,
+        true,
+        .{ .username = "remote", .host = "peer.test" },
+        "",
+    );
+    try pair.b.sendMembershipSync();
+    const live_generation = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(live_generation);
+    pair.b.clearOutbound();
+    try pair.a.feed(live_generation, @intCast(stale_now));
+    pair.a.processDeferredResidenceFrames(@intCast(stale_now));
+    server.discardIdentityTransitions(&pair.a);
+    try std.testing.expectEqual(@as(usize, 1), pair.a.channelMembers("#roster-gc-barrier").len);
+
+    // A later completed B generation omits the member. Its last refresh shares
+    // the preceding marker's millisecond, so the ambiguous equality survives
+    // one extra generation rather than risking a false PART across read splits.
+    try pair.b.sendMembershipSync();
+    const first_omitted_generation = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(first_omitted_generation);
+    pair.b.clearOutbound();
+    const first_omitted_now: u64 = @intCast(stale_now + membership_resync_interval_ms);
+    try pair.a.feed(first_omitted_generation, first_omitted_now);
+    pair.a.processDeferredResidenceFrames(first_omitted_now);
+    try std.testing.expectEqual(@as(usize, 1), pair.a.channelMembers("#roster-gc-barrier").len);
+    try std.testing.expect(pair.a.inner.?.peer.peekNextMembershipTransition() == null);
+
+    // The following authenticated generation gives an unambiguous boundary:
+    // only peer-originated omission proof—not elapsed time or A's egress flags—
+    // authorizes the repair PART.
+    try pair.b.sendMembershipSync();
+    const second_omitted_generation = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(second_omitted_generation);
+    pair.b.clearOutbound();
+    const second_omitted_now = first_omitted_now + @as(u64, @intCast(membership_resync_interval_ms));
+    try pair.a.feed(second_omitted_generation, second_omitted_now);
+    pair.a.processDeferredResidenceFrames(second_omitted_now);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.channelMembers("#roster-gc-barrier").len);
+    const repair = pair.a.inner.?.peer.peekNextMembershipTransition() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(s2s_peer_mod.S2sPeer.MembershipDelta.Kind.parted, repair.kind);
+    try std.testing.expectEqualStrings("RemoteLive", repair.nick);
 }
 
 test "hot-adopt secured link tears down cleanly when RESYNC exceeds the carried SendQ" {
