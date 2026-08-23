@@ -775,6 +775,7 @@ test "secure relay v2 scope and mandatory signature are strict" {
     msg.target = "bob";
     msg.recipient_route_id = @splat(0);
     try std.testing.expectError(error.InvalidSemantic, validateSemantic(msg));
+    msg = try signedSample(&kp, &pubkey, &signature);
     msg.origin_sig = "";
     try std.testing.expectError(error.InvalidSemantic, validateSemantic(msg));
 }
