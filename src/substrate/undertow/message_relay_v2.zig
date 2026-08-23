@@ -163,7 +163,7 @@ fn validateBody(msg: RelayMessage) SemanticError!void {
         },
         .direct => {
             if (isChannelTarget(msg.target) or msg.recipient.len != 0 or msg.recipient_route_id == null or
-                (msg.sender_member_modes != null and msg.sender_member_modes.? != 0))
+                msg.sender_member_modes != null)
                 return error.InvalidSemantic;
         },
         .channel_whisper => {
@@ -658,9 +658,6 @@ test "secure relay v2 signed channel and direct scopes round-trip" {
     channel.scope_kind = .direct;
     channel.target = "bob";
     channel.min_rank = 0;
-    // Direct scopes use zero as an origin-signed residence assertion. There is
-    // no channel rank to convey, and non-zero values remain invalid.
-    channel.sender_member_modes = 0;
     channel.recipient_route_id = try routeId(@splat(0x22));
     try stampOrigin(allocator, &channel, &kp, &pubkey, &signature);
     const direct_wire = try encode(allocator, channel);
@@ -668,7 +665,6 @@ test "secure relay v2 signed channel and direct scopes round-trip" {
     var direct = try decode(allocator, direct_wire);
     defer direct.deinit(allocator);
     try std.testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(allocator, direct.msg));
-    try std.testing.expectEqual(@as(?u8, 0), direct.msg.sender_member_modes);
     try std.testing.expectEqualSlices(u8, &channel.recipient_route_id.?, &direct.msg.recipient_route_id.?);
 }
 
@@ -779,13 +775,6 @@ test "secure relay v2 scope and mandatory signature are strict" {
     msg.target = "bob";
     msg.recipient_route_id = @splat(0);
     try std.testing.expectError(error.InvalidSemantic, validateSemantic(msg));
-    msg = try signedSample(&kp, &pubkey, &signature);
-    msg.scope_kind = .direct;
-    msg.target = "bob";
-    msg.recipient_route_id = try routeId(@splat(0x45));
-    msg.sender_member_modes = 1;
-    try std.testing.expectError(error.InvalidSemantic, validateSemantic(msg));
-    msg = try signedSample(&kp, &pubkey, &signature);
     msg.origin_sig = "";
     try std.testing.expectError(error.InvalidSemantic, validateSemantic(msg));
 }

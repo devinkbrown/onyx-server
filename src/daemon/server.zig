@@ -11339,6 +11339,12 @@ pub const LinuxServer = struct {
     /// merely choosing USER `webhook` cannot satisfy the server-host binding.
     fn isVerifiedWebhookRelay(self: *LinuxServer, msg: s2s_link.RelayMessage, auth: RelayOriginAuth) bool {
         if (auth != .verified) return false;
+        // This exception is only for the immutable shape authored by
+        // `injectWebhookPost`; a keyed peer must not obtain a general nick-home
+        // bypass by putting `webhook` in an arbitrary DM/NOTICE/DATA prefix.
+        if (msg.verb != .privmsg or !world_model.isChannelName(msg.target) or
+            msg.min_rank != 0 or msg.recipient.len != 0 or msg.data_tag.len != 0)
+            return false;
         const bang = std.mem.indexOfScalar(u8, msg.source_prefix, '!') orelse return false;
         const at_rel = std.mem.indexOfScalar(u8, msg.source_prefix[bang + 1 ..], '@') orelse return false;
         const at = bang + 1 + at_rel;
@@ -11665,18 +11671,6 @@ pub const LinuxServer = struct {
             null;
         var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
         var signature: [message_relay_v2.sig_len]u8 = undefined;
-        // Direct scopes have no channel modes to carry, but still need an
-        // origin-signed residence assertion to cross a topology where roster
-        // rows are deliberately link-local (A-B-C: A cannot otherwise know a
-        // node-C sender). Reuse the authenticated zero-mode sentinel already
-        // understood by the receiver's unknown-home gate. A known conflicting
-        // home still fails closed; only absence of multi-hop roster authority
-        // is bridged. This function is the local-authoring boundary, so callers
-        // cannot inject the assertion into an inbound message.
-        const effective_sender_member_modes: ?u8 = if (scope_kind == .direct)
-            sender_member_modes orelse 0
-        else
-            sender_member_modes;
         var msg = message_relay_v2.RelayMessage{
             .verb = verb,
             .target = target,
@@ -11689,7 +11683,7 @@ pub const LinuxServer = struct {
             .recipient = recipient,
             .scope_kind = scope_kind,
             .sender_route_id = sender_route,
-            .sender_member_modes = effective_sender_member_modes,
+            .sender_member_modes = sender_member_modes,
             .recipient_route_id = recipient_route,
             .origin_node = self.config.node_id,
             .hlc = hlc,
@@ -12249,6 +12243,13 @@ pub const LinuxServer = struct {
             .{ .bits = bits }
         else
             null;
+        // Roster rows are link-local, so a far receiver in A-B-C cannot know a
+        // node-C direct sender's home. A signed, non-null sender route is the
+        // origin's existing wire-compatible assertion that this event came
+        // from one locally attached reusable session. It can bridge only an
+        // absent roster claim; a known conflicting home remains a permanent
+        // rejection below. Old peers continue to decode the exact same schema.
+        const signed_direct_residence = msg.scope_kind == .direct and msg.sender_route_id != null;
         const sender_home = self.relaySenderHome(source_nick, msg.origin_node);
         // replica_proof is a portable session — it may override residence.
         // signed_member_modes is only the origin's assertion of mode bits: it
@@ -12260,7 +12261,7 @@ pub const LinuxServer = struct {
                     self.recordRelayHomeMismatch(clean_msg, home);
                     return .permanent;
                 },
-                .unknown => if (signed_member_modes == null)
+                .unknown => if (signed_member_modes == null and !signed_direct_residence)
                     return .{ .retry = .unknown_home_authority },
                 .match => {},
             }
@@ -59471,6 +59472,40 @@ fn addTestRelayHomes(
     for (nicks) |nick| try std.testing.expectEqual(origin_node, server.meshNickHomeNode(nick).?);
 }
 
+test "verified webhook residence bypass is restricted to server-authored channel PRIVMSG" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var relay_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &relay_peer, 99, &.{"Remote"});
+    defer relay_peer.deinit();
+
+    const base = s2s_link.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_nick = "CI-Bot",
+        .source_prefix = "CI-Bot!webhook@relay-origin.test",
+        .text = "build passed",
+        .origin_node = 99,
+        .hlc = 1,
+    };
+    try std.testing.expect(server.isVerifiedWebhookRelay(base, .verified));
+    try std.testing.expect(!server.isVerifiedWebhookRelay(base, .unsigned));
+
+    var direct = base;
+    direct.target = "Victim";
+    try std.testing.expect(!server.isVerifiedWebhookRelay(direct, .verified));
+    var notice = base;
+    notice.verb = .notice;
+    try std.testing.expect(!server.isVerifiedWebhookRelay(notice, .verified));
+    var typed = base;
+    typed.data_tag = "comic";
+    try std.testing.expect(!server.isVerifiedWebhookRelay(typed, .verified));
+}
+
 /// Most legacy server fixtures predate physical attachment identifiers. SESSION
 /// SID tests must opt into the production-only stable row identity explicitly;
 /// a null attachment intentionally has no public SID.
@@ -72656,6 +72691,24 @@ test "MESSAGE_V2 known-home mismatch with signed member modes still drops perman
     try std.testing.expect(out == .permanent);
     try std.testing.expectEqual(@as(usize, 0), target.send_len);
     try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch);
+
+    // A signed direct sender route may bridge only missing multi-hop roster
+    // state. It must never override an explicit residence conflict.
+    var direct = msg;
+    direct.target = "Target";
+    direct.text = "signed route must not launder a home mismatch";
+    direct.scope_kind = .direct;
+    direct.sender_member_modes = null;
+    direct.sender_route_id = try message_relay_v2.routeId(@splat(0x71));
+    direct.recipient_route_id = try message_relay_v2.routeId(@splat(0x72));
+    direct.hlc = server.nextMeshHlc();
+    try message_relay_v2.stampOrigin(alloc, &direct, &origin.sign_kp, &pubkey, &signature);
+    const direct_wire = try message_relay_v2.encode(alloc, direct);
+    defer alloc.free(direct_wire);
+    const direct_out = server.deliverRelayV2(direct, direct_wire, origin.shortId());
+    try std.testing.expect(direct_out == .permanent);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(u64, 2), server.rejected_relay_home_mismatch);
 }
 
 // ---------------------------------------------------------------------------
