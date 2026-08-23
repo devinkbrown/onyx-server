@@ -59406,6 +59406,58 @@ fn addTestLocalClient(server: *Server, nick: []const u8, account: ?[]const u8) !
     } else return error.SkipZigTest;
 }
 
+/// Install roster-backed sender-home authority for tests that call the legacy
+/// relay-v1 delivery boundary directly. Production only accepts such a relay
+/// after membership convergence; keeping that precondition explicit in the
+/// fixture prevents policy tests from accidentally exercising an unknown-home
+/// drop instead of the delivery rule they intend to cover.
+fn addTestRelayHomes(
+    server: *Server,
+    peer: *s2s_link.S2sLink,
+    origin_node: s2s_link.NodeId,
+    nicks: []const []const u8,
+) !void {
+    const alloc = std.testing.allocator;
+    try peer.init(.{
+        .allocator = alloc,
+        .local_node_id = origin_node,
+        .remote_node_id = server.config.node_id,
+        .local_epoch_ms = 1000,
+        .server_name = "relay-origin.test",
+        .config = .{ .require_signed_frames = false },
+    });
+    errdefer peer.deinit();
+    const link = try alloc.create(s2s_link.S2sLink);
+    var server_owns_link = false;
+    errdefer if (!server_owns_link) alloc.destroy(link);
+    try link.init(.{
+        .allocator = alloc,
+        .local_node_id = server.config.node_id,
+        .remote_node_id = origin_node,
+        .local_epoch_ms = 1001,
+        .server_name = "relay-receiver.test",
+        .config = .{ .require_signed_frames = false },
+    });
+    errdefer if (!server_owns_link) link.deinit();
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+    server_owns_link = true;
+
+    try peer.start(50);
+    for (nicks, 0..) |nick, index| try peer.sendMembership(
+        "#relay-home",
+        nick,
+        0,
+        100 + index,
+        true,
+        .{ .username = "relay", .host = "origin.test" },
+        "",
+    );
+    try pumpLinkPair(peer, link, alloc);
+    try std.testing.expect(link.established());
+    for (nicks) |nick| try std.testing.expectEqual(origin_node, server.meshNickHomeNode(nick).?);
+}
+
 /// Most legacy server fixtures predate physical attachment identifiers. SESSION
 /// SID tests must opt into the production-only stable row identity explicitly;
 /// a null attachment intentionally has no public SID.
@@ -68315,6 +68367,9 @@ test "relay direct messages honor local +R SILENCE and recipient session-sync" {
             else => return err,
         };
         defer server.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, 99, &.{"Remote"});
+        defer relay_peer.deinit();
 
         const target_id = try addTestLocalClient(&server, "Target", "targetacct");
         const sibling_id = try addTestLocalClient(&server, "Sibling", "targetacct");
@@ -68399,6 +68454,9 @@ test "SILENCE ACCESS control is case-insensitive: nick-case cannot bypass the ig
         else => return err,
     };
     defer server.deinit();
+    var relay_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &relay_peer, 99, &.{ "Remote", "Friend" });
+    defer relay_peer.deinit();
 
     const target_id = try addTestLocalClient(&server, "Target", "targetacct");
     const target = server.connFor(target_id).?;
@@ -68830,6 +68888,9 @@ test "relay direct messages honor local +C and +g callerid policy" {
             else => return err,
         };
         defer server.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, 99, &.{"Remote"});
+        defer relay_peer.deinit();
 
         const target_id = try addTestLocalClient(&server, "Target", "targetacct");
         const target = server.connFor(target_id).?;
@@ -69070,6 +69131,9 @@ test "relayed channel message is recorded into CHATHISTORY for cross-node read-b
             else => return err,
         };
         defer server.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, 4242, &.{"Remote"});
+        defer relay_peer.deinit();
 
         const member_id = try addTestLocalClient(&server, "Local", null);
         _ = try server.world.join("#hist", worldIdFromClient(member_id));
@@ -69136,6 +69200,9 @@ test "relayed TAGMSG reaches capable members only and preserves its live msgid i
             else => return err,
         };
         defer server.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, 4242, &.{"Remote"});
+        defer relay_peer.deinit();
 
         const tagged_id = try addTestLocalClient(&server, "Tagged", null);
         const plain_id = try addTestLocalClient(&server, "Plain", null);
@@ -69571,6 +69638,9 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
         else => return err,
     };
     defer server.deinit();
+    var relay_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &relay_peer, 4242, &.{"Remote"});
+    defer relay_peer.deinit();
 
     const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#e2eebody" };
     _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
@@ -69891,6 +69961,9 @@ test "E2EEPOLICYBODY TAGMSG stays tag-only in required rooms" {
         else => return err,
     };
     defer server.deinit();
+    var relay_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &relay_peer, 4242, &.{"Remote"});
+    defer relay_peer.deinit();
 
     const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#e2eetag" };
     _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
@@ -70837,6 +70910,9 @@ test "deliverRelay accepts a correctly signed origin message" {
 
         var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x21)));
         defer kp.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, message_relay.originShortId(kp.public_key), &.{"Remote"});
+        defer relay_peer.deinit();
         var pk_buf: [message_relay.pubkey_len]u8 = undefined;
         var sig_buf: [message_relay.sig_len]u8 = undefined;
         const msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "signed and delivered", 1, &pk_buf, &sig_buf);
@@ -71940,7 +72016,11 @@ test "verified relay DM stores canonical account history with origin time and un
         try std.testing.expectEqualStrings(live_time, extractTimeTag(replay) orelse return error.TestUnexpectedResult);
 
         // Legacy delivery remains compatible, but its mutable account string is
-        // never allowed to create or select an account-scoped history key.
+        // never allowed to create or select an account-scoped history key. The
+        // sender still needs ordinary roster-backed residence authority.
+        var legacy_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &legacy_peer, 999, &.{"Evil"});
+        defer legacy_peer.deinit();
         target.send_len = 0;
         target.send_offset = 0;
         server.deliverRelay(.{
@@ -72021,6 +72101,9 @@ test "deliverRelay still delivers a legacy unsigned message (backward compat)" {
             else => return err,
         };
         defer server.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, 99, &.{"Remote"});
+        defer relay_peer.deinit();
 
         const target_id = try addTestLocalClient(&server, "Target", "targetacct");
         const target = server.connFor(target_id).?;
@@ -72049,6 +72132,9 @@ test "deliverRelay rejects unsafe direct callers before delivery and dedup obser
         else => return err,
     };
     defer server.deinit();
+    var relay_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &relay_peer, 99, &.{"Remote"});
+    defer relay_peer.deinit();
 
     const target_id = try addTestLocalClient(&server, "Target", "targetacct");
     const target = server.connFor(target_id).?;
