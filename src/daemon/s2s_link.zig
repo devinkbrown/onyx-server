@@ -422,6 +422,11 @@ pub const S2sLink = struct {
         try self.peer.sendMembership(self.sink(), channel, nick, status, hlc, present, ident, setter);
     }
 
+    /// Mark completion of one full outbound membership snapshot.
+    pub fn sendMembershipSync(self: *S2sLink) !void {
+        try self.peer.sendMembershipSync(self.sink());
+    }
+
     /// Announce a local IRCX channel PROP set/delete (or re-broadcast a remote
     /// one) to the peer. Outbound frames accumulate in `out`. `origin` selects
     /// local-authored vs re-broadcast attribution and carries the self-contained

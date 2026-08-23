@@ -12,6 +12,7 @@ const std = @import("std");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const prop_prefix = "identity.key.";
+pub const residence_prop_prefix = "identity.residence.";
 pub const max_label_len: usize = 32;
 pub const public_key_len: usize = Ed25519.PublicKey.encoded_length;
 pub const signature_len: usize = Ed25519.Signature.encoded_length;
@@ -35,6 +36,23 @@ pub fn validLabel(raw: []const u8) bool {
         else => return false,
     };
     return true;
+}
+
+fn startsWithAsciiFold(raw: []const u8, lowercase_prefix: []const u8) bool {
+    if (raw.len < lowercase_prefix.len) return false;
+    for (raw[0..lowercase_prefix.len], lowercase_prefix) |byte, expected| {
+        if (std.ascii.toLower(byte) != expected) return false;
+    }
+    return true;
+}
+
+/// Security-boundary predicate for the two retired replicated identity
+/// namespaces. It deliberately recognizes mixed-case and malformed suffixes:
+/// PROP storage folds keys, so validity must never decide whether a reserved
+/// namespace reaches the quarantine path.
+pub fn isReservedNamespace(raw: []const u8) bool {
+    return startsWithAsciiFold(raw, prop_prefix) or
+        startsWithAsciiFold(raw, residence_prop_prefix);
 }
 
 fn decodeHex(comptime len: usize, raw: []const u8) ?[len / 2]u8 {
@@ -138,7 +156,6 @@ pub fn parseClaimValue(value: []const u8) ?Claim {
 // oper_cred_share "OCG1"). `expiry_ms` is WALL-CLOCK ms — cross-host absolute
 // times always use the real-time clock, never a per-node monotonic clock.
 
-pub const residence_prop_prefix = "identity.residence.";
 pub const residence_domain = "ONYX-ACCOUNT-RESIDENCE-v1";
 pub const residence_magic: u32 = 0x41525031; // "ARP1"
 /// Node shortIds render as fixed-width 16-char lower hex in the prop key.
@@ -456,4 +473,14 @@ test "account residence prop keys are canonical fixed-width lower hex" {
     try std.testing.expect(!isResidencePropKey("identity.residence.00abcdef0123456g"));
     try std.testing.expect(!isResidencePropKey("identity.key.primary"));
     try std.testing.expect(!isPropKey("identity.residence.00abcdef01234567"));
+}
+
+test "E5E1 reserved identity namespaces fold case and include malformed suffixes only" {
+    try std.testing.expect(isReservedNamespace("identity.key.primary"));
+    try std.testing.expect(isReservedNamespace("IDENTITY.KEY."));
+    try std.testing.expect(isReservedNamespace("Identity.Residence.bad suffix"));
+    try std.testing.expect(isReservedNamespace("identity.residence.00ABCDEF01234567"));
+    try std.testing.expect(!isReservedNamespace("identity.keyX.primary"));
+    try std.testing.expect(!isReservedNamespace("identity.residenc."));
+    try std.testing.expect(!isReservedNamespace("identity"));
 }

@@ -47,6 +47,7 @@ const svc_clonescan = @import("svc_clonescan.zig");
 const svc_lastseen = @import("svc_lastseen.zig");
 const proofmark = @import("proofmark.zig");
 const key_transparency = @import("key_transparency.zig");
+const durable_credential_props = @import("durable_credential_props.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const svc_enforce = @import("svc_enforce.zig");
@@ -95,11 +96,14 @@ const route_report = @import("../proto/route_report.zig");
 const ripple_report = @import("../proto/ripple_report.zig");
 const link_health_mod = @import("link_health.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
+const session_reclaim_attachment = @import("../proto/session_reclaim_attachment.zig");
+const session_resume_credential = @import("../proto/session_resume_credential.zig");
 const session_portability = @import("../proto/session_portability.zig");
 const migration_relay = @import("helix/migration_relay.zig");
 const session_migrate = @import("helix/session_migrate.zig");
 const session_replica_v2 = @import("helix/session_replica.zig");
 const oper_cred_share = @import("../proto/oper_cred_share.zig");
+const oper_session_provenance = @import("oper_session_provenance.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
 const whowas = @import("whowas.zig");
@@ -146,7 +150,14 @@ const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
 const account_identity = @import("../proto/account_identity.zig");
 const e2ee_policy = @import("../proto/e2ee_policy.zig");
+
+comptime {
+    if (e2ee_policy.max_room_envelope_wire_len != message_relay.max_text_len)
+        @compileError("required-room ciphertext limit must match the signed mesh relay body limit");
+}
+
 const e2ee_group_control = @import("../proto/e2ee_group_control.zig");
+const e2ee_group_delivery = @import("../proto/e2ee_group_delivery.zig");
 const topic_tag = @import("../proto/topic_tag.zig");
 const ircx_prop_providers = @import("../proto/ircx_prop_providers.zig");
 const ircx_access_store = @import("../proto/ircx_access_store.zig");
@@ -337,6 +348,7 @@ const shard_mod = @import("shard.zig");
 const reactor_pool_mod = @import("reactor_pool.zig");
 const reuseport = @import("reuseport.zig");
 const reactor_fabric = @import("reactor_fabric.zig");
+const session_drop_tx = @import("session_drop_tx.zig");
 const deliver_handle = @import("deliver_handle.zig");
 const oper_mod = @import("oper.zig");
 const conn_class = @import("conn_class.zig");
@@ -346,6 +358,7 @@ const config_format = @import("config_format.zig");
 const tls_certs = @import("tls_certs.zig");
 const x509_verify = @import("../crypto/x509_verify.zig");
 const services_mod = @import("services.zig");
+const ocg2_runtime_mod = @import("ocg2_runtime.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const webauthn = @import("../crypto/webauthn.zig");
 const webauthn_creds_mod = @import("webauthn_creds.zig");
@@ -353,15 +366,25 @@ const base64url = @import("../proto/base64url.zig");
 const account_register = @import("../proto/account_register.zig");
 const account_notify = @import("../proto/account_notify.zig");
 const sessions_mod = @import("sessions.zig");
+const session_sid = @import("session_sid.zig");
 const mooring_hs = @import("../crypto/mooring_handshake.zig");
 const trace = @import("../proto/trace.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
-const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .max_text = 512 });
+// History must retain every room ciphertext that the delivery and signed-mesh
+// paths admit.  Keep this sourced from the protocol ceiling so a future wire
+// limit change cannot silently re-introduce delivery-without-replay loss.
+const HistoryStore = lotus.Lotus(.{
+    .max_targets = 512,
+    .max_per_target = 256,
+    .max_text = e2ee_policy.max_room_envelope_wire_len,
+});
 const relay_v2_deferred_capacity: usize = 256;
 const relay_v2_initial_retry_ms: u64 = 1000;
 const relay_v2_retry_frame_budget: usize = 32;
 const relay_v2_retry_byte_budget: usize = 256 * 1024;
+const relay_v2_unknown_home_retry_limit: u8 = 8;
+const relay_v2_unknown_home_retry_ttl_ms: u64 = 30_000;
 const e2ee_group_initial_retry_ms: u64 = 1000;
 const e2ee_group_retry_frame_budget: usize = 32;
 const RelayV2RetryWork = struct {
@@ -373,6 +396,20 @@ const E2eeGroupRetryWork = struct {
     peer: u64,
     relay_id: e2ee_group_relay.RelayId,
     wire: []u8,
+};
+const RelayV2DeferredReason = enum {
+    transient,
+    unknown_home_authority,
+};
+const DeferredRelayV2 = struct {
+    inbound: s2s_link.InboundMessageV2,
+    reason: RelayV2DeferredReason,
+    first_deferred_ms: u64,
+    retries: u8 = 0,
+
+    fn deinit(self: *DeferredRelayV2, allocator: std.mem.Allocator) void {
+        self.inbound.deinit(allocator);
+    }
 };
 
 /// Test-only deterministic ACK fault target. Live reactor threads and the
@@ -1083,12 +1120,9 @@ const session_attachment_lease_refresh_interval_ms: i64 = 30 * 1000;
 /// distinct portable tokens per housekeeping turn so a large account cannot
 /// monopolize the event loop.
 const session_replica_dirty_retry_batch: usize = 8;
-/// Staleness window for reaping never-retracted remote member projections from
-/// each peer's RouteTable. The resync re-burst refreshes every PRESENT member's
-/// local last-seen stamp to ~now every `membership_resync_interval_ms`; this window
-/// is 3x that, so a live member (refreshed every 30s) is never pruned and only a
-/// truly-departed member whose PART/QUIT was lost (collision-rename, USR2 churn,
-/// abrupt drop) ages out instead of lingering as a zombie in NAMES/WHOIS forever.
+/// Legacy plaintext-peer staleness window. Secured links never infer departure
+/// from elapsed time: authenticated MEMBERSHIP_SYNC generations repair omissions
+/// in the inbound peer direction (see S2sPeer.recvMembershipSync).
 const stale_member_ttl_ms: i64 = 90_000;
 /// Max members per netsplit/netjoin IRCv3 BATCH chunk; a larger channel splits
 /// across multiple batches so members past a fixed cap are never silently lost.
@@ -1399,19 +1433,6 @@ fn formatNumericCode(code: Numeric, buf: []u8) []const u8 {
     return buf[0..3];
 }
 
-/// WHOIS operator flags for a REMOTE user derived from a propagated cross-mesh
-/// oper grant's privilege bits: `oper_override` renders "is an IRC operator",
-/// `server_admin` upgrades the wording to Network Administrator. Zero bits
-/// (a revocation tombstone) grants nothing.
-const RemoteOperStatus = struct { is_oper: bool, is_admin: bool };
-
-fn remoteGrantWhoisStatus(privilege_bits: u64) RemoteOperStatus {
-    if (privilege_bits == 0) return .{ .is_oper = false, .is_admin = false };
-    const privs = oper_mod.OperPrivileges.fromBits(privilege_bits);
-    const admin = privs.has(.server_admin);
-    return .{ .is_oper = admin or privs.has(.oper_override), .is_admin = admin };
-}
-
 pub const ServerError = error{
     InvalidAddress,
     PermissionDenied,
@@ -1423,6 +1444,7 @@ pub const ServerError = error{
     ClientNotFound,
     BadCompletion,
     OutputTooSmall,
+    InvalidNamesRoster,
     TextTooLong,
     TokenOutOfRange,
     UnknownOpKind,
@@ -1548,6 +1570,21 @@ pub fn freeIsupportTokens(allocator: std.mem.Allocator, tokens: []const []const 
     allocator.free(tokens);
 }
 
+pub const DurableDeviceBoot = union(enum) {
+    inactive,
+    /// Explicit migration/test mode: remove every legacy device PROP and its
+    /// clock without installing a durable authority. Production main never
+    /// selects this arm.
+    purge_only,
+    authoritative: struct {
+        /// Strictly restored from the configured account OroStore before the
+        /// server is constructed. The owner must outlive both Services and the
+        /// server.
+        state: *durable_credential_props.State,
+        local_origin_node: u64,
+    },
+};
+
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16,
@@ -1628,9 +1665,9 @@ pub const Config = struct {
     /// `!news` is served from these files (robust full coverage) instead of
     /// in-daemon TLS fetches. `[geo] news_cache_dir`.
     geo_news_cache_dir: []const u8 = "",
-    /// Path for persisting runtime operator grants (GRANT/REVOKE). When set, the
-    /// active grants are written here on change and reloaded at boot so they
-    /// survive a restart. `[oper] grants_path`.
+    /// Path for persisting inactive legacy OCG1 records (GRANT/REVOKE). When
+    /// set, non-tombstone records are written here and reloaded at boot for
+    /// compatibility telemetry; they never authorize sessions.
     oper_grants_path: []const u8 = "",
     /// Path for persisting the Event Spine history ring (`[oper]
     /// event_history_path`); loaded at boot, rewritten on the stats cadence.
@@ -1919,6 +1956,10 @@ pub const Config = struct {
     /// Multi-session/bouncer registry sizing.
     session_max_accounts: u64 = 65536,
     session_max_per_account: u32 = 64,
+    /// Reader-first rollout barrier for SRM2 composite issuance. Decoders are
+    /// always enabled; operators explicitly enable writers only after every
+    /// node in the rolling mesh understands srm2l/srm2m.
+    session_resume_composite_issuance: bool = false,
     session_migrate_on_detach: bool = true,
     session_max_pending_migrations: u32 = 4096,
     /// Runtime memo offline-mailbox limits. Configurable via `[bouncer]`.
@@ -2130,6 +2171,17 @@ pub const Config = struct {
     /// Account services (REGISTER/IDENTIFY/DROP/…) backed by the WAL store. Null =
     /// account management disabled. Borrowed; outlives the server (owned by main).
     account_services: ?*services_mod.Services = null,
+    /// Projection-free OCG2 observer, synchronously primed by the process owner
+    /// with elapsed=0 before Server construction. Null keeps it wholly inert.
+    /// Borrowed; owner must outlive the server.
+    ocg2_runtime: ?*ocg2_runtime_mod.Runtime = null,
+    /// Exact monotonic millisecond sample paired with the process owner's
+    /// elapsed=0 prime. Required iff `ocg2_runtime` is present.
+    ocg2_runtime_monotonic_origin_ms: ?u64 = null,
+    /// Boot-only DPROP1 authority. Production leaves this inactive unless main
+    /// has opened the configured account OroStore, loaded the reserved snapshot
+    /// strictly, and attached the exact same State to Services.
+    durable_device_boot: DurableDeviceBoot = .inactive,
     /// Hostname cloak key. When set, every client's real IP/host is HMAC-cloaked
     /// on connect so other users never see the raw address. Null = no cloaking
     /// (real host shown). main derives this from `[server] cloak_secret`, or a
@@ -2718,6 +2770,9 @@ pub const ConnState = struct {
     /// expires across a USR2 upgrade (fail-closed — a stale challenge is never
     /// honored). Default `.none` = no ceremony in flight.
     webauthn_pending: WebauthnPending = .{},
+    /// Last `SESSION LIST` rows actually emitted to this connection. Legacy
+    /// `SESSION DROP #n` binds to this snapshot; Helix/account/logout clear it.
+    session_list_cache: session_sid.ListCache = .{},
 
     pub fn init(fd: linux.fd_t) ConnState {
         return .{ .fd = fd };
@@ -3173,6 +3228,10 @@ const Reactor = struct {
 /// `boundPort`), where `rx()` falls back to the single embedded reactor — which is
 /// the same pointer in the single-reactor configuration, so the fallback is exact.
 threadlocal var current_reactor: ?*Reactor = null;
+// Test-only final-edge allocator tripwire. Production never assigns these;
+// the guarded writes compile to no work outside a test artifact.
+threadlocal var test_dprop_commit_fail_index: ?*usize = null;
+threadlocal var test_dprop_commit_alloc_index: ?*const usize = null;
 
 /// Sentinel for `upgrade_quiesce_shard`: no multi-shard UPGRADE seal in flight.
 const no_quiesce_shard: u32 = std.math.maxInt(u32);
@@ -3197,6 +3256,75 @@ const RuntimeFeatureConfig = struct {
     config: Config,
     owned_disabled_features: ?[][]const u8 = null,
 };
+
+const DurableDeviceAuthority = struct {
+    state: *durable_credential_props.State,
+    local_origin_node: u64,
+    local_origin_pubkey: [entity_prop_event.pubkey_len]u8,
+};
+
+const DurableDevicePlan = union(enum) {
+    inactive,
+    purge_only,
+    authoritative: DurableDeviceAuthority,
+};
+
+/// Validate the boot authority before `initReactor` opens any socket. Merely
+/// attaching a DPROP State to Services is not activation: the explicit union is
+/// the sole server-level authority switch.
+fn validateDurableDeviceBoot(config: Config) !DurableDevicePlan {
+    return switch (config.durable_device_boot) {
+        .inactive => .inactive,
+        .purge_only => .purge_only,
+        .authoritative => |authority| blk: {
+            if (authority.local_origin_node == 0 or config.node_id == 0)
+                return error.DurableDeviceActivationFailed;
+            const identity = config.node_identity orelse return error.DurableDeviceActivationFailed;
+            if (identity.shortId() != authority.local_origin_node or
+                config.node_id != authority.local_origin_node or
+                authority.state.localOriginNode() != authority.local_origin_node)
+                return error.DurableDeviceActivationFailed;
+            const services = config.account_services orelse return error.DurableDeviceActivationFailed;
+            if (services.durable_credential_props_state != authority.state)
+                return error.DurableDeviceActivationFailed;
+            break :blk .{ .authoritative = .{
+                .state = authority.state,
+                .local_origin_node = authority.local_origin_node,
+                .local_origin_pubkey = identity.sign_kp.public_key,
+            } };
+        },
+    };
+}
+
+fn buildConfiguredDurableDeviceCandidate(
+    allocator: std.mem.Allocator,
+    props: *const ircx_prop_store.DefaultStore,
+    channel_clocks: *const prop_checkpoint.ChannelClockMap,
+    entity_clocks: *const prop_checkpoint.EntityClockMap,
+    plan: DurableDevicePlan,
+) !prop_checkpoint.Restored {
+    return switch (plan) {
+        .inactive => unreachable,
+        .purge_only => prop_checkpoint.buildDurableDeviceCandidate(
+            allocator,
+            props,
+            channel_clocks,
+            entity_clocks,
+            null,
+            null,
+            null,
+        ),
+        .authoritative => |authority| prop_checkpoint.buildDurableDeviceCandidate(
+            allocator,
+            props,
+            channel_clocks,
+            entity_clocks,
+            authority.state,
+            authority.local_origin_node,
+            authority.local_origin_pubkey,
+        ),
+    };
+}
 
 fn disabledFeaturePresent(features: []const []const u8, needle: []const u8) bool {
     for (features) |feature| {
@@ -3315,6 +3443,8 @@ const remote_quit_dedup_ms: i64 = 1_000;
 /// Bounded ring of recent oper-prefix announcements, for `emitOperPrefixMode`
 /// idempotence. No allocation: fixed capacity, fixed-size name buffers. A
 /// matching (channel, nick, add) within the window is suppressed as a repeat.
+/// The opposite direction replaces the remembered state so a real `+Y,-Y,+Y`
+/// sequence is never mistaken for relink duplication.
 const OperPrefixDedup = struct {
     const cap = 16;
     const name_max = 64;
@@ -3335,16 +3465,18 @@ const OperPrefixDedup = struct {
         return std.ascii.eqlIgnoreCase(buf, s);
     }
 
-    /// Return true if the same (channel, nick, add) was announced within the
-    /// window — a duplicate to suppress. Otherwise records it and returns false.
+    /// Return true if the same current direction was announced within the
+    /// window — a duplicate to suppress. An opposite direction is a semantic
+    /// transition: replace the keyed state immediately and allow it through.
     fn seenRecently(self: *OperPrefixDedup, channel: []const u8, nick: []const u8, add: bool, now_ms: i64) bool {
         if (channel.len > name_max or nick.len > name_max) return false; // don't dedup outliers
         for (&self.entries) |*e| {
             if (!e.used) continue;
-            if (now_ms - e.ts_ms > oper_prefix_dedup_ms) continue;
-            if (e.add == add and eqCi(e.chan[0..e.chan_len], channel) and eqCi(e.nick[0..e.nick_len], nick)) {
-                return true;
-            }
+            if (!eqCi(e.chan[0..e.chan_len], channel) or !eqCi(e.nick[0..e.nick_len], nick)) continue;
+            if (e.add == add and now_ms - e.ts_ms <= oper_prefix_dedup_ms) return true;
+            e.add = add;
+            e.ts_ms = now_ms;
+            return false;
         }
         // Record (evicting the oldest slot via the ring head).
         const e = &self.entries[self.head];
@@ -3499,7 +3631,7 @@ pub const LinuxServer = struct {
     /// and decoded owned fields without consuming RVG2; timer/session-replica
     /// turns retry them locally, so correctness never depends on a sender
     /// defeating its outbound reflection cache and retransmitting.
-    relay_v2_deferred: [relay_v2_deferred_capacity]s2s_link.InboundMessageV2 = undefined,
+    relay_v2_deferred: [relay_v2_deferred_capacity]DeferredRelayV2 = undefined,
     relay_v2_deferred_len: usize = 0,
     /// Count of inbound relayed MESSAGEs dropped in `deliverRelay` because their
     /// self-contained origin signature failed (bad Ed25519 signature, or a pubkey
@@ -3511,13 +3643,28 @@ pub const LinuxServer = struct {
     /// Count of inbound relayed MESSAGEs whose sender nick is homed on a KNOWN
     /// mesh node that is NOT the frame's `origin_node` (a keyed-but-Byzantine peer
     /// asserting a prefix for a user this receiver homes on a *different* node).
-    /// Such a message is dropped LOCALLY (never rendered / folded into local
-    /// state) but is still re-forwarded, so a downstream node with fresher routing
-    /// makes its own decision. Distinct from `rejected_relay_signatures`: the
+    /// Such a message is dropped fail-closed (never rendered / folded into local
+    /// state and never propagated). Distinct from `rejected_relay_signatures`: the
     /// signature check binds `origin_node` to the signing key, this binds the
     /// *sender identity* to its home node (and also guards the legacy unsigned
     /// path, where `origin_node` is otherwise fully spoofable).
     rejected_relay_home_mismatch: u64 = 0,
+    /// Count of legacy relay-v1 messages dropped because sender-home authority was
+    /// unknown at this node and no signed/portable bypass proof existed. Distinct
+    /// from known-home mismatch for observability.
+    rejected_relay_unknown_home_v1: u64 = 0,
+    /// Remote user `e2ee.device.*` facts are never an authority source. Count
+    /// their pre-admission quarantine separately so operators can distinguish a
+    /// credential-injection attempt from an ordinary bad origin signature.
+    remote_device_props_quarantined: u64 = 0,
+    /// E5E1 retires both user identity namespaces from ENTITY_PROP authority.
+    /// Count the folded pre-signature quarantine separately from signature and
+    /// legacy home-authority rejects.
+    remote_identity_props_quarantined: u64 = 0,
+    /// A DPROP1 ambiguous/fatal durable cut is process-fatal for subsequent
+    /// device-property authorship. It is deliberately sticky: only reopening
+    /// OroStore and reconstructing the server may decide the durable outcome.
+    durable_device_restart_required: bool = false,
     /// Per-reactor I/O (ring, connection table, listeners, wake). One entry per
     /// shard, heap-allocated at init (`reactors.len == clamped num_shards`).
     /// `reactors[0]` is the single-reactor fast path; reached through `rx()` so
@@ -3825,6 +3972,13 @@ pub const LinuxServer = struct {
     activity_subs: activity_subscriptions.SubscriptionStore,
     /// Phase 3: per-account live session registry (multi-device / bouncer).
     sessions: sessions_mod.SessionStore,
+    /// Authoritative bounded journal for cross-reactor SESSION DROP. Controls
+    /// carry only its generational ids and are disposable wake hints; every
+    /// transition is serialized by World's write lock.
+    session_drop_journal: session_drop_tx.Journal = session_drop_tx.Journal.init(),
+    /// Bumped on Helix session-registry adopt so leftover LIST ordinals cannot
+    /// revoke a successor identity. `0` is reserved (empty cache).
+    session_list_epoch: u64 = 1,
     /// Legacy one-shot replay state carried for rolling compatibility. Modern
     /// mesh session credentials are reusable multi-attachment capabilities.
     session_reclaim_replay: session_reclaim_mesh.ReplayRing(256) = .{},
@@ -3944,6 +4098,14 @@ pub const LinuxServer = struct {
     /// concurrent overwrite is at worst a momentary cosmetic mix in MAP.
     mesh_peer_names: [32][64]u8 = @splat(@as([64]u8, @splat(0))),
     mesh_peer_name_lens: [32]u8 = @splat(0),
+    /// Security-sensitive reactor-0 publication paired with the cosmetic name
+    /// snapshot above. Exact mesh reclaim readers copy under this mutex instead
+    /// of traversing another reactor's mutable SlotMap or borrowing link memory.
+    mesh_peer_identity_mu: std.atomic.Mutex = .unlocked,
+    mesh_peer_node_ids: [32]u64 = @splat(0),
+    mesh_peer_public_keys: [32][crypto_sign.public_key_len]u8 =
+        @splat(@as([crypto_sign.public_key_len]u8, @splat(0))),
+    mesh_peer_public_key_present: [32]bool = @splat(false),
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Onyx Server media SFU control plane): who is in each call.
@@ -4053,6 +4215,13 @@ pub const LinuxServer = struct {
     grant_incarnation: u64 = 0,
     /// Account services backend (borrowed; owned by main).
     account_services: ?*services_mod.Services = null,
+    /// Projection-free OCG2 observer (borrowed; owned and primed by main).
+    ocg2_runtime: ?*ocg2_runtime_mod.Runtime = null,
+    /// Exact monotonic origin paired with the observer's elapsed=0 prime.
+    ocg2_runtime_monotonic_origin_ms: ?u64 = null,
+    /// A terminal observer failure is reported once; later timer turns remain
+    /// silent while the fail-closed Runtime stays terminal.
+    ocg2_runtime_terminal_logged: bool = false,
     /// Web Push delivery worker (borrowed; owned by main; null = disabled).
     webpush_worker: ?*webpush_mod.Worker = null,
     /// Monotonic millis captured at init, for STATS u uptime.
@@ -4232,6 +4401,8 @@ pub const LinuxServer = struct {
         const runtime_features = try runtimeDisabledFeatures(allocator, raw_config);
         errdefer if (runtime_features.owned_disabled_features) |owned| allocator.free(owned);
         var config = runtime_features.config;
+        if ((config.ocg2_runtime == null) != (config.ocg2_runtime_monotonic_origin_ms == null))
+            return error.InvalidOcg2RuntimeClock;
         // A secured mesh identifies nodes by the self-certified short id of the
         // configured key.  `[node].id` predates that identity and is still useful
         // for plaintext deployments, but letting it remain the runtime mesh id
@@ -4240,11 +4411,43 @@ pub const LinuxServer = struct {
         // Canonicalize once at the Server boundary so every producer, route,
         // dedup key, and secured-link handshake observes the same node handle.
         if (config.node_identity) |ident| config.node_id = ident.shortId();
+        const durable_plan = try validateDurableDeviceBoot(config);
         try validateMeshAdmissionSecurity(config);
         const boot_unix = @divTrunc(platform.realtimeMillis(), 1000);
         protocol_inventory.setBootUnix(boot_unix);
         protocol_inventory.setNodeId(config.node_id);
         protocol_inventory.setMeshPeerCount(0);
+        // Build the complete cold PROP successor before opening even the first
+        // listener. DPROP validation, purge/repopulation, clock allocation, and
+        // checked HLC observation are therefore incapable of leaving a bound
+        // but non-authoritative daemon behind on failure.
+        var initial_props = ircx_prop_store.DefaultStore.init(allocator);
+        defer initial_props.deinit();
+        var initial_channel_clocks: prop_checkpoint.ChannelClockMap = .empty;
+        defer initial_channel_clocks.deinit(allocator);
+        var initial_entity_clocks: prop_checkpoint.EntityClockMap = .empty;
+        defer initial_entity_clocks.deinit(allocator);
+        var durable_property_candidate: ?prop_checkpoint.Restored = null;
+        defer if (durable_property_candidate) |*candidate| candidate.deinit();
+        var initial_mesh_clock: mesh_clock_mod.MeshClock = .{};
+        switch (durable_plan) {
+            .inactive => {},
+            .purge_only, .authoritative => {
+                durable_property_candidate = try buildConfiguredDurableDeviceCandidate(
+                    allocator,
+                    &initial_props,
+                    &initial_channel_clocks,
+                    &initial_entity_clocks,
+                    durable_plan,
+                );
+                try initial_mesh_clock.observeChecked(
+                    durable_property_candidate.?.max_hlc,
+                    @intCast(@max(@as(i64, 0), platform.realtimeMillis())),
+                    mesh_clock_mod.default_max_future_skew_ms,
+                );
+            },
+        }
+
         const shard_count = clampShards(config);
         // For >1 shard EVERY listener (shard 0 included) must be SO_REUSEPORT or
         // the kernel rejects the second bind on the shared port. The single-shard
@@ -4482,7 +4685,10 @@ pub const LinuxServer = struct {
             .spamtrap = spamtrap_mod.DefaultSpamtrap.init(allocator),
             .metadata = metadata_store.DefaultStore.init(allocator),
             .geo = geo_ptr,
-            .props = ircx_prop_store.DefaultStore.init(allocator),
+            .props = if (durable_property_candidate) |candidate|
+                candidate.props
+            else
+                ircx_prop_store.DefaultStore.init(allocator),
             .access = ircx_access_store.AccessStore.init(allocator),
             .saccess = ircx_saccess.ServerAccessStore.init(allocator),
             .chan_akick = svc_akick.AkickStore.init(allocator),
@@ -4540,10 +4746,18 @@ pub const LinuxServer = struct {
             .transcript = transcript_mod.TranscriptLog.initConfig(allocator, config.transcript_config),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
+            .ocg2_runtime = config.ocg2_runtime,
+            .ocg2_runtime_monotonic_origin_ms = config.ocg2_runtime_monotonic_origin_ms,
+            .mesh_clock = initial_mesh_clock,
             .reactor = config.reactor,
             .start_ms = if (config.reactor) |r| r.nowMillis() else platform.monotonicMillis(),
             .boot_unix = boot_unix,
         };
+        if (durable_property_candidate) |candidate| {
+            self.channel_prop_clocks = candidate.channel_clocks;
+            self.entity_prop_clocks = candidate.entity_clocks;
+            durable_property_candidate = null;
+        }
     }
 
     /// By-value construction, kept for callers that own the result directly.
@@ -4578,7 +4792,7 @@ pub const LinuxServer = struct {
                 .max_per_account = self.config.session_max_per_account,
             });
         }
-        // Restore runtime operator grants persisted by a previous run.
+        // Restore inactive legacy OCG1 records persisted by a previous run.
         self.loadGrants();
         // Restore per-channel statistics persisted by a previous run so they
         // survive a restart or USR2 hot-upgrade.
@@ -5472,6 +5686,7 @@ pub const LinuxServer = struct {
                         slot.value.ws = null;
                     }
                     self.clearDeferredSessionMeshParts(&slot.value);
+                    slot.value.session_list_cache.reset();
                     if (slot.value.send_overflow.capacity > 0)
                         slot.value.send_overflow.deinit(slot.value.overflow_allocator);
                     if (slot.value.recv_overflow.capacity > 0)
@@ -5554,6 +5769,7 @@ pub const LinuxServer = struct {
         self.reset_store.deinit();
         self.totp.deinit();
         self.activity_subs.deinit();
+        self.session_drop_journal.deinit();
         self.sessions.deinit();
         if (self.pending_migrations) |*pm| pm.deinit();
         self.session_replica_store.deinit();
@@ -5690,6 +5906,7 @@ pub const LinuxServer = struct {
         // fabric record. Abort it before any already-mailboxed later event can
         // append, then sweep again for failures discovered while draining.
         self.abortPoisonedDeliveries();
+        self.drainSessionDropControls();
         self.drainFabric();
         self.drainAttachmentSpoolForCurrentReactor();
         if (self.rx() == &self.reactors[0]) self.retryRelayV2Outbox();
@@ -5709,6 +5926,19 @@ pub const LinuxServer = struct {
     /// buffer is still released so the pool never leaks.
     fn drainFabric(self: *LinuxServer) void {
         _ = self.drainFabricCount();
+    }
+
+    /// Drain the independent SESSION DROP control lane before ordinary byte
+    /// delivery. A control is only a wake hint: the bounded journal remains the
+    /// authority, so a late/duplicate control merely prompts the same sweep.
+    fn drainSessionDropControls(self: *LinuxServer) void {
+        const fabric = if (self.fabric) |*f| f else {
+            self.sweepSessionDropTransactions();
+            return;
+        };
+        var controls: [64]reactor_fabric.SessionDropControl = undefined;
+        while (fabric.drainControls(self.rx().shard_id, &controls) != 0) {}
+        self.sweepSessionDropTransactions();
     }
 
     /// Counted form used by the Helix final fixed point. A delivery drained on a
@@ -5888,9 +6118,45 @@ pub const LinuxServer = struct {
         _ = self.prunePendingReplicasWithoutStoreAuthority(now_wall);
     }
 
+    /// Advance the projection-free OCG2 observer from reactor 0 only. Main
+    /// primes the borrowed Runtime synchronously with elapsed=0 and supplies the
+    /// exact monotonic origin used for that prime; timer turns then advance only
+    /// the elapsed component while sampling wall time independently. Retryable
+    /// results are intentionally quiet and naturally retry next cadence. A
+    /// terminal Runtime (or an impossible local monotonic rollback) is logged
+    /// once and never driven again.
+    fn tickOcg2Runtime(self: *LinuxServer) bool {
+        if (self.rx() != &self.reactors[0]) return false;
+        if (self.ocg2_runtime_terminal_logged) return false;
+        const runtime = self.ocg2_runtime orelse return false;
+        const origin_ms = self.ocg2_runtime_monotonic_origin_ms orelse return false;
+        const now_ms = self.nowU64();
+        if (now_ms < origin_ms) {
+            // CLOCK_MONOTONIC cannot precede a sample captured earlier in this
+            // process. Treat a violated seam (including a broken injected test
+            // clock) as a one-way authority failure, never as elapsed=0.
+            _ = runtime.failMonotonicRollback();
+            self.ocg2_runtime_terminal_logged = true;
+            srvLog("onyx-server: OCG2 observer stopped: monotonic clock preceded its primed origin\n", .{});
+            return false;
+        }
+
+        switch (runtime.tick(self.meshWallMs(), now_ms - origin_ms)) {
+            .disabled, .complete, .retryable => {},
+            .failed => |failure| {
+                self.ocg2_runtime_terminal_logged = true;
+                srvLog("onyx-server: OCG2 observer stopped: {s}\n", .{@tagName(std.meta.activeTag(failure))});
+            },
+        }
+        return true;
+    }
+
     /// Fired when the periodic timer elapses: run the timeout sweep and re-arm.
     fn onTimerTick(self: *LinuxServer) void {
         self.rx().timer_armed = false;
+        // The journal sweep is authoritative recovery for a missed control
+        // mailbox hint and for a requester/owner that vanished before cleanup.
+        self.sweepSessionDropTransactions();
         // A delivery gap is a stream-integrity failure, not ordinary timeout
         // work. Disconnect it before any timer-driven projection or retry can
         // enqueue a later event to that generation.
@@ -5921,6 +6187,7 @@ pub const LinuxServer = struct {
         if (self.rx() == &self.reactors[0] and self.config.nick_delay_ms != 0) _ = self.nick_delay.sweep(self.nowMs());
         // Prune the throttle's expired/empty per-IP state on the same cadence.
         if (self.rx() == &self.reactors[0]) {
+            _ = self.tickOcg2Runtime();
             if (self.conn_throttle) |*t| t.prune(self.nowMs());
             // Evict unlocked, decayed-to-floor login-throttle records too.
             _ = self.login_throttle.sweep(self.nowMs());
@@ -6087,19 +6354,23 @@ pub const LinuxServer = struct {
     /// feed path stamps onto each member (`applyMembership`'s `now_ms`), so the
     /// staleness compare stays in one clock domain (see `RouteTable.pruneStale`).
     /// Walks the same `self.rx().clients.slots` as `resyncMeshStateToPeers` (peer
-    /// links live on reactor 0) and reaches `routes` directly. Like
-    /// `resyncMeshStateToPeers`, it gates on `link.established()`; the simpler
-    /// `clearDroppedPeerRouteOrigin` does not.
+    /// links live on reactor 0). Secured links are deliberately excluded: their
+    /// remote roster is inbound state, while this connection's replay/burst flags
+    /// describe outbound state and cannot safely authorize deletion. They repair
+    /// omissions only from peer-originated authenticated MEMBERSHIP_SYNC markers.
+    /// The simpler `clearDroppedPeerRouteOrigin` does not use this lifecycle gate.
     fn pruneStaleMeshMembers(self: *LinuxServer, now_ms: i64) void {
         const window: i64 = stale_member_ttl_ms;
         for (self.rx().clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |link| {
+            if (slot.value.s2s_secured != null) continue;
+            if (slot.value.s2s) |link| {
                 if (!link.established()) continue;
-                if (link.inner) |inner| _ = inner.peer.routes.pruneStale(now_ms, window);
-            } else if (slot.value.s2s) |link| {
-                if (!link.established()) continue;
-                _ = link.peer.routes.pruneStale(now_ms, window);
+                _ = link.peer.pruneStaleMembers(now_ms, window) catch {
+                    self.drainIdentityTransitions(link);
+                    continue;
+                };
+                self.drainIdentityTransitions(link);
             }
         }
     }
@@ -6710,8 +6981,11 @@ pub const LinuxServer = struct {
             services_mod.Services.KeyTransparencyStatus{ .enabled = false };
         w.writeAll(",\"accounts\":{\"key_transparency\":{\"enabled\":") catch return w.buffered();
         w.writeAll(if (kt_status.enabled) "true" else "false") catch return w.buffered();
+        w.writeAll(",\"available\":") catch return w.buffered();
+        w.writeAll(if (kt_status.available) "true" else "false") catch return w.buffered();
+        w.writeAll(",\"semantics\":\"observational\",\"scope\":\"node-local\"") catch return w.buffered();
         w.print(",\"entries\":{d},\"root\":", .{kt_status.entries}) catch return w.buffered();
-        if (kt_status.enabled) {
+        if (kt_status.enabled and kt_status.available) {
             const root_hex = std.fmt.bytesToHex(kt_status.root, .lower);
             w.print("\"{s}\"", .{&root_hex}) catch return w.buffered();
         } else {
@@ -6964,6 +7238,7 @@ pub const LinuxServer = struct {
             // serialization instead of touching it outside the World lock.
             self.world.lockWrite();
             self.abortPoisonedDeliveries();
+            self.drainSessionDropControls();
             self.drainFabric();
             self.abortPoisonedDeliveries();
             self.world.unlockWrite();
@@ -7356,6 +7631,7 @@ pub const LinuxServer = struct {
         if (self.fabric == null) return;
         self.world.lockWrite();
         self.abortPoisonedDeliveries();
+        self.drainSessionDropControls();
         self.drainFabric();
         self.abortPoisonedDeliveries();
         self.world.unlockWrite();
@@ -8565,6 +8841,12 @@ pub const LinuxServer = struct {
             self.markPeerHealth(link.remoteName(), .established);
             self.updatePartitionTransitions();
             if (self.resolveS2sCollision(conn, link.remoteName())) return; // this link lost the dedup
+            // Publish only after collision resolution. If the new secured link
+            // won, resolveS2sCollision marked the old route dedup-closing and
+            // this immediately replaces its authenticated key in the trust
+            // snapshot; if there was no collision it makes the peer trusted
+            // without waiting for the periodic timer.
+            self.publishPeerCount();
 
             // Replay the retained Store for both current and rolling-old peers.
             // Old peers receive an exact-once legacy translation of current
@@ -8775,6 +9057,7 @@ pub const LinuxServer = struct {
             self.markPeerHealth(link.remoteName(), .established);
             self.updatePartitionTransitions();
             if (self.resolveS2sCollision(conn, link.remoteName())) return; // this link lost the dedup
+            self.publishPeerCount();
         }
         const out = link.outbound();
         if (out.len != 0) {
@@ -9418,22 +9701,130 @@ pub const LinuxServer = struct {
             const tok = try tokenFromId(id);
             return self.closeConn(tok, close_reason);
         }
+        // A close is an authority decision, not merely an ordered mailbox item.
+        // Publish the exact-generation atomic before the owner can consume a
+        // positive RECV CQE that raced ahead of this control message. The owner
+        // checks delivery_gap before parsing bytes, so successful enqueue and
+        // mailbox congestion have the same fail-closed command boundary.
+        if (self.poisonDeliveryGeneration(id) == .target_gone) return;
         const fabric = if (self.fabric) |*f| f else {
-            _ = self.poisonDeliveryGeneration(id);
             return;
         };
         const buf = fabric.acquire(id.shard, "") orelse {
-            _ = self.poisonDeliveryGeneration(id);
             self.noteCrossShardDrop(fabric, 1);
             return;
         };
         if (!fabric.sendTo(id.shard, .{ .to = id, .buf = buf, .close_after = true, .close_reason = close_reason })) {
             fabric.release(id.shard, buf);
-            _ = self.poisonDeliveryGeneration(id);
             self.noteCrossShardDrop(fabric, 1);
             return;
         }
         self.wakeShard(id.shard);
+    }
+
+    /// Complete an attached DROP on this reactor only. Foreign owners are
+    /// fail-closed at dispatch until the reserved two-owner protocol lands.
+    fn revokeAttachedSessionOnLocalOwner(self: *LinuxServer, account: []const u8, expected: sessions_mod.Session) ListedSessionRevoke {
+        if (account.len > 64) return .stale;
+        const notice = ":onyx.local NOTICE * :SESSION: this session was revoked from another device\r\n";
+        const id = clientIdFromMonitor(expected.client);
+        if (id.shard != self.rx().shard_id) return .temporarily_unavailable;
+        {
+            const conn = self.rx().clients.get(id) orelse return .stale;
+            const conn_account = conn.session.account() orelse return .stale;
+            if (!std.ascii.eqlIgnoreCase(conn_account, account) or conn.closing) return .stale;
+
+            // Stage every fallible World mutation while the exact row still
+            // exists.  `closeConn` uses that row to discover a live sibling;
+            // removing it first would turn this into a false final QUIT.
+            var restores: std.ArrayListUnmanaged(world_model.MemberRestore) = .empty;
+            defer restores.deinit(self.allocator);
+            const nick = conn.session.displayName();
+            var successor: ?client_model.ClientId = null;
+            var first_eligible: ?client_model.ClientId = null;
+            const from_wid = worldIdFromClient(id);
+            const nick_owner = self.world.findNick(nick);
+            const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return .temporarily_unavailable;
+            defer self.allocator.free(rows);
+            var unattested_exact_sibling = false;
+            for (rows) |row| {
+                if (!row.attached or row.client == expected.client) continue;
+                if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, expected.token)) continue;
+                const candidate_id = clientIdFromMonitor(row.client);
+                if (candidate_id.shard != self.rx().shard_id) {
+                    unattested_exact_sibling = true;
+                    continue;
+                }
+                const candidate = self.connFor(candidate_id) orelse {
+                    unattested_exact_sibling = true;
+                    continue;
+                };
+                if (candidate.closing or candidate.s2s != null or candidate.s2s_secured != null) {
+                    unattested_exact_sibling = true;
+                    continue;
+                }
+                const candidate_account = candidate.session.account() orelse continue;
+                if (!std.ascii.eqlIgnoreCase(candidate_account, account)) continue;
+                if (!std.ascii.eqlIgnoreCase(candidate.session.displayName(), nick)) continue;
+                if (first_eligible == null) first_eligible = candidate_id;
+                if (nick_owner) |owner| {
+                    if (owner.eql(worldIdFromClient(candidate_id))) {
+                        successor = candidate_id;
+                        break;
+                    }
+                }
+            }
+            // If the target is still the rendered nick owner, any validated
+            // exact sibling can take it.  If another exact sibling owns the
+            // nick, it must be chosen: claiming onto an arbitrary earlier row
+            // would reject NickInUse and make a safe local revoke unavailable.
+            if (successor == null) if (nick_owner) |owner| {
+                if (owner.eql(from_wid)) successor = first_eligible;
+            };
+            // A same-token attached row whose owner cannot participate in this
+            // transaction is evidence that this is not a final-row close. It
+            // must not be downgraded to a QUIT-producing final revoke.
+            if (successor == null and (unattested_exact_sibling or first_eligible != null)) return .temporarily_unavailable;
+
+            var handoff: ?world_model.World.PreparedSessionRestore = null;
+            if (successor) |next| {
+                const to_wid = worldIdFromClient(next);
+                var channels = self.world.channels.iterator();
+                while (channels.next()) |entry| {
+                    const old_modes = self.world.memberModes(entry.key_ptr.*, from_wid);
+                    const next_modes = self.world.memberModes(entry.key_ptr.*, to_wid);
+                    if (old_modes == null and next_modes == null) continue;
+                    restores.append(self.allocator, .{
+                        .channel = entry.key_ptr.*,
+                        .modes = .{ .bits = (if (old_modes) |m| m.bits else 0) | (if (next_modes) |m| m.bits else 0) },
+                    }) catch return .temporarily_unavailable;
+                }
+                const exact = [_]world_model.ClientId{ from_wid, to_wid };
+                handoff = self.world.prepareSessionRestore(
+                    nick,
+                    to_wid,
+                    &exact,
+                    .{ .claim_exact = to_wid },
+                    restores.items,
+                ) catch return .temporarily_unavailable;
+            }
+            defer if (handoff) |*prepared| prepared.abort();
+
+            // The Store CAS is the linearization point.  A stale LIST selector
+            // aborts the inert World ticket, leaving nick/membership unchanged.
+            const handle = self.sessions.removeExact(account, expected) orelse return .stale;
+            if (handoff) |*prepared| {
+                prepared.commit();
+                conn.session_handoff_complete = true;
+            }
+            conn.session_handoff_checked = true;
+            lockSpin(&self.attachment_delivery_mu);
+            _ = self.attachment_delivery_spool.discardAttachment(expected.client);
+            self.attachment_delivery_mu.unlock();
+            self.finalizeRemovedSessionAuthority(handle);
+            self.enqueueDeliveryThenClose(id, notice, "session revoked") catch {};
+            return .removed;
+        }
     }
 
     fn enqueueDeliveryMaybeClose(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, close_after: bool, close_reason: []const u8) DeliveryOutcome {
@@ -9798,6 +10189,48 @@ pub const LinuxServer = struct {
         lockSpin(&self.attachment_delivery_mu);
         defer self.attachment_delivery_mu.unlock();
         _ = try self.attachment_delivery_spool.transferAttachment(old_client, new_client);
+    }
+
+    const PreparedResumeAttachmentTransfer = struct {
+        server: *LinuxServer,
+        prepared: attachment_delivery_spool.PreparedAttachmentTransfer,
+        locked: bool = true,
+
+        fn commit(self: *PreparedResumeAttachmentTransfer) void {
+            _ = self.prepared.commit();
+        }
+
+        fn release(self: *PreparedResumeAttachmentTransfer) void {
+            if (self.locked) {
+                self.server.attachment_delivery_mu.unlock();
+                self.locked = false;
+            }
+        }
+
+        fn deinit(self: *PreparedResumeAttachmentTransfer) void {
+            self.prepared.deinit();
+            self.release();
+            self.* = undefined;
+        }
+    };
+
+    /// Prepare the delivery half of an exact attachment rebind and retain the
+    /// spool mutation lock until the joint SessionStore/World/spool cut has
+    /// committed or aborted. The returned ticket is logically non-copyable.
+    fn prepareResumeAttachmentTransfer(
+        self: *LinuxServer,
+        old_client: sessions_mod.ClientId,
+        new_client: sessions_mod.ClientId,
+    ) attachment_delivery_spool.TransferError!PreparedResumeAttachmentTransfer {
+        lockSpin(&self.attachment_delivery_mu);
+        errdefer self.attachment_delivery_mu.unlock();
+        return .{
+            .server = self,
+            .prepared = try self.attachment_delivery_spool.prepareAttachmentTransfer(
+                old_client,
+                new_client,
+            ),
+        };
     }
 
     const PreparedAttachmentDeliveryBatch = struct {
@@ -10459,9 +10892,16 @@ pub const LinuxServer = struct {
         return if (best) |claim| claim.node_id else null;
     }
 
-    /// Inbound sender-identity binding: true when the relayed message's sender nick
-    /// is homed on a mesh node this receiver KNOWS, and that home is NOT the frame's
-    /// claimed `origin_node`. `source_prefix` IS covered by relay-v1's signed
+    const RelaySenderHome = union(enum) {
+        unknown,
+        match,
+        mismatch: u64,
+    };
+
+    /// Inbound sender-identity binding: classify whether the relayed message's
+    /// sender nick is homed on a mesh node this receiver KNOWS, and if known
+    /// whether that home matches the frame's claimed `origin_node`.
+    /// `source_prefix` IS covered by relay-v1's signed
     /// transcript; the separately encoded `source_nick` is not, so deliverRelay
     /// ignores it and re-derives the nick from that signed prefix. A keyed origin
     /// can still deliberately sign a prefix for a nick it does not own: the
@@ -10469,13 +10909,10 @@ pub const LinuxServer = struct {
     /// receiver's route table homes that user elsewhere,
     /// so the claim is rejected here. Deliberately account-INDEPENDENT: `account` is
     /// origin-controlled/unsigned and must never wave a mismatched sender through.
-    /// An UNKNOWN nick (route not yet learned) returns false — the message follows
-    /// the existing deliver+re-forward path so cross-node delivery is not stranded
-    /// by convergence lag. See the TODO in `deliverRelay` for the stricter
-    /// fail-closed-on-unknown + transcript-signing hardening left as follow-up.
-    fn relaySenderHomeMismatch(self: *LinuxServer, source_nick: []const u8, origin_node: u64) bool {
-        const home = self.meshNickHomeNode(source_nick) orelse return false;
-        return home != origin_node;
+    fn relaySenderHome(self: *LinuxServer, source_nick: []const u8, origin_node: u64) RelaySenderHome {
+        const home = self.meshNickHomeNode(source_nick) orelse return .unknown;
+        if (home == origin_node) return .match;
+        return .{ .mismatch = home };
     }
 
     /// Resolve the residence-trusted account for `nick` at one exact mesh node.
@@ -10728,6 +11165,17 @@ pub const LinuxServer = struct {
         self.traceLog(.warn, .s2s, line);
     }
 
+    fn recordRelayUnknownHomeV1(self: *LinuxServer, msg: s2s_link.RelayMessage) void {
+        self.rejected_relay_unknown_home_v1 +|= 1;
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "dropped relayed {s} from {s} claiming origin {d}: sender home unknown and no portable proof",
+            .{ msg.verb.commandWord(), msg.source_nick, msg.origin_node },
+        ) catch "dropped relayed message: sender home unknown without portable proof";
+        self.traceLog(.warn, .s2s, line);
+    }
+
     /// Sign a relay message's canonical origin transcript in place at the ORIGIN
     /// (this node authored it), stamping `origin_pubkey`/`origin_sig` so every hop
     /// can verify it. No-op (legacy unsigned path) when this node has no node
@@ -10891,6 +11339,12 @@ pub const LinuxServer = struct {
     /// merely choosing USER `webhook` cannot satisfy the server-host binding.
     fn isVerifiedWebhookRelay(self: *LinuxServer, msg: s2s_link.RelayMessage, auth: RelayOriginAuth) bool {
         if (auth != .verified) return false;
+        // This exception is only for the immutable shape authored by
+        // `injectWebhookPost`; a keyed peer must not obtain a general nick-home
+        // bypass by putting `webhook` in an arbitrary DM/NOTICE/DATA prefix.
+        if (msg.verb != .privmsg or !world_model.isChannelName(msg.target) or
+            msg.min_rank != 0 or msg.recipient.len != 0 or msg.data_tag.len != 0)
+            return false;
         const bang = std.mem.indexOfScalar(u8, msg.source_prefix, '!') orelse return false;
         const at_rel = std.mem.indexOfScalar(u8, msg.source_prefix[bang + 1 ..], '@') orelse return false;
         const at = bang + 1 + at_rel;
@@ -11315,25 +11769,42 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn deferRelayV2(self: *LinuxServer, item: *s2s_link.InboundMessageV2) bool {
+    fn deferRelayV2(
+        self: *LinuxServer,
+        item: *s2s_link.InboundMessageV2,
+        reason: RelayV2DeferredReason,
+    ) bool {
         for (self.relay_v2_deferred[0..self.relay_v2_deferred_len]) |*pending| {
-            if (std.mem.eql(u8, pending.wire, item.wire)) {
+            if (std.mem.eql(u8, pending.inbound.wire, item.wire)) {
+                if (reason == .unknown_home_authority) pending.reason = .unknown_home_authority;
                 item.deinit(self.allocator);
                 return true;
             }
         }
         if (self.relay_v2_deferred_len == relay_v2_deferred_capacity) return false;
-        self.relay_v2_deferred[self.relay_v2_deferred_len] = item.*;
+        self.relay_v2_deferred[self.relay_v2_deferred_len] = .{
+            .inbound = item.*,
+            .reason = reason,
+            .first_deferred_ms = self.meshWallMs(),
+            .retries = 0,
+        };
         self.relay_v2_deferred_len += 1;
         item.* = undefined;
         return true;
+    }
+
+    fn relayV2UnknownHomeRetryExpired(_: *LinuxServer, pending: *const DeferredRelayV2, now_ms: u64) bool {
+        if (pending.reason != .unknown_home_authority) return false;
+        if (pending.retries >= relay_v2_unknown_home_retry_limit) return true;
+        return now_ms >= pending.first_deferred_ms and
+            now_ms - pending.first_deferred_ms >= relay_v2_unknown_home_retry_ttl_ms;
     }
 
     const RelayV2DeliveryOutcome = union(enum) {
         accepted: relay_v2_replay_guard.RelayId,
         duplicate: relay_v2_replay_guard.RelayId,
         permanent,
-        retry,
+        retry: RelayV2DeferredReason,
     };
 
     fn sendRelayV2AckToPeer(
@@ -11634,16 +12105,30 @@ pub const LinuxServer = struct {
     }
 
     fn retryDeferredRelayV2(self: *LinuxServer) void {
+        const now_ms = self.meshWallMs();
         var index: usize = 0;
         while (index < self.relay_v2_deferred_len) {
             const pending = &self.relay_v2_deferred[index];
-            switch (self.deliverRelayV2(pending.owned.msg, pending.wire, pending.via_peer)) {
-                .retry => {
+            switch (self.deliverRelayV2(
+                pending.inbound.owned.msg,
+                pending.inbound.wire,
+                pending.inbound.via_peer,
+            )) {
+                .retry => |reason| {
+                    pending.reason = reason;
+                    pending.retries +|= 1;
+                    if (self.relayV2UnknownHomeRetryExpired(pending, now_ms)) {
+                        pending.deinit(self.allocator);
+                        self.relay_v2_deferred_len -= 1;
+                        if (index != self.relay_v2_deferred_len)
+                            self.relay_v2_deferred[index] = self.relay_v2_deferred[self.relay_v2_deferred_len];
+                        continue;
+                    }
                     index += 1;
                     continue;
                 },
-                .accepted => |id| _ = self.sendRelayV2AckToPeer(pending.via_peer, id),
-                .duplicate => |id| _ = self.sendRelayV2AckToPeer(pending.via_peer, id),
+                .accepted => |id| _ = self.sendRelayV2AckToPeer(pending.inbound.via_peer, id),
+                .duplicate => |id| _ = self.sendRelayV2AckToPeer(pending.inbound.via_peer, id),
                 .permanent => {},
             }
             pending.deinit(self.allocator);
@@ -11671,7 +12156,7 @@ pub const LinuxServer = struct {
                     item.deinit(self.allocator);
                 },
                 .permanent => item.deinit(self.allocator),
-                .retry => if (!self.deferRelayV2(item)) {
+                .retry => |reason| if (!self.deferRelayV2(item, reason)) {
                     // Do not keep consuming a feed after the exact deferred
                     // authority is full. Closing forces retained sender replay;
                     // silently accepting or evicting would create an event gap.
@@ -11700,12 +12185,12 @@ pub const LinuxServer = struct {
         // today's mutable route or policy state. Re-ack an exact retained
         // duplicate before target/session resolution; unseen events still run
         // every first-admission check below before RVG2 can advance.
-        switch (self.probeRelayV2(msg, via_peer) catch return .retry) {
+        switch (self.probeRelayV2(msg, via_peer) catch return .{ .retry = .transient }) {
             .duplicate => |id| return if (self.retainRelayV2DuplicateIngress(
                 id,
                 wire,
                 via_peer,
-            ) catch return .retry) .{ .duplicate = id } else .permanent,
+            ) catch return .{ .retry = .transient }) .{ .duplicate = id } else .permanent,
             .unseen => {},
             .equivocation,
             .retired,
@@ -11715,13 +12200,13 @@ pub const LinuxServer = struct {
             => return .permanent,
         }
         const source_nick = msg.sourceNick() orelse return .permanent;
-        if (!self.relayV2OriginKnown(msg)) return .retry;
+        if (!self.relayV2OriginKnown(msg)) return .{ .retry = .transient };
         const latest_physical = std.math.add(
             u64,
             self.meshWallMs(),
             mesh_clock_mod.default_max_future_skew_ms,
         ) catch std.math.maxInt(u64);
-        if (mesh_clock_mod.MeshClock.physicalOf(msg.hlc) > latest_physical) return .retry;
+        if (mesh_clock_mod.MeshClock.physicalOf(msg.hlc) > latest_physical) return .{ .retry = .transient };
         var safe_tag_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
         const safe_tags = clientOnlyTags(msg.tags, &safe_tag_buf);
         const clean_msg = s2s_link.RelayMessage{
@@ -11752,11 +12237,36 @@ pub const LinuxServer = struct {
                 sender_route,
                 &sender_account_buf,
             ) != null;
-            if (receiver_owns_route and replica_proof == null) return .retry;
+            if (receiver_owns_route and replica_proof == null) return .{ .retry = .transient };
         }
-        const local_sender_allowed = !((self.nickIsLiveLocal(source_nick) or
-            self.relaySenderHomeMismatch(source_nick, msg.origin_node)) and
-            replica_proof == null);
+        const signed_member_modes: ?world_model.MemberModes = if (msg.sender_member_modes) |bits|
+            .{ .bits = bits }
+        else
+            null;
+        // Roster rows are link-local, so a far receiver in A-B-C cannot know a
+        // node-C direct sender's home. A signed, non-null sender route is the
+        // origin's existing wire-compatible assertion that this event came
+        // from one locally attached reusable session. It can bridge only an
+        // absent roster claim; a known conflicting home remains a permanent
+        // rejection below. Old peers continue to decode the exact same schema.
+        const signed_direct_residence = msg.scope_kind == .direct and msg.sender_route_id != null;
+        const sender_home = self.relaySenderHome(source_nick, msg.origin_node);
+        // replica_proof is a portable session — it may override residence.
+        // signed_member_modes is only the origin's assertion of mode bits: it
+        // may skip the unknown-home retry (no residence yet), but must never
+        // launder a known-home mismatch.
+        if (replica_proof == null) {
+            switch (sender_home) {
+                .mismatch => |home| {
+                    self.recordRelayHomeMismatch(clean_msg, home);
+                    return .permanent;
+                },
+                .unknown => if (signed_member_modes == null and !signed_direct_residence)
+                    return .{ .retry = .unknown_home_authority },
+                .match => {},
+            }
+        }
+        const local_sender_allowed = !(self.nickIsLiveLocal(source_nick) and replica_proof == null);
         const residence_account: ?[]const u8 = if (replica_proof == null)
             self.trustedRemoteAccountAtNode(source_nick, msg.origin_node)
         else
@@ -11767,10 +12277,6 @@ pub const LinuxServer = struct {
             account
         else
             "";
-        const signed_member_modes: ?world_model.MemberModes = if (msg.sender_member_modes) |bits|
-            .{ .bits = bits }
-        else
-            null;
         const is_data_family = switch (msg.verb) {
             .data, .request, .reply => true,
             else => false,
@@ -11785,6 +12291,8 @@ pub const LinuxServer = struct {
         // Bound the strip buffer to the largest deliverable line body so an
         // oversized colour-formatted MESSAGE_V2 cannot fail the strip and fall
         // through with raw mIRC codes on a +f channel (CWE-400 / policy bypass).
+        // Required-room ciphertext is validated on the original body first;
+        // +f must never rewrite an admitted ONYXROOM1 envelope.
         var noformat_buf: [default_reply_bytes]u8 = undefined;
         var dm_key_buf: [320]u8 = undefined;
         var recipient_account_buf: [session_replica_account_max]u8 = undefined;
@@ -11795,21 +12303,11 @@ pub const LinuxServer = struct {
                 proof.trusted_account,
                 proof.token,
                 &sender_ids,
-            ) catch return .retry;
+            ) catch return .{ .retry = .transient };
         }
 
         switch (msg.scope_kind) {
             .channel => {
-                if (msg.verb != .tagmsg and !is_data_family and
-                    self.world.channelHasExtFlag(msg.target, .noformat) and
-                    color_strip.hasFormatting(msg.text))
-                {
-                    effective_text = color_strip.stripFormattingWith(
-                        .{ .max_output_bytes = default_reply_bytes },
-                        msg.text,
-                        &noformat_buf,
-                    ) catch msg.text;
-                }
                 // Topology is never channel-membership authority. A third-hop
                 // origin signature proves authorship, not +n bypass rights;
                 // only the separately authenticated webhook shape is external.
@@ -11822,7 +12320,7 @@ pub const LinuxServer = struct {
                     // newly converging multi-hop route. Do not turn missing
                     // receiver-owned membership authority into either a +n
                     // bypass or a consumed-and-lost denial.
-                    return .retry;
+                    return .{ .retry = .transient };
                 }
                 const effective_sender_modes = if (replica_proof) |proof|
                     proof.modes
@@ -11834,12 +12332,32 @@ pub const LinuxServer = struct {
                     effective_sender_modes,
                     policy_account,
                 )) return .permanent;
-                const local_content_allowed = self.messageSatisfiesEncryptionPolicy(
-                    msg.target,
-                    if (safe_tags.len != 0) safe_tags else null,
-                ) and !(is_data_family and
+                // DATA/REQUEST/REPLY stay on the pre-envelope contract: required
+                // rooms only asked for a legacy e2ee tag, never ONYXROOM1 text.
+                const e2ee_ok = if (is_data_family)
+                    self.channelEncryptionPolicy(msg.target) != .required or
+                        e2ee_policy.encryptedTagPresent(if (safe_tags.len != 0) safe_tags else null)
+                else
+                    self.messageSatisfiesEncryptionPolicy(
+                        msg.target,
+                        if (safe_tags.len != 0) safe_tags else null,
+                        msg.text,
+                        msg.verb == .tagmsg,
+                    );
+                const local_content_allowed = e2ee_ok and !(is_data_family and
                     self.world.channelHasExtFlag(msg.target, .nocomicdata) and
                     effective_sender_modes.rank() < 2);
+                if (local_content_allowed and msg.verb != .tagmsg and !is_data_family and
+                    self.channelEncryptionPolicy(msg.target) != .required and
+                    self.world.channelHasExtFlag(msg.target, .noformat) and
+                    color_strip.hasFormatting(msg.text))
+                {
+                    effective_text = color_strip.stripFormattingWith(
+                        .{ .max_output_bytes = default_reply_bytes },
+                        msg.text,
+                        &noformat_buf,
+                    ) catch msg.text;
+                }
                 if (local_sender_allowed and local_content_allowed) {
                     speech = self.relayChannelSpeechGate(
                         msg.target,
@@ -11884,10 +12402,10 @@ pub const LinuxServer = struct {
                     null,
                     &recipient_account_buf,
                     &recipient_ids,
-                ) catch return .retry;
+                ) catch return .{ .retry = .transient };
                 switch (target_resolution) {
                     .ready => |target| exact_target = target,
-                    .pending => return .retry,
+                    .pending => return .{ .retry = .transient },
                     .transit => {},
                 }
                 if (exact_target) |target| {
@@ -11941,10 +12459,10 @@ pub const LinuxServer = struct {
                         msg.target,
                         &recipient_account_buf,
                         &recipient_ids,
-                    ) catch return .retry;
+                    ) catch return .{ .retry = .transient };
                     switch (target_resolution) {
                         .ready => |target| exact_target = target,
-                        .pending => return .retry,
+                        .pending => return .{ .retry = .transient },
                         .transit => {},
                     }
                 }
@@ -11986,7 +12504,7 @@ pub const LinuxServer = struct {
         // it to render the complete attachment batch before live RVG2 authority
         // moves; `admitMessage` below still performs the signature/origin checks
         // and must return the same identity before publication.
-        const predicted_relay_id = message_relay_v2.relayId(self.allocator, msg) catch return .retry;
+        const predicted_relay_id = message_relay_v2.relayId(self.allocator, msg) catch return .{ .retry = .transient };
         var msgid_buf: [msgid_mod.id_len]u8 = undefined;
         var time_buf: [40]u8 = undefined;
         const stable_msgid = msgid_mod.fromStableId(predicted_relay_id, &msgid_buf);
@@ -12018,7 +12536,7 @@ pub const LinuxServer = struct {
                             var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
                             if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
                         }
-                        delivery_ids.append(self.allocator, id) catch return .retry;
+                        delivery_ids.append(self.allocator, id) catch return .{ .retry = .transient };
                     }
                 }
             },
@@ -12029,7 +12547,7 @@ pub const LinuxServer = struct {
                         var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
                         if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
                     }
-                    delivery_ids.append(self.allocator, id) catch return .retry;
+                    delivery_ids.append(self.allocator, id) catch return .{ .retry = .transient };
                 }
                 for (sender_ids.items) |sender_id| {
                     var already_recipient = false;
@@ -12043,7 +12561,7 @@ pub const LinuxServer = struct {
                         var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
                         if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
                     }
-                    delivery_ids.append(self.allocator, sender_id) catch return .retry;
+                    delivery_ids.append(self.allocator, sender_id) catch return .{ .retry = .transient };
                 }
             },
         }
@@ -12051,10 +12569,10 @@ pub const LinuxServer = struct {
             delivery_ids.items,
             tags,
             line,
-        ) catch return .retry;
+        ) catch return .{ .retry = .transient };
         defer prepared_delivery.deinit();
 
-        const outbox_peers = self.collectRelayV2OutboxPeers(via_peer, true) catch return .retry;
+        const outbox_peers = self.collectRelayV2OutboxPeers(via_peer, true) catch return .{ .retry = .transient };
         defer self.allocator.free(outbox_peers);
         const outbox_reservation = RelayV2OutboxReservation{
             .peers = outbox_peers,
@@ -12062,7 +12580,7 @@ pub const LinuxServer = struct {
             .wire = wire,
             .unbound_excluded_peer = via_peer,
         };
-        const relay_id = switch (self.admitRelayV2Detailed(msg, history_row, outbox_reservation, &prepared_delivery) catch return .retry) {
+        const relay_id = switch (self.admitRelayV2Detailed(msg, history_row, outbox_reservation, &prepared_delivery) catch return .{ .retry = .transient }) {
             .accepted => |id| id,
             .duplicate => |id| return .{ .duplicate = id },
             .rejected => return .permanent,
@@ -12135,9 +12653,8 @@ pub const LinuxServer = struct {
         return .{ .accepted = relay_id };
     }
 
-    /// Deliver an inbound relayed user message to LOCAL recipients (channel
-    /// members or a local nick), then re-forward to other peers for multi-hop
-    /// (loop-guarded by the per-peer seen-set + origin id).
+    /// Deliver an inbound legacy relayed user message to LOCAL recipients only.
+    /// Multi-hop propagation is owned exclusively by accepted MESSAGE_V2 objects.
     fn deliverRelay(self: *LinuxServer, msg: s2s_link.RelayMessage) void {
         // Decode enforces this for wire traffic, but tests and in-process paths
         // can call deliverRelay directly. Keep the semantic trust boundary here
@@ -12281,19 +12798,21 @@ pub const LinuxServer = struct {
         // standalone `source_nick` field is unsigned but ignored above (we derive
         // it from the signed prefix). `account`, `tags`, and `min_rank` are also
         // unsigned/hop-mutable and cannot establish nick ownership.
-        // If this receiver homes that nick on a KNOWN node other than the claimed
-        // `origin_node`, the claim is a cross-node impersonation: drop it locally
-        // (never render / fold into history) but still re-forward so a downstream
-        // node with fresher routing decides for itself. Account is NOT consulted —
-        // it is origin-controlled and unsigned.
-        //
-        // TODO(mesh-nick-binding): consider fail-closed-on-UNKNOWN once cross-node
-        // presence convergence is guaranteed, so an unlearned signed prefix is
-        // dropped rather than delivered. Left out here to avoid regressing legitimate
-        // convergence-lagged / legacy-unsigned cross-node delivery.
-        if (self.relaySenderHomeMismatch(clean_msg.source_nick, clean_msg.origin_node) and replica_modes == null) {
-            self.recordRelayHomeMismatch(clean_msg, self.meshNickHomeNode(clean_msg.source_nick) orelse clean_msg.origin_node);
-            return;
+        // Legacy v1 is fail-closed on sender-home uncertainty unless a signed
+        // portable proof supplies authority or the self-certifying origin has
+        // authored the daemon's exact synthetic webhook identity.
+        if (replica_modes == null and !verified_webhook) {
+            switch (self.relaySenderHome(clean_msg.source_nick, clean_msg.origin_node)) {
+                .match => {},
+                .mismatch => |home| {
+                    self.recordRelayHomeMismatch(clean_msg, home);
+                    return;
+                },
+                .unknown => {
+                    self.recordRelayUnknownHomeV1(clean_msg);
+                    return;
+                },
+            }
         }
 
         if (world_model.isChannelName(clean_msg.target)) {
@@ -12301,9 +12820,15 @@ pub const LinuxServer = struct {
             // policy (+n/+m/+M/+b/+Z) against the REMOTE sender before delivering
             // to local members. A mode/ban that has desynced across the mesh (or
             // a hostile/buggy peer) must not let a remote actor bypass local
-            // policy. Channels without those flags always deliver. The multi-hop
-            // re-forward below is unaffected (a downstream node re-checks its own
-            // policy), so a transient desync here does not strand the message.
+            // policy. Channels without those flags always deliver.
+            // Typed DATA/REQUEST/REPLY never used the room-text pairing; keep
+            // the legacy relay path ungated so comic-chat frames still fan out.
+            if (!is_data_family and !self.messageSatisfiesEncryptionPolicy(
+                clean_msg.target,
+                if (clean_msg.tags.len != 0) clean_msg.tags else null,
+                clean_msg.text,
+                clean_msg.verb == .tagmsg,
+            )) return;
             const speech = self.relayChannelSpeechGate(
                 clean_msg.target,
                 clean_msg.source_nick,
@@ -12327,14 +12852,17 @@ pub const LinuxServer = struct {
             var nf_text_buf: [default_reply_bytes]u8 = undefined;
             // +V NOCOMICDATA: re-enforce the local channel's comic-chat-DATA ban
             // against a remote sender (the local handleData rejects non-op DATA
-            // here with 531; on the receive side we silently drop, still
-            // re-forwarding for multi-hop so a downstream node re-checks).
+            // here with 531; on the receive side we silently drop).
             if (is_data_family and self.world.channelHasExtFlag(clean_msg.target, .nocomicdata) and
                 (replica_modes orelse self.relaySenderModes(clean_msg.target, clean_msg.source_nick)).rank() < 2)
             {
                 return;
             }
-            if (clean_msg.verb != .tagmsg and !is_data_family and self.world.channelHasExtFlag(clean_msg.target, .noformat) and color_strip.hasFormatting(clean_msg.text)) {
+            if (clean_msg.verb != .tagmsg and !is_data_family and
+                self.channelEncryptionPolicy(clean_msg.target) != .required and
+                self.world.channelHasExtFlag(clean_msg.target, .noformat) and
+                color_strip.hasFormatting(clean_msg.text))
+            {
                 if (color_strip.stripFormattingWith(.{ .max_output_bytes = default_reply_bytes }, clean_msg.text, &nf_text_buf)) |clean|
                     eff_text = clean
                 else |_| {}
@@ -12523,8 +13051,7 @@ pub const LinuxServer = struct {
     /// <recipient> :<text>` line to the LOCAL recipient nick when it shares the
     /// channel, re-enforcing the same membership invariant the local handler does
     /// (both sender and recipient must be on the channel). The global seen-set is
-    /// already observed by the caller (`deliverRelay`). Multi-hop re-forward is
-    /// scoped to the recipient's owning node so a WHISPER can traverse the mesh.
+    /// already observed by the caller (`deliverRelay`).
     fn deliverRelayWhisper(
         self: *LinuxServer,
         msg: s2s_link.RelayMessage,
@@ -12532,17 +13059,24 @@ pub const LinuxServer = struct {
     ) void {
         // Origin spoof guard: a peer must not assert a prefix for a nick that is
         // live & local here — UNLESS it is the SAME account (a legitimate
-        // multi-client / one-nick sibling on a peer; see deliverRelay). Still
-        // re-forward for multi-hop; only a DIFFERENT account's assertion is dropped.
+        // multi-client / one-nick sibling on a peer; see deliverRelay).
         if (self.nickIsLiveLocal(msg.source_nick) and replica_proof == null) {
             return;
         }
-        // Sender-identity binding (see deliverRelay): a nick homed on a KNOWN node
-        // other than the claimed origin is a cross-node impersonation — drop the
-        // local WHISPER (never render it to the recipient) but still re-forward.
-        if (self.relaySenderHomeMismatch(msg.source_nick, msg.origin_node) and replica_proof == null) {
-            self.recordRelayHomeMismatch(msg, self.meshNickHomeNode(msg.source_nick) orelse msg.origin_node);
-            return;
+        // Sender-identity binding (see deliverRelay): enforce known-home match and
+        // fail closed on unknown residence without signed portable proof.
+        if (replica_proof == null) {
+            switch (self.relaySenderHome(msg.source_nick, msg.origin_node)) {
+                .match => {},
+                .mismatch => |home| {
+                    self.recordRelayHomeMismatch(msg, home);
+                    return;
+                },
+                .unknown => {
+                    self.recordRelayUnknownHomeV1(msg);
+                    return;
+                },
+            }
         }
         // WHISPER is stricter than ordinary channel speech: both endpoints must
         // share the named channel even when +n is unset. A valid relay signature
@@ -12833,6 +13367,7 @@ pub const LinuxServer = struct {
             if (conn.recv_overflow.capacity > 0) conn.recv_overflow.deinit(conn.overflow_allocator);
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
+                const publish_peer_snapshot = !conn.s2s_dedup;
                 const dropped_node = link.peerShortId();
                 if (!conn.s2s_dedup and link.remoteName().len != 0) {
                     self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
@@ -12857,9 +13392,15 @@ pub const LinuxServer = struct {
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
                 self.stats.onClose(true, was_est);
+                // The removed slot must be absent before recomputing. A dedup
+                // loser never republishes: the collision winner already
+                // replaced the route at establishment, and teardown must not
+                // perturb that survivor's snapshot.
+                if (publish_peer_snapshot) self.publishPeerCount();
                 return;
             }
             if (conn.s2s) |link| {
+                const publish_peer_snapshot = !conn.s2s_dedup;
                 const dropped_node = link.remoteNodeId();
                 if (!conn.s2s_dedup and link.remoteName().len != 0) {
                     self.logMeshEvent(.peer_down, link.remoteName(), "link dropped");
@@ -12880,10 +13421,12 @@ pub const LinuxServer = struct {
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
                 self.stats.onClose(true, was_est);
+                if (publish_peer_snapshot) self.publishPeerCount();
                 return;
             }
             self.stats.onClose(false, false);
             self.stats.onQuit();
+            conn.session_list_cache.reset();
             // Free any in-flight inbound multiline batch buffer.
             self.abortMultiline(conn);
             // Tear down the per-connection TLS engine, if any.
@@ -12911,12 +13454,23 @@ pub const LinuxServer = struct {
             // detached (for reclaim/bouncer); an anonymous client is dropped.
             if (conn.session.account()) |acct| {
                 const resume_handle = self.sessions.resumeHandleForClient(acct, monitorIdFromClient(id));
+                if (resume_handle) |handle|
+                    self.cancelSessionDropsForToken(acct, handle.token);
                 if (!conn.session_detach_prepared) {
                     if (self.encodeMigrationSnapshot(id, conn)) |snapshot| {
                         defer self.allocator.free(snapshot);
-                        _ = self.sessions.markDetachedWithSnapshot(acct, monitorIdFromClient(id), snapshot);
+                        if (!self.sessions.markDetachedWithSnapshot(acct, monitorIdFromClient(id), snapshot)) {
+                            // Snapshot allocation failure already detaches while
+                            // preserving the prior image. Retry the allocation-
+                            // free detach to distinguish that safe degraded case
+                            // from a still-conflicting/missing row; only the
+                            // latter may be retired before ConnState is freed.
+                            if (!self.sessions.markDetached(acct, monitorIdFromClient(id)))
+                                _ = self.removeTrackedSession(acct, monitorIdFromClient(id));
+                        }
                     } else {
-                        _ = self.sessions.markDetached(acct, monitorIdFromClient(id));
+                        if (!self.sessions.markDetached(acct, monitorIdFromClient(id)))
+                            _ = self.removeTrackedSession(acct, monitorIdFromClient(id));
                     }
                 }
                 // Portable resume is opt-in: only a session whose MTOKEN was
@@ -13508,6 +14062,7 @@ pub const LinuxServer = struct {
                     conn.closing = true;
                     return;
                 }
+                self.armBoundedExactResumeHoldIfNeeded(id, conn);
                 if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
                 try self.deliverMemo(conn); // hand over any offline messages
                 // OBSERVE: push a connect record to watching operators.
@@ -13547,6 +14102,21 @@ pub const LinuxServer = struct {
             return;
         }
 
+        // An authenticated E2EE socket admitted only for a bounded exact-resume
+        // attempt is isolated from ordinary IRC participation until it proves a
+        // physical attachment. SESSION/CAP/QUIT remain available; PING returned
+        // above so clients can keep the handshake transport alive.
+        if (conn.resume_autojoin_deferred and
+            conn.session.hasCap(.onyx_e2ee) and
+            !self.attachmentHasReusableSession(id) and
+            !std.ascii.eqlIgnoreCase(parsed.command, "SESSION") and
+            !std.ascii.eqlIgnoreCase(parsed.command, "CAP") and
+            !std.ascii.eqlIgnoreCase(parsed.command, "QUIT"))
+        {
+            try self.failReply(conn, "SESSION", "RESUME_PENDING", "complete exact SESSION RESUME before IRC participation");
+            return;
+        }
+
         // A per-client fault (oversized reply, malformed param) must close only
         // THAT connection — never escalate to runOnce and tear down the reactor.
         // `error.ControlByte` is such a fault: the outbound reply builders reject
@@ -13556,6 +14126,7 @@ pub const LinuxServer = struct {
         self.dispatchRegistered(id, conn, &parsed, line) catch |err| switch (err) {
             error.ControlByte,
             error.OutputTooSmall,
+            error.InvalidNamesRoster,
             error.TextTooLong,
             error.NoSpaceLeft,
             error.OversizeLine,
@@ -13569,6 +14140,17 @@ pub const LinuxServer = struct {
         // leaving a visible channel member that encrypted fan-out must omit.
         if (std.ascii.eqlIgnoreCase(parsed.command, "CAP") and
             !try self.enforceE2eeSessionEligibility(id, conn)) return;
+    }
+
+    fn labeledBulkCaptureCapacity(conn: *const ConnState, names: bool) ?usize {
+        const inline_queued = conn.send_len - conn.send_offset;
+        const queued = std.math.add(usize, inline_queued, conn.send_overflow.items.len) catch return null;
+        if (queued >= conn.sendq_cap) return null;
+        const remaining = conn.sendq_cap - queued;
+        // NAMES completeness is bounded by the configured SendQ itself: do not
+        // reintroduce the former ~520 KiB truncation through labeled-response.
+        // Historical finite-row bulk commands retain their 65-arena command cap.
+        return if (names) remaining else @min(default_reply_bytes * 65, remaining);
     }
 
     fn dispatchRegistered(
@@ -13603,7 +14185,28 @@ pub const LinuxServer = struct {
 
         if (want_label) |label| {
             var cap_buf: [default_reply_bytes]u8 = undefined;
-            var capture = ReplyCapture{ .buf = &cap_buf };
+            const names_label = std.ascii.eqlIgnoreCase(parsed.command, "NAMES");
+            const bulk_label = std.ascii.eqlIgnoreCase(parsed.command, "CHATHISTORY") or
+                std.ascii.eqlIgnoreCase(parsed.command, "SEARCH") or
+                std.ascii.eqlIgnoreCase(parsed.command, "JOIN");
+            const dynamic_capture_cap = if (bulk_label or names_label) cap: {
+                const capacity = labeledBulkCaptureCapacity(conn, names_label) orelse {
+                    self.poisonOwnedDelivery(conn);
+                    return;
+                };
+                // The labeled emitter performs exact transport-framing
+                // reservation after the plaintext command capture is complete.
+                break :cap capacity;
+            } else 0;
+            const bulk_buf = if (bulk_label or names_label)
+                self.allocator.alloc(u8, dynamic_capture_cap) catch {
+                    self.poisonOwnedDelivery(conn);
+                    return;
+                }
+            else
+                null;
+            defer if (bulk_buf) |storage| self.allocator.free(storage);
+            var capture = ReplyCapture{ .buf = bulk_buf orelse &cap_buf };
             conn.reply_capture = &capture;
             const outcome = self.dispatchModules(id, conn, parsed, line) catch |err| {
                 conn.reply_capture = null;
@@ -13611,7 +14214,9 @@ pub const LinuxServer = struct {
             };
             conn.reply_capture = null; // restore the wire path before re-emitting
             if (outcome == .handled) {
-                try emitLabeledIssuer(conn, label, &capture);
+                emitLabeledIssuer(conn, label, &capture, self.allocator) catch {
+                    self.poisonOwnedDelivery(conn);
+                };
                 return;
             }
             // not_found: the spine emitted nothing into the capture; fall through
@@ -14265,6 +14870,7 @@ pub const LinuxServer = struct {
         // keyed), so it must be recency-comparable, never monotonic (was the
         // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
         const hlc = self.nextMeshHlc();
+        var generation_complete = true;
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
             var members = self.world.memberIterator(cv.name) orelse continue;
@@ -14275,7 +14881,10 @@ pub const LinuxServer = struct {
                 // token-less anti-entropy until its exact signed Store row is
                 // accepted. The dedicated deferred flush preserves strict
                 // OFFER -> NICK -> MEMBERSHIP ordering and then clears this gate.
-                if (mconn.session_mesh_announce_pending) continue;
+                if (mconn.session_mesh_announce_pending) {
+                    generation_complete = false;
+                    continue;
+                }
                 const nick = mconn.session.displayName();
                 const status: u4 = @truncate((self.world.memberModes(cv.name, member.*) orelse world_model.MemberModes.empty()).bits);
                 const ident = membershipIdentityOf(mconn);
@@ -14309,7 +14918,10 @@ pub const LinuxServer = struct {
                 const mc = &slot.value;
                 if (mc.s2s != null or mc.s2s_secured != null) continue; // skip peer links
                 if (!mc.session.registered()) continue;
-                if (mc.session_mesh_announce_pending) continue;
+                if (mc.session_mesh_announce_pending) {
+                    generation_complete = false;
+                    continue;
+                }
                 const pnick = mc.session.displayName();
                 if (std.mem.eql(u8, pnick, "*")) continue;
                 const pident = membershipIdentityOf(mc);
@@ -14319,6 +14931,19 @@ pub const LinuxServer = struct {
                     link.sendMembership(presence_channel, pnick, 0, hlc, true, pident, "") catch return false;
                 }
             }
+        }
+        // A pending live attachment was intentionally omitted until its signed
+        // Store authority is publishable. Flush the complete PRESENT prefix but
+        // leave this retryable stage uncommitted; certifying it as a complete
+        // generation could false-PART the receiver's existing row.
+        if (!generation_complete) return false;
+        // Ordered after every PRESENT record above. On secured links this is an
+        // authenticated inbound-generation proof; rolling-old peers skip the
+        // unknown tag and therefore fail safe by retaining rows until upgraded.
+        if (conn.s2s_secured) |link| {
+            link.sendMembershipSync() catch return false;
+        } else if (conn.s2s) |link| {
+            link.sendMembershipSync() catch return false;
         }
         return true;
     }
@@ -14678,6 +15303,142 @@ pub const LinuxServer = struct {
         return out[0..written.len];
     }
 
+    /// Pre-staged LWW clock bytes. All fallible allocations happen here; the
+    /// later commit only swaps pointers or `putAssumeCapacity`.
+    const StagedEntityPropClock = struct {
+        replace: ?*EntityPropClock = null,
+        map_key: []u8 = &.{},
+        entity: []u8 = &.{},
+        key: []u8 = &.{},
+        owner: []u8,
+        origin_pubkey: []u8,
+        origin_sig: []u8,
+        kind: entity_prop_event.EntityKind,
+        hlc: u64,
+        present: bool,
+        origin_node: u64,
+
+        fn discard(self: *StagedEntityPropClock, allocator: std.mem.Allocator) void {
+            if (self.replace == null) {
+                if (self.map_key.len != 0) allocator.free(self.map_key);
+                if (self.entity.len != 0) allocator.free(self.entity);
+                if (self.key.len != 0) allocator.free(self.key);
+            }
+            allocator.free(self.owner);
+            allocator.free(self.origin_pubkey);
+            allocator.free(self.origin_sig);
+            self.* = undefined;
+        }
+    };
+
+    fn stageEntityPropClock(
+        self: *LinuxServer,
+        kind: entity_prop_event.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+        origin_node: u64,
+        origin_pubkey: []const u8,
+        origin_sig: []const u8,
+    ) ?StagedEntityPropClock {
+        if (self.entityPropClock(kind, entity, key)) |existing| {
+            if (hlc <= existing.hlc) return null;
+            const owner_copy = self.allocator.dupe(u8, owner) catch return null;
+            const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
+                self.allocator.free(owner_copy);
+                return null;
+            };
+            const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
+                self.allocator.free(owner_copy);
+                self.allocator.free(pubkey_copy);
+                return null;
+            };
+            return .{
+                .replace = existing,
+                .owner = owner_copy,
+                .origin_pubkey = pubkey_copy,
+                .origin_sig = sig_copy,
+                .kind = kind,
+                .hlc = hlc,
+                .present = present,
+                .origin_node = origin_node,
+            };
+        }
+
+        self.entity_prop_clocks.ensureUnusedCapacity(self.allocator, 1) catch return null;
+        const map_key = self.allocEntityPropClockKey(kind, entity, key) catch return null;
+        const entity_copy = self.allocator.dupe(u8, entity) catch {
+            self.allocator.free(map_key);
+            return null;
+        };
+        const key_copy = self.allocator.dupe(u8, key) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            return null;
+        };
+        const owner_copy = self.allocator.dupe(u8, owner) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            self.allocator.free(key_copy);
+            return null;
+        };
+        const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            self.allocator.free(key_copy);
+            self.allocator.free(owner_copy);
+            return null;
+        };
+        const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            self.allocator.free(key_copy);
+            self.allocator.free(owner_copy);
+            self.allocator.free(pubkey_copy);
+            return null;
+        };
+        return .{
+            .map_key = map_key,
+            .entity = entity_copy,
+            .key = key_copy,
+            .owner = owner_copy,
+            .origin_pubkey = pubkey_copy,
+            .origin_sig = sig_copy,
+            .kind = kind,
+            .hlc = hlc,
+            .present = present,
+            .origin_node = origin_node,
+        };
+    }
+
+    fn commitStagedEntityPropClock(self: *LinuxServer, staged: StagedEntityPropClock) void {
+        if (staged.replace) |existing| {
+            self.allocator.free(existing.owner);
+            self.allocator.free(existing.origin_pubkey);
+            self.allocator.free(existing.origin_sig);
+            existing.owner = staged.owner;
+            existing.origin_pubkey = staged.origin_pubkey;
+            existing.origin_sig = staged.origin_sig;
+            existing.hlc = staged.hlc;
+            existing.present = staged.present;
+            existing.origin_node = staged.origin_node;
+            return;
+        }
+        self.entity_prop_clocks.putAssumeCapacity(staged.map_key, .{
+            .kind = staged.kind,
+            .entity = staged.entity,
+            .key = staged.key,
+            .owner = staged.owner,
+            .hlc = staged.hlc,
+            .present = staged.present,
+            .origin_node = staged.origin_node,
+            .origin_pubkey = staged.origin_pubkey,
+            .origin_sig = staged.origin_sig,
+        });
+    }
+
     /// LWW-record a user/member PROP clock. The ENTITY_PROP counterpart of
     /// `recordChannelPropClock`: stores the ORIGINAL author's `origin_node` + the
     /// self-contained multi-hop `(pubkey, sig)` so a later re-broadcast/burst
@@ -14698,81 +15459,18 @@ pub const LinuxServer = struct {
         origin_pubkey: []const u8,
         origin_sig: []const u8,
     ) bool {
-        if (self.entityPropClock(kind, entity, key)) |existing| {
-            if (hlc <= existing.hlc) return false;
-            const owner_copy = self.allocator.dupe(u8, owner) catch return false;
-            const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
-                self.allocator.free(owner_copy);
-                return false;
-            };
-            const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
-                self.allocator.free(owner_copy);
-                self.allocator.free(pubkey_copy);
-                return false;
-            };
-            self.allocator.free(existing.owner);
-            self.allocator.free(existing.origin_pubkey);
-            self.allocator.free(existing.origin_sig);
-            existing.owner = owner_copy;
-            existing.origin_pubkey = pubkey_copy;
-            existing.origin_sig = sig_copy;
-            existing.hlc = hlc;
-            existing.present = present;
-            existing.origin_node = origin_node;
-            return true;
-        }
-
-        const map_key = self.allocEntityPropClockKey(kind, entity, key) catch return false;
-        const entity_copy = self.allocator.dupe(u8, entity) catch {
-            self.allocator.free(map_key);
-            return false;
-        };
-        const key_copy = self.allocator.dupe(u8, key) catch {
-            self.allocator.free(map_key);
-            self.allocator.free(entity_copy);
-            return false;
-        };
-        const owner_copy = self.allocator.dupe(u8, owner) catch {
-            self.allocator.free(map_key);
-            self.allocator.free(entity_copy);
-            self.allocator.free(key_copy);
-            return false;
-        };
-        const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
-            self.allocator.free(map_key);
-            self.allocator.free(entity_copy);
-            self.allocator.free(key_copy);
-            self.allocator.free(owner_copy);
-            return false;
-        };
-        const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
-            self.allocator.free(map_key);
-            self.allocator.free(entity_copy);
-            self.allocator.free(key_copy);
-            self.allocator.free(owner_copy);
-            self.allocator.free(pubkey_copy);
-            return false;
-        };
-
-        self.entity_prop_clocks.putNoClobber(self.allocator, map_key, .{
-            .kind = kind,
-            .entity = entity_copy,
-            .key = key_copy,
-            .owner = owner_copy,
-            .hlc = hlc,
-            .present = present,
-            .origin_node = origin_node,
-            .origin_pubkey = pubkey_copy,
-            .origin_sig = sig_copy,
-        }) catch {
-            self.allocator.free(map_key);
-            self.allocator.free(entity_copy);
-            self.allocator.free(key_copy);
-            self.allocator.free(owner_copy);
-            self.allocator.free(pubkey_copy);
-            self.allocator.free(sig_copy);
-            return false;
-        };
+        const staged = self.stageEntityPropClock(
+            kind,
+            entity,
+            key,
+            owner,
+            hlc,
+            present,
+            origin_node,
+            origin_pubkey,
+            origin_sig,
+        ) orelse return false;
+        self.commitStagedEntityPropClock(staged);
         return true;
     }
 
@@ -14821,6 +15519,7 @@ pub const LinuxServer = struct {
         present: bool,
         origin: s2s_peer_mod.S2sPeer.PropOrigin,
     ) void {
+        if (kind == .user and account_identity.isReservedNamespace(key)) return;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
                 if (!slot.occupied) continue;
@@ -14839,6 +15538,214 @@ pub const LinuxServer = struct {
         }
     }
 
+    const DurableDeviceMutationOutcome = enum {
+        committed,
+        not_logged_in,
+        owner_mismatch,
+        invalid_fact,
+        signer_unavailable,
+        durable_unavailable,
+        stale,
+        replay,
+        equivocation,
+        preadmission_failed,
+        restart_required,
+    };
+
+    /// Recognize the reserved namespace case-insensitively because PROP storage
+    /// folds keys. Without this gate `E2EE.DEVICE.foo` could bypass the durable
+    /// writer and overwrite the same folded live row as `e2ee.device.foo`.
+    fn isReservedDevicePropPrefix(raw: []const u8) bool {
+        return raw.len >= e2ee_policy.device_prop_prefix.len and
+            std.ascii.eqlIgnoreCase(raw[0..e2ee_policy.device_prop_prefix.len], e2ee_policy.device_prop_prefix);
+    }
+
+    fn canonicalDevicePropKey(raw: []const u8, out: *[e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8) ?[]const u8 {
+        if (!isReservedDevicePropPrefix(raw) or
+            raw.len <= e2ee_policy.device_prop_prefix.len or
+            raw.len > e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len)
+            return null;
+        const device_id = raw[e2ee_policy.device_prop_prefix.len..];
+        if (!e2ee_policy.validDeviceId(device_id)) return null;
+        @memcpy(out[0..e2ee_policy.device_prop_prefix.len], e2ee_policy.device_prop_prefix);
+        _ = std.ascii.lowerString(out[e2ee_policy.device_prop_prefix.len..][0..device_id.len], device_id);
+        return out[0 .. e2ee_policy.device_prop_prefix.len + device_id.len];
+    }
+
+    fn validDurableDeviceValue(key: []const u8, value: []const u8) bool {
+        const parsed = splitE2eeDeviceValue(value) orelse return false;
+        const canonical_device = key[e2ee_policy.device_prop_prefix.len..];
+        const directory = @import("../proto/e2ee_device_directory.zig");
+        if (directory.isStoredAlgorithm(parsed.algorithm)) {
+            const odd1 = directory.parseCanonical(parsed.public_key) orelse return false;
+            var derived_buf: [directory.device_id_len]u8 = undefined;
+            const derived = directory.deviceId(odd1, &derived_buf);
+            if (!std.ascii.eqlIgnoreCase(canonical_device, derived)) return false;
+        } else {
+            e2ee_policy.validateAdvertisement(
+                canonical_device,
+                parsed.algorithm,
+                parsed.public_key,
+            ) catch return false;
+        }
+        var canonical_buf: [e2ee_policy.max_device_value_len]u8 = undefined;
+        const canonical = e2ee_policy.deviceValue(parsed.algorithm, parsed.public_key, &canonical_buf) orelse return false;
+        return std.mem.eql(u8, canonical, value);
+    }
+
+    /// Sole local authoring transaction for user `e2ee.device.*` facts.
+    ///
+    /// The authenticated account supplies both entity and owner. The live PROP
+    /// mutation and exact signed ENTITY_PROP clock are allocation-complete before
+    /// Services crosses the DPROP1 durable cut. Only `.committed` publishes those
+    /// prepared live structures, after which notification and mesh fanout reuse
+    /// the exact tuple committed durably. A durable ambiguity permanently poisons
+    /// this server instance; retrying could publish the opposite of WAL replay.
+    fn commitLocalDurableDeviceProp(
+        self: *LinuxServer,
+        conn: *ConnState,
+        requested_entity: ?ircx_prop_store.Entity,
+        raw_key: []const u8,
+        value: []const u8,
+        present: bool,
+    ) DurableDeviceMutationOutcome {
+        if (self.durable_device_restart_required) return .restart_required;
+        const raw_account = conn.session.account() orelse return .not_logged_in;
+        const canonical_account = services_mod.canonicalAccount(raw_account) catch return .invalid_fact;
+        const account = canonical_account.asSlice();
+        if (requested_entity) |requested| {
+            if (requested.kind != .user or !std.ascii.eqlIgnoreCase(requested.id, account))
+                return .owner_mismatch;
+        }
+
+        var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+        const key = canonicalDevicePropKey(raw_key, &key_buf) orelse return .invalid_fact;
+        if (present and !validDurableDeviceValue(key, value)) return .invalid_fact;
+        if (!present and value.len != 0) return .invalid_fact;
+
+        const svc = self.account_services orelse return .durable_unavailable;
+        const ident = self.config.node_identity orelse return .signer_unavailable;
+        const origin_node = ident.shortId();
+        if (origin_node == 0) return .signer_unavailable;
+        const hlc = self.nextChannelPropHlc();
+        var pubkey_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+        var event = entity_prop_event.EntityPropEvent{
+            .present = present,
+            .kind = .user,
+            .origin_node = origin_node,
+            .hlc = hlc,
+            .entity = account,
+            .key = key,
+            .value = if (present) value else "",
+            .owner = account,
+        };
+        const transcript = entity_prop_event.originTranscript(self.allocator, event) catch return .signer_unavailable;
+        defer self.allocator.free(transcript);
+        entity_prop_event.signInPlace(&event, &ident.sign_kp, transcript, &pubkey_buf, &sig_buf) catch
+            return .signer_unavailable;
+
+        const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
+        var prepared_set: ?ircx_prop_store.DefaultStore.PreparedSetProp = null;
+        defer if (prepared_set) |*prepared| prepared.deinit();
+        var prepared_delete: ?ircx_prop_store.DefaultStore.PreparedDeleteProp = null;
+        defer if (prepared_delete) |prepared| prepared.deinit();
+        if (present) {
+            prepared_set = self.props.prepareSetProp(entity, key, value, .{ .id = account, .access = .user }) catch
+                return .preadmission_failed;
+        } else {
+            prepared_delete = self.props.prepareDeleteProp(entity, key) catch
+                return .preadmission_failed;
+        }
+
+        var staged_clock = self.stageEntityPropClock(
+            .user,
+            account,
+            key,
+            account,
+            hlc,
+            present,
+            event.origin_node,
+            event.origin_pubkey,
+            event.origin_sig,
+        ) orelse return .preadmission_failed;
+        var clock_committed = false;
+        defer if (!clock_committed) staged_clock.discard(self.allocator);
+
+        switch (svc.commitLocalDurableDeviceFact(event)) {
+            .committed => {},
+            .disabled => return .durable_unavailable,
+            .stale => return .stale,
+            .replay => return .replay,
+            .equivocation => return .equivocation,
+            .preadmission => return .preadmission_failed,
+            .restart_required => {
+                self.durable_device_restart_required = true;
+                srvLog("CRITICAL: DPROP1 durable device-property outcome is ambiguous/fatal; stopping for OroStore reopen\n", .{});
+                self.traceLog(.warn, .storage, "CRITICAL DPROP1 durable outcome requires OroStore reopen");
+                if (self.shutdown) |run| self.requestStop(run);
+                return .restart_required;
+            },
+        }
+
+        if (prepared_set) |*prepared| {
+            _ = prepared.commit();
+        } else {
+            _ = prepared_delete.?.commit();
+        }
+        self.commitStagedEntityPropClock(staged_clock);
+        clock_committed = true;
+        self.notifyLocalPropChange(conn, entity, key, if (present) value else "");
+        self.announceEntityProp(
+            .user,
+            account,
+            key,
+            if (present) value else "",
+            account,
+            hlc,
+            present,
+            .{ .node = event.origin_node, .pubkey = event.origin_pubkey, .sig = event.origin_sig },
+        );
+        return .committed;
+    }
+
+    fn durableDeviceFailureReply(
+        self: *LinuxServer,
+        conn: *ConnState,
+        command: []const u8,
+        outcome: DurableDeviceMutationOutcome,
+    ) !void {
+        return switch (outcome) {
+            .committed => {},
+            .not_logged_in => self.failReply(conn, command, "NOT_LOGGED_IN", "Log in before managing E2EE device keys"),
+            .owner_mismatch => self.failReply(conn, command, "DEVICE_OWNER_MISMATCH", "Device keys may only be changed by their authenticated account"),
+            .invalid_fact => self.failReply(conn, command, "BAD_DEVICE_FACT", "Device property key or value is invalid"),
+            .signer_unavailable => self.failReply(conn, command, "SIGNER_UNAVAILABLE", "Signed device-property authority is unavailable"),
+            .durable_unavailable => self.failReply(conn, command, "DURABLE_UNAVAILABLE", "Durable device-property state is unavailable"),
+            .stale => self.failReply(conn, command, "STALE_FACT", "Durable device-property state is newer"),
+            .replay => self.failReply(conn, command, "REPLAY", "Device-property fact was already committed"),
+            .equivocation => self.failReply(conn, command, "EQUIVOCATION", "Conflicting device-property fact was rejected"),
+            .preadmission_failed => self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Device-property transaction could not be prepared"),
+            .restart_required => self.failReply(conn, command, "RESTART_REQUIRED", "Durable device-property outcome requires store reopen"),
+        };
+    }
+
+    fn durableDeviceNumericReply(
+        self: *LinuxServer,
+        conn: *ConnState,
+        entity: ircx_prop_store.Entity,
+        outcome: DurableDeviceMutationOutcome,
+    ) !void {
+        _ = self;
+        return switch (outcome) {
+            .committed => {},
+            .not_logged_in, .owner_mismatch => queueNumeric(conn, .ERR_NOACCESS, &.{entity.id}, "Device keys may only be changed by their authenticated account"),
+            .invalid_fact => queueNumeric(conn, .ERR_BADPROPERTY, &.{entity.id}, "Invalid device property"),
+            .stale, .replay, .equivocation => queueNumeric(conn, .ERR_SECURITY, &.{entity.id}, "Device property failed durable security admission"),
+            .signer_unavailable, .durable_unavailable, .preadmission_failed, .restart_required => queueNumeric(conn, .ERR_RESOURCE, &.{entity.id}, "Durable device-property authority is unavailable"),
+        };
+    }
+
     /// Sign + record + announce a freshly LOCALLY-authored user/member PROP fact.
     /// Shared by the PROP set and delete paths in `handleProp` so both fan a signed
     /// ENTITY_PROP out to the mesh and seed a local clock for later bursts.
@@ -14851,8 +15758,20 @@ pub const LinuxServer = struct {
         value: []const u8,
         owner: []const u8,
     ) void {
+        self.propagateLocalEntityPropAt(present, store_kind, entity, key, value, owner, self.nextChannelPropHlc());
+    }
+
+    fn propagateLocalEntityPropAt(
+        self: *LinuxServer,
+        present: bool,
+        store_kind: ircx_prop_store.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+    ) void {
         const kind = entity_prop_event.EntityKind.fromStoreKind(store_kind) orelse return;
-        const hlc = self.nextChannelPropHlc();
         var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
         var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
         const ps = self.signLocalEntityProp(present, kind, entity, key, value, owner, hlc, &pk_buf, &sig_buf);
@@ -14997,6 +15916,28 @@ pub const LinuxServer = struct {
     /// by the store on insert; a malformed id (rejected by `Entity.fromId`) simply
     /// fails to apply.
     fn applyRemoteEntityProp(self: *LinuxServer, ch: anytype) bool {
+        if (ch.kind.toStoreKind() == .user and account_identity.isReservedNamespace(ch.key)) {
+            self.remote_identity_props_quarantined +|= 1;
+            var quarantine_buf: [256]u8 = undefined;
+            const quarantine = std.fmt.bufPrint(
+                &quarantine_buf,
+                "quarantined remote ENTITY_PROP identity fact {s}/{s} from node {d}",
+                .{ ch.entity, ch.key, ch.origin_node },
+            ) catch "quarantined remote ENTITY_PROP identity fact";
+            self.traceLog(.warn, .s2s, quarantine);
+            return false;
+        }
+        if (ch.kind.toStoreKind() == .user and isReservedDevicePropPrefix(ch.key)) {
+            self.remote_device_props_quarantined +|= 1;
+            var warning_buf: [256]u8 = undefined;
+            const warning = std.fmt.bufPrint(
+                &warning_buf,
+                "quarantined remote ENTITY_PROP device fact {s}/{s} from node {d}",
+                .{ ch.entity, ch.key, ch.origin_node },
+            ) catch "quarantined remote ENTITY_PROP device fact";
+            self.traceLog(.warn, .s2s, warning);
+            return false;
+        }
         if (!self.entityPropOriginVerified(ch)) return false;
         // P1: an identity.key.*/identity.residence.* write is only authoritative
         // from the account's home — reject a non-home (forged) write fail-closed
@@ -15017,17 +15958,61 @@ pub const LinuxServer = struct {
             else => return false,
         };
         const owner = if (ch.owner.len != 0) ch.owner else "remote";
+
+        // No-partial-mutation commit: reserve EVERY allocation this fact could
+        // ever require — the prop-store write and the LWW clock write — before
+        // touching anything a later failure could leave half-applied.
+        // `prepareSetProp` is a real reservation (unlike `preflightSetProp`,
+        // which validates but disclaims reserving), and `stageEntityPropClock`
+        // is already allocation-complete. Neither mutates props, clocks, the
+        // KEYTRANS log, or the mesh HLC watermark. Only once BOTH have
+        // succeeded may the watermark — which never rolls back — advance, and
+        // only then do we run the commit sequence, which by construction
+        // cannot fail.
+        var prepared_set: ?ircx_prop_store.DefaultStore.PreparedSetProp = null;
+        defer if (prepared_set) |*prepared| prepared.deinit();
         if (ch.present) {
-            self.props.preflightSetProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch
-                return false;
+            prepared_set = self.props.prepareSetProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch return false;
         }
-        if (!self.observeRemotePropertyHlc(ch.hlc)) return false;
-        if (ch.present) {
-            _ = self.props.setProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch return false;
+
+        var staged = self.stageEntityPropClock(
+            ch.kind,
+            ch.entity,
+            ch.key,
+            owner,
+            ch.hlc,
+            ch.present,
+            ch.origin_node,
+            ch.origin_pubkey,
+            ch.origin_sig,
+        ) orelse return false;
+
+        // The mesh HLC watermark only ever moves forward, so it may advance
+        // only once every fallible step above has already succeeded —
+        // advancing it any earlier would pin the watermark forward for a
+        // remote fact that never actually committed.
+        if (!self.observeRemotePropertyHlc(ch.hlc)) {
+            staged.discard(self.allocator);
+            return false;
+        }
+
+        if (prepared_set) |*prepared| {
+            _ = prepared.commit();
         } else {
             self.props.deleteProp(entity, ch.key) catch {};
         }
-        return self.recordEntityPropClock(ch.kind, ch.entity, ch.key, owner, ch.hlc, ch.present, ch.origin_node, ch.origin_pubkey, ch.origin_sig);
+        self.commitStagedEntityPropClock(staged);
+        self.observeUserCredentialProp(
+            ch.present,
+            ch.kind.toStoreKind(),
+            ch.entity,
+            ch.key,
+            ch.value,
+            ch.hlc,
+            ch.origin_node,
+            ch.origin_pubkey,
+        );
+        return true;
     }
 
     /// Mesh counterpart of a local user/member PROP-notify: fan a remote
@@ -15076,6 +16061,7 @@ pub const LinuxServer = struct {
         var it = self.entity_prop_clocks.iterator();
         while (it.next()) |entry| {
             const clock = entry.value_ptr;
+            if (clock.kind == .user and account_identity.isReservedNamespace(clock.key)) continue;
             var present = clock.present;
             var value: []const u8 = "";
             var owner: []const u8 = clock.owner;
@@ -16760,10 +17746,29 @@ pub const LinuxServer = struct {
         return conn.mesh_nick_hlc;
     }
 
+    /// Exact reusable-session token held by the local nick owner. Account
+    /// equality alone is insufficient here: only the exact signed session may
+    /// collapse a remote UID sidecar into this canonical local identity.
+    fn localNickSessionToken(ctx: *anyopaque, nick: []const u8) ?s2s_link.S2sLink.SessionToken {
+        const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+        const wid = self.world.findNick(nick) orelse return null;
+        const id = clientIdFromWorld(wid);
+        const conn = self.connFor(id) orelse return null;
+        const account = conn.session.account() orelse return null;
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return null;
+        return handle.token;
+    }
+
     /// Build the borrowed `LocalNickResolver` the mesh links consult; `self` must
     /// outlive every link (it does — links are torn down before server shutdown).
     fn localNickResolver(self: *LinuxServer) s2s_link.S2sLink.LocalNickResolver {
-        return .{ .ctx = self, .held_fn = localNickHeld, .account_fn = localNickAccount, .hlc_fn = localNickHlc };
+        return .{
+            .ctx = self,
+            .held_fn = localNickHeld,
+            .account_fn = localNickAccount,
+            .hlc_fn = localNickHlc,
+            .session_token_fn = localNickSessionToken,
+        };
     }
 
     /// The `identity.key.*` / `identity.residence.*` account-identity props are
@@ -16776,50 +17781,8 @@ pub const LinuxServer = struct {
     /// would then verify it — defeating F1. Design C's premise (the replicated
     /// identity pubkey is authoritative) requires TWO preconditions:
     ///
-    ///  (1) NON-FORGEABLE account-key authority on ENTITY_PROP INGEST — LANDED as
-    ///      `accountIdentityPropAuthorized` (in `applyRemoteEntityProp`). An
-    ///      `identity.key.*`/`identity.residence.*` write for `entity=<account>`
-    ///      is accepted only from the account's authoritative home, via two
-    ///      non-forgeable anchors rooted in SASL (the analog of the nick-path
-    ///      `meshNickHomeNode`/`recordRelayHomeMismatch` gate): the LOCAL-SASL
-    ///      anchor (this node owns the account ⇒ reject every remote-origin write)
-    ///      and the FIRST-origin binding (a Byzantine peer cannot overwrite the
-    ///      genuine home's key at any hlc). A Byzantine node with no SASL session
-    ///      for the victim cannot write the victim's key.
-    ///
-    ///  (2) STORE-SIDE account blanking on trust — LANDED:
-    ///      `recvMembership`/`recvNickChange` now persist
-    ///      `if (account_trusted) ev.account else ""` at the applyMembership/
-    ///      renameNick sites, so a forged (untrusted) incumbent is stored
-    ///      account-less and can NEVER later let a TRUSTED newcomer
-    ///      `remote_same_account`-merge with it on a third node. Proven by the
-    ///      `residence_trust_dst` forged-incumbent (C1) invariant.
-    ///
-    /// With both landed, residence trust is F1-sound ON HOME AND WARM (already-
-    /// converged) NODES: a PROVEN same-account claim coexists (multi-device
-    /// restored), an UNPROVEN/forged claim takes the conservative UID path, and the
-    /// sticky-trust rule (§4.4) never re-gates a live established member
-    /// (`route_table.zig` same-node `.keep`). The bounded residual is a COLD node
-    /// that relinks through a Byzantine burst source before converging with an
-    /// honest peer: see `accountIdentityPropAuthorized` — that fail-open is STICKY
-    /// (not self-healing) on a genuinely cold process. Exact entity clocks now
-    /// survive USR2, so a hot upgrade does not re-arm this window; the fully-sound
-    /// cold-node anchor is the larger mesh-security design.
-    /// Owner: onyx-server-mesh / stack-architect.
-    fn accountKeyAuthorityGateAvailable() bool {
-        return true; // F1: (1) ENTITY_PROP identity-write authority gate AND (2) store-side account blank both landed.
-    }
-
-    /// RECEIVER-side residence-proof verify callback (Design C / F1). Verify a
-    /// remote claim's `{account, origin_node}` against the RECEIVER-OWNED
-    /// replicated `identity.residence.<origin>` proof and `identity.key.*`
-    /// pubkey — never a wire field. The callback returns trusted, untrusted, or
-    /// reject; positive legacy trust requires a live proof for exactly this
-    /// account+node and the account-key-authority gate.
-    /// S2S runs reactor-0-only, so this read never races a concurrent reactor's
-    /// prop mutation the RCU store does not already serialize. Any
-    /// decode/lookup/verify miss ⇒ false (conservative UID path).
-    /// A signed SESSION_REPLICA authority is also an exact residence proof for a
+    /// RECEIVER-side residence callback. Only signed SESSION_REPLICA_V2 authority
+    /// is an exact residence proof for a
     /// live local attachment of that SAME portable token. This is deliberately
     /// narrower than account equality: the local World owner, its exact token
     /// group, and one live accepted signed-origin entry must bind account, nick,
@@ -16900,32 +17863,10 @@ pub const LinuxServer = struct {
         // an account; otherwise that substitution could move the protected route.
         if (self.hasRetainedSessionReplicaNickAuthority(nick)) return .reject;
         if (account.len == 0) return .untrusted;
-        return if (self.legacyResidenceTrusted(account, origin_node)) .trusted else .untrusted;
-    }
-
-    fn legacyResidenceTrusted(self: *LinuxServer, account: []const u8, origin_node: u64) bool {
-        // Fail closed: the replicated identity key is not yet authenticated as
-        // account-authoritative on ENTITY_PROP ingest (see the doc above), so a
-        // proof that verifies against it cannot be trusted as F1-sound.
-        if (!accountKeyAuthorityGateAvailable()) return false;
-        const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-        var rkey_buf: [account_identity.residence_prop_prefix.len + account_identity.residence_node_hex_len]u8 = undefined;
-        const rkey = account_identity.residencePropKey(origin_node, &rkey_buf) orelse return false;
-        const proof_ev = self.props.getProp(entity, rkey) catch return false;
-        var wire_buf: [account_identity.max_residence_len]u8 = undefined;
-        const wire = decodeResidenceHex(proof_ev.value, &wire_buf) orelse return false;
-        const now_ms = self.grantNowU64();
-        // Try every enrolled identity key for the account: the proof must verify
-        // against at least one receiver-owned pubkey and bind {account, origin}.
-        var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-        const rows = self.props.listProps(entity, &views) catch return false;
-        for (rows) |kv| {
-            if (!account_identity.isPropKey(kv.key)) continue;
-            const claim = account_identity.parseClaimValue(kv.value) orelse continue;
-            _ = account_identity.verifyResidence(wire, claim.public_key, account, origin_node, now_ms) catch continue;
-            return true;
-        }
-        return false;
+        // E5E1: replicated identity.key/residence props are retired as an
+        // account-authority source. Only the exact negotiated SESSION_REPLICA_V2
+        // proof path above can return trusted.
+        return .untrusted;
     }
 
     /// Build the borrowed `ResidenceVerifier` the mesh links consult (Design C).
@@ -17091,40 +18032,109 @@ pub const LinuxServer = struct {
         return self.flushMeshBurstStage(conn);
     }
 
-    /// Append a peer's remote channel members into the NAMES buffer (deduped,
-    /// auditorium-filtered). Returns the new count. `members` is a borrowed
-    /// roster from either link type. Each member renders with its PROPAGATED
-    /// real username + visible (cloaked) host; only a roster entry whose origin
-    /// never supplied identity falls back to the `mesh@<server>` placeholder.
+    const NamesRosterEntry = struct {
+        prefixes: chanmode.PrefixList,
+        nick: []const u8,
+        user: []const u8,
+        host: []const u8,
+
+        fn asMember(self: *const NamesRosterEntry) names_reply.Member {
+            return .{
+                .prefixes = self.prefixes.asSlice(),
+                .nick = self.nick,
+                .user = self.user,
+                .host = self.host,
+            };
+        }
+    };
+
+    const NamesNickContext = struct {
+        pub fn hash(_: @This(), nick: []const u8) u64 {
+            var hasher = std.hash.Wyhash.init(0x4e41_4d45_535f_4e49);
+            for (nick) |ch| {
+                const folded = [1]u8{std.ascii.toLower(ch)};
+                hasher.update(&folded);
+            }
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+            return std.ascii.eqlIgnoreCase(a, b);
+        }
+    };
+
+    const NamesNickSet = std.HashMapUnmanaged(
+        []const u8,
+        void,
+        NamesNickContext,
+        std.hash_map.default_max_load_percentage,
+    );
+
+    /// Add one representable logical IRC identity to a dynamically bounded NAMES
+    /// roster. The entry limit is derived from this request's remaining plaintext
+    /// output budget: every accepted member consumes at least one token byte and
+    /// one separator byte, so a larger unique roster could not possibly complete
+    /// before the SendQ/capture ceiling anyway. Any invalid identity aborts the
+    /// still-private roster build: silently skipping an admitted mesh row and
+    /// then emitting 366 would falsely certify a complete channel image.
+    fn appendNamesRosterEntry(
+        self: *LinuxServer,
+        entries: *std.ArrayListUnmanaged(NamesRosterEntry),
+        seen: *NamesNickSet,
+        max_entries: usize,
+        nick: []const u8,
+        user: []const u8,
+        host: []const u8,
+        modes: world_model.MemberModes,
+        is_override_oper: bool,
+    ) ServerError!bool {
+        var prefixes = modes.allPrefixes();
+        if (is_override_oper) prefixes.prependOper();
+        const candidate = NamesRosterEntry{
+            .prefixes = prefixes,
+            .nick = nick,
+            .user = user,
+            .host = host,
+        };
+        names_reply.validateMember(candidate.asMember()) catch return error.InvalidNamesRoster;
+        if (seen.contains(nick)) return false;
+        if (entries.items.len >= max_entries) return error.OutputTooSmall;
+        try entries.ensureUnusedCapacity(self.allocator, 1);
+        const seen_result = try seen.getOrPut(self.allocator, nick);
+        if (seen_result.found_existing) return false;
+        entries.appendAssumeCapacity(candidate);
+        return true;
+    }
+
+    /// Append a peer's remote channel members into the NAMES roster (deduped,
+    /// auditorium-filtered). `members` is a borrowed roster from either link
+    /// type. Each member renders with its PROPAGATED real username + visible
+    /// (cloaked) host; only a roster entry whose origin never supplied identity
+    /// falls back to the `mesh@<server>` placeholder.
     fn addRemoteMembers(
         self: *LinuxServer,
-        members_buf: []names_reply.Member,
-        prefix_buf: []chanmode.PrefixList,
-        count_in: usize,
+        entries: *std.ArrayListUnmanaged(NamesRosterEntry),
+        seen: *NamesNickSet,
+        max_entries: usize,
         is_auditorium: bool,
         viewer_rank: auditorium.Rank,
         remote_name: []const u8,
         members: anytype,
-    ) usize {
-        var count = count_in;
+    ) ServerError!void {
         for (members) |rm| {
-            if (count >= members_buf.len) break;
-            if (nameAlreadyListed(members_buf[0..count], rm.nick)) continue;
             const modes = world_model.MemberModes{ .bits = @as(u8, rm.status) };
             if (is_auditorium and !auditorium.visibleTo(viewer_rank, auditoriumRank(modes))) continue;
-            prefix_buf[count] = modes.allPrefixes();
-            // Remote network operators (oper_override via a propagated grant)
-            // render with the `*` prefix too, so admin status is uniform mesh-wide.
-            if (self.isOverrideOper(rm.nick)) prefix_buf[count].prependOper();
-            members_buf[count] = .{
-                .prefixes = prefix_buf[count].asSlice(),
-                .nick = rm.nick,
-                .user = if (rm.username.len != 0) rm.username else world_projection.remote_user_placeholder,
-                .host = if (rm.host.len != 0) rm.host else if (remote_name.len != 0) remote_name else default_host,
-            };
-            count += 1;
+            _ = try self.appendNamesRosterEntry(
+                entries,
+                seen,
+                max_entries,
+                rm.nick,
+                if (rm.username.len != 0) rm.username else world_projection.remote_user_placeholder,
+                if (rm.host.len != 0) rm.host else if (remote_name.len != 0) remote_name else default_host,
+                modes,
+                self.isOverrideOper(rm.nick),
+            );
         }
-        return count;
     }
 
     /// Total members of `channel` across the WHOLE mesh: the local member count plus
@@ -18000,7 +19010,12 @@ pub const LinuxServer = struct {
             self.sendTopicReply(conn, join_target) catch {};
             // draft/no-implicit-names: a capable client suppresses the automatic
             // NAMES burst on JOIN (it can still request NAMES explicitly).
-            if (!conn.session.hasCap(.no_implicit_names)) self.sendNames(conn, join_target) catch {};
+            // Fail-closed like explicit NAMES / resume bootstrap: never certify a
+            // successful JOIN with a swallowed empty roster (nicklist desync —
+            // client arms an implicit NAMES burst and will not re-poll while it
+            // believes the burst is in flight). InvalidNamesRoster / OutputTooSmall
+            // propagate to processLiveLine which marks conn.closing.
+            if (!conn.session.hasCap(.no_implicit_names)) try self.sendNames(conn, join_target);
 
             self.pushMarkreadOnJoin(conn, join_target) catch {};
 
@@ -18905,6 +19920,31 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Convert the protocol builder's validated command body into one complete
+    /// IRC wire line. `buildKickBroadcastWith` intentionally omits framing (as
+    /// do the other protocol builders); this sole production boundary appends
+    /// CRLF exactly once before channel delivery.
+    fn buildKickWire(
+        out: []u8,
+        kicker_prefix: kick.Prefix,
+        channel: []const u8,
+        user: []const u8,
+        reason: []const u8,
+    ) kick.KickError![]const u8 {
+        if (out.len < 2) return error.OutputTooSmall;
+        const body = try kick.buildKickBroadcastWith(
+            .{ .require_utf8 = false },
+            out[0 .. out.len - 2],
+            kicker_prefix,
+            channel,
+            user,
+            reason,
+        );
+        out[body.len] = '\r';
+        out[body.len + 1] = '\n';
+        return out[0 .. body.len + 2];
+    }
+
     /// KICK <channel> <user> [:reason]. Kicker must be op-or-higher and may not
     /// kick a member who outranks them (tier rank). The target sees their own
     /// kick (broadcast before removal).
@@ -18959,7 +19999,7 @@ pub const LinuxServer = struct {
         // arm so a malformed/oversized event cannot strand an absent intent.
         const reason = utf8TruncateBytes(args.reason, self.config.kicklen);
         var msg_buf: [default_reply_bytes]u8 = undefined;
-        const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, reason) catch return;
+        const msg = buildKickWire(&msg_buf, kicker_prefix, args.channel, args.user, reason) catch return;
 
         const target_id = clientIdFromWorld(target);
         const target_conn = self.connFor(target_id);
@@ -19727,8 +20767,8 @@ pub const LinuxServer = struct {
     /// visible host — falling back to the placeholder/origin-server forms only
     /// when the origin never supplied identity), 312 with the actual home
     /// server, RPL_WHOISCHANNELS (319) from the mesh roster, RPL_WHOISACCOUNT
-    /// (330) when the member's account propagated, RPL_WHOISOPERATOR (313) when a
-    /// live propagated oper grant covers the nick, and 318. To an OPERATOR requester
+    /// (330) when the member's account propagated, and 318. Step 5 deliberately
+    /// does not project inactive OCG1 records into remote operator status. To an OPERATOR requester
     /// it ALSO surfaces the deanonymized identity a secured oper-info link propagated:
     /// the real host/IP (338), GeoIP/ASN (320, computed locally from that IP), and
     /// the TLS cert fingerprint (276). Idle/away/671 are per-connection state remote
@@ -19739,17 +20779,6 @@ pub const LinuxServer = struct {
         sink: *whois.WhoisLineSink,
         remote: RemoteWhois,
     ) !void {
-        var is_oper = false;
-        var is_admin = false;
-        var oper_title: ?[]const u8 = null;
-        // Cross-mesh oper grants are keyed by account and matched to the nick
-        // (same convention as isOverrideOper / the `*` status prefix).
-        if (self.oper_grants.lookup(remote.nick, self.grantNowU64())) |g| {
-            const status = remoteGrantWhoisStatus(g.privilege_bits);
-            is_oper = status.is_oper;
-            is_admin = status.is_admin;
-            if (is_oper and g.title.len > 0) oper_title = g.title;
-        }
         // Channels the remote user is in, resolved from the mesh rosters (they are
         // not in the local world member set). Gives the 319 line that was missing.
         var memberships: [32]whois.ChannelMembership = undefined;
@@ -19788,9 +20817,12 @@ pub const LinuxServer = struct {
             // 330 "is logged in as <account>" for a remote member whose account the
             // mesh propagated (cap_member_account) — matches a local user's WHOIS.
             .account = if (remote.account.len != 0) remote.account else null,
-            .is_oper = is_oper,
-            .is_admin = is_admin,
-            .oper_title = oper_title,
+            // OCG1 is compatibility telemetry only during Step 5. Remote
+            // operator projection remains inactive until the accepted OCG2
+            // activation step supplies an authoritative runtime source.
+            .is_oper = false,
+            .is_admin = false,
+            .oper_title = null,
             // Idle/signon are per-connection state the origin node doesn't replicate,
             // so suppress RPL_WHOISIDLE rather than render a bogus "idle 0, epoch".
             .show_idle = false,
@@ -20579,14 +21611,17 @@ pub const LinuxServer = struct {
             },
             'm', 'M' => {
                 // Command usage (RPL_STATSCOMMANDS 212): one line per dispatched
-                // verb with its hit count, total bytes, and remote count (always 0
-                // here — these are local-client command totals).
+                // verb as `<command> <count> <bytes> <remote>` — four discrete
+                // middle params (never a space-joined blob). Remote is always 0
+                // here; these are local-client command totals.
                 const Ctx = struct { c: *ConnState };
                 try self.command_usage.forEach(Ctx{ .c = conn }, struct {
                     fn emit(cx: Ctx, row: command_usage.CommandUsage.Row) anyerror!void {
-                        var buf: [48]u8 = undefined;
-                        const counts = std.fmt.bufPrint(&buf, "{d} {d} 0", .{ row.count, row.bytes }) catch return;
-                        try queueNumeric(cx.c, .RPL_STATSCOMMANDS, &.{ row.name, counts }, "");
+                        var count_buf: [20]u8 = undefined;
+                        var bytes_buf: [20]u8 = undefined;
+                        const count_s = try std.fmt.bufPrint(&count_buf, "{d}", .{row.count});
+                        const bytes_s = try std.fmt.bufPrint(&bytes_buf, "{d}", .{row.bytes});
+                        try queueNumeric(cx.c, .RPL_STATSCOMMANDS, &.{ row.name, count_s, bytes_s, "0" }, "");
                     }
                 }.emit);
             },
@@ -21270,10 +22305,86 @@ pub const LinuxServer = struct {
                 if (have == null or !std.mem.eql(u8, have.?, want)) continue;
             }
             if (!historyMessageVisibleTo(&conn.session, message)) continue;
-            try writeHistoryReplayLine(&writer, &conn.session, target, message);
+            try writeHistoryReplayLine(&writer, &conn.session, if (use_batch) ref else null, target, message);
         }
         if (use_batch) try writer.print("BATCH -{s}\r\n", .{ref});
         return writer.buffered();
+    }
+
+    /// Render a complete bounded replay without imposing the old fixed 32 KiB
+    /// aggregate ceiling.  One admitted history row can contain a 4096-byte
+    /// room envelope plus replay-visible client tags and prefixes, so several
+    /// valid rows legitimately exceed that legacy scratch buffer.  Query row
+    /// counts are already bounded (64 for CHATHISTORY/rewind, 50 for SEARCH);
+    /// reserve two ordinary reply frames per row to cover the largest legal
+    /// line, plus batch framing.  The caller owns and must free the allocation.
+    fn renderHistoryReplayOwned(
+        self: *LinuxServer,
+        conn: *ConnState,
+        ref: []const u8,
+        target: []const u8,
+        messages: []const lotus.Message,
+        topic_filter: ?[]const u8,
+    ) ![]u8 {
+        const max_replay_rows: usize = 64;
+        if (messages.len > max_replay_rows) return error.OutputTooSmall;
+        const capacity = std.math.add(
+            usize,
+            default_reply_bytes,
+            try std.math.mul(usize, messages.len, default_reply_bytes * 2),
+        ) catch return error.OutputTooSmall;
+        const scratch = try self.allocator.alloc(u8, capacity);
+        errdefer self.allocator.free(scratch);
+        const rendered = try self.renderHistoryReplay(conn, scratch, ref, target, messages, topic_filter);
+        const owned = try self.allocator.dupe(u8, rendered);
+        self.allocator.free(scratch);
+        return owned;
+    }
+
+    /// Enqueue a rendered replay one complete IRC line at a time.  The replay
+    /// may legitimately exceed the daemon's 8 KiB logical-record boundary even
+    /// though each individual IRC line is legal.  Treating the whole batch as a
+    /// single append makes the connection firewall close an otherwise healthy
+    /// reader; line-wise appends preserve the exact byte stream while allowing
+    /// SendQ overflow and TLS/WebSocket framing to operate on bounded records.
+    fn appendHistoryReplay(conn: *ConnState, replay: []const u8) !void {
+        const websocket_open = if (conn.ws) |ws| ws.phase == .open else false;
+        const userspace_tls = if (conn.tls) |tls| tls.handshakeDone() and !conn.tls_tx_offloaded else false;
+        const raw_bound = linewiseReplayRawBound(replay, websocket_open, userspace_tls) orelse
+            return error.OutputTooSmall;
+        try reserveRawAppendToConn(conn, raw_bound);
+        var rest = replay;
+        while (std.mem.indexOfScalar(u8, rest, '\n')) |newline| {
+            const line = rest[0 .. newline + 1];
+            if (line.len > default_reply_bytes) return error.OutputTooSmall;
+            rest = rest[newline + 1 ..];
+        }
+        if (rest.len != 0) return error.OutputTooSmall;
+
+        rest = replay;
+        while (std.mem.indexOfScalar(u8, rest, '\n')) |newline| {
+            const line = rest[0 .. newline + 1];
+            try appendToConn(conn, line);
+            rest = rest[newline + 1 ..];
+        }
+    }
+
+    /// Conservative SendQ reservation for a replay emitted one line per append.
+    /// Userspace TLS creates at least one record for every append, so its record
+    /// count is the number of IRC lines rather than ceil(total/16KiB).
+    fn linewiseReplayRawBound(replay: []const u8, websocket_open: bool, userspace_tls: bool) ?usize {
+        const lines = std.mem.count(u8, replay, "\n");
+        var bytes = replay.len;
+        if (websocket_open) {
+            const terminators = std.math.mul(usize, lines, 2) catch return null;
+            if (terminators > bytes) return null;
+            bytes -= terminators;
+            bytes = std.math.add(usize, bytes, std.math.mul(usize, lines, 10) catch return null) catch return null;
+        }
+        if (userspace_tls) {
+            bytes = std.math.add(usize, bytes, std.math.mul(usize, lines, 256) catch return null) catch return null;
+        }
+        return bytes;
     }
 
     /// The EPHEMERAL TTL for a channel in milliseconds (0 = not ephemeral).
@@ -21298,10 +22409,20 @@ pub const LinuxServer = struct {
         return if (now > ttl_ms) now - ttl_ms else 0;
     }
 
-    fn writeHistoryReplayLine(writer: anytype, session: *const dispatch.ClientSession, target: []const u8, message: lotus.Message) !void {
+    fn writeHistoryReplayLine(
+        writer: anytype,
+        session: *const dispatch.ClientSession,
+        batch_ref: ?[]const u8,
+        target: []const u8,
+        message: lotus.Message,
+    ) !void {
         var timestamp_buf: [24]u8 = undefined;
         const timestamp = try chathistory_cmd.formatTimestamp(message.timestamp, &timestamp_buf);
-        try writer.print("@time={s};msgid={s}", .{ timestamp, message.msgid });
+        if (batch_ref) |ref| {
+            try writer.print("@batch={s};time={s};msgid={s}", .{ ref, timestamp, message.msgid });
+        } else {
+            try writer.print("@time={s};msgid={s}", .{ timestamp, message.msgid });
+        }
         if (historyEntryIsTagmsg(message.command)) {
             const raw = message.client_tags orelse return;
             var tag_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
@@ -21370,12 +22491,15 @@ pub const LinuxServer = struct {
         const found = self.history.after(channel, marker_ms, buf.len, buf[0..]) catch return;
         if (found.len == 0) return;
         if (!historyReplayHasVisible(conn, found)) return;
-        var out_buf: [default_reply_bytes * 4]u8 = undefined;
-        const replay = self.renderHistoryReplay(conn, &out_buf, "rewind", channel, found, null) catch {
+        const replay = self.renderHistoryReplayOwned(conn, "rewind", channel, found, null) catch {
             self.failReply(conn, "CHATHISTORY", "REPLAY_TOO_LARGE", "Bouncer rewind is too large; request fewer messages") catch {};
             return;
         };
-        try appendToConn(conn, replay);
+        defer self.allocator.free(replay);
+        appendHistoryReplay(conn, replay) catch {
+            self.poisonOwnedDelivery(conn);
+            return;
+        };
     }
 
     /// CHATHISTORY <sub> <target> <criteria...> <limit> — IRCv3 history replay.
@@ -21397,6 +22521,15 @@ pub const LinuxServer = struct {
             else => "Invalid CHATHISTORY parameters",
         };
         try self.failReply(conn, "CHATHISTORY", "INVALID_PARAMS", reason);
+    }
+
+    fn chathistoryCommandLine(line: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+        if (trimmed.len == 0) return null;
+        if (trimmed[0] != '@') return trimmed;
+        const tag_end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse return null;
+        const command_line = std.mem.trimStart(u8, trimmed[tag_end + 1 ..], " ");
+        return if (command_line.len == 0) null else command_line;
     }
 
     fn handleChathistoryTargets(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
@@ -21438,10 +22571,17 @@ pub const LinuxServer = struct {
         for (targets) |target| {
             var line_buf: [192]u8 = undefined;
             const detail = chathistory_targets.formatTargetLine(&line_buf, target) catch continue;
-            try writer.print(":{s} CHATHISTORY TARGETS {s}\r\n", .{ self.serverName(), detail });
+            if (use_batch) {
+                try writer.print("@batch=1 :{s} CHATHISTORY TARGETS {s}\r\n", .{ self.serverName(), detail });
+            } else {
+                try writer.print(":{s} CHATHISTORY TARGETS {s}\r\n", .{ self.serverName(), detail });
+            }
         }
         if (use_batch) try writer.print("BATCH -1\r\n", .{});
-        try appendToConn(conn, writer.buffered());
+        appendHistoryReplay(conn, writer.buffered()) catch {
+            self.poisonOwnedDelivery(conn);
+            return;
+        };
     }
 
     pub fn handleChathistory(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView, line: []const u8) !void {
@@ -21449,12 +22589,18 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "CHATHISTORY", "NEED_REGISTRATION", "You must negotiate the draft/chathistory capability");
             return;
         }
-        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
-        if (std.ascii.startsWithIgnoreCase(trimmed, "CHATHISTORY TARGETS")) {
-            try self.handleChathistoryTargets(id, conn, trimmed);
+        // Module handlers receive the original wire line so they can inspect
+        // tags through `parsed`. The CHATHISTORY grammar itself begins at the
+        // command, not at an optional `@tags` prefix.
+        const command_line = chathistoryCommandLine(line) orelse {
+            try self.failReply(conn, "CHATHISTORY", "INVALID_PARAMS", "Invalid CHATHISTORY parameters");
+            return;
+        };
+        if (std.ascii.startsWithIgnoreCase(command_line, "CHATHISTORY TARGETS")) {
+            try self.handleChathistoryTargets(id, conn, command_line);
             return;
         }
-        const req = chathistory_cmd.parse(trimmed) catch |err| {
+        const req = chathistory_cmd.parse(command_line) catch |err| {
             // IRCv3 chathistory: malformed requests get a typed standard reply,
             // `FAIL CHATHISTORY <code> :<reason>`, never silence.
             const code = @tagName(chathistory_cmd.failCode(err));
@@ -21568,12 +22714,15 @@ pub const LinuxServer = struct {
             },
         }
 
-        var out_buf: [default_reply_bytes * 4]u8 = undefined;
-        const replay = self.renderHistoryReplay(conn, &out_buf, "1", target, found, topic_filter) catch {
+        const replay = self.renderHistoryReplayOwned(conn, "1", target, found, topic_filter) catch {
             try self.failReply(conn, "CHATHISTORY", "REPLAY_TOO_LARGE", "History replay is too large; request fewer messages");
             return;
         };
-        try appendToConn(conn, replay);
+        defer self.allocator.free(replay);
+        appendHistoryReplay(conn, replay) catch {
+            self.poisonOwnedDelivery(conn);
+            return;
+        };
     }
 
     /// A CHATHISTORY entry is a draft/event-playback EVENT (rather than an
@@ -21708,12 +22857,15 @@ pub const LinuxServer = struct {
             ordered[k] = found_buf[found_len - 1 - k];
         }
 
-        var out_buf: [default_reply_bytes * 4]u8 = undefined;
-        const replay = self.renderHistoryReplay(conn, &out_buf, "search", target, ordered[0..found_len], null) catch {
+        const replay = self.renderHistoryReplayOwned(conn, "search", target, ordered[0..found_len], null) catch {
             try self.failReply(conn, "SEARCH", "RESULTS_TOO_LARGE", "Too many results; narrow the query");
             return;
         };
-        try appendToConn(conn, replay);
+        defer self.allocator.free(replay);
+        appendHistoryReplay(conn, replay) catch {
+            self.poisonOwnedDelivery(conn);
+            return;
+        };
     }
 
     /// AND semantics: whether `msgid` is in the index hit list for every word in
@@ -22419,11 +23571,14 @@ pub const LinuxServer = struct {
         modes: world_model.MemberModes,
     ) bool {
         if (conn.reply_capture != null) return false;
-        // sendNames renders into one default_reply_bytes arena (plus at most 32
-        // CRLF terminators); JOIN and the two topic numerics are each bounded by
-        // the same line builder. Six arenas leave a strict whole-batch ceiling
-        // with room for server-time tags and future bounded numeric growth.
-        const capture_storage = self.allocator.alloc(u8, default_reply_bytes * 6) catch return false;
+        // Size the isolated bootstrap from this connection's actual remaining
+        // SendQ rather than a fixed six-arena estimate. Large complete NAMES
+        // bursts can legitimately exceed that legacy ceiling; the capture and
+        // SendQ checks still bound memory and abort before World publication.
+        const inline_queued = conn.send_len - conn.send_offset;
+        const queued = std.math.add(usize, inline_queued, conn.send_overflow.items.len) catch return false;
+        if (queued >= conn.sendq_cap) return false;
+        const capture_storage = self.allocator.alloc(u8, conn.sendq_cap - queued) catch return false;
         defer self.allocator.free(capture_storage);
         var capture = ReplyCapture{ .buf = capture_storage };
 
@@ -22729,19 +23884,52 @@ pub const LinuxServer = struct {
     /// this probe NEVER restores or consumes the newest ghost implicitly.
     fn restoreDetachedBeforeAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8) bool {
         const cid = monitorIdFromClient(id);
-        const candidate = self.sessions.copyNewestDetachedSnapshotInAccount(self.allocator, account, cid) catch return false;
-        const detached = candidate orelse return false;
-        defer self.allocator.free(detached.snapshot);
+        const candidate = self.sessions.copyNewestDetachedSnapshotInAccount(self.allocator, account, cid) catch null;
+        const has_local_candidate = candidate != null;
+        if (candidate) |detached| self.allocator.free(detached.snapshot);
+        // A portable resume may exist only on a peer, so the local SessionStore
+        // cannot always predict it before the post-001 SESSION RESUME command.
+        // Any client that negotiated the session-sync contract gets the same
+        // bounded window; SESSION TOKEN releases a genuinely fresh login at once.
+        if (!has_local_candidate and !conn.session.hasCap(.onyx_session_sync)) return false;
 
         conn.resume_autojoin_deferred = true;
         conn.resume_autojoin_deadline_ms = self.nowMs() + 2_000;
         return true;
     }
 
+    /// Arm the resume/autojoin hold before E2EE eligibility is enforced. This is
+    /// required when no-evict bootstrap tracking leaves an at-cap reconnect
+    /// intentionally untracked: exact resume must get a bounded chance to replace
+    /// its selected detached row, while all ordinary participation stays gated.
+    fn armBoundedExactResumeHoldIfNeeded(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+    ) void {
+        const account = conn.session.account() orelse return;
+        if (self.attachmentHasReusableSession(id)) return;
+        var rows_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+        var has_detached_attachment = false;
+        for (self.sessions.sessionsInto(account, &rows_buf)) |row| {
+            if (!row.attached and row.attachment_id != null) {
+                has_detached_attachment = true;
+                break;
+            }
+        }
+        if (!has_detached_attachment and !conn.session.hasCap(.onyx_session_sync)) return;
+        conn.resume_autojoin_deferred = true;
+        conn.resume_autojoin_deadline_ms = self.nowMs() + 2_000;
+    }
+
     fn finishDeferredSessionAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, restored: bool) void {
         if (!conn.resume_autojoin_deferred) return;
         conn.resume_autojoin_deferred = false;
         conn.resume_autojoin_deadline_ms = 0;
+        // The one-shot TOKEN preservation is meaningful only inside this bounded
+        // retry window. Expiry (or any explicit finish) releases both latches so
+        // a stale WARN cannot refuse every later Helix UPGRADE indefinitely.
+        conn.preserve_resume_credential_once = false;
         if (!restored) self.applyAutojoin(id, conn);
     }
 
@@ -22750,8 +23938,39 @@ pub const LinuxServer = struct {
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const conn = entry.value;
-            if (!conn.resume_autojoin_deferred or now < conn.resume_autojoin_deadline_ms) continue;
-            self.finishDeferredSessionAutojoin(entry.id, conn, false);
+            if (conn.resume_autojoin_deferred) {
+                if (now < conn.resume_autojoin_deadline_ms) continue;
+                if (conn.session.hasCap(.onyx_e2ee) and
+                    conn.session.account() != null and
+                    !self.attachmentHasReusableSession(entry.id))
+                {
+                    conn.resume_autojoin_deferred = false;
+                    conn.resume_autojoin_deadline_ms = 0;
+                    conn.preserve_resume_credential_once = false;
+                    retainCloseReason(conn, "E2EE exact session resume expired");
+                    conn.closing = true;
+                    self.failReply(
+                        conn,
+                        "E2EEGROUP",
+                        "SESSION_UNAVAILABLE",
+                        "exact session resume window expired",
+                    ) catch {};
+                    continue;
+                }
+                self.finishDeferredSessionAutojoin(entry.id, conn, false);
+                continue;
+            }
+            // A manual RESUME retry can arm credential preservation without an
+            // account-autojoin hold. It owns the same bounded deadline and must
+            // expire independently, otherwise no autojoin sweep can ever clear
+            // it and every later UPGRADE remains refused.
+            if (conn.preserve_resume_credential_once and
+                conn.resume_autojoin_deadline_ms != 0 and
+                now >= conn.resume_autojoin_deadline_ms)
+            {
+                conn.preserve_resume_credential_once = false;
+                conn.resume_autojoin_deadline_ms = 0;
+            }
         }
     }
 
@@ -23558,6 +24777,7 @@ pub const LinuxServer = struct {
                     }) else -1,
                     .snapshot = if (!s.attached) (s.snapshot orelse &.{}) else &.{},
                     .portable_resume = s.portable_resume,
+                    .attachment_id = if (s.attachment_id) |attachment_id| attachment_id.raw else null,
                 };
             }
             const cap = session_capsule.SessionCapsule{
@@ -24486,6 +25706,7 @@ pub const LinuxServer = struct {
     }
 
     const UpgradeContinuityBlocker = enum {
+        session_drop_transaction,
         relay_v2_deferred,
         webtransport_listener,
         acme_companion,
@@ -24500,6 +25721,9 @@ pub const LinuxServer = struct {
     /// mutation boundary for MediaRooms/signaling. Transport predicates take
     /// their own pump locks; bridge values are inspected under their owner lock.
     fn upgradeContinuityBlockerLocked(self: *LinuxServer) ?UpgradeContinuityBlocker {
+        // DROP reservations are RAM-only two-owner latches. Refuse rather than
+        // serializing a half-committed identity transfer into the successor.
+        if (self.session_drop_journal.activeCount() != 0) return .session_drop_transaction;
         // Deferred MESSAGE_V2 owns exact signed wire not yet published into
         // RVG2. Until it has a Helix capsule, exec must never discard it.
         if (self.relay_v2_deferred_len != 0) return .relay_v2_deferred;
@@ -24519,6 +25743,7 @@ pub const LinuxServer = struct {
 
     fn upgradeContinuityBlockerName(blocker: UpgradeContinuityBlocker) []const u8 {
         return switch (blocker) {
+            .session_drop_transaction => "SESSION DROP transaction",
             .relay_v2_deferred => "deferred MESSAGE_V2 authority",
             .webtransport_listener => "WebTransport listener",
             .acme_companion => "ACME renewal companion",
@@ -25074,7 +26299,7 @@ pub const LinuxServer = struct {
         srvLog("onyx-server: UPGRADE resume refused inherited state: {s}\n", .{reason});
     }
 
-    pub fn adoptInheritedSessions(self: *LinuxServer) error{InvalidInheritedHandoff}!void {
+    pub fn adoptInheritedSessions(self: *LinuxServer) error{ InvalidInheritedHandoff, DurableDeviceActivationFailed }!void {
         if (comptime builtin.os.tag != .linux) return;
         const arena_fd = self.config.resume_arena_fd orelse {
             // A state-fd manifest without its arena is an incomplete handoff. A
@@ -25709,7 +26934,17 @@ pub const LinuxServer = struct {
             }
             property_checkpoint_bytes = c.fields[0].bytes;
         }
-        if (property_checkpoint_bytes == null) {
+        const durable_hot_plan = validateDurableDeviceBoot(self.config) catch |err| {
+            var reason_buf: [160]u8 = undefined;
+            const reason = std.fmt.bufPrint(
+                &reason_buf,
+                "invalid DPROP1 boot authority during hot adoption ({s})",
+                .{@errorName(err)},
+            ) catch "invalid DPROP1 boot authority during hot adoption";
+            self.abandonInheritedSessionState(caps, arena_fd, reason);
+            return error.DurableDeviceActivationFailed;
+        };
+        if (property_checkpoint_bytes == null and durable_hot_plan == .inactive) {
             self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory property-state checkpoint");
             return error.InvalidInheritedHandoff;
         }
@@ -25791,12 +27026,49 @@ pub const LinuxServer = struct {
                 self.abandonInheritedSessionState(caps, arena_fd, "invalid property-state checkpoint");
                 return error.InvalidInheritedHandoff;
             };
+        }
+        switch (durable_hot_plan) {
+            .inactive => {},
+            .purge_only, .authoritative => {
+                const base_props = if (property_replacement) |*replacement| &replacement.props else &self.props;
+                const base_channel = if (property_replacement) |*replacement| &replacement.channel_clocks else &self.channel_prop_clocks;
+                const base_entity = if (property_replacement) |*replacement| &replacement.entity_clocks else &self.entity_prop_clocks;
+                var reconciled = buildConfiguredDurableDeviceCandidate(
+                    self.allocator,
+                    base_props,
+                    base_channel,
+                    base_entity,
+                    durable_hot_plan,
+                ) catch |err| {
+                    var reason_buf: [160]u8 = undefined;
+                    const reason = std.fmt.bufPrint(
+                        &reason_buf,
+                        "DPROP1 hot property reconciliation failed ({s})",
+                        .{@errorName(err)},
+                    ) catch "DPROP1 hot property reconciliation failed";
+                    self.abandonInheritedSessionState(caps, arena_fd, reason);
+                    return error.DurableDeviceActivationFailed;
+                };
+                if (property_replacement) |*replacement| replacement.deinit();
+                property_replacement = reconciled;
+                reconciled = undefined;
+            },
+        }
+        if (property_replacement) |*replacement| {
             staged_mesh_clock.observeChecked(
-                property_replacement.?.max_hlc,
+                replacement.max_hlc,
                 self.meshWallMs(),
                 mesh_clock_mod.default_max_future_skew_ms,
-            ) catch {
-                self.abandonInheritedSessionState(caps, arena_fd, "property-state HLC is future-skewed or exhausted");
+            ) catch |err| {
+                var reason_buf: [176]u8 = undefined;
+                const reason = std.fmt.bufPrint(
+                    &reason_buf,
+                    "property-state HLC is future-skewed or exhausted ({s})",
+                    .{@errorName(err)},
+                ) catch "property-state HLC is future-skewed or exhausted";
+                self.abandonInheritedSessionState(caps, arena_fd, reason);
+                if (durable_hot_plan != .inactive)
+                    return error.DurableDeviceActivationFailed;
                 return error.InvalidInheritedHandoff;
             };
         }
@@ -25926,12 +27198,6 @@ pub const LinuxServer = struct {
         const prior_stage_retry_pending = self.session_replica_stage_retry_pending;
         const prior_stage_retry_cursor = self.session_replica_stage_retry_cursor;
         const prior_stage_retry_pass_failed = self.session_replica_stage_retry_pass_failed;
-        if (staged_mesh_clock.last_stamp > self.mesh_clock.last_stamp)
-            self.mesh_clock = staged_mesh_clock;
-        self.migration_offer_epoch = @max(
-            self.migration_offer_epoch,
-            staged_migration_offer_epoch,
-        );
         self.mesh_clock_lock.unlock();
         errdefer {
             lockSpin(&self.mesh_clock_lock);
@@ -26624,6 +27890,18 @@ pub const LinuxServer = struct {
         );
         self.webhook_store.publishUpgradeReplacement(&webhook_replacement);
         self.inherited_webhook_store_restored = true;
+        // DPROP1/PRPC and their causal boundary publish together only here.
+        // Both candidates are fully built and checked; these swaps/assignments
+        // allocate, persist, notify, gossip, and append transparency nowhere.
+        if (comptime builtin.is_test) {
+            if (durable_hot_plan != .inactive) {
+                if (test_dprop_commit_fail_index) |fail_index| {
+                    const alloc_index = test_dprop_commit_alloc_index orelse unreachable;
+                    fail_index.* = alloc_index.*;
+                }
+            }
+        }
+        lockSpin(&self.mesh_clock_lock);
         if (property_replacement) |*replacement| {
             replacement.swapInto(
                 &self.props,
@@ -26633,6 +27911,13 @@ pub const LinuxServer = struct {
             property_entities_restored = self.props.entity_count;
             property_clocks_restored = self.channel_prop_clocks.count() + self.entity_prop_clocks.count();
         }
+        if (staged_mesh_clock.last_stamp > self.mesh_clock.last_stamp)
+            self.mesh_clock = staged_mesh_clock;
+        self.migration_offer_epoch = @max(
+            self.migration_offer_epoch,
+            staged_migration_offer_epoch,
+        );
+        self.mesh_clock_lock.unlock();
         std.mem.swap(HistoryStore, &self.history, &history_replacement);
         std.mem.swap(search_index_mod.SearchIndex, &self.search_index, &search_replacement);
         self.event_history.publishCheckpoint(&event_history_replacement);
@@ -26737,11 +28022,15 @@ pub const LinuxServer = struct {
         attachment_remaps: *std.ArrayList(attachment_delivery_spool.AttachmentRemap),
     ) usize {
         if (cap.account.len == 0 or cap.sessions.len == 0) return 0;
+        self.bumpSessionListEpoch();
         // Validate first, apply second: one malformed entry rejects the whole
         // account BEFORE anything is written (fail-closed).
         var detached_count: usize = 0;
         for (cap.sessions, 0..) |entry, entry_index| {
             if (entry.token.len != @sizeOf(sessions_mod.Token)) return 0;
+            if (entry.attachment_id) |raw| {
+                _ = sessions_mod.AttachmentId.fromBytes(raw) catch return 0;
+            }
             if (attachmentClientNeedsRemap(attachment_clients, entry.client)) {
                 for (attachment_remaps.items) |mapping| {
                     if (mapping.old_client == entry.client) return 0;
@@ -26789,6 +28078,27 @@ pub const LinuxServer = struct {
                     entry.client,
                     cid,
                 ) orelse return 0;
+                // Pass 2 installs a compatibility row because the connection
+                // capsule does not carry physical attachment identity. Refresh
+                // that inert candidate row from HSSN v4 before it can become
+                // live. A legacy v1-v3 row has no id; when successor crypto is
+                // available, mint one now so the first reader upgrade creates
+                // current identity and the next v4 upgrade preserves it.
+                const outcome = self.restoreInheritedSessionAttachment(
+                    cap.account,
+                    cid,
+                    token,
+                    entry.attachment_id,
+                    entry.signon_unix,
+                ) orelse return 0;
+                // Refreshing an already-adopted live client reports the
+                // displaced pre-refresh row as `evicted`; it is the same
+                // physical candidate, not a capacity eviction or retired
+                // authority. Verify that exact identity instead of feeding it
+                // to the ordinary eviction finalizer.
+                const displaced = outcome.evicted orelse return 0;
+                if (displaced.client != cid or
+                    !std.crypto.timing_safe.eql(sessions_mod.Token, displaced.token, token)) return 0;
                 continue;
             }
             const synthetic: client_model.ClientId = .{
@@ -26805,7 +28115,13 @@ pub const LinuxServer = struct {
                 return 0;
             }
             const cid = monitorIdFromClient(synthetic);
-            const outcome = self.sessions.attachReportingEviction(cap.account, cid, token, entry.signon_unix) catch {
+            const outcome = self.restoreInheritedSessionAttachment(
+                cap.account,
+                cid,
+                token,
+                entry.attachment_id,
+                entry.signon_unix,
+            ) orelse {
                 for (applied[0..applied_n]) |rc| _ = self.sessions.remove(cap.account, rc);
                 return 0;
             };
@@ -26848,6 +28164,56 @@ pub const LinuxServer = struct {
         }
         remaps_committed = true;
         return cap.sessions.len;
+    }
+
+    /// Install the exact HSSN v4 attachment id, or mint the first stable id for
+    /// a genuine legacy v1-v3 row. The latter is reader-first compatible: old
+    /// predecessors never issued SRM2, while this successor's next v4 seal will
+    /// preserve the freshly minted id byte-for-byte. Without configured crypto,
+    /// retain the compatibility row without inventing weak identity.
+    fn restoreInheritedSessionAttachment(
+        self: *LinuxServer,
+        account: []const u8,
+        client: sessions_mod.ClientId,
+        token: sessions_mod.Token,
+        encoded_attachment_id: ?[session_capsule.attachment_id_len]u8,
+        signon_ms: i64,
+    ) ?sessions_mod.AttachOutcome {
+        if (encoded_attachment_id) |raw| {
+            const attachment_id = sessions_mod.AttachmentId.fromBytes(raw) catch return null;
+            return self.sessions.attachWithAttachmentReportingEviction(
+                account,
+                client,
+                token,
+                attachment_id,
+                signon_ms,
+            ) catch null;
+        }
+
+        const io = self.config.crypto_io orelse
+            return self.sessions.attachReportingEviction(
+                account,
+                client,
+                token,
+                signon_ms,
+            ) catch null;
+        // AttachmentId.mint already bounds zero-entropy retries. Bound global
+        // collision retries independently so hostile/injected entropy cannot
+        // spin adoption forever.
+        for (0..4) |_| {
+            const attachment_id = sessions_mod.AttachmentId.mint(io) catch return null;
+            return self.sessions.attachWithAttachmentReportingEviction(
+                account,
+                client,
+                token,
+                attachment_id,
+                signon_ms,
+            ) catch |err| switch (err) {
+                error.DuplicateAttachmentId => continue,
+                else => return null,
+            };
+        }
+        return null;
     }
 
     fn attachmentClientNeedsRemap(
@@ -26951,6 +28317,7 @@ pub const LinuxServer = struct {
                 conn.ws = null;
             }
             self.clearDeferredSessionMeshParts(conn);
+            conn.session_list_cache.reset();
             conn.send_overflow.clearAndFree(conn.overflow_allocator);
             conn.recv_overflow.clearAndFree(conn.overflow_allocator);
             conn.fd = -1;
@@ -26964,6 +28331,7 @@ pub const LinuxServer = struct {
         };
         self.world.removeClient(worldIdFromClient(id));
         if (conn.session.account()) |acct| _ = self.removeTrackedSession(acct, monitorIdFromClient(id));
+        conn.session_list_cache.reset();
         conn.recv_overflow.clearAndFree(conn.overflow_allocator);
         conn.send_overflow.clearAndFree(conn.overflow_allocator);
         if (conn.tls) |t| {
@@ -26994,6 +28362,7 @@ pub const LinuxServer = struct {
         }
         conn.recv_overflow.clearAndFree(conn.overflow_allocator);
         conn.send_overflow.clearAndFree(conn.overflow_allocator);
+        conn.session_list_cache.reset();
         _ = self.rx().clients.free(id);
         if (close_fd) closeFd(fd);
     }
@@ -27028,6 +28397,20 @@ pub const LinuxServer = struct {
         conn.last_message_ms = if (snap.last_message_ms != 0) snap.last_message_ms else now;
         conn.last_activity_ms = now;
         conn.session.restore(snap);
+        // The carried oper block is profile history only: restore() deliberately
+        // clears it. Re-derive successor authority from the restored authenticated
+        // account and the live sealed local config, while keeping durable OCG2
+        // explicitly disabled at the frozen Step 5 boundary. A forged/nonconfigured
+        // carried `is_oper` therefore stays inert, while an exact configured-local
+        // account retains its current privilege projection across Helix.
+        const configured_binding = if (conn.session.account()) |account|
+            if (self.oper_registry) |*registry|
+                oper_session_provenance.configuredLocalBinding(registry, account)
+            else
+                null
+        else
+            null;
+        _ = conn.session.reconcileOperAuthority(configured_binding, .disabled, self.grantNowU64());
         self.applyOperAutoOverride(conn); // re-affirm +j across USR2 for auto_override admins
         self.injectSessionState(conn);
         // TLS client: rebuild the live engine BEFORE anything else can touch the
@@ -31147,8 +32530,17 @@ pub const LinuxServer = struct {
         return e2ee_policy.policyValue(ev.value) orelse .off;
     }
 
-    fn messageSatisfiesEncryptionPolicy(self: *LinuxServer, channel: []const u8, raw_tags: ?[]const u8) bool {
-        return self.channelEncryptionPolicy(channel) != .required or e2ee_policy.encryptedTagPresent(raw_tags);
+    fn messageSatisfiesEncryptionPolicy(
+        self: *LinuxServer,
+        channel: []const u8,
+        raw_tags: ?[]const u8,
+        body: []const u8,
+        tag_only: bool,
+    ) bool {
+        return switch (self.channelEncryptionPolicy(channel)) {
+            .off, .optional => true,
+            .required => e2ee_policy.requiredRoomCommandAdmitted(raw_tags, body, tag_only),
+        };
     }
 
     fn historyPolicyAllows(self: *LinuxServer, channel: []const u8, is_member: bool, is_oper: bool) bool {
@@ -31371,8 +32763,15 @@ pub const LinuxServer = struct {
                 // always). The store's plain listProps hides ALL secrets, so list
                 // RAW and apply the daemon's per-tier gate per entry — an authorized
                 // requester sees their tier's keys, everyone else sees none.
-                var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-                const rows = self.props.listPropsRaw(entity, &views) catch views[0..0];
+                var user_views: [ircx_prop_store.user_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+                var default_views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+                const rows = switch (entity.kind) {
+                    .user => self.props.listPropsRaw(entity, &user_views),
+                    .channel, .member => self.props.listPropsRaw(entity, &default_views),
+                } catch {
+                    try queueNumeric(conn, .ERR_RESOURCE, &.{entity.id}, "Could not inspect complete property list");
+                    return;
+                };
                 for (rows) |ev| {
                     if (propIsSecret(entity, ev.key) and !self.maySeeSecretKey(id, conn, entity, ev.key)) continue;
                     try propEmitEntry(conn, ev);
@@ -31415,6 +32814,28 @@ pub const LinuxServer = struct {
                 try propEmitEnd(conn, q.entity);
             },
             .set => |m| {
+                var device_key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+                if (m.entity.kind == .user and isReservedDevicePropPrefix(m.key)) {
+                    const device_key = canonicalDevicePropKey(m.key, &device_key_buf) orelse {
+                        try queueNumeric(conn, .ERR_BADPROPERTY, &.{ m.entity.id, m.key }, "Invalid device property");
+                        return;
+                    };
+                    if (!validDurableDeviceValue(device_key, m.value)) {
+                        try queueNumeric(conn, .ERR_BADVALUE, &.{ m.entity.id, m.key }, "Invalid device property value");
+                        return;
+                    }
+                    const outcome = self.commitLocalDurableDeviceProp(conn, m.entity, device_key, m.value, true);
+                    if (outcome != .committed) {
+                        try self.durableDeviceNumericReply(conn, m.entity, outcome);
+                        return;
+                    }
+                    const canonical_account = services_mod.canonicalAccount(conn.session.account().?) catch unreachable;
+                    const entity = ircx_prop_store.Entity{ .kind = .user, .id = canonical_account.asSlice() };
+                    const ev = self.props.getPropRaw(entity, device_key) catch unreachable;
+                    try propEmitEntry(conn, ev);
+                    try propEmitEnd(conn, entity);
+                    return;
+                }
                 const access = self.propAccess(id, conn, m.entity) orelse {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{m.entity.id}, "Insufficient access to set property");
                     return;
@@ -31461,8 +32882,11 @@ pub const LinuxServer = struct {
                     }
                 } else {
                     // user/member props propagate over ENTITY_PROP with the same
-                    // signed multi-hop LWW guarantees.
-                    self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
+                    // signed multi-hop LWW guarantees. Exact credential keys
+                    // share the observation helper with E2EEKEY/IDENTITY.
+                    const hlc = self.nextChannelPropHlc();
+                    self.observeLocalUserCredentialProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, hlc);
+                    self.propagateLocalEntityPropAt(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner, hlc);
                 }
                 // Notify local IRCX clients that may see this entity (per-tier
                 // for secret channel keys); the setter's own echo follows.
@@ -31471,6 +32895,21 @@ pub const LinuxServer = struct {
                 try propEmitEnd(conn, m.entity);
             },
             .delete => |k| {
+                var device_key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+                if (k.entity.kind == .user and k.key.len != 0 and isReservedDevicePropPrefix(k.key)) {
+                    const device_key = canonicalDevicePropKey(k.key, &device_key_buf) orelse {
+                        try queueNumeric(conn, .ERR_BADPROPERTY, &.{ k.entity.id, k.key }, "Invalid device property");
+                        return;
+                    };
+                    const outcome = self.commitLocalDurableDeviceProp(conn, k.entity, device_key, "", false);
+                    if (outcome != .committed) {
+                        try self.durableDeviceNumericReply(conn, k.entity, outcome);
+                        return;
+                    }
+                    const canonical_account = services_mod.canonicalAccount(conn.session.account().?) catch unreachable;
+                    try propEmitEnd(conn, .{ .kind = .user, .id = canonical_account.asSlice() });
+                    return;
+                }
                 if (self.propAccess(id, conn, k.entity) == null) {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{k.entity.id}, "Insufficient access to delete property");
                     return;
@@ -31488,8 +32927,19 @@ pub const LinuxServer = struct {
                     return;
                 }
                 if (k.key.len == 0) {
-                    var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-                    const rows = self.props.listProps(k.entity, &views) catch views[0..0];
+                    var views: [ircx_prop_store.user_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+                    const rows = self.props.listPropsRaw(k.entity, &views) catch {
+                        try queueNumeric(conn, .ERR_RESOURCE, &.{k.entity.id}, "Could not inspect properties before clear");
+                        return;
+                    };
+                    if (k.entity.kind == .user) {
+                        for (rows) |ev| {
+                            if (isReservedDevicePropPrefix(ev.key)) {
+                                try queueNumeric(conn, .ERR_SECURITY, &.{k.entity.id}, "Delete device properties individually through durable authority");
+                                return;
+                            }
+                        }
+                    }
                     const owner = conn.session.displayName();
                     // Sign + announce each deletion while the rows (which borrow the
                     // store's key bytes) are still live, THEN clear the store —
@@ -31507,7 +32957,9 @@ pub const LinuxServer = struct {
                         }
                     } else {
                         for (rows) |ev| {
-                            self.propagateLocalEntityProp(false, k.entity.kind, k.entity.id, ev.key, "", owner);
+                            const hlc = self.nextChannelPropHlc();
+                            self.observeLocalUserCredentialProp(false, k.entity.kind, k.entity.id, ev.key, "", hlc);
+                            self.propagateLocalEntityPropAt(false, k.entity.kind, k.entity.id, ev.key, "", owner, hlc);
                             self.notifyLocalPropChange(conn, k.entity, ev.key, "");
                         }
                     }
@@ -31515,6 +32967,7 @@ pub const LinuxServer = struct {
                     try propEmitEnd(conn, k.entity);
                     return;
                 }
+                const existed = if (self.props.getProp(k.entity, k.key)) |_| true else |_| false;
                 self.props.deleteProp(k.entity, k.key) catch {};
                 if (k.entity.kind == .channel) {
                     const hlc = self.nextChannelPropHlc();
@@ -31526,7 +32979,11 @@ pub const LinuxServer = struct {
                         self.announceChannelProp(k.entity.id, k.key, "", owner, hlc, false, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
                     }
                 } else {
-                    self.propagateLocalEntityProp(false, k.entity.kind, k.entity.id, k.key, "", conn.session.displayName());
+                    const hlc = self.nextChannelPropHlc();
+                    if (existed) {
+                        self.observeLocalUserCredentialProp(false, k.entity.kind, k.entity.id, k.key, "", hlc);
+                    }
+                    self.propagateLocalEntityPropAt(false, k.entity.kind, k.entity.id, k.key, "", conn.session.displayName(), hlc);
                 }
                 self.notifyLocalPropChange(conn, k.entity, k.key, "");
                 try propEmitEnd(conn, k.entity);
@@ -31681,10 +33138,17 @@ pub const LinuxServer = struct {
         conn.session.sasl_router = null;
         conn.session.sasl_pending = null;
         self.retireMediaBeforeAccountMutation(id, conn, if (result.guest) null else account);
+        _ = self.clearOperAuthorityTransition(
+            id,
+            conn,
+            true,
+            if (result.guest) "anonymous authentication replaced operator authority" else "account authentication replaced operator authority",
+        );
         if (result.guest) {
             // ANONYMOUS is an account transition too: it clears account() and
             // therefore must retire the previous tracked portable authority.
             if (conn.session.account()) |old| _ = self.removeTrackedSession(old, monitorIdFromClient(id));
+            conn.session_list_cache.reset();
             conn.session.loginGuest(account);
         } else {
             if (conn.session.account()) |old| {
@@ -31711,6 +33175,7 @@ pub const LinuxServer = struct {
         }
         if (oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(id, conn);
+        self.armBoundedExactResumeHoldIfNeeded(id, conn);
         if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(id, conn);
@@ -31826,11 +33291,9 @@ pub const LinuxServer = struct {
     }
 
     /// Resolve remote DATA reserved-prefix authority from receiver-owned state.
-    /// The relay's account text is never consulted: `policy_account` must already
-    /// have been derived from a signed portable-session proof or an authenticated
-    /// remote residence, and the matching oper grant was itself verified on
-    /// ingestion. Network opers retain the same override as local opers; without
-    /// that grant, OWN/HST additionally requires authenticated channel rank.
+    /// During Step 5 no remote operator authority is active: OCG1 records are
+    /// compatibility telemetry only and OCG2 has no runtime consumer. OWN/HST
+    /// therefore require authenticated channel rank; SYS/ADM fail closed.
     fn remoteDataTagAuthorized(
         self: *LinuxServer,
         tag: []const u8,
@@ -31840,13 +33303,9 @@ pub const LinuxServer = struct {
     ) bool {
         if (tag.len < 3) return true;
         const prefix = tag[0..3];
-        const policy_is_oper = if (policy_account.len != 0)
-            if (self.oper_grants.lookup(policy_account, self.grantNowU64())) |grant|
-                grant.privilege_bits != 0
-            else
-                false
-        else
-            false;
+        _ = self;
+        _ = policy_account;
+        const policy_is_oper = false;
         if (std.ascii.eqlIgnoreCase(prefix, "SYS") or
             std.ascii.eqlIgnoreCase(prefix, "ADM")) return policy_is_oper;
         if (std.ascii.eqlIgnoreCase(prefix, "OWN") or
@@ -34134,95 +35593,19 @@ pub const LinuxServer = struct {
         const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(peer_pubkey) catch return false;
         const now: u64 = self.grantNowU64();
         const fields = oper_cred_share.verify(pk, bytes, now) catch return false;
-        // Whether this account ALREADY confers the derived `*` (+Y) before this
-        // grant lands. A live opered session is re-minted on a periodic cadence
-        // well inside the grant TTL (so its grant never lapses on a peer); each
-        // re-mint arrives here as a `superseded` upsert carrying identical
-        // privileges. Announcing +Y on every such refresh re-broadcasts
-        // `MODE #chan +Y <nick>` to every shared channel each cadence tick (the
-        // 30s "+Y" churn). Only a genuine transition should move the prefix;
-        // NAMES/WHO already render the derived `*` for anyone joining fresh.
-        const had_oper_override = if (self.oper_grants.lookup(fields.account, now)) |prev|
-            oper_mod.OperPrivileges.fromBits(prev.privilege_bits).has(.oper_override)
-        else
-            false;
         const accepted = self.oper_grants.upsert(fields) != .stale_ignored;
         if (accepted) {
             self.logMeshEvent(.oper_grant_in, fields.account, fields.issuer_node);
-            const now_oper_override = oper_mod.OperPrivileges.fromBits(fields.privilege_bits).has(.oper_override);
-            if (fields.privilege_bits == 0) {
-                // Revocation tombstone: drop oper from any connected sessions.
-                self.deElevateSessions(fields.account);
-            } else {
-                // Retroactively elevate any already-connected sessions of this
-                // account so recognition is immediate, not deferred to next login.
-                self.elevateGrantedSessions(fields.account);
-            }
-            // Account identity is not necessarily the displayed nick. Resolve
-            // every live local attachment and every residence-verified remote
-            // roster projection for this account, then move the derived prefix
-            // once per distinct display nick. Unchanged periodic re-mints never
-            // enter this branch; non-tombstone privilege narrowing gets -Y too.
-            if (had_oper_override != now_oper_override)
-                self.announceOperPrefixForAccount(fields.account, now_oper_override);
+            // OCG1 is compatibility telemetry only. It may converge in the
+            // legacy registry, but it cannot mutate session privilege or emit a
+            // derived operator prefix. OCG2 activation remains separately held.
         }
         return accepted;
     }
 
-    /// Elevate every already-registered local session for `account` that is not
-    /// yet an operator, or reconcile already-oper sessions on a live re-grant,
-    /// using the live grant registry. Every reactor's session projection is
-    /// mutated under the completion-wide World write lock; output to a foreign
-    /// socket crosses the reactor fabric rather than touching its SendQ/ring.
-    fn elevateGrantedSessions(self: *LinuxServer, account: []const u8) void {
-        const now: u64 = self.grantNowU64();
-        const grant = self.oper_grants.lookup(account, now) orelse return;
-        if (grant.privilege_bits == 0) return;
-        const privileges = oper_mod.OperPrivileges.fromBits(grant.privilege_bits);
-        for (self.reactors) |*reactor| for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
-            if (!slot.occupied) continue;
-            const c = &slot.value;
-            const id = slotClientId(reactor, slot_index, slot.gen);
-            if (c.s2s != null or c.s2s_secured != null) continue; // not a client
-            if (!c.session.registered()) continue;
-            const acct = c.session.account() orelse continue;
-            if (!std.ascii.eqlIgnoreCase(acct, account)) continue;
-            if (self.oper_registry) |reg| {
-                if (reg.lookup(acct) != null) {
-                    if (c.session.isOper()) continue; // configured oper authority wins over runtime grants
-                }
-            }
-            if (c.session.isOper()) {
-                const override_was_set = c.session.hasUmode(.override);
-                const had_override_priv = c.session.hasPriv(.oper_override);
-                c.session.setOperGrant(privileges, grant.class, grant.title);
-                const has_override_priv = c.session.hasPriv(.oper_override);
-                self.applyOperAutoOverride(c); // re-affirm +j if auto_override + still holds oper_override
-                if (override_was_set and had_override_priv and !has_override_priv) {
-                    if (c.session.setUmode(.override, false)) {
-                        const reason = "cleared override after oper_override privilege was removed";
-                        self.auditOverrideUse(c, "UMODE", c.session.displayName(), reason);
-                        // Tell the affected oper directly — they may not be
-                        // subscribed to the oper-action event feed, but they must
-                        // still learn WHY their override was removed.
-                        self.deliverNoticeTo(id, c, reason) catch {};
-                        var mode_buf: [default_reply_bytes]u8 = undefined;
-                        const nick = c.session.displayName();
-                        const line = formatMessage(&mode_buf, self.serverName(), "MODE", &.{ nick, "-j" }, null) catch "";
-                        if (line.len != 0) self.enqueueDelivery(id, line) catch {};
-                    }
-                }
-                continue;
-            }
-            // The caller owns the one account-wide prefix transition after all
-            // physical attachments converge; suppress per-attachment emission.
-            self.elevateOperFromAccountTo(id, c, false) catch continue;
-        };
-    }
-
-    /// Mint + store a signed grant for a locally-elevated operator so peer nodes
-    /// can recognize them. Stored locally too (self-trust); the S2S layer
-    /// broadcasts it to peers. Best-effort: silently no-ops without a node key.
+    /// Mint + store an inactive legacy OCG1 record for compatibility telemetry.
+    /// Stored locally and broadcast to peers, but never accepted as authority.
+    /// Best-effort: silently no-ops without a node key.
     fn mintOperGrant(self: *LinuxServer, account: []const u8, privileges: oper_mod.OperPrivileges, class_name: []const u8, title: []const u8) void {
         const now: u64 = self.grantNowU64();
         // Strictly-increasing incarnation so a later GRANT/REVOKE always wins,
@@ -34384,41 +35767,34 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         announce_prefix: bool,
     ) !void {
-        if (conn.session.isOper()) return;
+        // Account authentication is an authority replacement, never an
+        // additive privilege path.  Revoke the prior projection before looking
+        // up the newly-authenticated account so a same-account refresh, an
+        // account switch, or a missing/revoked binding cannot retain or union
+        // privileges from the previous grant.  ClientSession.loginAs() also
+        // clears at the identity boundary; keeping this guard here makes every
+        // direct reconciliation caller fail closed as well.
+        _ = self.clearOperAuthorityTransition(id, conn, announce_prefix, "operator authority recomputed");
         const account = conn.session.account() orelse return;
 
-        // Operator authority comes from either a local [oper] binding or a
-        // signed grant propagated from a peer node (cross-mesh recognition).
-        var privileges: oper_mod.OperPrivileges = undefined;
-        var class_name: []const u8 = undefined;
-        var title: []const u8 = undefined;
-        // Event-Spine auto-subscription on elevation: ONLY the categories the
-        // oper's binding presubscribes to (0 = none — they must `EVENT ADD`).
-        // A cross-mesh grant carries no presubscribe, so a remote oper defaults
-        // to no auto-subscription.
-        var presubscribe_bits: u64 = 0;
-        var from_local = false;
-        if (self.oper_registry) |registry| {
-            if (registry.elevate(.{ .name = account })) |grant| {
-                privileges = grant.privileges;
-                class_name = grant.class_name;
-                title = grant.title;
-                presubscribe_bits = grant.presubscribe_bits;
-                from_local = true;
-            } else |_| {}
-        }
-        if (!from_local) {
-            const now: u64 = self.grantNowU64();
-            const g = self.oper_grants.lookup(account, now) orelse return; // not an operator anywhere
-            if (g.privilege_bits == 0) return; // zero-privilege grant = revocation tombstone
-            privileges = oper_mod.OperPrivileges.fromBits(g.privilege_bits);
-            class_name = g.class;
-            title = g.title;
-        }
+        const application_now = self.grantNowU64();
+        const configured_binding = if (self.oper_registry) |*registry|
+            oper_session_provenance.configuredLocalBinding(registry, account)
+        else
+            null;
+        const presubscribe_bits = if (configured_binding) |*binding| binding.presubscribeBits() else 0;
 
-        // Capture the granted privilege set + class on the session so handlers
-        // can gate sensitive actions on specific privileges, not just is_oper.
-        conn.session.setOperGrant(privileges, class_name, title);
+        // Step 5 deliberately consumes only the sealed live-config capability.
+        // The durable Services image can already return a typed active OCG2
+        // record, so threading it here would activate OCG2 before the frozen
+        // transactional Step 6 boundary. Keep that source explicitly disabled.
+        const outcome = conn.session.reconcileOperAuthority(configured_binding, .disabled, application_now);
+        if (outcome != .replaced or !conn.session.isOper()) return;
+        const privileges = conn.session.oper_priv;
+        const class_name = conn.session.operClass();
+        const title = conn.session.operTitle();
+
+        if (!conn.session.isOper()) return;
         self.applyOperAutoOverride(conn); // [oper] auto_override → +j for oper_override holders
         // Opers are always in IRCX mode: SASL oper elevation auto-enables it, so
         // the IRCX command surface + PROP-change notifications "just work" without
@@ -34428,10 +35804,8 @@ pub const LinuxServer = struct {
         // and persist it so the operator is restored after a full restart (a USR2
         // keeps the session's oper status; a cold restart does not) without waiting
         // for a peer to re-propagate it.
-        if (from_local) {
-            self.mintOperGrant(account, privileges, class_name, title);
-            self.persistGrants();
-        }
+        self.mintOperGrant(account, privileges, class_name, title);
+        self.persistGrants();
         self.traceLog(.notice, .oper, "operator elevated via SASL account");
         // Wallops, oper notices, kills, etc. arrive as typed Event-Spine events,
         // but ONLY for the categories this oper presubscribed to (per the
@@ -34487,34 +35861,48 @@ pub const LinuxServer = struct {
         if (conn.session.hasPriv(.oper_override)) _ = conn.session.setUmode(.override, true);
     }
 
-    /// Drop operator status from every connected session of `account` (a
-    /// REVOKE / revocation-tombstone arriving from a peer). Config-bound opers
-    /// are left alone — their authority comes from `[[opers]]`, not a grant.
-    fn deElevateSessions(self: *LinuxServer, account: []const u8) void {
-        if (self.oper_registry) |reg| {
-            if (reg.lookup(account) != null) return; // configured oper; not grant-revocable
+    /// Revoke one live operator projection and publish every externally-visible
+    /// consequence exactly once. Account mutation callers invoke this BEFORE
+    /// loginAs/loginGuest/logout clears the session, preserving the old +a/+j
+    /// and derived +Y facts long enough to retract them from clients. The
+    /// actual authority cut happens first; all wire/event publication is
+    /// best-effort and can never keep privilege alive on delivery failure.
+    fn clearOperAuthorityTransition(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        announce_prefix: bool,
+        reason: []const u8,
+    ) bool {
+        if (!conn.session.isOper()) return false;
+        const had_admin = conn.session.hasUmode(.admin);
+        const had_override_mode = conn.session.hasUmode(.override);
+        const had_oper_prefix = conn.session.hasPriv(.oper_override);
+        const nick = conn.session.displayName();
+
+        conn.session.clearOper();
+
+        var modes_buf: [5]u8 = undefined;
+        var modes_len: usize = 0;
+        modes_buf[modes_len] = '-';
+        modes_len += 1;
+        modes_buf[modes_len] = 'o';
+        modes_len += 1;
+        if (had_admin) {
+            modes_buf[modes_len] = usermode.letterOf(.admin) orelse 'a';
+            modes_len += 1;
         }
-        for (self.reactors) |*reactor| for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
-            if (!slot.occupied) continue;
-            const c = &slot.value;
-            const id = slotClientId(reactor, slot_index, slot.gen);
-            if (c.s2s != null or c.s2s_secured != null) continue;
-            if (!c.session.registered() or !c.session.isOper()) continue;
-            const acct = c.session.account() orelse continue;
-            if (!std.ascii.eqlIgnoreCase(acct, account)) continue;
-            c.session.clearOper();
-            var msg_buf: [default_reply_bytes]u8 = undefined;
-            const nick = c.session.displayName();
-            const msg = formatMessage(&msg_buf, self.serverName(), "MODE", &.{ nick, "-o" }, null) catch continue;
-            self.enqueueDelivery(id, msg) catch {};
-            var notice_buf: [256]u8 = undefined;
-            const notice = std.fmt.bufPrint(
-                &notice_buf,
-                ":{s} NOTICE * :Your operator authority has been revoked.\r\n",
-                .{self.serverName()},
-            ) catch continue;
-            self.enqueueDelivery(id, notice) catch {};
-        };
+        if (had_override_mode) {
+            modes_buf[modes_len] = usermode.letterOf(.override) orelse 'j';
+            modes_len += 1;
+        }
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = formatMessage(&msg_buf, self.serverName(), "MODE", &.{ nick, modes_buf[0..modes_len] }, null) catch "";
+        if (msg.len != 0) self.enqueueDelivery(id, msg) catch {};
+        self.publishUserEvent(conn, "DEOPER", reason) catch {};
+        if (announce_prefix and had_oper_prefix)
+            self.announceOperPrefixAllChannels(nick, false);
+        return true;
     }
 
     /// Resolve a GRANT's privilege set: an explicit comma-separated privilege-name
@@ -34545,10 +35933,9 @@ pub const LinuxServer = struct {
         });
     }
 
-    /// GRANT <account> <class> [priv,priv,...] — give a registered account
-    /// operator authority network-wide. Requires the `oper_grant` privilege. Mints
-    /// a signed grant (recorded locally, propagated to secured peers, and honored
-    /// on the account's next login) and elevates already-connected sessions now.
+    /// GRANT <account> <class> [priv,priv,...] — retain an inactive legacy OCG1
+    /// record for compatibility telemetry. Requires `oper_grant`, but never
+    /// projects authority into a session; OCG2 activation is separately gated.
     pub fn handleGrant(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.hasPriv(.oper_grant)) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied (oper_grant required)");
@@ -34573,26 +35960,20 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "GRANT: unknown privilege name in list");
             return;
         };
-        const had_oper_override = if (self.oper_grants.lookup(account, self.grantNowU64())) |grant|
-            oper_mod.OperPrivileges.fromBits(grant.privilege_bits).has(.oper_override)
-        else
-            false;
         self.mintOperGrant(account, privs, class, "");
-        self.elevateGrantedSessions(account);
-        const has_oper_override = privs.has(.oper_override);
-        if (had_oper_override != has_oper_override)
-            self.announceOperPrefixForAccount(account, has_oper_override);
         self.persistGrants();
 
         var b: [256]u8 = undefined;
-        try self.noticeTo(conn, std.fmt.bufPrint(&b, "GRANT: {s} is now an operator (class {s})", .{ account, class }) catch "GRANT applied");
-        self.notifyObservers(.oper_up, observeSubject(conn, account));
+        try self.noticeTo(conn, std.fmt.bufPrint(
+            &b,
+            "GRANT: stored inactive legacy record for {s} (class {s}); no authority activated",
+            .{ account, class },
+        ) catch "GRANT: stored inactive legacy record; no authority activated");
     }
 
-    /// REVOKE <account> — remove operator authority from a runtime-granted account
-    /// network-wide: a zero-privilege tombstone supersedes the grant (propagated to
-    /// peers + honored on next login) and connected sessions are de-elevated now.
-    /// Configured `[[opers]]` accounts are not revocable this way.
+    /// REVOKE <account> — supersede an inactive legacy OCG1 record with a
+    /// zero-privilege tombstone. Configured `[[opers]]` accounts remain outside
+    /// this compatibility plane and cannot be revoked by this command.
     pub fn handleRevoke(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.hasPriv(.oper_grant)) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied (oper_grant required)");
@@ -34609,20 +35990,13 @@ pub const LinuxServer = struct {
                 return;
             }
         }
-        const had_oper_override = if (self.oper_grants.lookup(account, self.grantNowU64())) |grant|
-            oper_mod.OperPrivileges.fromBits(grant.privilege_bits).has(.oper_override)
-        else
-            false;
         self.mintOperGrant(account, oper_mod.OperPrivileges.empty, "revoked", "");
-        self.deElevateSessions(account);
-        if (had_oper_override) self.announceOperPrefixForAccount(account, false);
         self.persistGrants();
         var b: [256]u8 = undefined;
-        try self.noticeTo(conn, std.fmt.bufPrint(&b, "REVOKE: operator authority removed from {s}", .{account}) catch "REVOKE applied");
-        self.notifyObservers(.oper_up, observeSubject(conn, account));
+        try self.noticeTo(conn, std.fmt.bufPrint(&b, "REVOKE: stored inactive legacy tombstone for {s}", .{account}) catch "REVOKE: stored inactive legacy tombstone");
     }
 
-    /// GRANTS — list the live runtime operator grants (account, class, scope).
+    /// GRANTS — list non-tombstone inactive legacy OCG1 records.
     pub fn handleGrants(self: *LinuxServer, conn: *ConnState) !void {
         try self.noticeTo(conn, "Runtime operator grants:");
         const now: u64 = self.grantNowU64();
@@ -34639,7 +36013,7 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, std.fmt.bufPrint(&b, "End of grants ({d}).", .{count}) catch "End of grants.");
     }
 
-    /// Persist the active runtime operator grants to `[oper] grants_path` (tab-
+    /// Persist inactive non-tombstone legacy OCG1 records to `[oper] grants_path` (tab-
     /// separated account/privbits/class/title, one per line). Tombstones
     /// (privilege_bits == 0) are omitted, so a revoked account is simply absent
     /// and is not restored. No-op when no path is configured.
@@ -34665,9 +36039,9 @@ pub const LinuxServer = struct {
         writeFileAbs(self.allocator, self.config.oper_grants_path, out.items);
     }
 
-    /// Reload persisted runtime grants at boot: re-mint each into the registry so
-    /// previously-granted accounts elevate on their next login. Called once from
-    /// `start`. No-op without a configured path / readable file.
+    /// Reload persisted legacy OCG1 records at boot for compatibility telemetry.
+    /// Re-minting does not project session authority. Called once from `start`;
+    /// no-op without a configured path / readable file.
     fn loadGrants(self: *LinuxServer) void {
         if (self.config.oper_grants_path.len == 0) return;
         const io = self.config.crypto_io orelse return;
@@ -34688,7 +36062,7 @@ pub const LinuxServer = struct {
             self.mintOperGrant(account, oper_mod.OperPrivileges.fromBits(bits), class, title);
             restored += 1;
         }
-        if (restored != 0) srvLog("onyx-server: restored {d} runtime operator grant(s)\n", .{restored});
+        if (restored != 0) srvLog("onyx-server: restored {d} inactive legacy OCG1 record(s)\n", .{restored});
     }
 
     /// Restore the per-channel statistics snapshot persisted by a previous run,
@@ -34834,6 +36208,7 @@ pub const LinuxServer = struct {
 
     /// Mark `conn` logged in as the canonical (lowercased) `account`.
     fn loginSession(conn: *ConnState, account: []const u8) void {
+        conn.session_list_cache.reset();
         var buf: [account_register.MAX_ACCOUNT_BYTES]u8 = undefined;
         const n = @min(account.len, buf.len);
         const lower = std.ascii.lowerString(buf[0..n], account[0..n]);
@@ -34872,6 +36247,7 @@ pub const LinuxServer = struct {
     fn finishLogin(self: *LinuxServer, conn: *ConnState, account: []const u8) !void {
         const id = idFromToken(conn.token);
         self.retireMediaBeforeAccountMutation(id, conn, account);
+        _ = self.clearOperAuthorityTransition(id, conn, true, "account authentication replaced operator authority");
         // Re-login to a different account: drop the previous account's session
         // binding first (mirrors handleLogout / handleIdentify) so a stale
         // SessionStore entry can't keep this connection in the old delivery set.
@@ -34886,6 +36262,7 @@ pub const LinuxServer = struct {
         self.restoreAccountSilence(conn, account);
         try self.elevateOperFromAccount(conn);
         self.trackSession(id, conn);
+        self.armBoundedExactResumeHoldIfNeeded(id, conn);
         if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(id, conn);
@@ -34914,6 +36291,12 @@ pub const LinuxServer = struct {
             return;
         };
         self.retireMediaBeforeAccountMutation(idFromToken(conn.token), conn, account);
+        _ = self.clearOperAuthorityTransition(
+            idFromToken(conn.token),
+            conn,
+            true,
+            "account registration replaced operator authority",
+        );
         if (conn.session.account()) |old| {
             if (!std.ascii.eqlIgnoreCase(old, account))
                 _ = self.removeTrackedSession(old, monitorIdFromClient(idFromToken(conn.token)));
@@ -34950,6 +36333,7 @@ pub const LinuxServer = struct {
         }
         if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
+        self.armBoundedExactResumeHoldIfNeeded(idFromToken(conn.token), conn);
         if (!try self.enforceE2eeSessionEligibility(idFromToken(conn.token), conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(idFromToken(conn.token), conn);
@@ -35037,6 +36421,12 @@ pub const LinuxServer = struct {
         }
         self.loginRecordSuccess(conn, account);
         self.retireMediaBeforeAccountMutation(idFromToken(conn.token), conn, account);
+        _ = self.clearOperAuthorityTransition(
+            idFromToken(conn.token),
+            conn,
+            true,
+            "account authentication replaced operator authority",
+        );
         // Re-IDENTIFY to a different account: drop the previous account's session
         // binding first (mirrors handleLogout), so a stale SessionStore entry can
         // never keep this connection in the old account's delivery/fan-out set.
@@ -35057,6 +36447,7 @@ pub const LinuxServer = struct {
         try emitReplyLine(conn, line);
         try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
+        self.armBoundedExactResumeHoldIfNeeded(idFromToken(conn.token), conn);
         if (!try self.enforceE2eeSessionEligibility(idFromToken(conn.token), conn)) return;
         try self.deliverMemo(conn);
         self.applyLoginJoinState(idFromToken(conn.token), conn);
@@ -35072,6 +36463,7 @@ pub const LinuxServer = struct {
         self.retireMediaBeforeAccountMutation(id, conn, null);
         // Drop this connection's live session before clearing the account binding
         // (the session is keyed by account; logout fully ends it, no reclaim).
+        conn.session_list_cache.reset();
         if (conn.session.account()) |acct| _ = self.removeTrackedSession(acct, monitorIdFromClient(id));
         // Whether an account session is actually being cleared decides if we emit
         // 901 RPL_LOGGEDOUT below (a no-op LOGOUT on an unauthenticated session
@@ -35095,16 +36487,37 @@ pub const LinuxServer = struct {
                 try appendToConn(conn, line);
             } else |_| {}
         }
+        if (was_oper)
+            _ = self.clearOperAuthorityTransition(id, conn, true, "account logout revoked operator authority");
         conn.session.logout();
         var buf: [default_reply_bytes]u8 = undefined;
-        if (was_oper) {
-            conn.session.clearOper();
-            const nick = conn.session.displayName();
-            const mode = std.fmt.bufPrint(&buf, ":{s} MODE {s} :-o\r\n", .{ self.serverName(), nick }) catch return;
-            try appendToConn(conn, mode);
-        }
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now logged out\r\n", .{ self.serverName(), conn.session.displayName() }) catch return;
         try emitReplyLine(conn, line);
+    }
+
+    fn closeDroppedAccountConnections(
+        self: *LinuxServer,
+        account: []const u8,
+        except: ?client_model.ClientId,
+    ) void {
+        // Account deletion revokes the identity, not merely its resumable rows.
+        // ConnState is owner-reactor storage: inspect it under the World lock but
+        // route teardown through the owner seam so foreign SendQ/ring state is
+        // never mutated here. Local close errors still leave `closing` set by
+        // closeConn's retry path; cross-shard mailbox exhaustion poisons the
+        // exact generation and is swept closed by its owner.
+        for (self.reactors) |*reactor| {
+            var slot_index: usize = 0;
+            while (slot_index < reactor.clients.slots.items.len) : (slot_index += 1) {
+                const slot = &reactor.clients.slots.items[slot_index];
+                if (!slot.occupied) continue;
+                const live_account = slot.value.session.account() orelse continue;
+                if (!std.ascii.eqlIgnoreCase(live_account, account)) continue;
+                const id = slotClientId(reactor, slot_index, slot.gen);
+                if (except) |retained| if (id.eql(retained)) continue;
+                self.enqueueCloseOnOwner(id, "Account dropped") catch {};
+            }
+        }
     }
 
     /// `DROP <account> <password>` — delete an account (requires its password).
@@ -35127,15 +36540,19 @@ pub const LinuxServer = struct {
         // Account deletion is an authorization boundary, not just a services
         // record mutation. Retire every local reusable-session authority now so
         // a previously issued MTOKEN cannot resurrect the deleted account from a
-        // mesh replica. This deliberately does not mutate live ConnState objects
-        // across reactor ownership; account-notify/live login teardown remains a
-        // separate pre-existing DROP semantic.
+        // mesh replica.
         _ = self.removeAllTrackedSessions(account);
         // Hand any channels this account founded to their configured successors.
         self.promoteSuccessorsForDroppedFounder(account);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} dropped\r\n", .{ self.serverName(), conn.session.displayName(), account }) catch return;
-        try emitReplyLine(conn, line);
+        const requester = idFromToken(conn.token);
+        // Account deletion closes every authenticated socket, but the requester
+        // must observe the committed result first. Queue its notice and terminal
+        // close as one ordered owner operation; an immediate local close would
+        // discard the just-appended SendQ before the kernel could transmit it.
+        try self.enqueueDeliveryThenClose(requester, line, "Account dropped");
+        self.closeDroppedAccountConnections(account, requester);
     }
 
     /// `SETPASS <current-password> <new-password>` — change the logged-in account's
@@ -35651,6 +37068,121 @@ pub const LinuxServer = struct {
         return @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
     }
 
+    fn localPropOriginNode(self: *const LinuxServer) u64 {
+        if (self.config.node_identity) |ident| return ident.shortId();
+        return self.config.node_id;
+    }
+
+    fn observationalCredentialKind(key: []const u8) ?key_transparency.CredentialKind {
+        if (e2ee_policy.isDevicePropKey(key)) return .e2ee_device;
+        if (account_identity.isPropKey(key)) return .identity;
+        return null;
+    }
+
+    fn observationalCredentialKeyId(key: []const u8) ?[]const u8 {
+        if (e2ee_policy.isDevicePropKey(key)) return key[e2ee_policy.device_prop_prefix.len..];
+        if (account_identity.isPropKey(key)) return key[account_identity.prop_prefix.len..];
+        return null;
+    }
+
+    fn observationalBindMaterial(
+        kind: key_transparency.CredentialKind,
+        value: []const u8,
+        identity_key_buf: *[account_identity.public_key_len]u8,
+    ) []const u8 {
+        if (kind == .identity) {
+            if (account_identity.parseClaimValue(value)) |claim| {
+                identity_key_buf.* = claim.public_key;
+                return identity_key_buf;
+            }
+        }
+        return value;
+    }
+
+    /// Best-effort observation of an exact `e2ee.device.*` or `identity.key.*`
+    /// user PROP after the mutation has already succeeded. Member, residence,
+    /// and unrelated keys are ignored. Never changes the caller's reply.
+    fn observeUserCredentialProp(
+        self: *LinuxServer,
+        present: bool,
+        store_kind: ircx_prop_store.EntityKind,
+        account: []const u8,
+        key: []const u8,
+        value: []const u8,
+        hlc: u64,
+        origin_node: u64,
+        origin_pubkey: []const u8,
+    ) void {
+        if (store_kind != .user) return;
+        const kind = observationalCredentialKind(key) orelse return;
+        const key_id = observationalCredentialKeyId(key) orelse return;
+        var identity_key_buf: [account_identity.public_key_len]u8 = undefined;
+        const material = if (present)
+            observationalBindMaterial(kind, value, &identity_key_buf)
+        else
+            "";
+        self.observeCredentialFact(
+            account,
+            kind,
+            if (present) .bind else .delete,
+            key_id,
+            material,
+            hlc,
+            origin_node,
+            origin_pubkey,
+        );
+    }
+
+    fn observeLocalUserCredentialProp(
+        self: *LinuxServer,
+        present: bool,
+        store_kind: ircx_prop_store.EntityKind,
+        account: []const u8,
+        key: []const u8,
+        value: []const u8,
+        hlc: u64,
+    ) void {
+        self.observeUserCredentialProp(
+            present,
+            store_kind,
+            account,
+            key,
+            value,
+            hlc,
+            self.localPropOriginNode(),
+            "",
+        );
+    }
+
+    /// Record one node-local observation after a PROP mutation has already
+    /// succeeded. Never rolls back the prop and never holds a prop lock.
+    fn observeCredentialFact(
+        self: *LinuxServer,
+        account: []const u8,
+        kind: key_transparency.CredentialKind,
+        action: key_transparency.Action,
+        key_id: []const u8,
+        material: []const u8,
+        hlc: u64,
+        origin_node: u64,
+        origin_pubkey: []const u8,
+    ) void {
+        const svc = self.account_services orelse return;
+        svc.observeKeyTransparencyFact(
+            account,
+            kind,
+            action,
+            key_id,
+            material,
+            key_transparency.observationTimestampMs(hlc),
+            .{
+                .hlc = hlc,
+                .origin_node = origin_node,
+                .origin_pubkey = origin_pubkey,
+            },
+        );
+    }
+
     const E2eeDeviceValue = struct {
         algorithm: []const u8,
         public_key: []const u8,
@@ -35931,29 +37463,14 @@ pub const LinuxServer = struct {
 
     fn renderE2eeGroupLineFromPrefix(
         prefix: []const u8,
+        from_account: []const u8,
         record: e2ee_group_control.Record,
         out: []u8,
     ) ServerError![]const u8 {
-        return if (record.kind == .welcome)
-            std.fmt.bufPrint(
-                out,
-                ":{s} {s} {s} {s} {s} {s} :{s}\r\n",
-                .{
-                    prefix,
-                    record.kind.wireTag(),
-                    record.channel,
-                    record.from_device,
-                    record.to_account.?,
-                    record.to_device.?,
-                    record.payload,
-                },
-            ) catch error.OutputTooSmall
-        else
-            std.fmt.bufPrint(
-                out,
-                ":{s} {s} {s} {s} :{s}\r\n",
-                .{ prefix, record.kind.wireTag(), record.channel, record.from_device, record.payload },
-            ) catch error.OutputTooSmall;
+        return e2ee_group_delivery.renderClientLine(prefix, from_account, record, out) catch |err| switch (err) {
+            error.OutputTooSmall => error.OutputTooSmall,
+            error.InvalidRecord => error.OutputTooSmall,
+        };
     }
 
     fn deliverE2eeGroupLine(
@@ -36069,6 +37586,7 @@ pub const LinuxServer = struct {
         var line_buf: [e2ee_group_max_line_bytes]u8 = undefined;
         const line = renderE2eeGroupLineFromPrefix(
             record.source_prefix,
+            record.account,
             control,
             &line_buf,
         ) catch return .rejected;
@@ -36178,10 +37696,10 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn e2eeDeviceCount(self: *LinuxServer, account: []const u8) usize {
+    fn e2eeDeviceCount(self: *LinuxServer, account: []const u8) !usize {
         const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-        var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-        const rows = self.props.listProps(entity, &views) catch return 0;
+        var views: [ircx_prop_store.user_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+        const rows = try self.props.listPropsRaw(entity, &views);
         var count: usize = 0;
         for (rows) |ev| {
             if (e2ee_policy.isDevicePropKey(ev.key)) count += 1;
@@ -36252,9 +37770,10 @@ pub const LinuxServer = struct {
         record: e2ee_group_control.Record,
         out: []u8,
     ) ServerError![]const u8 {
+        const from_account = conn.session.account() orelse return error.OutputTooSmall;
         var prefix_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
-        return renderE2eeGroupLineFromPrefix(prefix, record, out);
+        return renderE2eeGroupLineFromPrefix(prefix, from_account, record, out);
     }
 
     /// Operator-only process-local activation barrier:
@@ -36408,7 +37927,7 @@ pub const LinuxServer = struct {
         const source_prefix = clientPrefix(conn, &source_prefix_buf) catch
             return self.warnReply(conn, "E2EEGROUP", "TEMPORARILY_UNAVAILABLE", "Could not bind group E2EE origin");
         var line_buf: [e2ee_group_max_line_bytes]u8 = undefined;
-        const line = renderE2eeGroupLineFromPrefix(source_prefix, record, &line_buf) catch
+        const line = renderE2eeGroupLineFromPrefix(source_prefix, account, record, &line_buf) catch
             return self.failReply(conn, "E2EEGROUP", "BAD_PAYLOAD", "Group E2EE control record is too large");
 
         // A standalone server has no mesh signing authority and preserves the
@@ -36521,8 +38040,10 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(sub, "STATUS")) {
             const account = conn.session.account() orelse
                 return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before managing E2EE device keys");
+            const count = self.e2eeDeviceCount(account) catch
+                return self.failReply(conn, "E2EEKEY", "TEMPORARILY_UNAVAILABLE", "Could not inspect the complete device directory");
             var b: [128]u8 = undefined;
-            const body = std.fmt.bufPrint(&b, "STATUS account={s} devices={d}", .{ account, self.e2eeDeviceCount(account) }) catch return;
+            const body = std.fmt.bufPrint(&b, "STATUS account={s} devices={d}", .{ account, count }) catch return;
             return self.e2eeKeyReply(conn, body);
         }
 
@@ -36530,10 +38051,9 @@ pub const LinuxServer = struct {
             const account = if (p.len >= 2) p[1] else (conn.session.account() orelse
                 return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before listing your E2EE device keys"));
             const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-            var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-            const rows = self.props.listProps(entity, &views) catch rows: {
-                break :rows views[0..0];
-            };
+            var views: [ircx_prop_store.user_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+            const rows = self.props.listPropsRaw(entity, &views) catch
+                return self.failReply(conn, "E2EEKEY", "TEMPORARILY_UNAVAILABLE", "Could not inspect the complete device directory");
             var count: usize = 0;
             for (rows) |ev| {
                 if (!e2ee_policy.isDevicePropKey(ev.key)) continue;
@@ -36554,59 +38074,42 @@ pub const LinuxServer = struct {
         }
 
         if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
-            const account = conn.session.account() orelse
+            _ = conn.session.account() orelse
                 return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before adding E2EE device keys");
             if (p.len < 4) return self.failReply(conn, "E2EEKEY", "NEED_MORE_PARAMS", "Usage: E2EEKEY ADD <device-id> <algorithm> <public-key>");
             var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
             const key = e2ee_policy.devicePropKey(p[1], &key_buf) orelse
                 return self.failReply(conn, "E2EEKEY", "BAD_DEVICE", "Device id must use A-Z, a-z, 0-9, dot, dash, or underscore");
+            e2ee_policy.validateAdvertisement(p[1], p[2], p[3]) catch |err| switch (err) {
+                error.InvalidDevice => return self.failReply(
+                    conn,
+                    "E2EEKEY",
+                    "BAD_DEVICE",
+                    "Device id must match the OGC1 directory identifier",
+                ),
+                error.InvalidKey => return self.failReply(conn, "E2EEKEY", "BAD_KEY", "Algorithm or public key is invalid"),
+            };
             var value_buf: [e2ee_policy.max_device_value_len]u8 = undefined;
             const value = e2ee_policy.deviceValue(p[2], p[3], &value_buf) orelse
                 return self.failReply(conn, "E2EEKEY", "BAD_KEY", "Algorithm or public key is invalid");
-            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-            const ev = self.props.setProp(entity, key, value, .{ .id = account, .access = .member }) catch
-                return self.failReply(conn, "E2EEKEY", "STORE_FAILED", "Could not store E2EE device key");
-            if (self.account_services) |svc| svc.recordExternalKeyTransparencyEvent(
-                account,
-                .e2ee_device,
-                .bind,
-                p[1],
-                value,
-                self.keyTransparencyTimestampMs(),
-            );
-            self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
-            self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
+            const outcome = self.commitLocalDurableDeviceProp(conn, null, key, value, true);
+            if (outcome != .committed)
+                return self.durableDeviceFailureReply(conn, "E2EEKEY", outcome);
             var b: [128]u8 = undefined;
             const body = std.fmt.bufPrint(&b, "ADDED id={s} alg={s}", .{ p[1], p[2] }) catch return;
             return self.e2eeKeyReply(conn, body);
         }
 
         if (std.ascii.eqlIgnoreCase(sub, "DEL") or std.ascii.eqlIgnoreCase(sub, "DELETE")) {
-            const account = conn.session.account() orelse
+            _ = conn.session.account() orelse
                 return self.failReply(conn, "E2EEKEY", "NOT_LOGGED_IN", "Log in before deleting E2EE device keys");
             if (p.len < 2) return self.failReply(conn, "E2EEKEY", "NEED_MORE_PARAMS", "Usage: E2EEKEY DEL <device-id>");
             var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
             const key = e2ee_policy.devicePropKey(p[1], &key_buf) orelse
                 return self.failReply(conn, "E2EEKEY", "BAD_DEVICE", "Device id must use A-Z, a-z, 0-9, dot, dash, or underscore");
-            const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-            var removed_value_buf: [e2ee_policy.max_device_value_len]u8 = undefined;
-            const removed_value: ?[]const u8 = if (self.props.getProp(entity, key)) |prior| blk: {
-                if (prior.value.len > removed_value_buf.len) break :blk null;
-                @memcpy(removed_value_buf[0..prior.value.len], prior.value);
-                break :blk removed_value_buf[0..prior.value.len];
-            } else |_| null;
-            self.props.deleteProp(entity, key) catch {};
-            if (removed_value) |material| if (self.account_services) |svc|
-                svc.recordExternalKeyTransparencyEvent(
-                    account,
-                    .e2ee_device,
-                    .delete,
-                    p[1],
-                    material,
-                    self.keyTransparencyTimestampMs(),
-                );
-            self.propagateLocalEntityProp(false, entity.kind, entity.id, key, "", account);
-            self.notifyLocalPropChange(conn, entity, key, "");
+            const outcome = self.commitLocalDurableDeviceProp(conn, null, key, "", false);
+            if (outcome != .committed)
+                return self.durableDeviceFailureReply(conn, "E2EEKEY", outcome);
             var b: [96]u8 = undefined;
             const body = std.fmt.bufPrint(&b, "DELETED id={s}", .{p[1]}) catch return;
             return self.e2eeKeyReply(conn, body);
@@ -36694,16 +38197,9 @@ pub const LinuxServer = struct {
             const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
             const ev = self.props.setProp(entity, key, value, .{ .id = account, .access = .member }) catch
                 return self.failReply(conn, "IDENTITY", "STORE_FAILED", "Could not store portable identity key");
-            const identity_claim = account_identity.parseClaimValue(value) orelse unreachable;
-            if (self.account_services) |svc| svc.recordExternalKeyTransparencyEvent(
-                account,
-                .identity,
-                .bind,
-                p[1],
-                &identity_claim.public_key,
-                self.keyTransparencyTimestampMs(),
-            );
-            self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
+            const hlc = self.nextChannelPropHlc();
+            self.observeLocalUserCredentialProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, hlc);
+            self.propagateLocalEntityPropAt(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner, hlc);
             self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
             var b: [128]u8 = undefined;
             const body = std.fmt.bufPrint(&b, "ADDED label={s}", .{p[1]}) catch return;
@@ -36797,25 +38293,13 @@ pub const LinuxServer = struct {
             const key = account_identity.propKey(p[1], &key_buf) orelse
                 return self.failReply(conn, "IDENTITY", "BAD_LABEL", "Identity label must use A-Z, a-z, 0-9, dot, dash, or underscore");
             const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
-            const removed_public_key: ?[account_identity.public_key_len]u8 =
-                if (self.props.getProp(entity, key)) |prior|
-                    if (account_identity.parseClaimValue(prior.value)) |claim|
-                        claim.public_key
-                    else
-                        null
-                else |_|
-                    null;
+            const existed = if (self.props.getProp(entity, key)) |_| true else |_| false;
             self.props.deleteProp(entity, key) catch {};
-            if (removed_public_key) |material| if (self.account_services) |svc|
-                svc.recordExternalKeyTransparencyEvent(
-                    account,
-                    .identity,
-                    .delete,
-                    p[1],
-                    &material,
-                    self.keyTransparencyTimestampMs(),
-                );
-            self.propagateLocalEntityProp(false, entity.kind, entity.id, key, "", account);
+            const hlc = self.nextChannelPropHlc();
+            if (existed) {
+                self.observeLocalUserCredentialProp(false, entity.kind, entity.id, key, "", hlc);
+            }
+            self.propagateLocalEntityPropAt(false, entity.kind, entity.id, key, "", account, hlc);
             self.notifyLocalPropChange(conn, entity, key, "");
             var b: [96]u8 = undefined;
             const body = std.fmt.bufPrint(&b, "DELETED label={s}", .{p[1]}) catch return;
@@ -36852,10 +38336,15 @@ pub const LinuxServer = struct {
 
         if (std.ascii.eqlIgnoreCase(sub, "STATUS") or std.ascii.eqlIgnoreCase(sub, "ROOT")) {
             const status = svc.keyTransparencyStatus();
-            if (!status.enabled) return self.keyTransReply(conn, "STATUS disabled");
+            if (!status.enabled) return self.keyTransReply(conn, "STATUS disabled semantics=observational scope=node-local");
+            if (!status.available) return self.keyTransReply(conn, "STATUS unavailable semantics=observational scope=node-local");
             const root_hex = std.fmt.bytesToHex(status.root, .lower);
-            var b: [160]u8 = undefined;
-            const body = std.fmt.bufPrint(&b, "STATUS enabled entries={d} root={s}", .{ status.entries, &root_hex }) catch return;
+            var b: [220]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &b,
+                "STATUS enabled semantics=observational scope=node-local entries={d} root={s}",
+                .{ status.entries, &root_hex },
+            ) catch return;
             return self.keyTransReply(conn, body);
         }
 
@@ -36866,11 +38355,13 @@ pub const LinuxServer = struct {
             var proof = svc.keyTransparencyProof(self.allocator, position) catch |err| {
                 const code: []const u8 = switch (err) {
                     error.Disabled => "DISABLED",
+                    error.Unavailable => "TEMPORARILY_UNAVAILABLE",
                     error.IndexOutOfRange => "NO_SUCH_LEAF",
                     error.OutOfMemory => "INTERNAL_ERROR",
                 };
                 const reason: []const u8 = switch (err) {
                     error.Disabled => "Key transparency log is not enabled",
+                    error.Unavailable => "Key transparency log is unavailable",
                     error.IndexOutOfRange => "No key transparency leaf exists at that position",
                     error.OutOfMemory => "Could not allocate proof snapshot",
                 };
@@ -36910,7 +38401,127 @@ pub const LinuxServer = struct {
             return self.keyTransReply(conn, end);
         }
 
-        return self.failReply(conn, "KEYTRANS", "INVALID_SUBCOMMAND", "Usage: KEYTRANS [STATUS|ROOT|PROOF <position>]");
+        // EVENT/DEVICE are a public transparency surface: they reveal the
+        // canonical account, kind, action, key id, material hash, timestamp,
+        // and leaf. They never emit raw COSE keys, identity signatures, or
+        // passwords. Anyone who can walk positions can audit the log; that is
+        // the point, not a directory of live credentials.
+        if (std.ascii.eqlIgnoreCase(sub, "EVENT")) {
+            if (p.len < 2) return self.failReply(conn, "KEYTRANS", "NEED_MORE_PARAMS", "Usage: KEYTRANS EVENT <position>");
+            const position = std.fmt.parseInt(usize, p[1], 10) catch
+                return self.failReply(conn, "KEYTRANS", "BAD_POSITION", "Event position must be a decimal leaf index");
+            const snapshot = svc.keyTransparencyEvent(position) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.Disabled => "DISABLED",
+                    error.Unavailable => "TEMPORARILY_UNAVAILABLE",
+                    error.IndexOutOfRange => "NO_SUCH_LEAF",
+                };
+                const reason: []const u8 = switch (err) {
+                    error.Disabled => "Key transparency log is not enabled",
+                    error.Unavailable => "Key transparency log is unavailable",
+                    error.IndexOutOfRange => "No key transparency event exists at that position",
+                };
+                return self.failReply(conn, "KEYTRANS", code, reason);
+            };
+            const key_hash_hex = std.fmt.bytesToHex(snapshot.event.key_hash, .lower);
+            const leaf_hex = std.fmt.bytesToHex(snapshot.event.leaf, .lower);
+            var b: [default_reply_bytes]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &b,
+                "EVENT position={d} size={d} account={s} kind={s} action={s} key_id={s} key_hash={s} time={d} leaf={s}",
+                .{
+                    snapshot.position,
+                    snapshot.size,
+                    snapshot.event.account(),
+                    snapshot.event.kind.wireName(),
+                    snapshot.event.action.wireName(),
+                    snapshot.event.keyId(),
+                    &key_hash_hex,
+                    snapshot.event.timestamp_ms,
+                    &leaf_hex,
+                },
+            ) catch return;
+            return self.keyTransReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "DEVICE")) {
+            if (p.len < 3) return self.failReply(conn, "KEYTRANS", "NEED_MORE_PARAMS", "Usage: KEYTRANS DEVICE <account> <device-id>");
+            const snapshot = svc.keyTransparencyDevice(p[1], p[2]) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.Disabled => "DISABLED",
+                    error.Unavailable => "TEMPORARILY_UNAVAILABLE",
+                    error.InvalidName => "BAD_ACCOUNT",
+                    error.InvalidKeyId => "BAD_DEVICE",
+                    error.NotFound => "NO_SUCH_DEVICE",
+                };
+                const reason: []const u8 = switch (err) {
+                    error.Disabled => "Key transparency log is not enabled",
+                    error.Unavailable => "Key transparency log is unavailable",
+                    error.InvalidName => "Account must be a canonical services name",
+                    error.InvalidKeyId => "Device id contains unsupported bytes",
+                    error.NotFound => "No key transparency event exists for that account and device",
+                };
+                return self.failReply(conn, "KEYTRANS", code, reason);
+            };
+            const key_hash_hex = std.fmt.bytesToHex(snapshot.event.key_hash, .lower);
+            const leaf_hex = std.fmt.bytesToHex(snapshot.event.leaf, .lower);
+            var b: [default_reply_bytes]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &b,
+                "DEVICE account={s} id={s} observation={s} scope=node-local position={d} size={d} key_hash={s} time={d} leaf={s}",
+                .{
+                    snapshot.event.account(),
+                    snapshot.event.keyId(),
+                    snapshot.observation.wireName(),
+                    snapshot.position,
+                    snapshot.size,
+                    &key_hash_hex,
+                    snapshot.event.timestamp_ms,
+                    &leaf_hex,
+                },
+            ) catch return;
+            return self.keyTransReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "CONSISTENCY")) {
+            if (p.len < 2) return self.failReply(conn, "KEYTRANS", "NEED_MORE_PARAMS", "Usage: KEYTRANS CONSISTENCY <old-size>");
+            const old_size = std.fmt.parseInt(usize, p[1], 10) catch
+                return self.failReply(conn, "KEYTRANS", "BAD_SIZE", "Consistency size must be a decimal prefix length");
+            const cmp = svc.keyTransparencyConsistency(old_size) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.Disabled => "DISABLED",
+                    error.Unavailable => "TEMPORARILY_UNAVAILABLE",
+                    error.SizeAhead => "BAD_SIZE",
+                    error.UnknownCheckpoint => "UNKNOWN_CHECKPOINT",
+                    error.Corrupt => "CORRUPT",
+                    error.OutOfMemory => "INTERNAL_ERROR",
+                };
+                const reason: []const u8 = switch (err) {
+                    error.Disabled => "Observational key log is not enabled",
+                    error.Unavailable => "Observational key log is unavailable",
+                    error.SizeAhead => "Requested size is ahead of the current log",
+                    error.UnknownCheckpoint => "No durable checkpoint exists at that size",
+                    error.Corrupt => "Durable checkpoint is corrupt or does not match this log",
+                    error.OutOfMemory => "Could not compare checkpoint",
+                };
+                return self.failReply(conn, "KEYTRANS", code, reason);
+            };
+            const prefix: []const u8 = switch (cmp.prefix) {
+                .match => "match",
+                .mismatch => "mismatch",
+            };
+            const old_root_hex = std.fmt.bytesToHex(cmp.old_root, .lower);
+            const root_hex = std.fmt.bytesToHex(cmp.root, .lower);
+            var b: [360]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &b,
+                "CONSISTENCY old_size={d} old_root={s} size={d} root={s} prefix={s} scheme=checkpoint-comparison",
+                .{ cmp.old_size, &old_root_hex, cmp.size, &root_hex, prefix },
+            ) catch return;
+            return self.keyTransReply(conn, body);
+        }
+
+        return self.failReply(conn, "KEYTRANS", "INVALID_SUBCOMMAND", "Usage: KEYTRANS [STATUS|ROOT|PROOF <position>|EVENT <position>|DEVICE <account> <device-id>|CONSISTENCY <old-size>]");
     }
 
     // ── WEBAUTHN: passkey (FIDO2) registration + passwordless login ──────────
@@ -38298,6 +39909,44 @@ pub const LinuxServer = struct {
         return toHexLower(raw[0..n], out_hex);
     }
 
+    /// Mint an origin-signed, attachment-scoped SRM2 exact-restore claim. The
+    /// first rollout binds destination to the issuer: another trusted node may
+    /// verify and redirect to it, but may not restore a local same-token row.
+    fn meshExactReclaimClaim(
+        self: *LinuxServer,
+        account: []const u8,
+        token: sessions_mod.Token,
+        attachment_id: sessions_mod.AttachmentId,
+        out_hex: []u8,
+    ) ?[]const u8 {
+        const identity = self.config.node_identity orelse return null;
+        const io = self.config.crypto_io orelse return null;
+        const now_u64 = self.meshWallMs();
+        const now: i64 = @intCast(@min(now_u64, @as(u64, std.math.maxInt(i64))));
+        var nonce_bytes: [8]u8 = undefined;
+        io.random(&nonce_bytes);
+        const nonce = std.mem.readInt(u64, &nonce_bytes, .big);
+        if (nonce == 0) return null;
+        const wire = session_reclaim_attachment.encodeClaim(
+            self.allocator,
+            .{
+                .kind = .exact_restore,
+                .account = account,
+                .group_token = token,
+                .attachment_id = attachment_id,
+                .origin_node = identity.shortId(),
+                .destination_node = identity.shortId(),
+                .issued_at_ms = now,
+                .expires_at_ms = now + @as(i64, @intCast(mesh_reclaim_ttl_ms)),
+                .nonce = nonce,
+            },
+            &identity.sign_kp,
+        ) catch return null;
+        defer self.allocator.free(wire);
+        if (wire.len * 2 > out_hex.len) return null;
+        return toHexLower(wire, out_hex);
+    }
+
     /// Register a live session for the client's account (once; keeps the token
     /// stable). No-op if the client is not logged in. Called after account login.
     fn finalizeRemovedSessionAuthority(self: *LinuxServer, handle: sessions_mod.ResumeHandle) void {
@@ -38338,6 +39987,18 @@ pub const LinuxServer = struct {
             if (handle) |captured| self.finalizeRemovedSessionAuthority(captured);
         }
         return removed;
+    }
+
+    /// SESSION DROP's compare-and-remove boundary. The SessionStore verifies
+    /// token/client/signon/attachment while exclusively locked; nothing after a
+    /// LIST snapshot may retarget a recycled runtime client id.
+    fn removeTrackedSessionExact(self: *LinuxServer, account: []const u8, expected: sessions_mod.Session) bool {
+        const handle = self.sessions.removeExact(account, expected) orelse return false;
+        lockSpin(&self.attachment_delivery_mu);
+        _ = self.attachment_delivery_spool.discardAttachment(expected.client);
+        self.attachment_delivery_mu.unlock();
+        self.finalizeRemovedSessionAuthority(handle);
+        return true;
     }
 
     /// Remove every local authority row for an account without allocating. The
@@ -38384,16 +40045,42 @@ pub const LinuxServer = struct {
         const cid = monitorIdFromClient(id);
         if (self.sessions.containsClient(account, cid)) return true;
         const signon: i64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-        const outcome = self.sessions.attachReportingEviction(account, cid, self.genSessionToken(), signon) catch |err| {
+        const io = self.config.crypto_io orelse {
+            // Compatibility-only deployments still need LIST/fan-out tracking.
+            // The sentinel row has no bearer and no stable attachment id, so it
+            // cannot enter either exact resume path.
+            const legacy = self.sessions.attachReportingEviction(
+                account,
+                cid,
+                @splat(0),
+                signon,
+            ) catch |err| {
+                srvLog("onyx-server: compatibility session tracking failed for account '{s}': {s}\n", .{ account, @errorName(err) });
+                return false;
+            };
+            self.finalizeAttachEviction(legacy);
+            return true;
+        };
+        const token = self.genSessionToken();
+        if (tokenIsNull(token)) {
+            srvLog("onyx-server: session tracking failed for account '{s}': invalid generated token\n", .{account});
+            return false;
+        }
+        _ = self.sessions.mintBootstrapAttachmentNoEvict(
+            account,
+            cid,
+            token,
+            signon,
+            io,
+        ) catch |err| {
             // Surface, never swallow: at the per-account cap with every slot
-            // still attached there is nothing to evict, so this session goes
+            // occupied there is no safe row to evict, so this session goes
             // UNTRACKED (no reclaim token, no session-sync fan-out, absent from
-            // SESSION LIST). Log so the condition is observable; the eviction
-            // policy itself is a separate config/warden concern.
+            // SESSION LIST). An immediately following exact RESUME may still
+            // replace its selected detached row without destroying a sibling.
             srvLog("onyx-server: session tracking failed for account '{s}': {s}\n", .{ account, @errorName(err) });
             return false;
         };
-        self.finalizeAttachEviction(outcome);
         return true;
     }
 
@@ -38413,6 +40100,12 @@ pub const LinuxServer = struct {
     ) !bool {
         if (!conn.session.hasCap(.onyx_e2ee)) return true;
         if (self.attachmentHasReusableSession(id)) return true;
+        // At the account cap, initial no-evict tracking intentionally leaves a
+        // reconnecting socket untracked so its exact RESUME can replace the
+        // selected detached row. Honor only the existing bounded autojoin hold;
+        // expiry returns here and closes an E2EE socket that never proves it.
+        if (conn.resume_autojoin_deferred and conn.resume_autojoin_deadline_ms > self.nowMs())
+            return true;
         // No authenticated account ⇒ no reusable SessionStore attachment is
         // expected (guest / anonymous best-effort). Fail closed only for
         // account sockets that negotiated the durable-delivery promise without
@@ -38763,9 +40456,393 @@ pub const LinuxServer = struct {
         }
     }
 
+    fn bumpSessionListEpoch(self: *LinuxServer) void {
+        self.session_list_epoch +%= 1;
+        if (self.session_list_epoch == 0) self.session_list_epoch = 1;
+    }
+
+    const ListedSessionRevoke = enum {
+        removed,
+        self_target,
+        stale,
+        temporarily_unavailable,
+    };
+
+    const session_drop_timeout_ms: u64 = 5_000;
+
+    fn dropStoreSelector(row: sessions_mod.Session) sessions_mod.ExactSelector {
+        return .{
+            .client = row.client,
+            .token = row.token,
+            .signon_ms = row.signon_ms,
+            .attachment_id = row.attachment_id,
+        };
+    }
+
+    fn dropJournalSelector(row: sessions_mod.Session) session_drop_tx.ExactSelector {
+        return .{
+            .client = row.client,
+            .token = row.token,
+            .signon_ms = row.signon_ms,
+            .attachment_id = row.attachment_id,
+        };
+    }
+
+    fn dropJournalToStore(selector: session_drop_tx.ExactSelector) sessions_mod.ExactSelector {
+        return .{
+            .client = selector.client,
+            .token = selector.token,
+            .signon_ms = selector.signon_ms,
+            .attachment_id = selector.attachment_id,
+        };
+    }
+
+    fn hintSessionDropOwner(self: *LinuxServer, shard: u12, id: session_drop_tx.TxId) void {
+        if (shard == self.rx().shard_id) return;
+        const fabric = if (self.fabric) |*f| f else return;
+        const control = session_drop_tx.Control.init(id) orelse return;
+        // Full controls are counted by ReactorFabric but are not authoritative:
+        // every reactor timer scans the journal and recovers the same state.
+        if (!fabric.sendControlTo(shard, control)) {
+            const total = fabric.controlMissCount();
+            if (total == 1 or total % 1024 == 0) {
+                var buf: [144]u8 = undefined;
+                const line = std.fmt.bufPrint(
+                    &buf,
+                    "SESSION DROP control hint missed; journal sweep remains authoritative (total {d})",
+                    .{total},
+                ) catch "SESSION DROP control hint missed; journal sweep remains authoritative";
+                self.traceLog(.warn, .reactor, line);
+            }
+        }
+        self.wakeShard(shard);
+    }
+
+    fn finishSessionDropAbort(self: *LinuxServer, id: session_drop_tx.TxId, result: session_drop_tx.TerminalResult) void {
+        const before = self.session_drop_journal.get(id) orelse return;
+        switch (before.state) {
+            .committing => self.session_drop_journal.failCommitBeforeLinearization(id, result) catch {},
+            .target_pending, .successor_pending, .commit_pending => self.session_drop_journal.requestAbort(id, result) catch {},
+            else => {},
+        }
+        const entry = self.session_drop_journal.get(id) orelse return;
+        const reservation = session_drop_tx.reservationId(id);
+        if (entry.target_reserved) {
+            _ = self.sessions.cancelDropReservation(entry.accountName(), dropJournalToStore(entry.target), reservation);
+            _ = self.session_drop_journal.markReservationReleased(id, .target) catch {};
+        }
+        const after_target = self.session_drop_journal.get(id) orelse return;
+        if (after_target.successor_reserved) if (after_target.successor) |successor| {
+            _ = self.sessions.cancelDropReservation(after_target.accountName(), dropJournalToStore(successor), reservation);
+            _ = self.session_drop_journal.markReservationReleased(id, .successor) catch {};
+        };
+        const terminal = self.session_drop_journal.get(id) orelse return;
+        if (terminal.terminalResult() != null)
+            self.session_drop_journal.markResultConsumed(id) catch {};
+        _ = self.session_drop_journal.reapIfDone(id);
+    }
+
+    /// Timer/control recovery. Admission drives the transaction synchronously
+    /// while World is locked, but every pre-linearization phase is journaled so
+    /// a missed owner hint or vanished requester can still release reservations.
+    fn sweepSessionDropTransactions(self: *LinuxServer) void {
+        var ids_buf: [session_drop_tx.capacity]session_drop_tx.TxId = undefined;
+        const ids = self.session_drop_journal.activeIdsInto(&ids_buf);
+        const now = self.nowU64();
+        for (ids) |id| {
+            const entry = self.session_drop_journal.get(id) orelse continue;
+            if (entry.state.isPrecommit() and now >= entry.deadline_ms) {
+                _ = self.session_drop_journal.expire(id, now) catch {};
+            } else if (entry.state.isPrecommit() and self.connFor(entry.requester) == null) {
+                self.session_drop_journal.requestAbort(id, .requester_gone) catch {};
+            }
+            const current = self.session_drop_journal.get(id) orelse continue;
+            if (current.state == .abort_pending or current.state == .aborted)
+                self.finishSessionDropAbort(id, current.result orelse .cancelled);
+        }
+    }
+
+    /// A normal close/logout/rebind must never free ConnState while a token-group
+    /// reservation prevented its Store row from detaching. Cancel every
+    /// pre-linearization DROP that freezes this logical token, release its exact
+    /// reservations, then let the caller retry the owner mutation in the same
+    /// World-locked turn. A committing transaction cannot interleave here.
+    fn cancelSessionDropsForToken(self: *LinuxServer, account: []const u8, token: sessions_mod.Token) void {
+        var ids_buf: [session_drop_tx.capacity]session_drop_tx.TxId = undefined;
+        const ids = self.session_drop_journal.activeIdsInto(&ids_buf);
+        for (ids) |tx| {
+            const entry = self.session_drop_journal.get(tx) orelse continue;
+            if (!std.ascii.eqlIgnoreCase(entry.accountName(), account)) continue;
+            const target_matches = std.crypto.timing_safe.eql(sessions_mod.Token, entry.target.token, token);
+            const successor_matches = if (entry.successor) |successor|
+                std.crypto.timing_safe.eql(sessions_mod.Token, successor.token, token)
+            else
+                false;
+            if (!target_matches and !successor_matches) continue;
+            if (!entry.state.isPrecommit()) continue;
+            self.finishSessionDropAbort(tx, .cancelled);
+        }
+    }
+
+    fn revokeListedSessionRow(
+        self: *LinuxServer,
+        account: []const u8,
+        caller_id: client_model.ClientId,
+        target: sessions_mod.Session,
+        reply: session_drop_tx.ReplyKey,
+    ) ListedSessionRevoke {
+        const caller_cid = monitorIdFromClient(caller_id);
+        if (target.client == caller_cid) return .self_target;
+        if (target.attached)
+            return self.revokeAttachedSessionReserved(account, caller_id, target, reply);
+        return if (self.removeTrackedSessionExact(account, target)) .removed else .stale;
+    }
+
+    /// Reserved cross-reactor DROP. World serialization protects the journal,
+    /// connection generations, and prepared identity handoff; SessionStore's
+    /// exact token-group reservation freezes every row whose liveness could
+    /// change the successor decision. The Store CAS is the linearization point.
+    fn revokeAttachedSessionReserved(
+        self: *LinuxServer,
+        account: []const u8,
+        requester: client_model.ClientId,
+        expected: sessions_mod.Session,
+        reply: session_drop_tx.ReplyKey,
+    ) ListedSessionRevoke {
+        if (account.len > session_drop_tx.account_capacity) return .stale;
+        const target_id = clientIdFromMonitor(expected.client);
+        const target_conn = self.connFor(target_id) orelse
+            return if (target_id.shard == self.rx().shard_id) .stale else .temporarily_unavailable;
+        const target_account = target_conn.session.account() orelse return .stale;
+        if (!std.ascii.eqlIgnoreCase(target_account, account) or target_conn.closing)
+            return .stale;
+        const target_nick = target_conn.session.displayName();
+        const tx = self.session_drop_journal.begin(.{
+            .requester = requester,
+            .account = account,
+            .target = dropJournalSelector(expected),
+            .target_nick = target_nick,
+            .reply = reply,
+            .deadline_ms = self.nowU64() +| session_drop_timeout_ms,
+        }) catch return .temporarily_unavailable;
+        var completed = false;
+        defer if (!completed) self.finishSessionDropAbort(tx, .temporarily_unavailable);
+
+        self.hintSessionDropOwner(target_id.shard, tx);
+        const reservation = session_drop_tx.reservationId(tx);
+        switch (self.sessions.reserveDrop(account, dropStoreSelector(expected), reservation)) {
+            .reserved, .already_reserved => {},
+            .stale => return .stale,
+            .reserved_by_other, .invalid_id => return .temporarily_unavailable,
+        }
+        self.session_drop_journal.markTargetReserved(tx) catch return .temporarily_unavailable;
+
+        const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch
+            return .temporarily_unavailable;
+        defer self.allocator.free(rows);
+        var successor_row: ?sessions_mod.Session = null;
+        var first_eligible: ?sessions_mod.Session = null;
+        var unattested = false;
+        const from_wid = worldIdFromClient(target_id);
+        const nick_owner = self.world.findNick(target_nick);
+        for (rows) |row| {
+            if (!row.attached or row.client == expected.client) continue;
+            if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, expected.token)) continue;
+            const candidate_id = clientIdFromMonitor(row.client);
+            const candidate = self.connFor(candidate_id) orelse {
+                unattested = true;
+                continue;
+            };
+            const candidate_account = candidate.session.account() orelse {
+                unattested = true;
+                continue;
+            };
+            if (candidate.closing or candidate.s2s != null or candidate.s2s_secured != null or
+                !std.ascii.eqlIgnoreCase(candidate_account, account) or
+                !std.ascii.eqlIgnoreCase(candidate.session.displayName(), target_nick))
+            {
+                unattested = true;
+                continue;
+            }
+            if (first_eligible == null) first_eligible = row;
+            if (nick_owner) |owner| if (owner.eql(worldIdFromClient(candidate_id))) {
+                successor_row = row;
+                break;
+            };
+        }
+        if (successor_row == null) if (nick_owner) |owner| {
+            if (owner.eql(from_wid)) successor_row = first_eligible;
+        };
+        if (successor_row == null and (unattested or first_eligible != null))
+            return .temporarily_unavailable;
+
+        if (successor_row) |successor| {
+            self.session_drop_journal.setSuccessorPending(tx, dropJournalSelector(successor)) catch
+                return .temporarily_unavailable;
+            const successor_id = clientIdFromMonitor(successor.client);
+            self.hintSessionDropOwner(successor_id.shard, tx);
+            switch (self.sessions.reserveDrop(account, dropStoreSelector(successor), reservation)) {
+                .reserved, .already_reserved => {},
+                .stale => return .stale,
+                .reserved_by_other, .invalid_id => return .temporarily_unavailable,
+            }
+            self.session_drop_journal.markSuccessorReserved(tx) catch return .temporarily_unavailable;
+        } else {
+            self.session_drop_journal.markCommitPending(tx) catch return .temporarily_unavailable;
+        }
+
+        var restores: std.ArrayListUnmanaged(world_model.MemberRestore) = .empty;
+        defer restores.deinit(self.allocator);
+        var handoff: ?world_model.World.PreparedSessionRestore = null;
+        if (successor_row) |successor| {
+            const successor_id = clientIdFromMonitor(successor.client);
+            const to_wid = worldIdFromClient(successor_id);
+            var channels = self.world.channels.iterator();
+            while (channels.next()) |entry| {
+                const old_modes = self.world.memberModes(entry.key_ptr.*, from_wid);
+                const next_modes = self.world.memberModes(entry.key_ptr.*, to_wid);
+                if (old_modes == null and next_modes == null) continue;
+                restores.append(self.allocator, .{
+                    .channel = entry.key_ptr.*,
+                    .modes = .{ .bits = (if (old_modes) |m| m.bits else 0) | (if (next_modes) |m| m.bits else 0) },
+                }) catch return .temporarily_unavailable;
+            }
+            const exact = [_]world_model.ClientId{ from_wid, to_wid };
+            handoff = self.world.prepareSessionRestore(
+                target_nick,
+                to_wid,
+                &exact,
+                .{ .claim_exact = to_wid },
+                restores.items,
+            ) catch return .temporarily_unavailable;
+        }
+        defer if (handoff) |*prepared| prepared.abort();
+
+        self.session_drop_journal.beginCommit(tx) catch return .temporarily_unavailable;
+        const handle = self.sessions.commitDropReservation(account, dropStoreSelector(expected), reservation) orelse {
+            self.session_drop_journal.failCommitBeforeLinearization(tx, .stale_list) catch {};
+            return .stale;
+        };
+        _ = self.session_drop_journal.markReservationReleased(tx, .target) catch {};
+        if (handoff) |*prepared| {
+            prepared.commit();
+            handoff = null;
+            target_conn.session_handoff_complete = true;
+        }
+        target_conn.session_handoff_checked = true;
+
+        if (successor_row) |successor| {
+            _ = self.sessions.cancelDropReservation(account, dropStoreSelector(successor), reservation);
+            _ = self.session_drop_journal.markReservationReleased(tx, .successor) catch {};
+        }
+        lockSpin(&self.attachment_delivery_mu);
+        _ = self.attachment_delivery_spool.discardAttachment(expected.client);
+        self.attachment_delivery_mu.unlock();
+        self.finalizeRemovedSessionAuthority(handle);
+        const notice = ":onyx.local NOTICE * :SESSION: this session was revoked from another device\r\n";
+        self.enqueueDeliveryThenClose(target_id, notice, "session revoked") catch {};
+        // Nothing after the Store CAS may report failure: these journal
+        // transitions are allocation-free invariants of the already-committed
+        // path, and the client-visible result must follow the linearization.
+        self.session_drop_journal.markCommitted(tx) catch unreachable;
+        self.session_drop_journal.markResultConsumed(tx) catch unreachable;
+        _ = self.session_drop_journal.reapIfDone(tx);
+        completed = true;
+        return .removed;
+    }
+
+    fn handleSessionDrop(
+        self: *LinuxServer,
+        conn: *ConnState,
+        account: []const u8,
+        caller_cid: sessions_mod.ClientId,
+        raw: []const u8,
+    ) !void {
+        const target = session_sid.parseDropTarget(raw) catch {
+            try self.failReply(conn, "SESSION", "INVALID_INDEX", "DROP requires a session sid or a positive index from SESSION LIST");
+            return;
+        };
+        const account_sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch {
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the session list");
+            return;
+        };
+        defer self.allocator.free(account_sessions);
+
+        var buf: [default_reply_bytes]u8 = undefined;
+        switch (target) {
+            .ordinal => |idx| {
+                const cached = conn.session_list_cache.lookup(self.session_list_epoch, account, idx) catch {
+                    try self.failReply(conn, "SESSION", "STALE_LIST", "SESSION LIST snapshot is no longer valid; list again");
+                    return;
+                };
+                const current = session_sid.resolveCachedRow(account_sessions, cached) catch {
+                    try self.failReply(conn, "SESSION", "STALE_LIST", "SESSION LIST snapshot is no longer valid; list again");
+                    return;
+                };
+                switch (self.revokeListedSessionRow(account, clientIdFromMonitor(caller_cid), current, .{ .ordinal = idx })) {
+                    .removed => {},
+                    .self_target => {
+                        try self.failReply(conn, "SESSION", "CANNOT_DROP_CURRENT", "Cannot drop this connection; use LOGOUT or disconnect");
+                        return;
+                    },
+                    .stale => {
+                        try self.failReply(conn, "SESSION", "STALE_LIST", "Session changed; list again");
+                        return;
+                    },
+                    .temporarily_unavailable => {
+                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "Cross-reactor session revoke is temporarily unavailable");
+                        return;
+                    },
+                }
+                // Keep ordinal numbering stable but erase the successfully
+                // revoked row's token/AID immediately.
+                conn.session_list_cache.invalidate(idx);
+                const ok_line = std.fmt.bufPrint(&buf, "SESSION DROP #{d} ok", .{idx}) catch "SESSION DROP ok";
+                try self.noticeTo(conn, ok_line);
+            },
+            .sid => |sid| {
+                const matched = session_sid.matchSid(account_sessions, sid);
+                const row = switch (matched) {
+                    .none => {
+                        try self.failReply(conn, "SESSION", "NO_SUCH_SESSION", "No session matches that sid");
+                        return;
+                    },
+                    .ambiguous => {
+                        try self.failReply(conn, "SESSION", "AMBIGUOUS_SID", "Session sid is ambiguous; refuse to revoke");
+                        return;
+                    },
+                    .unique => |value| value,
+                };
+                const current = session_sid.resolveCachedRow(account_sessions, row) catch {
+                    try self.failReply(conn, "SESSION", "STALE_LIST", "Session changed; list again");
+                    return;
+                };
+                switch (self.revokeListedSessionRow(account, clientIdFromMonitor(caller_cid), current, .{ .sid = sid })) {
+                    .removed => {},
+                    .self_target => {
+                        try self.failReply(conn, "SESSION", "CANNOT_DROP_CURRENT", "Cannot drop this connection; use LOGOUT or disconnect");
+                        return;
+                    },
+                    .stale => {
+                        try self.failReply(conn, "SESSION", "STALE_LIST", "Session changed; list again");
+                        return;
+                    },
+                    .temporarily_unavailable => {
+                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "Cross-reactor session revoke is temporarily unavailable");
+                        return;
+                    },
+                }
+                conn.session_list_cache.invalidateExact(row);
+                const sid_hex = session_sid.formatSid(sid);
+                const ok_line = std.fmt.bufPrint(&buf, "SESSION DROP sid={s} ok", .{sid_hex}) catch "SESSION DROP ok";
+                try self.noticeTo(conn, ok_line);
+            },
+        }
+    }
+
     /// `SESSION [LIST|TOKEN|DROP]` — list the account's live sessions, reveal this
     /// session's reclaim token (to the owning session only), or revoke another
-    /// session by its LIST index (`SESSION DROP #<n>`).
+    /// session by sid or by the caller's last LIST ordinal (`SESSION DROP #<n>`).
     pub fn handleSession(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const account = conn.session.account() orelse {
             try self.noticeTo(conn, "SESSION: you are not logged in to an account");
@@ -38779,68 +40856,53 @@ pub const LinuxServer = struct {
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "DROP")) {
-            // SESSION DROP #<n> — revoke the n-th row from SESSION LIST (1-based).
-            // Never drops the caller's own current attachment (use LOGOUT for that).
+            // SESSION DROP <sid|#n> — sid revokes exactly one physical row;
+            // #n binds to the last LIST this connection emitted. Never drops the
+            // caller's own current attachment (use LOGOUT for that).
             if (parsed.param_count < 2) {
-                try self.failReply(conn, "SESSION", "NEED_MORE_PARAMS", "Usage: SESSION DROP #<n>");
+                try self.failReply(conn, "SESSION", "NEED_MORE_PARAMS", "Usage: SESSION DROP <sid|#n>");
                 return;
             }
-            const raw = parsed.paramSlice()[1];
-            const idx_txt = if (raw.len > 0 and raw[0] == '#') raw[1..] else raw;
-            const target_idx = std.fmt.parseInt(usize, idx_txt, 10) catch {
-                try self.failReply(conn, "SESSION", "INVALID_INDEX", "DROP requires a positive session index from SESSION LIST");
-                return;
-            };
-            if (target_idx == 0) {
-                try self.failReply(conn, "SESSION", "INVALID_INDEX", "DROP requires a positive session index from SESSION LIST");
-                return;
-            }
-            const account_sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch {
-                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the session list");
-                return;
-            };
-            defer self.allocator.free(account_sessions);
-            if (target_idx > account_sessions.len) {
-                try self.failReply(conn, "SESSION", "NO_SUCH_SESSION", "No session at that index");
-                return;
-            }
-            const target = account_sessions[target_idx - 1];
-            if (target.client == cid) {
-                try self.failReply(conn, "SESSION", "CANNOT_DROP_CURRENT", "Cannot drop this connection; use LOGOUT or disconnect");
-                return;
-            }
-            if (target.attached) {
-                const target_id = clientIdFromMonitor(target.client);
-                if (self.connFor(target_id)) |target_conn| {
-                    self.noticeTo(target_conn, "SESSION: this session was revoked from another device") catch {};
-                    self.closeConn(target_conn.token, "session revoked") catch {};
-                }
-            }
-            // Always retire the store row so detached ghosts cannot resume.
-            _ = self.removeTrackedSession(account, target.client);
-            const ok_line = std.fmt.bufPrint(&buf, "SESSION DROP #{d} ok", .{target_idx}) catch "SESSION DROP ok";
-            try self.noticeTo(conn, ok_line);
+            try self.handleSessionDrop(conn, account, cid, parsed.paramSlice()[1]);
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "TOKEN")) {
-            // Onyx sends RESUME then TOKEN in-order after 001. Reaching TOKEN with
-            // the deferral still set means no resume succeeded; release autojoin
-            // now instead of waiting for the timer.
-            self.finishDeferredSessionAutojoin(id, conn, false);
             if (conn.preserve_resume_credential_once) {
                 conn.preserve_resume_credential_once = false;
+                if (!conn.resume_autojoin_deferred) conn.resume_autojoin_deadline_ms = 0;
                 try self.warnReply(conn, "SESSION", "RESUME_CREDENTIAL_PRESERVED", "retryable resume did not consume the stored credential; repeat SESSION TOKEN to replace it");
                 return;
             }
+            // Onyx sends RESUME then TOKEN in-order after 001. Reaching TOKEN with
+            // the deferral still set means no resume succeeded; release autojoin
+            // now instead of waiting for the timer. A retryable RESUME failure is
+            // handled above and deliberately preserves both the credential and
+            // deferral, preventing a temporary nick from joining account rooms.
+            self.finishDeferredSessionAutojoin(id, conn, false);
             if (self.sessions.resumeHandleForClient(account, cid)) |handle| {
                 if (!tokenIsNull(handle.token)) {
-                    const hex = std.fmt.bytesToHex(handle.token, .lower);
-                    const line = std.fmt.bufPrint(&buf, "SESSION TOKEN {s}", .{hex}) catch return;
+                    const token_hex = std.fmt.bytesToHex(handle.token, .lower);
+                    const attachment_id = handle.attachment_id;
+                    const exact_issuance = self.config.session_resume_composite_issuance and
+                        attachment_id != null;
+                    const line = if (exact_issuance) blk: {
+                        const aid = attachment_id.?;
+                        const credential = session_resume_credential.encodeLocal(handle.token, aid) catch return;
+                        break :blk std.fmt.bufPrint(
+                            &buf,
+                            "SESSION TOKEN {s}",
+                            .{credential},
+                        ) catch return;
+                    } else std.fmt.bufPrint(&buf, "SESSION TOKEN {s}", .{token_hex}) catch return;
                     try self.noticeTo(conn, line);
                     // Also offer a mesh-sealed token usable to reclaim/redirect from
                     // ANY node in the mesh (only when a mesh shared key is set).
                     var mbuf: [1024]u8 = undefined;
-                    if (self.meshReclaimToken(account, &hex, &mbuf)) |mhex| {
+                    const mesh_authority = if (exact_issuance)
+                        self.meshExactReclaimClaim(account, handle.token, attachment_id.?, &mbuf)
+                    else
+                        self.meshReclaimToken(account, &token_hex, &mbuf);
+                    if (mesh_authority) |mhex| {
                         // Set the replication gate before emitting the credential: if
                         // the connection drops after the write is queued, detach must
                         // still ship the snapshot that this token can unlock.
@@ -38852,7 +40914,23 @@ pub const LinuxServer = struct {
                         _ = self.shipSessionMigration(id, conn, account, handle.token);
                         var lb: [1152]u8 = undefined;
                         const expires_unix = (self.meshWallMs() + mesh_reclaim_ttl_ms) / 1000;
-                        const mline = std.fmt.bufPrint(&lb, "SESSION MTOKEN {s} expires={d}", .{ mhex, expires_unix }) catch return;
+                        const mline = if (exact_issuance) blk: {
+                            var credential_buf: [1200]u8 = undefined;
+                            const credential = session_resume_credential.encodeMesh(
+                                &credential_buf,
+                                mhex,
+                                attachment_id.?,
+                            ) catch return;
+                            break :blk std.fmt.bufPrint(
+                                &lb,
+                                "SESSION MTOKEN {s} expires={d}",
+                                .{ credential, expires_unix },
+                            ) catch return;
+                        } else std.fmt.bufPrint(
+                            &lb,
+                            "SESSION MTOKEN {s} expires={d}",
+                            .{ mhex, expires_unix },
+                        ) catch return;
                         try self.noticeTo(conn, mline);
                     }
                     return;
@@ -38861,21 +40939,50 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "SESSION: no token for this session");
             return;
         }
-        // LIST (default): never reveal tokens here.
-        var idx: usize = 0;
+        // LIST (default): never reveal tokens here. Bind #n to this emission.
+        // LIST failure must invalidate the previous selector image before any
+        // allocation can fail; a caller cannot reuse stale ordinals after OOM.
+        conn.session_list_cache.reset();
         const account_sessions = self.sessions.copySessionsAlloc(self.allocator, account) catch {
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the session list");
             return;
         };
         defer self.allocator.free(account_sessions);
+        // Never let an old or precomputed image select a row that was not
+        // actually emitted. Any formatting/write/allocation failure leaves the
+        // cache empty and requires the client to LIST again.
+        var staged_cache = session_sid.ListCache{};
+        defer staged_cache.reset();
+        staged_cache.prepare(self.allocator, self.session_list_epoch, account, account_sessions.len) catch {
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not securely stage the complete session list");
+            return;
+        };
+        var emitted: usize = 0;
         for (account_sessions) |s| {
-            idx += 1;
             const current: []const u8 = if (s.client == cid) "*" else "-";
             const state: []const u8 = if (s.attached) "attached" else "detached";
-            const line = std.fmt.bufPrint(&buf, "SESSION LIST {s} #{d} signon={d} {s}", .{ current, idx, s.signon_ms, state }) catch continue;
+            const sid = session_sid.sidOf(s);
+            const next_idx = emitted + 1;
+            const line = if (sid) |id_bytes| blk: {
+                const sid_hex = session_sid.formatSid(id_bytes);
+                break :blk std.fmt.bufPrint(
+                    &buf,
+                    "SESSION LIST {s} #{d} signon={d} {s} sid={s}",
+                    .{ current, next_idx, s.signon_ms, state, sid_hex },
+                ) catch continue;
+            } else std.fmt.bufPrint(
+                &buf,
+                "SESSION LIST {s} #{d} signon={d} {s}",
+                .{ current, next_idx, s.signon_ms, state },
+            ) catch continue;
             try self.noticeTo(conn, line);
+            staged_cache.rows.appendAssumeCapacity(.{ .token = s.token, .client = s.client, .signon_ms = s.signon_ms, .attachment_id = s.attachment_id });
+            emitted += 1;
         }
         try self.noticeTo(conn, "SESSION: end of session list");
+        conn.session_list_cache.reset();
+        conn.session_list_cache = staged_cache;
+        staged_cache = .{};
     }
 
     /// `SESSION RESUME <token>` — attach this client to the caller's logical
@@ -38884,30 +40991,120 @@ pub const LinuxServer = struct {
     /// only a detached attachment exists we replace that ghost. Every successful
     /// attachment carries the same token so later reconnects can land on any live
     /// sibling instead of racing for one-shot ownership.
+    fn markSessionResumeRetryable(self: *LinuxServer, conn: *ConnState) void {
+        conn.preserve_resume_credential_once = true;
+        // A WARN means the exact credential is still authoritative and the
+        // client is expected to retry it. Preservation itself owns this bounded
+        // deadline even for a later manual RESUME with no autojoin hold; when a
+        // hold exists the same deadline also prevents seating a temporary
+        // account-room identity before the next attempt.
+        conn.resume_autojoin_deadline_ms = self.nowMs() + 2_000;
+    }
+
+    fn handleExactLocalResume(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        token: sessions_mod.Token,
+        attachment_id: sessions_mod.AttachmentId,
+        cross_server: bool,
+    ) !void {
+        const outcome = self.restoreExactAttachment(id, conn, account, token, attachment_id);
+        switch (outcome) {
+            .missing => {
+                try self.failReply(conn, "SESSION", "NO_ATTACHMENT", "No exact session attachment matches that credential");
+                return;
+            },
+            .busy => {
+                try self.failReply(conn, "SESSION", "ATTACHMENT_IN_USE", "Exact session attachment is already active");
+                return;
+            },
+            .retryable => {
+                self.markSessionResumeRetryable(conn);
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "exact session restore failed; credential remains valid");
+                return;
+            },
+            .already_attached => {
+                self.finishDeferredSessionAutojoin(id, conn, true);
+                try self.noticeTo(conn, "SESSION RESUME: already attached to this exact session");
+                return;
+            },
+            .restored, .reclaimed => {},
+        }
+
+        conn.preserve_resume_credential_once = false;
+        self.finishDeferredSessionAutojoin(id, conn, outcome == .restored);
+        if (self.refreshPortableSessionReplicas(id, conn, account, token))
+            self.flushDeferredSessionMeshAnnouncements(id, conn);
+        const action: []const u8 = if (outcome == .restored) "restored" else "reclaimed";
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &line_buf,
+            "SESSION RESUME: exact session {s}{s}",
+            .{ action, if (cross_server) " (cross-server)" else "" },
+        ) catch return;
+        try self.noticeTo(conn, line);
+        var event_buf: [default_reply_bytes]u8 = undefined;
+        const event = std.fmt.bufPrint(
+            &event_buf,
+            "SESSION exact-{s}{s} account={s}",
+            .{ action, if (cross_server) " cross-server" else "", account },
+        ) catch return;
+        self.publishOperEvent(.service, .notice, event) catch {};
+    }
+
     pub fn handleSessionResume(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, parsed: *const irc_line.LineView) !void {
+        // Preservation belongs to exactly one retryable attempt. Clear any prior
+        // WARN latch before parsing this attempt; only a retryable outcome below
+        // may arm it again. Terminal and already-attached results therefore can
+        // never leave SESSION TOKEN stuck behind a stale preservation warning.
+        conn.preserve_resume_credential_once = false;
+        if (!conn.resume_autojoin_deferred) conn.resume_autojoin_deadline_ms = 0;
         const cid = monitorIdFromClient(id);
         const params = parsed.paramSlice();
         if (params.len < 2 or params[1].len == 0) {
             try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
             return;
         }
-        // A token longer than the local 16-byte form is a mesh-sealed token:
-        // reclaim/redirect it across the mesh.
-        if (params[1].len != 2 * @sizeOf(sessions_mod.Token)) {
-            try self.handleMeshReclaim(id, conn, account, params[1]);
+        const raw_credential = params[1];
+        if (std.mem.startsWith(u8, raw_credential, session_resume_credential.local_prefix ++ ".") or
+            std.mem.startsWith(u8, raw_credential, session_resume_credential.mesh_prefix ++ "."))
+        {
+            const credential = session_resume_credential.decode(raw_credential) catch {
+                try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME credential is malformed or noncanonical");
+                return;
+            };
+            switch (credential) {
+                .local => |exact| {
+                    try self.handleExactLocalResume(
+                        id,
+                        conn,
+                        account,
+                        exact.group_token,
+                        exact.attachment_id,
+                        false,
+                    );
+                },
+                .mesh => |exact| try self.handleMeshExactReclaim(
+                    id,
+                    conn,
+                    account,
+                    exact.sealed_hex,
+                    exact.attachment_id,
+                ),
+            }
             return;
         }
-        var token: sessions_mod.Token = undefined;
-        _ = std.fmt.hexToBytes(&token, params[1]) catch {
-            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME token is not valid hex");
+        const token = sessionTokenFromHex(raw_credential) orelse {
+            if (raw_credential.len == 2 * @sizeOf(sessions_mod.Token)) {
+                try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
+                return;
+            }
+            // Unprefixed non-local credentials are the rolling SRM1 path.
+            try self.handleMeshReclaim(id, conn, account, raw_credential);
             return;
         };
-        if (tokenIsNull(token)) {
-            // The all-zero sentinel marks sessions tracked without a CSPRNG; it
-            // is never a credential, so it must never match a ghost.
-            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
-            return;
-        }
         if (self.sessions.clientHasToken(account, cid, token)) {
             self.finishDeferredSessionAutojoin(id, conn, true);
             try self.noticeTo(conn, "SESSION RESUME: already attached to this session");
@@ -38920,18 +41117,18 @@ pub const LinuxServer = struct {
         if (self.sessions.findAttachedTokenSessionInAccount(account, token, cid)) |source| {
             const source_id = clientIdFromMonitor(source.client);
             const source_conn = self.connFor(source_id) orelse {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live session attachment is converging; retry the same token");
                 return;
             };
             const snapshot = self.encodeMigrationSnapshot(source_id, source_conn) orelse {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the live session; retry the same token");
                 return;
             };
             defer self.allocator.free(snapshot);
             if (!self.restoreEncodedMigrationSnapshot(id, conn, account, token, snapshot, .join_existing)) {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live session attach failed; token remains valid");
                 return;
             }
@@ -38943,53 +41140,158 @@ pub const LinuxServer = struct {
             return;
         }
 
-        const matched = self.sessions.findDetachedTokenSessionInAccount(account, token) orelse {
+        _ = self.sessions.findDetachedTokenSessionInAccount(account, token) orelse {
             try self.failReply(conn, "SESSION", "NO_SESSION", "No session matches that token");
             return;
         };
         const snapshot = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, token) catch null;
         defer if (snapshot) |bytes| self.allocator.free(bytes);
-        // Restore FIRST, consume the ghost only AFTER a successful restore: a
-        // transient decode-stage failure (a corrupt/truncated snapshot rejected
-        // by Snapshot.decode BEFORE any conn mutation) must leave the detached
-        // ghost (and its snapshot) reclaimable, not irrecoverably discarded. A
-        // deterministic post-decode failure (e.g. nick re-registration) simply
-        // re-preserves the ghost until its TTL — no worse than the old
-        // unconditional discard, and self-heals once the conflict clears.
-        const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshot(id, conn, account, token, bytes, .join_existing) else false;
+        // Bare legacy tokens carry no stable physical selector. They may clone
+        // group state into this freshly minted attachment, but must never consume
+        // a detached sibling or transfer its attachment-specific spool.
+        const restored = if (snapshot) |bytes| self.restoreEncodedMigrationSnapshot(
+            id,
+            conn,
+            account,
+            token,
+            bytes,
+            .join_existing,
+        ) else false;
         if (snapshot != null and !restored) {
-            conn.preserve_resume_credential_once = true;
+            self.markSessionResumeRetryable(conn);
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
             return;
         }
-        // Bind BEFORE removing the ghost so joinTokenGroup can verify the local
-        // credential exists and inherit its portable-replication state. The old
-        // detached attachment is then replaced by this live one; the TOKEN itself
-        // remains reusable for additional clients.
         if (snapshot == null and !self.sessions.joinTokenGroup(account, cid, token)) {
-            conn.preserve_resume_credential_once = true;
+            self.markSessionResumeRetryable(conn);
             try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session registry changed during resume; retry the same token");
             return;
         }
         if (snapshot == null) self.bindDeferredSessionMeshAnnouncements(id, conn, token);
-        self.transferAttachmentDeliveries(matched.client, cid) catch {
-            conn.preserve_resume_credential_once = true;
-            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "pending delivery state conflicted during resume; token remains valid");
-            return;
-        };
-        _ = self.removeTrackedSession(account, matched.client);
         conn.preserve_resume_credential_once = false;
         self.finishDeferredSessionAutojoin(id, conn, true);
         if (self.refreshPortableSessionReplicas(id, conn, account, token))
             self.flushDeferredSessionMeshAnnouncements(id, conn);
         if (restored) {
-            try self.noticeTo(conn, "SESSION RESUME: session restored");
+            try self.noticeTo(conn, "SESSION RESUME: legacy session state cloned into a new attachment");
         } else {
-            try self.noticeTo(conn, "SESSION RESUME: session reclaimed");
+            try self.noticeTo(conn, "SESSION RESUME: legacy session attached as a new attachment");
         }
         var event_buf: [default_reply_bytes]u8 = undefined;
-        const event = std.fmt.bufPrint(&event_buf, "SESSION {s} account={s}", .{ if (restored) "restored" else "reclaimed", account }) catch return;
+        const event = std.fmt.bufPrint(&event_buf, "SESSION legacy-create-new account={s}", .{account}) catch return;
         self.publishOperEvent(.service, .notice, event) catch {};
+    }
+
+    const TrustedReclaimRoute = union(enum) {
+        local,
+        remote: struct {
+            name: [64]u8,
+            len: u8,
+
+            fn slice(self: *const @This()) []const u8 {
+                return self.name[0..self.len];
+            }
+        },
+    };
+
+    fn trustedReclaimRoute(
+        self: *LinuxServer,
+        origin_node: u64,
+        signer: session_reclaim_attachment.SignedClaim,
+    ) ?TrustedReclaimRoute {
+        const identity = self.config.node_identity orelse return null;
+        if (origin_node == identity.shortId()) {
+            if (!std.mem.eql(u8, &signer.signer, &identity.sign_kp.public_key)) return null;
+            return .local;
+        }
+        lockSpin(&self.mesh_peer_identity_mu);
+        defer self.mesh_peer_identity_mu.unlock();
+        const count = @min(
+            @as(usize, @intCast(self.net_peer_count.load(.acquire))),
+            self.mesh_peer_node_ids.len,
+        );
+        for (0..count) |i| {
+            if (self.mesh_peer_node_ids[i] != origin_node or
+                !self.mesh_peer_public_key_present[i] or
+                !std.mem.eql(u8, &self.mesh_peer_public_keys[i], &signer.signer)) continue;
+            const len = self.mesh_peer_name_lens[i];
+            if (len == 0) return null;
+            var remote: @FieldType(TrustedReclaimRoute, "remote") = .{
+                .name = @splat(0),
+                .len = len,
+            };
+            @memcpy(remote.name[0..len], self.mesh_peer_names[i][0..len]);
+            return .{ .remote = remote };
+        }
+        return null;
+    }
+
+    fn handleMeshExactReclaim(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        claim_hex: []const u8,
+        attachment_id: sessions_mod.AttachmentId,
+    ) !void {
+        if (claim_hex.len % 2 != 0 or
+            claim_hex.len / 2 < session_reclaim_attachment.min_claim_wire_len or
+            claim_hex.len / 2 > session_reclaim_attachment.max_claim_wire_len)
+        {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "malformed exact mesh credential");
+            return;
+        }
+        var raw: [session_reclaim_attachment.max_claim_wire_len]u8 = undefined;
+        const wire = std.fmt.hexToBytes(raw[0 .. claim_hex.len / 2], claim_hex) catch {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "exact mesh credential is not valid hex");
+            return;
+        };
+        const signed = session_reclaim_attachment.decodeClaim(wire) catch {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "malformed exact mesh claim");
+            return;
+        };
+        session_reclaim_attachment.verifyClaim(signed) catch {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "exact mesh claim failed verification");
+            return;
+        };
+        const claim = signed.claim;
+        const now: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+        session_reclaim_attachment.validateAt(claim, now, .{}) catch {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "exact mesh claim expired or is not yet valid");
+            return;
+        };
+        if (claim.kind != .exact_restore or
+            claim.origin_node != claim.destination_node or
+            !std.ascii.eqlIgnoreCase(claim.account, account) or
+            !claim.attachment_id.eql(attachment_id))
+        {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "exact mesh claim does not match this session");
+            return;
+        }
+        const route = self.trustedReclaimRoute(claim.origin_node, signed) orelse {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "exact mesh claim signer is not a trusted route");
+            return;
+        };
+        switch (route) {
+            .local => try self.handleExactLocalResume(
+                id,
+                conn,
+                account,
+                claim.group_token,
+                attachment_id,
+                true,
+            ),
+            .remote => |remote_route| {
+                self.markSessionResumeRetryable(conn);
+                var buf: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(
+                    &buf,
+                    "SESSION REDIRECT: exact session lives on {s}; reconnect there to reclaim",
+                    .{remote_route.slice()},
+                ) catch return;
+                try self.noticeTo(conn, line);
+            },
+        }
     }
 
     /// Cross-server reclaim: `SESSION RESUME <mesh-token>` where the token is a
@@ -39046,18 +41348,18 @@ pub const LinuxServer = struct {
         if (self.sessions.findAttachedTokenSessionInAccount(account, migrate_token, cid)) |source| {
             const source_id = clientIdFromMonitor(source.client);
             const source_conn = self.connFor(source_id) orelse {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "live mesh attachment is converging; retry the same token");
                 return;
             };
             const snapshot = self.encodeMigrationSnapshot(source_id, source_conn) orelse {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the live mesh session; retry the same token");
                 return;
             };
             defer self.allocator.free(snapshot);
             if (!self.restoreEncodedMigrationSnapshot(id, conn, account, migrate_token, snapshot, .join_existing)) {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session attach failed; token remains valid");
                 return;
             }
@@ -39092,15 +41394,7 @@ pub const LinuxServer = struct {
                 .join_existing
             else
                 .{ .adopt_verified = true };
-            if (self.restoreStagedMigration(id, conn, account, migrate_token, staged_bind)) {
-                if (ghost) |g| {
-                    self.transferAttachmentDeliveries(g, cid) catch {
-                        conn.preserve_resume_credential_once = true;
-                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "pending delivery state conflicted during mesh resume; token remains valid");
-                        return;
-                    };
-                    _ = self.removeTrackedSession(account, g);
-                }
+            if (self.restoreStagedMigration(id, conn, account, migrate_token, staged_bind, null)) {
                 conn.preserve_resume_credential_once = false;
                 _ = self.markPortableResumeIssuedForConn(id, conn, account);
                 self.finishDeferredSessionAutojoin(id, conn, true);
@@ -39114,10 +41408,10 @@ pub const LinuxServer = struct {
             // Restore failed mid-way: fall through to the legacy decision so the
             // client still gets a coherent (redirect/deny) answer.
         }
-        var peer_names: [32][]const u8 = undefined;
-        const peer_count = self.readPeerNames(&peer_names);
+        const peer_names = self.readPeerNames();
         var origin_reachable = origin_is_self;
-        for (peer_names[0..peer_count]) |name| {
+        for (0..peer_names.count) |i| {
+            const name = peer_names.name(i);
             if (std.ascii.eqlIgnoreCase(name, fields.origin_node)) {
                 origin_reachable = true;
                 break;
@@ -39125,10 +41419,9 @@ pub const LinuxServer = struct {
         }
         switch (session_reclaim_mesh.decide(fields, ghost != null, origin_is_self, origin_reachable, false, now)) {
             .grant_local => {
-                // This node owns the detached session. Prefer the local detached
-                // snapshot first: the client may have followed a redirect back to
-                // the origin, and should get the same full-state restore as the
-                // ordinary local SESSION RESUME path.
+                // Legacy SRM1 has only group authority. Clone its state into the
+                // claimant's fresh attachment; never consume a detached sibling
+                // or transfer attachment-specific durable delivery ownership.
                 const local_snapshot = self.sessions.copyDetachedSnapshotInAccount(self.allocator, account, migrate_token) catch null;
                 defer if (local_snapshot) |bytes| self.allocator.free(bytes);
                 const restored = if (local_snapshot) |bytes| self.restoreEncodedMigrationSnapshot(
@@ -39141,23 +41434,18 @@ pub const LinuxServer = struct {
                 ) else false;
 
                 if (local_snapshot != null and !restored) {
-                    conn.preserve_resume_credential_once = true;
+                    self.markSessionResumeRetryable(conn);
                     try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session restore failed; token remains valid");
                     return;
                 }
 
                 if (ghost) |g| {
+                    _ = g;
                     if (local_snapshot == null and !self.sessions.joinTokenGroup(account, cid, migrate_token)) {
-                        conn.preserve_resume_credential_once = true;
+                        self.markSessionResumeRetryable(conn);
                         try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "mesh session registry changed during resume; retry the same token");
                         return;
                     }
-                    self.transferAttachmentDeliveries(g, cid) catch {
-                        conn.preserve_resume_credential_once = true;
-                        try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "pending delivery state conflicted during mesh reclaim; token remains valid");
-                        return;
-                    };
-                    _ = self.removeTrackedSession(account, g);
                 } else unreachable;
                 if (local_snapshot == null) self.bindDeferredSessionMeshAnnouncements(id, conn, migrate_token);
                 conn.preserve_resume_credential_once = false;
@@ -39178,7 +41466,7 @@ pub const LinuxServer = struct {
                 // owning node ships the migration capsule from its own grant_local
                 // path (above) when it consumes the ghost, so the peer the client
                 // lands on already has the staged capsule to restore from.
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 const line = std.fmt.bufPrint(&buf, "SESSION REDIRECT: session lives on {s}; reconnect there to reclaim", .{node}) catch return;
                 try self.noticeTo(conn, line);
             },
@@ -39186,7 +41474,7 @@ pub const LinuxServer = struct {
             .deny_replay => unreachable, // reusable credentials are never probed as consumed
             .deny_unknown => try self.failReply(conn, "SESSION", "NO_SESSION", "no matching session on origin node"),
             .deny_unreachable => {
-                conn.preserve_resume_credential_once = true;
+                self.markSessionResumeRetryable(conn);
                 try self.warnReply(conn, "SESSION", "ORIGIN_UNREACHABLE", "origin is disconnected; retry this resume credential when the mesh converges");
             },
         }
@@ -41245,6 +43533,7 @@ pub const LinuxServer = struct {
         account: []const u8,
         session_token: session_migrate.Token,
         bind_kind: sessions_mod.TokenBindKind,
+        attachment_transfer: ?RestoreAttachmentTransfer,
     ) bool {
         const pm = if (self.pending_migrations) |*p| p else return false;
         const entry = pm.getLive(
@@ -41256,7 +43545,22 @@ pub const LinuxServer = struct {
         var snap = migration_relay.Snapshot.decode(self.allocator, entry.snapshot) catch return false;
         defer snap.deinit(self.allocator);
 
-        return self.restoreAndBindMigrationSnapshot(id, conn, account, session_token, bind_kind, &snap);
+        if (attachment_transfer == null)
+            return self.restoreAndBindMigrationSnapshot(id, conn, account, session_token, bind_kind, &snap);
+        if (!self.migrationRestorePreflight(id, conn, account, &snap)) return false;
+
+        const cid = monitorIdFromClient(id);
+        var token_ticket = self.sessions.prepareTokenBind(account, cid, session_token, bind_kind) orelse return false;
+        defer token_ticket.deinit();
+        return self.restoreAndBindMigrationSnapshotWithTicket(
+            id,
+            conn,
+            account,
+            session_token,
+            &snap,
+            &token_ticket,
+            attachment_transfer,
+        );
     }
 
     fn restoreEncodedMigrationSnapshot(
@@ -41271,6 +43575,146 @@ pub const LinuxServer = struct {
         var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return false;
         defer snap.deinit(self.allocator);
         return self.restoreAndBindMigrationSnapshot(id, conn, account, session_token, bind_kind, &snap);
+    }
+
+    const ExactAttachmentResumeOutcome = enum {
+        already_attached,
+        restored,
+        reclaimed,
+        missing,
+        busy,
+        retryable,
+    };
+
+    /// Replace only the detached physical attachment selected by the composite
+    /// credential. The retained exact ticket freezes token/id ownership while
+    /// the common World/output restore planner and durable delivery remap are
+    /// prepared; no sibling selection or token-only fallback is permitted.
+    fn restoreExactAttachment(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        session_token: sessions_mod.Token,
+        attachment_id: sessions_mod.AttachmentId,
+    ) ExactAttachmentResumeOutcome {
+        const cid = monitorIdFromClient(id);
+        if (self.sessions.clientHasAttachment(account, cid, session_token, attachment_id))
+            return .already_attached;
+        const target = self.sessions.findAttachmentSessionInAccount(
+            account,
+            session_token,
+            attachment_id,
+        ) orelse return .missing;
+        if (target.attached) return .busy;
+
+        var ticket = self.sessions.prepareExactAttachmentRebind(
+            account,
+            cid,
+            session_token,
+            attachment_id,
+        ) orelse return .retryable;
+        defer ticket.deinit();
+        const remap = ticket.remap();
+        var delivery_ticket = self.prepareResumeAttachmentTransfer(
+            remap.old_client,
+            remap.new_client,
+        ) catch return .retryable;
+        defer delivery_ticket.deinit();
+        if (ticket.snapshot()) |bytes| {
+            var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return .retryable;
+            defer snap.deinit(self.allocator);
+            if (!self.migrationRestorePreflight(id, conn, account, &snap)) return .retryable;
+            if (!self.restoreAndBindMigrationSnapshotWithTicket(
+                id,
+                conn,
+                account,
+                session_token,
+                &snap,
+                &ticket,
+                .{ .prepared_exact = &delivery_ticket },
+            )) return .retryable;
+            return .restored;
+        }
+
+        if (!ticket.commit()) {
+            ticket.abort();
+            return .retryable;
+        }
+        delivery_ticket.commit();
+        // SessionStore remains exclusively retained by `ticket`; release ADS1
+        // before finish or any helper can reacquire SessionStore. This preserves
+        // the global SessionStore -> attachment_delivery_mu lock order.
+        delivery_ticket.release();
+        ticket.finish();
+        self.bindDeferredSessionMeshAnnouncements(id, conn, session_token);
+        return .reclaimed;
+    }
+
+    /// Restore one detached physical attachment and move its retained delivery
+    /// ownership inside the same prepared SessionStore/World transaction. A
+    /// conflicting event-id rendering therefore aborts before the claimant's
+    /// token, identity, membership, or output becomes visible.
+    fn restoreEncodedMigrationSnapshotReplacingAttachment(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        session_token: sessions_mod.Token,
+        bytes: []const u8,
+        bind_kind: sessions_mod.TokenBindKind,
+        old_client: sessions_mod.ClientId,
+    ) bool {
+        var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return false;
+        defer snap.deinit(self.allocator);
+        if (!self.migrationRestorePreflight(id, conn, account, &snap)) return false;
+
+        const new_client = monitorIdFromClient(id);
+        var token_ticket = self.sessions.prepareTokenBind(
+            account,
+            new_client,
+            session_token,
+            bind_kind,
+        ) orelse return false;
+        defer token_ticket.deinit();
+        return self.restoreAndBindMigrationSnapshotWithTicket(
+            id,
+            conn,
+            account,
+            session_token,
+            &snap,
+            &token_ticket,
+            .{ .legacy = .{ .old_client = old_client, .new_client = new_client } },
+        );
+    }
+
+    /// Join an existing reusable-token group while replacing one detached
+    /// attachment's durable delivery ownership. The retained SessionStore
+    /// ticket prevents registry drift between spool conflict preflight and the
+    /// allocation-free token commit, including the degraded no-snapshot path.
+    fn bindTokenReplacingAttachment(
+        self: *LinuxServer,
+        account: []const u8,
+        new_client: sessions_mod.ClientId,
+        session_token: sessions_mod.Token,
+        bind_kind: sessions_mod.TokenBindKind,
+        old_client: sessions_mod.ClientId,
+    ) bool {
+        var token_ticket = self.sessions.prepareTokenBind(
+            account,
+            new_client,
+            session_token,
+            bind_kind,
+        ) orelse return false;
+        defer token_ticket.deinit();
+
+        self.transferAttachmentDeliveries(old_client, new_client) catch return false;
+        if (!token_ticket.commit()) {
+            token_ticket.abort();
+            return false;
+        }
+        token_ticket.finish();
+        return true;
     }
 
     fn restoreBootstrapLiveMigrationSnapshot(
@@ -41336,7 +43780,10 @@ pub const LinuxServer = struct {
             session_token,
             &snap,
             &ticket,
-            .{ .old_client = source.client, .new_client = monitorIdFromClient(id) },
+            .{ .legacy = .{
+                .old_client = source.client,
+                .new_client = monitorIdFromClient(id),
+            } },
         );
     }
 
@@ -41719,9 +44166,12 @@ pub const LinuxServer = struct {
         );
     }
 
-    const RestoreAttachmentTransfer = struct {
-        old_client: sessions_mod.ClientId,
-        new_client: sessions_mod.ClientId,
+    const RestoreAttachmentTransfer = union(enum) {
+        legacy: struct {
+            old_client: sessions_mod.ClientId,
+            new_client: sessions_mod.ClientId,
+        },
+        prepared_exact: *PreparedResumeAttachmentTransfer,
     };
 
     /// Complete a restore with either an ordinary token-bind ticket or the
@@ -41900,7 +44350,18 @@ pub const LinuxServer = struct {
         const nonce_len = @min(conn.session.sasl_server_nonce.len, nonce_buf.len);
         @memcpy(nonce_buf[0..nonce_len], conn.session.sasl_server_nonce[0..nonce_len]);
         var desired_session = conn.session;
-        const profile = prepareMigratedSessionProfile(&desired_session, account, snap, conn.is_tls);
+        const configured_binding = if (self.oper_registry) |*registry|
+            oper_session_provenance.configuredLocalBinding(registry, account)
+        else
+            null;
+        const profile = prepareMigratedSessionProfile(
+            &desired_session,
+            account,
+            snap,
+            conn.is_tls,
+            configured_binding,
+            self.grantNowU64(),
+        );
 
         var old_nick_buf: [64]u8 = undefined;
         const old_nick_src = conn.session.displayName();
@@ -42082,10 +44543,20 @@ pub const LinuxServer = struct {
         // profile, and output plan has succeeded. The spool transfer performs
         // conflict preflight before its allocation-free commit; after it
         // succeeds, both retained tickets have no-fail commits remaining.
-        if (attachment_transfer) |transfer|
-            self.transferAttachmentDeliveries(transfer.old_client, transfer.new_client) catch return false;
+        if (attachment_transfer) |transfer| switch (transfer) {
+            .legacy => |legacy| self.transferAttachmentDeliveries(
+                legacy.old_client,
+                legacy.new_client,
+            ) catch return false,
+            .prepared_exact => {},
+        };
         var bootstrap_eviction: ?sessions_mod.EvictedSession = null;
         if (@TypeOf(token_ticket.*) == sessions_mod.PreparedTokenBind) {
+            if (!token_ticket.commit()) {
+                token_ticket.abort();
+                return false;
+            }
+        } else if (@TypeOf(token_ticket.*) == sessions_mod.PreparedAttachmentRebind) {
             if (!token_ticket.commit()) {
                 token_ticket.abort();
                 return false;
@@ -42097,6 +44568,16 @@ pub const LinuxServer = struct {
             @compileError("unsupported session restore ticket type");
         }
         world_ticket.commit();
+        if (attachment_transfer) |transfer| switch (transfer) {
+            .legacy => {},
+            .prepared_exact => |prepared| {
+                prepared.commit();
+                // Do not carry ADS1 into token_ticket.finish() or any later
+                // SessionStore helper: teardown takes these locks in the
+                // opposite temporal phase under the documented global order.
+                prepared.release();
+            },
+        };
         conn.session = desired_session;
         if (!conn.session_mesh_announce_pending) {
             conn.session_mesh_announce_pending = true;
@@ -42235,6 +44716,8 @@ pub const LinuxServer = struct {
         authenticated_account: []const u8,
         snap: *const migration_relay.Snapshot,
         transport_secure: bool,
+        configured_binding: ?oper_session_provenance.ConfiguredLocalBinding,
+        authority_now_ms: u64,
     ) MigratedProfileResult {
         // restore() overwrites inline storage, so copy every live slice needed for
         // re-derivation before entering it. Negotiated caps live outside the fields
@@ -42247,18 +44730,8 @@ pub const LinuxServer = struct {
         const account_len = @min(authenticated_account.len, account_buf.len);
         @memcpy(account_buf[0..account_len], authenticated_account[0..account_len]);
 
-        const live_was_oper = session.isOper();
-        const live_priv_bits = session.oper_priv.toBits();
         const live_had_override = session.hasUmode(.override);
         const live_media_tx_denied = session.hasUmode(.media_tx_deny);
-        var live_class_buf: [64]u8 = undefined;
-        const live_class_src = session.operClass();
-        const live_class_len = @min(live_class_src.len, live_class_buf.len);
-        @memcpy(live_class_buf[0..live_class_len], live_class_src[0..live_class_len]);
-        var live_title_buf: [64]u8 = undefined;
-        const live_title_src = session.operTitle();
-        const live_title_len = @min(live_title_src.len, live_title_buf.len);
-        @memcpy(live_title_buf[0..live_title_len], live_title_src[0..live_title_len]);
 
         // The HMAC-authenticated caller account is canonical even for rolling-old
         // snapshots that omitted their account field. The current socket's real
@@ -42276,21 +44749,16 @@ pub const LinuxServer = struct {
             // A carried oper bit is profile history, not current authority. RESUME
             // runs after local authentication/elevation, so only the claimant's
             // verified live grant may retain +o or derive +a/+j.
-            .is_oper = live_was_oper,
+            .is_oper = false,
         });
 
-        // Privilege non-downgrade: SASL elevation precedes RESUME. Preserve that
-        // complete current grant. Preserve an already-authorized +j until the
-        // carried directional mode string explicitly removes it.
-        if (live_was_oper) {
-            session.setOperGrant(
-                oper_mod.OperPrivileges.fromBits(live_priv_bits),
-                live_class_buf[0..live_class_len],
-                live_title_buf[0..live_title_len],
-            );
-            if (live_had_override and session.hasPriv(.oper_override)) {
-                _ = session.setUmode(.override, true);
-            }
+        // A carried oper bit and the predecessor's in-memory projection are
+        // profile history, never authority. Recompute from the live sealed
+        // configured binding after restore; OCG2 remains explicitly disabled
+        // until the transactional activation step is accepted.
+        _ = session.reconcileOperAuthority(configured_binding, .disabled, authority_now_ms);
+        if (live_had_override and session.hasPriv(.oper_override)) {
+            _ = session.setUmode(.override, true);
         }
 
         return applyMigratedUmodesToSession(
@@ -44351,7 +46819,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
         }
-        // Report the live grant stored on the session (captured at elevation).
+        // Report the reconciled projection stored on the session.
         var buf: [default_reply_bytes]u8 = undefined;
         var n: usize = 0;
         var it = conn.session.oper_priv.set.iterator();
@@ -45655,6 +48123,19 @@ pub const LinuxServer = struct {
         self.publishOperEventSubject(.policy, .notice, msg, channel) catch {};
     }
 
+    fn ocg2RehashHasRestartOnlyIntent(
+        runtime_present: bool,
+        config: config_format.Config.OperOcg2,
+    ) bool {
+        return runtime_present or config.enabled or config.projection_enabled or
+            config.minting_enabled or config.authority_node_id != 0 or
+            config.authority_public_key != null;
+    }
+
+    fn ocg2RehashHasUnsupportedRuntimeMode(config: config_format.Config.OperOcg2) bool {
+        return config.projection_enabled or config.minting_enabled;
+    }
+
     /// REHASH — oper-only configuration reload. Re-reads and re-parses the
     /// configured file and swaps in a freshly-built oper registry (account→class
     /// bindings). Existing sessions keep their current oper state; new SASL logins
@@ -45680,6 +48161,11 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "REHASH: config parse error; keeping current config");
             return;
         };
+        if (ocg2RehashHasUnsupportedRuntimeMode(parsed.oper_ocg2)) {
+            parsed.deinit(self.allocator);
+            try self.noticeTo(conn, "REHASH: OCG2 project/mint mode is unsupported by this release; keeping current config");
+            return;
+        }
         // Build the new oper bindings (strings borrow `parsed`, kept alive below).
         const bindings = buildOperBindingsFromConfig(self.allocator, parsed) catch {
             parsed.deinit(self.allocator);
@@ -45725,6 +48211,14 @@ pub const LinuxServer = struct {
         // tickets issued before this REHASH still resume for one more window) and
         // a fresh current key is generated. No-op when resumption is off.
         if (self.config.tls_enable_resumption) self.rotateTicketKey();
+
+        // OCG2 owns a process-lifetime durable State + observer and cannot be
+        // rebuilt transactionally by this partial live reload. Be explicit
+        // whenever either the running process or the newly parsed file carries
+        // OCG2 intent; accepting the rest of REHASH must never imply that its
+        // authority tuple or activation stage changed live.
+        if (ocg2RehashHasRestartOnlyIntent(self.ocg2_runtime != null, self.reload_parsed.?.oper_ocg2))
+            try self.noticeTo(conn, "REHASH: [oper.ocg2] settings are restart-only and were not applied");
 
         var note_buf: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(
@@ -46432,37 +48926,82 @@ pub const LinuxServer = struct {
     /// consistent (count, names) pair.
     fn publishPeerCount(self: *LinuxServer) void {
         var seen: [32][]const u8 = undefined;
+        var seen_node_ids: [32]u64 = @splat(0);
+        var seen_public_keys: [32][crypto_sign.public_key_len]u8 =
+            @splat(@as([crypto_sign.public_key_len]u8, @splat(0)));
+        var seen_public_key_present: [32]bool = @splat(false);
         var n: usize = 0;
         var it = self.rx().clients.iterator();
         outer: while (it.next()) |entry| {
+            // A collision loser remains established until its final close, but
+            // it is no longer a route. Excluding it lets the winner replace the
+            // authenticated node/key atomically at collision commitment.
+            if (entry.value.closing or entry.value.s2s_dedup) continue;
             const name = establishedPeerName(entry.value) orelse continue;
             for (seen[0..n]) |s| {
                 if (std.mem.eql(u8, s, name)) continue :outer;
             }
             if (n < seen.len) {
                 seen[n] = name;
+                if (entry.value.s2s_secured) |link| {
+                    if (link.remoteNodeId()) |node_id| seen_node_ids[n] = node_id;
+                    if (link.peerNodeKey()) |key| {
+                        seen_public_keys[n] = key;
+                        seen_public_key_present[n] = true;
+                    }
+                }
                 n += 1;
             }
         }
+        lockSpin(&self.mesh_peer_identity_mu);
+        defer self.mesh_peer_identity_mu.unlock();
         for (seen[0..n], 0..) |nm, i| {
             const len = @min(nm.len, self.mesh_peer_names[i].len);
             @memcpy(self.mesh_peer_names[i][0..len], nm[0..len]);
             self.mesh_peer_name_lens[i] = @intCast(len);
+            self.mesh_peer_node_ids[i] = seen_node_ids[i];
+            self.mesh_peer_public_keys[i] = seen_public_keys[i];
+            self.mesh_peer_public_key_present[i] = seen_public_key_present[i];
+        }
+        for (n..self.mesh_peer_names.len) |i| {
+            self.mesh_peer_name_lens[i] = 0;
+            self.mesh_peer_node_ids[i] = 0;
+            self.mesh_peer_public_keys[i] = @splat(0);
+            self.mesh_peer_public_key_present[i] = false;
         }
         const count: u32 = @intCast(n);
         protocol_inventory.setMeshPeerCount(count);
         self.net_peer_count.store(count, .release);
     }
 
-    /// Copy the published peer names into `out` (cross-shard safe). Returns the
-    /// count written, capped at `out.len` and the snapshot capacity.
-    fn readPeerNames(self: *LinuxServer, out: [][]const u8) usize {
-        const n = @min(@as(usize, @intCast(self.net_peer_count.load(.acquire))), @min(out.len, self.mesh_peer_names.len));
-        for (0..n) |i| {
-            const len = self.mesh_peer_name_lens[i];
-            out[i] = self.mesh_peer_names[i][0..len];
+    const PeerNameSnapshot = struct {
+        names: [32][64]u8 = @splat(@as([64]u8, @splat(0))),
+        lens: [32]u8 = @splat(0),
+        count: usize = 0,
+
+        fn name(self: *const PeerNameSnapshot, index: usize) []const u8 {
+            return self.names[index][0..self.lens[index]];
         }
-        return n;
+    };
+
+    /// Return a caller-owned, internally consistent copy of the published peer
+    /// names. The old API returned slices borrowed from mutable shared storage;
+    /// a same-count route replacement could rewrite those bytes after unlock
+    /// while MAP/SRM1 was still reading them on another shard.
+    fn readPeerNames(self: *LinuxServer) PeerNameSnapshot {
+        var snapshot = PeerNameSnapshot{};
+        lockSpin(&self.mesh_peer_identity_mu);
+        defer self.mesh_peer_identity_mu.unlock();
+        snapshot.count = @min(
+            @as(usize, @intCast(self.net_peer_count.load(.acquire))),
+            snapshot.names.len,
+        );
+        for (0..snapshot.count) |i| {
+            const len = @min(@as(usize, self.mesh_peer_name_lens[i]), snapshot.names[i].len);
+            @memcpy(snapshot.names[i][0..len], self.mesh_peer_names[i][0..len]);
+            snapshot.lens[i] = @intCast(len);
+        }
+        return snapshot;
     }
 
     /// MAP — network topology: this server with each established S2S peer (both
@@ -46477,9 +49016,9 @@ pub const LinuxServer = struct {
         // Peer names come from the reactor-0-published snapshot, not this shard's
         // own connection set — otherwise MAP run on a non-zero shard (the peer
         // links live only on reactor 0) would list no peers.
-        var names: [32][]const u8 = undefined;
-        const np = self.readPeerNames(&names);
-        for (names[0..np]) |rname| {
+        const names = self.readPeerNames();
+        for (0..names.count) |i| {
+            const rname = names.name(i);
             var pbuf: [160]u8 = undefined;
             const pdetail = std.fmt.bufPrint(&pbuf, "  `- {s}", .{rname}) catch continue;
             try queueNumeric(conn, .RPL_MAP, &.{}, pdetail);
@@ -47877,22 +50416,6 @@ pub const LinuxServer = struct {
             self.spamtrapCheck(conn.session.displayName(), .nick, target, conn.session.isOper());
         }
 
-        var prefix_buf: [256]u8 = undefined;
-        var msg_buf: [default_reply_bytes]u8 = undefined;
-        const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), command, &.{target}, text);
-
-        // Allocate one event identity before any local/mesh fan-out. The same
-        // authenticated `(origin,hlc)` deterministically yields msgid + time on
-        // every node, so all attachments can reference and order one event.
-        const event_hlc = self.nextMeshHlc();
-        const event_time_ms = mesh_clock_mod.MeshClock.physicalOf(event_hlc);
-        var msgid_buf: [msgid_mod.id_len]u8 = undefined;
-        var message_id = msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
-
-        // IRCv3 echo-message: a sender that negotiated the cap also receives its
-        // own message back, byte-identical to what recipients see (`msg`).
-        const echo = conn.session.hasCap(.echo_message);
-
         // RFC 1459: NOTICE must NEVER generate an error
         // reply (prevents NOTICE/error ping-pong between bots and servers). All
         // delivery-failure numerics below are suppressed for NOTICE.
@@ -47932,17 +50455,43 @@ pub const LinuxServer = struct {
                 if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                 return;
             }
-            if (!self.messageSatisfiesEncryptionPolicy(chan, clean_client_tags)) {
+            if (!self.messageSatisfiesEncryptionPolicy(chan, clean_client_tags, text, false)) {
                 if (!is_notice) try self.failReply(conn, command, "E2EE_REQUIRED", "Channel requires encrypted messages");
                 return;
             }
+        }
+
+        // Required-room admission happened above, before we format an IRC line
+        // or allocate an event identity. In particular, an oversized tagged
+        // plaintext candidate produces E2EE_REQUIRED (or silent NOTICE), not an
+        // OutputTooSmall error or a partially admitted event.
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), command, &.{target}, text);
+
+        // Allocate one event identity before any local/mesh fan-out. The same
+        // authenticated `(origin,hlc)` deterministically yields msgid + time on
+        // every node, so all attachments can reference and order one event.
+        const event_hlc = self.nextMeshHlc();
+        const event_time_ms = mesh_clock_mod.MeshClock.physicalOf(event_hlc);
+        var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+        var message_id = msgid_mod.fromMeshEvent(self.config.node_id, event_hlc, &msgid_buf);
+
+        // IRCv3 echo-message: a sender that negotiated the cap also receives its
+        // own message back, byte-identical to what recipients see (`msg`).
+        const echo = conn.session.hasCap(.echo_message);
+
+        if (world_model.isChannelName(chan)) {
             const speech = try self.channelSpeechGate(id, conn, target, chan, text, is_notice, min_rank, true);
             if (speech == .deny) return;
             const opmod_route = speech == .opmoderate;
             // Fantasy bot: a speaker's PRIVMSG beginning with '!' may invoke the
             // weather/news bot. The message is still delivered to the channel
             // normally below; this only posts the server's answer as a NOTICE.
-            if (!is_notice and text.len > 1 and text[0] == '!') {
+            // Required rooms never treat ciphertext as a bot command.
+            if (!is_notice and self.channelEncryptionPolicy(chan) != .required and
+                text.len > 1 and text[0] == '!')
+            {
                 self.handleFantasy(id, conn, chan, text);
             }
             // +f noformat (IRCX NOFORMAT; chm_nocolour): strip mIRC
@@ -47954,7 +50503,9 @@ pub const LinuxServer = struct {
             var nf_msg_buf: [default_reply_bytes]u8 = undefined;
             var eff_text = text;
             var eff_msg = msg;
-            if (self.world.channelHasExtFlag(chan, .noformat) and color_strip.hasFormatting(text)) {
+            if (self.channelEncryptionPolicy(chan) != .required and
+                self.world.channelHasExtFlag(chan, .noformat) and color_strip.hasFormatting(text))
+            {
                 if (color_strip.stripFormattingWith(.{ .max_output_bytes = default_reply_bytes }, text, &nf_text_buf)) |clean| {
                     var nf_prefix_buf: [320]u8 = undefined;
                     if (clientPrefix(conn, &nf_prefix_buf)) |pfx| {
@@ -48767,12 +51318,10 @@ pub const LinuxServer = struct {
         return .regular;
     }
 
-    /// Whether `nick` is an IRC operator holding oper_override (the network-admin
-    /// override) — rendered as the `*` status prefix and in WHOIS. Covers both a
-    /// local session AND a cross-mesh oper grant propagated from a peer node
-    /// (keyed by account; matched to the nick), so a remote server's admins also
-    /// render with `*`. The grant path requires the secured Mooring mesh, over
-    /// which signed grants travel.
+    /// Whether `nick` is a locally projected IRC operator holding oper_override.
+    /// Step 5 consumes only configured-local session authority. Inactive OCG1
+    /// records may still relay, persist, and survive Helix, but never feed this
+    /// runtime decision or any downstream +Y/NAMES/WHOIS/KICK behavior.
     fn isOverrideOper(self: *LinuxServer, nick: []const u8) bool {
         for (self.reactors) |*reactor| {
             var it = reactor.clients.iterator();
@@ -48782,14 +51331,6 @@ pub const LinuxServer = struct {
                 if (!c.session.registered()) continue;
                 if (c.session.hasPriv(.oper_override) and std.ascii.eqlIgnoreCase(c.session.displayName(), nick)) return true;
             }
-        }
-        // Prefer the residence-verified remote account when the roster knows it;
-        // legacy peers without account propagation retain the historical
-        // account==nick fallback. This keeps later JOIN/NAMES rendering aligned
-        // with the live transition emitter for account != display nick.
-        const grant_account = self.trustedRemoteAccountForNick(nick) orelse nick;
-        if (self.oper_grants.lookup(grant_account, self.grantNowU64())) |g| {
-            if (g.privilege_bits != 0 and oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override)) return true;
         }
         return false;
     }
@@ -48813,17 +51354,67 @@ pub const LinuxServer = struct {
         // prefixes (all of them when the requester negotiated multi-prefix, else
         // only the highest) and optionally nick!user@host (userhost-in-names).
         //
-        // Cap is intentionally large: a mesh channel with many locals + remotes
-        // used to silently truncate at 128, so each side of the mesh saw a
-        // different partial roster and clients permanently desynced after 366
-        // closed the (incomplete) burst. 512 covers realistic federation sizes
-        // without a heap alloc on the completion path; beyond that we still emit
-        // what we collected and close cleanly rather than inventing a second
-        // partial burst later.
-        const max_members: usize = 512;
-        var members_buf: [max_members]names_reply.Member = undefined;
-        var prefix_buf: [max_members]chanmode.PrefixList = undefined;
-        var count: usize = 0;
+        // Bound collection by the exact plaintext room remaining in the current
+        // destination. A NAMES entry has a non-empty nick and consumes at least a
+        // token byte plus a separator; accepting more unique identities than
+        // this two-byte bound could never produce a complete burst. Unlike the
+        // old fixed 512 stack array, this scales to every roster that can actually
+        // fit the caller's configured SendQ or transactional reply capture.
+        const plaintext_budget = if (conn.reply_capture) |capture|
+            capture.buf.len - capture.len
+        else budget: {
+            const inline_queued = conn.send_len - conn.send_offset;
+            const queued = std.math.add(usize, inline_queued, conn.send_overflow.items.len) catch
+                return error.OutputTooSmall;
+            if (queued >= conn.sendq_cap) return error.OutputTooSmall;
+            break :budget conn.sendq_cap - queued;
+        };
+        if (plaintext_budget == 0) return error.OutputTooSmall;
+
+        const caps = names_reply.RequesterCaps{
+            .multi_prefix = conn.session.hasCap(.multi_prefix) or conn.ircx,
+            .userhost_in_names = conn.session.hasCap(.userhost_in_names),
+        };
+        const srv = self.serverName();
+        const requester = conn.session.displayName();
+        const end_text = "End of /NAMES list";
+        const minimum_end_len = std.math.add(
+            usize,
+            1 + srv.len + 1 + 3 + 1 + requester.len + 1 + channel.len + 2 + end_text.len,
+            2,
+        ) catch return error.OutputTooSmall;
+        if (minimum_end_len > plaintext_budget) return error.OutputTooSmall;
+
+        // Exact current-topology candidate bound: local physical rows, every
+        // established peer's retained channel roster, and at most one synthetic
+        // resume claimant. The dedupe index collapses physical/mesh aliases, but
+        // its allocation can never grow beyond this authoritative source image.
+        var topology_upper = self.world.memberCount(channel);
+        if (projection != null)
+            topology_upper = std.math.add(usize, topology_upper, 1) catch
+                return error.OutputTooSmall;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const remote_count = if (slot.value.s2s_secured) |link|
+                    if (link.established()) link.channelMembers(channel).len else 0
+                else if (slot.value.s2s) |link|
+                    if (link.established()) link.channelMembers(channel).len else 0
+                else
+                    0;
+                topology_upper = std.math.add(usize, topology_upper, remote_count) catch
+                    return error.OutputTooSmall;
+            }
+        }
+        // Each emitted identity costs at least its non-empty nick plus either a
+        // separator or a strictly-larger 353 header. Reserve the complete 366
+        // first, then use the checked two-byte minimum to constrain heap growth.
+        const output_member_limit = (plaintext_budget - minimum_end_len) / 2;
+        const max_entries = @min(topology_upper, output_member_limit);
+        var roster: std.ArrayListUnmanaged(NamesRosterEntry) = .empty;
+        defer roster.deinit(self.allocator);
+        var seen: NamesNickSet = .empty;
+        defer seen.deinit(self.allocator);
 
         // +x AUDITORIUM: regular members are hidden from each other; only ops and
         // voiced members are visible (plus the viewer always sees themselves).
@@ -48840,24 +51431,11 @@ pub const LinuxServer = struct {
         if (self.world.memberIterator(channel)) |members_src| {
             var it = members_src;
             while (it.next()) |member| {
-                if (count >= max_members) break;
                 const projected = if (projection) |image| image.contains(member.*) else false;
                 const nick = if (projected)
                     projection.?.nick
                 else
                     self.world.nickOf(member.*) orelse continue;
-                // Multiple sockets attached to one logical session are distinct
-                // delivery endpoints but one IRC identity. Keep every endpoint in
-                // World for fan-out/participation, while rendering the nick once in
-                // NAMES so clients do not manufacture duplicate users.
-                var duplicate = false;
-                for (members_buf[0..count]) |listed| {
-                    if (std.ascii.eqlIgnoreCase(listed.nick, nick)) {
-                        duplicate = true;
-                        break;
-                    }
-                }
-                if (duplicate) continue;
                 const modes = if (projected)
                     projection.?.modes
                 else
@@ -48866,19 +51444,22 @@ pub const LinuxServer = struct {
                     const is_self = projected or if (viewer_wid) |vw| member.*.eql(vw) else false;
                     if (!is_self and !auditorium.visibleTo(viewer_rank, auditoriumRank(modes))) continue;
                 }
-                prefix_buf[count] = modes.allPrefixes();
-                // Network operators (oper_override) render with the `*` prefix above
-                // founder. Derived from live oper status, not a stored channel mode.
-                if ((projected and projection.?.is_override_oper) or self.isOverrideOper(nick))
-                    prefix_buf[count].prependOper();
-                members_buf[count] = .{
-                    .prefixes = prefix_buf[count].asSlice(),
-                    .nick = nick,
-                    .user = if (projected) projection.?.user else usernameOf(self, member.*),
-                    .host = default_host,
-                };
-                count += 1;
-                if (projected) projected_member_seen = true;
+                // Multiple sockets attached to one logical session are distinct
+                // delivery endpoints but one IRC identity. Keep every endpoint in
+                // World for fan-out/participation, while rendering the nick once in
+                // NAMES so clients do not manufacture duplicate users.
+                const added = try self.appendNamesRosterEntry(
+                    &roster,
+                    &seen,
+                    max_entries,
+                    nick,
+                    if (projected) projection.?.user else usernameOf(self, member.*),
+                    default_host,
+                    modes,
+                    (projected and projection.?.is_override_oper) or self.isOverrideOper(nick),
+                );
+                if (projected and (added or seen.contains(nick)))
+                    projected_member_seen = true;
             }
         }
 
@@ -48887,18 +51468,17 @@ pub const LinuxServer = struct {
         // add several physical exact-token rows, which ordinary NAMES dedupes by
         // nick in the same way.
         if (projection) |projected| synthetic: {
-            if (projected_member_seen or count >= max_members) break :synthetic;
-            if (nameAlreadyListed(members_buf[0..count], projected.nick)) break :synthetic;
-            prefix_buf[count] = projected.modes.allPrefixes();
-            if (projected.is_override_oper or self.isOverrideOper(projected.nick))
-                prefix_buf[count].prependOper();
-            members_buf[count] = .{
-                .prefixes = prefix_buf[count].asSlice(),
-                .nick = projected.nick,
-                .user = projected.user,
-                .host = default_host,
-            };
-            count += 1;
+            if (projected_member_seen or seen.contains(projected.nick)) break :synthetic;
+            _ = try self.appendNamesRosterEntry(
+                &roster,
+                &seen,
+                max_entries,
+                projected.nick,
+                projected.user,
+                default_host,
+                projected.modes,
+                projected.is_override_oper or self.isOverrideOper(projected.nick),
+            );
         }
 
         // World projection (#6): merge remote members announced by established S2S
@@ -48911,42 +51491,61 @@ pub const LinuxServer = struct {
         // shard-0 clients (the multi-shard NAMES gap). The whole completion runs
         // under `world.lockWrite`, so this cross-reactor read is race-free — the
         // same pattern `findRemoteWhois`/`relayToPeers` already rely on.
-        outer: for (self.reactors) |*reactor| {
+        for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (count >= max_members) break :outer;
                 if (!slot.occupied) continue;
                 if (slot.value.s2s_secured) |link| {
-                    if (link.established()) count = self.addRemoteMembers(&members_buf, &prefix_buf, count, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
+                    if (link.established()) try self.addRemoteMembers(&roster, &seen, max_entries, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
                 } else if (slot.value.s2s) |link| {
-                    if (link.established()) count = self.addRemoteMembers(&members_buf, &prefix_buf, count, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
+                    if (link.established()) try self.addRemoteMembers(&roster, &seen, max_entries, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
                 }
             }
         }
 
-        const caps = names_reply.RequesterCaps{
-            .multi_prefix = conn.session.hasCap(.multi_prefix) or conn.ircx,
-            .userhost_in_names = conn.session.hasCap(.userhost_in_names),
-        };
-
         // 353 visibility symbol: '@' for secret (+s), '=' otherwise.
         const channel_status: u8 = if (self.world.channelHasFlag(channel, .secret)) '@' else '=';
-        const srv = self.serverName();
-        const requester = conn.session.displayName();
 
-        // Stream 353 lines in chunks that fit the reply arena + line sink. A
-        // single writeNamesReplies call used to fail closed to a bare 366 when
-        // the channel's rendered roster exceeded default_reply_bytes or 32
-        // lines (userhost-in-names + mesh remotes) — late partial / empty NAMES
-        // desync on both sides of the mesh. Chunk, emit every 353 that fits,
-        // and ALWAYS terminate with exactly one 366.
+        // Render the WHOLE burst into isolated bounded storage before touching
+        // the live socket/capture. This prevents a SendQ limit or allocation
+        // failure after an early 353 from leaving a client with a partial roster.
+        // The pessimistic size assumes every member needs its own 353 line; the
+        // actual writer folds multiple tokens per standards-compliant line.
+        const header_len = 1 + srv.len + 1 + 3 + 1 + requester.len + 3 + channel.len + 2;
+        var storage_upper = minimum_end_len;
+        for (roster.items) |*entry| {
+            const member = entry.asMember();
+            var token_len = (if (member.prefixes.len == 0) @as(usize, 0) else if (caps.multi_prefix) member.prefixes.len else 1) + member.nick.len;
+            if (caps.userhost_in_names) {
+                token_len = std.math.add(usize, token_len, 1 + member.user.len + 1 + member.host.len) catch
+                    return error.OutputTooSmall;
+            }
+            if (header_len > names_reply.DEFAULT_MAX_LINE_BYTES or
+                token_len > names_reply.DEFAULT_MAX_LINE_BYTES - header_len)
+                return error.OutputTooSmall;
+            const line_upper = std.math.add(usize, header_len + 2, token_len) catch
+                return error.OutputTooSmall;
+            storage_upper = std.math.add(usize, storage_upper, line_upper) catch
+                return error.OutputTooSmall;
+        }
+        const burst_storage = try self.allocator.alloc(u8, @min(storage_upper, plaintext_budget));
+        defer self.allocator.free(burst_storage);
+        var burst = ReplyCapture{ .buf = burst_storage };
+
+        // Render 353 lines in fixed-size view pages. The owned roster itself is
+        // dynamically complete; only this scratch view remains stack-bounded.
+        // Binary shrinking handles worst-case userhost-in-names tokens or the
+        // line-sink bound without truncating the next page.
         var out_buf: [default_reply_bytes]u8 = undefined;
         var lines_buf: [64]names_reply.NamesLine = undefined;
+        var page_buf: [128]names_reply.Member = undefined;
         var offset: usize = 0;
-        while (offset < count) {
-            // Greedy: try the remaining tail; on capacity error binary-shrink.
-            var end = count;
+        while (offset < roster.items.len) {
+            const page_len = @min(page_buf.len, roster.items.len - offset);
+            for (roster.items[offset .. offset + page_len], 0..) |*entry, i|
+                page_buf[i] = entry.asMember();
+            var end = page_len;
             var progressed = false;
-            while (end > offset) {
+            while (end > 0) {
                 var sink = names_reply.NamesLineSink{ .lines = &lines_buf };
                 if (names_reply.writeNamReplyLines(
                     &out_buf,
@@ -48954,46 +51553,52 @@ pub const LinuxServer = struct {
                     requester,
                     channel,
                     channel_status,
-                    members_buf[offset..end],
+                    page_buf[0..end],
                     caps,
                     &sink,
                 )) |_| {
                     for (sink.slice()) |line| {
-                        try appendToConn(conn, line.bytes);
-                        try appendToConn(conn, "\r\n");
+                        burst.append(line.bytes);
+                        burst.append("\r\n");
                     }
-                    offset = end;
+                    if (burst.overflowed) return error.OutputTooSmall;
+                    offset += end;
                     progressed = true;
                     break;
                 } else |err| switch (err) {
                     error.OutputTooSmall, error.TooManyRecipients => {
-                        const mid = offset + (end - offset) / 2;
-                        if (mid == offset) {
-                            // Single member cannot be rendered into this arena —
-                            // skip it rather than aborting the rest of the list.
-                            offset += 1;
-                            progressed = true;
-                            break;
-                        }
+                        const mid = end / 2;
+                        if (mid == 0) return error.OutputTooSmall;
                         end = mid;
                     },
-                    else => {
-                        // Validation of server/nick/channel failed — close out.
-                        try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
-                        return;
-                    },
+                    else => return error.OutputTooSmall,
                 }
             }
             if (!progressed) break;
         }
 
         var end_buf: [default_reply_bytes]u8 = undefined;
-        const end_line = names_reply.buildEndOfNamesLine(&end_buf, srv, requester, channel, "End of /NAMES list") catch {
-            try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
-            return;
+        const end_line = names_reply.buildEndOfNamesLine(&end_buf, srv, requester, channel, end_text) catch {
+            return error.OutputTooSmall;
         };
-        try appendToConn(conn, end_line);
-        try appendToConn(conn, "\r\n");
+        burst.append(end_line);
+        burst.append("\r\n");
+        if (burst.overflowed) return error.OutputTooSmall;
+
+        if (conn.reply_capture == null) {
+            const raw_bound = resumeBootstrapRawBound(conn, burst.captured()) orelse
+                return error.OutputTooSmall;
+            try reserveRawAppendToConn(conn, raw_bound);
+            appendToConn(conn, burst.captured()) catch |err| {
+                // Raw capacity is reserved, but userspace TLS/WS framing can
+                // still fail after producing an earlier record. JOIN ignores a
+                // NAMES error, so make that unexpected partial stream terminal.
+                self.poisonOwnedDelivery(conn);
+                return err;
+            };
+            return;
+        }
+        try appendToConn(conn, burst.captured());
     }
 };
 
@@ -49167,15 +51772,6 @@ fn sessionCanUseTagmsg(session: *const dispatch.ClientSession) bool {
     return session.hasCap(.message_tags) or session.hasCap(.typing) or session.hasCap(.react) or session.hasCap(.reply);
 }
 
-/// True if `nick` (ASCII case-insensitive) is already among the listed members —
-/// used to dedupe remote mesh members against local ones in NAMES.
-fn nameAlreadyListed(members: []const names_reply.Member, nick: []const u8) bool {
-    for (members) |m| {
-        if (std.ascii.eqlIgnoreCase(m.nick, nick)) return true;
-    }
-    return false;
-}
-
 fn clientIdFromWorld(id: world_model.ClientId) client_model.ClientId {
     return .{ .shard = id.shard, .slot = id.slot, .gen = id.gen };
 }
@@ -49297,20 +51893,91 @@ fn setCloexec(fd: linux.fd_t, enabled: bool) bool {
     return linux.errno(linux.fcntl(fd, posix.F.SETFD, flags)) == .SUCCESS;
 }
 
-/// Reframe a captured labeled command's plaintext replies under `label` and
-/// emit them on the wire (through the normal WS/TLS seam). A capture overflow,
-/// or framing that will not fit the scratch buffer, degrades to delivering the
-/// captured reply unwrapped rather than dropping it — only reachable when a
-/// single command emits more than one full inline buffer to the issuer.
-fn emitLabeledIssuer(conn: *ConnState, label: []const u8, capture: *const ReplyCapture) ServerError!void {
-    if (capture.overflowed) return appendToConn(conn, capture.captured());
-    var frame_buf: [default_reply_bytes]u8 = undefined;
-    var sink = FrameBufSink{ .buf = &frame_buf };
-    var it = CrlfReplyIterator{ .bytes = capture.captured() };
-    labeled_response.emitIterator(&sink, label, labeled_batch_ref, &it) catch {
-        return appendToConn(conn, capture.captured());
+fn validCapturedBatchRef(ref: []const u8) bool {
+    if (ref.len == 0 or ref.len > labeled_response.MAX_BATCH_REF_LEN) return false;
+    for (ref) |ch| switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-' => {},
+        else => return false,
     };
-    return appendToConn(conn, sink.written());
+    return true;
+}
+
+fn isApplicableHistoryBatchType(batch_type: []const u8) bool {
+    return std.mem.eql(u8, batch_type, "chathistory") or
+        std.mem.eql(u8, batch_type, chathistory_cmd.targets_batch_type);
+}
+
+/// A labeled CHATHISTORY response already has its protocol-defined batch. Keep
+/// that one batch, validate all membership before emitting anything to the
+/// connection, and put the command label on its opening BATCH line.
+fn emitLabeledApplicableHistoryBatch(
+    sink: *FrameBufSink,
+    label: []const u8,
+    captured: []const u8,
+) error{OutputTooSmall}!bool {
+    var it = CrlfReplyIterator{ .bytes = captured };
+    const opening = it.next() orelse return false;
+    if (opening.len < 2 or !std.mem.endsWith(u8, opening, "\r\n")) return error.OutputTooSmall;
+    const parsed_open = irc_line.parseLine(opening) catch return error.OutputTooSmall;
+    if (!std.ascii.eqlIgnoreCase(parsed_open.command, "BATCH")) return false;
+
+    // A captured non-history batch still follows the generic labeled-response
+    // contract. A malformed BATCH opening fails closed rather than being nested.
+    if (parsed_open.param_count < 2 or parsed_open.params[0].len < 2 or
+        parsed_open.params[0][0] != '+' or !validCapturedBatchRef(parsed_open.params[0][1..]))
+    {
+        return error.OutputTooSmall;
+    }
+    if (!isApplicableHistoryBatchType(parsed_open.params[1])) return false;
+    const ref = parsed_open.params[0][1..];
+
+    var labeled_open_buf: [labeled_response.MAX_WIRE_LINE]u8 = undefined;
+    const labeled_open = labeled_response.tagLine(label, opening, &labeled_open_buf) catch
+        return error.OutputTooSmall;
+    try sink.appendLine(labeled_open);
+
+    while (it.next()) |line| {
+        if (line.len < 2 or !std.mem.endsWith(u8, line, "\r\n")) return error.OutputTooSmall;
+        const parsed = irc_line.parseLine(line) catch return error.OutputTooSmall;
+        if (std.ascii.eqlIgnoreCase(parsed.command, "BATCH")) {
+            if (parsed.tags_raw != null or parsed.param_count != 1 or parsed.params[0].len != ref.len + 1 or
+                parsed.params[0][0] != '-' or !std.mem.eql(u8, parsed.params[0][1..], ref) or it.next() != null)
+            {
+                return error.OutputTooSmall;
+            }
+            try sink.appendLine(line);
+            return true;
+        }
+        const member_ref = batchTagValue(&parsed) orelse return error.OutputTooSmall;
+        if (!std.mem.eql(u8, member_ref, ref)) return error.OutputTooSmall;
+        try sink.appendLine(line);
+    }
+    return error.OutputTooSmall;
+}
+
+/// Reframe a captured labeled command's plaintext replies under `label` and
+/// emit them on the wire (through the normal WS/TLS seam). Bulk commands receive
+/// a bounded larger capture in dispatchRegistered; any remaining capture
+/// overflow fails closed before a truncated IRC line can reach the transport.
+fn emitLabeledIssuer(
+    conn: *ConnState,
+    label: []const u8,
+    capture: *const ReplyCapture,
+    allocator: std.mem.Allocator,
+) ServerError!void {
+    if (capture.overflowed) return error.OutputTooSmall;
+    const lines = std.mem.count(u8, capture.captured(), "\n");
+    const framing_slack = std.math.mul(usize, lines + 3, 256) catch return error.OutputTooSmall;
+    const capacity = std.math.add(usize, capture.captured().len, framing_slack) catch return error.OutputTooSmall;
+    const frame_buf = allocator.alloc(u8, @max(capacity, default_reply_bytes)) catch return error.OutputTooSmall;
+    defer allocator.free(frame_buf);
+    var sink = FrameBufSink{ .buf = frame_buf };
+    const emitted_existing_batch = try emitLabeledApplicableHistoryBatch(&sink, label, capture.captured());
+    if (!emitted_existing_batch) {
+        var it = CrlfReplyIterator{ .bytes = capture.captured() };
+        labeled_response.emitIterator(&sink, label, labeled_batch_ref, &it) catch return error.OutputTooSmall;
+    }
+    return LinuxServer.appendHistoryReplay(conn, sink.written());
 }
 
 /// Guarded choke point for the inline reply-line builders that embed
@@ -49825,6 +52492,244 @@ fn resetTestSendQ(conn: *ConnState) void {
     conn.send_len = 0;
     conn.send_offset = 0;
     if (conn.send_overflow.items.len != 0) conn.send_overflow.clearRetainingCapacity();
+}
+
+test "secured establishment immediately publishes authenticated trust route" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var initiator_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "session-replay-test");
+    defer initiator_identity.deinit();
+    var responder_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x62)), "session-replay-test");
+    defer responder_identity.deinit();
+    const initiator_prekey = try initiator_identity.signedPrekey(1, 10, 1000, LinuxServer.s2s_bands, LinuxServer.s2s_features);
+    const responder_prekey = try responder_identity.signedPrekey(2, 10, 1000, LinuxServer.s2s_bands, LinuxServer.s2s_features);
+    var initiator = try secured_s2s_link.SecuredLink.init(.{
+        .allocator = allocator,
+        .role = .initiator,
+        .identity = &initiator_identity,
+        .local_prekey = initiator_prekey,
+        .cfg = .{
+            .realm = initiator_identity.realm,
+            .supported_bands = LinuxServer.s2s_bands,
+            .supported_features = LinuxServer.s2s_features,
+            .mesh_pass = "session-replay-secret",
+            .now_ms = 20,
+        },
+        .rng = std.testing.io,
+        .server_name = "replay-a.test",
+    });
+    defer initiator.deinit();
+    var responder = try secured_s2s_link.SecuredLink.init(.{
+        .allocator = allocator,
+        .role = .responder,
+        .identity = &responder_identity,
+        .local_prekey = responder_prekey,
+        .cfg = .{
+            .realm = responder_identity.realm,
+            .supported_bands = LinuxServer.s2s_bands,
+            .supported_features = LinuxServer.s2s_features,
+            .mesh_pass = "session-replay-secret",
+            .now_ms = 20,
+        },
+        .rng = std.testing.io,
+        .server_name = "replay-b.test",
+    });
+    defer responder.deinit();
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = responder_identity.shortId(),
+        .server_name = "replay-b.test",
+        .node_identity = &responder_identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.send_armed = true; // retain deterministic handshake output in SendQ
+    conn.s2s_secured = &responder;
+    defer {
+        if (server.rx().clients.get(id)) |live| {
+            live.s2s_secured = null; // stack-owned by `pair`
+            live.send_armed = false;
+            _ = server.rx().clients.free(id);
+        }
+    }
+
+    var rounds: usize = 0;
+    while (!responder.established() and rounds < 64) : (rounds += 1) {
+        var progressed = false;
+        // A secured responder speaks first with its prekey preamble. Move that
+        // output through the daemon SendQ, then return the initiator response
+        // through the real secured drive path where establishment publishes.
+        if (responder.outbound().len != 0) {
+            if (!server.flushMeshBurstStage(conn)) return error.TestUnexpectedResult;
+        }
+        {
+            const to_peer = try copyTestSendQ(allocator, conn);
+            defer allocator.free(to_peer);
+            resetTestSendQ(conn);
+            if (to_peer.len != 0) {
+                progressed = true;
+                try initiator.feed(to_peer, @intCast(rounds + 21));
+            }
+        }
+        {
+            const to_server = try allocator.dupe(u8, initiator.outbound());
+            defer allocator.free(to_server);
+            initiator.clearOutbound();
+            if (to_server.len != 0) {
+                progressed = true;
+                server.driveS2sSecured(conn, &responder, to_server);
+                if (conn.closing) return error.TestUnexpectedResult;
+            }
+        }
+        if (!progressed) return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(responder.established());
+
+    // No timer/adoption publication is invoked: the establishment transition
+    // itself must make the authenticated peer immediately available to SRM2.
+    try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
+    lockSpin(&server.mesh_peer_identity_mu);
+    defer server.mesh_peer_identity_mu.unlock();
+    try std.testing.expectEqual(initiator_identity.shortId(), server.mesh_peer_node_ids[0]);
+    try std.testing.expect(server.mesh_peer_public_key_present[0]);
+    try std.testing.expectEqualSlices(u8, &initiator_identity.sign_kp.public_key, &server.mesh_peer_public_keys[0]);
+    try std.testing.expectEqualStrings(
+        "replay-a.test",
+        server.mesh_peer_names[0][0..server.mesh_peer_name_lens[0]],
+    );
+}
+
+test "secured establish collision winner teardown trust lifecycle" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var old_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x63, 0x64);
+    defer old_pair.deinit();
+    var winner_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x65, 0x66);
+    defer winner_pair.deinit();
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        // Lexically smaller than replay-b.test, so the initiator is the
+        // deterministic reciprocal-dial survivor.
+        .server_name = "aaa.test",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const old_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const old_conn = server.rx().clients.get(old_id).?;
+    old_conn.s2s_secured = &old_pair.a;
+    old_conn.s2s_initiator = false;
+    const winner_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const winner = server.rx().clients.get(winner_id).?;
+    winner.s2s_secured = &winner_pair.a;
+    winner.s2s_initiator = true;
+    defer {
+        if (server.rx().clients.get(old_id)) |live| live.s2s_secured = null;
+        if (server.rx().clients.get(winner_id)) |live| live.s2s_secured = null;
+        _ = server.rx().clients.free(old_id);
+        _ = server.rx().clients.free(winner_id);
+    }
+
+    // Seed the old route, then resolve the reciprocal-dial collision exactly as
+    // the secured establishment path does before its immediate publication.
+    winner.closing = true;
+    server.publishPeerCount();
+    winner.closing = false;
+    try std.testing.expectEqual(old_pair.idb.shortId(), server.mesh_peer_node_ids[0]);
+    try std.testing.expect(!server.resolveS2sCollision(winner, "replay-b.test"));
+    try std.testing.expect(old_conn.s2s_dedup);
+    server.publishPeerCount();
+
+    // The still-established loser remains in the slab until close, but is no
+    // longer a route. Publication must select the winner's authenticated key.
+    try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
+    try std.testing.expectEqual(winner_pair.idb.shortId(), server.mesh_peer_node_ids[0]);
+    try std.testing.expectEqualSlices(u8, &winner_pair.idb.sign_kp.public_key, &server.mesh_peer_public_keys[0]);
+
+    const winning_names = server.readPeerNames();
+    winner.closing = true;
+    server.publishPeerCount();
+    try std.testing.expectEqual(@as(u32, 0), server.net_peer_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), server.mesh_peer_name_lens[0]);
+    // The caller-owned pre-teardown view cannot race the same storage rewrite.
+    try std.testing.expectEqualStrings("replay-b.test", winning_names.name(0));
+}
+
+test "non-dedup S2S close immediately removes published peer" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var sender: s2s_link.S2sLink = undefined;
+    try sender.init(.{
+        .allocator = allocator,
+        .local_node_id = 71,
+        .remote_node_id = 72,
+        .local_epoch_ms = 100,
+        .server_name = "closing-peer.test",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer sender.deinit();
+    const receiver = try allocator.create(s2s_link.S2sLink);
+    var receiver_owned_by_server = false;
+    try receiver.init(.{
+        .allocator = allocator,
+        .local_node_id = 72,
+        .remote_node_id = 71,
+        .local_epoch_ms = 101,
+        .server_name = "local.test",
+        .config = .{ .require_signed_frames = false },
+    });
+    errdefer if (!receiver_owned_by_server) {
+        receiver.deinit();
+        allocator.destroy(receiver);
+    };
+    try sender.start(102);
+    try pumpLinkPair(&sender, receiver, allocator);
+    try std.testing.expect(receiver.established());
+
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.s2s = receiver; // closeConn owns the heap link from here
+    receiver_owned_by_server = true;
+    server.publishPeerCount();
+    try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
+    const before_close = server.readPeerNames();
+    try std.testing.expectEqualStrings("closing-peer.test", before_close.name(0));
+
+    try server.closeConn(conn.token, "test peer close");
+    try std.testing.expect(server.rx().clients.get(id) == null);
+    try std.testing.expectEqual(@as(u32, 0), server.net_peer_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), server.mesh_peer_name_lens[0]);
+    // Caller-owned copy remains stable after the shared same/zero-count rewrite.
+    try std.testing.expectEqualStrings("closing-peer.test", before_close.name(0));
 }
 
 test "session replica live publication pairs a newer lease and detached publication invalidates it" {
@@ -51519,6 +54424,162 @@ test "v2 Store hot-adoption is SQ-inert until authority-first link activation" {
     try std.testing.expect(!conn.session_replica_resync_burst_pending);
 }
 
+test "secured roster repair follows inbound membership generations across asymmetric replay" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "roster-gc-barrier.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "roster-gc-barrier-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer = server.rx().clients.get(peer_id).?;
+    peer.overflow_allocator = allocator;
+    peer.token = try tokenFromId(peer_id);
+    peer.send_armed = true;
+    peer.s2s_secured = &pair.a;
+    peer.s2s_burst_done = true;
+    defer {
+        peer.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+
+    const pending_id = try addTestLocalClient(&server, "PendingLocal", null);
+    const pending = server.connFor(pending_id).?;
+    _ = try server.world.join("#roster-gc-barrier", worldIdFromClient(pending_id));
+
+    // Seed B's existing view through the actual daemon burst path.
+    try std.testing.expect(server.sendMembershipBurstTo(peer));
+    const initial_daemon_burst = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(initial_daemon_burst);
+    pair.a.clearOutbound();
+    try pair.b.feed(initial_daemon_burst, 80);
+    pair.b.processDeferredResidenceFrames(80);
+    server.discardIdentityTransitions(&pair.b);
+    try std.testing.expectEqual(@as(usize, 1), pair.b.channelMembers("#roster-gc-barrier").len);
+
+    // The same live attachment now awaits signed Store authority. It is omitted,
+    // so the daemon must withhold the marker and leave the stage retryable; B's
+    // existing row cannot be repaired away before deferred reannouncement.
+    pending.session_mesh_announce_pending = true;
+    try std.testing.expect(!server.sendMembershipBurstTo(peer));
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+    try std.testing.expectEqual(@as(usize, 1), pair.b.channelMembers("#roster-gc-barrier").len);
+
+    // Once authority is ready, the complete daemon burst reaffirms the row before
+    // its marker, producing neither a repair PART nor a replacement JOIN.
+    pending.session_mesh_announce_pending = false;
+    try std.testing.expect(server.sendMembershipBurstTo(peer));
+    const daemon_burst = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(daemon_burst);
+    pair.a.clearOutbound();
+    try pair.b.feed(daemon_burst, 90);
+    pair.b.processDeferredResidenceFrames(90);
+    try std.testing.expectEqual(@as(?i64, 90), pair.b.inner.?.peer.last_membership_sync_ms);
+    try std.testing.expectEqual(@as(usize, 1), pair.b.channelMembers("#roster-gc-barrier").len);
+    try std.testing.expect(pair.b.inner.?.peer.peekNextMembershipTransition() == null);
+
+    try pair.b.sendMembership(
+        "#roster-gc-barrier",
+        "RemoteLive",
+        0,
+        100,
+        true,
+        .{ .username = "remote", .host = "peer.test" },
+        "",
+    );
+    const wire = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(wire);
+    pair.b.clearOutbound();
+    try pair.a.feed(wire, 100);
+    pair.a.processDeferredResidenceFrames(100);
+    server.discardIdentityTransitions(&pair.a);
+    try std.testing.expectEqual(@as(usize, 1), pair.a.channelMembers("#roster-gc-barrier").len);
+
+    try pair.b.sendMembershipSync();
+    const first_marker = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(first_marker);
+    pair.b.clearOutbound();
+    try pair.a.feed(first_marker, 100);
+    pair.a.processDeferredResidenceFrames(100);
+    server.discardIdentityTransitions(&pair.a);
+
+    // A's outbound authority/replay state is already settled, while B sends no
+    // completed inbound generation for longer than the historical TTL. A must
+    // retain B's live member: local egress state cannot authorize inbound loss.
+    peer.session_replica_replay_pending = false;
+    peer.session_replica_resync_burst_pending = false;
+    peer.s2s_burst_done = true;
+    const refreshed_at = pair.a.channelMembers("#roster-gc-barrier")[0].last_refreshed_ms;
+    const stale_now = refreshed_at + stale_member_ttl_ms + 1;
+    server.pruneStaleMeshMembers(stale_now);
+    try std.testing.expectEqual(@as(usize, 1), pair.a.channelMembers("#roster-gc-barrier").len);
+
+    // B eventually completes a full generation containing RemoteLive. Its
+    // reaffirmation refreshes the inbound row before the authenticated marker.
+    try pair.b.sendMembership(
+        "#roster-gc-barrier",
+        "RemoteLive",
+        0,
+        101,
+        true,
+        .{ .username = "remote", .host = "peer.test" },
+        "",
+    );
+    try pair.b.sendMembershipSync();
+    const live_generation = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(live_generation);
+    pair.b.clearOutbound();
+    try pair.a.feed(live_generation, @intCast(stale_now));
+    pair.a.processDeferredResidenceFrames(@intCast(stale_now));
+    server.discardIdentityTransitions(&pair.a);
+    try std.testing.expectEqual(@as(usize, 1), pair.a.channelMembers("#roster-gc-barrier").len);
+
+    // A later completed B generation omits the member. Its last refresh shares
+    // the preceding marker's millisecond, so the ambiguous equality survives
+    // one extra generation rather than risking a false PART across read splits.
+    try pair.b.sendMembershipSync();
+    const first_omitted_generation = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(first_omitted_generation);
+    pair.b.clearOutbound();
+    const first_omitted_now: u64 = @intCast(stale_now + membership_resync_interval_ms);
+    try pair.a.feed(first_omitted_generation, first_omitted_now);
+    pair.a.processDeferredResidenceFrames(first_omitted_now);
+    try std.testing.expectEqual(@as(usize, 1), pair.a.channelMembers("#roster-gc-barrier").len);
+    try std.testing.expect(pair.a.inner.?.peer.peekNextMembershipTransition() == null);
+
+    // The following authenticated generation gives an unambiguous boundary:
+    // only peer-originated omission proof—not elapsed time or A's egress flags—
+    // authorizes the repair PART.
+    try pair.b.sendMembershipSync();
+    const second_omitted_generation = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(second_omitted_generation);
+    pair.b.clearOutbound();
+    const second_omitted_now = first_omitted_now + @as(u64, @intCast(membership_resync_interval_ms));
+    try pair.a.feed(second_omitted_generation, second_omitted_now);
+    pair.a.processDeferredResidenceFrames(second_omitted_now);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.channelMembers("#roster-gc-barrier").len);
+    const repair = pair.a.inner.?.peer.peekNextMembershipTransition() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(s2s_peer_mod.S2sPeer.MembershipDelta.Kind.parted, repair.kind);
+    try std.testing.expectEqualStrings("RemoteLive", repair.nick);
+}
+
 test "hot-adopt secured link tears down cleanly when RESYNC exceeds the carried SendQ" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -52889,6 +55950,81 @@ const test_multi_oper_bindings = [_]oper_mod.OperBinding{
     .{ .account_name = "oper", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}), .presubscribe_bits = test_presub_all_bits },
 };
 
+fn testAccountSwitchVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
+    return (std.mem.eql(u8, creds.authcid, "admin") or
+        std.mem.eql(u8, creds.authcid, "oper") or
+        std.mem.eql(u8, creds.authcid, "plain")) and
+        std.mem.eql(u8, creds.password, "onyx");
+}
+var test_account_switch_anchor: u8 = 0;
+const test_account_switch_checker = sasl.PlainChecker{
+    .ptr = &test_account_switch_anchor,
+    .verifyFn = testAccountSwitchVerify,
+};
+const test_account_switch_bindings = [_]oper_mod.OperBinding{
+    .{ .account_name = "admin", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full, .presubscribe_bits = test_presub_all_bits },
+    .{ .account_name = "oper", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}) },
+};
+const test_account_switch_narrow_admin_bindings = [_]oper_mod.OperBinding{
+    .{ .account_name = "admin", .class_name = "refreshed", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_kill}) },
+    .{ .account_name = "oper", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}) },
+};
+
+/// Server tests must establish operator authority through the same validated,
+/// sealed configured-local capability as production.  The temporary registry
+/// is consumed synchronously by reconcileOperAuthority; no authority pointer is
+/// retained in ClientSession after the projection is copied.
+fn reconcileTestOper(
+    session: *dispatch.ClientSession,
+    privileges: oper_mod.OperPrivileges,
+    class_name: []const u8,
+    title: []const u8,
+) !void {
+    if (session.account() == null) session.loginAs("test-oper");
+    const account = session.account().?;
+    const bindings = [_]oper_mod.OperBinding{.{
+        .account_name = account,
+        .class_name = class_name,
+        .privileges = privileges,
+        .title = title,
+    }};
+    const registry = try oper_mod.OperRegistry.init(&bindings);
+    const capability = oper_session_provenance.configuredLocalBinding(&registry, account) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        oper_session_provenance.ReconcileOutcome.replaced,
+        session.reconcileOperAuthority(capability, .disabled, 100),
+    );
+}
+
+fn prepareMigratedSessionProfileForTest(
+    session: *dispatch.ClientSession,
+    authenticated_account: []const u8,
+    snap: *const migration_relay.Snapshot,
+    transport_secure: bool,
+    privileges: oper_mod.OperPrivileges,
+    class_name: []const u8,
+    title: []const u8,
+) !LinuxServer.MigratedProfileResult {
+    const bindings = [_]oper_mod.OperBinding{.{
+        .account_name = authenticated_account,
+        .class_name = class_name,
+        .privileges = privileges,
+        .title = title,
+    }};
+    const registry = try oper_mod.OperRegistry.init(&bindings);
+    const capability = oper_session_provenance.configuredLocalBinding(&registry, authenticated_account) orelse
+        return error.TestUnexpectedResult;
+    return LinuxServer.prepareMigratedSessionProfile(
+        session,
+        authenticated_account,
+        snap,
+        transport_secure,
+        capability,
+        100,
+    );
+}
+
 fn testRuntimeGrantVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
     return (std.mem.eql(u8, creds.authcid, "admin") or std.mem.eql(u8, creds.authcid, "target")) and
         std.mem.eql(u8, creds.password, "onyx");
@@ -53352,6 +56488,28 @@ fn rejectUpgradePiecesForTest(
     return arena_dup;
 }
 
+fn rejectDurableUpgradePiecesForTest(
+    server: *Server,
+    pieces: []const helix_live.StatePiece,
+    arena_name: []const u8,
+) !linux.fd_t {
+    var prepared = try helix_live.prepare(std.testing.allocator, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = arena_name,
+        .pieces = pieces,
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+    server.config.resume_arena_fd = arena_dup;
+    try std.testing.expectError(error.DurableDeviceActivationFailed, server.adoptInheritedSessions());
+    return arena_dup;
+}
+
 /// Encode one complete manifested stream while deliberately widening one
 /// capsule's advertised maximum. Production `prepare` always emits registry
 /// headers; this negative-fixture helper keeps the manifest digest valid so the
@@ -53369,6 +56527,49 @@ fn encodeUpgradeStreamWithWidenedHeaderForTest(
         var cap = helix_capsule.make(piece.kind, &fields);
         if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
         if (piece.kind == widened_kind) cap.header.max_supported +|= 1;
+        try accumulator.add(.{
+            .header = .{
+                .schema_id = cap.header.schema_id,
+                .kind = @intFromEnum(cap.header.kind),
+                .version = cap.header.version,
+                .min_supported = cap.header.min_supported,
+                .max_supported = cap.header.max_supported,
+            },
+            .bytes = piece.bytes,
+        });
+        const encoded = try helix_capsule.encode(allocator, cap);
+        defer allocator.free(encoded);
+        try stream.appendSlice(allocator, encoded);
+    }
+    var manifest_buf: [handoff_manifest.encoded_len]u8 = undefined;
+    const manifest_wire = try accumulator.encode(&manifest_buf);
+    var manifest_fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = manifest_wire }};
+    const manifest_cap = helix_capsule.make(.handoff_manifest, &manifest_fields);
+    const manifest_encoded = try helix_capsule.encode(allocator, manifest_cap);
+    defer allocator.free(manifest_encoded);
+    try stream.appendSlice(allocator, manifest_encoded);
+    return stream.toOwnedSlice(allocator);
+}
+
+/// Encode a complete manifested stream while stamping the `.sessions` piece as
+/// a genuine rolling v3 capsule. The caller supplies a v3 HSSN body; this keeps
+/// the compatibility fixture honest at both the outer and inner version seams.
+fn encodeUpgradeStreamWithLegacyV3SessionsForTest(
+    allocator: std.mem.Allocator,
+    pieces: []const helix_live.StatePiece,
+) ![]u8 {
+    var stream: std.ArrayList(u8) = .empty;
+    errdefer stream.deinit(allocator);
+    var accumulator = handoff_manifest.Accumulator.init();
+    for (pieces) |piece| {
+        var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
+        var cap = helix_capsule.make(piece.kind, &fields);
+        if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+        if (piece.kind == .sessions) {
+            cap.header.version = 3;
+            cap.header.min_supported = 1;
+            cap.header.max_supported = 3;
+        }
         try accumulator.add(.{
             .header = .{
                 .schema_id = cap.header.schema_id,
@@ -53836,14 +57037,17 @@ test "UPGRADE seal + adopt carries the cross-mesh oper-grant registry (grants, t
     _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-oper-grants");
     current_reactor = null;
 
-    // The successor's registry converged BEFORE its io loop could process any
-    // peer grant re-mint: `applyMeshGrant` will see `had_oper_override=true`.
+    // The successor's inactive compatibility registry converges before its I/O
+    // loop, but the restored record remains telemetry and cannot project any
+    // runtime operator decision.
     const g = successor.oper_grants.lookup("trev", now) orelse return error.TestExpectedGrant;
     try std.testing.expectEqual(trev_bits, g.privilege_bits);
     try std.testing.expect(oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override));
     try std.testing.expectEqualStrings("netadmin", g.class);
     try std.testing.expectEqualStrings("ircx.us", g.issuer_node);
     try std.testing.expectEqual(@as(u64, 100), g.incarnation);
+    try std.testing.expect(!successor.isOverrideOper("trev"));
+    try std.testing.expect(!successor.remoteDataTagAuthorized("SYS.notice", false, null, "trev"));
     const tomb = successor.oper_grants.lookup("revoked_oper", now) orelse return error.TestExpectedGrant;
     try std.testing.expectEqual(@as(u64, 0), tomb.privilege_bits);
     try std.testing.expectEqual(@as(u64, 200), tomb.incarnation);
@@ -53917,12 +57121,17 @@ test "UPGRADE arena without an oper-grant checkpoint (pre-checkpoint predecessor
     try std.testing.expectEqual(@as(u64, 0), successor.grant_incarnation);
 }
 
-test "UPGRADE nonempty ADS1 follows detached HSSN owner across two hops and drains FIFO once" {
+test "UPGRADE legacy v3 session mints stable AID and nonempty ADS1 follows it across two hops" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
-    const config = Config{ .host = "127.0.0.1", .port = 0, .tls_port = 0 };
+    const config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    };
     const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -53962,19 +57171,50 @@ test "UPGRADE nonempty ADS1 follows detached HSSN owner across two hops and drai
             return error.TestUnexpectedResult,
     );
 
+    // Model the deployed pre-SRM2 predecessor exactly: HSSN v3 ended after the
+    // portable-resume byte and its outer capsule was stamped 3/1/3. The current
+    // sealer wrote one null v4 presence byte for this deliberately bare row;
+    // remove it and lower the inner version byte to construct the genuine v3
+    // body without duplicating the codec in this integration test.
+    var legacy_v3_hssn: ?[]u8 = null;
+    defer if (legacy_v3_hssn) |bytes| alloc.free(bytes);
+    for (predecessor_pieces.items) |*piece| {
+        if (piece.kind != .sessions) continue;
+        try std.testing.expect(piece.bytes.len > session_capsule.magic.len + 1);
+        try std.testing.expectEqual(@as(u8, session_capsule.version), piece.bytes[session_capsule.magic.len]);
+        try std.testing.expectEqual(@as(u8, 0), piece.bytes[piece.bytes.len - 1]);
+        const bytes = try alloc.dupe(u8, piece.bytes[0 .. piece.bytes.len - 1]);
+        bytes[session_capsule.magic.len] = 3;
+        legacy_v3_hssn = bytes;
+        piece.bytes = bytes;
+        break;
+    }
+    try std.testing.expect(legacy_v3_hssn != null);
+    const legacy_stream = try encodeUpgradeStreamWithLegacyV3SessionsForTest(
+        alloc,
+        predecessor_pieces.items,
+    );
+    defer alloc.free(legacy_stream);
+
     const successor = createTestServer(alloc, config) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer alloc.destroy(successor);
     defer successor.deinit();
-    _ = try adoptUpgradePiecesForTest(
+    _ = try adoptUpgradeStreamForTest(
         successor,
-        predecessor_pieces.items,
+        legacy_stream,
         "onyx-test-ads1-two-hop-first",
     );
     current_reactor = null;
     const first_successor_client = successor.sessions.findDetachedTokenInAccount("alice", token) orelse
+        return error.TestUnexpectedResult;
+    const first_successor_handle = successor.sessions.resumeHandleForClient(
+        "alice",
+        first_successor_client,
+    ) orelse return error.TestUnexpectedResult;
+    const minted_attachment_id = first_successor_handle.attachment_id orelse
         return error.TestUnexpectedResult;
     try std.testing.expect(first_successor_client != old_client);
     try std.testing.expectEqual(
@@ -54021,6 +57261,12 @@ test "UPGRADE nonempty ADS1 follows detached HSSN owner across two hops and drai
     current_reactor = null;
     const second_successor_client = second_successor.sessions.findDetachedTokenInAccount("alice", token) orelse
         return error.TestUnexpectedResult;
+    const second_successor_handle = second_successor.sessions.resumeHandleForClient(
+        "alice",
+        second_successor_client,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(second_successor_handle.attachment_id != null);
+    try std.testing.expect(second_successor_handle.attachment_id.?.eql(minted_attachment_id));
     try std.testing.expectEqual(
         @as(usize, 2),
         second_successor.attachment_delivery_spool.pendingCountFor(second_successor_client),
@@ -55927,6 +59173,25 @@ test "UPGRADE continuity gate accepts idle state and refuses every media or comp
 
     try std.testing.expect(blocker(&server) == null);
 
+    const drop_tx = try server.session_drop_journal.begin(.{
+        .requester = .{ .shard = 0, .slot = 1, .gen = 1 },
+        .account = "upgrade-drop",
+        .target = .{
+            .client = 2,
+            .token = @splat(0x61),
+            .signon_ms = 10,
+            .attachment_id = try sessions_mod.AttachmentId.fromBytes(@as([16]u8, @splat(0x62))),
+        },
+        .target_nick = "UpgradeDrop",
+        .reply = .{ .ordinal = 1 },
+        .deadline_ms = 100,
+    });
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.session_drop_transaction, blocker(&server).?);
+    try server.session_drop_journal.requestAbort(drop_tx, .cancelled);
+    try server.session_drop_journal.markResultConsumed(drop_tx);
+    try std.testing.expect(server.session_drop_journal.reapIfDone(drop_tx));
+    try std.testing.expect(blocker(&server) == null);
+
     try server.media_rooms.join("#media-gate", "alice", .voice);
     try std.testing.expectEqual(Server.UpgradeContinuityBlocker.media_rooms, blocker(&server).?);
     try std.testing.expect(server.media_rooms.leaveAll("#media-gate", "alice"));
@@ -56144,12 +59409,116 @@ fn addTestLocalClient(server: *Server, nick: []const u8, account: ?[]const u8) !
         const id = try server.rx().clients.alloc(ConnState.init(-1));
         const conn = server.rx().clients.get(id).?;
         conn.token = try tokenFromId(id);
+        // Match the production accept path: tests that exercise a real SendQ
+        // overflow must have an allocator for the heap-backed tail.
+        conn.overflow_allocator = server.allocator;
         try conn.session.setNick(nick);
         if (account) |acct| conn.session.loginAs(acct);
         try server.world.registerNick(nick, worldIdFromClient(id));
         if (account != null) server.trackSession(id, conn);
         return id;
     } else return error.SkipZigTest;
+}
+
+/// Install roster-backed sender-home authority for tests that call the legacy
+/// relay-v1 delivery boundary directly. Production only accepts such a relay
+/// after membership convergence; keeping that precondition explicit in the
+/// fixture prevents policy tests from accidentally exercising an unknown-home
+/// drop instead of the delivery rule they intend to cover.
+fn addTestRelayHomes(
+    server: *Server,
+    peer: *s2s_link.S2sLink,
+    origin_node: s2s_link.NodeId,
+    nicks: []const []const u8,
+) !void {
+    const alloc = std.testing.allocator;
+    try peer.init(.{
+        .allocator = alloc,
+        .local_node_id = origin_node,
+        .remote_node_id = server.config.node_id,
+        .local_epoch_ms = 1000,
+        .server_name = "relay-origin.test",
+        .config = .{ .require_signed_frames = false },
+    });
+    errdefer peer.deinit();
+    const link = try alloc.create(s2s_link.S2sLink);
+    var server_owns_link = false;
+    errdefer if (!server_owns_link) alloc.destroy(link);
+    try link.init(.{
+        .allocator = alloc,
+        .local_node_id = server.config.node_id,
+        .remote_node_id = origin_node,
+        .local_epoch_ms = 1001,
+        .server_name = "relay-receiver.test",
+        .config = .{ .require_signed_frames = false },
+    });
+    errdefer if (!server_owns_link) link.deinit();
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+    server_owns_link = true;
+
+    try peer.start(50);
+    for (nicks, 0..) |nick, index| try peer.sendMembership(
+        "#relay-home",
+        nick,
+        0,
+        100 + index,
+        true,
+        .{ .username = "relay", .host = "origin.test" },
+        "",
+    );
+    try pumpLinkPair(peer, link, alloc);
+    try std.testing.expect(link.established());
+    for (nicks) |nick| try std.testing.expectEqual(origin_node, server.meshNickHomeNode(nick).?);
+}
+
+test "verified webhook residence bypass is restricted to server-authored channel PRIVMSG" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var relay_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &relay_peer, 99, &.{"Remote"});
+    defer relay_peer.deinit();
+
+    const base = s2s_link.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_nick = "CI-Bot",
+        .source_prefix = "CI-Bot!webhook@relay-origin.test",
+        .text = "build passed",
+        .origin_node = 99,
+        .hlc = 1,
+    };
+    try std.testing.expect(server.isVerifiedWebhookRelay(base, .verified));
+    try std.testing.expect(!server.isVerifiedWebhookRelay(base, .unsigned));
+
+    var direct = base;
+    direct.target = "Victim";
+    try std.testing.expect(!server.isVerifiedWebhookRelay(direct, .verified));
+    var notice = base;
+    notice.verb = .notice;
+    try std.testing.expect(!server.isVerifiedWebhookRelay(notice, .verified));
+    var typed = base;
+    typed.data_tag = "comic";
+    try std.testing.expect(!server.isVerifiedWebhookRelay(typed, .verified));
+}
+
+/// Most legacy server fixtures predate physical attachment identifiers. SESSION
+/// SID tests must opt into the production-only stable row identity explicitly;
+/// a null attachment intentionally has no public SID.
+fn assignTestSessionAttachment(server: *Server, account: []const u8, id: client_model.ClientId, marker: u8) !void {
+    const cid = monitorIdFromClient(id);
+    const rows = try server.sessions.copySessionsAlloc(std.testing.allocator, account);
+    defer std.testing.allocator.free(rows);
+    const old = for (rows) |row| {
+        if (row.client == cid) break row;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(server.sessions.remove(account, cid));
+    const attachment = try sessions_mod.AttachmentId.fromBytes(@as([16]u8, @splat(marker)));
+    _ = try server.sessions.attachWithAttachment(account, cid, old.token, attachment, old.signon_ms);
 }
 
 test "remote QUIT marked mesh departures render once per local recipient across shared channels" {
@@ -56268,33 +59637,6 @@ const LiveClient = struct {
     }
 };
 
-test "remoteGrantWhoisStatus maps grant privilege bits to WHOIS 313 flags" {
-    // No grant bits (revocation tombstone): no operator line at all.
-    const none = remoteGrantWhoisStatus(0);
-    try std.testing.expect(!none.is_oper and !none.is_admin);
-
-    // oper_override alone: "is an IRC operator".
-    const override_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits();
-    const oper_only = remoteGrantWhoisStatus(override_bits);
-    try std.testing.expect(oper_only.is_oper);
-    try std.testing.expect(!oper_only.is_admin);
-
-    // server_admin upgrades the wording to Network Administrator.
-    const admin_bits = oper_mod.OperPrivileges.initMany(&.{ .oper_override, .server_admin }).toBits();
-    const admin = remoteGrantWhoisStatus(admin_bits);
-    try std.testing.expect(admin.is_oper);
-    try std.testing.expect(admin.is_admin);
-
-    // server_admin without oper_override still renders the operator line.
-    const admin_only = remoteGrantWhoisStatus(oper_mod.OperPrivileges.initMany(&.{.server_admin}).toBits());
-    try std.testing.expect(admin_only.is_oper);
-    try std.testing.expect(admin_only.is_admin);
-
-    // Unrelated privileges (no override/admin) stay silent in WHOIS.
-    const plain = remoteGrantWhoisStatus(oper_mod.OperPrivileges.initMany(&.{.client_kill}).toBits());
-    try std.testing.expect(!plain.is_oper and !plain.is_admin);
-}
-
 test "rebroadcastLocalOpers re-mints an oper homed on a non-zero shard" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
@@ -56314,7 +59656,7 @@ test "rebroadcastLocalOpers re-mints an oper homed on a non-zero shard" {
         try conn.session.setNick("kain");
         conn.session.loginAs("kain");
         conn.session.registration.registered = true;
-        conn.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+        try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
 
         // The read-only scan must cover every reactor; the re-mint lands in the
         // local grant registry (and best-effort broadcasts to secured peers).
@@ -57274,13 +60616,14 @@ test "UPGRADE resume: peer RESYNC re-burst of unchanged remote state emits zero 
     defer alloc.free(quiet);
     try std.testing.expectEqualStrings("", quiet);
 
-    // GENUINE changes after adoption still surface exactly once.
+    // Genuine member/topic changes after adoption still surface exactly once.
+    // The OCG1 tombstone remains telemetry and cannot emit a derived -Y.
     fx.successor.world.lockWrite();
     const op_voice: u4 = @truncate(chanmode.MemberModes.fromModes(&.{ .op, .voice }).bits);
     try pair.b.sendMembership("#root", "trev", op_voice, 950, true, ResyncQuietFixture.trev_ident, "kain");
     try pair.b.sendTopic("#root", "calm seas", "trev", 2000, 951, true);
     try fx.feedAndDrain(alloc, 952);
-    // Revocation tombstone: a genuine transition OUT of oper_override.
+    // Revocation tombstone: retained compatibility telemetry only.
     try std.testing.expect(try fx.applyRemintedGrant(102, 0));
     fx.successor.world.unlockWrite();
 
@@ -57288,17 +60631,16 @@ test "UPGRADE resume: peer RESYNC re-burst of unchanged remote state emits zero 
     defer alloc.free(changed);
     try std.testing.expect(std.mem.indexOf(u8, changed, "MODE #root +v trev") != null);
     try std.testing.expect(std.mem.indexOf(u8, changed, "TOPIC #root :calm seas") != null);
-    try std.testing.expect(std.mem.indexOf(u8, changed, "MODE #root -Y trev") != null);
     // Exactly once each.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, changed, "TOPIC #root"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, changed, "-Y trev"));
+    try std.testing.expect(std.mem.indexOf(u8, changed, "-Y trev") == null);
     // And still no spurious re-JOIN anywhere in the whole exchange.
     try std.testing.expect(std.mem.indexOf(u8, changed, "JOIN") == null);
     try std.testing.expect(std.mem.indexOf(u8, changed, "NICK") == null);
     try std.testing.expect(std.mem.indexOf(u8, changed, "+Y") == null);
 }
 
-test "UPGRADE resume negative control: without the carried grant registry the RESYNC re-mint re-announces +Y" {
+test "UPGRADE resume without carried OCG1 registry still never projects +Y" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
@@ -57325,12 +60667,11 @@ test "UPGRADE resume negative control: without the carried grant registry the RE
     ));
     fx.successor.world.unlockWrite();
 
-    // The observed live bug reproduced: the unchanged oper's re-mint announces
-    // a spurious `MODE #root +Y trev`, and an un-carried topic re-announces —
-    // proving the quiet test above has teeth.
+    // The un-carried topic legitimately re-announces, but an OCG1 re-mint is
+    // inactive telemetry and cannot announce a derived operator prefix.
     const noisy = try copyTestSendQ(alloc, fx.alice);
     defer alloc.free(noisy);
-    try std.testing.expect(std.mem.indexOf(u8, noisy, "MODE #root +Y trev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, noisy, "MODE #root +Y trev") == null);
     try std.testing.expect(std.mem.indexOf(u8, noisy, "TOPIC #root :stormy weather") != null);
 }
 
@@ -57797,7 +61138,7 @@ test "periodic timer tick re-mints live oper grants inside the TTL" {
         const id = try addTestLocalClient(&server, "kain", "kain");
         const conn = server.connFor(id).?;
         conn.session.registration.registered = true;
-        conn.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+        try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
 
         // Seed a nearly-lapsed grant, as if minted almost a full TTL ago. With
         // no periodic re-mint, lookup starts returning null the moment it
@@ -58001,7 +61342,7 @@ test "emitLabeledIssuer: single captured line is tagged with the label" {
     var cb: [256]u8 = undefined;
     var cap = ReplyCapture{ .buf = &cb };
     cap.append(":onyx 351 me v :info\r\n");
-    try emitLabeledIssuer(&conn, "lbl1", &cap);
+    try emitLabeledIssuer(&conn, "lbl1", &cap, std.testing.allocator);
     try std.testing.expectEqualStrings("@label=lbl1 :onyx 351 me v :info\r\n", conn.send_buf[0..conn.send_len]);
 }
 
@@ -58011,32 +61352,111 @@ test "emitLabeledIssuer: multi-line response is a labeled BATCH" {
     var cap = ReplyCapture{ .buf = &cb };
     cap.append(":onyx 311 me nick u h * :n\r\n");
     cap.append(":onyx 318 me nick :End\r\n");
-    try emitLabeledIssuer(&conn, "w1", &cap);
-    const out = conn.send_buf[0..conn.send_len];
-    try expectContains(out, "@label=w1 BATCH +suzu-label labeled-response\r\n");
-    try expectContains(out, "@batch=suzu-label :onyx 311 me nick u h * :n\r\n");
-    try expectContains(out, "@batch=suzu-label :onyx 318 me nick :End\r\n");
-    try expectContains(out, "BATCH -suzu-label\r\n");
+    try emitLabeledIssuer(&conn, "w1", &cap, std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@label=w1 BATCH +suzu-label labeled-response\r\n" ++
+            "@batch=suzu-label :onyx 311 me nick u h * :n\r\n" ++
+            "@batch=suzu-label :onyx 318 me nick :End\r\n" ++
+            "BATCH -suzu-label\r\n",
+        conn.send_buf[0..conn.send_len],
+    );
+}
+
+test "emitLabeledIssuer: labels an existing CHATHISTORY batch without nesting" {
+    var conn = ConnState.init(-1);
+    var cb: [512]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    const captured =
+        "BATCH +history chathistory #secure\r\n" ++
+        "@batch=history;time=2026-08-14T10:11:12.013Z;msgid=m1;+onyx/e2ee=mls :alice PRIVMSG #secure :ONYXROOM1.payload\r\n" ++
+        "BATCH -history\r\n";
+    cap.append(captured);
+    try emitLabeledIssuer(&conn, "hist-1", &cap, std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@label=hist-1 BATCH +history chathistory #secure\r\n" ++
+            "@batch=history;time=2026-08-14T10:11:12.013Z;msgid=m1;+onyx/e2ee=mls :alice PRIVMSG #secure :ONYXROOM1.payload\r\n" ++
+            "BATCH -history\r\n",
+        conn.send_buf[0..conn.send_len],
+    );
+}
+
+test "emitLabeledIssuer: labels an existing CHATHISTORY TARGETS batch without nesting" {
+    var conn = ConnState.init(-1);
+    var cb: [384]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(
+        "BATCH +targets draft/chathistory-targets\r\n" ++
+            "@batch=targets :onyx CHATHISTORY TARGETS #secure timestamp=2026-08-14T10:11:12.013Z\r\n" ++
+            "BATCH -targets\r\n",
+    );
+    try emitLabeledIssuer(&conn, "targets-1", &cap, std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@label=targets-1 BATCH +targets draft/chathistory-targets\r\n" ++
+            "@batch=targets :onyx CHATHISTORY TARGETS #secure timestamp=2026-08-14T10:11:12.013Z\r\n" ++
+            "BATCH -targets\r\n",
+        conn.send_buf[0..conn.send_len],
+    );
+}
+
+test "emitLabeledIssuer: rejects malformed CHATHISTORY batch atomically" {
+    var conn = ConnState.init(-1);
+    var cb: [512]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(
+        "BATCH +history chathistory #secure\r\n" ++
+            "@batch=wrong;time=2026-08-14T10:11:12.013Z;msgid=m1 :alice PRIVMSG #secure :hello\r\n" ++
+            "BATCH -history\r\n",
+    );
+    try std.testing.expectError(error.OutputTooSmall, emitLabeledIssuer(&conn, "hist-1", &cap, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
+}
+
+test "emitLabeledIssuer: rejects unsafe CHATHISTORY batch references atomically" {
+    var conn = ConnState.init(-1);
+    var cb: [512]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(
+        "BATCH +bad;ref chathistory #secure\r\n" ++
+            "@batch=bad;ref;time=2026-08-14T10:11:12.013Z;msgid=m1 :alice PRIVMSG #secure :hello\r\n" ++
+            "BATCH -bad;ref\r\n",
+    );
+    try std.testing.expectError(error.OutputTooSmall, emitLabeledIssuer(&conn, "hist-1", &cap, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
+}
+
+test "emitLabeledIssuer: rejects an applicable batch when SendQ cannot fit it" {
+    var conn = ConnState.init(-1);
+    conn.sendq_cap = 8;
+    var cb: [256]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(
+        "BATCH +history chathistory #secure\r\n" ++
+            "@batch=history;time=2026-08-14T10:11:12.013Z;msgid=m1 :alice PRIVMSG #secure :hello\r\n" ++
+            "BATCH -history\r\n",
+    );
+    try std.testing.expectError(error.OutputTooSmall, emitLabeledIssuer(&conn, "hist-1", &cap, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
 }
 
 test "emitLabeledIssuer: a command that replies nothing yields a bare ACK" {
     var conn = ConnState.init(-1);
     var cb: [64]u8 = undefined;
     var cap = ReplyCapture{ .buf = &cb };
-    try emitLabeledIssuer(&conn, "pong7", &cap);
+    try emitLabeledIssuer(&conn, "pong7", &cap, std.testing.allocator);
     try std.testing.expectEqualStrings("@label=pong7 ACK\r\n", conn.send_buf[0..conn.send_len]);
 }
 
-test "emitLabeledIssuer: capture overflow delivers the reply unwrapped" {
+test "emitLabeledIssuer: capture overflow fails closed without a partial line" {
     var conn = ConnState.init(-1);
     var cb: [16]u8 = undefined;
     var cap = ReplyCapture{ .buf = &cb };
     cap.append(":onyx 351 me v :a really long info line that overflows\r\n");
     try std.testing.expect(cap.overflowed);
-    try emitLabeledIssuer(&conn, "x", &cap);
-    const out = conn.send_buf[0..conn.send_len];
-    try std.testing.expect(std.mem.indexOf(u8, out, "@label=") == null);
-    try std.testing.expectEqualStrings(cap.captured(), out);
+    try std.testing.expectError(error.OutputTooSmall, emitLabeledIssuer(&conn, "x", &cap, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
 }
 
 test "threaded server: a labeled WHOIS is reframed under the @label via SerpentRegistry" {
@@ -58497,7 +61917,7 @@ test "enforceDnsbl fails open: no resolver, an unresolved IP, and opers all pass
         try std.testing.expect(!server.enforceDnsbl(conn));
 
         // Operators are exempt even if a verdict existed.
-        conn.session.setOperGrant(oper_mod.OperPrivileges.fromBits(~@as(u64, 0)), "netadmin", "Admin");
+        try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.fromBits(~@as(u64, 0)), "netadmin", "Admin");
         try std.testing.expect(!server.enforceDnsbl(conn));
     } else return error.SkipZigTest;
 }
@@ -58852,7 +62272,7 @@ test "KEYTRANS exposes credential transparency root and inclusion proof" {
     conn.send_len = 0;
     try server.handleKeyTrans(conn, &status);
     const root_hex = std.fmt.bytesToHex(kt.root(), .lower);
-    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS STATUS enabled entries=2 root=");
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS STATUS enabled semantics=observational scope=node-local entries=2 root=");
     try expectContains(conn.send_buf[0..conn.send_len], &root_hex);
 
     var proof = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
@@ -58869,6 +62289,1845 @@ test "KEYTRANS exposes credential transparency root and inclusion proof" {
     conn.send_len = 0;
     try server.handleKeyTrans(conn, &proof);
     try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NO_SUCH_LEAF");
+
+    var event_lv = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    event_lv.params[0] = "EVENT";
+    event_lv.params[1] = "1";
+    event_lv.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &event_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS EVENT position=1 size=2 account=alice kind=webauthn action=bind key_id=credAAA");
+    try expectContains(conn.send_buf[0..conn.send_len], "leaf=");
+
+    var consist = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    consist.params[0] = "CONSISTENCY";
+    consist.params[1] = "1";
+    consist.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &consist);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS UNKNOWN_CHECKPOINT");
+
+    consist.params[1] = "0";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &consist);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS CONSISTENCY old_size=0");
+    try expectContains(conn.send_buf[0..conn.send_len], "prefix=match scheme=checkpoint-comparison");
+
+    consist.params[1] = "9";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &consist);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS BAD_SIZE");
+
+    event_lv.params[1] = "9";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &event_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NO_SUCH_LEAF");
+
+    var need = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    need.params[0] = "EVENT";
+    need.param_count = 1;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &need);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NEED_MORE_PARAMS");
+
+    need.params[0] = "DEVICE";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &need);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NEED_MORE_PARAMS");
+}
+
+test "KEYTRANS DEVICE and EVENT survive store restart" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wal_name = "server-keytrans-restart.wal";
+    var first_root: [64]u8 = undefined;
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        try services.recordExternalKeyTransparencyEvent("Alice", .e2ee_device, .bind, "phone", "mls-x25519:abcd+/=", 11);
+        try services.recordExternalKeyTransparencyEvent("Alice", .e2ee_device, .delete, "phone", "mls-x25519:abcd+/=", 12);
+        first_root = std.fmt.bytesToHex(kt.root(), .lower);
+    }
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+    try std.testing.expectEqualStrings(&first_root, &std.fmt.bytesToHex(kt.root(), .lower));
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "kain", null);
+    const conn = server.connFor(id).?;
+
+    var device = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    device.params[0] = "DEVICE";
+    device.params[1] = "ALICE";
+    device.params[2] = "phone";
+    device.param_count = 3;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS DEVICE account=alice id=phone observation=delete scope=node-local position=1 size=2");
+
+    device.params[2] = "missing";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NO_SUCH_DEVICE");
+
+    var event_lv = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    event_lv.params[0] = "EVENT";
+    event_lv.params[1] = "0";
+    event_lv.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &event_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS EVENT position=0 size=2 account=alice kind=e2ee_device action=bind key_id=phone");
+
+    var consist = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    consist.params[0] = "CONSISTENCY";
+    consist.params[1] = "1";
+    consist.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &consist);
+    try expectContains(conn.send_buf[0..conn.send_len], "prefix=match scheme=checkpoint-comparison");
+
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+}
+
+test "KEYTRANS DEVICE reports bound then deleted and rejects a bad account" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-keytrans-device.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "phone", "pub", 1);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "kain", null);
+    const conn = server.connFor(id).?;
+
+    var device = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    device.params[0] = "DEVICE";
+    device.params[1] = "Alice";
+    device.params[2] = "phone";
+    device.param_count = 3;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS DEVICE account=alice id=phone observation=bind scope=node-local position=0 size=1");
+
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .delete, "phone", "pub", 2);
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "observation=delete scope=node-local position=1 size=2");
+
+    device.params[1] = "!!!";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS BAD_ACCOUNT");
+}
+
+test "KEYTRANS corrupt store is fail-closed and restore is idempotent" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const kt_store = @import("key_transparency_store.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-keytrans-corrupt.wal");
+    defer store.deinit();
+    {
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "phone", "pub", 1);
+        services.attachKeyTransparencyLog(&kt);
+        try std.testing.expectEqual(@as(usize, 1), kt.len());
+        var ev_key: [kt_store.event_key_len]u8 = undefined;
+        try store.family(.props).put(kt_store.eventKey(0, &ev_key), "junk");
+    }
+
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expect(kt.unusable);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "kain", null);
+    const conn = server.connFor(id).?;
+
+    var status = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    status.params[0] = "STATUS";
+    status.param_count = 1;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &status);
+    try expectContains(conn.send_buf[0..conn.send_len], "KEYTRANS STATUS unavailable");
+
+    var event_lv = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    event_lv.params[0] = "EVENT";
+    event_lv.params[1] = "0";
+    event_lv.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &event_lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS TEMPORARILY_UNAVAILABLE");
+
+    var device = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    device.params[0] = "DEVICE";
+    device.params[1] = "alice";
+    device.params[2] = "phone";
+    device.param_count = 3;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &device);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS TEMPORARILY_UNAVAILABLE");
+
+    var consist = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    consist.params[0] = "CONSISTENCY";
+    consist.params[1] = "0";
+    consist.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &consist);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS TEMPORARILY_UNAVAILABLE");
+}
+
+test "DPROP1 startup authority union rejects partial and mismatched configurations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-dprop-boot-invariants.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc1)), "dprop-boot-invariants.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    try std.testing.expect((try validateDurableDeviceBoot(.{ .port = 0 })) == .inactive);
+    try std.testing.expect((try validateDurableDeviceBoot(.{ .port = 0, .durable_device_boot = .purge_only })) == .purge_only);
+    try std.testing.expectError(error.DurableDeviceActivationFailed, validateDurableDeviceBoot(.{
+        .port = 0,
+        .node_identity = &identity,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }));
+    services.attachDurableCredentialProps(&state);
+    try std.testing.expectError(error.DurableDeviceActivationFailed, validateDurableDeviceBoot(.{
+        .port = 0,
+        .node_id = identity.shortId() +% 1,
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }));
+    const valid = try validateDurableDeviceBoot(.{
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    });
+    try std.testing.expect(valid == .authoritative);
+    try std.testing.expect(valid.authoritative.state == &state);
+}
+
+test "DPROP1 shared cold-hot candidate is purge-first idempotent allocation-failure atomic" {
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc2)), "dprop-candidate.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    var pubkey: [entity_prop_event.pubkey_len]u8 = undefined;
+    var signature: [entity_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedEntityProp(
+        &identity.sign_kp,
+        .user,
+        "alice",
+        "e2ee.device.phone",
+        "mls-x25519:abcd+/=",
+        "alice",
+        17,
+        true,
+        &pubkey,
+        &signature,
+    );
+    var prepared = switch (try state.prepare(.{
+        .present = fact.present,
+        .kind = fact.kind,
+        .origin_node = fact.origin_node,
+        .hlc = fact.hlc,
+        .entity = fact.entity,
+        .key = fact.key,
+        .value = fact.value,
+        .owner = fact.owner,
+        .origin_pubkey = fact.origin_pubkey,
+        .origin_sig = fact.origin_sig,
+    })) {
+        .update => |update| update,
+        else => return error.TestUnexpectedResult,
+    };
+    prepared.commitInto(&state);
+
+    var base = ircx_prop_store.DefaultStore.init(std.testing.allocator);
+    defer base.deinit();
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    _ = try base.setProp(entity, "ordinary", "keep", .{ .id = "alice", .access = .user });
+    _ = try base.setProp(entity, "e2ee.device.stale", "mls-x25519:stale+/=", .{ .id = "alice", .access = .user });
+    var channels: prop_checkpoint.ChannelClockMap = .empty;
+    defer channels.deinit(std.testing.allocator);
+    var entities: prop_checkpoint.EntityClockMap = .empty;
+    defer entities.deinit(std.testing.allocator);
+    var purged = try buildConfiguredDurableDeviceCandidate(std.testing.allocator, &base, &channels, &entities, .purge_only);
+    defer purged.deinit();
+    try std.testing.expectEqualStrings("keep", (try purged.props.getProp(entity, "ordinary")).value);
+    try std.testing.expectError(error.PropMissing, purged.props.getProp(entity, "e2ee.device.stale"));
+    try std.testing.expect(purged.entity_clocks.count() == 0);
+    const plan = DurableDevicePlan{ .authoritative = .{
+        .state = &state,
+        .local_origin_node = identity.shortId(),
+        .local_origin_pubkey = identity.sign_kp.public_key,
+    } };
+    var first = try buildConfiguredDurableDeviceCandidate(std.testing.allocator, &base, &channels, &entities, plan);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("keep", (try first.props.getProp(entity, "ordinary")).value);
+    try std.testing.expectError(error.PropMissing, first.props.getProp(entity, "e2ee.device.stale"));
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try first.props.getProp(entity, "e2ee.device.phone")).value);
+    var second = try buildConfiguredDurableDeviceCandidate(
+        std.testing.allocator,
+        &first.props,
+        &first.channel_clocks,
+        &first.entity_clocks,
+        plan,
+    );
+    defer second.deinit();
+    const first_wire = try prop_checkpoint.encode(std.testing.allocator, &first.props, &first.channel_clocks, &first.entity_clocks);
+    defer std.testing.allocator.free(first_wire);
+    const second_wire = try prop_checkpoint.encode(std.testing.allocator, &second.props, &second.channel_clocks, &second.entity_clocks);
+    defer std.testing.allocator.free(second_wire);
+    try std.testing.expectEqualSlices(u8, first_wire, second_wire);
+
+    const Sweep = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            props: *const ircx_prop_store.DefaultStore,
+            channel_clocks: *const prop_checkpoint.ChannelClockMap,
+            entity_clocks: *const prop_checkpoint.EntityClockMap,
+            durable: *const durable_credential_props.State,
+            origin: u64,
+            public_key: [entity_prop_event.pubkey_len]u8,
+        ) !void {
+            const local_entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+            var candidate = buildConfiguredDurableDeviceCandidate(allocator, props, channel_clocks, entity_clocks, .{ .authoritative = .{
+                .state = @constCast(durable),
+                .local_origin_node = origin,
+                .local_origin_pubkey = public_key,
+            } }) catch |err| switch (err) {
+                // PROP's public API intentionally normalizes allocation failure
+                // to its capacity error. Translate only inside this deterministic
+                // allocator sweep so the harness advances to the next failpoint.
+                error.CapacityExceeded => return error.OutOfMemory,
+                else => return err,
+            };
+            defer candidate.deinit();
+            _ = try candidate.props.getProp(local_entity, "e2ee.device.phone");
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{
+        &base,
+        &channels,
+        &entities,
+        &state,
+        identity.shortId(),
+        identity.sign_kp.public_key,
+    });
+}
+
+test "DPROP1 cold activation publishes exact authority and stays observationally silent" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-dprop-cold-activate.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc3)), "dprop-cold-activate.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    var pubkey: [entity_prop_event.pubkey_len]u8 = undefined;
+    var signature: [entity_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedEntityProp(&identity.sign_kp, .user, "alice", "e2ee.device.phone", "mls-x25519:abcd+/=", "alice", 19, true, &pubkey, &signature);
+    var prepared = switch (try state.prepare(.{
+        .present = fact.present,
+        .kind = fact.kind,
+        .origin_node = fact.origin_node,
+        .hlc = fact.hlc,
+        .entity = fact.entity,
+        .key = fact.key,
+        .value = fact.value,
+        .owner = fact.owner,
+        .origin_pubkey = fact.origin_pubkey,
+        .origin_sig = fact.origin_sig,
+    })) {
+        .update => |update| update,
+        else => return error.TestUnexpectedResult,
+    };
+    prepared.commitInto(&state);
+    var transparency = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer transparency.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+    services.attachKeyTransparencyLog(&transparency);
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try server.props.getProp(entity, "e2ee.device.phone")).value);
+    try std.testing.expectEqual(@as(u64, 19), server.entityPropClock(.user, "alice", "e2ee.device.phone").?.hlc);
+    try std.testing.expect(server.mesh_clock.last_stamp >= 19);
+    try std.testing.expectEqual(@as(usize, 0), transparency.len());
+}
+
+fn commitDurableDeviceFactForBootTest(
+    state: *durable_credential_props.State,
+    identity: *const node_identity.NodeIdentity,
+    hlc: u64,
+) !void {
+    var pubkey: [entity_prop_event.pubkey_len]u8 = undefined;
+    var signature: [entity_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedEntityProp(
+        &identity.sign_kp,
+        .user,
+        "alice",
+        "e2ee.device.phone",
+        "mls-x25519:abcd+/=",
+        "alice",
+        hlc,
+        true,
+        &pubkey,
+        &signature,
+    );
+    var prepared = switch (try state.prepare(.{
+        .present = fact.present,
+        .kind = fact.kind,
+        .origin_node = fact.origin_node,
+        .hlc = fact.hlc,
+        .entity = fact.entity,
+        .key = fact.key,
+        .value = fact.value,
+        .owner = fact.owner,
+        .origin_pubkey = fact.origin_pubkey,
+        .origin_sig = fact.origin_sig,
+    })) {
+        .update => |update| update,
+        else => return error.TestUnexpectedResult,
+    };
+    prepared.commitInto(state);
+}
+
+test "DPROP1 hot activation without PRPC restores authority and is observationally silent" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const predecessor = createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var complete: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer complete.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &complete, &blobs);
+    var without_prpc: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer without_prpc.deinit(alloc);
+    for (complete.items) |piece| {
+        if (piece.kind == .mesh_checkpoint and prop_checkpoint.isUpgradeCheckpoint(piece.bytes)) continue;
+        try without_prpc.append(alloc, piece);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-hot-no-prpc.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc4)), "dprop-hot-no-prpc.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(alloc, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    var transparency = key_transparency.KeyTransparencyLog.init(alloc);
+    defer transparency.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+    services.attachKeyTransparencyLog(&transparency);
+    const successor = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    const sentinel = ircx_prop_store.Entity{ .kind = .user, .id = "sentinel" };
+    _ = try successor.props.setProp(sentinel, "ordinary", "keep", .{ .id = "sentinel", .access = .user });
+    try commitDurableDeviceFactForBootTest(&state, &identity, 29);
+    const changes_before = store.changeCount();
+    const transparency_before = transparency.len();
+
+    _ = try adoptUpgradePiecesForTest(successor, without_prpc.items, "onyx-test-dprop-hot-no-prpc");
+    current_reactor = null;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    try std.testing.expectEqualStrings("keep", (try successor.props.getProp(sentinel, "ordinary")).value);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try successor.props.getProp(entity, "e2ee.device.phone")).value);
+    try std.testing.expectEqual(@as(u64, 29), successor.entityPropClock(.user, "alice", "e2ee.device.phone").?.hlc);
+    try std.testing.expectEqual(changes_before, store.changeCount());
+    try std.testing.expectEqual(transparency_before, transparency.len());
+}
+
+test "DPROP1 hot carried conflict is purge-first authority-wins and final edge allocates nothing" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const predecessor = createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    _ = try predecessor.props.setProp(entity, "ordinary", "carried", .{ .id = "alice", .access = .user });
+    _ = try predecessor.props.setProp(entity, "e2ee.device.phone", "mls-x25519:carried-conflict+/=", .{ .id = "alice", .access = .user });
+    try std.testing.expect(predecessor.recordEntityPropClock(
+        .user,
+        "alice",
+        "e2ee.device.phone",
+        "alice",
+        31,
+        true,
+        7,
+        "",
+        "",
+    ));
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    const future_device_hlc = ((predecessor.meshWallMs() + mesh_clock_mod.default_max_future_skew_ms + 60_000) << mesh_clock_mod.seq_bits) | 1;
+    predecessor.entityPropClock(.user, "alice", "e2ee.device.phone").?.hlc = future_device_hlc;
+    const conflicting_prpc = try prop_checkpoint.encode(
+        alloc,
+        &predecessor.props,
+        &predecessor.channel_prop_clocks,
+        &predecessor.entity_prop_clocks,
+    );
+    defer alloc.free(conflicting_prpc);
+    try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .property, .{
+        .kind = .mesh_checkpoint,
+        .bytes = conflicting_prpc,
+        .min_supported = 2,
+    }));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-hot-conflict.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc6)), "dprop-hot-conflict.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(alloc, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    try commitDurableDeviceFactForBootTest(&state, &identity, 41);
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    const successor = createTestServer(failing.allocator(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        test_dprop_commit_fail_index = null;
+        test_dprop_commit_alloc_index = null;
+        failing.fail_index = std.math.maxInt(usize);
+        successor.deinit();
+        failing.allocator().destroy(successor);
+    }
+    test_dprop_commit_fail_index = &failing.fail_index;
+    test_dprop_commit_alloc_index = &failing.alloc_index;
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-dprop-hot-conflict");
+    current_reactor = null;
+
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectError(error.OutOfMemory, failing.allocator().alloc(u8, 1));
+    try std.testing.expect(failing.has_induced_failure);
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqualStrings("carried", (try successor.props.getProp(entity, "ordinary")).value);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try successor.props.getProp(entity, "e2ee.device.phone")).value);
+    try std.testing.expectEqual(@as(u64, 41), successor.entityPropClock(.user, "alice", "e2ee.device.phone").?.hlc);
+    try std.testing.expect(successor.mesh_clock.last_stamp < future_device_hlc);
+}
+
+test "DPROP1 hot unrelated future PRPC clock is fatal and leaves causal triplet exact" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const predecessor = createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    const unrelated = ircx_prop_store.Entity{ .kind = .user, .id = "bob" };
+    _ = try predecessor.props.setProp(unrelated, "BIO", "future ordinary", .{ .id = "bob", .access = .user });
+    try std.testing.expect(predecessor.recordEntityPropClock(.user, "bob", "BIO", "bob", 37, true, 9, "", ""));
+    const future_hlc = ((predecessor.meshWallMs() + mesh_clock_mod.default_max_future_skew_ms + 60_000) << mesh_clock_mod.seq_bits) | 1;
+    predecessor.entityPropClock(.user, "bob", "BIO").?.hlc = future_hlc;
+    const future_prpc = try prop_checkpoint.encode(
+        alloc,
+        &predecessor.props,
+        &predecessor.channel_prop_clocks,
+        &predecessor.entity_prop_clocks,
+    );
+    defer alloc.free(future_prpc);
+    try std.testing.expect(replaceUpgradeFixtureAuthority(&pieces, .property, .{
+        .kind = .mesh_checkpoint,
+        .bytes = future_prpc,
+        .min_supported = 2,
+    }));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-hot-future.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc5)), "dprop-hot-future.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(alloc, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    try commitDurableDeviceFactForBootTest(&state, &identity, 29);
+    var transparency = key_transparency.KeyTransparencyLog.init(alloc);
+    defer transparency.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+    services.attachKeyTransparencyLog(&transparency);
+    const successor = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    const sentinel = ircx_prop_store.Entity{ .kind = .user, .id = "sentinel" };
+    _ = try successor.props.setProp(sentinel, "ordinary", "keep", .{ .id = "sentinel", .access = .user });
+    const triplet_before = try prop_checkpoint.encode(
+        alloc,
+        &successor.props,
+        &successor.channel_prop_clocks,
+        &successor.entity_prop_clocks,
+    );
+    defer alloc.free(triplet_before);
+    const clock_before = successor.mesh_clock;
+    const epoch_before = successor.migration_offer_epoch;
+    const changes_before = store.changeCount();
+    const transparency_before = transparency.len();
+
+    _ = try rejectDurableUpgradePiecesForTest(successor, pieces.items, "onyx-test-dprop-hot-future");
+    current_reactor = null;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    try std.testing.expectEqualStrings("keep", (try successor.props.getProp(sentinel, "ordinary")).value);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try successor.props.getProp(entity, "e2ee.device.phone")).value);
+    try std.testing.expectError(error.PropMissing, successor.props.getProp(unrelated, "BIO"));
+    const triplet_after = try prop_checkpoint.encode(
+        alloc,
+        &successor.props,
+        &successor.channel_prop_clocks,
+        &successor.entity_prop_clocks,
+    );
+    defer alloc.free(triplet_after);
+    try std.testing.expectEqualSlices(u8, triplet_before, triplet_after);
+    try std.testing.expectEqual(clock_before, successor.mesh_clock);
+    try std.testing.expectEqual(epoch_before, successor.migration_offer_epoch);
+    try std.testing.expectEqual(changes_before, store.changeCount());
+    try std.testing.expectEqual(transparency_before, transparency.len());
+}
+
+test "DPROP1 cold startup without mandatory signer rejects local device writes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wal_name = "server-kt-cold-obs.wal";
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const id = try addTestLocalClient(&server, "Alice", "alice");
+        const conn = server.connFor(id).?;
+        var add = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+        add.params[0] = "ADD";
+        add.params[1] = "phone";
+        add.params[2] = "mls-x25519";
+        add.params[3] = "abcd+/=";
+        add.param_count = 4;
+        try server.handleE2eeKey(conn, &add);
+        try std.testing.expectEqual(@as(usize, 0), kt.len());
+        try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY SIGNER_UNAVAILABLE");
+        try std.testing.expectError(error.PropMissing, server.props.getProp(.{ .kind = .user, .id = "Alice" }, "e2ee.device.phone"));
+    }
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expectError(error.PropMissing, server.props.getProp(.{ .kind = .user, .id = "Alice" }, "e2ee.device.phone"));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+}
+
+test "KEYTRANS local mutation does not rollback or false-fail when observation is unavailable" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-no-rollback.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try services.recordExternalKeyTransparencyEvent("alice", .e2ee_device, .bind, "seed", "pub", 1);
+    const kt_store = @import("key_transparency_store.zig");
+    var ev_key: [kt_store.event_key_len]u8 = undefined;
+    try store.family(.props).put(kt_store.eventKey(0, &ev_key), "junk");
+
+    var kt2 = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt2.deinit();
+    var services2 = services_mod.Services.init(&store, null);
+    services2.attachKeyTransparencyLog(&kt2);
+    try std.testing.expect(kt2.unusable);
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd5)), "dprop-server-kt-unavailable.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    services2.attachDurableCredentialProps(&dprop);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services2, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    var add = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    add.params[0] = "ADD";
+    add.params[1] = "phone";
+    add.params[2] = "mls-x25519";
+    add.params[3] = "abcd+/=";
+    add.param_count = 4;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &add);
+    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY ADDED id=phone");
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+    try std.testing.expectEqualStrings(
+        "mls-x25519:abcd+/=",
+        (try server.props.getProp(.{ .kind = .user, .id = "Alice" }, "e2ee.device.phone")).value,
+    );
+    try std.testing.expectEqual(@as(usize, 0), kt2.len());
+}
+
+test "DPROP1 remote user device ENTITY_PROP is quarantined before all admission side effects" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-remote-once.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const before_stamp = server.mesh_clock.last_stamp;
+    var first = makeEntityPropChange(.user, "bob", "e2ee.device.phone", "mls-x25519:abcd+/=", 100, 0xA);
+    try std.testing.expect(!server.applyRemoteEntityProp(&first));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expectEqual(@as(u64, 1), server.remote_device_props_quarantined);
+    try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+    try std.testing.expectEqual(@as(usize, 0), server.entity_prop_clocks.count());
+    try std.testing.expectError(error.PropMissing, server.props.getProp(.{ .kind = .user, .id = "bob" }, "e2ee.device.phone"));
+
+    var malformed = makeEntityPropChange(.user, "bob", "E2EE.DEVICE.", "garbage", 101, 0xB);
+    try std.testing.expect(!server.applyRemoteEntityProp(&malformed));
+    try std.testing.expectEqual(@as(u64, 2), server.remote_device_props_quarantined);
+    try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+
+    // Non-device user facts retain their existing remote path.
+    var other = makeEntityPropChange(.user, "bob", "display.pronouns", "they", 200, 0xB);
+    try std.testing.expect(server.applyRemoteEntityProp(&other));
+    try std.testing.expectEqualStrings("they", (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "display.pronouns")).value);
+
+    var ident = makeEntityPropChange(.user, "bob", "identity.key.primary", "home-A-key-value", 250, 0xA);
+    try std.testing.expect(!server.applyRemoteEntityProp(&ident));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expect(!server.applyRemoteEntityProp(&ident));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expectEqual(@as(u64, 2), server.remote_identity_props_quarantined);
+}
+
+test "DPROP1 remote device quarantine persists as policy across restart" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wal_name = "server-kt-remote-replay.wal";
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        var first = makeEntityPropChange(.user, "bob", "e2ee.device.phone", "mls-x25519:abcd+/=", 100, 0xA);
+        try std.testing.expect(!server.applyRemoteEntityProp(&first));
+        try std.testing.expectEqual(@as(usize, 0), kt.len());
+    }
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expectError(error.PropMissing, server.props.getProp(.{ .kind = .user, .id = "bob" }, "e2ee.device.phone"));
+    var replay = makeEntityPropChange(.user, "bob", "e2ee.device.phone", "mls-x25519:abcd+/=", 100, 0xA);
+    try std.testing.expect(!server.applyRemoteEntityProp(&replay));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expectEqual(@as(u64, 1), server.remote_device_props_quarantined);
+}
+
+test "KEYTRANS generic local PROP observes exact user credential keys" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-observe.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd6)), "dprop-server-prop.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(std.testing.allocator, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    services.attachDurableCredentialProps(&dprop);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+
+    var set_line = try irc_line.parseLine("PROP Alice e2ee.device.phone :mls-x25519:abcd+/=");
+    try server.handleProp(id, conn, &set_line);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+    try std.testing.expectEqual(key_transparency.Action.bind, (try kt.eventAt(0)).action);
+    const clock = server.entityPropClock(.user, "Alice", "e2ee.device.phone").?;
+    try std.testing.expectEqual(@as(i64, @intCast(clock.hlc)), (try kt.eventAt(0)).timestamp_ms);
+
+    conn.send_len = 0;
+    var del_line = try irc_line.parseLine("PROP Alice e2ee.device.phone :");
+    try server.handleProp(id, conn, &del_line);
+    try std.testing.expectEqual(@as(usize, 2), kt.len());
+    try std.testing.expectEqual(key_transparency.Action.delete, (try kt.eventAt(1)).action);
+    try expectContains(conn.send_buf[0..conn.send_len], " 819 ");
+}
+
+test "KEYTRANS generic local PROP identity.key is observed and residence is not" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-ident.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+
+    var ident = try irc_line.parseLine("PROP Alice identity.key.primary :home-A-key-value");
+    try server.handleProp(id, conn, &ident);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+    try std.testing.expectEqual(key_transparency.CredentialKind.identity, (try kt.eventAt(0)).kind);
+
+    var residence = try irc_line.parseLine("PROP Alice identity.residence.0000000000000001 :proof");
+    try server.handleProp(id, conn, &residence);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+
+    var unrelated = try irc_line.parseLine("PROP Alice STATUS :hello");
+    try server.handleProp(id, conn, &unrelated);
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+}
+
+test "KEYTRANS generic local PROP rejects and member entities do not observe" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-reject.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const alice_id = try addTestLocalClient(&server, "Alice", "Alice");
+    const alice = server.connFor(alice_id).?;
+    alice.ircx = true;
+    const bob_id = try addTestLocalClient(&server, "Bob", "Bob");
+    const bob = server.connFor(bob_id).?;
+    bob.ircx = true;
+
+    var steal = try irc_line.parseLine("PROP Alice e2ee.device.phone :mls-x25519:abcd+/=");
+    try server.handleProp(bob_id, bob, &steal);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+
+    _ = try server.world.join("#room", worldIdFromClient(alice_id));
+    _ = try server.world.setMemberMode("#room", worldIdFromClient(alice_id), .op, true);
+    var member = try irc_line.parseLine("PROP #room:Alice e2ee.device.phone :mls-x25519:abcd+/=");
+    try server.handleProp(alice_id, alice, &member);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+}
+
+test "KEYTRANS generic local PROP missing delete does not observe" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-missing-del.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+    var del_line = try irc_line.parseLine("PROP Alice e2ee.device.missing :");
+    try server.handleProp(id, conn, &del_line);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+}
+
+test "DPROP1 remote device origin cannot bypass quarantine after cold restart" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wal_name = "server-kt-origin-restart.wal";
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        var first = makeEntityPropChange(.user, "bob", "e2ee.device.phone", "mls-x25519:abcd+/=", 100, 0xA);
+        try std.testing.expect(!server.applyRemoteEntityProp(&first));
+        try std.testing.expectEqual(@as(usize, 0), kt.len());
+    }
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expectError(error.PropMissing, server.props.getProp(.{ .kind = .user, .id = "bob" }, "e2ee.device.phone"));
+    var other_origin = makeEntityPropChange(.user, "bob", "e2ee.device.phone", "mls-x25519:abcd+/=", 100, 0xB);
+    try std.testing.expect(!server.applyRemoteEntityProp(&other_origin));
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+}
+
+test "DPROP1 local device write converges exact signed durable live clock and transparency fact" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-converge.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd7)), "dprop-server-converge.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .node_identity = &ident,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.committed,
+        server.commitLocalDurableDeviceProp(conn, null, "E2EE.DEVICE.Phone", "mls-x25519:abcd+/=", true),
+    );
+    const fact = dprop.get("alice", "e2ee.device.phone") orelse return error.TestUnexpectedResult;
+    const clock = server.entityPropClock(.user, "alice", "e2ee.device.phone") orelse return error.TestUnexpectedResult;
+    const live = try server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, "e2ee.device.phone");
+    try std.testing.expectEqualStrings("alice", live.owner);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", live.value);
+    try std.testing.expectEqual(fact.hlc, clock.hlc);
+    try std.testing.expectEqual(fact.origin_node, clock.origin_node);
+    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, clock.origin_pubkey);
+    try std.testing.expectEqualSlices(u8, fact.origin_sig, clock.origin_sig);
+    try std.testing.expectEqual(entity_prop_event.VerifyOutcome.verified, try entity_prop_event.verifyOrigin(alloc, fact.event()));
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+}
+
+test "DPROP1 missing-row delete commits exact signed tombstone without creating live PROP" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-missing-delete.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd9)), "dprop-server-missing-delete.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+
+    var del = try irc_line.parseLine("PROP Alice SET E2EE.DEVICE.Missing");
+    try server.handleProp(id, conn, &del);
+    try expectContains(conn.send_buf[0..conn.send_len], " 819 ");
+    const fact = dprop.get("alice", "e2ee.device.missing") orelse return error.TestUnexpectedResult;
+    const clock = server.entityPropClock(.user, "alice", "e2ee.device.missing") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!fact.present);
+    try std.testing.expect(!clock.present);
+    try std.testing.expectEqual(fact.hlc, clock.hlc);
+    try std.testing.expectEqualSlices(u8, fact.origin_sig, clock.origin_sig);
+    try std.testing.expectEqual(entity_prop_event.VerifyOutcome.verified, try entity_prop_event.verifyOrigin(alloc, fact.event()));
+    try std.testing.expectError(error.PropMissing, server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, "e2ee.device.missing"));
+    try std.testing.expectEqual(@as(usize, 1), kt.len());
+    try std.testing.expectEqual(key_transparency.Action.delete, (try kt.eventAt(0)).action);
+}
+
+test "DPROP1 channel and member device-looking properties retain generic PROP behavior" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-generic-nonuser.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xda)), "dprop-server-generic-nonuser.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+    _ = try server.world.join("#room", worldIdFromClient(id));
+    _ = try server.world.setMemberMode("#room", worldIdFromClient(id), .op, true);
+
+    var channel_set = try irc_line.parseLine("PROP #room SET E2EE.DEVICE.Phone :channel-generic");
+    try server.handleProp(id, conn, &channel_set);
+    try std.testing.expectEqualStrings("channel-generic", (try server.props.getPropRaw(.{ .kind = .channel, .id = "#room" }, "e2ee.device.phone")).value);
+    conn.send_len = 0;
+    var member_set = try irc_line.parseLine("PROP #room:Alice SET E2EE.DEVICE.Phone :member-generic");
+    try server.handleProp(id, conn, &member_set);
+    try std.testing.expectEqualStrings("member-generic", (try server.props.getPropRaw(.{ .kind = .member, .id = "#room:Alice" }, "e2ee.device.phone")).value);
+    try std.testing.expectEqual(@as(usize, 0), dprop.count());
+}
+
+test "DPROP1 ambiguous durable cut is sticky requests stop and publishes no live state" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-ambiguous.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd8)), "dprop-server-ambiguous.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .node_identity = &ident,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    var run = std.atomic.Value(bool).init(true);
+    server.shutdown = &run;
+    store.setPreparedIoFault(.{ .sync = true });
+
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.restart_required,
+        server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:abcd+/=", true),
+    );
+    try std.testing.expect(server.durable_device_restart_required);
+    try std.testing.expect(!run.load(.acquire));
+    try std.testing.expect(store.preparedWritesPoisoned());
+    try std.testing.expectEqual(@as(usize, 0), dprop.count());
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expect(server.entityPropClock(.user, "alice", "e2ee.device.phone") == null);
+    try std.testing.expectError(error.PropMissing, server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, "e2ee.device.phone"));
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.restart_required,
+        server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:retry+/=", true),
+    );
+    try std.testing.expectEqual(@as(usize, 0), dprop.count());
+}
+
+test "DPROP1 transaction preparation signing clock and Services failures publish nothing" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-failure-lanes.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xdb)), "dprop-server-failure-lanes.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+
+    // PROP-store reservation collision: helper must stop before clock, durable,
+    // transparency, notification, or mesh publication.
+    {
+        var occupied = try server.props.prepareSetProp(entity, "ordinary", "held", .{ .id = "alice", .access = .user });
+        defer occupied.deinit();
+        try std.testing.expectEqual(
+            LinuxServer.DurableDeviceMutationOutcome.preadmission_failed,
+            server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:abcd+/=", true),
+        );
+    }
+
+    // Transcript/signing allocation failure is classified as signer unavailable.
+    const saved_allocator = server.allocator;
+    var signing_fail = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    server.allocator = signing_fail.allocator();
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.signer_unavailable,
+        server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:abcd+/=", true),
+    );
+    server.allocator = saved_allocator;
+
+    // The next allocator boundary is entity-clock staging, after transcript
+    // signing and PROP preparation have succeeded.
+    var clock_fail = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    server.allocator = clock_fail.allocator();
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.preadmission_failed,
+        server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:abcd+/=", true),
+    );
+    server.allocator = saved_allocator;
+
+    // Definite Services preadmission failure from an undersized record limit.
+    var small_store = try services_mod.OroStore.openWithConfig(
+        alloc,
+        std.testing.io,
+        tmp.dir,
+        "server-dprop-failure-small.wal",
+        .{ .max_record_bytes = 16 },
+    );
+    defer small_store.deinit();
+    var small_dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer small_dprop.deinit();
+    var small_services = services_mod.Services.init(&small_store, null);
+    small_services.attachDurableCredentialProps(&small_dprop);
+    server.account_services = &small_services;
+    try std.testing.expectEqual(
+        LinuxServer.DurableDeviceMutationOutcome.preadmission_failed,
+        server.commitLocalDurableDeviceProp(conn, null, "e2ee.device.phone", "mls-x25519:abcd+/=", true),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), dprop.count());
+    try std.testing.expectEqual(@as(usize, 0), small_dprop.count());
+    try std.testing.expectEqual(@as(usize, 0), kt.len());
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expect(server.entityPropClock(.user, "alice", "e2ee.device.phone") == null);
+    try std.testing.expectError(error.PropMissing, server.props.getPropRaw(entity, "e2ee.device.phone"));
+}
+
+test "DPROP1 PROP CLEAR scans beyond sixty four rows and preserves reserved device facts" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "Alice" };
+    var key_buf: [32]u8 = undefined;
+    for (0..127) |index| {
+        const key = try std.fmt.bufPrint(&key_buf, "a{d:0>3}", .{index});
+        _ = try server.props.setProp(entity, key, "ordinary", .{ .id = "Alice", .access = .user });
+    }
+    _ = try server.props.setProp(entity, "e2ee.device.phone", "mls-x25519:abcd+/=", .{ .id = "Alice", .access = .user });
+
+    var clear = try irc_line.parseLine("PROP Alice CLEAR");
+    try server.handleProp(id, conn, &clear);
+    try expectContains(conn.send_buf[0..conn.send_len], " 908 ");
+    try std.testing.expectEqualStrings("ordinary", (try server.props.getProp(entity, "a000")).value);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try server.props.getProp(entity, "e2ee.device.phone")).value);
+}
+
+test "DPROP1 user PROP and E2EEKEY enumerate all one hundred twenty eight capacity rows" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "Alice" };
+    var key_buf: [32]u8 = undefined;
+    for (0..127) |index| {
+        const key = try std.fmt.bufPrint(&key_buf, "a{d:0>3}", .{index});
+        _ = try server.props.setProp(entity, key, "ordinary", .{ .id = "Alice", .access = .user });
+    }
+    _ = try server.props.setProp(entity, "e2ee.device.phone", "mls-x25519:abcd+/=", .{ .id = "Alice", .access = .user });
+
+    var prop_list = try irc_line.parseLine("PROP Alice");
+    try server.handleProp(id, conn, &prop_list);
+    try std.testing.expectEqual(@as(usize, 128), std.mem.count(u8, conn.send_buf[0..conn.send_len], " 818 "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, conn.send_buf[0..conn.send_len], " 819 "));
+    try expectContains(conn.send_buf[0..conn.send_len], " a126 ");
+    try expectContains(conn.send_buf[0..conn.send_len], " e2ee.device.phone ");
+
+    var status = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    status.params[0] = "STATUS";
+    status.param_count = 1;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &status);
+    try expectContains(conn.send_buf[0..conn.send_len], "STATUS account=Alice devices=1");
+
+    var device_list = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    device_list.params[0] = "LIST";
+    device_list.param_count = 1;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &device_list);
+    try expectContains(conn.send_buf[0..conn.send_len], "DEVICE account=Alice id=phone alg=mls-x25519 key=abcd+/=");
+    try expectContains(conn.send_buf[0..conn.send_len], "END account=Alice devices=1");
+
+    conn.send_len = 0;
+    var clear = try irc_line.parseLine("PROP Alice CLEAR");
+    try server.handleProp(id, conn, &clear);
+    try expectContains(conn.send_buf[0..conn.send_len], " 908 ");
+    try std.testing.expectEqualStrings("ordinary", (try server.props.getProp(entity, "a000")).value);
+    try std.testing.expectEqualStrings("ordinary", (try server.props.getProp(entity, "a126")).value);
+    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", (try server.props.getProp(entity, "e2ee.device.phone")).value);
+}
+
+test "DPROP1 reserved local PROP numerics and oper override remain fail closed" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const alice_id = try addTestLocalClient(&server, "Alice", "Alice");
+    const alice = server.connFor(alice_id).?;
+    alice.ircx = true;
+
+    var malformed = try irc_line.parseLine("PROP Alice SET E2EE.DEVICE. :garbage");
+    try server.handleProp(alice_id, alice, &malformed);
+    try expectContains(alice.send_buf[0..alice.send_len], " 905 ");
+    alice.send_len = 0;
+    var bad_value = try irc_line.parseLine("PROP Alice SET e2ee.device.phone :not-a-device-value");
+    try server.handleProp(alice_id, alice, &bad_value);
+    try expectContains(alice.send_buf[0..alice.send_len], " 906 ");
+    alice.send_len = 0;
+    var unavailable = try irc_line.parseLine("PROP Alice SET e2ee.device.phone :mls-x25519:abcd+/=");
+    try server.handleProp(alice_id, alice, &unavailable);
+    try expectContains(alice.send_buf[0..alice.send_len], " 907 ");
+
+    const bob_id = try addTestLocalClient(&server, "Bob", "Bob");
+    const bob = server.connFor(bob_id).?;
+    bob.ircx = true;
+    try reconcileTestOper(&bob.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+    _ = bob.session.setUmode(.override, true);
+    var steal = try irc_line.parseLine("PROP Alice SET e2ee.device.phone :mls-x25519:abcd+/=");
+    try server.handleProp(bob_id, bob, &steal);
+    try expectContains(bob.send_buf[0..bob.send_len], " 913 ");
+    bob.send_len = 0;
+    var erase = try irc_line.parseLine("PROP Alice SET e2ee.device.phone");
+    try server.handleProp(bob_id, bob, &erase);
+    try expectContains(bob.send_buf[0..bob.send_len], " 913 ");
+}
+
+test "DPROP1 stale durable admission maps generic PROP to ERR_SECURITY 908" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-stale-numeric.wal");
+    defer store.deinit();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xdc)), "dprop-server-stale-numeric.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&dprop);
+
+    var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+    const high = try buildSignedEntityProp(
+        &ident.sign_kp,
+        .user,
+        "alice",
+        "e2ee.device.phone",
+        "mls-x25519:existing+/=",
+        "alice",
+        std.math.maxInt(u64) - 1,
+        true,
+        &pk_buf,
+        &sig_buf,
+    );
+    try std.testing.expect(services.commitLocalDurableDeviceFact(.{
+        .present = high.present,
+        .kind = high.kind,
+        .origin_node = high.origin_node,
+        .hlc = high.hlc,
+        .entity = high.entity,
+        .key = high.key,
+        .value = high.value,
+        .owner = high.owner,
+        .origin_pubkey = high.origin_pubkey,
+        .origin_sig = high.origin_sig,
+    }) == .committed);
+
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "Alice", "Alice");
+    const conn = server.connFor(id).?;
+    conn.ircx = true;
+    var set = try irc_line.parseLine("PROP Alice SET e2ee.device.phone :mls-x25519:new+/=");
+    try server.handleProp(id, conn, &set);
+    try expectContains(conn.send_buf[0..conn.send_len], " 908 ");
+    try std.testing.expect(server.entityPropClock(.user, "alice", "e2ee.device.phone") == null);
+    try std.testing.expectError(error.PropMissing, server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, "e2ee.device.phone"));
+    try std.testing.expectEqualStrings("mls-x25519:existing+/=", dprop.get("alice", "e2ee.device.phone").?.value);
+}
+
+const RemotePropFailureVariant = enum {
+    absent_entity,
+    absent_key,
+    replacement,
+    delete,
+};
+
+/// Exercise the real server-owned allocator at every operation allocation
+/// boundary.  A fresh Server, PROP store, and durable KT store are created for
+/// every fail point; the failure is armed only after deterministic setup so a
+/// failed boot cannot masquerade as a rejected remote fact.
+fn runRemotePropFailureSweep(tmp: *std.testing.TmpDir, variant: RemotePropFailureVariant) !void {
+    var applied = false;
+    var saw_rejection = false;
+    var fail_index: usize = 0;
+    while (fail_index < 96) : (fail_index += 1) {
+        var name_buf: [72]u8 = undefined;
+        const wal_name = try std.fmt.bufPrint(&name_buf, "server-kt-atomic-{d}-{d}.wal", .{ @intFromEnum(variant), fail_index });
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+        defer kt.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachKeyTransparencyLog(&kt);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var server = Server.init(failing.allocator(), .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        if (variant != .absent_entity) {
+            var seed = makeEntityPropChange(.user, "bob", "profile.atomic.phone", "seed-key", 100, 0xA);
+            try std.testing.expect(server.applyRemoteEntityProp(&seed));
+        }
+        const before_len = kt.len();
+        const before_root = kt.root();
+        const before_clocks = server.entity_prop_clocks.count();
+        const before_entities = server.props.entity_count;
+        const before_clock = if (variant == .absent_entity)
+            null
+        else
+            server.entityPropClock(.user, "bob", "profile.atomic.phone").?.*;
+        const before_stamp = server.mesh_clock.last_stamp;
+        const before_physical = server.mesh_clock.last_physical;
+
+        // Arm the same allocator that constructed Server and its PROP store;
+        // this gives a deterministic real failure in the remote operation.
+        failing.fail_index = failing.alloc_index + fail_index;
+        var fact = switch (variant) {
+            .absent_entity => makeEntityPropChange(.user, "carol", "profile.atomic.phone", "new-entity-key", 200, 0xC),
+            .absent_key => makeEntityPropChange(.user, "bob", "profile.atomic.tablet", "new-tablet-key", 200, 0xA),
+            .replacement => makeEntityPropChange(.user, "bob", "profile.atomic.phone", "replaced-key", 200, 0xA),
+            .delete => makeEntityPropChange(.user, "bob", "profile.atomic.phone", "", 200, 0xA),
+        };
+        if (variant == .delete) fact.present = false;
+        applied = server.applyRemoteEntityProp(&fact);
+        if (applied) break;
+        saw_rejection = true;
+        try std.testing.expect(!applied);
+        try std.testing.expectEqual(before_len, kt.len());
+        const after_root = kt.root();
+        try std.testing.expectEqualSlices(u8, &before_root, &after_root);
+        try std.testing.expectEqual(before_clocks, server.entity_prop_clocks.count());
+        try std.testing.expectEqual(before_entities, server.props.entity_count);
+        if (before_clock) |clock| {
+            const after_clock = server.entityPropClock(.user, "bob", "profile.atomic.phone").?;
+            try std.testing.expectEqual(clock.hlc, after_clock.hlc);
+            try std.testing.expectEqual(clock.present, after_clock.present);
+            try std.testing.expectEqual(clock.origin_node, after_clock.origin_node);
+            try std.testing.expectEqualSlices(u8, clock.owner, after_clock.owner);
+            try std.testing.expectEqualSlices(u8, clock.origin_pubkey, after_clock.origin_pubkey);
+            try std.testing.expectEqualSlices(u8, clock.origin_sig, after_clock.origin_sig);
+        } else {
+            try std.testing.expect(server.entityPropClock(.user, "carol", "profile.atomic.phone") == null);
+        }
+        try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+        try std.testing.expectEqual(before_physical, server.mesh_clock.last_physical);
+
+        switch (variant) {
+            .absent_entity => try std.testing.expectError(
+                error.PropMissing,
+                server.props.getProp(.{ .kind = .user, .id = "carol" }, "profile.atomic.phone"),
+            ),
+            .absent_key => {
+                try std.testing.expectEqualStrings(
+                    "seed-key",
+                    (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.atomic.phone")).value,
+                );
+                try std.testing.expectError(
+                    error.PropMissing,
+                    server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.atomic.tablet"),
+                );
+            },
+            .replacement, .delete => try std.testing.expectEqualStrings(
+                "seed-key",
+                (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.atomic.phone")).value,
+            ),
+        }
+    }
+    try std.testing.expect(saw_rejection);
+    try std.testing.expect(applied);
+}
+
+test "KEYTRANS remote apply allocation failure leaves props clocks and log unchanged" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A fresh allocator and server are used for every fail point.  The server
+    // is constructed with that allocator (rather than swapping only one field
+    // after construction), so both the PROP store and entity-clock staging see
+    // the same deterministic failure boundary.
+    try runRemotePropFailureSweep(&tmp, .absent_key);
+}
+
+test "KEYTRANS remote apply fresh server allocator is atomic for every prop mutation shape" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const variants = [_]RemotePropFailureVariant{ .absent_entity, .absent_key, .replacement, .delete };
+    for (variants) |variant| try runRemotePropFailureSweep(&tmp, variant);
+}
+
+test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure creating a brand-new entity leaves no stranded entity, props, clock, HLC, or log growth" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-entity-oom.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // "carol" has never appeared before: applying her first fact must either
+    // create the entity AND its prop together, or create neither — never an
+    // empty entity stranded by a later allocation failure (the defect this
+    // repair closes: `setProp` could previously insert the outer entity row
+    // and then fail inserting its first prop).
+    const before_len = kt.len();
+    const before_clocks = server.entity_prop_clocks.count();
+    const before_entities = server.props.entity_count;
+    const before_stamp = server.mesh_clock.last_stamp;
+    const saved_props_allocator = server.props.allocator;
+    var applied = false;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        server.props.allocator = failing.allocator();
+        var fact = makeEntityPropChange(.user, "carol", "profile.phone", "new-entity-value", 100, 0xC);
+        applied = server.applyRemoteEntityProp(&fact);
+        server.props.allocator = saved_props_allocator;
+        if (!applied) {
+            try std.testing.expectEqual(before_entities, server.props.entity_count);
+            try std.testing.expectEqual(before_clocks, server.entity_prop_clocks.count());
+            try std.testing.expectEqual(before_len, kt.len());
+            try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+            try std.testing.expectError(
+                error.PropMissing,
+                server.props.getProp(.{ .kind = .user, .id = "carol" }, "profile.phone"),
+            );
+            continue;
+        }
+        break;
+    }
+    try std.testing.expect(applied);
+    try std.testing.expectEqual(before_entities + 1, server.props.entity_count);
+    try std.testing.expectEqual(before_len, kt.len());
+    try std.testing.expectEqualStrings(
+        "new-entity-value",
+        (try server.props.getProp(.{ .kind = .user, .id = "carol" }, "profile.phone")).value,
+    );
+}
+
+test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure inserting a new key into an existing entity leaves its existing prop, clock, HLC, and log unchanged" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-key-oom.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var seed = makeEntityPropChange(.user, "bob", "profile.phone", "seed-value", 100, 0xA);
+    try std.testing.expect(server.applyRemoteEntityProp(&seed));
+    const before_len = kt.len();
+    const before_clocks = server.entity_prop_clocks.count();
+    const before_entities = server.props.entity_count;
+    const before_stamp = server.mesh_clock.last_stamp;
+    const saved_props_allocator = server.props.allocator;
+    var applied = false;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        server.props.allocator = failing.allocator();
+        var next = makeEntityPropChange(.user, "bob", "profile.tablet", "new-value", 200, 0xA);
+        applied = server.applyRemoteEntityProp(&next);
+        server.props.allocator = saved_props_allocator;
+        if (!applied) {
+            try std.testing.expectEqual(before_entities, server.props.entity_count);
+            try std.testing.expectEqual(before_clocks, server.entity_prop_clocks.count());
+            try std.testing.expectEqual(before_len, kt.len());
+            try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+            try std.testing.expectEqualStrings(
+                "seed-value",
+                (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone")).value,
+            );
+            try std.testing.expectError(
+                error.PropMissing,
+                server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.tablet"),
+            );
+            continue;
+        }
+        break;
+    }
+    try std.testing.expect(applied);
+    try std.testing.expectEqual(before_len, kt.len());
+    try std.testing.expectEqualStrings(
+        "seed-value",
+        (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone")).value,
+    );
+    try std.testing.expectEqualStrings(
+        "new-value",
+        (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.tablet")).value,
+    );
+}
+
+test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure replacing an existing value leaves the old value, clock, HLC, and log unchanged" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-replace-oom.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var seed = makeEntityPropChange(.user, "bob", "profile.phone", "seed-value", 100, 0xA);
+    try std.testing.expect(server.applyRemoteEntityProp(&seed));
+    const before_len = kt.len();
+    const before_clocks = server.entity_prop_clocks.count();
+    const before_entities = server.props.entity_count;
+    const before_stamp = server.mesh_clock.last_stamp;
+    const saved_props_allocator = server.props.allocator;
+    var applied = false;
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        server.props.allocator = failing.allocator();
+        var replace = makeEntityPropChange(.user, "bob", "profile.phone", "replaced-value", 200, 0xA);
+        applied = server.applyRemoteEntityProp(&replace);
+        server.props.allocator = saved_props_allocator;
+        if (!applied) {
+            try std.testing.expectEqual(before_entities, server.props.entity_count);
+            try std.testing.expectEqual(before_clocks, server.entity_prop_clocks.count());
+            try std.testing.expectEqual(before_len, kt.len());
+            try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+            try std.testing.expectEqualStrings(
+                "seed-value",
+                (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone")).value,
+            );
+            continue;
+        }
+        break;
+    }
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings(
+        "replaced-value",
+        (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone")).value,
+    );
+}
+
+test "KEYTRANS remote ENTITY_PROP apply: clock-stage allocation failure on a delete fact leaves the prop, clock, HLC, and log unchanged" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-delete-oom.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // A tombstone never touches the prop-store allocator (`deleteProp` only
+    // frees), so this exercises the OTHER fallible step: clock staging via
+    // `server.allocator`. Before this repair, `observeRemotePropertyHlc` ran
+    // BEFORE clock staging, so a staging failure here still left the HLC
+    // watermark advanced; asserting it unchanged is the regression proof.
+    var seed = makeEntityPropChange(.user, "bob", "profile.phone", "seed-value", 100, 0xA);
+    try std.testing.expect(server.applyRemoteEntityProp(&seed));
+    const before_len = kt.len();
+    const before_clocks = server.entity_prop_clocks.count();
+    const before_entities = server.props.entity_count;
+    const before_stamp = server.mesh_clock.last_stamp;
+    const saved_allocator = server.allocator;
+    var applied = false;
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        server.allocator = failing.allocator();
+        var tomb = makeEntityPropChange(.user, "bob", "profile.phone", "", 300, 0xA);
+        tomb.present = false;
+        applied = server.applyRemoteEntityProp(&tomb);
+        server.allocator = saved_allocator;
+        if (!applied) {
+            try std.testing.expectEqual(before_entities, server.props.entity_count);
+            try std.testing.expectEqual(before_clocks, server.entity_prop_clocks.count());
+            try std.testing.expectEqual(before_len, kt.len());
+            try std.testing.expectEqual(before_stamp, server.mesh_clock.last_stamp);
+            try std.testing.expectEqualStrings(
+                "seed-value",
+                (try server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone")).value,
+            );
+            continue;
+        }
+        break;
+    }
+    try std.testing.expect(applied);
+    try std.testing.expectError(
+        error.PropMissing,
+        server.props.getProp(.{ .kind = .user, .id = "bob" }, "profile.phone"),
+    );
 }
 
 test "E2EEKEY advertises account device keys through user props" {
@@ -58890,19 +64149,17 @@ test "E2EEKEY advertises account device keys through user props" {
     add.param_count = 4;
     conn.send_len = 0;
     try server.handleE2eeKey(conn, &add);
-    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY ADDED id=phone alg=mls-x25519");
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY DURABLE_UNAVAILABLE");
 
     const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
-    const ev = try server.props.getProp(entity, "e2ee.device.phone");
-    try std.testing.expectEqualStrings("mls-x25519:abcd+/=", ev.value);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "e2ee.device.phone"));
 
     var list_lv = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
     list_lv.params[0] = "LIST";
     list_lv.param_count = 1;
     conn.send_len = 0;
     try server.handleE2eeKey(conn, &list_lv);
-    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DEVICE account=kain id=phone alg=mls-x25519 key=abcd+/=");
-    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY END account=kain devices=1");
+    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY END account=kain devices=0");
 
     var del = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
     del.params[0] = "DEL";
@@ -58910,8 +64167,176 @@ test "E2EEKEY advertises account device keys through user props" {
     del.param_count = 2;
     conn.send_len = 0;
     try server.handleE2eeKey(conn, &del);
-    try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DELETED id=phone");
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY DURABLE_UNAVAILABLE");
     try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "e2ee.device.phone"));
+}
+
+fn testOgc1Advertisement() !struct {
+    encoded: [136]u8,
+    device_id: [27]u8,
+} {
+    const directory = @import("../proto/e2ee_device_directory.zig");
+    comptime {
+        if (directory.encoded_len != 136 or directory.device_id_len != 27)
+            @compileError("OGC1 advertisement test vector sizes drifted");
+    }
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(
+        @as([Ed25519.KeyPair.seed_length]u8, @splat(0x5a)),
+    );
+    const odd1 = directory.fromParts(
+        kp.public_key.toBytes(),
+        std.crypto.ecc.P256.basePoint.toUncompressedSec1(),
+    ) orelse return error.TestUnexpectedResult;
+    var encoded: [directory.encoded_len]u8 = undefined;
+    _ = directory.encodeCanonical(odd1, &encoded);
+    var device_id: [directory.device_id_len]u8 = undefined;
+    _ = directory.deviceId(odd1, &device_id);
+    return .{ .encoded = encoded, .device_id = device_id };
+}
+
+test "E2EEKEY ADD accepts onyx-ogc1-v1 only with the derived device id" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const directory = @import("../proto/e2ee_device_directory.zig");
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "kain", "kain");
+    const conn = server.connFor(id).?;
+    const advertisement = try testOgc1Advertisement();
+
+    var mismatched = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+    mismatched.params[0] = "ADD";
+    mismatched.params[1] = "phone";
+    mismatched.params[2] = directory.stored_algorithm;
+    mismatched.params[3] = &advertisement.encoded;
+    mismatched.param_count = 4;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &mismatched);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY BAD_DEVICE");
+
+    var malformed = mismatched;
+    malformed.params[1] = &advertisement.device_id;
+    malformed.params[3] = "abcd+/=";
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &malformed);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY BAD_KEY");
+
+    var add = mismatched;
+    add.params[1] = &advertisement.device_id;
+    add.params[3] = &advertisement.encoded;
+    conn.send_len = 0;
+    try server.handleE2eeKey(conn, &add);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY DURABLE_UNAVAILABLE");
+
+    var key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
+    const key = e2ee_policy.devicePropKey(&advertisement.device_id, &key_buf).?;
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, key));
+}
+
+test "DPROP1 E2EEKEY mixed-case ODD1 commits folded PROP lists and restores" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const dprop_boot = @import("durable_credential_props_boot.zig");
+    const directory = @import("../proto/e2ee_device_directory.zig");
+    const wal_name = "server-dprop-odd1-folded-restart.wal";
+    const folded_id = "ogc1-mpeycfzdqv8bz2wubf_ukd";
+    const folded_key = "e2ee.device." ++ folded_id;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xe1)), "dprop-odd1-folded.test");
+    defer ident.deinit();
+    const origin = ident.shortId();
+    const advertisement = try testOgc1Advertisement();
+
+    {
+        var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var dprop = try dprop_boot.load(alloc, &store, origin);
+        defer dprop.deinit();
+        var services = services_mod.Services.init(&store, null);
+        services.attachDurableCredentialProps(&dprop);
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .account_services = &services,
+            .node_identity = &ident,
+            .durable_device_boot = .{ .authoritative = .{
+                .state = &dprop,
+                .local_origin_node = origin,
+            } },
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const id = try addTestLocalClient(&server, "Alice", "alice");
+        const conn = server.connFor(id).?;
+        var add = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+        add.params[0] = "ADD";
+        add.params[1] = &advertisement.device_id;
+        add.params[2] = directory.stored_algorithm;
+        add.params[3] = &advertisement.encoded;
+        add.param_count = 4;
+        var unrelated = add;
+        unrelated.params[1] = "ogc1-aaaaaaaaaaaaaaaaaaaaaa";
+        try server.handleE2eeKey(conn, &unrelated);
+        try expectContains(conn.send_buf[0..conn.send_len], "FAIL E2EEKEY BAD_DEVICE");
+        try std.testing.expectEqual(@as(usize, 0), dprop.count());
+        conn.send_len = 0;
+        try server.handleE2eeKey(conn, &add);
+        try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY ADDED id=ogc1-MPEyCFzdqv8BZ2wUbf_uKD alg=onyx-ogc1-v1");
+        try std.testing.expectEqual(@as(usize, 1), dprop.count());
+        try std.testing.expect(dprop.get("alice", folded_key) != null);
+        const live = try server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, folded_key);
+        try std.testing.expectEqualStrings(directory.stored_algorithm ++ ":" ++ directory.kat_wire.*, live.value);
+
+        var list_cmd = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+        list_cmd.params[0] = "LIST";
+        list_cmd.param_count = 1;
+        conn.send_len = 0;
+        try server.handleE2eeKey(conn, &list_cmd);
+        try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DEVICE account=alice id=" ++ folded_id ++ " alg=onyx-ogc1-v1");
+        try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY END account=alice devices=1");
+    }
+
+    {
+        var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var dprop = try dprop_boot.load(alloc, &store, origin);
+        defer dprop.deinit();
+        try std.testing.expectEqual(@as(usize, 1), dprop.count());
+        var services = services_mod.Services.init(&store, null);
+        services.attachDurableCredentialProps(&dprop);
+        var server = Server.init(alloc, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .account_services = &services,
+            .node_identity = &ident,
+            .durable_device_boot = .{ .authoritative = .{
+                .state = &dprop,
+                .local_origin_node = origin,
+            } },
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const live = try server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, folded_key);
+        try std.testing.expectEqualStrings(directory.stored_algorithm ++ ":" ++ directory.kat_wire.*, live.value);
+        const id = try addTestLocalClient(&server, "Alice", "alice");
+        const conn = server.connFor(id).?;
+        var list_cmd = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
+        list_cmd.params[0] = "LIST";
+        list_cmd.param_count = 1;
+        try server.handleE2eeKey(conn, &list_cmd);
+        try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY DEVICE account=alice id=" ++ folded_id ++ " alg=onyx-ogc1-v1");
+        try expectContains(conn.send_buf[0..conn.send_len], "E2EEKEY END account=alice devices=1");
+    }
 }
 
 test "E2EEKEY and IDENTITY live mutations append verifiable key transparency events" {
@@ -58930,6 +64355,11 @@ test "E2EEKEY and IDENTITY live mutations append verifiable key transparency eve
     defer kt.deinit();
     var services = services_mod.Services.init(&store, null);
     services.attachKeyTransparencyLog(&kt);
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0xd4)), "dprop-server-keytrans.test");
+    defer ident.deinit();
+    var dprop = try durable_credential_props.State.init(alloc, .{ .local_origin_node = ident.shortId() });
+    defer dprop.deinit();
+    services.attachDurableCredentialProps(&dprop);
     const event_time_ms: i64 = 1_700_000_123_000;
     var sim_time = reactor_mod.SimReactor.init(event_time_ms);
 
@@ -58938,6 +64368,7 @@ test "E2EEKEY and IDENTITY live mutations append verifiable key transparency eve
         .port = 0,
         .account_services = &services,
         .reactor = sim_time.reactor(),
+        .node_identity = &ident,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -58947,8 +64378,6 @@ test "E2EEKEY and IDENTITY live mutations append verifiable key transparency eve
 
     const id = try addTestLocalClient(&server, "Alice", "Alice");
     const conn = server.connFor(id).?;
-    const e2ee_material = "mls-x25519:abcd+/=";
-
     var e2ee_add = irc_line.LineView{ .raw = "", .command = "E2EEKEY" };
     e2ee_add.params[0] = "ADD";
     e2ee_add.params[1] = "phone";
@@ -58970,10 +64399,9 @@ test "E2EEKEY and IDENTITY live mutations append verifiable key transparency eve
     e2ee_del.param_count = 2;
     try server.handleE2eeKey(conn, &e2ee_del);
     try std.testing.expectEqual(@as(usize, 2), kt.len());
-    // The legacy idempotent "DELETED" reply for an absent key remains, but no
-    // nonexistent credential change enters transparency.
+    // A missing-row delete is still a durable tombstone with a fresh HLC.
     try server.handleE2eeKey(conn, &e2ee_del);
-    try std.testing.expectEqual(@as(usize, 2), kt.len());
+    try std.testing.expectEqual(@as(usize, 3), kt.len());
 
     const Ed25519 = std.crypto.sign.Ed25519;
     const kp = try Ed25519.KeyPair.generateDeterministic(
@@ -58998,56 +64426,42 @@ test "E2EEKEY and IDENTITY live mutations append verifiable key transparency eve
     identity_add.params[3] = &sig_hex;
     identity_add.param_count = 4;
     try server.handleIdentity(conn, &identity_add);
-    try std.testing.expectEqual(@as(usize, 3), kt.len());
+    try std.testing.expectEqual(@as(usize, 4), kt.len());
 
     var identity_del = irc_line.LineView{ .raw = "", .command = "IDENTITY" };
     identity_del.params[0] = "DEL";
     identity_del.params[1] = "primary";
     identity_del.param_count = 2;
     try server.handleIdentity(conn, &identity_del);
-    try std.testing.expectEqual(@as(usize, 4), kt.len());
+    try std.testing.expectEqual(@as(usize, 5), kt.len());
 
-    const expected = [_]key_transparency.Event{
-        .{
-            .account = "alice",
-            .kind = .e2ee_device,
-            .action = .bind,
-            .key_id = "phone",
-            .key_hash = key_transparency.materialHash(e2ee_material),
-            .timestamp_ms = event_time_ms,
-        },
-        .{
-            .account = "alice",
-            .kind = .e2ee_device,
-            .action = .delete,
-            .key_id = "phone",
-            .key_hash = key_transparency.materialHash(e2ee_material),
-            .timestamp_ms = event_time_ms,
-        },
-        .{
-            .account = "alice",
-            .kind = .identity,
-            .action = .bind,
-            .key_id = "primary",
-            .key_hash = key_transparency.materialHash(&identity_public),
-            .timestamp_ms = event_time_ms,
-        },
-        .{
-            .account = "alice",
-            .kind = .identity,
-            .action = .delete,
-            .key_id = "primary",
-            .key_hash = key_transparency.materialHash(&identity_public),
-            .timestamp_ms = event_time_ms,
-        },
-    };
+    const bind_e2ee = try kt.eventAt(0);
+    try std.testing.expectEqual(key_transparency.Action.bind, bind_e2ee.action);
+    try std.testing.expectEqual(key_transparency.CredentialKind.e2ee_device, bind_e2ee.kind);
+    const del_e2ee = try kt.eventAt(1);
+    try std.testing.expectEqual(key_transparency.Action.delete, del_e2ee.action);
+    const bind_id = try kt.eventAt(3);
+    try std.testing.expectEqual(key_transparency.CredentialKind.identity, bind_id.kind);
+    try std.testing.expectEqualSlices(u8, &key_transparency.factObservationHash(.{
+        .account = "alice",
+        .kind = .identity,
+        .action = .bind,
+        .key_id = "primary",
+        .hlc = @intCast(bind_id.timestamp_ms),
+        .origin_node = server.localPropOriginNode(),
+        .origin_pubkey = "",
+    }, &identity_public), &bind_id.key_hash);
+    const del_id = try kt.eventAt(4);
+    try std.testing.expectEqual(key_transparency.Action.delete, del_id.action);
+
     const root = kt.root();
-    for (expected, 0..) |event, position| {
+    for (0..kt.len()) |position| {
+        const owned = try kt.eventAt(position);
         var proof = try kt.proof(position);
         defer proof.deinit(alloc);
         try std.testing.expect(key_transparency.verifyInclusion(
             root,
-            event,
+            owned.asEvent(),
             proof,
             position,
             kt.len(),
@@ -59121,6 +64535,7 @@ test "E2EEGROUP guest CAP REQ onyx/e2ee after registration stays open" {
         .host = "127.0.0.1",
         .port = 0,
         .crypto_io = std.testing.io,
+        .session_max_per_account = 2,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -59177,7 +64592,7 @@ test "E2EEGROUP local handler renders exact capable-member and targeted Welcome 
 
     var key_package = try irc_line.parseLine("E2EEGROUP #secure key-package phone :AQIDBA");
     try server.handleE2eeGroup(sender, &key_package);
-    const expected_key = ":Alice!alice@localhost E2EE.KEYPACKAGE #secure phone :AQIDBA\r\n";
+    const expected_key = ":Alice!alice@localhost E2EE.KEYPACKAGE #secure alice phone :AQIDBA\r\n";
     try expectContains(sender.send_buf[0..sender.send_len], expected_key);
     try expectContains(bob.send_buf[0..bob.send_len], expected_key);
     try expectContains(bob_phone.send_buf[0..bob_phone.send_len], expected_key);
@@ -59192,7 +64607,7 @@ test "E2EEGROUP local handler renders exact capable-member and targeted Welcome 
     bob_phone.send_offset = 0;
     var commit = try irc_line.parseLine("E2EEGROUP #secure commit phone :b3BhcXVl");
     try server.handleE2eeGroup(sender, &commit);
-    const expected_commit = ":Alice!alice@localhost E2EE.COMMIT #secure phone :b3BhcXVl\r\n";
+    const expected_commit = ":Alice!alice@localhost E2EE.COMMIT #secure alice phone :b3BhcXVl\r\n";
     try expectContains(sender.send_buf[0..sender.send_len], expected_commit);
     try expectContains(bob.send_buf[0..bob.send_len], expected_commit);
     try expectContains(bob_phone.send_buf[0..bob_phone.send_len], expected_commit);
@@ -59207,7 +64622,7 @@ test "E2EEGROUP local handler renders exact capable-member and targeted Welcome 
     // SessionStore lookup must use the canonical lowercase key stored at login.
     var welcome = try irc_line.parseLine("E2EEGROUP #secure welcome phone Bob tablet :d2VsY29tZQ");
     try server.handleE2eeGroup(sender, &welcome);
-    const expected_welcome = ":Alice!alice@localhost E2EE.WELCOME #secure phone Bob tablet :d2VsY29tZQ\r\n";
+    const expected_welcome = ":Alice!alice@localhost E2EE.WELCOME #secure alice phone Bob tablet :d2VsY29tZQ\r\n";
     try std.testing.expectEqual(@as(usize, 0), sender.send_len);
     try expectContains(bob.send_buf[0..bob.send_len], expected_welcome);
     try expectContains(bob_phone.send_buf[0..bob_phone.send_len], expected_welcome);
@@ -59313,7 +64728,7 @@ test "E2EEGROUP local handler fails closed and accepts the full payload bound" {
     var expected_buf: [e2ee_group_max_line_bytes]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        ":Alice!alice@localhost E2EE.COMMIT #secure phone :{s}\r\n",
+        ":Alice!alice@localhost E2EE.COMMIT #secure alice phone :{s}\r\n",
         .{&max_payload},
     );
     try std.testing.expectEqualSlices(u8, expected, target.send_buf[0..target.send_len]);
@@ -59375,7 +64790,7 @@ test "E2EEGROUP live operator quiesce is privileged observable non-mutating and 
     const target = server.connFor(target_id).?;
     for ([_]*ConnState{ oper, sender, target }) |conn|
         conn.session.registration.registered = true;
-    oper.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&oper.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     oper.session.addCap(.standard_replies);
     sender.ircx = true;
     sender.session.addCap(.standard_replies);
@@ -59587,7 +65002,7 @@ test "E2EEGROUP live operator quiesce is privileged observable non-mutating and 
     );
     try expectContains(
         target.send_buf[0..target.send_len],
-        ":Alice!alice@localhost E2EE.COMMIT #secure phone :AQIDBA\r\n",
+        ":Alice!alice@localhost E2EE.COMMIT #secure alice phone :AQIDBA\r\n",
     );
 }
 
@@ -59887,8 +65302,8 @@ test "E2EEGROUP mesh live path accepts once refloods exact wire retries and reti
     var retained: [2]attachment_delivery_spool.PendingRecord = undefined;
     const retained_rows = server.attachment_delivery_spool.collectPending(&retained);
     try std.testing.expectEqual(@as(usize, 2), retained_rows.len);
-    try expectContains(retained_rows[0].bytes, "E2EE.COMMIT #secure phone :AQIDBA");
-    try expectContains(retained_rows[1].bytes, "E2EE.COMMIT #secure phone :AQIDBA");
+    try expectContains(retained_rows[0].bytes, "E2EE.COMMIT #secure bob phone :AQIDBA");
+    try expectContains(retained_rows[1].bytes, "E2EE.COMMIT #secure bob phone :AQIDBA");
     try std.testing.expectEqual(@as(usize, 1), server.e2ee_group_mesh_authority.custodyLen());
     try std.testing.expect(server.e2ee_group_mesh_authority.containsCustody(
         egress.idb.shortId(),
@@ -59915,7 +65330,7 @@ test "E2EEGROUP mesh live path accepts once refloods exact wire retries and reti
     server.drainAttachmentSpoolForCurrentReactor();
     current_reactor = &server.reactors[0];
     try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
-    const delivered_line = ":Bob!bob@peer-b.test E2EE.COMMIT #secure phone :AQIDBA\r\n";
+    const delivered_line = ":Bob!bob@peer-b.test E2EE.COMMIT #secure bob phone :AQIDBA\r\n";
     try std.testing.expectEqual(
         @as(usize, 1),
         countOccurrences(local.send_buf[0..local.send_len], delivered_line),
@@ -61152,7 +66567,7 @@ test "P1: identity.key ENTITY_PROP ingest rejects a REMOTE write for a LOCALLY-h
     try std.testing.expect(!server.applyRemoteEntityProp(&forged_res));
 }
 
-test "P1: identity.key ENTITY_PROP ingest binds the key to its FIRST origin (a different peer cannot overwrite it)" {
+test "E5E1 identity ENTITY_PROP ingest rejects every remote origin before LWW" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "local");
     defer ident.deinit();
@@ -61162,29 +66577,29 @@ test "P1: identity.key ENTITY_PROP ingest binds the key to its FIRST origin (a d
     };
     defer server.deinit();
 
-    // kain is NOT local here (a third node). kain's real home A writes the key
-    // first — accepted, and the origin binding is recorded.
+    // Neither an asserted home nor a later competing origin may establish the
+    // retired replicated identity namespace.
     const home_a: u64 = 0xA;
     const byz_b: u64 = 0xB;
     const key_a = "home-A-key-value";
     var genuine = makeEntityPropChange(.user, "kain", "identity.key.primary", key_a, 100, home_a);
-    try std.testing.expect(server.applyRemoteEntityProp(&genuine));
+    try std.testing.expect(!server.applyRemoteEntityProp(&genuine));
     const entity = ircx_prop_store.Entity{ .kind = .user, .id = "kain" };
-    try std.testing.expectEqualStrings(key_a, (try server.props.getProp(entity, "identity.key.primary")).value);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "identity.key.primary"));
 
     // A Byzantine peer B tries to OVERWRITE kain's key with its own, at a HIGHER
     // hlc so plain LWW would accept it — the origin binding rejects it.
     const key_b = "byzantine-B-value";
     var forged = makeEntityPropChange(.user, "kain", "identity.key.primary", key_b, 999, byz_b);
     try std.testing.expect(!server.applyRemoteEntityProp(&forged));
-    // A's key survives — B never gets its key trusted for kain.
-    try std.testing.expectEqualStrings(key_a, (try server.props.getProp(entity, "identity.key.primary")).value);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "identity.key.primary"));
 
-    // The SAME origin A may still update (key rotation from the genuine home).
+    // Even the same asserted origin cannot rotate through ENTITY_PROP.
     const key_a2 = "home-A-rotated-v2";
     var rotate = makeEntityPropChange(.user, "kain", "identity.key.primary", key_a2, 200, home_a);
-    try std.testing.expect(server.applyRemoteEntityProp(&rotate));
-    try std.testing.expectEqualStrings(key_a2, (try server.props.getProp(entity, "identity.key.primary")).value);
+    try std.testing.expect(!server.applyRemoteEntityProp(&rotate));
+    try std.testing.expectError(error.PropMissing, server.props.getProp(entity, "identity.key.primary"));
+    try std.testing.expectEqual(@as(u64, 3), server.remote_identity_props_quarantined);
 }
 
 test "P1: a NON-identity user prop is NOT origin-bound (regression: ordinary ENTITY_PROP LWW is unchanged)" {
@@ -62667,6 +68082,13 @@ test "session replica lifecycle DROP revokes every distinct local token" {
 
     const a_id = try addTestLocalClient(server, "DropA", "drop-acct");
     const b_id = try addTestLocalClient(server, "DropB", "drop-acct");
+    try reconcileTestOper(
+        &server.connFor(b_id).?.session,
+        oper_mod.OperPrivileges.full,
+        "drop-test-oper",
+        "Drop Test Operator",
+    );
+    try std.testing.expect(server.connFor(b_id).?.session.isOper());
     const a_token = (server.sessions.resumeHandleForClient("drop-acct", monitorIdFromClient(a_id)) orelse return error.TestUnexpectedResult).token;
     const b_token = (server.sessions.resumeHandleForClient("drop-acct", monitorIdFromClient(b_id)) orelse return error.TestUnexpectedResult).token;
     try std.testing.expect(!std.crypto.timing_safe.eql(session_migrate.Token, a_token, b_token));
@@ -62684,6 +68106,93 @@ test "session replica lifecycle DROP revokes every distinct local token" {
     try std.testing.expectEqual(@as(usize, 0), server.sessions.sessionsInto("drop-acct", &rows).len);
     try expectTestSessionReplicaRevoked(server, a_token);
     try expectTestSessionReplicaRevoked(server, b_token);
+    // DROP revokes the live identity as well as SessionStore/mesh authority.
+    // Depending on whether closeConn must retry a logical-session handoff, the
+    // fixture slot is either gone or already terminally closing. In both cases
+    // the command boundary refuses more input, including SESSION TOKEN; even the
+    // explicitly elevated sibling cannot retain usable operator authority.
+    const a_after = server.connFor(a_id);
+    const b_after = server.connFor(b_id);
+    try std.testing.expect(a_after == null or a_after.?.closing);
+    try std.testing.expect(b_after == null or b_after.?.closing);
+}
+
+test "multi-reactor DROP poison wins a raced authenticated recv before owner close" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var account_store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "drop-cross-reactor-race.wal");
+    defer account_store.deinit();
+    var services = services_mod.Services.init(&account_store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("drop-race", "correct horse battery staple", &scratch);
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x99)), "local");
+    defer ident.deinit();
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .node_id = ident.shortId(),
+        .node_identity = &ident,
+        .crypto_io = std.testing.io,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    current_reactor = &server.reactors[0];
+    const issuer_id = try addTestLocalClient(server, "DropIssuer", "drop-race");
+    server.connFor(issuer_id).?.session.registration.registered = true;
+
+    current_reactor = &server.reactors[1];
+    const target_id = try addTestLocalClient(server, "DropRemote", "drop-race");
+    const target = server.connFor(target_id).?;
+    target.session.registration.registered = true;
+    try reconcileTestOper(
+        &target.session,
+        oper_mod.OperPrivileges.full,
+        "drop-race-oper",
+        "Drop Race Operator",
+    );
+    try std.testing.expect(target.session.isOper());
+    const raced_command = "SESSION TOKEN\r\n";
+    @memcpy(target.recv_buf[0..raced_command.len], raced_command);
+    // Retain the slot after poison observation so the test can prove that the
+    // positive RECV did not execute even though the close control remains queued.
+    target.send_armed = true;
+
+    current_reactor = &server.reactors[0];
+    var line = irc_line.LineView{ .raw = "", .command = "DROP" };
+    line.params[0] = "drop-race";
+    line.params[1] = "correct horse battery staple";
+    line.param_count = 2;
+    try server.handleDrop(server.connFor(issuer_id).?, &line);
+    try std.testing.expect(target.delivery_gap.load(.acquire));
+    try std.testing.expect(!target.closing);
+
+    // The owner sees the raced positive CQE before drainFabric sees the queued
+    // close. The source-published exact-generation poison must still win before
+    // IRC parsing, so no replacement token or operator command can run.
+    current_reactor = &server.reactors[1];
+    try server.handleRecv(.{
+        .token = target.token,
+        .res = @intCast(raced_command.len),
+        .more = false,
+    });
+    try std.testing.expect(target.delivery_abort_started);
+    try std.testing.expect(target.closing);
+    try std.testing.expect(target.session.isOper()); // retained only on terminal storage
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expect(std.mem.indexOf(u8, target.send_buf[0..target.send_len], "MTOKEN") == null);
+    try std.testing.expect(server.sessions.resumeHandleForClient("drop-race", monitorIdFromClient(target_id)) == null);
+    _ = server.drainFabric();
 }
 
 test "session replica lifecycle keeps one-of-N authority and last nonportable sibling revokes" {
@@ -62720,7 +68229,7 @@ test "session replica lifecycle keeps one-of-N authority and last nonportable si
     try expectTestSessionReplicaRevoked(server, token);
 }
 
-test "session replica lifecycle revokes portable authority evicted by attach cap" {
+test "session tracking at cap preserves detached portable authority for exact resume" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x94)), "local");
     defer ident.deinit();
@@ -62745,8 +68254,10 @@ test "session replica lifecycle revokes portable authority evicted by attach cap
     try std.testing.expect(server.sessions.markDetached("cap-acct", monitorIdFromClient(old_id)));
     try publishTestSessionReplicaAuthority(server, token, "cap-acct", "Evicted");
 
-    _ = try addTestLocalClient(server, "Replacement", "cap-acct");
-    try expectTestSessionReplicaRevoked(server, token);
+    const replacement_id = try addTestLocalClient(server, "Replacement", "cap-acct");
+    try std.testing.expect(server.session_replica_store.getOrigin(token, server.config.node_id) != null);
+    try std.testing.expect(server.sessions.resumeHandleForClient("cap-acct", monitorIdFromClient(old_id)) != null);
+    try std.testing.expect(server.sessions.resumeHandleForClient("cap-acct", monitorIdFromClient(replacement_id)) == null);
 }
 
 test "session replica lifecycle revokes portable authority replaced on same-client attach" {
@@ -62904,6 +68415,9 @@ test "relay direct messages honor local +R SILENCE and recipient session-sync" {
             else => return err,
         };
         defer server.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, 99, &.{"Remote"});
+        defer relay_peer.deinit();
 
         const target_id = try addTestLocalClient(&server, "Target", "targetacct");
         const sibling_id = try addTestLocalClient(&server, "Sibling", "targetacct");
@@ -62988,6 +68502,9 @@ test "SILENCE ACCESS control is case-insensitive: nick-case cannot bypass the ig
         else => return err,
     };
     defer server.deinit();
+    var relay_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &relay_peer, 99, &.{ "Remote", "Friend" });
+    defer relay_peer.deinit();
 
     const target_id = try addTestLocalClient(&server, "Target", "targetacct");
     const target = server.connFor(target_id).?;
@@ -63256,7 +68773,7 @@ test "threaded server: auxiliary direct events fan out exact-token attachments o
     );
 }
 
-test "threaded server: remote DATA reserved tags require trusted oper grant or channel rank" {
+test "threaded server: inactive OCG1 never authorizes remote DATA reserved tags" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -63283,14 +68800,13 @@ test "threaded server: remote DATA reserved tags require trusted oper grant or c
     // A mutable relay account claim cannot become `policy_account`; passing an
     // ungranted forged value demonstrates that mere text has no authority.
     try std.testing.expect(!server.remoteDataTagAuthorized("ADM.alert", true, member, "forged-oper-text"));
-    try std.testing.expect(server.remoteDataTagAuthorized("SYS.notice", false, null, "trusted-oper"));
-    try std.testing.expect(server.remoteDataTagAuthorized("ADM.alert", true, member, "trusted-oper"));
+    try std.testing.expect(!server.remoteDataTagAuthorized("SYS.notice", false, null, "trusted-oper"));
+    try std.testing.expect(!server.remoteDataTagAuthorized("ADM.alert", true, member, "trusted-oper"));
     try std.testing.expect(server.remoteDataTagAuthorized("OWN.state", true, channel_op, ""));
     try std.testing.expect(!server.remoteDataTagAuthorized("HST.state", true, member, ""));
     try std.testing.expect(!server.remoteDataTagAuthorized("OWN.state", false, null, ""));
-    // Network-oper override matches the local handleData policy even when the
-    // target is direct rather than a channel.
-    try std.testing.expect(server.remoteDataTagAuthorized("HST.state", false, null, "trusted-oper"));
+    // The stored OCG1 record also cannot bypass channel rank for a direct target.
+    try std.testing.expect(!server.remoteDataTagAuthorized("HST.state", false, null, "trusted-oper"));
 }
 
 test "session-sync exact-once matrix: authenticated inbound relay dedupes exact tokens and account mirror" {
@@ -63420,6 +68936,9 @@ test "relay direct messages honor local +C and +g callerid policy" {
             else => return err,
         };
         defer server.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, 99, &.{"Remote"});
+        defer relay_peer.deinit();
 
         const target_id = try addTestLocalClient(&server, "Target", "targetacct");
         const target = server.connFor(target_id).?;
@@ -63660,6 +69179,9 @@ test "relayed channel message is recorded into CHATHISTORY for cross-node read-b
             else => return err,
         };
         defer server.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, 4242, &.{"Remote"});
+        defer relay_peer.deinit();
 
         const member_id = try addTestLocalClient(&server, "Local", null);
         _ = try server.world.join("#hist", worldIdFromClient(member_id));
@@ -63726,6 +69248,9 @@ test "relayed TAGMSG reaches capable members only and preserves its live msgid i
             else => return err,
         };
         defer server.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, 4242, &.{"Remote"});
+        defer relay_peer.deinit();
 
         const tagged_id = try addTestLocalClient(&server, "Tagged", null);
         const plain_id = try addTestLocalClient(&server, "Plain", null);
@@ -64115,8 +69640,11 @@ test "E2EE policy: channel PROP validates and required rooms reject plaintext" {
         try std.testing.expectEqual(LinuxServer.ChannelEncryptionPolicy.off, server.channelEncryptionPolicy("#secure"));
         _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
         try std.testing.expectEqual(LinuxServer.ChannelEncryptionPolicy.required, server.channelEncryptionPolicy("#secure"));
-        try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#secure", null));
-        try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#secure", "+onyx/e2ee=1"));
+        try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#secure", null, "plain", false));
+        try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#secure", "+onyx/e2ee=1", "tagged plaintext", false));
+        try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#secure", "+onyx/e2ee=mls", "tagged plaintext", false));
+        try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#secure", "+typing=active", "", true));
+        try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#secure", null, "", true));
 
         const id = try addTestLocalClient(&server, "alice", null);
         const conn = server.connFor(id).?;
@@ -64126,6 +69654,406 @@ test "E2EE policy: channel PROP validates and required rooms reject plaintext" {
         try server.messageOne(id, conn, "PRIVMSG", "#secure", "plain", null);
         try expectContains(conn.send_buf[0..conn.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
     } else return error.SkipZigTest;
+}
+
+fn testMinRoomEnvelope(out: []u8) []const u8 {
+    var body: [e2ee_policy.min_room_envelope_decoded_len]u8 = @splat(0);
+    body[0] = e2ee_policy.room_envelope_version;
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const need = e2ee_policy.room_envelope_prefix.len + encoder.calcSize(body.len);
+    std.debug.assert(out.len >= need);
+    @memcpy(out[0..e2ee_policy.room_envelope_prefix.len], e2ee_policy.room_envelope_prefix);
+    _ = encoder.encode(out[e2ee_policy.room_envelope_prefix.len..need], &body);
+    return out[0..need];
+}
+
+fn testMaxRoomEnvelope(out: []u8) []const u8 {
+    var body: [e2ee_policy.max_room_envelope_decoded_len]u8 = @splat(0);
+    body[0] = e2ee_policy.room_envelope_version;
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const need = e2ee_policy.room_envelope_prefix.len + encoder.calcSize(body.len);
+    std.debug.assert(need == e2ee_policy.max_room_envelope_wire_len);
+    std.debug.assert(out.len >= need);
+    @memcpy(out[0..e2ee_policy.room_envelope_prefix.len], e2ee_policy.room_envelope_prefix);
+    _ = encoder.encode(out[e2ee_policy.room_envelope_prefix.len..need], &body);
+    return out[0..need];
+}
+
+test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var relay_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &relay_peer, 4242, &.{"Remote"});
+    defer relay_peer.deinit();
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#e2eebody" };
+    _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
+
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    alice.session.addCap(.onyx_e2ee);
+    bob.session.addCap(.onyx_e2ee);
+    _ = try server.world.join("#e2eebody", worldIdFromClient(alice_id));
+    _ = try server.world.join("#e2eebody", worldIdFromClient(bob_id));
+    _ = try server.world.setChannelFlag("#e2eebody", .no_external, false);
+
+    var envelope_buf: [96]u8 = undefined;
+    const envelope = testMinRoomEnvelope(&envelope_buf);
+    var max_envelope_buf: [e2ee_policy.max_room_envelope_wire_len]u8 = undefined;
+    const max_envelope = testMaxRoomEnvelope(&max_envelope_buf);
+    try std.testing.expect(e2ee_policy.isCanonicalRoomEnvelope(max_envelope));
+    try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=mls", envelope, false));
+    try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=1", envelope, false));
+    try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=mls", "plain", false));
+    try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#e2eebody", "+onyx/e2ee=sframe", envelope, false));
+    try std.testing.expect(!server.messageSatisfiesEncryptionPolicy("#e2eebody", null, envelope, false));
+    try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eebody", "+typing=active", "", true));
+
+    const history_before = server.history.totalStoredCount();
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", "tagged plaintext", "+onyx/e2ee=mls");
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "tagged plaintext") == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "NOTICE", "#e2eebody", "notice plaintext", "+onyx/e2ee=mls");
+    try std.testing.expectEqual(@as(usize, 0), alice.send_len);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "notice plaintext") == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", envelope, "+onyx/e2ee=1");
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], envelope) == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", envelope, null);
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], envelope) == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    const oversize = try std.testing.allocator.alloc(u8, e2ee_policy.max_room_envelope_wire_len + 1);
+    defer std.testing.allocator.free(oversize);
+    @memcpy(oversize[0..e2ee_policy.room_envelope_prefix.len], e2ee_policy.room_envelope_prefix);
+    @memset(oversize[e2ee_policy.room_envelope_prefix.len..], 'A');
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", oversize, "+onyx/e2ee=mls");
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "ONYXROOM1") == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    const format_oversize = try std.testing.allocator.alloc(u8, 40_001);
+    defer std.testing.allocator.free(format_oversize);
+    @memcpy(format_oversize[0..e2ee_policy.room_envelope_prefix.len], e2ee_policy.room_envelope_prefix);
+    @memset(format_oversize[e2ee_policy.room_envelope_prefix.len..], 'A');
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", format_oversize, "+onyx/e2ee=mls");
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "ONYXROOM1") == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "NOTICE", "#e2eebody", format_oversize, "+onyx/e2ee=mls");
+    try std.testing.expectEqual(@as(usize, 0), alice.send_len);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "ONYXROOM1") == null);
+    try std.testing.expectEqual(history_before, server.history.totalStoredCount());
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", max_envelope, "+onyx/e2ee=mls");
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try expectContains(bob.send_buf[0..bob.send_len], max_envelope);
+    var hbuf: [8]lotus.Message = undefined;
+    const recorded = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+    try std.testing.expectEqualStrings(max_envelope, recorded[0].text);
+    alice.session.addCap(.batch);
+    var replay_buf: [default_reply_bytes * 4]u8 = undefined;
+    const replay = try server.renderHistoryReplay(alice, &replay_buf, "e2ee-max", "#e2eebody", recorded, null);
+    try expectContains(replay, max_envelope);
+    try expectContains(replay, "@batch=e2ee-max;time=");
+    try expectContains(replay, ";+onyx/e2ee=mls :");
+
+    // Aggregate replay must not retain the old 32 KiB all-or-nothing ceiling:
+    // every selected row is individually legal, and CHATHISTORY, rewind, and
+    // SEARCH all share this owned renderer.
+    for (0..8) |index| {
+        var replay_id_buf: [32]u8 = undefined;
+        const replay_id = try std.fmt.bufPrint(&replay_id_buf, "max-{d}", .{index});
+        _ = try server.history.append("#e2ee-replay-max", .{
+            .msgid = replay_id,
+            .sender = "alice!u@host",
+            .text = max_envelope,
+            .timestamp = 100 + index,
+            .client_tags = "+onyx/e2ee=mls",
+        });
+    }
+    var max_replay_rows: [8]lotus.Message = undefined;
+    const max_rows = try server.history.latest("#e2ee-replay-max", max_replay_rows.len, &max_replay_rows);
+    const large_replay = try server.renderHistoryReplayOwned(alice, "e2ee-many", "#e2ee-replay-max", max_rows, null);
+    defer server.allocator.free(large_replay);
+    try std.testing.expect(large_replay.len > default_reply_bytes * 4);
+    try expectContains(large_replay, max_envelope);
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, large_replay, "@batch=e2ee-many;time="));
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, large_replay, ";+onyx/e2ee=mls :"));
+    const replay_lines = std.mem.count(u8, large_replay, "\n");
+    try std.testing.expectEqual(
+        large_replay.len + replay_lines * 256,
+        LinuxServer.linewiseReplayRawBound(large_replay, false, true).?,
+    );
+    try std.testing.expectEqual(
+        large_replay.len - replay_lines * 2 + replay_lines * 10 + replay_lines * 256,
+        LinuxServer.linewiseReplayRawBound(large_replay, true, true).?,
+    );
+    resetTestSendQ(alice);
+    try LinuxServer.appendHistoryReplay(alice, large_replay);
+    try std.testing.expectEqual(large_replay.len, alice.send_len + alice.send_overflow.items.len);
+    try std.testing.expectEqualSlices(u8, large_replay[0..alice.send_len], alice.send_buf[0..alice.send_len]);
+    try std.testing.expectEqualSlices(u8, large_replay[alice.send_len..], alice.send_overflow.items);
+
+    resetTestSendQ(alice);
+    const original_sendq_cap = alice.sendq_cap;
+    alice.sendq_cap = large_replay.len - 1;
+    try std.testing.expectError(error.OutputTooSmall, LinuxServer.appendHistoryReplay(alice, large_replay));
+    try std.testing.expectEqual(@as(usize, 0), alice.send_len);
+    try std.testing.expectEqual(@as(usize, 0), alice.send_overflow.items.len);
+    alice.sendq_cap = original_sendq_cap;
+
+    const label_storage = try std.testing.allocator.alloc(u8, large_replay.len);
+    defer std.testing.allocator.free(label_storage);
+    var label_capture = ReplyCapture{ .buf = label_storage };
+    label_capture.append(large_replay);
+    try emitLabeledIssuer(alice, "e2ee-label", &label_capture, std.testing.allocator);
+    const labeled_wire = try copyTestSendQ(std.testing.allocator, alice);
+    defer std.testing.allocator.free(labeled_wire);
+    try expectContains(labeled_wire, "@label=e2ee-label BATCH +e2ee-many chathistory #e2ee-replay-max\r\n");
+    try expectContains(labeled_wire, "BATCH -e2ee-many\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, labeled_wire, "labeled-response") == null);
+    try std.testing.expect(std.mem.indexOf(u8, labeled_wire, "suzu-label") == null);
+    try expectContains(labeled_wire, max_envelope);
+
+    const mesh_before = (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len;
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "#e2eebody",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+onyx/e2ee=mls",
+        .text = "mesh tagged plaintext",
+        .origin_node = 4242,
+        .hlc = 11,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "mesh tagged plaintext") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "mesh tagged plaintext") == null);
+    try std.testing.expectEqual(mesh_before, (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len);
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    server.deliverRelay(.{
+        .verb = .notice,
+        .target = "#e2eebody",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+onyx/e2ee=1",
+        .text = envelope,
+        .origin_node = 4242,
+        .hlc = 12,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], envelope) == null);
+    try std.testing.expectEqual(mesh_before, (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len);
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "#e2eebody",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+onyx/e2ee=mls",
+        .text = oversize,
+        .origin_node = 4242,
+        .hlc = 13,
+    });
+    try std.testing.expectEqual(@as(usize, 0), alice.send_len);
+    try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+    try std.testing.expectEqual(mesh_before, (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len);
+
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "#e2eebody",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+onyx/e2ee=mls",
+        .text = format_oversize,
+        .origin_node = 4242,
+        .hlc = 14,
+    });
+    try std.testing.expectEqual(@as(usize, 0), alice.send_len);
+    try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+    try std.testing.expectEqual(mesh_before, (try server.history.latest("#e2eebody", hbuf.len, &hbuf)).len);
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "#e2eebody",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+onyx/e2ee=mls",
+        .text = max_envelope,
+        .origin_node = 4242,
+        .hlc = 15,
+    });
+    try expectContains(alice.send_buf[0..alice.send_len], max_envelope);
+    try expectContains(bob.send_buf[0..bob.send_len], max_envelope);
+    const after_mesh = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
+    try std.testing.expectEqual(mesh_before + 1, after_mesh.len);
+    try std.testing.expectEqualStrings(max_envelope, after_mesh[0].text);
+
+    _ = try server.world.setChannelExtFlag("#e2eebody", .noformat, true);
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", max_envelope, "+onyx/e2ee=mls");
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try expectContains(bob.send_buf[0..bob.send_len], max_envelope);
+    const after_noformat = server.history.latest("#e2eebody", hbuf.len, &hbuf) catch &.{};
+    try std.testing.expectEqual(mesh_before + 2, after_noformat.len);
+    try std.testing.expectEqualStrings(max_envelope, after_noformat[0].text);
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eebody", "!weather nowhere", "+onyx/e2ee=mls");
+    try expectContains(alice.send_buf[0..alice.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "!weather") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "NOTICE") == null);
+}
+
+test "E2EEPOLICYBODY optional rooms still accept untagged plaintext" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#e2eeopt" };
+    _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "optional", .{ .id = "op", .access = .owner });
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    _ = try server.world.join("#e2eeopt", worldIdFromClient(alice_id));
+    _ = try server.world.join("#e2eeopt", worldIdFromClient(bob_id));
+
+    try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eeopt", null, "plain", false));
+    try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eeopt", "+onyx/e2ee=1", "plain", false));
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eeopt", "plain optional", null);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try expectContains(bob.send_buf[0..bob.send_len], "plain optional");
+}
+
+test "E2EEPOLICYBODY off rooms still accept untagged plaintext" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#e2eeoff" };
+    _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "off", .{ .id = "op", .access = .owner });
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    _ = try server.world.join("#e2eeoff", worldIdFromClient(alice_id));
+    _ = try server.world.join("#e2eeoff", worldIdFromClient(bob_id));
+
+    try std.testing.expect(server.messageSatisfiesEncryptionPolicy("#e2eeoff", null, "plain", false));
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#e2eeoff", "plain off", null);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try expectContains(bob.send_buf[0..bob.send_len], "plain off");
+}
+
+test "E2EEPOLICYBODY TAGMSG stays tag-only in required rooms" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var relay_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &relay_peer, 4242, &.{"Remote"});
+    defer relay_peer.deinit();
+
+    const chan = ircx_prop_store.Entity{ .kind = .channel, .id = "#e2eetag" };
+    _ = try server.props.setProp(chan, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    alice.session.addCap(.message_tags);
+    alice.session.addCap(.typing);
+    bob.session.addCap(.message_tags);
+    bob.session.addCap(.typing);
+    _ = try server.world.join("#e2eetag", worldIdFromClient(alice_id));
+    _ = try server.world.join("#e2eetag", worldIdFromClient(bob_id));
+    _ = try server.world.setChannelFlag("#e2eetag", .no_external, false);
+
+    // Existing required-room policy never demanded a text envelope for TAGMSG.
+    // Typing/react remain tag-only; requiring ONYXROOM1 would drop them.
+    const history_before = server.history.totalStoredCount();
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    var tagmsg = try irc_line.parseLine("@+typing=active TAGMSG #e2eetag");
+    try server.handleTagmsg(alice_id, alice, &tagmsg);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "FAIL") == null);
+    try expectContains(bob.send_buf[0..bob.send_len], "TAGMSG #e2eetag");
+    try expectContains(bob.send_buf[0..bob.send_len], "+typing=active");
+    try std.testing.expect(server.history.totalStoredCount() >= history_before);
+
+    resetTestSendQ(alice);
+    resetTestSendQ(bob);
+    server.deliverRelay(.{
+        .verb = .tagmsg,
+        .target = "#e2eetag",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "+typing=active",
+        .text = "",
+        .origin_node = 4242,
+        .hlc = 21,
+    });
+    try expectContains(alice.send_buf[0..alice.send_len], "TAGMSG #e2eetag");
+    try expectContains(bob.send_buf[0..bob.send_len], "TAGMSG #e2eetag");
 }
 
 test "AI policy: public PROP visibility reaches non-op channel members" {
@@ -64296,6 +70224,10 @@ test "topics: CHATHISTORY topic filter is extracted from the command's message t
     // inline parser exposes an @-stripped, +-preserving `tags_raw`, and
     // `handleChathistory` reads the filter from it via `topic_tag.labelFromTags`.
     const tagged = try irc_line.parseLine("@+onyx/topic=general CHATHISTORY LATEST #t * 50");
+    try std.testing.expectEqualStrings(
+        "CHATHISTORY LATEST #t * 50",
+        LinuxServer.chathistoryCommandLine("@+onyx/topic=general CHATHISTORY LATEST #t * 50\r\n").?,
+    );
     var tbuf: [topic_tag.max_label_len]u8 = undefined;
     const filter = if (tagged.tags_raw) |tr| topic_tag.labelFromTags(tr, &tbuf) else null;
     try std.testing.expectEqualStrings("general", filter.?);
@@ -64308,6 +70240,11 @@ test "topics: CHATHISTORY topic filter is extracted from the command's message t
     // No tag → null → the funnel replays everything (backward-compatible).
     const plain = try irc_line.parseLine("CHATHISTORY LATEST #t * 50");
     try std.testing.expect((if (plain.tags_raw) |tr| topic_tag.labelFromTags(tr, &tbuf) else null) == null);
+    try std.testing.expectEqualStrings(
+        "CHATHISTORY LATEST #t * 50",
+        LinuxServer.chathistoryCommandLine("CHATHISTORY LATEST #t * 50\r\n").?,
+    );
+    try std.testing.expect(LinuxServer.chathistoryCommandLine("@label=only") == null);
 }
 
 test "threaded server: +onyx/topic tag rides fanout + echo; untagged is unchanged" {
@@ -64485,7 +70422,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh\":{\"quorum\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"relay_v2\":{\"bridge_implemented\":true,\"authoring\":\"compat\",\"authoring_eligible\":false,\"activation_epoch\":0,\"roster_count\":0,\"roster_digest\":null}") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"mesh_admission\":{\"mode\":\"open\",\"secured_s2s\":false,\"require_secured\":false,\"require_signed_frames\":true,\"roots\":0,\"token_present\":false,\"min_revocation_epoch\":0}") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"entries\":1,\"root\":\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"key_transparency\":{\"enabled\":true,\"available\":true,\"semantics\":\"observational\",\"scope\":\"node-local\",\"entries\":1,\"root\":\"") != null);
         const kt_root_hex = std.fmt.bytesToHex(kt.root(), .lower);
         try std.testing.expect(std.mem.indexOf(u8, text, &kt_root_hex) != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\"history\":{\"targets\":2,\"entries\":3,\"tombstones\":1,\"root\":\"") != null);
@@ -64598,11 +70535,15 @@ test "oper-prefix dedup: collapses repeat +Y within the window, allows real tran
     try std.testing.expect(d.seenRecently("#root", "TREV", true, 1500)); // case-insensitive
     // A different sign (-Y) is a real transition, not a repeat.
     try std.testing.expect(!d.seenRecently("#root", "trev", false, 1600));
+    // Re-adding immediately after that removal is another real transition,
+    // while a repeated re-add remains collapsible.
+    try std.testing.expect(!d.seenRecently("#root", "trev", true, 1610));
+    try std.testing.expect(d.seenRecently("#root", "trev", true, 1620));
     // A different channel or nick is not a repeat.
     try std.testing.expect(!d.seenRecently("#other", "trev", true, 1600));
     try std.testing.expect(!d.seenRecently("#root", "kain", true, 1600));
     // After the window elapses, the same announcement fires again (real re-add).
-    try std.testing.expect(!d.seenRecently("#root", "trev", true, 1000 + oper_prefix_dedup_ms + 1));
+    try std.testing.expect(!d.seenRecently("#root", "trev", true, 1620 + oper_prefix_dedup_ms + 1));
 }
 
 test "remote QUIT dedup is recipient-local and case-insensitive" {
@@ -65017,6 +70958,9 @@ test "deliverRelay accepts a correctly signed origin message" {
 
         var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x21)));
         defer kp.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, message_relay.originShortId(kp.public_key), &.{"Remote"});
+        defer relay_peer.deinit();
         var pk_buf: [message_relay.pubkey_len]u8 = undefined;
         var sig_buf: [message_relay.sig_len]u8 = undefined;
         const msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "signed and delivered", 1, &pk_buf, &sig_buf);
@@ -65027,7 +70971,7 @@ test "deliverRelay accepts a correctly signed origin message" {
     } else return error.SkipZigTest;
 }
 
-test "session replica residence rejects downgrade without widening rowless authority to a decoy" {
+test "E5E1 session replica residence rejects downgrade without widening exact token authority" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var local_ident = try node_identity.fromSeed(@as([32]u8, @splat(0x35)), "session-downgrade-local");
@@ -65103,6 +71047,10 @@ test "session replica residence rejects downgrade without widening rowless autho
     // With no retained v2 authority, the rolling legacy fold still applies.
     const legacy_id = try addTestLocalClient(&server, "Legacy", "legacy-acct");
     const legacy_change = DeltaStub{ .channel = "#legacy", .nick = "Legacy", .account = "legacy-acct" };
+    try std.testing.expectEqual(
+        s2s_link.S2sLink.ResidenceDecision.untrusted,
+        LinuxServer.residenceTrusted(&server, "legacy-acct", "Legacy", remote_a_node, false),
+    );
     try std.testing.expect(server.foldLegacySessionMembership(&downgraded, &legacy_change, "remote.test"));
     try std.testing.expect(server.world.isMember("#legacy", worldIdFromClient(legacy_id)));
 
@@ -66116,7 +72064,11 @@ test "verified relay DM stores canonical account history with origin time and un
         try std.testing.expectEqualStrings(live_time, extractTimeTag(replay) orelse return error.TestUnexpectedResult);
 
         // Legacy delivery remains compatible, but its mutable account string is
-        // never allowed to create or select an account-scoped history key.
+        // never allowed to create or select an account-scoped history key. The
+        // sender still needs ordinary roster-backed residence authority.
+        var legacy_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &legacy_peer, 999, &.{"Evil"});
+        defer legacy_peer.deinit();
         target.send_len = 0;
         target.send_offset = 0;
         server.deliverRelay(.{
@@ -66197,6 +72149,9 @@ test "deliverRelay still delivers a legacy unsigned message (backward compat)" {
             else => return err,
         };
         defer server.deinit();
+        var relay_peer: s2s_link.S2sLink = undefined;
+        try addTestRelayHomes(&server, &relay_peer, 99, &.{"Remote"});
+        defer relay_peer.deinit();
 
         const target_id = try addTestLocalClient(&server, "Target", "targetacct");
         const target = server.connFor(target_id).?;
@@ -66225,6 +72180,9 @@ test "deliverRelay rejects unsafe direct callers before delivery and dedup obser
         else => return err,
     };
     defer server.deinit();
+    var relay_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &relay_peer, 99, &.{"Remote"});
+    defer relay_peer.deinit();
 
     const target_id = try addTestLocalClient(&server, "Target", "targetacct");
     const target = server.connFor(target_id).?;
@@ -66252,7 +72210,7 @@ test "deliverRelay rejects unsafe direct callers before delivery and dedup obser
     try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :valid event survived\r\n");
 }
 
-test "deliverRelay re-forward preserves the signature for the next hop" {
+test "legacy relay signature payload stays self-verifiable" {
     if (comptime builtin.os.tag == .linux) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -66260,18 +72218,15 @@ test "deliverRelay re-forward preserves the signature for the next hop" {
         };
         defer server.deinit();
 
-        // No local recipient for #relay here: deliverRelay's job is the re-forward
-        // path. We assert the message that WOULD be re-forwarded (clean_msg) keeps the
-        // original signature, by re-verifying the encoded copy at std-allocator level.
+        // Re-encode/decode the signed payload and verify the original author
+        // signature still self-certifies the claimed origin.
         var kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x51)));
         defer kp.deinit();
         var pk_buf: [message_relay.pubkey_len]u8 = undefined;
         var sig_buf: [message_relay.sig_len]u8 = undefined;
         const msg = try buildSignedRelay(&kp, "#relay", "Remote!r@elsewhere", "multi-hop authored once", 9, &pk_buf, &sig_buf);
 
-        // The relayed clean_msg copies origin_pubkey/origin_sig verbatim; an encode
-        // round-trip (what a real re-forward does over the wire) still verifies as the
-        // ORIGINAL origin at the next hop.
+        // The encoded/decoded wire copy preserves origin_pubkey/origin_sig verbatim.
         const wire = try message_relay.encode(std.testing.allocator, msg);
         defer std.testing.allocator.free(wire);
         var hop2 = try message_relay.decode(std.testing.allocator, wire);
@@ -66286,7 +72241,7 @@ test "deliverRelay re-forward preserves the signature for the next hop" {
     } else return error.SkipZigTest;
 }
 
-test "deliverRelay binds sender nick to its home node: cross-node impersonation is dropped, legit delivered, unknown passes" {
+test "deliverRelay binds sender nick to home: legit delivers, mismatch and unknown drop" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .node_id = 2 }) catch |err| switch (err) {
@@ -66332,6 +72287,7 @@ test "deliverRelay binds sender nick to its home node: cross-node impersonation 
     server.deliverRelay(base);
     try expectContains(target.send_buf[0..target.send_len], ":ricky!ricky@h PRIVMSG Target :legit cross-node line\r\n");
     try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_home_mismatch);
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_unknown_home_v1);
 
     // (2) Impersonation: a keyed peer authors a frame claiming origin_node 777 while
     // asserting "ricky" (whom THIS node homes on node 1). It must be dropped locally
@@ -66344,21 +72300,415 @@ test "deliverRelay binds sender nick to its home node: cross-node impersonation 
     server.deliverRelay(spoof);
     try std.testing.expectEqual(@as(usize, 0), target.send_len);
     try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch);
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_unknown_home_v1);
     try std.testing.expect(std.mem.indexOf(u8, target.send_buf[0..target.send_len], "IMPERSONATED") == null);
 
-    // (3) Unknown sender (no route home) still delivers — the binding rejects only a
-    // KNOWN-and-different home, never strands convergence-lagged / legacy traffic.
+    // (3) Unknown sender-home (no route home) is now fail-closed for legacy relay
+    // unless signed portable authority exists.
     target.send_len = 0;
     var unknown = base;
     unknown.source_nick = "ghostly";
     unknown.source_prefix = "ghostly!g@elsewhere";
     unknown.origin_node = 555;
     unknown.hlc = 1003;
-    unknown.text = "unknown sender still flows";
+    unknown.text = "unknown sender must drop";
     try std.testing.expectEqual(@as(?s2s_link.NodeId, null), server.meshNickHomeNode("ghostly"));
     server.deliverRelay(unknown);
-    try expectContains(target.send_buf[0..target.send_len], ":ghostly!g@elsewhere PRIVMSG Target :unknown sender still flows\r\n");
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
     try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch); // unchanged
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_unknown_home_v1);
+}
+
+test "MESSAGE_V2 unknown home retries then converges and delivers once" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x31)), "relay-v2-unknown-home");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x32)), "relay-v2-unknown-home");
+    defer origin.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(target_id));
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_prefix = "ghost!u@origin.test",
+        .text = "unknown home waits for authority",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+
+    const first = server.deliverRelayV2(msg, wire, origin.shortId());
+    const first_reason = switch (first) {
+        .retry => |reason| reason,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RelayV2DeferredReason.unknown_home_authority, first_reason);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.len());
+
+    // Converge sender home at the signed origin, then admit once.
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{
+        .allocator = alloc,
+        .local_node_id = origin.shortId(),
+        .remote_node_id = local.shortId(),
+        .local_epoch_ms = 1000,
+        .server_name = "origin.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer peer.deinit();
+    const link = try alloc.create(s2s_link.S2sLink);
+    try link.init(.{
+        .allocator = alloc,
+        .local_node_id = local.shortId(),
+        .remote_node_id = origin.shortId(),
+        .local_epoch_ms = 1001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+
+    try peer.start(50);
+    try peer.sendMembership("#room", "ghost", 0, 100, true, .{ .username = "ghost", .host = "h" }, "");
+    try pumpLinkPair(&peer, link, alloc);
+    try std.testing.expect(link.established());
+    try std.testing.expectEqual(@as(?s2s_link.NodeId, origin.shortId()), server.meshNickHomeNode("ghost"));
+
+    const second = server.deliverRelayV2(msg, wire, origin.shortId());
+    switch (second) {
+        .accepted => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try expectContains(target.send_buf[0..target.send_len], ":ghost!u@origin.test PRIVMSG #room :unknown home waits for authority\r\n");
+    const delivered_len = target.send_len;
+
+    const third = server.deliverRelayV2(msg, wire, origin.shortId());
+    switch (third) {
+        .duplicate => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(delivered_len, target.send_len);
+}
+
+test "MESSAGE_V2 unknown home convergence to different node drops permanently" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x33)), "relay-v2-unknown-mismatch");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x34)), "relay-v2-unknown-mismatch");
+    defer origin.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(target_id));
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_prefix = "ghost!u@origin.test",
+        .text = "different home must drop",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+
+    const first = server.deliverRelayV2(msg, wire, origin.shortId());
+    switch (first) {
+        .retry => |reason| try std.testing.expectEqual(RelayV2DeferredReason.unknown_home_authority, reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+
+    var other_peer: s2s_link.S2sLink = undefined;
+    try other_peer.init(.{
+        .allocator = alloc,
+        .local_node_id = 0xDEAD_BEEF,
+        .remote_node_id = local.shortId(),
+        .local_epoch_ms = 2000,
+        .server_name = "other.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer other_peer.deinit();
+    const other_link = try alloc.create(s2s_link.S2sLink);
+    try other_link.init(.{
+        .allocator = alloc,
+        .local_node_id = local.shortId(),
+        .remote_node_id = 0xDEAD_BEEF,
+        .local_epoch_ms = 2001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = other_link;
+
+    try other_peer.start(50);
+    try other_peer.sendMembership("#room", "ghost", 0, 100, true, .{ .username = "ghost", .host = "h" }, "");
+    try pumpLinkPair(&other_peer, other_link, alloc);
+    try std.testing.expect(other_link.established());
+    try std.testing.expectEqual(@as(?s2s_link.NodeId, 0xDEAD_BEEF), server.meshNickHomeNode("ghost"));
+
+    const second = server.deliverRelayV2(msg, wire, origin.shortId());
+    try std.testing.expect(second == .permanent);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch);
+}
+
+test "MESSAGE_V2 deferred unknown-home expires without delivery" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x35)), "relay-v2-unknown-expiry");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x36)), "relay-v2-unknown-expiry");
+    defer origin.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(target_id));
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_prefix = "ghost!u@origin.test",
+        .text = "deferred unknown home should expire",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+    const owned = try message_relay_v2.decode(alloc, wire);
+    var inbound = s2s_link.InboundMessageV2{
+        .owned = owned,
+        .wire = try alloc.dupe(u8, wire),
+        .via_peer = origin.shortId(),
+    };
+    try std.testing.expect(server.deferRelayV2(&inbound, .unknown_home_authority));
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_deferred_len);
+    server.relay_v2_deferred[0].first_deferred_ms = server.meshWallMs() - (relay_v2_unknown_home_retry_ttl_ms + 1);
+    server.retryDeferredRelayV2();
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_deferred_len);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+}
+
+test "MESSAGE_V2 signed member modes bypass unknown-home retry" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x37)), "relay-v2-membermode-bypass");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x38)), "relay-v2-membermode-bypass");
+    defer origin.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(target_id));
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_prefix = "ghost!u@origin.test",
+        .text = "signed member modes bypass unknown home",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+        .sender_member_modes = 0,
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+
+    const out = server.deliverRelayV2(msg, wire, origin.shortId());
+    switch (out) {
+        .accepted => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try expectContains(target.send_buf[0..target.send_len], ":ghost!u@origin.test PRIVMSG #room :signed member modes bypass unknown home\r\n");
+}
+
+test "MESSAGE_V2 known-home mismatch with signed member modes still drops permanently" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x39)), "relay-v2-mismatch-membermode");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x3a)), "relay-v2-mismatch-membermode");
+    defer origin.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(target_id));
+
+    var other_peer: s2s_link.S2sLink = undefined;
+    try other_peer.init(.{
+        .allocator = alloc,
+        .local_node_id = 0xDEAD_BEEF,
+        .remote_node_id = local.shortId(),
+        .local_epoch_ms = 2000,
+        .server_name = "other.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer other_peer.deinit();
+    const other_link = try alloc.create(s2s_link.S2sLink);
+    try other_link.init(.{
+        .allocator = alloc,
+        .local_node_id = local.shortId(),
+        .remote_node_id = 0xDEAD_BEEF,
+        .local_epoch_ms = 2001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = other_link;
+
+    try other_peer.start(50);
+    try other_peer.sendMembership("#room", "ghost", 0, 100, true, .{ .username = "ghost", .host = "h" }, "");
+    try pumpLinkPair(&other_peer, other_link, alloc);
+    try std.testing.expect(other_link.established());
+    try std.testing.expectEqual(@as(?s2s_link.NodeId, 0xDEAD_BEEF), server.meshNickHomeNode("ghost"));
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#room",
+        .source_prefix = "ghost!u@origin.test",
+        .text = "member modes must not launder a home mismatch",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+        .sender_member_modes = 0,
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+
+    const out = server.deliverRelayV2(msg, wire, origin.shortId());
+    try std.testing.expect(out == .permanent);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_home_mismatch);
+
+    // A signed direct sender route may bridge only missing multi-hop roster
+    // state. It must never override an explicit residence conflict.
+    var direct = msg;
+    direct.target = "Target";
+    direct.text = "signed route must not launder a home mismatch";
+    direct.scope_kind = .direct;
+    direct.sender_member_modes = null;
+    direct.sender_route_id = try message_relay_v2.routeId(@splat(0x71));
+    direct.recipient_route_id = try message_relay_v2.routeId(@splat(0x72));
+    direct.hlc = server.nextMeshHlc();
+    try message_relay_v2.stampOrigin(alloc, &direct, &origin.sign_kp, &pubkey, &signature);
+    const direct_wire = try message_relay_v2.encode(alloc, direct);
+    defer alloc.free(direct_wire);
+    const direct_out = server.deliverRelayV2(direct, direct_wire, origin.shortId());
+    try std.testing.expect(direct_out == .permanent);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(u64, 2), server.rejected_relay_home_mismatch);
 }
 
 // ---------------------------------------------------------------------------
@@ -66663,6 +73013,124 @@ fn buildSignedEntityProp(
         .origin_pubkey = ev.origin_pubkey,
         .origin_sig = ev.origin_sig,
     };
+}
+
+test "E5E1 remote identity namespace quarantine precedes signatures clocks stores and authority" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const baseline_hlc = server.nextMeshHlc();
+    const baseline_clock = server.mesh_clock;
+    const baseline_signatures = server.rejected_relay_signatures;
+    const baseline_authority = server.rejected_relay_home_mismatch;
+    const quarantined = [_]TestEntityPropFact{
+        .{ .kind = .user, .entity = "alice", .key = "identity.key.primary", .value = "bad", .owner = "alice", .hlc = baseline_hlc + 1, .present = true, .origin_node = 7, .origin_pubkey = "forged", .origin_sig = "forged" },
+        .{ .kind = .user, .entity = "alice", .key = "IDENTITY.KEY.", .value = "", .owner = "alice", .hlc = baseline_hlc + 2, .present = false, .origin_node = 7 },
+        .{ .kind = .user, .entity = "alice", .key = "Identity.Residence.0000000000000007", .value = "bad", .owner = "alice", .hlc = baseline_hlc + 3, .present = true, .origin_node = 7 },
+        .{ .kind = .user, .entity = "alice", .key = "identity.residence.abc", .value = "", .owner = "alice", .hlc = baseline_hlc + 4, .present = false, .origin_node = 7 },
+    };
+    for (quarantined) |fact| {
+        try std.testing.expect(!server.applyRemoteEntityProp(fact));
+        try std.testing.expect(server.entityPropClock(.user, fact.entity, fact.key) == null);
+        try std.testing.expectError(
+            error.PropMissing,
+            server.props.getPropRaw(.{ .kind = .user, .id = fact.entity }, fact.key),
+        );
+        try std.testing.expectEqual(baseline_clock.last_physical, server.mesh_clock.last_physical);
+        try std.testing.expectEqual(baseline_clock.last_stamp, server.mesh_clock.last_stamp);
+        try std.testing.expectEqual(baseline_signatures, server.rejected_relay_signatures);
+        try std.testing.expectEqual(baseline_authority, server.rejected_relay_home_mismatch);
+    }
+    try std.testing.expectEqual(@as(u64, quarantined.len), server.remote_identity_props_quarantined);
+
+    const near = TestEntityPropFact{ .kind = .user, .entity = "alice", .key = "identity.keyX.keep", .value = "ordinary", .owner = "alice", .hlc = baseline_hlc + 10, .present = true, .origin_node = 7 };
+    try std.testing.expect(server.applyRemoteEntityProp(near));
+    try std.testing.expectEqualStrings("ordinary", (try server.props.getPropRaw(.{ .kind = .user, .id = "alice" }, near.key)).value);
+
+    const member = TestEntityPropFact{ .kind = .member, .entity = "#room:alice", .key = "identity.key.primary", .value = "member", .owner = "alice", .hlc = baseline_hlc + 11, .present = true, .origin_node = 7 };
+    try std.testing.expect(server.applyRemoteEntityProp(member));
+    try std.testing.expectEqualStrings("member", (try server.props.getPropRaw(.{ .kind = .member, .id = member.entity }, member.key)).value);
+}
+
+test "E5E1 local identity add residence and delete never export to plaintext or secured links" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var plain_local: s2s_link.S2sLink = undefined;
+    try plain_local.init(.{ .allocator = allocator, .local_node_id = 0xA1, .remote_node_id = 0xA2, .local_epoch_ms = 1000, .server_name = "e5e1-local.test", .config = .{ .require_signed_frames = false } });
+    defer plain_local.deinit();
+    var plain_remote: s2s_link.S2sLink = undefined;
+    try plain_remote.init(.{ .allocator = allocator, .local_node_id = 0xA2, .remote_node_id = 0xA1, .local_epoch_ms = 2000, .server_name = "e5e1-remote.test", .config = .{ .require_signed_frames = false } });
+    defer plain_remote.deinit();
+    try plain_local.start(10);
+    var round: usize = 0;
+    while (round < 32) : (round += 1) {
+        const local_wire = try allocator.dupe(u8, plain_local.outbound());
+        defer allocator.free(local_wire);
+        const remote_wire = try allocator.dupe(u8, plain_remote.outbound());
+        defer allocator.free(remote_wire);
+        plain_local.clearOutbound();
+        plain_remote.clearOutbound();
+        if (local_wire.len == 0 and remote_wire.len == 0) break;
+        if (local_wire.len != 0) try plain_remote.feed(local_wire, round + 11, 0xE5E1 +% round);
+        if (remote_wire.len != 0) try plain_local.feed(remote_wire, round + 11, 0x1E5E +% round);
+    }
+    try std.testing.expect(plain_local.established());
+
+    var secured = try SessionReplayTestPair.initWithSeeds(allocator, 0xB1, 0xB2);
+    defer secured.deinit();
+    secured.a.clearOutbound();
+    secured.b.clearOutbound();
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const plain_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const plain_conn = server.rx().clients.get(plain_id).?;
+    plain_conn.overflow_allocator = allocator;
+    plain_conn.token = try tokenFromId(plain_id);
+    plain_conn.send_armed = true;
+    plain_conn.sendq_cap = default_sendq_cap;
+    plain_conn.s2s = &plain_local;
+    const secured_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const secured_conn = server.rx().clients.get(secured_id).?;
+    secured_conn.overflow_allocator = allocator;
+    secured_conn.token = try tokenFromId(secured_id);
+    secured_conn.send_armed = true;
+    secured_conn.sendq_cap = default_sendq_cap;
+    secured_conn.s2s_secured = &secured.a;
+    defer {
+        plain_conn.s2s = null;
+        secured_conn.s2s_secured = null;
+        _ = server.rx().clients.free(plain_id);
+        _ = server.rx().clients.free(secured_id);
+    }
+
+    const entity = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    _ = try server.props.setProp(entity, "identity.key.primary", "local-key", .{ .id = "alice", .access = .user });
+    server.propagateLocalEntityPropAt(true, .user, "alice", "identity.key.primary", "local-key", "alice", 100);
+    _ = try server.props.setProp(entity, "identity.residence.0000000000000001", "local-proof", .{ .id = "alice", .access = .user });
+    server.propagateLocalEntityPropAt(true, .user, "alice", "identity.residence.0000000000000001", "local-proof", "alice", 101);
+    try server.props.deleteProp(entity, "identity.key.primary");
+    server.propagateLocalEntityPropAt(false, .user, "alice", "identity.key.primary", "", "alice", 102);
+
+    try std.testing.expect(server.entityPropClock(.user, "alice", "identity.key.primary") != null);
+    try std.testing.expect(server.entityPropClock(.user, "alice", "identity.residence.0000000000000001") != null);
+    try std.testing.expectEqual(@as(usize, 0), plain_conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), plain_conn.send_overflow.items.len);
+    try std.testing.expectEqual(@as(usize, 0), secured_conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), secured_conn.send_overflow.items.len);
+    try std.testing.expectEqual(@as(usize, 0), plain_local.outbound().len);
+    try std.testing.expectEqual(@as(usize, 0), secured.a.outbound().len);
 }
 
 test "remote property admission advances HLC only for accepted channel and entity facts" {
@@ -67460,6 +73928,28 @@ fn expectSingleNamesNick(
     try std.testing.expectEqual(@as(usize, 1), matches);
 }
 
+/// Assert the complete (possibly split across several 353 replies) roster has
+/// exactly one entry, with the expected status spelling, and no generated mesh
+/// UID. The terminating 366 must already have been received by the caller.
+fn expectExactSingleNamesRoster(bytes: []const u8, header: []const u8, expected_entry: []const u8) !void {
+    var lines = std.mem.splitSequence(u8, bytes, "\r\n");
+    var entries_seen: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, header) == null) continue;
+        const trailing_at = std.mem.indexOf(u8, line, " :") orelse return error.TestUnexpectedResult;
+        var entries = std.mem.tokenizeScalar(u8, line[trailing_at + 2 ..], ' ');
+        while (entries.next()) |entry| {
+            entries_seen += 1;
+            try std.testing.expectEqualStrings(expected_entry, entry);
+            var nick_at: usize = 0;
+            while (nick_at < entry.len and std.mem.indexOfScalar(u8, "*!.@+", entry[nick_at]) != null)
+                nick_at += 1;
+            try std.testing.expect(!mesh_uid_alloc.validate(entry[nick_at..]));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries_seen);
+}
+
 fn waitMillis(ms: i64) void {
     const deadline = platform.monotonicMillis() + ms;
     while (platform.monotonicMillis() < deadline) {}
@@ -67679,7 +74169,13 @@ test "threaded server: login defers autojoin and restores only after exact SESSI
     defer store.deinit();
     var services = services_mod.Services.init(&store, null);
 
-    var cfg = Config{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io };
+    var cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
+    };
     cfg.chanlimit = 96;
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -67728,7 +74224,7 @@ test "threaded server: login defers autojoin and restores only after exact SESSI
     const token_start = (std.mem.indexOf(u8, a.written(), token_marker) orelse return error.TestUnexpectedResult) + token_marker.len;
     const token_tail = a.written()[token_start..];
     const token_len = std.mem.indexOfScalar(u8, token_tail, '\r') orelse return error.TestUnexpectedResult;
-    var token_buf: [64]u8 = undefined;
+    var token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(token_buf[0..token_len], token_tail[0..token_len]);
     const resume_token = token_buf[0..token_len];
 
@@ -67748,9 +74244,9 @@ test "threaded server: login defers autojoin and restores only after exact SESSI
     // Same-account authentication alone must not consume an arbitrary device
     // ghost. The exact credential is the ownership proof.
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "NICK :trev") == null);
-    var resume_line: [128]u8 = undefined;
+    var resume_line: [160]u8 = undefined;
     try writeAllFd(fd_b, try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{resume_token}));
-    try recvUntil(&b, "SESSION RESUME: session restored", 200);
+    try recvUntil(&b, "SESSION RESUME: exact session restored", 200);
     try recvUntil(&b, "NICK :trev", 200);
     try recvUntil(&b, "JOIN #root", 200);
     try recvUntil(&b, "JOIN #ops", 200);
@@ -67774,6 +74270,40 @@ test "threaded server: login defers autojoin and restores only after exact SESSI
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "TempResume") == null);
 }
 
+test "threaded server: session-sync fresh login defers autojoin until SESSION TOKEN" {
+    var cfg = operTestConfig(0);
+    cfg.sasl_checker = test_dm_relay_checker;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try server.autojoins.add("nova", "#autohome");
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+    try saslPlainPreludeWithCaps(fd, "nova", "pw", "onyx/session-sync");
+    try writeAllFd(fd, "NICK TempPortable\r\nUSER web 0 * :Portable resume\r\n");
+    try recvUntil(&client, " 001 TempPortable ", 200);
+    testSleepMs(50);
+    try client.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), "JOIN #autohome") == null);
+
+    client.reset();
+    try writeAllFd(fd, "SESSION TOKEN\r\n");
+    try recvUntil(&client, "JOIN #autohome", 200);
+}
+
 test "threaded server: SASL-opered login keeps privileges across explicit detached-session restore" {
     // Regression: SASL registration elevates the live session FIRST, then the
     // client explicitly restores its detached ghost. The ghost's migration
@@ -67794,6 +74324,7 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -67828,7 +74359,7 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
     const token_start = (std.mem.indexOf(u8, a.written(), token_marker) orelse return error.TestUnexpectedResult) + token_marker.len;
     const token_tail = a.written()[token_start..];
     const token_len = std.mem.indexOfScalar(u8, token_tail, '\r') orelse return error.TestUnexpectedResult;
-    var token_buf: [64]u8 = undefined;
+    var token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(token_buf[0..token_len], token_tail[0..token_len]);
     const resume_token = token_buf[0..token_len];
     closeFd(fd_a);
@@ -67844,9 +74375,9 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
     try saslPlainPrelude(fd_b, "admin", "onyx");
     try writeAllFd(fd_b, "NICK TempOper\r\nUSER webchat 0 * :Webchat\r\n");
     try recvUntil(&b, " 381 TempOper ", 200);
-    var resume_line: [128]u8 = undefined;
+    var resume_line: [160]u8 = undefined;
     try writeAllFd(fd_b, try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{resume_token}));
-    try recvUntil(&b, "SESSION RESUME: session restored", 200);
+    try recvUntil(&b, "SESSION RESUME: exact session restored", 200);
     try recvUntil(&b, "NICK :trev", 200);
     try recvUntil(&b, "JOIN #ops", 200);
 
@@ -68044,14 +74575,739 @@ test "threaded server: session reclaim local restore failure leaves the ghost re
     // Onyx immediately asks for TOKEN after RESUME. The first request after a
     // retryable failure must not overwrite the old stored credential. A second
     // explicit request is the user's escape hatch to replace it.
+    b_conn.resume_autojoin_deferred = true;
+    b_conn.resume_autojoin_deadline_ms = platform.monotonicMillis() + 10_000;
     b_conn.send_len = 0;
     var token_line = try irc_line.parseLine("SESSION TOKEN");
     try server.handleSession(b_id, b_conn, &token_line);
     try expectContains(b_conn.send_buf[0..b_conn.send_len], "WARN SESSION RESUME_CREDENTIAL_PRESERVED");
     try std.testing.expect(std.mem.indexOf(u8, b_conn.send_buf[0..b_conn.send_len], ":SESSION TOKEN ") == null);
+    try std.testing.expect(b_conn.resume_autojoin_deferred);
     b_conn.send_len = 0;
     try server.handleSession(b_id, b_conn, &token_line);
     try expectContains(b_conn.send_buf[0..b_conn.send_len], "SESSION TOKEN ");
+    try std.testing.expect(!b_conn.resume_autojoin_deferred);
+}
+
+test "SESSION RESUME retry latch clears on terminal and already-attached attempts" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "resume-latch";
+    const ghost_id = try addTestLocalClient(&server, "LatchGhost", account);
+    const claimant_id = try addTestLocalClient(&server, "LatchClaimant", account);
+    const claimant = server.connFor(claimant_id).?;
+    const ghost_cid = monitorIdFromClient(ghost_id);
+    const claimant_cid = monitorIdFromClient(claimant_id);
+    const token = server.sessions.resumeHandleForClient(account, ghost_cid).?.token;
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot(account, ghost_cid, "corrupt-resume-image"));
+    const token_hex = std.fmt.bytesToHex(token, .lower);
+    var line_buf: [64]u8 = undefined;
+    var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(&line_buf, "SESSION RESUME {s}", .{token_hex}));
+
+    // A retryable restore re-arms an already-expired autojoin hold. The sweep
+    // immediately after WARN must not release the temporary identity.
+    claimant.resume_autojoin_deferred = true;
+    claimant.resume_autojoin_deadline_ms = server.nowMs() - 1;
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try std.testing.expect(claimant.preserve_resume_credential_once);
+    try std.testing.expect(claimant.resume_autojoin_deadline_ms > server.nowMs());
+    server.sweepDeferredSessionAutojoins();
+    try std.testing.expect(claimant.resume_autojoin_deferred);
+
+    // A terminal next attempt owns its own latch state; it cannot inherit the
+    // prior WARN and block the following SESSION TOKEN request.
+    claimant.send_len = 0;
+    var terminal_line = try irc_line.parseLine("SESSION RESUME 00000000000000000000000000000000");
+    try server.handleSessionResume(claimant_id, claimant, account, &terminal_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "INVALID_TOKEN");
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+
+    // Recreate a retryable outcome, then model convergence attaching this exact
+    // physical client before its next request. The idempotent already-attached
+    // result must clear the sticky latch and finish the deferred autojoin hold.
+    claimant.send_len = 0;
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try std.testing.expect(claimant.preserve_resume_credential_once);
+    const attached = try server.sessions.attachReportingEviction(account, claimant_cid, token, 2);
+    server.finalizeAttachEviction(attached);
+    claimant.send_len = 0;
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "already attached to this session");
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+    try std.testing.expect(!claimant.resume_autojoin_deferred);
+}
+
+test "SESSION RESUME composite rejects malformed terminal and forged exact authority without downgrade" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xd1)), "resume-security");
+    defer identity.deinit();
+    var foreign_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xd2)), "resume-security-foreign");
+    defer foreign_identity.deinit();
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .server_name = "resume-security.test",
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "resume-security";
+    const target_id = try addTestLocalClient(&server, "SecurityTarget", account);
+    const claimant_id = try addTestLocalClient(&server, "SecurityClaimant", account);
+    const target_handle = server.sessions.resumeHandleForClient(
+        account,
+        monitorIdFromClient(target_id),
+    ) orelse return error.TestUnexpectedResult;
+    const target_aid = target_handle.attachment_id orelse return error.TestUnexpectedResult;
+    const claimant = server.connFor(claimant_id) orelse return error.TestUnexpectedResult;
+
+    // A recognized SRM2 prefix is strict: malformed authority is terminal and
+    // cannot fall through into either bare local-token or SRM1 parsing.
+    var malformed = try irc_line.parseLine("SESSION RESUME srm2l.not-a-token.not-an-attachment");
+    try server.handleSessionResume(claimant_id, claimant, account, &malformed);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION INVALID_TOKEN");
+    try std.testing.expect(server.sessions.findAttachmentSessionInAccount(
+        account,
+        target_handle.token,
+        target_aid,
+    ) != null);
+
+    // A correctly encoded exact selector for a live attachment is terminal,
+    // and an unknown physical id is distinctly terminal. Neither arms retry.
+    claimant.send_len = 0;
+    const live_credential = try session_resume_credential.encodeLocal(target_handle.token, target_aid);
+    var line_buf: [1600]u8 = undefined;
+    var live_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{live_credential},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &live_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION ATTACHMENT_IN_USE");
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+
+    claimant.send_len = 0;
+    const absent_aid = sessions_mod.AttachmentId.fromBytes(@as([16]u8, @splat(0xee))) catch unreachable;
+    const absent_credential = try session_resume_credential.encodeLocal(target_handle.token, absent_aid);
+    var absent_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{absent_credential},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &absent_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION NO_ATTACHMENT");
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+
+    const now: i64 = @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+    const base_claim = session_reclaim_attachment.Claim{
+        .kind = .exact_restore,
+        .account = account,
+        .group_token = target_handle.token,
+        .attachment_id = target_aid,
+        .origin_node = identity.shortId(),
+        .destination_node = identity.shortId(),
+        .issued_at_ms = now,
+        .expires_at_ms = now + @as(i64, @intCast(LinuxServer.mesh_reclaim_ttl_ms)),
+        .nonce = 7,
+    };
+    const local_wire = try session_reclaim_attachment.encodeClaim(
+        std.testing.allocator,
+        base_claim,
+        &identity.sign_kp,
+    );
+    defer std.testing.allocator.free(local_wire);
+    var local_hex_buf: [session_reclaim_attachment.max_claim_wire_len * 2]u8 = undefined;
+    const local_hex = LinuxServer.toHexLower(local_wire, &local_hex_buf);
+
+    // The textual attachment suffix is independently bound to the signed
+    // claim, so replacing only the suffix fails before target selection.
+    claimant.send_len = 0;
+    var mesh_text_buf: [1600]u8 = undefined;
+    const suffix_tampered = try session_resume_credential.encodeMesh(
+        &mesh_text_buf,
+        local_hex,
+        absent_aid,
+    );
+    var suffix_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{suffix_tampered},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &suffix_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION INVALID_TOKEN");
+
+    // A valid signature for another account cannot be replayed by this account.
+    var wrong_account_claim = base_claim;
+    wrong_account_claim.account = "other-account";
+    const wrong_account_wire = try session_reclaim_attachment.encodeClaim(
+        std.testing.allocator,
+        wrong_account_claim,
+        &identity.sign_kp,
+    );
+    defer std.testing.allocator.free(wrong_account_wire);
+    var wrong_account_hex_buf: [session_reclaim_attachment.max_claim_wire_len * 2]u8 = undefined;
+    const wrong_account_hex = LinuxServer.toHexLower(wrong_account_wire, &wrong_account_hex_buf);
+    const wrong_account_text = try session_resume_credential.encodeMesh(
+        &mesh_text_buf,
+        wrong_account_hex,
+        target_aid,
+    );
+    claimant.send_len = 0;
+    var wrong_account_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{wrong_account_text},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &wrong_account_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION INVALID_TOKEN");
+
+    // A cryptographically valid claim from a node without an authenticated
+    // secured route is untrusted, even when all payload fields otherwise match.
+    var foreign_claim = base_claim;
+    foreign_claim.origin_node = foreign_identity.shortId();
+    foreign_claim.destination_node = foreign_identity.shortId();
+    const foreign_wire = try session_reclaim_attachment.encodeClaim(
+        std.testing.allocator,
+        foreign_claim,
+        &foreign_identity.sign_kp,
+    );
+    defer std.testing.allocator.free(foreign_wire);
+    var foreign_hex_buf: [session_reclaim_attachment.max_claim_wire_len * 2]u8 = undefined;
+    const foreign_hex = LinuxServer.toHexLower(foreign_wire, &foreign_hex_buf);
+    const foreign_text = try session_resume_credential.encodeMesh(
+        &mesh_text_buf,
+        foreign_hex,
+        target_aid,
+    );
+    claimant.send_len = 0;
+    var foreign_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{foreign_text},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &foreign_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION INVALID_TOKEN");
+
+    // The synchronized reactor-0 publication is the only remote trust source.
+    // Route results own a fixed name copy, survive publication replacement, and
+    // disappear immediately when the authenticated key or live count changes.
+    const foreign_signed = try session_reclaim_attachment.decodeClaim(foreign_wire);
+    lockSpin(&server.mesh_peer_identity_mu);
+    server.mesh_peer_node_ids[0] = foreign_identity.shortId();
+    server.mesh_peer_public_keys[0] = foreign_identity.sign_kp.public_key;
+    server.mesh_peer_public_key_present[0] = true;
+    const published_name = "foreign-resume.test";
+    @memcpy(server.mesh_peer_names[0][0..published_name.len], published_name);
+    server.mesh_peer_name_lens[0] = @intCast(published_name.len);
+    server.net_peer_count.store(1, .release);
+    server.mesh_peer_identity_mu.unlock();
+    const published_route = server.trustedReclaimRoute(
+        foreign_identity.shortId(),
+        foreign_signed,
+    ) orelse return error.TestUnexpectedResult;
+    switch (published_route) {
+        .local => return error.TestUnexpectedResult,
+        .remote => |remote| try std.testing.expectEqualStrings(published_name, remote.slice()),
+    }
+    lockSpin(&server.mesh_peer_identity_mu);
+    @memset(&server.mesh_peer_names[0], 0);
+    server.mesh_peer_public_keys[0] = identity.sign_kp.public_key;
+    server.mesh_peer_identity_mu.unlock();
+    switch (published_route) {
+        .local => return error.TestUnexpectedResult,
+        .remote => |remote| try std.testing.expectEqualStrings(published_name, remote.slice()),
+    }
+    try std.testing.expect(server.trustedReclaimRoute(
+        foreign_identity.shortId(),
+        foreign_signed,
+    ) == null);
+    lockSpin(&server.mesh_peer_identity_mu);
+    server.mesh_peer_public_keys[0] = foreign_identity.sign_kp.public_key;
+    server.net_peer_count.store(0, .release);
+    server.mesh_peer_identity_mu.unlock();
+    try std.testing.expect(server.trustedReclaimRoute(
+        foreign_identity.shortId(),
+        foreign_signed,
+    ) == null);
+}
+
+test "SESSION RESUME exact selector moves only its sibling and durable spool" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .session_max_per_account = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "selected-sibling";
+    const first_id = try addTestLocalClient(&server, "SelectedOne", account);
+    const second_id = try addTestLocalClient(&server, "SelectedTwo", account);
+    const claimant_id = try addTestLocalClient(&server, "SelectedClaimant", account);
+    const first_cid = monitorIdFromClient(first_id);
+    const second_cid = monitorIdFromClient(second_id);
+    const claimant_cid = monitorIdFromClient(claimant_id);
+    try std.testing.expect(!server.sessions.containsClient(account, claimant_cid));
+    const first_handle = server.sessions.resumeHandleForClient(account, first_cid) orelse
+        return error.TestUnexpectedResult;
+    const first_aid = first_handle.attachment_id orelse return error.TestUnexpectedResult;
+    const second_aid = (server.sessions.resumeHandleForClient(account, second_cid) orelse
+        return error.TestUnexpectedResult).attachment_id orelse return error.TestUnexpectedResult;
+    try std.testing.expect(server.sessions.joinTokenGroup(account, second_cid, first_handle.token));
+
+    const first_conn = server.connFor(first_id) orelse return error.TestUnexpectedResult;
+    first_conn.session.addCap(.message_tags);
+    first_conn.send_armed = true;
+    first_conn.sendq_cap = 0;
+    try server.deliverTagged(first_id, .{
+        .time_value = "",
+        .account = null,
+        .msgid = "0123456789ABCDEFGHJKMNPQSA",
+    }, ":source!u@h PRIVMSG SelectedOne :selected-first\r\n");
+    const second_conn = server.connFor(second_id) orelse return error.TestUnexpectedResult;
+    second_conn.session.addCap(.message_tags);
+    second_conn.send_armed = true;
+    second_conn.sendq_cap = 0;
+    try server.deliverTagged(second_id, .{
+        .time_value = "",
+        .account = null,
+        .msgid = "0123456789ABCDEFGHJKMNPQSB",
+    }, ":source!u@h PRIVMSG SelectedTwo :selected-second\r\n");
+    try std.testing.expect(server.sessions.markDetached(account, first_cid));
+    try std.testing.expect(server.sessions.markDetached(account, second_cid));
+
+    const claimant = server.connFor(claimant_id) orelse return error.TestUnexpectedResult;
+    const credential = try session_resume_credential.encodeLocal(first_handle.token, first_aid);
+    var line_buf: [1600]u8 = undefined;
+    var line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{credential},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "SESSION RESUME: exact session reclaimed");
+
+    const rebound = server.sessions.findAttachmentSessionInAccount(
+        account,
+        first_handle.token,
+        first_aid,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rebound.attached);
+    try std.testing.expectEqual(claimant_cid, rebound.client);
+    const untouched = server.sessions.findAttachmentSessionInAccount(
+        account,
+        first_handle.token,
+        second_aid,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!untouched.attached);
+    try std.testing.expectEqual(second_cid, untouched.client);
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.pendingCountFor(first_cid));
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.pendingCountFor(claimant_cid));
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.pendingCountFor(second_cid));
+    try std.testing.expect(server.attachment_delivery_mu.tryLock());
+    server.attachment_delivery_mu.unlock();
+}
+
+test "ReleaseSafe SESSION TOKEN reader-first issuance gate defaults legacy and explicitly enables SRM2" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xd3)), "resume-issuance-gate");
+    defer identity.deinit();
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .server_name = "resume-issuance.test",
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "resume-issuance-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "IssuanceGate", "issuance-account");
+    const conn = server.connFor(id) orelse return error.TestUnexpectedResult;
+    var token_line = try irc_line.parseLine("SESSION TOKEN");
+    try server.handleSession(id, conn, &token_line);
+    const legacy_local = testSessionTokenFromReply(conn.send_buf[0..conn.send_len], "SESSION TOKEN ") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, session_resume_credential.token_hex_len), legacy_local.len);
+    try std.testing.expect(!std.mem.startsWith(u8, legacy_local, "srm2"));
+    const legacy_mesh = testSessionTokenFromReply(conn.send_buf[0..conn.send_len], "SESSION MTOKEN ") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(!std.mem.startsWith(u8, legacy_mesh, "srm2"));
+
+    server.config.session_resume_composite_issuance = true;
+    conn.send_len = 0;
+    conn.send_offset = 0;
+    try server.handleSession(id, conn, &token_line);
+    const exact_local = testSessionTokenFromReply(conn.send_buf[0..conn.send_len], "SESSION TOKEN ") orelse
+        return error.TestUnexpectedResult;
+    const decoded_local = switch (try session_resume_credential.decode(exact_local)) {
+        .local => |value| value,
+        .mesh => return error.TestUnexpectedResult,
+    };
+    const handle = server.sessions.resumeHandleForClient(
+        "issuance-account",
+        monitorIdFromClient(id),
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(handle.token, decoded_local.group_token);
+    try std.testing.expect(decoded_local.attachment_id.eql(handle.attachment_id orelse
+        return error.TestUnexpectedResult));
+    _ = try expectFreshMeshSessionToken(
+        conn.send_buf[0..conn.send_len],
+        "resume-issuance-secret",
+        "issuance-account",
+        exact_local,
+    );
+}
+
+test "E2EE at-cap exact resume hold isolates succeeds on proof and closes on expiry" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .session_max_per_account = 1,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "e2ee-cap-success";
+    const ghost_id = try addTestLocalClient(&server, "E2eeGhost", account);
+    const ghost_cid = monitorIdFromClient(ghost_id);
+    const handle = server.sessions.resumeHandleForClient(account, ghost_cid) orelse
+        return error.TestUnexpectedResult;
+    const aid = handle.attachment_id orelse return error.TestUnexpectedResult;
+    try std.testing.expect(server.sessions.markDetached(account, ghost_cid));
+    const claimant_id = try addTestLocalClient(&server, "E2eeClaimant", account);
+    const claimant = server.connFor(claimant_id) orelse return error.TestUnexpectedResult;
+    claimant.session.registration.registered = true;
+    claimant.session.addCap(.onyx_e2ee);
+    try std.testing.expect(!server.sessions.containsClient(account, monitorIdFromClient(claimant_id)));
+    server.armBoundedExactResumeHoldIfNeeded(claimant_id, claimant);
+    try std.testing.expect(claimant.resume_autojoin_deferred);
+    try std.testing.expect(try server.enforceE2eeSessionEligibility(claimant_id, claimant));
+
+    claimant.send_len = 0;
+    try server.processLiveLine(claimant_id, claimant, "JOIN #must-not-join");
+    try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION RESUME_PENDING");
+    try std.testing.expect(!server.world.isMember("#must-not-join", worldIdFromClient(claimant_id)));
+
+    const credential = try session_resume_credential.encodeLocal(handle.token, aid);
+    var command_buf: [1600]u8 = undefined;
+    var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &command_buf,
+        "SESSION RESUME {s}",
+        .{credential},
+    ));
+    claimant.send_len = 0;
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "exact session reclaimed");
+    try std.testing.expect(!claimant.resume_autojoin_deferred);
+    try std.testing.expect(!claimant.closing);
+    try std.testing.expect(server.sessions.clientHasAttachment(
+        account,
+        monitorIdFromClient(claimant_id),
+        handle.token,
+        aid,
+    ));
+
+    const expiry_account = "e2ee-cap-expiry";
+    const expiry_ghost_id = try addTestLocalClient(&server, "ExpiryGhost", expiry_account);
+    try std.testing.expect(server.sessions.markDetached(
+        expiry_account,
+        monitorIdFromClient(expiry_ghost_id),
+    ));
+    const expiry_id = try addTestLocalClient(&server, "ExpiryClaimant", expiry_account);
+    const expiry = server.connFor(expiry_id) orelse return error.TestUnexpectedResult;
+    expiry.session.registration.registered = true;
+    expiry.session.addCap(.onyx_e2ee);
+    server.armBoundedExactResumeHoldIfNeeded(expiry_id, expiry);
+    try std.testing.expect(try server.enforceE2eeSessionEligibility(expiry_id, expiry));
+    expiry.resume_autojoin_deadline_ms = server.nowMs() - 1;
+    server.sweepDeferredSessionAutojoins();
+    try std.testing.expect(expiry.closing);
+    try std.testing.expect(!expiry.resume_autojoin_deferred);
+    try expectContains(expiry.send_buf[0..expiry.send_len], "FAIL E2EEGROUP SESSION_UNAVAILABLE");
+}
+
+test "SESSION RESUME legacy local and SRM1 create new without stripping ghost spool" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "legacy-resume.test",
+        .crypto_io = std.testing.io,
+        .mesh_pass = "legacy-resume-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const Helpers = struct {
+        fn exercise(
+            srv: *Server,
+            account: []const u8,
+            target_nick: []const u8,
+            claimant_nick: []const u8,
+            use_mesh: bool,
+        ) !void {
+            const target_id = try addTestLocalClient(srv, target_nick, account);
+            const claimant_id = try addTestLocalClient(srv, claimant_nick, account);
+            const target_cid = monitorIdFromClient(target_id);
+            const claimant_cid = monitorIdFromClient(claimant_id);
+            const handle = srv.sessions.resumeHandleForClient(account, target_cid) orelse
+                return error.TestUnexpectedResult;
+            const aid = handle.attachment_id orelse return error.TestUnexpectedResult;
+            const target = srv.connFor(target_id) orelse return error.TestUnexpectedResult;
+            target.session.addCap(.message_tags);
+            target.send_armed = true;
+            target.sendq_cap = 0;
+            try srv.deliverTagged(target_id, .{
+                .time_value = "",
+                .account = null,
+                .msgid = if (use_mesh) "0123456789ABCDEFGHJKMNPQSD" else "0123456789ABCDEFGHJKMNPQSC",
+            }, if (use_mesh)
+                ":source!u@h PRIVMSG LegacyMesh :mesh-ghost\r\n"
+            else
+                ":source!u@h PRIVMSG LegacyLocal :local-ghost\r\n");
+            try std.testing.expect(srv.sessions.markDetached(account, target_cid));
+
+            const token_hex = std.fmt.bytesToHex(handle.token, .lower);
+            var credential_buf: [1024]u8 = undefined;
+            const presented = if (use_mesh) blk: {
+                break :blk try testLegacyMeshResumeCredential(
+                    &credential_buf,
+                    "legacy-resume-secret",
+                    account,
+                    &token_hex,
+                    "legacy-resume.test",
+                );
+            } else &token_hex;
+            var command_buf: [1200]u8 = undefined;
+            var line = try irc_line.parseLine(try std.fmt.bufPrint(
+                &command_buf,
+                "SESSION RESUME {s}",
+                .{presented},
+            ));
+            const claimant = srv.connFor(claimant_id) orelse return error.TestUnexpectedResult;
+            try srv.handleSessionResume(claimant_id, claimant, account, &line);
+            try expectContains(
+                claimant.send_buf[0..claimant.send_len],
+                if (use_mesh) "session reclaimed (cross-server)" else "legacy session attached as a new attachment",
+            );
+            const ghost = srv.sessions.findAttachmentSessionInAccount(
+                account,
+                handle.token,
+                aid,
+            ) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(!ghost.attached);
+            try std.testing.expectEqual(target_cid, ghost.client);
+            try std.testing.expect(srv.sessions.clientHasToken(account, claimant_cid, handle.token));
+            try std.testing.expectEqual(@as(usize, 1), srv.attachment_delivery_spool.pendingCountFor(target_cid));
+            try std.testing.expectEqual(@as(usize, 0), srv.attachment_delivery_spool.pendingCountFor(claimant_cid));
+        }
+    };
+
+    try Helpers.exercise(&server, "legacy-local-account", "LegacyLocal", "LocalClaimant", false);
+    try Helpers.exercise(&server, "legacy-mesh-account", "LegacyMesh", "MeshClaimant", true);
+}
+
+test "expired SESSION RESUME retry hold clears TOKEN latch and restores UPGRADE readiness" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "ExpiryClient", "expiry-acct");
+    const conn = server.connFor(id).?;
+    conn.resume_autojoin_deferred = true;
+    conn.resume_autojoin_deadline_ms = server.nowMs() - 1;
+    conn.preserve_resume_credential_once = true;
+
+    // The bounded in-flight handshake blocks an upgrade, but expiry releases
+    // both predecessor-only latches rather than leaving UPGRADE stuck forever.
+    try std.testing.expect(!server.prepareSessionReplicaUpgradeBoundary());
+    server.sweepDeferredSessionAutojoins();
+    try std.testing.expect(!conn.resume_autojoin_deferred);
+    try std.testing.expectEqual(@as(i64, 0), conn.resume_autojoin_deadline_ms);
+    try std.testing.expect(!conn.preserve_resume_credential_once);
+    try std.testing.expect(server.prepareSessionReplicaUpgradeBoundary());
+
+    // Expiry is also a coherent TOKEN boundary: the next explicit request gets
+    // the current credential, not a stale retry-preservation warning.
+    conn.send_len = 0;
+    conn.send_offset = 0;
+    conn.send_overflow.clearAndFree(conn.overflow_allocator);
+    var token_line = try irc_line.parseLine("SESSION TOKEN");
+    try server.handleSession(id, conn, &token_line);
+    try expectContains(conn.send_buf[0..conn.send_len], "SESSION TOKEN ");
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], "RESUME_CREDENTIAL_PRESERVED") == null);
+}
+
+test "manual SESSION RESUME retry preservation expires without autojoin deferral and restores UPGRADE readiness" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "manual-retry-expiry";
+    const ghost_id = try addTestLocalClient(&server, "ManualGhost", account);
+    const claimant_id = try addTestLocalClient(&server, "ManualClaimant", account);
+    const claimant = server.connFor(claimant_id).?;
+    const ghost_cid = monitorIdFromClient(ghost_id);
+    const token = server.sessions.resumeHandleForClient(account, ghost_cid).?.token;
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot(account, ghost_cid, "corrupt-manual-resume-image"));
+    try std.testing.expect(!claimant.resume_autojoin_deferred);
+
+    const token_hex = std.fmt.bytesToHex(token, .lower);
+    var line_buf: [64]u8 = undefined;
+    var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(&line_buf, "SESSION RESUME {s}", .{token_hex}));
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "WARN SESSION TEMPORARILY_UNAVAILABLE");
+    try std.testing.expect(claimant.preserve_resume_credential_once);
+    try std.testing.expect(!claimant.resume_autojoin_deferred);
+    try std.testing.expect(claimant.resume_autojoin_deadline_ms > server.nowMs());
+    try std.testing.expect(!server.prepareSessionReplicaUpgradeBoundary());
+
+    // A manual retry has no autojoin hold for the old sweep to visit. Its own
+    // preservation deadline must still release the predecessor-only UPGRADE gate.
+    claimant.resume_autojoin_deadline_ms = server.nowMs() - 1;
+    server.sweepDeferredSessionAutojoins();
+    try std.testing.expect(!claimant.preserve_resume_credential_once);
+    try std.testing.expectEqual(@as(i64, 0), claimant.resume_autojoin_deadline_ms);
+    try std.testing.expect(server.prepareSessionReplicaUpgradeBoundary());
+}
+
+test "threaded server: explicit detached session resume spool conflict aborts before identity commit" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "atomic-resume";
+    const ghost_id = try addTestLocalClient(&server, "Ghost", account);
+    const ghost_cid = monitorIdFromClient(ghost_id);
+    const ghost_handle = server.sessions.resumeHandleForClient(account, ghost_cid).?;
+    const ghost_token = ghost_handle.token;
+    const ghost_attachment_id = ghost_handle.attachment_id.?;
+    const encoded = try (migration_relay.Snapshot{
+        .nick = "Ghost",
+        .umodes = "+i",
+        .channels = &.{"#resume-target"},
+        .channel_modes = &.{world_model.MemberModes.fromModes(&.{.op}).bits},
+        .account = account,
+    }).encode(allocator);
+    defer allocator.free(encoded);
+    try std.testing.expect(server.sessions.markDetachedWithSnapshot(account, ghost_cid, encoded));
+    server.world.unregisterNick(worldIdFromClient(ghost_id));
+
+    const claimant_id = try addTestLocalClient(&server, "Fresh", account);
+    const claimant = server.connFor(claimant_id).?;
+    const claimant_cid = monitorIdFromClient(claimant_id);
+    const claimant_token = server.sessions.resumeHandleForClient(account, claimant_cid).?.token;
+    try server.world.restoreMember(
+        "#claimant-old",
+        worldIdFromClient(claimant_id),
+        world_model.MemberModes.empty(),
+    );
+
+    const event_id: attachment_delivery_spool.EventId = @splat(0x7a);
+    _ = try server.attachment_delivery_spool.reserveBatch(&.{
+        .{
+            .client = ghost_cid,
+            .event_id = event_id,
+            .bytes = ":source!u@h PRIVMSG Ghost :retained\r\n",
+        },
+        .{
+            .client = claimant_cid,
+            .event_id = event_id,
+            .bytes = ":source!u@h PRIVMSG Fresh :conflict\r\n",
+        },
+    });
+    const spool_before = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
+    defer allocator.free(spool_before);
+
+    const exact_credential = try session_resume_credential.encodeLocal(ghost_token, ghost_attachment_id);
+    var line_buf: [128]u8 = undefined;
+    var resume_line = try irc_line.parseLine(try std.fmt.bufPrint(
+        &line_buf,
+        "SESSION RESUME {s}",
+        .{exact_credential},
+    ));
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+
+    try expectContains(claimant.send_buf[0..claimant.send_len], "WARN SESSION TEMPORARILY_UNAVAILABLE");
+    try std.testing.expectEqualStrings("Fresh", claimant.session.displayName());
+    try std.testing.expect(server.sessions.clientHasToken(account, claimant_cid, claimant_token));
+    try std.testing.expect(!server.sessions.clientHasToken(account, claimant_cid, ghost_token));
+    try std.testing.expect(server.sessions.findDetachedTokenSessionInAccount(account, ghost_token) != null);
+    try std.testing.expect(server.world.isMember("#claimant-old", worldIdFromClient(claimant_id)));
+    try std.testing.expect(!server.world.isMember("#resume-target", worldIdFromClient(claimant_id)));
+    const spool_after_failure = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
+    defer allocator.free(spool_after_failure);
+    try std.testing.expectEqualSlices(u8, spool_before, spool_after_failure);
+
+    // Remove only the claimant-side conflict and retry the same still-valid
+    // credential. The selected ghost must disappear, and its retained delivery
+    // must move to the newly restored physical attachment exactly once.
+    _ = server.attachment_delivery_spool.discardAttachment(claimant_cid);
+    claimant.send_len = 0;
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "SESSION RESUME: exact session restored");
+    try std.testing.expectEqualStrings("Ghost", claimant.session.displayName());
+    try std.testing.expect(server.sessions.clientHasToken(account, claimant_cid, ghost_token));
+    try std.testing.expect(server.sessions.resumeHandleForClient(account, ghost_cid) == null);
+    try std.testing.expect(!server.attachment_delivery_spool.contains(ghost_cid, event_id));
+    try std.testing.expect(server.attachment_delivery_spool.contains(claimant_cid, event_id));
+    var retained_buf: [1]attachment_delivery_spool.PendingRecord = undefined;
+    const retained = server.attachment_delivery_spool.collectPending(&retained_buf);
+    try std.testing.expectEqual(@as(usize, 1), retained.len);
+    try std.testing.expectEqual(claimant_cid, retained[0].client);
+    try std.testing.expectEqual(event_id, retained[0].event_id);
+    try std.testing.expectEqualStrings(":source!u@h PRIVMSG Ghost :retained\r\n", retained[0].bytes);
 }
 
 test "SESSION DROP removes a sibling attachment by LIST index" {
@@ -68069,7 +75325,10 @@ test "SESSION DROP removes a sibling attachment by LIST index" {
     const a_id = try addTestLocalClient(&server, "dropa", "dropacct");
     const b_id = try addTestLocalClient(&server, "dropb", "dropacct");
     const a_conn = server.connFor(a_id).?;
+    const b_conn = server.connFor(b_id).?;
     const b_cid = monitorIdFromClient(b_id);
+    try server.world.restoreMember("#drop-final", worldIdFromClient(a_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#drop-final", worldIdFromClient(b_id), world_model.MemberModes.empty());
 
     // LIST from A: both attachments appear; DROP B's index.
     a_conn.send_len = 0;
@@ -68097,13 +75356,609 @@ test "SESSION DROP removes a sibling attachment by LIST index" {
     try std.testing.expect(!server.sessions.containsClient("dropacct", b_cid));
     try std.testing.expect(server.sessions.containsClient("dropacct", monitorIdFromClient(a_id)));
 
-    // Cannot drop the caller's own current attachment.
+    // Cannot drop the caller's own current attachment. Bind to the original
+    // LIST snapshot rather than reindexing the leftover row as a fresh #1.
+    var a_idx: usize = 0;
+    for (rows, 0..) |row, i| {
+        if (row.client == monitorIdFromClient(a_id)) a_idx = i + 1;
+    }
+    try std.testing.expect(a_idx > 0);
     a_conn.send_len = 0;
-    var self_drop = try irc_line.parseLine("SESSION DROP #1");
+    var self_drop_buf: [32]u8 = undefined;
+    const self_drop_txt = try std.fmt.bufPrint(&self_drop_buf, "SESSION DROP #{d}", .{a_idx});
+    var self_drop = try irc_line.parseLine(self_drop_txt);
     try server.handleSession(a_id, a_conn, &self_drop);
-    // After B is gone only A remains at #1 — either CANNOT_DROP_CURRENT or ok only if
-    // index 1 were another row; with a single row it must refuse.
     try expectContains(a_conn.send_buf[0..a_conn.send_len], "CANNOT_DROP_CURRENT");
+
+    // B was the final exact-token row. Its later close must retain ordinary
+    // final-identity behavior (one QUIT), rather than treating an unrelated
+    // account attachment as a logical-session successor.
+    a_conn.send_len = 0;
+    // Model the target's revoke notice completing its SendQ drain. Until that
+    // completion, closeConn correctly preserves the slot to avoid UAF on the
+    // kernel-owned send buffer and cannot yet publish the final QUIT.
+    b_conn.send_armed = false;
+    b_conn.send_offset = b_conn.send_len;
+    try server.closeConn(b_conn.token, "session revoked");
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], " QUIT ");
+}
+
+fn sessionListSidForClient(haystack: []const u8, idx: usize) ![]const u8 {
+    var star_buf: [40]u8 = undefined;
+    var dash_buf: [40]u8 = undefined;
+    const star = try std.fmt.bufPrint(&star_buf, "SESSION LIST * #{d} ", .{idx});
+    const dash = try std.fmt.bufPrint(&dash_buf, "SESSION LIST - #{d} ", .{idx});
+    const line_start = std.mem.indexOf(u8, haystack, star) orelse
+        (std.mem.indexOf(u8, haystack, dash) orelse return error.TestUnexpectedResult);
+    const sid_at = std.mem.indexOfPos(u8, haystack, line_start, " sid=") orelse
+        return error.TestUnexpectedResult;
+    const hex_start = sid_at + " sid=".len;
+    const hex_end = hex_start + session_sid.sid_hex_len;
+    if (hex_end > haystack.len) return error.TestUnexpectedResult;
+    return haystack[hex_start..hex_end];
+}
+
+test "SESSION DROP #n cannot retarget after list snapshot mutation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const a_id = try addTestLocalClient(&server, "ordA", "ordacct");
+    const b_id = try addTestLocalClient(&server, "ordB", "ordacct");
+    const c_id = try addTestLocalClient(&server, "ordC", "ordacct");
+    try assignTestSessionAttachment(&server, "ordacct", a_id, 0xa1);
+    try assignTestSessionAttachment(&server, "ordacct", b_id, 0xb1);
+    try assignTestSessionAttachment(&server, "ordacct", c_id, 0xc1);
+    const a_conn = server.connFor(a_id).?;
+    const b_cid = monitorIdFromClient(b_id);
+    const c_cid = monitorIdFromClient(c_id);
+
+    a_conn.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(a_id, a_conn, &list_line);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "sid=");
+
+    const listed = try server.sessions.copySessionsAlloc(std.testing.allocator, "ordacct");
+    defer std.testing.allocator.free(listed);
+    var b_idx: usize = 0;
+    var c_idx: usize = 0;
+    for (listed, 0..) |row, i| {
+        if (row.client == b_cid) b_idx = i + 1;
+        if (row.client == c_cid) c_idx = i + 1;
+    }
+    try std.testing.expect(b_idx > 0 and c_idx > 0);
+    try std.testing.expect(c_idx > b_idx);
+
+    // Removing B shifts C into B's live ordinal. A fresh reindex would drop C.
+    try std.testing.expect(server.removeTrackedSession("ordacct", b_cid));
+    try std.testing.expect(!server.sessions.containsClient("ordacct", b_cid));
+    try std.testing.expect(server.sessions.containsClient("ordacct", c_cid));
+
+    a_conn.send_len = 0;
+    var stale_buf: [32]u8 = undefined;
+    const stale_txt = try std.fmt.bufPrint(&stale_buf, "SESSION DROP #{d}", .{b_idx});
+    var stale_line = try irc_line.parseLine(stale_txt);
+    try server.handleSession(a_id, a_conn, &stale_line);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "STALE_LIST");
+    try std.testing.expect(server.sessions.containsClient("ordacct", c_cid));
+    try std.testing.expect(server.sessions.containsClient("ordacct", monitorIdFromClient(a_id)));
+
+    // The original later ordinal still names C, not a newly inserted row.
+    const d_id = try addTestLocalClient(&server, "ordD", "ordacct");
+    const d_cid = monitorIdFromClient(d_id);
+    a_conn.send_len = 0;
+    var drop_c_buf: [32]u8 = undefined;
+    const drop_c_txt = try std.fmt.bufPrint(&drop_c_buf, "SESSION DROP #{d}", .{c_idx});
+    var drop_c_line = try irc_line.parseLine(drop_c_txt);
+    try server.handleSession(a_id, a_conn, &drop_c_line);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], " ok");
+    try std.testing.expect(!server.sessions.containsClient("ordacct", c_cid));
+    try std.testing.expect(server.sessions.containsClient("ordacct", d_cid));
+}
+
+test "SESSION DROP sid revokes exactly one physical attachment and leaves shared-token siblings live" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const a_id = try addTestLocalClient(&server, "sidA", "sidacct");
+    const b_id = try addTestLocalClient(&server, "sidB", "sidacct");
+    const c_id = try addTestLocalClient(&server, "sidC", "sidacct");
+    try assignTestSessionAttachment(&server, "sidacct", a_id, 0xa2);
+    try assignTestSessionAttachment(&server, "sidacct", b_id, 0xb2);
+    try assignTestSessionAttachment(&server, "sidacct", c_id, 0xc2);
+    const a_conn = server.connFor(a_id).?;
+    const b_conn = server.connFor(b_id).?;
+    const c_conn = server.connFor(c_id).?;
+    const a_cid = monitorIdFromClient(a_id);
+    const b_cid = monitorIdFromClient(b_id);
+    const c_cid = monitorIdFromClient(c_id);
+    const a_handle = server.sessions.resumeHandleForClient("sidacct", a_cid).?;
+    try std.testing.expect(server.sessions.joinTokenGroup("sidacct", b_cid, a_handle.token));
+    // Model the shared rendered identity: B is a same-token attachment with no
+    // separate nick lookup, and has overlapping channel authority to union.
+    server.world.unregisterNick(worldIdFromClient(b_id));
+    try b_conn.session.setNick("sidA");
+    try server.world.restoreMember("#sid-drop", worldIdFromClient(a_id), world_model.MemberModes.fromModes(&.{.op}));
+    try server.world.restoreMember("#sid-drop", worldIdFromClient(b_id), world_model.MemberModes.fromModes(&.{.voice}));
+    // C is a real channel observer, so the later no-QUIT assertion proves the
+    // shared logical identity did not flap out of the roster during DROP.
+    try server.world.restoreMember("#sid-drop", worldIdFromClient(c_id), world_model.MemberModes.empty());
+    const token_hex = std.fmt.bytesToHex(a_handle.token, .lower);
+    const sid_rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "sidacct");
+    defer std.testing.allocator.free(sid_rows);
+    const a_row = for (sid_rows) |row| {
+        if (row.client == a_cid) break row;
+    } else return error.TestUnexpectedResult;
+    const expected_sid = session_sid.formatSid(session_sid.sidOf(a_row).?);
+
+    c_conn.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(c_id, c_conn, &list_line);
+    const listed = c_conn.send_buf[0..c_conn.send_len];
+    try expectContains(listed, "sid=");
+    try std.testing.expect(std.mem.indexOf(u8, listed, &token_hex) == null);
+    try expectContains(listed, &expected_sid);
+
+    // Caller in the logical session cannot revoke it.
+    a_conn.send_len = 0;
+    var self_sid_buf: [64]u8 = undefined;
+    const self_sid_txt = try std.fmt.bufPrint(&self_sid_buf, "SESSION DROP sid={s}", .{expected_sid});
+    var self_sid_line = try irc_line.parseLine(self_sid_txt);
+    try server.handleSession(a_id, a_conn, &self_sid_line);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "CANNOT_DROP_CURRENT");
+    try std.testing.expect(server.sessions.containsClient("sidacct", a_cid));
+    try std.testing.expect(server.sessions.containsClient("sidacct", b_cid));
+
+    c_conn.send_len = 0;
+    var drop_sid_buf: [64]u8 = undefined;
+    const drop_sid_txt = try std.fmt.bufPrint(&drop_sid_buf, "SESSION DROP {s}", .{expected_sid});
+    var drop_sid_line = try irc_line.parseLine(drop_sid_txt);
+    try server.handleSession(c_id, c_conn, &drop_sid_line);
+    try expectContains(c_conn.send_buf[0..c_conn.send_len], "SESSION DROP sid=");
+    try expectContains(c_conn.send_buf[0..c_conn.send_len], " ok");
+    try std.testing.expect(!server.sessions.containsClient("sidacct", a_cid));
+    try std.testing.expect(server.sessions.containsClient("sidacct", b_cid));
+    try std.testing.expect(server.sessions.containsClient("sidacct", c_cid));
+    try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(b_id)), server.world.findNick("sidA"));
+    const union_modes = server.world.memberModes("#sid-drop", worldIdFromClient(b_id)).?;
+    try std.testing.expect(union_modes.isOperator());
+    try std.testing.expect(union_modes.contains(.voice));
+    // The prepared ticket atomically makes B the nick owner and installs the
+    // union before close; source membership remains until that connection's
+    // queued revoke notice drains and closeConn removes its physical World id.
+    try std.testing.expect(server.world.memberModes("#sid-drop", worldIdFromClient(a_id)) != null);
+
+    // Drain the close after the Store CAS. The handoff latch prevents closeConn
+    // from re-staging against the now-removed source row or emitting a false
+    // identity QUIT to the surviving observer.
+    c_conn.send_len = 0;
+    a_conn.send_armed = false;
+    a_conn.send_offset = a_conn.send_len;
+    try server.closeConn(a_conn.token, "session revoked");
+    try std.testing.expect(server.connFor(a_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, c_conn.send_buf[0..c_conn.send_len], " QUIT ") == null);
+    try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(b_id)), server.world.findNick("sidA"));
+    try std.testing.expect(server.world.memberModes("#sid-drop", worldIdFromClient(b_id)).?.isOperator());
+    try std.testing.expect(server.world.memberModes("#sid-drop", worldIdFromClient(a_id)) == null);
+}
+
+test "SESSION DROP crosses two live reactors and preserves an exact-token sibling identity" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+    server.fabric = reactor_fabric.ReactorFabric.init(server.allocator, server.reactors.len) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const previous = current_reactor;
+    defer current_reactor = previous;
+
+    // The requester and surviving attachment are live shard-0 ConnStates. The
+    // exact row being revoked is a real live shard-1 ConnState, not a fabricated
+    // SessionStore row with an unreachable ClientId.
+    current_reactor = &server.reactors[0];
+    const requester_id = try addTestLocalClient(&server, "CrossObserver", "crossdrop-live");
+    const sibling_id = try addTestLocalClient(&server, "CrossSibling", "crossdrop-live");
+    const requester = server.connFor(requester_id) orelse return error.TestUnexpectedResult;
+    const sibling = server.connFor(sibling_id) orelse return error.TestUnexpectedResult;
+
+    current_reactor = &server.reactors[1];
+    const target_id = try addTestLocalClient(&server, "CrossTarget", "crossdrop-live");
+    try std.testing.expectEqual(@as(u12, 1), target_id.shard);
+    try assignTestSessionAttachment(&server, "crossdrop-live", target_id, 0xd1);
+    const target = server.connFor(target_id) orelse return error.TestUnexpectedResult;
+    const target_cid = monitorIdFromClient(target_id);
+    const target_handle = server.sessions.resumeHandleForClient("crossdrop-live", target_cid) orelse
+        return error.TestUnexpectedResult;
+
+    // Model two physical attachments beneath one rendered identity. CrossTarget
+    // remains the current World nick owner until the reserved commit hands the
+    // exact identity and unioned modes to CrossSibling on the other reactor.
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        "crossdrop-live",
+        monitorIdFromClient(sibling_id),
+        target_handle.token,
+    ));
+    server.world.unregisterNick(worldIdFromClient(sibling_id));
+    try sibling.session.setNick("CrossTarget");
+    try server.world.restoreMember(
+        "#crossdrop-live",
+        worldIdFromClient(target_id),
+        world_model.MemberModes.fromModes(&.{.op}),
+    );
+    try server.world.restoreMember(
+        "#crossdrop-live",
+        worldIdFromClient(sibling_id),
+        world_model.MemberModes.fromModes(&.{.voice}),
+    );
+    try server.world.restoreMember(
+        "#crossdrop-live",
+        worldIdFromClient(requester_id),
+        world_model.MemberModes.empty(),
+    );
+
+    requester.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(requester_id, requester, &list_line);
+    const rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "crossdrop-live");
+    defer std.testing.allocator.free(rows);
+    const target_row = for (rows) |row| {
+        if (row.client == target_cid) break row;
+    } else return error.TestUnexpectedResult;
+    const target_sid = session_sid.formatSid(session_sid.sidOf(target_row) orelse
+        return error.TestUnexpectedResult);
+    try expectContains(requester.send_buf[0..requester.send_len], &target_sid);
+
+    requester.send_len = 0;
+    var drop_buf: [64]u8 = undefined;
+    const drop_text = try std.fmt.bufPrint(&drop_buf, "SESSION DROP sid={s}", .{target_sid});
+    var drop = try irc_line.parseLine(drop_text);
+    try server.handleSession(requester_id, requester, &drop);
+
+    try expectContains(requester.send_buf[0..requester.send_len], "SESSION DROP sid=");
+    try expectContains(requester.send_buf[0..requester.send_len], " ok");
+    try std.testing.expect(!server.sessions.containsClient("crossdrop-live", target_cid));
+    try std.testing.expect(server.sessions.clientHasToken(
+        "crossdrop-live",
+        monitorIdFromClient(sibling_id),
+        target_handle.token,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), server.session_drop_journal.activeCount());
+    try std.testing.expectEqual(
+        @as(?world_model.ClientId, worldIdFromClient(sibling_id)),
+        server.world.findNick("CrossTarget"),
+    );
+    const inherited_modes = server.world.memberModes("#crossdrop-live", worldIdFromClient(sibling_id)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(inherited_modes.isOperator());
+    try std.testing.expect(inherited_modes.contains(.voice));
+
+    // The target owner consumes the cross-reactor close delivery. This proves
+    // both close scheduling and the actual owner-side closure path.
+    current_reactor = &server.reactors[1];
+    server.drainSessionDropControls();
+    server.drainFabric();
+    try std.testing.expect(target.closing);
+    try std.testing.expectEqualStrings("session revoked", target.close_reason);
+    try expectContains(target.send_buf[0..target.send_len], "this session was revoked from another device");
+
+    requester.send_len = 0;
+    target.send_armed = false;
+    target.send_offset = target.send_len;
+    try server.closeConn(target.token, "session revoked");
+    try std.testing.expect(server.connFor(target_id) == null);
+
+    // Closing the removed physical row must not tear down the shared rendered
+    // identity. Drain any cross-shard observer delivery and prove no false QUIT.
+    current_reactor = &server.reactors[0];
+    server.drainFabric();
+    try std.testing.expect(std.mem.indexOf(u8, requester.send_buf[0..requester.send_len], " QUIT ") == null);
+    try std.testing.expectEqual(
+        @as(?world_model.ClientId, worldIdFromClient(sibling_id)),
+        server.world.findNick("CrossTarget"),
+    );
+    try std.testing.expect(server.world.memberModes("#crossdrop-live", worldIdFromClient(sibling_id)) != null);
+    try std.testing.expectEqual(@as(usize, 0), server.session_drop_journal.activeCount());
+}
+
+test "SESSION DROP fails closed on absent, stale, and account-switched ids" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const a_id = try addTestLocalClient(&server, "failA", "failacct");
+    const b_id = try addTestLocalClient(&server, "failB", "failacct");
+    try assignTestSessionAttachment(&server, "failacct", a_id, 0xa3);
+    try assignTestSessionAttachment(&server, "failacct", b_id, 0xb3);
+    const a_conn = server.connFor(a_id).?;
+    const b_cid = monitorIdFromClient(b_id);
+
+    a_conn.send_len = 0;
+    var missing = try irc_line.parseLine("SESSION DROP 0123456789abcdef0123456789abcdef");
+    try server.handleSession(a_id, a_conn, &missing);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "NO_SUCH_SESSION");
+
+    a_conn.send_len = 0;
+    var before_list = try irc_line.parseLine("SESSION DROP #1");
+    try server.handleSession(a_id, a_conn, &before_list);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "STALE_LIST");
+
+    a_conn.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(a_id, a_conn, &list_line);
+    const listed = try server.sessions.copySessionsAlloc(std.testing.allocator, "failacct");
+    defer std.testing.allocator.free(listed);
+    var b_idx: usize = 0;
+    for (listed, 0..) |row, i| {
+        if (row.client == b_cid) b_idx = i + 1;
+    }
+    try std.testing.expect(b_idx > 0);
+    const b_sid = try sessionListSidForClient(a_conn.send_buf[0..a_conn.send_len], b_idx);
+
+    server.bumpSessionListEpoch();
+    a_conn.send_len = 0;
+    var stale_epoch_buf: [32]u8 = undefined;
+    const stale_epoch_txt = try std.fmt.bufPrint(&stale_epoch_buf, "SESSION DROP #{d}", .{b_idx});
+    var stale_epoch = try irc_line.parseLine(stale_epoch_txt);
+    try server.handleSession(a_id, a_conn, &stale_epoch);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "STALE_LIST");
+    try std.testing.expect(server.sessions.containsClient("failacct", b_cid));
+
+    a_conn.send_len = 0;
+    try server.handleSession(a_id, a_conn, &list_line);
+    a_conn.session.loginAs("otheracct");
+    server.trackSession(a_id, a_conn);
+    a_conn.send_len = 0;
+    var switched_buf: [32]u8 = undefined;
+    const switched_txt = try std.fmt.bufPrint(&switched_buf, "SESSION DROP #{d}", .{b_idx});
+    var switched = try irc_line.parseLine(switched_txt);
+    try server.handleSession(a_id, a_conn, &switched);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "STALE_LIST");
+
+    // A real account rebind clears the cache before a later LOGIN can reuse it.
+    a_conn.session_list_cache.reset();
+    a_conn.session.loginAs("failacct");
+    a_conn.send_len = 0;
+    try server.handleSession(a_id, a_conn, &switched);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "STALE_LIST");
+
+    a_conn.send_len = 0;
+    var absent_sid_buf: [64]u8 = undefined;
+    const absent_sid_txt = try std.fmt.bufPrint(&absent_sid_buf, "SESSION DROP sid={s}", .{b_sid});
+    var absent_sid = try irc_line.parseLine(absent_sid_txt);
+    // B still exists; a SID must not cross the caller's current account.
+    a_conn.session.loginAs("otheracct");
+    try server.handleSession(a_id, a_conn, &absent_sid);
+    try expectContains(a_conn.send_buf[0..a_conn.send_len], "NO_SUCH_SESSION");
+    try std.testing.expect(server.sessions.containsClient("failacct", b_cid));
+}
+
+test "SESSION DROP leaves an attached foreign-shard row untouched until the reserved handoff protocol exists" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const caller_id = try addTestLocalClient(&server, "drop-origin", "crossdrop");
+    const caller = server.connFor(caller_id).?;
+    const foreign_id: client_model.ClientId = .{ .shard = 1, .slot = 7, .gen = 1 };
+    const foreign_cid = monitorIdFromClient(foreign_id);
+    const foreign_token: sessions_mod.Token = @splat(0x77);
+    const foreign_aid = try sessions_mod.AttachmentId.fromBytes(@as([16]u8, @splat(0x78)));
+    _ = try server.sessions.attachWithAttachment("crossdrop", foreign_cid, foreign_token, foreign_aid, 1234);
+
+    caller.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(caller_id, caller, &list_line);
+    const rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "crossdrop");
+    defer std.testing.allocator.free(rows);
+    const foreign_index = for (rows, 0..) |row, index| {
+        if (row.client == foreign_cid) break index + 1;
+    } else return error.TestUnexpectedResult;
+    const before = for (rows) |row| {
+        if (row.client == foreign_cid) break row;
+    } else return error.TestUnexpectedResult;
+
+    caller.send_len = 0;
+    var drop_buf: [32]u8 = undefined;
+    const drop_text = try std.fmt.bufPrint(&drop_buf, "SESSION DROP #{d}", .{foreign_index});
+    var drop = try irc_line.parseLine(drop_text);
+    try server.handleSession(caller_id, caller, &drop);
+    try expectContains(caller.send_buf[0..caller.send_len], "TEMPORARILY_UNAVAILABLE");
+
+    // No fabric control was queued and no foreign ConnState exists in this
+    // reactor. The SessionStore selector must therefore remain byte-for-byte
+    // equivalent; the World has no foreign client registration to remove.
+    const after_rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "crossdrop");
+    defer std.testing.allocator.free(after_rows);
+    const after = for (after_rows) |row| {
+        if (row.client == foreign_cid) break row;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(before.client, after.client);
+    try std.testing.expectEqual(before.signon_ms, after.signon_ms);
+    try std.testing.expect(std.crypto.timing_safe.eql(sessions_mod.Token, before.token, after.token));
+    try std.testing.expect(before.attachment_id.?.eql(after.attachment_id.?));
+    try std.testing.expect(after.attached);
+    try std.testing.expect(server.sessions.containsClient("crossdrop", foreign_cid));
+}
+
+test "closing a token sibling cancels reserved DROP before detaching its row" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(&server, "freeze-a", "freeze-acct");
+    const sibling_id = try addTestLocalClient(&server, "freeze-b", "freeze-acct");
+    const target_cid = monitorIdFromClient(target_id);
+    const sibling_cid = monitorIdFromClient(sibling_id);
+    const token = server.sessions.resumeHandleForClient("freeze-acct", target_cid).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup("freeze-acct", sibling_cid, token));
+
+    var rows_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+    const target = for (server.sessions.sessionsInto("freeze-acct", &rows_buf)) |row| {
+        if (row.client == target_cid) break row;
+    } else return error.TestUnexpectedResult;
+    const tx = try server.session_drop_journal.begin(.{
+        .requester = target_id,
+        .account = "freeze-acct",
+        .target = LinuxServer.dropJournalSelector(target),
+        .target_nick = "freeze-a",
+        .reply = .{ .ordinal = 1 },
+        .deadline_ms = server.nowU64() + 5_000,
+    });
+    try std.testing.expectEqual(
+        sessions_mod.ReserveDropResult.reserved,
+        server.sessions.reserveDrop("freeze-acct", LinuxServer.dropStoreSelector(target), session_drop_tx.reservationId(tx)),
+    );
+    try server.session_drop_journal.markTargetReserved(tx);
+
+    const sibling = server.connFor(sibling_id).?;
+    sibling.send_armed = false;
+    sibling.send_offset = sibling.send_len;
+    try server.closeConn(sibling.token, "test sibling close");
+
+    try std.testing.expect(server.connFor(sibling_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), server.session_drop_journal.activeCount());
+    try std.testing.expect(!server.sessions.hasDropReservation("freeze-acct", LinuxServer.dropStoreSelector(target)));
+    const after = server.sessions.sessionsInto("freeze-acct", &rows_buf);
+    const sibling_row = for (after) |row| {
+        if (row.client == sibling_cid) break row;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(!sibling_row.attached);
+}
+
+test "SESSION DROP never treats a local target with an unattested foreign token sibling as final" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const caller_id = try addTestLocalClient(&server, "drop-caller", "foreign-sibling");
+    const target_id = try addTestLocalClient(&server, "drop-target", "foreign-sibling");
+    const caller = server.connFor(caller_id).?;
+    const target_cid = monitorIdFromClient(target_id);
+    const token = server.sessions.resumeHandleForClient("foreign-sibling", target_cid).?.token;
+    const foreign_id: client_model.ClientId = .{ .shard = 1, .slot = 8, .gen = 1 };
+    const foreign_cid = monitorIdFromClient(foreign_id);
+    const foreign_aid = try sessions_mod.AttachmentId.fromBytes(@as([16]u8, @splat(0x79)));
+    _ = try server.sessions.attachWithAttachment("foreign-sibling", foreign_cid, token, foreign_aid, 2234);
+
+    caller.send_len = 0;
+    var list_line = try irc_line.parseLine("SESSION LIST");
+    try server.handleSession(caller_id, caller, &list_line);
+    const rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "foreign-sibling");
+    defer std.testing.allocator.free(rows);
+    const target_index = for (rows, 0..) |row, index| {
+        if (row.client == target_cid) break index + 1;
+    } else return error.TestUnexpectedResult;
+
+    caller.send_len = 0;
+    var drop_buf: [32]u8 = undefined;
+    const drop_text = try std.fmt.bufPrint(&drop_buf, "SESSION DROP #{d}", .{target_index});
+    var drop = try irc_line.parseLine(drop_text);
+    try server.handleSession(caller_id, caller, &drop);
+    try expectContains(caller.send_buf[0..caller.send_len], "TEMPORARILY_UNAVAILABLE");
+    try std.testing.expect(server.sessions.containsClient("foreign-sibling", target_cid));
+    try std.testing.expect(server.sessions.containsClient("foreign-sibling", foreign_cid));
+    try std.testing.expect(server.connFor(target_id) != null);
+}
+
+test "SESSION DROP prefers the current nick-owning sibling among three local token attachments" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const source_id = try addTestLocalClient(&server, "Tri", "three-way");
+    const earlier_id = try addTestLocalClient(&server, "Earlier", "three-way");
+    const owner_id = try addTestLocalClient(&server, "Owner", "three-way");
+    const source_cid = monitorIdFromClient(source_id);
+    const earlier_cid = monitorIdFromClient(earlier_id);
+    const owner_cid = monitorIdFromClient(owner_id);
+    const token = server.sessions.resumeHandleForClient("three-way", source_cid).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup("three-way", earlier_cid, token));
+    try std.testing.expect(server.sessions.joinTokenGroup("three-way", owner_cid, token));
+
+    const earlier = server.connFor(earlier_id).?;
+    const owner = server.connFor(owner_id).?;
+    server.world.unregisterNick(worldIdFromClient(earlier_id));
+    server.world.unregisterNick(worldIdFromClient(owner_id));
+    try earlier.session.setNick("Tri");
+    try owner.session.setNick("Tri");
+    // Model two prior handoffs: the later sibling, not the first eligible row,
+    // is now authoritative for the rendered nick.
+    server.world.unregisterNick(worldIdFromClient(source_id));
+    try server.world.registerNick("Tri", worldIdFromClient(owner_id));
+    try server.world.restoreMember("#three-way", worldIdFromClient(source_id), world_model.MemberModes.fromModes(&.{.op}));
+
+    const rows = try server.sessions.copySessionsAlloc(std.testing.allocator, "three-way");
+    defer std.testing.allocator.free(rows);
+    const source = for (rows) |row| {
+        if (row.client == source_cid) break row;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(LinuxServer.ListedSessionRevoke.removed, server.revokeAttachedSessionOnLocalOwner("three-way", source));
+    try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(owner_id)), server.world.findNick("Tri"));
+    try std.testing.expect(server.world.memberModes("#three-way", worldIdFromClient(owner_id)).?.isOperator());
+    try std.testing.expect(server.sessions.containsClient("three-way", earlier_cid));
+    try std.testing.expect(server.sessions.containsClient("three-way", owner_cid));
 }
 
 test "threaded server: EXTERNAL auto-resume latch excludes certificates and PLAIN" {
@@ -68178,7 +76033,8 @@ test "threaded server: EXTERNAL exact account nick auto-attaches one local token
     const claimant_id = try addTestLocalClient(&server, "bootstrap", "kain");
     const claimant = server.connFor(claimant_id).?;
     try claimant.session.setNick("kain");
-    claimant.session.setOperGrant(
+    try reconcileTestOper(
+        &claimant.session,
         oper_mod.OperPrivileges.initMany(&.{.oper_override}),
         "root",
         "Network Operator",
@@ -68221,7 +76077,7 @@ test "threaded server: EXTERNAL exact account nick auto-attaches one local token
         claimant.send_buf[0..claimant.send_len],
         " 353 kain = #root ",
         "kain",
-        "*kain",
+        "!kain",
     );
     // The physical row already existed: neither claimant nor owner gets a
     // duplicate logical JOIN, and neither side gets +Y churn.
@@ -68424,7 +76280,8 @@ test "threaded server: secured replica permits tokenless EXTERNAL exact account 
     const claimant_id = try addTestLocalClient(&server, "mesh-bootstrap", "kain");
     const claimant = server.connFor(claimant_id).?;
     try claimant.session.setNick("kain");
-    claimant.session.setOperGrant(
+    try reconcileTestOper(
+        &claimant.session,
         oper_mod.OperPrivileges.initMany(&.{.oper_override}),
         "root",
         "Network Operator",
@@ -68868,7 +76725,7 @@ test "threaded server: local resume joins an attached reusable session" {
 
     const observer_id = try addTestLocalClient(&server, "observer", null);
     const observer = server.connFor(observer_id).?;
-    observer.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&observer.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     try server.observe.set(
         LinuxServer.observeKey(observer),
         "*!*@203.0.113.77",
@@ -69569,6 +77426,7 @@ test "threaded server: session migration restore cannot switch the authenticated
         "alice",
         token,
         .{ .adopt_verified = true },
+        null,
     ));
     try std.testing.expectEqualStrings("alice", claimant.session.account().?);
     try std.testing.expect(server.pending_migrations.?.has(token));
@@ -69616,6 +77474,7 @@ test "atomic RESUME staged capsule adopts a rowless verified token" {
         "stage-acct",
         target_token,
         .{ .adopt_verified = true },
+        null,
     ));
     try std.testing.expect(server.sessions.clientHasToken(
         "stage-acct",
@@ -69630,7 +77489,7 @@ test "atomic RESUME staged capsule adopts a rowless verified token" {
     try std.testing.expect(claimant.session_mesh_announce_requires_authority);
 }
 
-test "atomic RESUME staged capsule joins then removes an existing ghost" {
+test "atomic legacy SRM1 staged capsule joins without consuming an existing ghost" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const mesh_key = "atomic-staged-ghost-key";
@@ -69650,7 +77509,10 @@ test "atomic RESUME staged capsule joins then removes an existing ghost" {
     const claimant_id = try addTestLocalClient(&server, "Before", "ghost-stage-acct");
     const claimant = server.connFor(claimant_id).?;
     const ghost_cid = monitorIdFromClient(ghost_id);
-    const target_token = server.sessions.resumeHandleForClient("ghost-stage-acct", ghost_cid).?.token;
+    const ghost_handle = server.sessions.resumeHandleForClient("ghost-stage-acct", ghost_cid) orelse
+        return error.TestUnexpectedResult;
+    const target_token = ghost_handle.token;
+    const ghost_attachment_id = ghost_handle.attachment_id orelse return error.TestUnexpectedResult;
     const channels = [_][]const u8{"#ghost-staged"};
     const encoded = try (migration_relay.Snapshot{
         .nick = "RestoredGhost",
@@ -69704,7 +77566,16 @@ test "atomic RESUME staged capsule joins then removes an existing ghost" {
         monitorIdFromClient(claimant_id),
         target_token,
     ));
-    try std.testing.expect(server.sessions.resumeHandleForClient("ghost-stage-acct", ghost_cid) == null);
+    const retained_ghost = server.sessions.resumeHandleForClient("ghost-stage-acct", ghost_cid) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(retained_ghost.attachment_id != null);
+    try std.testing.expect(retained_ghost.attachment_id.?.eql(ghost_attachment_id));
+    const claimant_handle = server.sessions.resumeHandleForClient(
+        "ghost-stage-acct",
+        monitorIdFromClient(claimant_id),
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(claimant_handle.attachment_id != null);
+    try std.testing.expect(!claimant_handle.attachment_id.?.eql(ghost_attachment_id));
     try std.testing.expectEqualStrings("RestoredGhost", claimant.session.displayName());
     try std.testing.expect(server.world.isMember("#ghost-staged", worldIdFromClient(claimant_id)));
     try std.testing.expect(server.pending_migrations.?.has(target_token));
@@ -70340,11 +78211,27 @@ test "threaded server: STATS m reports per-command usage to an oper" {
     try writeAllFd(fd_admin, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
     try recvUntil(&admin, " 381 Oper ", 200);
 
-    // STATS m: 212 RPL_STATSCOMMANDS rows, terminated by 219; NICK was dispatched
-    // during registration so it appears in the table.
+    // STATS m: 212 RPL_STATSCOMMANDS as `<cmd> <count> <bytes> <remote>`, then
+    // 219. NICK was dispatched during registration so it appears in the table
+    // with a positive count and a trailing remote field of 0.
     admin.reset();
     try writeAllFd(fd_admin, "STATS m\r\n");
     try recvUntil(&admin, " 212 Oper NICK ", 200);
+    // Discrete params — not a single space-joined "count bytes 0" middle field.
+    // Shape: `212 Oper NICK <count> <bytes> 0` before the empty trailing.
+    const stats_m = admin.written();
+    const nick_row = std.mem.indexOf(u8, stats_m, " 212 Oper NICK ") orelse return error.TestUnexpectedResult;
+    const after_nick = stats_m[nick_row + " 212 Oper NICK ".len ..];
+    const sp1 = std.mem.indexOfScalar(u8, after_nick, ' ') orelse return error.TestUnexpectedResult;
+    const count_tok = after_nick[0..sp1];
+    try std.testing.expect(count_tok.len > 0);
+    for (count_tok) |ch| try std.testing.expect(ch >= '0' and ch <= '9');
+    const rest = after_nick[sp1 + 1 ..];
+    const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse return error.TestUnexpectedResult;
+    const bytes_tok = rest[0..sp2];
+    try std.testing.expect(bytes_tok.len > 0);
+    for (bytes_tok) |ch| try std.testing.expect(ch >= '0' and ch <= '9');
+    try std.testing.expect(std.mem.startsWith(u8, rest[sp2 + 1 ..], "0"));
     try recvUntil(&admin, " 219 Oper m ", 200);
 
     // STATS i: 215 allow blocks (connection classes) for the configured registry.
@@ -70429,7 +78316,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     try recvUntil(&admin, "handle=1 name=guard tier=verified signed=true commands=0 hooks=1 grants=(none) intents=(none)", 200);
 }
 
-test "threaded server: SASL oper elevation persists the grant to oper_grants_path" {
+test "threaded server: SASL oper elevation persists inactive OCG1 compatibility record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -70477,8 +78364,8 @@ test "threaded server: SASL oper elevation persists the grant to oper_grants_pat
     try writeAllFd(fd, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
     try recvUntil(&admin, " 381 Oper ", 200);
 
-    // The SASL oper elevation must have written the local grant to the file, so a
-    // cold restart's loadGrants restores it (a `<account>\t<bits>\t…` TSV row).
+    // Configured-local elevation still emits the legacy compatibility record,
+    // but loadGrants never treats this TSV row as session authority.
     const contents = std.Io.Dir.cwd().readFileAlloc(std.testing.io, grants_path, std.testing.allocator, .limited(4096)) catch |err| {
         std.debug.print("grants file not written: {any}\n", .{err});
         return error.TestUnexpectedResult;
@@ -70486,6 +78373,25 @@ test "threaded server: SASL oper elevation persists the grant to oper_grants_pat
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "admin\t") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "netadmin") != null);
+
+    // A cold-start consumer may reload that TSV row into its OCG1 registry, but
+    // the row remains compatibility telemetry rather than runtime authority.
+    var restored = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .oper_grants_path = grants_path,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer restored.deinit();
+    restored.loadGrants();
+    const loaded = restored.oper_grants.lookup("admin", restored.grantNowU64()) orelse
+        return error.TestExpectedGrant;
+    try std.testing.expect(oper_mod.OperPrivileges.fromBits(loaded.privilege_bits).has(.oper_override));
+    try std.testing.expect(!restored.isOverrideOper("admin"));
+    try std.testing.expect(!restored.remoteDataTagAuthorized("SYS.notice", false, null, "admin"));
 }
 
 test "threaded server: a joining network operator announces the derived +Y prefix to existing members" {
@@ -71378,6 +79284,44 @@ test "event routing: legacy oper category subscriptions are independent of the I
     try std.testing.expect(!LinuxServer.sessionWantsEvent(&ircx, .kill, .notice, "k killed s (flood)", "k killed s (flood)"));
 }
 
+test "KICK server wire boundary appends exactly one CRLF" {
+    var buf: [default_reply_bytes]u8 = undefined;
+    const wire = try LinuxServer.buildKickWire(
+        &buf,
+        .{ .nick = "Founder", .user = "founder", .host = "localhost" },
+        "#room",
+        "Member",
+        "bounded reason",
+    );
+    try std.testing.expectEqualStrings(
+        ":Founder!founder@localhost KICK #room Member :bounded reason\r\n",
+        wire,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, wire, "\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, wire[0 .. wire.len - 2], "\r\n") == null);
+
+    var reason: [400]u8 = @splat('r');
+    const max_wire = try LinuxServer.buildKickWire(
+        &buf,
+        .{ .nick = "Founder", .user = "founder", .host = "localhost" },
+        "#room",
+        "Member",
+        &reason,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, max_wire, "\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, max_wire[0 .. max_wire.len - 2], "\r\n") == null);
+    try std.testing.expectError(
+        error.OutputTooSmall,
+        LinuxServer.buildKickWire(
+            buf[0..1],
+            .{ .nick = "Founder", .user = "founder", .host = "localhost" },
+            "#room",
+            "Member",
+            "reason",
+        ),
+    );
+}
+
 test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to-end" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -71419,10 +79363,29 @@ test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to
     try writeAllFd(fd_a, "MODE #x +o B\r\n");
     try recvUntil(&a, "MODE #x +o B", 200);
 
-    // A KICKs B (founder outranks op).
+    // A KICKs B (founder outranks op). Both actor and target receive one
+    // independently delimited wire line before any later command can mask a
+    // missing terminator.
     a.reset();
+    b.reset();
     try writeAllFd(fd_a, "KICK #x B :bye\r\n");
-    try recvUntil(&a, "KICK #x B :bye", 200);
+    try recvUntil(&a, "KICK #x B :bye\r\n", 200);
+    try recvUntil(&b, "KICK #x B :bye\r\n", 200);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(a.written(), "KICK #x B :bye\r\n"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(b.written(), "KICK #x B :bye\r\n"));
+
+    // The next server reply starts on a fresh line and the kicked target is no
+    // longer projected into NAMES. This is the wire-level path the UI consumes
+    // to remove the target from its member roster.
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "NAMES #x\r\n");
+    try writeAllFd(fd_b, "NAMES #x\r\n");
+    try recvUntil(&a, " 366 A #x :End of /NAMES list\r\n", 200);
+    try recvUntil(&b, " 366 B #x :End of /NAMES list\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "KICK #x") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "KICK #x") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " B") == null);
 
     // WHOIS A -> 311 user line + 318 end.
     a.reset();
@@ -73197,6 +81160,7 @@ test "threaded server: same-account same-nick second client attaches, not 433-dr
     var services = services_mod.Services.init(&store, null);
     var cfg = operTestConfig(0);
     cfg.crypto_io = std.testing.io;
+    cfg.session_resume_composite_issuance = true;
     cfg.account_services = &services;
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -73245,9 +81209,11 @@ test "threaded server: same-account same-nick second client attaches, not 433-dr
     const start = (std.mem.indexOf(u8, k1.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
     const tail = k1.written()[start..];
     const token_len = std.mem.indexOfScalar(u8, tail, '\r') orelse return error.TestUnexpectedResult;
-    var token_buf: [64]u8 = undefined;
+    var token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(token_buf[0..token_len], tail[0..token_len]);
     const token = token_buf[0..token_len];
+    const exact = (try session_resume_credential.decode(token)).local;
+    const legacy_group_token = std.fmt.bytesToHex(exact.group_token, .lower);
 
     // Same account and nick but a distinct token cannot consume the DM.
     k1.reset();
@@ -73262,7 +81228,7 @@ test "threaded server: same-account same-nick second client attaches, not 433-dr
     // event reaches both transports once while both remain connected.
     var resume_buf: [128]u8 = undefined;
     k2.reset();
-    try writeAllFd(fd_k2, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{token}));
+    try writeAllFd(fd_k2, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{legacy_group_token}));
     try recvUntil(&k2, "attached to live session", 200);
     k1.reset();
     k2.reset();
@@ -73287,6 +81253,7 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
 
     var cfg = operTestConfig(0);
     cfg.crypto_io = std.testing.io;
+    cfg.session_resume_composite_issuance = true;
     cfg.account_services = &services;
     // Use an ordinary authenticated account: the oper-test "admin" identity is
     // deliberately kick-immune, which would test +Y protection instead of
@@ -73333,9 +81300,11 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     const start = (std.mem.indexOf(u8, one.written(), marker) orelse return error.TestUnexpectedResult) + marker.len;
     const tail = one.written()[start..];
     const token_len = std.mem.indexOfScalar(u8, tail, '\r') orelse return error.TestUnexpectedResult;
-    var token_buf: [64]u8 = undefined;
+    var token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(token_buf[0..token_len], tail[0..token_len]);
     const token = token_buf[0..token_len];
+    const exact = (try session_resume_credential.decode(token)).local;
+    const legacy_group_token = std.fmt.bytesToHex(exact.group_token, .lower);
 
     // The second socket reaches 001 but must NOT inherit by account+nick alone:
     // it starts with a distinct generated token. Only presenting the SAME
@@ -73350,7 +81319,7 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     var resume_buf: [128]u8 = undefined;
     one.reset();
     two.reset();
-    try writeAllFd(fd_two, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{token}));
+    try writeAllFd(fd_two, try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{legacy_group_token}));
     try recvUntil(&two, "attached to live session", 200);
     try recvUntil(&two, "JOIN #shared", 200);
     try recvUntil(&two, " 353 kain = #shared ", 200);
@@ -73463,7 +81432,14 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     two.reset();
     try writeAllFd(fd_two, "SESSION TOKEN\r\n");
     try recvUntil(&two, "SESSION TOKEN ", 200);
-    try expectContains(two.written(), token);
+    const handoff_credential = testSessionTokenFromReply(two.written(), "SESSION TOKEN ") orelse
+        return error.TestUnexpectedResult;
+    const handoff_local = switch (try session_resume_credential.decode(handoff_credential)) {
+        .local => |value| value,
+        .mesh => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(exact.group_token, handoff_local.group_token);
+    try std.testing.expect(!handoff_local.attachment_id.eql(exact.attachment_id));
 }
 
 test "threaded server: draft/multiline batch reassembles + splits to recipient" {
@@ -75291,7 +83267,7 @@ test "exploit: SHUN list drops a CRLF-smuggled stored reason (oper handler, end-
     defer server.deinit();
     const id = try addTestLocalClient(&server, "operator", null);
     const conn = server.connFor(id).?;
-    conn.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.client_moderate}), "ircop", "oper");
+    try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.initMany(&.{.client_moderate}), "ircop", "oper");
 
     // A shun reason is stored WITHOUT control-byte validation (shun.add checks
     // only length), so a CRLF in the reason reaches the list-emit path. Seed a
@@ -76465,6 +84441,289 @@ test "threaded server: NAMES honors multi-prefix cap" {
     // the highest.
     try writeAllFd(fd_a, "NAMES #m\r\n");
     try recvUntil(&a, "!+A", 200);
+}
+
+test "session resume projection: large channel NAMES is complete and chunked past 512 members" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_clients = 1024,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const channel = "#large-names";
+    const member_count: usize = 513;
+    for (0..member_count) |i| {
+        var nick_buf: [64]u8 = undefined;
+        const nick = try std.fmt.bufPrint(&nick_buf, "RosterMember{d:0>4}LongNick", .{i});
+        const id = try addTestLocalClient(&server, nick, null);
+        try server.world.restoreMember(channel, worldIdFromClient(id), world_model.MemberModes.empty());
+    }
+    const viewer_id = try addTestLocalClient(&server, "NamesViewer", null);
+    const viewer = server.connFor(viewer_id).?;
+
+    const Inspection = struct {
+        namreply_lines: usize = 0,
+        end_lines: usize = 0,
+        member_tokens: usize = 0,
+
+        fn inspect(wire: []const u8) !@This() {
+            var result = @This(){};
+            var lines = std.mem.splitSequence(u8, wire, "\r\n");
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                try std.testing.expect(line.len <= names_reply.DEFAULT_MAX_LINE_BYTES);
+                const parsed = try irc_line.parseLine(line);
+                if (std.mem.eql(u8, parsed.command, "353")) {
+                    result.namreply_lines += 1;
+                    const params = parsed.paramSlice();
+                    try std.testing.expect(params.len != 0);
+                    var tokens = std.mem.splitScalar(u8, params[params.len - 1], ' ');
+                    while (tokens.next()) |token| {
+                        if (token.len != 0) result.member_tokens += 1;
+                    }
+                } else if (std.mem.eql(u8, parsed.command, "366")) {
+                    result.end_lines += 1;
+                }
+            }
+            return result;
+        }
+    };
+
+    // Ordinary NAMES must include the 513th member, span several legal 353
+    // lines, and close the complete burst with exactly one 366.
+    try server.sendNames(viewer, channel);
+    const ordinary_len = viewer.send_len - viewer.send_offset + viewer.send_overflow.items.len;
+    const ordinary = try allocator.alloc(u8, ordinary_len);
+    defer allocator.free(ordinary);
+    const ordinary_inline_len = viewer.send_len - viewer.send_offset;
+    @memcpy(ordinary[0..ordinary_inline_len], viewer.send_buf[viewer.send_offset..viewer.send_len]);
+    @memcpy(ordinary[ordinary_inline_len..], viewer.send_overflow.items);
+    const ordinary_inspection = try Inspection.inspect(ordinary);
+    try std.testing.expect(ordinary_inspection.namreply_lines > 1);
+    try std.testing.expectEqual(member_count, ordinary_inspection.member_tokens);
+    try std.testing.expectEqual(@as(usize, 1), ordinary_inspection.end_lines);
+    try expectContains(ordinary, "RosterMember0512LongNick");
+
+    viewer.send_len = 0;
+    viewer.send_offset = 0;
+    viewer.send_overflow.clearAndFree(viewer.overflow_allocator);
+
+    // SESSION RESUME renders against a not-yet-committed claimant projection.
+    // Even when the World roster already exceeds the old cap, the synthetic
+    // restored identity must be present before the same single 366 boundary.
+    const projected_nick = "ProjectedResume";
+    try server.sendNamesWithProjection(viewer, channel, .{
+        .exact_world_ids = &.{},
+        .nick = projected_nick,
+        .user = "resume-user",
+        .modes = world_model.MemberModes.fromModes(&.{.op}),
+        .is_override_oper = false,
+    });
+    const projected_len = viewer.send_len - viewer.send_offset + viewer.send_overflow.items.len;
+    const projected = try allocator.alloc(u8, projected_len);
+    defer allocator.free(projected);
+    const projected_inline_len = viewer.send_len - viewer.send_offset;
+    @memcpy(projected[0..projected_inline_len], viewer.send_buf[viewer.send_offset..viewer.send_len]);
+    @memcpy(projected[projected_inline_len..], viewer.send_overflow.items);
+    const projected_inspection = try Inspection.inspect(projected);
+    try std.testing.expect(projected_inspection.namreply_lines > 1);
+    try std.testing.expectEqual(member_count + 1, projected_inspection.member_tokens);
+    try std.testing.expectEqual(@as(usize, 1), projected_inspection.end_lines);
+    try expectContains(projected, "RosterMember0512LongNick");
+    try expectContains(projected, "@ProjectedResume");
+
+    // Capacity refusal is whole-burst atomic: an undersized SendQ gets neither
+    // an early 353 nor a misleading 366 that would close a partial roster.
+    viewer.send_len = 0;
+    viewer.send_offset = 0;
+    viewer.send_overflow.clearAndFree(viewer.overflow_allocator);
+    viewer.sendq_cap = 256;
+    try std.testing.expectError(error.OutputTooSmall, server.sendNames(viewer, channel));
+    try std.testing.expectEqual(@as(usize, 0), viewer.send_len);
+    try std.testing.expectEqual(@as(usize, 0), viewer.send_overflow.items.len);
+}
+
+test "NAMES rejects an admitted malformed remote member without partial 353 or 366" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{
+        .allocator = allocator,
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 1000,
+        .server_name = "peer.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer peer.deinit();
+    const link = try allocator.create(s2s_link.S2sLink);
+    try link.init(.{
+        .allocator = allocator,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_epoch_ms = 1001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+    try peer.start(50);
+    try pumpLinkPair(&peer, link, allocator);
+    try std.testing.expect(link.established());
+
+    // The resumed-roster seam models a previously admitted route row. The route
+    // table intentionally accepts opaque non-empty identity strings, so this
+    // malformed host reaches the NAMES boundary beside a valid remote member.
+    try link.primeResumedMember("#malformed-names", "ValidRemote", 1, 0, 100, .{
+        .username = "valid",
+        .host = "valid.example",
+    }, 100);
+    try link.primeResumedMember("#malformed-names", "MalformedRemote", 1, 0, 101, .{
+        .username = "bad",
+        .host = "bad host",
+    }, 101);
+    try std.testing.expectEqual(@as(usize, 2), link.channelMembers("#malformed-names").len);
+
+    const viewer_id = try addTestLocalClient(&server, "NamesViewer", null);
+    const viewer = server.connFor(viewer_id).?;
+    viewer.session.registration.registered = true;
+    try server.world.restoreMember("#malformed-names", worldIdFromClient(viewer_id), world_model.MemberModes.empty());
+
+    // Exercise the production CQE -> handleRecv -> processLiveLine firewall.
+    // Keep a synthetic SEND ownership reference so the connection remains
+    // inspectable after its per-connection roster fault is classified.
+    const command = "NAMES #malformed-names\r\n";
+    @memcpy(viewer.recv_buf[0..command.len], command);
+    viewer.recv_armed = true;
+    viewer.send_armed = true;
+    var handler = CompletionHandler{ .server = &server };
+    handler.onCompletion(.{ .recv = .{
+        .token = viewer.token,
+        .res = @intCast(command.len),
+        .more = false,
+    } });
+    try std.testing.expect(handler.err == null);
+    try std.testing.expect(viewer.closing);
+    try std.testing.expectEqual(@as(usize, 0), viewer.send_len);
+    try std.testing.expectEqual(@as(usize, 0), viewer.send_overflow.items.len);
+    viewer.send_armed = false;
+}
+
+test "JOIN auto-NAMES rejects malformed remote roster without empty nicklist" {
+    // Nicklist desync: JOIN used to `catch {}` sendNames failures, so a channel
+    // with one InvalidHost mesh row joined successfully and emitted neither 353
+    // nor 366. The client armed an implicit NAMES burst and suppressed re-poll
+    // while believing the burst was in flight — empty nicklist until TTL expiry.
+    // Fail-closed like explicit NAMES: close the connection, emit no partial roster.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{
+        .allocator = allocator,
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 1000,
+        .server_name = "peer.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer peer.deinit();
+    const link = try allocator.create(s2s_link.S2sLink);
+    try link.init(.{
+        .allocator = allocator,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_epoch_ms = 1001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+    try peer.start(50);
+    try pumpLinkPair(&peer, link, allocator);
+    try std.testing.expect(link.established());
+
+    try link.primeResumedMember("#join-malformed-names", "ValidRemote", 1, 0, 100, .{
+        .username = "valid",
+        .host = "valid.example",
+    }, 100);
+    try link.primeResumedMember("#join-malformed-names", "MalformedRemote", 1, 0, 101, .{
+        .username = "bad",
+        .host = "bad host",
+    }, 101);
+
+    const joiner_id = try addTestLocalClient(&server, "JoinViewer", null);
+    const joiner = server.connFor(joiner_id).?;
+    joiner.session.registration.registered = true;
+
+    const command = "JOIN #join-malformed-names\r\n";
+    @memcpy(joiner.recv_buf[0..command.len], command);
+    joiner.recv_armed = true;
+    joiner.send_armed = true;
+    var handler = CompletionHandler{ .server = &server };
+    handler.onCompletion(.{ .recv = .{
+        .token = joiner.token,
+        .res = @intCast(command.len),
+        .more = false,
+    } });
+    try std.testing.expect(handler.err == null);
+    try std.testing.expect(joiner.closing);
+    // No certified NAMES image: neither a 353 nor a lone 366 may escape.
+    const out = joiner.send_buf[joiner.send_offset..joiner.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, out, " 353 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " 366 ") == null);
+    joiner.send_armed = false;
+}
+
+test "labeled NAMES capture follows remaining SendQ beyond legacy 65 arenas" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var conn = ConnState.init(-1);
+    const legacy_cap = default_reply_bytes * 65;
+    conn.sendq_cap = legacy_cap + 128 * 1024;
+    conn.send_len = 1024;
+    conn.send_offset = 256;
+    const remaining = conn.sendq_cap - (conn.send_len - conn.send_offset);
+
+    try std.testing.expect(remaining > legacy_cap);
+    try std.testing.expectEqual(
+        remaining,
+        LinuxServer.labeledBulkCaptureCapacity(&conn, true).?,
+    );
+    try std.testing.expectEqual(
+        legacy_cap,
+        LinuxServer.labeledBulkCaptureCapacity(&conn, false).?,
+    );
+    conn.sendq_cap = conn.send_len - conn.send_offset;
+    try std.testing.expect(LinuxServer.labeledBulkCaptureCapacity(&conn, true) == null);
 }
 
 test "threaded server: IRCX NAMESX includes derived oper prefix in NAMES" {
@@ -78717,7 +86976,7 @@ test "event spine: +U OPMODERATE POLICY fan-out reaches oper on another shard" {
         const oper_conn = server.rx().clients.get(oper_id).?;
         oper_conn.token = try tokenFromId(oper_id);
         try oper_conn.session.setNick("RemoteOper");
-        oper_conn.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+        try reconcileTestOper(&oper_conn.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
         oper_conn.session.setEventMask(event_spine.CategoryMask.only(.policy));
 
         current_reactor = &server.reactors[0];
@@ -79200,7 +87459,7 @@ test "threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admissio
     server.fabric.?.release(1, reclaimed);
 }
 
-test "different-token session eviction retires old spool rows without leaking to newcomer" {
+test "tracking at cap preserves detached spool and leaves newcomer untracked" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -79228,9 +87487,9 @@ test "different-token session eviction retires old spool rows without leaking to
 
     const new_id = try addTestLocalClient(&server, "NewToken", "shared-account");
     const new_conn = server.connFor(new_id) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
-    try std.testing.expect(!server.sessions.containsClient("shared-account", monitorIdFromClient(old_id)));
-    try std.testing.expect(server.sessions.containsClient("shared-account", monitorIdFromClient(new_id)));
+    try std.testing.expectEqual(@as(usize, 1), server.attachment_delivery_spool.len());
+    try std.testing.expect(server.sessions.containsClient("shared-account", monitorIdFromClient(old_id)));
+    try std.testing.expect(!server.sessions.containsClient("shared-account", monitorIdFromClient(new_id)));
     try std.testing.expect(std.mem.indexOf(u8, new_conn.send_buf[0..new_conn.send_len], "old-token-secret") == null);
 }
 
@@ -79390,7 +87649,7 @@ test "cross-shard delivery poison: saturated special broadcasts poison only matc
     const observe_match = server.rx().clients.get(observe_match_id).?;
     observe_match.token = try tokenFromId(observe_match_id);
     try observe_match.session.setNick("ObserveMatch");
-    observe_match.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&observe_match.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     try server.observe.set(
         LinuxServer.observeKey(observe_match),
         "watch*!*@*",
@@ -79402,7 +87661,7 @@ test "cross-shard delivery poison: saturated special broadcasts poison only matc
     const observe_decoy = server.rx().clients.get(observe_decoy_id).?;
     observe_decoy.token = try tokenFromId(observe_decoy_id);
     try observe_decoy.session.setNick("ObserveDecoy");
-    observe_decoy.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&observe_decoy.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     try server.observe.set(
         LinuxServer.observeKey(observe_decoy),
         "watch*!*@*",
@@ -79414,14 +87673,14 @@ test "cross-shard delivery poison: saturated special broadcasts poison only matc
     const event_match = server.rx().clients.get(event_match_id).?;
     event_match.token = try tokenFromId(event_match_id);
     try event_match.session.setNick("EventMatch");
-    event_match.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&event_match.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     event_match.session.setEventMask(event_spine.CategoryMask.only(.policy));
 
     const event_decoy_id = try server.rx().clients.alloc(ConnState.init(-1));
     const event_decoy = server.rx().clients.get(event_decoy_id).?;
     event_decoy.token = try tokenFromId(event_decoy_id);
     try event_decoy.session.setNick("EventDecoy");
-    event_decoy.session.setOperGrant(oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
+    try reconcileTestOper(&event_decoy.session, oper_mod.OperPrivileges.full, "netadmin", "Network Admin");
     event_decoy.session.setEventMask(event_spine.CategoryMask.only(.kill));
 
     // Saturate only the destination shard's pool. Both special broadcast kinds
@@ -80942,6 +89201,189 @@ test "threaded server: MEMO IGNORE silently drops a blocked sender's memo" {
     try recvUntil(&a, "from bob :now allowed", 300);
 }
 
+fn testSaslPlainAccountLogin(conn: *ConnState, account: []const u8) !void {
+    var sink = QueueSink{ .conn = conn };
+    try processLine(conn, "CAP REQ :sasl", &sink);
+    try processLine(conn, "AUTHENTICATE PLAIN", &sink);
+    var raw: [96]u8 = undefined;
+    var raw_len: usize = 0;
+    raw[raw_len] = 0;
+    raw_len += 1;
+    @memcpy(raw[raw_len .. raw_len + account.len], account);
+    raw_len += account.len;
+    raw[raw_len] = 0;
+    raw_len += 1;
+    @memcpy(raw[raw_len .. raw_len + "onyx".len], "onyx");
+    raw_len += "onyx".len;
+    var encoded_buf: [std.base64.standard.Encoder.calcSize(raw.len)]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&encoded_buf, raw[0..raw_len]);
+    var line_buf: [160]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "AUTHENTICATE {s}", .{encoded});
+    try processLine(conn, line, &sink);
+    try std.testing.expectEqualStrings(account, conn.session.account() orelse return error.TestUnexpectedResult);
+}
+
+test "account-switch ratchet standard SASL then post-auth replacement never unions oper authority" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_account_switch_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_account_switch_bindings) catch unreachable,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "Switch", null);
+    const conn = server.connFor(id).?;
+    server.injectSessionState(conn);
+
+    // A full local operator authenticates first.
+    try testSaslPlainAccountLogin(conn, "admin");
+    try server.elevateOperFromAccount(conn);
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expect(conn.session.isAdmin());
+    try std.testing.expect(conn.session.hasPriv(.mesh_admin));
+    try std.testing.expectEqualStrings("netadmin", conn.session.operClass());
+    try std.testing.expectEqual(
+        oper_session_provenance.Source.configured_local,
+        std.meta.activeTag(conn.session.operProvenance()),
+    );
+
+    // Reconciliation itself must replace an already-live projection.  This
+    // directly guards the former `if (isOper()) return` ratchet independently
+    // of ClientSession.loginAs()'s own revoke-before-mutate defense.
+    server.oper_registry = oper_mod.OperRegistry.init(&test_account_switch_narrow_admin_bindings) catch unreachable;
+    try server.elevateOperFromAccount(conn);
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expect(conn.session.hasPriv(.client_kill));
+    try std.testing.expectEqual(@as(usize, 1), conn.session.oper_priv.count());
+    try std.testing.expect(!conn.session.hasPriv(.server_admin));
+    try std.testing.expectEqualStrings("refreshed", conn.session.operClass());
+    server.oper_registry = oper_mod.OperRegistry.init(&test_account_switch_bindings) catch unreachable;
+    try server.elevateOperFromAccount(conn);
+    try std.testing.expect(conn.session.isAdmin());
+    try std.testing.expect(conn.session.hasPriv(.mesh_admin));
+
+    // A -> non-oper must leave no privilege, class, title, admin, or override
+    // residue.  The server lookup itself clears again before returning absent.
+    try server.finishLogin(conn, "plain");
+    try std.testing.expect(!conn.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), conn.session.oper_priv.count());
+    try std.testing.expectEqualStrings("", conn.session.operClass());
+    try std.testing.expectEqualStrings("", conn.session.operTitle());
+    try std.testing.expect(!conn.session.hasUmode(.admin));
+    try std.testing.expect(!conn.session.hasUmode(.override));
+
+    // A -> B operator applies only B's one-bit grant; the former full grant is
+    // not unioned into it.
+    try server.finishLogin(conn, "admin");
+    try server.finishLogin(conn, "oper");
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expect(conn.session.hasPriv(.client_moderate));
+    try std.testing.expectEqual(@as(usize, 1), conn.session.oper_priv.count());
+    try std.testing.expect(!conn.session.hasPriv(.server_admin));
+    try std.testing.expect(!conn.session.hasPriv(.mesh_admin));
+    try std.testing.expectEqualStrings("ircop", conn.session.operClass());
+
+    // Same-account reauthentication is a new authority decision.  Change the
+    // configured binding, authenticate admin again, and prove the old full
+    // projection is replaced by the current one-bit policy.
+    server.oper_registry = oper_mod.OperRegistry.init(&test_account_switch_bindings) catch unreachable;
+    try server.finishLogin(conn, "admin");
+    try std.testing.expect(conn.session.isAdmin());
+    server.oper_registry = oper_mod.OperRegistry.init(&test_account_switch_narrow_admin_bindings) catch unreachable;
+    try server.finishLogin(conn, "admin");
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expect(conn.session.hasPriv(.client_kill));
+    try std.testing.expectEqual(@as(usize, 1), conn.session.oper_priv.count());
+    try std.testing.expect(!conn.session.hasPriv(.server_admin));
+    try std.testing.expect(!conn.session.hasPriv(.mesh_admin));
+    try std.testing.expectEqualStrings("refreshed", conn.session.operClass());
+}
+
+test "account-switch ratchet IRCX AUTH guest and logout clear exact oper authority" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .oper_registry = oper_mod.OperRegistry.init(&test_account_switch_bindings) catch unreachable,
+        .oper_auto_override = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const id = try addTestLocalClient(&server, "IrcxSwitch", null);
+    const conn = server.connFor(id).?;
+    const observer_id = try addTestLocalClient(&server, "Observer", null);
+    const observer = server.connFor(observer_id).?;
+    try observer.session.setIrcxEventSubscription(.user, "*");
+    try server.world.restoreMember("#ratchet", worldIdFromClient(id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#ratchet", worldIdFromClient(observer_id), world_model.MemberModes.empty());
+
+    try server.completeIrcxAuth(id, conn, .plain, .{ .account = "admin" });
+    try std.testing.expect(conn.session.isAdmin());
+    try std.testing.expect(conn.session.hasPriv(.mesh_admin));
+    try std.testing.expect(conn.session.hasUmode(.override));
+
+    resetTestSendQ(conn);
+    resetTestSendQ(observer);
+    try server.completeIrcxAuth(id, conn, .plain, .{ .account = "plain" });
+    try std.testing.expectEqualStrings("plain", conn.session.account().?);
+    try std.testing.expect(!conn.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), conn.session.oper_priv.count());
+    try expectContains(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -oaj\r\n");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -oaj\r\n"));
+    try expectContains(observer.send_buf[0..observer.send_len], " MODE #ratchet -Y IrcxSwitch\r\n");
+    try expectContains(observer.send_buf[0..observer.send_len], "USER DEOPER IrcxSwitch!");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], "USER DEOPER IrcxSwitch!"));
+
+    try server.completeIrcxAuth(id, conn, .plain, .{ .account = "admin" });
+    resetTestSendQ(conn);
+    resetTestSendQ(observer);
+    try server.completeIrcxAuth(id, conn, .plain, .{ .account = "oper" });
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expect(conn.session.hasPriv(.client_moderate));
+    try std.testing.expectEqual(@as(usize, 1), conn.session.oper_priv.count());
+    try std.testing.expect(!conn.session.hasPriv(.server_admin));
+    try std.testing.expectEqualStrings("ircop", conn.session.operClass());
+    try expectContains(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -oaj\r\n");
+    try expectContains(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch +or\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " MODE IrcxSwitch +ora") == null);
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " MODE IrcxSwitch +orj") == null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], " MODE #ratchet -Y IrcxSwitch\r\n"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], "USER DEOPER IrcxSwitch!"));
+
+    resetTestSendQ(conn);
+    resetTestSendQ(observer);
+    try server.completeIrcxAuth(id, conn, .anonymous, .{ .account = "guest", .guest = true });
+    try std.testing.expect(conn.session.account() == null);
+    try std.testing.expect(!conn.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), conn.session.oper_priv.count());
+    try expectContains(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -o\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, observer.send_buf[0..observer.send_len], " MODE #ratchet -Y IrcxSwitch\r\n") == null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], "USER DEOPER IrcxSwitch!"));
+
+    try server.completeIrcxAuth(id, conn, .plain, .{ .account = "admin" });
+    try std.testing.expect(conn.session.isOper());
+    resetTestSendQ(conn);
+    resetTestSendQ(observer);
+    try server.handleLogout(id, conn);
+    try std.testing.expect(conn.session.account() == null);
+    try std.testing.expect(!conn.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), conn.session.oper_priv.count());
+    try expectContains(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -oaj\r\n");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(conn.send_buf[0..conn.send_len], " MODE IrcxSwitch -oaj\r\n"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], " MODE #ratchet -Y IrcxSwitch\r\n"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(observer.send_buf[0..observer.send_len], "USER DEOPER IrcxSwitch!"));
+}
+
 test "threaded server: oper SASL login auto-enables IRCX" {
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -81863,7 +90305,7 @@ test "migrated profile uses authenticated account and preserves local transport 
         .account = "",
         .host = "migrated-cloak.example",
     };
-    const result = LinuxServer.prepareMigratedSessionProfile(&session, "alice", &snap, false);
+    const result = LinuxServer.prepareMigratedSessionProfile(&session, "alice", &snap, false, null, 100);
 
     try std.testing.expect(!result.override_activated);
     try std.testing.expectEqualStrings("alice", session.account().?);
@@ -81877,7 +90319,8 @@ test "migrated profile uses authenticated account and preserves local transport 
 test "migrated profile honors mode direction and rederives transport account and admin modes" {
     var tls_admin = dispatch.ClientSession.init();
     tls_admin.loginAs("admin");
-    tls_admin.setOperGrant(
+    try reconcileTestOper(
+        &tls_admin,
         oper_mod.OperPrivileges.initMany(&.{.server_admin}),
         "netadmin",
         "Network Admin",
@@ -81889,7 +90332,15 @@ test "migrated profile honors mode direction and rederives transport account and
         .umodes = "+iBzxa-irza",
         .channels = &.{},
     };
-    _ = LinuxServer.prepareMigratedSessionProfile(&tls_admin, "admin", &tls_snap, true);
+    _ = try prepareMigratedSessionProfileForTest(
+        &tls_admin,
+        "admin",
+        &tls_snap,
+        true,
+        oper_mod.OperPrivileges.initMany(&.{.server_admin}),
+        "netadmin",
+        "Network Admin",
+    );
     try std.testing.expect(!tls_admin.hasUmode(.invisible));
     try std.testing.expect(tls_admin.hasUmode(.bot));
     try std.testing.expect(tls_admin.hasUmode(.secure_tls));
@@ -81907,7 +90358,7 @@ test "migrated profile honors mode direction and rederives transport account and
         // Stale profile history cannot recreate an oper grant revoked locally.
         .is_oper = true,
     };
-    _ = LinuxServer.prepareMigratedSessionProfile(&plaintext, "plain", &plain_snap, false);
+    _ = LinuxServer.prepareMigratedSessionProfile(&plaintext, "plain", &plain_snap, false, null, 100);
     try std.testing.expect(!plaintext.hasUmode(.secure_tls));
     try std.testing.expect(!plaintext.hasUmode(.cloaked));
     try std.testing.expect(!plaintext.hasUmode(.admin));
@@ -81924,7 +90375,7 @@ test "migrated profile never relaxes a local media transmit deny" {
         .umodes = "-M",
         .channels = &.{},
     };
-    _ = LinuxServer.prepareMigratedSessionProfile(&removed, "restricted", &remove_snap, false);
+    _ = LinuxServer.prepareMigratedSessionProfile(&removed, "restricted", &remove_snap, false, null, 100);
     try std.testing.expect(removed.hasUmode(.media_tx_deny));
 
     var omitted = dispatch.ClientSession.init();
@@ -81935,7 +90386,7 @@ test "migrated profile never relaxes a local media transmit deny" {
         .umodes = "+i",
         .channels = &.{},
     };
-    _ = LinuxServer.prepareMigratedSessionProfile(&omitted, "restricted", &omitted_snap, false);
+    _ = LinuxServer.prepareMigratedSessionProfile(&omitted, "restricted", &omitted_snap, false, null, 100);
     try std.testing.expect(omitted.hasUmode(.media_tx_deny));
 
     // A carried deny may still tighten an unrestricted claimant.
@@ -81946,7 +90397,7 @@ test "migrated profile never relaxes a local media transmit deny" {
         .umodes = "+M",
         .channels = &.{},
     };
-    _ = LinuxServer.prepareMigratedSessionProfile(&tightened, "restricted", &add_snap, false);
+    _ = LinuxServer.prepareMigratedSessionProfile(&tightened, "restricted", &add_snap, false, null, 100);
     try std.testing.expect(tightened.hasUmode(.media_tx_deny));
 }
 
@@ -81958,20 +90409,28 @@ test "migrated override mode is directional privilege gated and reports activati
         .umodes = "+ij",
         .channels = &.{},
     };
-    const denied = LinuxServer.prepareMigratedSessionProfile(&plain, "plain", &plain_snap, false);
+    const denied = LinuxServer.prepareMigratedSessionProfile(&plain, "plain", &plain_snap, false, null, 100);
     try std.testing.expect(plain.hasUmode(.invisible));
     try std.testing.expect(!plain.hasUmode(.override));
     try std.testing.expect(!denied.override_activated);
 
     var privileged = dispatch.ClientSession.init();
     privileged.loginAs("priv");
-    privileged.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+    try reconcileTestOper(&privileged, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
     const add_snap = migration_relay.Snapshot{
         .nick = "Priv",
         .umodes = "+j",
         .channels = &.{},
     };
-    const activated = LinuxServer.prepareMigratedSessionProfile(&privileged, "priv", &add_snap, false);
+    const activated = try prepareMigratedSessionProfileForTest(
+        &privileged,
+        "priv",
+        &add_snap,
+        false,
+        oper_mod.OperPrivileges.initMany(&.{.oper_override}),
+        "netadmin",
+        "",
+    );
     try std.testing.expect(privileged.hasUmode(.override));
     try std.testing.expect(activated.override_activated);
 
@@ -81980,12 +90439,20 @@ test "migrated override mode is directional privilege gated and reports activati
         .umodes = "-j",
         .channels = &.{},
     };
-    const removed = LinuxServer.prepareMigratedSessionProfile(&privileged, "priv", &remove_snap, false);
+    const removed = try prepareMigratedSessionProfileForTest(
+        &privileged,
+        "priv",
+        &remove_snap,
+        false,
+        oper_mod.OperPrivileges.initMany(&.{.oper_override}),
+        "netadmin",
+        "",
+    );
     try std.testing.expect(!privileged.hasUmode(.override));
     try std.testing.expect(!removed.override_activated);
 }
 
-test "threaded server: narrowing live GRANT clears armed override" {
+test "threaded server: legacy GRANT remains inactive and cannot arm override" {
     var server = Server.init(std.testing.allocator, runtimeGrantTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -82015,25 +90482,28 @@ test "threaded server: narrowing live GRANT clears armed override" {
     try recvUntil(&t, " 001 T ", 200);
     try std.testing.expect(std.mem.indexOf(u8, t.written(), " 381 T ") == null);
 
+    a.reset();
     t.reset();
     try writeAllFd(fd_a, "GRANT target netadmin\r\n");
-    try recvUntil(&t, " 381 T ", 300);
-
-    t.reset();
-    try writeAllFd(fd_t, "MODE T +j\r\n");
-    try recvUntil(&t, "MODE T +j", 200);
-
-    t.reset();
-    try writeAllFd(fd_a, "GRANT target ircop client_kill\r\n");
-    try recvUntil(&t, "MODE T -j", 300);
-    try expectContains(t.written(), "cleared override after oper_override privilege was removed");
+    try recvUntil(&a, "stored inactive legacy record for target", 300);
+    try writeAllFd(fd_t, "PING :grant-inactive\r\n");
+    try recvUntil(&t, "PONG", 200);
+    try std.testing.expect(std.mem.indexOf(u8, t.written(), " 381 T ") == null);
 
     t.reset();
     try writeAllFd(fd_t, "MODE T +j\r\n");
     try recvUntil(&t, " 481 T ", 200);
+
+    a.reset();
+    t.reset();
+    try writeAllFd(fd_a, "GRANT target ircop client_kill\r\n");
+    try recvUntil(&a, "stored inactive legacy record for target", 300);
+    try writeAllFd(fd_t, "PING :narrow-inactive\r\n");
+    try recvUntil(&t, "PONG", 200);
+    try std.testing.expect(std.mem.indexOf(u8, t.written(), "MODE T -j") == null);
 }
 
-test "threaded server: local GRANT and REVOKE announce one oper prefix transition using display nick" {
+test "threaded server: legacy GRANT and REVOKE never announce oper prefix transitions" {
     var server = Server.init(std.testing.allocator, runtimeGrantTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -82067,46 +90537,54 @@ test "threaded server: local GRANT and REVOKE announce one oper prefix transitio
     try recvUntil(&target, " 001 DisplayTarget ", 200);
     try recvUntil(&bystander, " 001 Watcher ", 200);
 
+    // Inactive compatibility records are not operator lifecycle transitions.
+    // Subscribe the grantor to that exact OBSERVE action and prove neither
+    // GRANT nor REVOKE manufactures an `oper` event.
+    try writeAllFd(fd_admin, "EVENT OBSERVE * oper\r\n");
+    try recvUntil(&admin, "OBSERVE: end of snapshot", 300);
+
     try writeAllFd(fd_target, "JOIN #grants\r\n");
     try recvUntil(&target, " 366 DisplayTarget #grants ", 200);
     try writeAllFd(fd_bystander, "JOIN #grants\r\n");
     try recvUntil(&bystander, " 366 Watcher #grants ", 200);
 
-    // First grant makes the account an oper without oper_override. It must not
-    // invent the derived `*` prefix.
+    // OCG1 records are retained for compatibility telemetry only. Neither a
+    // grant nor a tombstone can project session authority or derived +Y/-Y.
     admin.reset();
     bystander.reset();
     try writeAllFd(fd_admin, "GRANT target ircop client_kill\r\n");
-    try recvUntil(&admin, "GRANT: target is now an operator", 300);
+    try recvUntil(&admin, "stored inactive legacy record for target", 300);
+    try writeAllFd(fd_admin, "PING :grant-observe-inactive\r\n");
+    try recvUntil(&admin, "PONG", 200);
+    try std.testing.expect(std.mem.indexOf(u8, admin.written(), " OBSERVE oper ") == null);
     try writeAllFd(fd_bystander, "PING :first-grant\r\n");
     try recvUntil(&bystander, "PONG", 200);
     try std.testing.expect(std.mem.indexOf(u8, bystander.written(), "MODE #grants +Y") == null);
 
-    // A second GRANT reconciles an already-oper session and adds override.
-    // Local members see exactly one transition under the display nick, not the
-    // authenticated account name.
     admin.reset();
     bystander.reset();
     try writeAllFd(fd_admin, "GRANT target ircop client_kill,oper_override\r\n");
-    try recvUntil(&admin, "GRANT: target is now an operator", 300);
+    try recvUntil(&admin, "stored inactive legacy record for target", 300);
+    try writeAllFd(fd_admin, "PING :override-observe-inactive\r\n");
+    try recvUntil(&admin, "PONG", 200);
+    try std.testing.expect(std.mem.indexOf(u8, admin.written(), " OBSERVE oper ") == null);
     try writeAllFd(fd_bystander, "PING :override-added\r\n");
     try recvUntil(&bystander, "PONG", 200);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bystander.written(), "MODE #grants +Y DisplayTarget"));
-    try std.testing.expect(std.mem.indexOf(u8, bystander.written(), "+Y target") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bystander.written(), "MODE #grants +Y") == null);
 
-    // REVOKE is the genuine transition out and likewise produces one -Y before
-    // the session loses its oper authority.
     admin.reset();
     bystander.reset();
     try writeAllFd(fd_admin, "REVOKE target\r\n");
-    try recvUntil(&admin, "REVOKE: operator authority removed from target", 300);
+    try recvUntil(&admin, "stored inactive legacy tombstone for target", 300);
+    try writeAllFd(fd_admin, "PING :revoke-observe-inactive\r\n");
+    try recvUntil(&admin, "PONG", 200);
+    try std.testing.expect(std.mem.indexOf(u8, admin.written(), " OBSERVE oper ") == null);
     try writeAllFd(fd_bystander, "PING :override-revoked\r\n");
     try recvUntil(&bystander, "PONG", 200);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bystander.written(), "MODE #grants -Y DisplayTarget"));
-    try std.testing.expect(std.mem.indexOf(u8, bystander.written(), "-Y target") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bystander.written(), "MODE #grants -Y") == null);
 }
 
-test "mesh GRANT resolves display nick once and converges sibling attachments across reactors" {
+test "mesh OCG1 GRANT converges records but never authorizes sessions or prefixes" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     defer current_reactor = null;
     var server = Server.init(std.testing.allocator, .{
@@ -82128,8 +90606,16 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
     primary.session.registration.registered = true;
     const watcher_id = try addTestLocalClient(&server, "Watcher", null);
     const watcher = server.connFor(watcher_id).?;
+    const alternate_id = try addTestLocalClient(&server, "DisplayTablet", "target");
+    const alternate = server.connFor(alternate_id).?;
+    alternate.session.registration.registered = true;
     try server.world.restoreMember("#mesh-grant", worldIdFromClient(primary_id), world_model.MemberModes.empty());
-    try server.world.restoreMember("#mesh-grant", worldIdFromClient(watcher_id), world_model.MemberModes.empty());
+    try server.world.restoreMember(
+        "#mesh-grant",
+        worldIdFromClient(watcher_id),
+        world_model.MemberModes.fromModes(&.{.founder}),
+    );
+    try server.world.restoreMember("#mesh-grant", worldIdFromClient(alternate_id), world_model.MemberModes.empty());
 
     // A second physical attachment for the same account/session lives on the
     // sibling reactor. It intentionally does not claim a second World nick row;
@@ -82148,7 +90634,7 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
     var wire_buf: [oper_cred_share.max_grant_len]u8 = undefined;
     const override_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits();
     const add_len = try oper_cred_share.sign(signer, .{
-        .account = "target",
+        .account = "DisplayTarget",
         .privilege_bits = override_bits,
         .class = "netadmin",
         .title = "",
@@ -82158,17 +90644,49 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
         .expiry_ms = now + Server.oper_grant_ttl_ms,
     }, &wire_buf);
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..add_len], signer.public_key.toBytes()));
-    try std.testing.expect(primary.session.isOper());
-    try std.testing.expect(sibling.session.isOper());
-    try std.testing.expect(primary.session.hasPriv(.oper_override));
-    try std.testing.expect(sibling.session.hasPriv(.oper_override));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y DisplayTarget"));
-    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "+Y target") == null);
+    try std.testing.expect(!primary.session.isOper());
+    try std.testing.expect(!sibling.session.isOper());
+    try std.testing.expect(!alternate.session.isOper());
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y") == null);
+    try std.testing.expect(!server.isOverrideOper("DisplayTarget"));
+    const stored_add = server.oper_grants.lookup("DisplayTarget", now) orelse return error.TestExpectedGrant;
+    try std.testing.expectEqual(override_bits, stored_add.privilege_bits);
+
+    // A grant that arrives BEFORE a remote JOIN likewise remains telemetry.
+    // This catches the old later-JOIN path that consulted isOverrideOper and
+    // manufactured a synthetic +Y after the ordinary JOIN.
+    const remote_add_len = try oper_cred_share.sign(signer, .{
+        .account = "RemoteLegacy",
+        .privilege_bits = override_bits,
+        .class = "netadmin",
+        .title = "",
+        .issuer_node = "grant-origin.test",
+        .incarnation = 1,
+        .issued_ms = now,
+        .expiry_ms = now + Server.oper_grant_ttl_ms,
+    }, &wire_buf);
+    try std.testing.expect(server.applyMeshGrant(wire_buf[0..remote_add_len], signer.public_key.toBytes()));
+    resetTestSendQ(watcher);
+    const remote_join = .{
+        .channel = "#mesh-grant",
+        .nick = "RemoteLegacy",
+        .username = "remote",
+        .realname = "Remote Legacy",
+        .host = "remote.example",
+        .setter = "",
+        .account = "RemoteLegacy",
+        .kind = s2s_peer_mod.S2sPeer.MembershipDelta.Kind.joined,
+        .status = @as(u4, 0),
+        .prev_status = @as(u4, 0),
+    };
+    server.emitRemoteMembership(&remote_join, "origin.example");
+    try expectContains(watcher.send_buf[0..watcher.send_len], "RemoteLegacy!remote@remote.example JOIN :#mesh-grant");
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y RemoteLegacy") == null);
 
     // A higher-incarnation refresh with unchanged privileges is silent.
     resetTestSendQ(watcher);
     const refresh_len = try oper_cred_share.sign(signer, .{
-        .account = "target",
+        .account = "DisplayTarget",
         .privilege_bits = override_bits,
         .class = "netadmin",
         .title = "",
@@ -82180,12 +90698,11 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..refresh_len], signer.public_key.toBytes()));
     try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "+Y") == null);
 
-    // A nonzero narrowing grant removes only oper_override. Both attachments
-    // remain operators, retain client_kill, and their one shared display nick
-    // gets exactly one -Y transition.
+    // A higher-incarnation legacy record still converges without changing any
+    // live session projection.
     const kill_bits = oper_mod.OperPrivileges.initMany(&.{.client_kill}).toBits();
     const narrow_len = try oper_cred_share.sign(signer, .{
-        .account = "target",
+        .account = "DisplayTarget",
         .privilege_bits = kill_bits,
         .class = "ircop",
         .title = "",
@@ -82195,14 +90712,12 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
         .expiry_ms = now + Server.oper_grant_ttl_ms,
     }, &wire_buf);
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..narrow_len], signer.public_key.toBytes()));
-    try std.testing.expect(primary.session.isOper());
-    try std.testing.expect(sibling.session.isOper());
-    try std.testing.expect(primary.session.hasPriv(.client_kill));
-    try std.testing.expect(sibling.session.hasPriv(.client_kill));
-    try std.testing.expect(!primary.session.hasPriv(.oper_override));
-    try std.testing.expect(!sibling.session.hasPriv(.oper_override));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant -Y DisplayTarget"));
-    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "-Y target") == null);
+    try std.testing.expect(!primary.session.isOper());
+    try std.testing.expect(!sibling.session.isOper());
+    try std.testing.expect(!alternate.session.isOper());
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant -Y") == null);
+    const stored_narrow = server.oper_grants.lookup("DisplayTarget", now) orelse return error.TestExpectedGrant;
+    try std.testing.expectEqual(kill_bits, stored_narrow.privilege_bits);
 
     // Begin a new dedup horizon before the independent re-add/revoke scenario;
     // the test is about grant transition ownership, not waiting two wall seconds.
@@ -82210,7 +90725,7 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
     resetTestSendQ(watcher);
     const restored_bits = oper_mod.OperPrivileges.initMany(&.{ .client_kill, .oper_override }).toBits();
     const restore_len = try oper_cred_share.sign(signer, .{
-        .account = "target",
+        .account = "DisplayTarget",
         .privilege_bits = restored_bits,
         .class = "netadmin",
         .title = "",
@@ -82220,17 +90735,35 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
         .expiry_ms = now + Server.oper_grant_ttl_ms,
     }, &wire_buf);
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..restore_len], signer.public_key.toBytes()));
-    try std.testing.expect(primary.session.hasPriv(.client_kill));
-    try std.testing.expect(sibling.session.hasPriv(.client_kill));
-    try std.testing.expect(primary.session.hasPriv(.oper_override));
-    try std.testing.expect(sibling.session.hasPriv(.oper_override));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y DisplayTarget"));
+    try std.testing.expect(!primary.session.isOper());
+    try std.testing.expect(!sibling.session.isOper());
+    try std.testing.expect(!alternate.session.isOper());
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y") == null);
 
-    // The tombstone de-elevates both physical attachments and emits one -Y for
-    // their shared display identity.
+    // A preloaded active-looking OCG1 record cannot affect later snapshots,
+    // WHOIS, reserved DATA admission, or KICK immunity.
+    resetTestSendQ(watcher);
+    try server.sendNames(watcher, "#mesh-grant");
+    try expectContains(watcher.send_buf[0..watcher.send_len], "DisplayTarget");
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "*DisplayTarget") == null);
+    resetTestSendQ(watcher);
+    var whois_line = try irc_line.parseLine("WHOIS DisplayTarget");
+    try server.handleWhois(watcher, &whois_line);
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], " 313 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "*#mesh-grant") == null);
+    try std.testing.expect(!server.remoteDataTagAuthorized("SYS.notice", false, null, "DisplayTarget"));
+    try std.testing.expect(!server.remoteDataTagAuthorized("HST.state", false, null, "DisplayTarget"));
+    resetTestSendQ(watcher);
+    var kick_line = try irc_line.parseLine("KICK #mesh-grant DisplayTarget :legacy telemetry is not immunity");
+    try server.handleKick(watcher_id, watcher, &kick_line);
+    try std.testing.expect(!server.world.isMember("#mesh-grant", worldIdFromClient(primary_id)));
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "Cannot kick a network operator") == null);
+
+    // The tombstone supersedes the stored record but likewise has no live
+    // session or prefix side effect.
     resetTestSendQ(watcher);
     const revoke_len = try oper_cred_share.sign(signer, .{
-        .account = "target",
+        .account = "DisplayTarget",
         .privilege_bits = 0,
         .class = "revoked",
         .title = "",
@@ -82242,8 +90775,61 @@ test "mesh GRANT resolves display nick once and converges sibling attachments ac
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..revoke_len], signer.public_key.toBytes()));
     try std.testing.expect(!primary.session.isOper());
     try std.testing.expect(!sibling.session.isOper());
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant -Y DisplayTarget"));
-    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "-Y target") == null);
+    try std.testing.expect(!alternate.session.isOper());
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant -Y") == null);
+    const stored_tombstone = server.oper_grants.lookup("DisplayTarget", now) orelse return error.TestExpectedGrant;
+    try std.testing.expectEqual(@as(u64, 0), stored_tombstone.privilege_bits);
+}
+
+test "remote WHOIS never projects an inactive OCG1 operator record" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const now = server.grantNowU64();
+    _ = server.oper_grants.upsert(.{
+        .account = "RemoteLegacy",
+        .privilege_bits = oper_mod.OperPrivileges.full.toBits(),
+        .class = "netadmin",
+        .title = "Legacy Network Administrator",
+        .issuer_node = "legacy-origin.test",
+        .incarnation = 1,
+        .issued_ms = now,
+        .expiry_ms = now + Server.oper_grant_ttl_ms,
+    });
+
+    const watcher_id = try addTestLocalClient(&server, "Watcher", null);
+    const watcher = server.connFor(watcher_id) orelse return error.TestUnexpectedResult;
+    watcher.session.registration.registered = true;
+    var storage: [default_reply_bytes * 2]u8 = undefined;
+    var lines_buf: [40]whois.WhoisLine = undefined;
+    var sink = whois.WhoisLineSink{ .lines = &lines_buf, .storage = &storage };
+    try server.sendRemoteWhois(watcher, &sink, .{
+        .nick = "RemoteLegacy",
+        .username = "remote",
+        .realname = "Remote Legacy",
+        .host = "remote.users.test",
+        .server = "remote.test",
+        .server_info = "Remote test server",
+        .account = "RemoteLegacy",
+        .real_host = "",
+        .certfp = "",
+    });
+
+    const reply = watcher.send_buf[0..watcher.send_len];
+    try expectContains(reply, " 311 Watcher RemoteLegacy remote remote.users.test ");
+    try expectContains(reply, " 318 Watcher RemoteLegacy ");
+    try std.testing.expect(std.mem.indexOf(u8, reply, " 313 Watcher RemoteLegacy ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "is an IRC operator") == null);
 }
 
 test "threaded server: IRCX EVENT subscription numerics" {
@@ -83796,6 +92382,7 @@ test "threaded server: CHATHISTORY records + replays channel messages" {
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-one", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-two", 200);
     try recvUntil(&a, "BATCH -1", 200);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, a.written(), "@batch=1;time="));
 }
 
 test "threaded server: SEARCH returns matching channel messages in a chathistory BATCH" {
@@ -84552,6 +93139,8 @@ test "threaded server: CHATHISTORY TARGETS lists active channels and DMs" {
     try recvUntil(&a, "CHATHISTORY TARGETS b timestamp=", 200);
     try recvUntil(&a, "CHATHISTORY TARGETS #t2 timestamp=", 200);
     const written = a.written();
+    try expectContains(written, "@batch=1 :");
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, written, "@batch=1 :"));
     const i_t1 = std.mem.indexOf(u8, written, "CHATHISTORY TARGETS #t1 timestamp=").?;
     const i_dm = std.mem.indexOf(u8, written, "CHATHISTORY TARGETS b timestamp=").?;
     const i_t2 = std.mem.indexOf(u8, written, "CHATHISTORY TARGETS #t2 timestamp=").?;
@@ -85651,6 +94240,101 @@ test "failed inherited client adoption does not advance HLC or queue carried out
     try std.testing.expectEqual(@as(usize, 0), server.reactors[0].clients.len());
 }
 
+test "current Helix adoption rederives only configured-local operator authority" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var cfg = operTestConfig(0);
+    cfg.oper_auto_override = true;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var admin_sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &admin_sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    var admin_fd_unconsumed = true;
+    defer if (admin_fd_unconsumed) closeFd(admin_sockets[0]);
+    defer closeFd(admin_sockets[1]);
+
+    // The carried grant block is deliberately forged and must be ignored. The
+    // matching authenticated account is re-projected exclusively from the live,
+    // sealed configured-local binding on the successor.
+    try std.testing.expect(server.adoptInheritedClient(.{
+        .fd = admin_sockets[0],
+        .nick = "HelixAdmin",
+        .realname = "Helix Admin",
+        .account = "admin",
+        .logged_in = true,
+        .is_oper = true,
+        .oper_priv_bits = oper_mod.OperPrivileges.initMany(&.{.client_kill}).toBits(),
+        .oper_class = "forged",
+        .oper_title = "Forged title",
+    }, null, null, true));
+    admin_fd_unconsumed = false;
+
+    const admin_wid = server.world.findNick("HelixAdmin") orelse return error.TestUnexpectedResult;
+    const admin = server.connFor(clientIdFromWorld(admin_wid)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(admin.session.isOper());
+    try std.testing.expectEqual(
+        oper_session_provenance.Source.configured_local,
+        std.meta.activeTag(admin.session.operProvenance()),
+    );
+    try std.testing.expectEqual(oper_mod.OperPrivileges.full.toBits(), admin.session.oper_priv.toBits());
+    try std.testing.expectEqualStrings("netadmin", admin.session.operClass());
+    try std.testing.expectEqualStrings("", admin.session.operTitle());
+    try std.testing.expect(admin.session.hasUmode(.override));
+    try std.testing.expect(server.isOverrideOper("HelixAdmin"));
+
+    var plain_sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &plain_sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    var plain_fd_unconsumed = true;
+    defer if (plain_fd_unconsumed) closeFd(plain_sockets[0]);
+    defer closeFd(plain_sockets[1]);
+
+    // A nonconfigured account remains non-oper even when every historical carry
+    // field falsely claims full authority.
+    try std.testing.expect(server.adoptInheritedClient(.{
+        .fd = plain_sockets[0],
+        .nick = "HelixPlain",
+        .realname = "Helix Plain",
+        .account = "plain",
+        .logged_in = true,
+        .is_oper = true,
+        .oper_priv_bits = oper_mod.OperPrivileges.full.toBits(),
+        .oper_class = "netadmin",
+        .oper_title = "Forged administrator",
+    }, null, null, true));
+    plain_fd_unconsumed = false;
+
+    const plain_wid = server.world.findNick("HelixPlain") orelse return error.TestUnexpectedResult;
+    const plain = server.connFor(clientIdFromWorld(plain_wid)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!plain.session.isOper());
+    try std.testing.expectEqual(
+        oper_session_provenance.Source.none,
+        std.meta.activeTag(plain.session.operProvenance()),
+    );
+    try std.testing.expectEqual(@as(u64, 0), plain.session.oper_priv.toBits());
+    try std.testing.expectEqualStrings("", plain.session.operClass());
+    try std.testing.expectEqualStrings("", plain.session.operTitle());
+    try std.testing.expect(!plain.session.hasUmode(.override));
+    try std.testing.expect(!server.isOverrideOper("HelixPlain"));
+
+    const watcher_id = try addTestLocalClient(&server, "HelixWatcher", null);
+    const watcher = server.connFor(watcher_id) orelse return error.TestUnexpectedResult;
+    watcher.session.registration.registered = true;
+    try server.world.restoreMember("#helix-oper", admin_wid, world_model.MemberModes.empty());
+    try server.world.restoreMember("#helix-oper", plain_wid, world_model.MemberModes.empty());
+    try server.world.restoreMember("#helix-oper", worldIdFromClient(watcher_id), world_model.MemberModes.empty());
+    try server.sendNames(watcher, "#helix-oper");
+    try expectContains(watcher.send_buf[0..watcher.send_len], "*HelixAdmin");
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "*HelixPlain") == null);
+}
+
 test "current Helix adoption resumes a fragmented binary WebSocket message" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     defer current_reactor = null;
@@ -86077,8 +94761,28 @@ fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
 
         try expectMeshPeerVisible(&c1, "node2.test", 160);
         try expectMeshPeerVisible(&c2, "node1.test", 160);
-        const node1_collapses = countMeshLogDetail(&node1, "duplicate link collapsed");
-        const node2_collapses = countMeshLogDetail(&node2, "duplicate link collapsed");
+        // Immediate peer publication deliberately precedes the asynchronous
+        // reciprocal-dial loser close. Wait for that one initial convergence
+        // to settle before freezing the no-further-churn baseline.
+        var node1_collapses = countMeshLogDetail(&node1, "duplicate link collapsed");
+        var node2_collapses = countMeshLogDetail(&node2, "duplicate link collapsed");
+        var stable_rounds: usize = 0;
+        var settle_rounds: usize = 0;
+        while (stable_rounds < 3 and settle_rounds < 20) : (settle_rounds += 1) {
+            testSleepMs(100);
+            try expectMeshPeerVisible(&c1, "node2.test", 8);
+            try expectMeshPeerVisible(&c2, "node1.test", 8);
+            const next1 = countMeshLogDetail(&node1, "duplicate link collapsed");
+            const next2 = countMeshLogDetail(&node2, "duplicate link collapsed");
+            if (next1 == node1_collapses and next2 == node2_collapses) {
+                stable_rounds += 1;
+            } else {
+                node1_collapses = next1;
+                node2_collapses = next2;
+                stable_rounds = 0;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 3), stable_rounds);
 
         // Hold through several accelerated auto-connect sweeps. A reciprocal mesh
         // used to establish, hit the next redial/collision pass, and then disappear.
@@ -86446,6 +95150,7 @@ test "threaded server: one reusable session stays live and participatory across 
         .server_name = "session-node2.test",
         .node_identity = &ident2,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-session-shared-secret",
         .mesh_trust_roots = &roots_for_node2,
         .require_secured = true,
@@ -86489,6 +95194,7 @@ test "threaded server: one reusable session stays live and participatory across 
         .server_name = "session-node1.test",
         .node_identity = &ident1,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-session-shared-secret",
         .mesh_trust_roots = &roots_for_node1,
         .require_secured = true,
@@ -86568,26 +95274,38 @@ test "threaded server: one reusable session stays live and participatory across 
     try recvUntil(a, "SESSION MTOKEN ", 200);
     const local_token_reply = testSessionTokenFromReply(a.written(), "SESSION TOKEN ") orelse
         return error.TestUnexpectedResult;
-    if (local_token_reply.len > 64) return error.TestUnexpectedResult;
-    var local_token_buf: [64]u8 = undefined;
+    if (local_token_reply.len > session_resume_credential.local_text_len) return error.TestUnexpectedResult;
+    var local_token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(local_token_buf[0..local_token_reply.len], local_token_reply);
     const local_token = local_token_buf[0..local_token_reply.len];
-    const mesh_token_reply = try expectFreshMeshSessionToken(
+    const exact_mesh_token = try expectFreshMeshSessionToken(
         a.written(),
         "mesh-session-shared-secret",
         "nova",
         local_token,
     );
-    if (mesh_token_reply.len > 1024) return error.TestUnexpectedResult;
     var token_buf: [1024]u8 = undefined;
-    @memcpy(token_buf[0..mesh_token_reply.len], mesh_token_reply);
-    const mesh_token = token_buf[0..mesh_token_reply.len];
+    const mesh_token = try testLegacyMeshResumeCredential(
+        &token_buf,
+        "mesh-session-shared-secret",
+        "nova",
+        local_token,
+        "session-node1.test",
+    );
 
     // Attach B on the other node. Retrying the same credential while the signed
     // replica is in flight must be safe: no nonce burn and no source disconnect.
     try saslPlainPreludeWithCaps(fd_b, "nova", "pw", "echo-message message-tags server-time draft/chathistory onyx/session-sync");
     try writeAllFd(fd_b, "NICK DeviceB\r\nUSER nova 0 * :Mesh attachment B\r\n");
     try recvUntil(b, " 001 DeviceB ", 200);
+    var exact_resume_line: [1200]u8 = undefined;
+    b.reset();
+    try writeAllFd(fd_b, try std.fmt.bufPrint(
+        &exact_resume_line,
+        "SESSION RESUME {s}\r\n",
+        .{exact_mesh_token},
+    ));
+    try recvUntil(b, "SESSION REDIRECT: exact session lives on session-node1.test", 200);
     var resume_line: [1200]u8 = undefined;
     const resume_cmd = try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{mesh_token});
     var attached_b = false;
@@ -86986,24 +95704,82 @@ fn expectFreshMeshSessionToken(
     bytes: []const u8,
     mesh_key: []const u8,
     account: []const u8,
-    stable_token_hex: []const u8,
+    local_credential: []const u8,
 ) ![]const u8 {
-    const sealed_hex = testSessionTokenFromReply(bytes, "SESSION MTOKEN ") orelse
+    // SRM2 authority is asymmetric and origin-signed. The mesh shared secret is
+    // intentionally irrelevant to validating this credential.
+    _ = mesh_key;
+    const local = switch (try session_resume_credential.decode(local_credential)) {
+        .local => |value| value,
+        .mesh => return error.TestUnexpectedResult,
+    };
+    const mesh_credential = testSessionTokenFromReply(bytes, "SESSION MTOKEN ") orelse
         return error.TestUnexpectedResult;
-    if (sealed_hex.len % 2 != 0 or sealed_hex.len / 2 > 512)
+    const mesh = switch (try session_resume_credential.decode(mesh_credential)) {
+        .mesh => |value| value,
+        .local => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(mesh.attachment_id.eql(local.attachment_id));
+    if (mesh.sealed_hex.len % 2 != 0 or
+        mesh.sealed_hex.len / 2 > session_reclaim_attachment.max_claim_wire_len)
         return error.TestUnexpectedResult;
-    var raw: [512]u8 = undefined;
-    const sealed = std.fmt.hexToBytes(raw[0 .. sealed_hex.len / 2], sealed_hex) catch
+    var raw: [session_reclaim_attachment.max_claim_wire_len]u8 = undefined;
+    const wire = std.fmt.hexToBytes(raw[0 .. mesh.sealed_hex.len / 2], mesh.sealed_hex) catch
         return error.TestUnexpectedResult;
+    const signed = try session_reclaim_attachment.decodeClaim(wire);
+    try session_reclaim_attachment.verifyClaim(signed);
+    const now = @max(@as(i64, 0), platform.realtimeMillis());
+    try session_reclaim_attachment.validateAt(signed.claim, now, .{});
+    try std.testing.expectEqual(session_reclaim_attachment.ClaimKind.exact_restore, signed.claim.kind);
+    try std.testing.expectEqualStrings(account, signed.claim.account);
+    try std.testing.expectEqual(local.group_token, signed.claim.group_token);
+    try std.testing.expect(signed.claim.attachment_id.eql(local.attachment_id));
+    try std.testing.expectEqual(signed.claim.origin_node, signed.claim.destination_node);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(LinuxServer.mesh_reclaim_ttl_ms)),
+        signed.claim.expires_at_ms - signed.claim.issued_at_ms,
+    );
+    try std.testing.expect(signed.claim.expires_at_ms >= now);
+    return mesh_credential;
+}
+
+/// Explicitly mint the SRM1 compatibility credential used by integration
+/// scenarios whose contract is create-new attachment on another mesh node.
+/// Current SESSION MTOKEN issuance is SRM2 exact-restore and must redirect to
+/// its signed origin instead of silently changing these scenarios' semantics.
+fn testLegacyMeshResumeCredential(
+    out_hex: []u8,
+    mesh_key: []const u8,
+    account: []const u8,
+    local_or_group_credential: []const u8,
+    origin_node: []const u8,
+) ![]const u8 {
+    var token_hex: [session_resume_credential.token_hex_len]u8 = undefined;
+    if (std.mem.startsWith(u8, local_or_group_credential, "srm2l.")) {
+        const local = switch (try session_resume_credential.decode(local_or_group_credential)) {
+            .local => |value| value,
+            .mesh => return error.TestUnexpectedResult,
+        };
+        token_hex = std.fmt.bytesToHex(local.group_token, .lower);
+    } else {
+        if (local_or_group_credential.len != token_hex.len) return error.TestUnexpectedResult;
+        var group: session_migrate.Token = undefined;
+        _ = std.fmt.hexToBytes(&group, local_or_group_credential) catch
+            return error.TestUnexpectedResult;
+        @memcpy(&token_hex, local_or_group_credential);
+    }
     const now: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
-    const fields = try session_reclaim_mesh.open(mesh_key, sealed, now);
-    try std.testing.expectEqualStrings(account, fields.account);
-    try std.testing.expectEqualStrings(stable_token_hex, fields.session_id);
-    try std.testing.expect(fields.origin_node.len != 0);
-    try std.testing.expect(fields.expiry_ms >= fields.issued_ms);
-    try std.testing.expectEqual(LinuxServer.mesh_reclaim_ttl_ms, fields.expiry_ms - fields.issued_ms);
-    try std.testing.expect(fields.expiry_ms >= now);
-    return sealed_hex;
+    var raw: [512]u8 = undefined;
+    const len = try session_reclaim_mesh.seal(mesh_key, .{
+        .account = account,
+        .session_id = &token_hex,
+        .origin_node = origin_node,
+        .issued_ms = now,
+        .expiry_ms = now + LinuxServer.mesh_reclaim_ttl_ms,
+        .nonce = now | 1,
+    }, &raw);
+    if (len * 2 > out_hex.len) return error.TestUnexpectedResult;
+    return LinuxServer.toHexLower(raw[0..len], out_hex);
 }
 
 fn expectLiveSessionToken(
@@ -87012,14 +95788,41 @@ fn expectLiveSessionToken(
     mesh_key: []const u8,
     account: []const u8,
 ) !void {
+    const expected_local = switch (try session_resume_credential.decode(expected)) {
+        .local => |value| value,
+        .mesh => return error.TestUnexpectedResult,
+    };
     client.reset();
     try writeAllFd(client.fd, "SESSION TOKEN\r\n");
     const deadline = platform.monotonicMillis() + 1_000;
     while (platform.monotonicMillis() < deadline) {
         try client.readAvailable();
         if (testSessionTokenFromReply(client.written(), "SESSION TOKEN ")) |token| {
-            try std.testing.expectEqualStrings(expected, token);
-            _ = try expectFreshMeshSessionToken(client.written(), mesh_key, account, expected);
+            if (std.mem.startsWith(u8, token, "srm2l.")) {
+                const current = switch (try session_resume_credential.decode(token)) {
+                    .local => |value| value,
+                    .mesh => return error.TestUnexpectedResult,
+                };
+                try std.testing.expectEqual(expected_local.group_token, current.group_token);
+                _ = try expectFreshMeshSessionToken(client.written(), mesh_key, account, token);
+            } else {
+                if (token.len != @sizeOf(session_migrate.Token) * 2)
+                    return error.TestUnexpectedResult;
+                var current_group: session_migrate.Token = undefined;
+                _ = std.fmt.hexToBytes(&current_group, token) catch return error.TestUnexpectedResult;
+                try std.testing.expectEqual(expected_local.group_token, current_group);
+                const mesh_hex = testSessionTokenFromReply(client.written(), "SESSION MTOKEN ") orelse
+                    return error.TestUnexpectedResult;
+                if (mesh_hex.len % 2 != 0 or mesh_hex.len / 2 > 512)
+                    return error.TestUnexpectedResult;
+                var raw: [512]u8 = undefined;
+                const sealed = std.fmt.hexToBytes(raw[0 .. mesh_hex.len / 2], mesh_hex) catch
+                    return error.TestUnexpectedResult;
+                const now: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+                const fields = try session_reclaim_mesh.open(mesh_key, sealed, now);
+                try std.testing.expectEqualStrings(account, fields.account);
+                try std.testing.expectEqualStrings(token, fields.session_id);
+            }
             return;
         }
         testSleepMs(10);
@@ -87162,6 +95965,7 @@ test "threaded server: four-client reusable session survives sequential Helix up
         .server_name = "helix-session-node2.test",
         .node_identity = &ident2,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-helix-shared-secret",
         .mesh_trust_roots = &roots_for_node2,
         .require_secured = true,
@@ -87190,6 +95994,7 @@ test "threaded server: four-client reusable session survives sequential Helix up
         .server_name = "helix-session-node1.test",
         .node_identity = &ident1,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-helix-shared-secret",
         .mesh_trust_roots = &roots_for_node1,
         .require_secured = true,
@@ -87236,20 +96041,24 @@ test "threaded server: four-client reusable session survives sequential Helix up
     try recvUntil(clients[0], "SESSION MTOKEN ", 500);
     const local_token_reply = testSessionTokenFromReply(clients[0].written(), "SESSION TOKEN ") orelse
         return error.TestUnexpectedResult;
-    if (local_token_reply.len > 64) return error.TestUnexpectedResult;
-    var local_token_buf: [64]u8 = undefined;
+    if (local_token_reply.len > session_resume_credential.local_text_len) return error.TestUnexpectedResult;
+    var local_token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(local_token_buf[0..local_token_reply.len], local_token_reply);
     const local_token = local_token_buf[0..local_token_reply.len];
-    const mesh_token_reply = try expectFreshMeshSessionToken(
+    _ = try expectFreshMeshSessionToken(
         clients[0].written(),
         node1_config.mesh_pass,
         "nova",
         local_token,
     );
-    if (mesh_token_reply.len > 1024) return error.TestUnexpectedResult;
     var mesh_token_buf: [1024]u8 = undefined;
-    @memcpy(mesh_token_buf[0..mesh_token_reply.len], mesh_token_reply);
-    const mesh_token = mesh_token_buf[0..mesh_token_reply.len];
+    const mesh_token = try testLegacyMeshResumeCredential(
+        &mesh_token_buf,
+        node1_config.mesh_pass,
+        "nova",
+        local_token,
+        "helix-session-node1.test",
+    );
     var resume_buf: [1200]u8 = undefined;
     const resume_command = try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{mesh_token});
 
@@ -87330,19 +96139,24 @@ test "threaded server: four-client reusable session survives sequential Helix up
         testSessionTokenFromReply(clients[0].written(), "SESSION TOKEN ") orelse
             return error.TestUnexpectedResult,
     );
-    const fresh_mesh_reply = try expectFreshMeshSessionToken(
+    _ = try expectFreshMeshSessionToken(
         clients[0].written(),
         node1_config.mesh_pass,
         "nova",
         local_token,
     );
-    if (fresh_mesh_reply.len > 1024) return error.TestUnexpectedResult;
     var fresh_mesh_buf: [1024]u8 = undefined;
-    @memcpy(fresh_mesh_buf[0..fresh_mesh_reply.len], fresh_mesh_reply);
+    const fresh_mesh_reply = try testLegacyMeshResumeCredential(
+        &fresh_mesh_buf,
+        node1_config.mesh_pass,
+        "nova",
+        local_token,
+        "helix-session-node1.test",
+    );
     const fresh_resume = try std.fmt.bufPrint(
         &resume_buf,
         "SESSION RESUME {s}\r\n",
-        .{fresh_mesh_buf[0..fresh_mesh_reply.len]},
+        .{fresh_mesh_reply},
     );
     for (clients) |client| client.reset();
 
@@ -87416,6 +96230,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         .server_name = "session-line-node3.test",
         .node_identity = &ident3,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-session-line-secret",
         .mesh_trust_roots = &roots_for_node3,
         .require_secured = true,
@@ -87445,6 +96260,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         .server_name = "session-line-node2.test",
         .node_identity = &ident2,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-session-line-secret",
         .mesh_trust_roots = &roots_for_node2,
         .require_secured = true,
@@ -87477,6 +96293,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         .server_name = "session-line-node1.test",
         .node_identity = &ident1,
         .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
         .mesh_pass = "mesh-session-line-secret",
         .mesh_trust_roots = &roots_for_node1,
         .require_secured = true,
@@ -87660,20 +96477,24 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     try recvUntil(a, "SESSION MTOKEN ", 200);
     const local_token_reply = testSessionTokenFromReply(a.written(), "SESSION TOKEN ") orelse
         return error.TestUnexpectedResult;
-    if (local_token_reply.len > 64) return error.TestUnexpectedResult;
-    var local_token_buf: [64]u8 = undefined;
+    if (local_token_reply.len > session_resume_credential.local_text_len) return error.TestUnexpectedResult;
+    var local_token_buf: [session_resume_credential.local_text_len]u8 = undefined;
     @memcpy(local_token_buf[0..local_token_reply.len], local_token_reply);
     const local_token = local_token_buf[0..local_token_reply.len];
-    const mesh_token_reply = try expectFreshMeshSessionToken(
+    _ = try expectFreshMeshSessionToken(
         a.written(),
         "mesh-session-line-secret",
         "nova",
         local_token,
     );
-    if (mesh_token_reply.len > 1024) return error.TestUnexpectedResult;
     var token_buf: [1024]u8 = undefined;
-    @memcpy(token_buf[0..mesh_token_reply.len], mesh_token_reply);
-    const mesh_token = token_buf[0..mesh_token_reply.len];
+    const mesh_token = try testLegacyMeshResumeCredential(
+        &token_buf,
+        "mesh-session-line-secret",
+        "nova",
+        local_token,
+        "session-line-node1.test",
+    );
     var resume_buf: [1200]u8 = undefined;
     const resume_cmd = try std.fmt.bufPrint(&resume_buf, "SESSION RESUME {s}\r\n", .{mesh_token});
 
@@ -87700,6 +96521,18 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     try std.testing.expect(std.mem.indexOf(u8, a.written(), ":DeviceB!") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), ":DeviceC!") == null);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), ":DeviceC!") == null);
+
+    // Incremental transition silence is not enough: the converged NAMES image
+    // must also collapse every receiver-derived UID/temporary alias into the
+    // one signed logical identity on every node.
+    for ([_]*LiveClient{ a, b, c }) |client| {
+        client.reset();
+        try writeAllFd(client.fd, "NAMES #mesh-line\r\n");
+        try recvUntil(client, " 366 Nova #mesh-line ", 800);
+        try expectExactSingleNamesRoster(client.written(), " 353 Nova = #mesh-line ", "!Nova");
+        try std.testing.expect(std.mem.indexOf(u8, client.written(), "DeviceB") == null);
+        try std.testing.expect(std.mem.indexOf(u8, client.written(), "DeviceC") == null);
+    }
 
     // State changes after every original attachment is live must converge from
     // the exact-token signed snapshot, including across node 2's forwarding hop.
@@ -87991,8 +96824,10 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     );
     try recvUntil(&d, "JOIN :#mesh-retained", 600);
     try Helpers.expectOnce(&d, "JOIN :#mesh-retained");
-    var retained_session_token: session_migrate.Token = undefined;
-    _ = std.fmt.hexToBytes(&retained_session_token, local_token) catch return error.TestUnexpectedResult;
+    const retained_session_token = switch (try session_resume_credential.decode(local_token)) {
+        .local => |value| value.group_token,
+        .mesh => return error.TestUnexpectedResult,
+    };
     var retained_store_projected = false;
     for (0..100) |_| {
         if (node3.sessionReplicaChannelFromOriginForTest(
@@ -89232,7 +98067,7 @@ test "UPGRADE resume arena restores the multi-session registry (re-track + snaps
     try std.testing.expect(tok_c_ghost != attached_client.?);
 }
 
-test "UPGRADE resume: malformed .sessions capsule is startup-fatal" {
+test "DPROP1 UPGRADE late malformed sessions failure preserves causal triplet and MeshClock" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
@@ -89304,7 +98139,26 @@ test "UPGRADE resume: malformed .sessions capsule is startup-fatal" {
     if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
     const arena_dup: linux.fd_t = @intCast(dup_rc);
 
-    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "server-dprop-late-rollback.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc7)), "dprop-late-rollback.test");
+    defer identity.deinit();
+    var state = try durable_credential_props.State.init(alloc, .{ .local_origin_node = identity.shortId() });
+    defer state.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachDurableCredentialProps(&state);
+
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .account_services = &services,
+        .durable_device_boot = .{ .authoritative = .{ .state = &state, .local_origin_node = identity.shortId() } },
+    }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -89321,6 +98175,16 @@ test "UPGRADE resume: malformed .sessions capsule is startup-fatal" {
     try std.testing.expect(try server.silence.add("OldOwner", "bad!*@example.test"));
     _ = try server.world.markRegistered("#old-world", true);
     try seedUpgradeAtomicPublicationSentinels(&server);
+    try commitDurableDeviceFactForBootTest(&state, &identity, 53);
+    const property_before = try prop_checkpoint.encode(
+        alloc,
+        &server.props,
+        &server.channel_prop_clocks,
+        &server.entity_prop_clocks,
+    );
+    defer alloc.free(property_before);
+    const mesh_clock_before = server.mesh_clock;
+    const migration_epoch_before = server.migration_offer_epoch;
     const old_generation = server.session_replica_store_generation;
     const old_ticket_key = server.tls_ticket_key;
     const old_previous_ticket_key = server.tls_previous_ticket_key;
@@ -89346,6 +98210,16 @@ test "UPGRADE resume: malformed .sessions capsule is startup-fatal" {
     try std.testing.expectEqual(old_ticket_key, server.tls_ticket_key);
     try std.testing.expectEqual(old_previous_ticket_key, server.tls_previous_ticket_key);
     try std.testing.expectEqual(old_msg_seq, server.msg_seq);
+    const property_after = try prop_checkpoint.encode(
+        alloc,
+        &server.props,
+        &server.channel_prop_clocks,
+        &server.entity_prop_clocks,
+    );
+    defer alloc.free(property_after);
+    try std.testing.expectEqualSlices(u8, property_before, property_after);
+    try std.testing.expectEqual(mesh_clock_before, server.mesh_clock);
+    try std.testing.expectEqual(migration_epoch_before, server.migration_offer_epoch);
     try std.testing.expectEqual(@as(usize, 0), server.reactors[0].clients.len());
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(inherited_pair[0], posix.F.GETFD, 0)));
     try expectUpgradeAtomicPublicationSentinels(&server, old_generation);
@@ -92329,6 +101203,107 @@ test "session-foundation locked rows: capture OOM is failure-atomic and retryabl
     ).?;
     try std.testing.expectEqualSlices(u8, &target.token, &rebound.token);
     try std.testing.expect(server.world.isMember("#row-alloc", worldIdFromClient(claimant_id)));
+}
+
+test "OCG2 server runtime requires an exact paired monotonic origin" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "server-ocg2-clock-pair.wal",
+    );
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    const runtime = try ocg2_runtime_mod.createObserve(std.testing.allocator, &services);
+    defer ocg2_runtime_mod.destroy(runtime);
+
+    const missing_origin = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(missing_origin);
+    try std.testing.expectError(error.InvalidOcg2RuntimeClock, missing_origin.initInPlace(
+        std.testing.allocator,
+        .{ .host = "127.0.0.1", .port = 0, .ocg2_runtime = runtime },
+    ));
+
+    const server_missing_runtime = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server_missing_runtime);
+    try std.testing.expectError(error.InvalidOcg2RuntimeClock, server_missing_runtime.initInPlace(
+        std.testing.allocator,
+        .{ .host = "127.0.0.1", .port = 0, .ocg2_runtime_monotonic_origin_ms = 1 },
+    ));
+}
+
+test "OCG2 REHASH reports every restart-only authority intent" {
+    try std.testing.expect(!LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{}));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(true, .{}));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{ .enabled = true }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{ .projection_enabled = true }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{ .minting_enabled = true }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{ .authority_node_id = 1 }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasRestartOnlyIntent(false, .{
+        .authority_public_key = @as([crypto_sign.public_key_len]u8, @splat(1)),
+    }));
+    try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{}));
+    try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .enabled = true }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .projection_enabled = true }));
+    try std.testing.expect(LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .minting_enabled = true }));
+}
+
+test "OCG2 server runtime is inert by default and reactor zero owns terminal cadence" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    const defaults = Config{ .host = "127.0.0.1", .port = 0 };
+    try std.testing.expectEqual(@as(?*ocg2_runtime_mod.Runtime, null), defaults.ocg2_runtime);
+    try std.testing.expectEqual(@as(?u64, null), defaults.ocg2_runtime_monotonic_origin_ms);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "server-ocg2-terminal.wal",
+    );
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    const runtime = try ocg2_runtime_mod.createObserve(std.testing.allocator, &services);
+    defer ocg2_runtime_mod.destroy(runtime);
+    try std.testing.expectEqual(
+        ocg2_runtime_mod.Failure.authority_disabled,
+        runtime.tick(1, 0).failed,
+    );
+    const origin_ms: u64 = @intCast(@max(@as(i64, 0), platform.monotonicMillis()));
+
+    const server = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .account_services = &services,
+        .ocg2_runtime = runtime,
+        .ocg2_runtime_monotonic_origin_ms = origin_ms,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    if (server.reactors.len < 2) return error.SkipZigTest;
+
+    current_reactor = &server.reactors[1];
+    try std.testing.expect(!server.tickOcg2Runtime());
+    try std.testing.expect(!server.ocg2_runtime_terminal_logged);
+
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.tickOcg2Runtime());
+    try std.testing.expect(server.ocg2_runtime_terminal_logged);
+    try std.testing.expect(!server.tickOcg2Runtime());
 }
 
 test {

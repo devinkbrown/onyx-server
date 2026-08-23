@@ -6,7 +6,12 @@
 //! PRPS payload remains an opaque, length-delimited PropStore checkpoint.
 
 const std = @import("std");
+const sign = @import("../../crypto/sign.zig");
+const durable_credential_props = @import("../durable_credential_props.zig");
+const key_transparency = @import("../key_transparency.zig");
+const account_identity = @import("../../proto/account_identity.zig");
 const channel_prop_event = @import("../../proto/channel_prop_event.zig");
+const e2ee_policy = @import("../../proto/e2ee_policy.zig");
 const entity_prop_event = @import("../../proto/entity_prop_event.zig");
 const ircx_prop_store = @import("../../proto/ircx_prop_store.zig");
 
@@ -26,6 +31,10 @@ pub const Error = std.mem.Allocator.Error || error{
     DuplicateClock,
     NonCanonicalOrder,
     InvalidPropStore,
+    InvalidDurableFact,
+    DurableOriginMismatch,
+    DurableOwnerMismatch,
+    DurableStateMismatch,
     HlcExhausted,
 };
 
@@ -360,6 +369,287 @@ pub fn maxClockHlc(
         maximum = @max(maximum, clock.hlc);
     }
     return maximum;
+}
+
+/// Build the complete PROP successor image used when DPROP1 becomes the sole
+/// authority for user device credentials. The input triplet remains borrowed
+/// and byte-for-byte untouched on every success and failure path.
+pub fn buildDurableDeviceCandidate(
+    allocator: std.mem.Allocator,
+    base_props: *const DefaultStore,
+    base_channel_clocks: *const ChannelClockMap,
+    base_entity_clocks: *const EntityClockMap,
+    dprop: ?*const durable_credential_props.State,
+    expected_local_origin: ?u64,
+    expected_local_pubkey: ?[entity_prop_event.pubkey_len]u8,
+) Error!Restored {
+    try validateDurableState(allocator, dprop, expected_local_origin);
+
+    const prop_image = base_props.encodeCheckpoint(allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPropStore,
+    };
+    defer allocator.free(prop_image);
+    var candidate_props: ?DefaultStore = DefaultStore.decodeCheckpoint(allocator, prop_image) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPropStore,
+    };
+    errdefer if (candidate_props) |*props| props.deinit();
+
+    {
+        var purge = candidate_props.?.prepareGlobalDevicePropPurge() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.LimitReached => return error.CapacityExceeded,
+            else => return error.InvalidPropStore,
+        };
+        defer purge.deinit();
+        _ = purge.commit();
+    }
+    {
+        var purge = candidate_props.?.prepareGlobalIdentityPropPurge() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.LimitReached => return error.CapacityExceeded,
+            else => return error.InvalidPropStore,
+        };
+        defer purge.deinit();
+        _ = purge.commit();
+    }
+
+    if (dprop) |state| {
+        var index: usize = 0;
+        while (index < state.count()) : (index += 1) {
+            const fact = state.factAt(index) orelse return error.DurableStateMismatch;
+            if (!fact.present) continue;
+            _ = candidate_props.?.setPropAllocationAware(
+                .{ .kind = .user, .id = fact.entity },
+                fact.key,
+                fact.value,
+                .{ .id = fact.entity, .access = .user },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.LimitReached => return error.CapacityExceeded,
+                else => return error.InvalidPropStore,
+            };
+        }
+    }
+
+    var restored = Restored{ .allocator = allocator, .props = candidate_props.? };
+    candidate_props = null;
+    errdefer restored.deinit();
+
+    try restored.channel_clocks.ensureTotalCapacity(allocator, base_channel_clocks.count());
+    var channel_it = base_channel_clocks.iterator();
+    while (channel_it.next()) |entry| {
+        try validateChannelClock(entry.value_ptr);
+        var expected_key_buf: [channel_prop_event.max_channel_len + 1 + channel_prop_event.max_key_len]u8 = undefined;
+        const expected_key = writeChannelClockKey(
+            &expected_key_buf,
+            entry.value_ptr.channel,
+            entry.value_ptr.key,
+        ) orelse return error.InvalidField;
+        if (!std.mem.eql(u8, entry.key_ptr.*, expected_key)) return error.InvalidMapKey;
+        var owned = try cloneChannelClock(allocator, entry.key_ptr.*, entry.value_ptr);
+        restored.channel_clocks.putAssumeCapacityNoClobber(owned.map_key, owned.clock);
+        owned = undefined;
+    }
+
+    var preserved_entity_count: usize = 0;
+    var entity_validation_it = base_entity_clocks.iterator();
+    while (entity_validation_it.next()) |entry| {
+        try validateEntityClock(entry.value_ptr);
+        var expected_key_buf: [1 + entity_prop_event.max_entity_len + 1 + entity_prop_event.max_key_len]u8 = undefined;
+        const expected_key = writeEntityClockKey(
+            &expected_key_buf,
+            entry.value_ptr.kind,
+            entry.value_ptr.entity,
+            entry.value_ptr.key,
+        ) orelse return error.InvalidField;
+        if (!std.mem.eql(u8, entry.key_ptr.*, expected_key)) return error.InvalidMapKey;
+        const preserve_identity = try preserveLocalIdentityClock(
+            allocator,
+            base_props,
+            entry.value_ptr,
+            expected_local_origin,
+            expected_local_pubkey,
+        );
+        if (!isUserDeviceClock(entry.value_ptr) and
+            (!isUserIdentityClock(entry.value_ptr) or preserve_identity))
+            preserved_entity_count = std.math.add(usize, preserved_entity_count, 1) catch
+                return error.CapacityExceeded;
+    }
+    const durable_count = if (dprop) |state| state.count() else 0;
+    const entity_capacity = std.math.add(usize, preserved_entity_count, durable_count) catch
+        return error.CapacityExceeded;
+    if (entity_capacity > std.math.maxInt(u32)) return error.CapacityExceeded;
+    try restored.entity_clocks.ensureTotalCapacity(allocator, @intCast(entity_capacity));
+
+    var entity_it = base_entity_clocks.iterator();
+    while (entity_it.next()) |entry| {
+        if (isUserDeviceClock(entry.value_ptr)) continue;
+        if (isUserIdentityClock(entry.value_ptr)) {
+            if (!try preserveLocalIdentityClock(allocator, base_props, entry.value_ptr, expected_local_origin, expected_local_pubkey)) continue;
+            if (entry.value_ptr.present) {
+                const row = base_props.getPropRaw(
+                    .{ .kind = .user, .id = entry.value_ptr.entity },
+                    entry.value_ptr.key,
+                ) catch continue;
+                _ = restored.props.setPropAllocationAware(
+                    row.entity,
+                    row.key,
+                    row.value,
+                    .{ .id = row.owner, .access = row.access },
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.LimitReached => return error.CapacityExceeded,
+                    else => return error.InvalidPropStore,
+                };
+            }
+        }
+        var owned = try cloneEntityClock(allocator, entry.key_ptr.*, entry.value_ptr);
+        restored.entity_clocks.putAssumeCapacityNoClobber(owned.map_key, owned.clock);
+        owned = undefined;
+    }
+
+    if (dprop) |state| {
+        var index: usize = 0;
+        while (index < state.count()) : (index += 1) {
+            const fact = state.factAt(index) orelse return error.DurableStateMismatch;
+            const borrowed = EntityClock{
+                .kind = .user,
+                .entity = @constCast(fact.entity),
+                .key = @constCast(fact.key),
+                .owner = @constCast(fact.owner),
+                .hlc = fact.hlc,
+                .present = fact.present,
+                .origin_node = fact.origin_node,
+                .origin_pubkey = @constCast(fact.origin_pubkey),
+                .origin_sig = @constCast(fact.origin_sig),
+            };
+            var map_key_buf: [1 + entity_prop_event.max_entity_len + 1 + entity_prop_event.max_key_len]u8 = undefined;
+            const map_key = writeEntityClockKey(&map_key_buf, .user, fact.entity, fact.key) orelse
+                return error.InvalidDurableFact;
+            if (restored.entity_clocks.contains(map_key)) return error.DurableStateMismatch;
+            var owned = try cloneEntityClock(allocator, map_key, &borrowed);
+            restored.entity_clocks.putAssumeCapacityNoClobber(owned.map_key, owned.clock);
+            owned = undefined;
+        }
+    }
+
+    restored.max_hlc = try maxClockHlc(&restored.channel_clocks, &restored.entity_clocks);
+    return restored;
+}
+
+fn validateDurableState(
+    allocator: std.mem.Allocator,
+    dprop: ?*const durable_credential_props.State,
+    expected_local_origin: ?u64,
+) Error!void {
+    const state = dprop orelse return;
+    const expected_origin = expected_local_origin orelse return error.DurableOriginMismatch;
+    if (expected_origin == 0) return error.DurableOriginMismatch;
+    if (state.localOriginNode() != expected_origin) return error.DurableOriginMismatch;
+
+    var observed_max: u64 = 0;
+    var previous: ?durable_credential_props.FactView = null;
+    var index: usize = 0;
+    while (index < state.count()) : (index += 1) {
+        const fact = state.factAt(index) orelse return error.DurableStateMismatch;
+        if (fact.origin_node != expected_origin) return error.DurableOriginMismatch;
+        if (!std.mem.eql(u8, fact.owner, fact.entity)) return error.DurableOwnerMismatch;
+        if (fact.hlc == 0 or fact.hlc == std.math.maxInt(u64)) return error.InvalidDurableFact;
+        key_transparency.validateAccount(fact.entity) catch return error.InvalidDurableFact;
+        if (!e2ee_policy.isDevicePropKey(fact.key)) return error.InvalidDurableFact;
+        if (!fact.present and fact.value.len != 0) return error.InvalidDurableFact;
+        if (fact.present) try validateDurableValue(fact.key, fact.value);
+        if (fact.origin_pubkey.len != entity_prop_event.pubkey_len or
+            fact.origin_sig.len != entity_prop_event.sig_len) return error.InvalidDurableFact;
+        if (try entity_prop_event.verifyOrigin(allocator, fact.event()) != .verified)
+            return error.InvalidDurableFact;
+        if (previous) |prior| {
+            const entity_order = std.mem.order(u8, prior.entity, fact.entity);
+            if (entity_order == .gt or
+                (entity_order == .eq and std.mem.order(u8, prior.key, fact.key) != .lt))
+                return error.DurableStateMismatch;
+        }
+        previous = fact;
+        observed_max = @max(observed_max, fact.hlc);
+    }
+    if (state.factAt(state.count()) != null or observed_max != state.maxHlc())
+        return error.DurableStateMismatch;
+}
+
+fn validateDurableValue(key: []const u8, value: []const u8) Error!void {
+    const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidDurableFact;
+    if (separator == 0 or separator + 1 >= value.len) return error.InvalidDurableFact;
+    const algorithm = value[0..separator];
+    const public_key = value[separator + 1 ..];
+    e2ee_policy.validateStoredAdvertisement(
+        key[e2ee_policy.device_prop_prefix.len..],
+        algorithm,
+        public_key,
+    ) catch return error.InvalidDurableFact;
+    var canonical_buf: [e2ee_policy.max_device_value_len]u8 = undefined;
+    const canonical = e2ee_policy.deviceValue(algorithm, public_key, &canonical_buf) orelse
+        return error.InvalidDurableFact;
+    if (!std.mem.eql(u8, canonical, value)) return error.InvalidDurableFact;
+}
+
+fn isUserDeviceClock(clock: *const EntityClock) bool {
+    return clock.kind == .user and startsWithAsciiFold(clock.key, e2ee_policy.device_prop_prefix);
+}
+
+fn isUserIdentityClock(clock: *const EntityClock) bool {
+    return clock.kind == .user and account_identity.isReservedNamespace(clock.key);
+}
+
+fn preserveLocalIdentityClock(
+    allocator: std.mem.Allocator,
+    base_props: *const DefaultStore,
+    clock: *const EntityClock,
+    expected_local_origin: ?u64,
+    expected_local_pubkey: ?[entity_prop_event.pubkey_len]u8,
+) Error!bool {
+    if (!isUserIdentityClock(clock)) return false;
+    const expected = expected_local_origin orelse return false;
+    const expected_pubkey = expected_local_pubkey orelse return false;
+    if (expected == 0 or clock.origin_node != expected or
+        !std.mem.eql(u8, clock.owner, clock.entity)) return false;
+    if (!std.mem.eql(u8, clock.origin_pubkey, &expected_pubkey)) return false;
+    if (!account_identity.isPropKey(clock.key) and
+        !account_identity.isResidencePropKey(clock.key)) return false;
+    var value: []const u8 = "";
+    if (clock.present) {
+        const row = base_props.getPropRaw(
+            .{ .kind = .user, .id = clock.entity },
+            clock.key,
+        ) catch return false;
+        if (!std.mem.eql(u8, row.key, clock.key) or
+            !std.mem.eql(u8, row.owner, clock.owner)) return false;
+        value = row.value;
+    }
+    const event = entity_prop_event.EntityPropEvent{
+        .present = clock.present,
+        .kind = .user,
+        .origin_node = clock.origin_node,
+        .hlc = clock.hlc,
+        .entity = clock.entity,
+        .key = clock.key,
+        .value = value,
+        .owner = clock.owner,
+        .origin_pubkey = clock.origin_pubkey,
+        .origin_sig = clock.origin_sig,
+    };
+    return (entity_prop_event.verifyOrigin(allocator, event) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    }) == .verified;
+}
+
+fn startsWithAsciiFold(value: []const u8, lowercase_prefix: []const u8) bool {
+    if (value.len < lowercase_prefix.len) return false;
+    for (value[0..lowercase_prefix.len], lowercase_prefix) |byte, expected| {
+        if (std.ascii.toLower(byte) != expected) return false;
+    }
+    return true;
 }
 
 pub fn writeChannelClockKey(out: []u8, channel: []const u8, key: []const u8) ?[]const u8 {
@@ -716,6 +1006,47 @@ fn testPutEntityClock(
     var owned = try cloneEntityClock(allocator, map_key, &borrowed);
     map.putAssumeCapacityNoClobber(owned.map_key, owned.clock);
     owned = undefined;
+}
+
+fn testPutSignedEntityClock(
+    allocator: std.mem.Allocator,
+    map: *EntityClockMap,
+    kp: *const sign.KeyPair,
+    entity: []const u8,
+    key: []const u8,
+    owner: []const u8,
+    value: []const u8,
+    hlc: u64,
+    present: bool,
+) !void {
+    var event = entity_prop_event.EntityPropEvent{
+        .present = present,
+        .kind = .user,
+        .origin_node = entity_prop_event.originShortId(kp.public_key),
+        .hlc = hlc,
+        .entity = entity,
+        .key = key,
+        .value = value,
+        .owner = owner,
+    };
+    const transcript = try entity_prop_event.originTranscript(allocator, event);
+    defer allocator.free(transcript);
+    var pubkey: [entity_prop_event.pubkey_len]u8 = undefined;
+    var signature: [entity_prop_event.sig_len]u8 = undefined;
+    try entity_prop_event.signInPlace(&event, kp, transcript, &pubkey, &signature);
+    try testPutEntityClock(
+        allocator,
+        map,
+        .user,
+        entity,
+        key,
+        owner,
+        hlc,
+        present,
+        event.origin_node,
+        event.origin_pubkey,
+        event.origin_sig,
+    );
 }
 
 fn testDeinitChannelMap(allocator: std.mem.Allocator, map: *ChannelClockMap) void {
@@ -1217,4 +1548,380 @@ test "Helix PROP checkpoint encode and decode exhaust allocation failures" {
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, DecodeSweep.run, .{checkpoint});
+}
+
+fn testCommitDurableFact(
+    state: *durable_credential_props.State,
+    seed_byte: u8,
+    entity: []const u8,
+    key: []const u8,
+    owner: []const u8,
+    hlc: u64,
+    present: bool,
+    value: []const u8,
+) !void {
+    var kp = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(seed_byte)));
+    defer kp.deinit();
+    var event = entity_prop_event.EntityPropEvent{
+        .present = present,
+        .kind = .user,
+        .origin_node = entity_prop_event.originShortId(kp.public_key),
+        .hlc = hlc,
+        .entity = entity,
+        .key = key,
+        .value = value,
+        .owner = owner,
+    };
+    const transcript = try entity_prop_event.originTranscript(std.testing.allocator, event);
+    defer std.testing.allocator.free(transcript);
+    var pubkey: [entity_prop_event.pubkey_len]u8 = undefined;
+    var signature: [entity_prop_event.sig_len]u8 = undefined;
+    try entity_prop_event.signInPlace(&event, &kp, transcript, &pubkey, &signature);
+    var outcome = try state.prepare(event);
+    switch (outcome) {
+        .update => |*update| {
+            defer update.deinit();
+            update.commitInto(state);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn testOriginForSeed(seed_byte: u8) !u64 {
+    var kp = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(seed_byte)));
+    defer kp.deinit();
+    return entity_prop_event.originShortId(kp.public_key);
+}
+
+test "Helix PROP durable candidate purges legacy devices and overlays facts atomically" {
+    const testing = std.testing;
+    const origin = try testOriginForSeed(0x6a);
+    var dprop = try durable_credential_props.State.init(testing.allocator, .{ .local_origin_node = origin });
+    defer dprop.deinit();
+    try testCommitDurableFact(
+        &dprop,
+        0x6a,
+        "alice",
+        "e2ee.device.phone",
+        "alice",
+        30,
+        true,
+        "mls-x25519:abcd+/=",
+    );
+    try testCommitDurableFact(
+        &dprop,
+        0x6a,
+        "bob",
+        "e2ee.device.retired",
+        "bob",
+        35,
+        false,
+        "",
+    );
+
+    var props = DefaultStore.init(testing.allocator);
+    defer props.deinit();
+    _ = try props.setProp(.{ .kind = .user, .id = "alice" }, "E2EE.Device.legacy", "mls-x25519:old+/=", .{ .id = "alice", .access = .user });
+    _ = try props.setProp(.{ .kind = .user, .id = "alice" }, "BIO", "preserve me", .{ .id = "alice", .access = .user });
+    _ = try props.setProp(.{ .kind = .member, .id = "#room:alice" }, "e2ee.device.member", "member value", .{ .id = "alice", .access = .member });
+
+    var channels: ChannelClockMap = .empty;
+    defer testDeinitChannelMap(testing.allocator, &channels);
+    try testPutChannelClock(testing.allocator, &channels, "#room", "TOPIC", "host", 40, true, 9, "", "");
+    var entities: EntityClockMap = .empty;
+    defer testDeinitEntityMap(testing.allocator, &entities);
+    try testPutEntityClock(testing.allocator, &entities, .user, "alice", "E2EE.Device.legacy", "alice", 99, true, 9, "", "");
+    try testPutEntityClock(testing.allocator, &entities, .user, "alice", "E2EE.Device.BAD ID", "alice", 98, true, 9, "", "");
+    try testPutEntityClock(testing.allocator, &entities, .user, "alice", "e2ee.deviceX.keep", "alice", 60, true, 9, "", "");
+    try testPutEntityClock(testing.allocator, &entities, .user, "alice", "BIO", "alice", 45, true, 9, "", "");
+    try testPutEntityClock(testing.allocator, &entities, .member, "#room:alice", "e2ee.device.member", "alice", 50, true, 9, "", "");
+
+    const base_props_before = try props.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(base_props_before);
+    var candidate = try buildDurableDeviceCandidate(
+        testing.allocator,
+        &props,
+        &channels,
+        &entities,
+        &dprop,
+        origin,
+        null,
+    );
+    defer candidate.deinit();
+
+    const alice = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    try testing.expectError(error.PropMissing, candidate.props.getPropRaw(alice, "e2ee.device.legacy"));
+    const phone = try candidate.props.getPropRaw(alice, "e2ee.device.phone");
+    try testing.expectEqualStrings("mls-x25519:abcd+/=", phone.value);
+    try testing.expectEqualStrings("alice", phone.owner);
+    try testing.expectEqual(ircx_prop_store.AccessLevel.user, phone.access);
+    try testing.expectEqualStrings("preserve me", (try candidate.props.getPropRaw(alice, "BIO")).value);
+    try testing.expectEqualStrings("member value", (try candidate.props.getPropRaw(.{ .kind = .member, .id = "#room:alice" }, "e2ee.device.member")).value);
+    try testing.expectEqual(@as(usize, 1), candidate.channel_clocks.count());
+    try testing.expectEqual(@as(usize, 5), candidate.entity_clocks.count());
+    try testing.expectEqual(@as(u64, 60), candidate.max_hlc);
+
+    var malformed_key_buf: [1 + entity_prop_event.max_entity_len + 1 + entity_prop_event.max_key_len]u8 = undefined;
+    const malformed_key = writeEntityClockKey(&malformed_key_buf, .user, "alice", "E2EE.Device.BAD ID").?;
+    try testing.expect(!candidate.entity_clocks.contains(malformed_key));
+    var near_prefix_key_buf: [1 + entity_prop_event.max_entity_len + 1 + entity_prop_event.max_key_len]u8 = undefined;
+    const near_prefix_key = writeEntityClockKey(&near_prefix_key_buf, .user, "alice", "e2ee.deviceX.keep").?;
+    const near_prefix_clock = candidate.entity_clocks.getPtr(near_prefix_key) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 60), near_prefix_clock.hlc);
+    try testing.expectEqualStrings("e2ee.deviceX.keep", near_prefix_clock.key);
+
+    var phone_key_buf: [1 + entity_prop_event.max_entity_len + 1 + entity_prop_event.max_key_len]u8 = undefined;
+    const phone_key = writeEntityClockKey(&phone_key_buf, .user, "alice", "e2ee.device.phone").?;
+    const phone_clock = candidate.entity_clocks.getPtr(phone_key) orelse return error.TestUnexpectedResult;
+    try testing.expect(phone_clock.present);
+    try testing.expectEqual(@as(u64, 30), phone_clock.hlc);
+    try testing.expectEqual(origin, phone_clock.origin_node);
+    try testing.expectEqualStrings("alice", phone_clock.owner);
+    const source_phone = dprop.factAt(0).?;
+    try testing.expect(phone_clock.entity.ptr != source_phone.entity.ptr);
+    try testing.expect(phone_clock.key.ptr != source_phone.key.ptr);
+    try testing.expect(phone_clock.owner.ptr != source_phone.owner.ptr);
+    try testing.expect(phone_clock.origin_pubkey.ptr != source_phone.origin_pubkey.ptr);
+    try testing.expect(phone_clock.origin_sig.ptr != source_phone.origin_sig.ptr);
+    try testing.expectEqualSlices(u8, source_phone.origin_pubkey, phone_clock.origin_pubkey);
+    try testing.expectEqualSlices(u8, source_phone.origin_sig, phone_clock.origin_sig);
+    const phone_map_entry = candidate.entity_clocks.getEntry(phone_key) orelse return error.TestUnexpectedResult;
+    try testing.expect(phone_map_entry.key_ptr.*.ptr != phone_clock.key.ptr);
+
+    var retired_key_buf: [1 + entity_prop_event.max_entity_len + 1 + entity_prop_event.max_key_len]u8 = undefined;
+    const retired_key = writeEntityClockKey(&retired_key_buf, .user, "bob", "e2ee.device.retired").?;
+    const retired_clock = candidate.entity_clocks.getPtr(retired_key) orelse return error.TestUnexpectedResult;
+    try testing.expect(!retired_clock.present);
+    try testing.expectEqual(@as(u64, 35), retired_clock.hlc);
+    try testing.expectError(error.PropMissing, candidate.props.getPropRaw(.{ .kind = .user, .id = "bob" }, "e2ee.device.retired"));
+
+    const base_props_after = try props.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(base_props_after);
+    try testing.expectEqualSlices(u8, base_props_before, base_props_after);
+    try testing.expectEqual(@as(usize, 5), entities.count());
+}
+
+test "E5E1 hot candidate purges identity authority except exact local signed canonical rows and tombstones" {
+    const testing = std.testing;
+    var local = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(0x91)));
+    defer local.deinit();
+    var foreign = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(0x92)));
+    defer foreign.deinit();
+    const local_origin = entity_prop_event.originShortId(local.public_key);
+
+    var props = DefaultStore.init(testing.allocator);
+    defer props.deinit();
+    const alice = ircx_prop_store.Entity{ .kind = .user, .id = "alice" };
+    _ = try props.setProp(alice, "identity.key.primary", "local-value", .{ .id = "alice", .access = .user });
+    _ = try props.setProp(alice, "identity.key.foreign", "foreign-value", .{ .id = "alice", .access = .user });
+    _ = try props.setProp(alice, "IDENTITY.KEY.Malformed", "mixed", .{ .id = "alice", .access = .user });
+    _ = try props.setProp(alice, "identity.residence.bad", "unsigned", .{ .id = "alice", .access = .user });
+    _ = try props.setProp(alice, "identity.keyX.keep", "near", .{ .id = "alice", .access = .user });
+    _ = try props.setProp(.{ .kind = .member, .id = "#room:alice" }, "identity.key.member", "member", .{ .id = "alice", .access = .member });
+
+    var channels: ChannelClockMap = .empty;
+    defer testDeinitChannelMap(testing.allocator, &channels);
+    var entities: EntityClockMap = .empty;
+    defer testDeinitEntityMap(testing.allocator, &entities);
+    try testPutSignedEntityClock(testing.allocator, &entities, &local, "alice", "identity.key.primary", "alice", "local-value", 30, true);
+    try testPutSignedEntityClock(testing.allocator, &entities, &foreign, "alice", "identity.key.foreign", "alice", "foreign-value", 90, true);
+    try testPutSignedEntityClock(testing.allocator, &entities, &local, "alice", "IDENTITY.KEY.Malformed", "alice", "mixed", 80, true);
+    try testPutEntityClock(testing.allocator, &entities, .user, "alice", "identity.residence.bad", "alice", 70, true, local_origin, "", "");
+    try testPutSignedEntityClock(testing.allocator, &entities, &local, "alice", "identity.residence.0000000000000001", "alice", "", 40, false);
+    try testPutEntityClock(testing.allocator, &entities, .user, "alice", "identity.keyX.keep", "alice", 50, true, 7, "", "");
+    try testPutEntityClock(testing.allocator, &entities, .member, "#room:alice", "identity.key.member", "alice", 60, true, 7, "", "");
+
+    var candidate = try buildDurableDeviceCandidate(
+        testing.allocator,
+        &props,
+        &channels,
+        &entities,
+        null,
+        local_origin,
+        local.public_key,
+    );
+    defer candidate.deinit();
+
+    try testing.expectEqualStrings("local-value", (try candidate.props.getPropRaw(alice, "identity.key.primary")).value);
+    try testing.expectError(error.PropMissing, candidate.props.getPropRaw(alice, "identity.key.foreign"));
+    try testing.expectError(error.PropMissing, candidate.props.getPropRaw(alice, "identity.key.malformed"));
+    try testing.expectError(error.PropMissing, candidate.props.getPropRaw(alice, "identity.residence.bad"));
+    try testing.expectEqualStrings("near", (try candidate.props.getPropRaw(alice, "identity.keyX.keep")).value);
+    try testing.expectEqualStrings("member", (try candidate.props.getPropRaw(.{ .kind = .member, .id = "#room:alice" }, "identity.key.member")).value);
+    try testing.expectEqual(@as(usize, 4), candidate.entity_clocks.count());
+    try testing.expectEqual(@as(u64, 60), candidate.max_hlc);
+
+    var key_buf: [1 + entity_prop_event.max_entity_len + 1 + entity_prop_event.max_key_len]u8 = undefined;
+    try testing.expect(candidate.entity_clocks.contains(writeEntityClockKey(&key_buf, .user, "alice", "identity.key.primary").?));
+    try testing.expect(candidate.entity_clocks.contains(writeEntityClockKey(&key_buf, .user, "alice", "identity.residence.0000000000000001").?));
+    try testing.expect(!candidate.entity_clocks.contains(writeEntityClockKey(&key_buf, .user, "alice", "identity.key.foreign").?));
+    try testing.expect(!candidate.entity_clocks.contains(writeEntityClockKey(&key_buf, .user, "alice", "IDENTITY.KEY.Malformed").?));
+
+    // Matching the configured short id is insufficient: a different configured
+    // full key must purge even a valid signature by the old/local signer.
+    var mismatched_key = try buildDurableDeviceCandidate(
+        testing.allocator,
+        &props,
+        &channels,
+        &entities,
+        null,
+        local_origin,
+        foreign.public_key,
+    );
+    defer mismatched_key.deinit();
+    try testing.expectError(error.PropMissing, mismatched_key.props.getPropRaw(alice, "identity.key.primary"));
+    try testing.expect(!mismatched_key.entity_clocks.contains(writeEntityClockKey(&key_buf, .user, "alice", "identity.key.primary").?));
+    try testing.expect(!mismatched_key.entity_clocks.contains(writeEntityClockKey(&key_buf, .user, "alice", "identity.residence.0000000000000001").?));
+}
+
+test "Helix PROP durable candidate supports purge-only and rejects authority mismatch" {
+    const testing = std.testing;
+    var props = DefaultStore.init(testing.allocator);
+    defer props.deinit();
+    _ = try props.setProp(.{ .kind = .user, .id = "alice" }, "e2ee.device.old", "mls-x25519:abcd+/=", .{ .id = "alice", .access = .user });
+    var channels: ChannelClockMap = .empty;
+    defer testDeinitChannelMap(testing.allocator, &channels);
+    var entities: EntityClockMap = .empty;
+    defer testDeinitEntityMap(testing.allocator, &entities);
+    try testPutEntityClock(testing.allocator, &entities, .user, "alice", "e2ee.device.old", "alice", 88, true, 1, "", "");
+
+    var purged = try buildDurableDeviceCandidate(testing.allocator, &props, &channels, &entities, null, null, null);
+    defer purged.deinit();
+    try testing.expectEqual(@as(usize, 0), purged.entity_clocks.count());
+    try testing.expectEqual(@as(u64, 0), purged.max_hlc);
+    try testing.expectError(error.PropMissing, purged.props.getPropRaw(.{ .kind = .user, .id = "alice" }, "e2ee.device.old"));
+
+    const origin = try testOriginForSeed(0x31);
+    var empty_dprop = try durable_credential_props.State.init(testing.allocator, .{ .local_origin_node = origin });
+    defer empty_dprop.deinit();
+    const props_before_mismatch = try props.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(props_before_mismatch);
+    try testing.expectError(
+        error.DurableOriginMismatch,
+        buildDurableDeviceCandidate(testing.allocator, &props, &channels, &entities, &empty_dprop, origin + 1, null),
+    );
+    const props_after_mismatch = try props.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(props_after_mismatch);
+    try testing.expectEqualSlices(u8, props_before_mismatch, props_after_mismatch);
+    try testing.expectEqual(@as(usize, 1), entities.count());
+
+    var dprop = try durable_credential_props.State.init(testing.allocator, .{ .local_origin_node = origin });
+    defer dprop.deinit();
+    try testCommitDurableFact(&dprop, 0x31, "alice", "e2ee.device.phone", "alice", 7, true, "mls-x25519:abcd+/=");
+    try testing.expectError(
+        error.DurableOriginMismatch,
+        buildDurableDeviceCandidate(testing.allocator, &props, &channels, &entities, &dprop, origin + 1, null),
+    );
+}
+
+test "Helix PROP durable candidate rejects owner mismatch without mutating base" {
+    const testing = std.testing;
+    const origin = try testOriginForSeed(0x41);
+    var dprop = try durable_credential_props.State.init(testing.allocator, .{ .local_origin_node = origin });
+    defer dprop.deinit();
+    try testCommitDurableFact(&dprop, 0x41, "alice", "e2ee.device.phone", "delegate", 7, true, "mls-x25519:abcd+/=");
+    var props = DefaultStore.init(testing.allocator);
+    defer props.deinit();
+    var channels: ChannelClockMap = .empty;
+    defer testDeinitChannelMap(testing.allocator, &channels);
+    var entities: EntityClockMap = .empty;
+    defer testDeinitEntityMap(testing.allocator, &entities);
+    try testing.expectError(
+        error.DurableOwnerMismatch,
+        buildDurableDeviceCandidate(testing.allocator, &props, &channels, &entities, &dprop, origin, null),
+    );
+    try testing.expectEqual(@as(usize, 0), entities.count());
+}
+
+test "Helix PROP durable candidate exhausts allocation failures without mutating inputs" {
+    const testing = std.testing;
+    const origin = try testOriginForSeed(0x52);
+    var dprop = try durable_credential_props.State.init(testing.allocator, .{ .local_origin_node = origin });
+    defer dprop.deinit();
+    try testCommitDurableFact(&dprop, 0x52, "alice", "e2ee.device.phone", "alice", 70, true, "mls-x25519:abcd+/=");
+    try testCommitDurableFact(&dprop, 0x52, "bob", "e2ee.device.old", "bob", 71, false, "");
+
+    var props = DefaultStore.init(testing.allocator);
+    defer props.deinit();
+    _ = try props.setProp(.{ .kind = .user, .id = "alice" }, "e2ee.device.old", "mls-x25519:old+/=", .{ .id = "alice", .access = .user });
+    _ = try props.setProp(.{ .kind = .user, .id = "alice" }, "BIO", "stable", .{ .id = "alice", .access = .user });
+    var channels: ChannelClockMap = .empty;
+    defer testDeinitChannelMap(testing.allocator, &channels);
+    try testPutChannelClock(testing.allocator, &channels, "#room", "TOPIC", "host", 10, true, 2, "", "");
+    var entities: EntityClockMap = .empty;
+    defer testDeinitEntityMap(testing.allocator, &entities);
+    try testPutEntityClock(testing.allocator, &entities, .user, "alice", "e2ee.device.old", "alice", 90, true, 2, "", "");
+    try testPutEntityClock(testing.allocator, &entities, .user, "alice", "BIO", "alice", 20, true, 2, "", "");
+    const props_before = try props.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(props_before);
+    const channels_before = try encode(testing.allocator, &props, &channels, &entities);
+    defer testing.allocator.free(channels_before);
+
+    const Sweep = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            store: *const DefaultStore,
+            channel_map: *const ChannelClockMap,
+            entity_map: *const EntityClockMap,
+            durable: *const durable_credential_props.State,
+            expected_origin: u64,
+        ) !void {
+            var candidate = try buildDurableDeviceCandidate(
+                allocator,
+                store,
+                channel_map,
+                entity_map,
+                durable,
+                expected_origin,
+                null,
+            );
+            defer candidate.deinit();
+            try testing.expectEqual(@as(usize, 1), candidate.channel_clocks.count());
+            try testing.expectEqual(@as(usize, 3), candidate.entity_clocks.count());
+            try testing.expectEqual(@as(u64, 71), candidate.max_hlc);
+        }
+    };
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        Sweep.run,
+        .{ &props, &channels, &entities, &dprop, origin },
+    );
+
+    const props_after = try props.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(props_after);
+    const channels_after = try encode(testing.allocator, &props, &channels, &entities);
+    defer testing.allocator.free(channels_after);
+    try testing.expectEqualSlices(u8, props_before, props_after);
+    try testing.expectEqualSlices(u8, channels_before, channels_after);
+}
+
+test "Helix PROP durable candidate distinguishes true row capacity from allocator OOM" {
+    const testing = std.testing;
+    const origin = try testOriginForSeed(0x53);
+    var dprop = try durable_credential_props.State.init(testing.allocator, .{ .local_origin_node = origin });
+    defer dprop.deinit();
+    try testCommitDurableFact(&dprop, 0x53, "overflow", "e2ee.device.phone", "overflow", 80, true, "mls-x25519:abcd+/=");
+
+    var props = DefaultStore.init(testing.allocator);
+    defer props.deinit();
+    var account_buf: [32]u8 = undefined;
+    for (0..ircx_prop_store.default_max_entities) |index| {
+        const account = try std.fmt.bufPrint(&account_buf, "capacity-user-{d}", .{index});
+        _ = try props.setProp(
+            .{ .kind = .user, .id = account },
+            "profile.atomic",
+            "stable",
+            .{ .id = account, .access = .user },
+        );
+    }
+    var channels: ChannelClockMap = .empty;
+    defer testDeinitChannelMap(testing.allocator, &channels);
+    var entities: EntityClockMap = .empty;
+    defer testDeinitEntityMap(testing.allocator, &entities);
+    try testing.expectError(
+        error.CapacityExceeded,
+        buildDurableDeviceCandidate(testing.allocator, &props, &channels, &entities, &dprop, origin, null),
+    );
+    try testing.expectEqual(ircx_prop_store.default_max_entities, props.entity_count);
+    try testing.expectError(error.PropMissing, props.getPropRaw(.{ .kind = .user, .id = "overflow" }, "e2ee.device.phone"));
 }

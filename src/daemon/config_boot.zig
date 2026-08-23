@@ -22,6 +22,107 @@ const cadence_frame = @import("../substrate/cadence_frame.zig");
 const media_session = @import("../substrate/media_session.zig");
 const certfp_bind = @import("certfp_bind.zig");
 const certfp = @import("../proto/certfp.zig");
+const durable_oper_authority = @import("durable_oper_authority.zig");
+const durable_oper_authority_boot = @import("durable_oper_authority_boot.zig");
+const node_identity = @import("node_identity.zig");
+const store_mod = @import("store.zig");
+
+/// Deliberately staged OCG2 runtime authority. `observe` is the historical
+/// enabled-only behavior: boot and verify the durable image without allowing it
+/// to alter live sessions or mint authority records.
+pub const Ocg2RuntimeMode = enum {
+    disabled,
+    observe,
+    project,
+    mint,
+};
+
+/// Runtime stages implemented by this binary. Keep CLI preflight and normal
+/// boot on this single predicate; reserved privilege-changing modes must never
+/// pass validation only to fail during service restart.
+pub fn ocg2RuntimeModeSupported(mode: Ocg2RuntimeMode) bool {
+    return mode == .disabled or mode == .observe;
+}
+
+pub const Ocg2BootConfig = struct {
+    enabled: bool = false,
+    mode: Ocg2RuntimeMode = .disabled,
+    authority: ?durable_oper_authority.Config = null,
+};
+
+pub const Ocg2LocalRole = enum { authority, receiver };
+
+pub const Ocg2IdentityError = error{
+    Ocg2Disabled,
+    MissingNodeIdentity,
+    Ocg2AuthorityPublicKeyMismatch,
+    Ocg2MintingRequiresAuthority,
+};
+
+pub const Ocg2ActivationSource = enum { initialized, restored };
+
+pub const Ocg2Activation = struct {
+    state: durable_oper_authority.State,
+    source: Ocg2ActivationSource,
+};
+
+pub fn mapOcg2BootConfig(cfg: config_format.Config) Ocg2BootConfig {
+    if (!cfg.oper_ocg2.enabled) return .{};
+    const mode: Ocg2RuntimeMode = if (cfg.oper_ocg2.minting_enabled)
+        .mint
+    else if (cfg.oper_ocg2.projection_enabled)
+        .project
+    else
+        .observe;
+    return .{ .enabled = true, .mode = mode, .authority = .{
+        .authority_node_id = cfg.oper_ocg2.authority_node_id,
+        .authority_pubkey = cfg.oper_ocg2.authority_public_key.?,
+    } };
+}
+
+/// Classify this process without ever importing authority private material from
+/// shared OCG2 config. If the local node claims the authority short ID, require
+/// its complete Ed25519 public key to equal the configured root.
+pub fn validateOcg2LocalIdentity(
+    cfg: Ocg2BootConfig,
+    identity: ?*const node_identity.NodeIdentity,
+) Ocg2IdentityError!Ocg2LocalRole {
+    if (!cfg.enabled) return error.Ocg2Disabled;
+    const local = identity orelse return error.MissingNodeIdentity;
+    const authority = cfg.authority orelse return error.Ocg2Disabled;
+    if (local.shortId() != authority.authority_node_id) {
+        if (cfg.mode == .mint) return error.Ocg2MintingRequiresAuthority;
+        return .receiver;
+    }
+    if (!std.crypto.timing_safe.eql(
+        [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8,
+        local.sign_kp.public_key,
+        authority.authority_pubkey,
+    )) return error.Ocg2AuthorityPublicKeyMismatch;
+    return .authority;
+}
+
+/// Activate the local durable image. Exactly two absent rows are the explicit
+/// cold-start case. One absent row is partial state and is never repaired; two
+/// present rows are validated and restored against the frozen authority tuple.
+pub fn activateOcg2Store(
+    allocator: std.mem.Allocator,
+    store: *store_mod.OroStore,
+    cfg: Ocg2BootConfig,
+) durable_oper_authority_boot.Error!Ocg2Activation {
+    const authority = cfg.authority orelse return error.InvalidAuthority;
+    const marker_present = store.get(.props, durable_oper_authority.marker_key) != null;
+    const snapshot_present = store.get(.props, durable_oper_authority.snapshot_key) != null;
+    if (marker_present != snapshot_present) return error.PartialInitialization;
+    if (!marker_present) return .{
+        .state = try durable_oper_authority_boot.initialize(allocator, store, authority),
+        .source = .initialized,
+    };
+    return .{
+        .state = try durable_oper_authority_boot.load(allocator, store, authority),
+        .source = .restored,
+    };
+}
 
 /// Overlay non-empty/non-zero config values onto `base` (which carries defaults).
 /// `cfg`'s string fields (e.g. host) are borrowed — keep `cfg` alive as long as
@@ -167,6 +268,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.clone_refuse_penalty = cfg.reputation.clone_refuse_penalty;
     out.session_max_accounts = cfg.sessions.max_accounts;
     out.session_max_per_account = cfg.sessions.max_per_account;
+    out.session_resume_composite_issuance = cfg.sessions.resume_composite_issuance;
     out.session_migrate_on_detach = cfg.sessions.migrate_on_detach;
     out.session_max_pending_migrations = cfg.sessions.max_pending_migrations;
     out.multiline_max_bytes = @intCast(cfg.ircv3.multiline_max_bytes);
@@ -443,6 +545,9 @@ pub fn mapAcmeBootConfig(cfg: config_format.Config) AcmeBootConfig {
 pub const Loaded = struct {
     config: server.Config,
     parsed: config_format.Config,
+    /// Public-only OCG2 root projection. Main validates the local node identity
+    /// and owns any activated state; Server receives no pointer or capability.
+    ocg2: Ocg2BootConfig = .{},
     /// Owned oper bindings backing `config.oper_registry` (strings borrow `parsed`).
     oper_bindings: []oper_mod.OperBinding = &.{},
     /// Parsed `[tls]` intent (strings borrow `parsed`); the live listener and
@@ -547,6 +652,7 @@ pub fn loadFromText(
     return .{
         .config = config,
         .parsed = parsed,
+        .ocg2 = mapOcg2BootConfig(parsed),
         .oper_bindings = oper_bindings,
         .tls = mapTlsBootConfig(parsed),
         .acme = mapAcmeBootConfig(parsed),
@@ -1175,7 +1281,7 @@ test "minimal config: unspecified optional fields keep defaults" {
     try testing.expectEqual(@as(u16, 0), loaded.config.s2s_port); // unspecified -> default
 }
 
-test "[sessions] registry sizing projects onto the boot config and defaults to 64" {
+test "[sessions] registry and composite issuance project onto boot config" {
     const allocator = testing.allocator;
     const base = server.Config{ .port = 6680 };
 
@@ -1185,6 +1291,7 @@ test "[sessions] registry sizing projects onto the boot config and defaults to 6
     defer defaults.deinit(allocator);
     try testing.expectEqual(@as(u64, 65536), defaults.config.session_max_accounts);
     try testing.expectEqual(@as(u32, 64), defaults.config.session_max_per_account);
+    try testing.expect(!defaults.config.session_resume_composite_issuance);
     try testing.expect(defaults.config.session_migrate_on_detach);
     try testing.expectEqual(@as(u32, 4096), defaults.config.session_max_pending_migrations);
 
@@ -1197,6 +1304,7 @@ test "[sessions] registry sizing projects onto the boot config and defaults to 6
         \\[sessions]
         \\max_accounts = 2048
         \\max_per_account = 9
+        \\resume_composite_issuance = true
         \\migrate_on_detach = false
         \\max_pending_migrations = 128
         \\
@@ -1205,8 +1313,18 @@ test "[sessions] registry sizing projects onto the boot config and defaults to 6
     defer loaded.deinit(allocator);
     try testing.expectEqual(@as(u64, 2048), loaded.config.session_max_accounts);
     try testing.expectEqual(@as(u32, 9), loaded.config.session_max_per_account);
+    try testing.expect(loaded.config.session_resume_composite_issuance);
     try testing.expect(!loaded.config.session_migrate_on_detach);
     try testing.expectEqual(@as(u32, 128), loaded.config.session_max_pending_migrations);
+
+    var explicitly_off = try loadFromText(
+        allocator,
+        "[node]\nid = 1\n[listen]\nirc = 6680\n[sessions]\nresume_composite_issuance = false\n",
+        base,
+        .{},
+    );
+    defer explicitly_off.deinit(allocator);
+    try testing.expect(!explicitly_off.config.session_resume_composite_issuance);
 }
 
 test "tls section projects onto the boot tls config" {
@@ -1321,6 +1439,117 @@ test "missing required [node].id is rejected" {
     const allocator = testing.allocator;
     const text = "[listen]\nirc = 6680\n";
     try testing.expectError(error.ParseError, loadFromText(allocator, text, .{ .port = 6680 }, .{}));
+}
+
+fn testOcg2BootConfig(seed: u8, mode: Ocg2RuntimeMode) !Ocg2BootConfig {
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(seed)), "ocg2-test");
+    defer identity.deinit();
+    return .{ .enabled = true, .mode = mode, .authority = .{
+        .authority_node_id = identity.shortId(),
+        .authority_pubkey = identity.sign_kp.public_key,
+    } };
+}
+
+test "OCG2 config boot mapping exposes disabled observe project and mint modes" {
+    const disabled = mapOcg2BootConfig(.{});
+    try testing.expect(!disabled.enabled);
+    try testing.expectEqual(Ocg2RuntimeMode.disabled, disabled.mode);
+    try testing.expect(disabled.authority == null);
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC0)), "ocg2-test");
+    defer identity.deinit();
+    const root = config_format.Config.OperOcg2{
+        .enabled = true,
+        .authority_node_id = identity.shortId(),
+        .authority_public_key = identity.sign_kp.public_key,
+    };
+
+    var cfg = config_format.Config{ .oper_ocg2 = root };
+    const observe = mapOcg2BootConfig(cfg);
+    try testing.expect(observe.enabled);
+    try testing.expectEqual(Ocg2RuntimeMode.observe, observe.mode);
+    try testing.expectEqual(identity.shortId(), observe.authority.?.authority_node_id);
+    try testing.expectEqualSlices(u8, &identity.sign_kp.public_key, &observe.authority.?.authority_pubkey);
+
+    cfg.oper_ocg2.projection_enabled = true;
+    const project = mapOcg2BootConfig(cfg);
+    try testing.expect(project.enabled);
+    try testing.expectEqual(Ocg2RuntimeMode.project, project.mode);
+
+    cfg.oper_ocg2.minting_enabled = true;
+    const mint = mapOcg2BootConfig(cfg);
+    try testing.expect(mint.enabled);
+    try testing.expectEqual(Ocg2RuntimeMode.mint, mint.mode);
+}
+
+test "OCG2 runtime support predicate admits only disabled and observe" {
+    try testing.expect(ocg2RuntimeModeSupported(.disabled));
+    try testing.expect(ocg2RuntimeModeSupported(.observe));
+    try testing.expect(!ocg2RuntimeModeSupported(.project));
+    try testing.expect(!ocg2RuntimeModeSupported(.mint));
+}
+
+test "OCG2 boot identity classification keeps receivers public-only and exact authority full-key bound" {
+    const config = try testOcg2BootConfig(0xC1, .observe);
+    var authority_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC1)), "ocg2-test");
+    defer authority_identity.deinit();
+    try testing.expectEqual(Ocg2LocalRole.authority, try validateOcg2LocalIdentity(config, &authority_identity));
+
+    var receiver_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC2)), "ocg2-test");
+    defer receiver_identity.deinit();
+    try testing.expectEqual(Ocg2LocalRole.receiver, try validateOcg2LocalIdentity(config, &receiver_identity));
+    try testing.expectError(error.MissingNodeIdentity, validateOcg2LocalIdentity(config, null));
+
+    authority_identity.sign_kp.public_key[0] ^= 1;
+    try testing.expectError(
+        error.Ocg2AuthorityPublicKeyMismatch,
+        validateOcg2LocalIdentity(config, &authority_identity),
+    );
+}
+
+test "OCG2 config boot permits projection on both roles and restricts minting to authority" {
+    const project = try testOcg2BootConfig(0xC5, .project);
+    const mint = try testOcg2BootConfig(0xC5, .mint);
+    var authority_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC5)), "ocg2-test");
+    defer authority_identity.deinit();
+    var receiver_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC6)), "ocg2-test");
+    defer receiver_identity.deinit();
+
+    try testing.expectEqual(Ocg2LocalRole.authority, try validateOcg2LocalIdentity(project, &authority_identity));
+    try testing.expectEqual(Ocg2LocalRole.receiver, try validateOcg2LocalIdentity(project, &receiver_identity));
+    try testing.expectEqual(Ocg2LocalRole.authority, try validateOcg2LocalIdentity(mint, &authority_identity));
+    try testing.expectError(
+        error.Ocg2MintingRequiresAuthority,
+        validateOcg2LocalIdentity(mint, &receiver_identity),
+    );
+}
+
+test "OCG2 store activation cold restores and rejects key change and partial state" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config = try testOcg2BootConfig(0xC3, .observe);
+    const wrong = try testOcg2BootConfig(0xC4, .observe);
+    var store = try store_mod.OroStore.openWithConfig(
+        testing.allocator,
+        testing.io,
+        tmp.dir,
+        "config-boot-ocg2.wal",
+        .{},
+    );
+    defer store.deinit();
+    var cold = try activateOcg2Store(testing.allocator, &store, config);
+    defer cold.state.deinit();
+    try testing.expectEqual(Ocg2ActivationSource.initialized, cold.source);
+    try testing.expect(store.get(.props, durable_oper_authority.marker_key) != null);
+    try testing.expect(store.get(.props, durable_oper_authority.snapshot_key) != null);
+
+    var restored = try activateOcg2Store(testing.allocator, &store, config);
+    defer restored.state.deinit();
+    try testing.expectEqual(Ocg2ActivationSource.restored, restored.source);
+    try testing.expectError(error.InvalidAuthority, activateOcg2Store(testing.allocator, &store, wrong));
+
+    try store.delete(.props, durable_oper_authority.snapshot_key);
+    try testing.expectError(error.PartialInitialization, activateOcg2Store(testing.allocator, &store, config));
 }
 
 test "[class.*] parses into the connection-class registry with v4/v6 + TLS match" {

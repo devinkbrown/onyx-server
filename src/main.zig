@@ -153,9 +153,12 @@ pub fn main(init: std.process.Init) !void {
         // flag and refuses a hot handoff unless the complete token matches.
         // This branch must stay ahead of all config, socket, and daemon setup.
         if (std.mem.eql(u8, first, onyx_server.daemon.helix.live.upgrade_capability_arg)) {
-            // English ONYX_ capability token only (Onyx brand only).
+            // Advertise the current contract plus the exact predecessor token.
+            // The latter lets a deployed HSSN v3 writer upgrade into this v4
+            // reader; current predecessors still require the current token and
+            // therefore reject rollback to a v3-only image.
             std.debug.print("{s}\n", .{
-                onyx_server.daemon.helix.live.upgrade_capability_token,
+                onyx_server.daemon.helix.live.upgrade_capability_advertisement,
             });
             return;
         } else
@@ -255,6 +258,50 @@ pub fn main(init: std.process.Init) !void {
                             std.debug.print("config ERROR in {s}: activation node identity in {s}: {s}\n", .{ path, key_path, @errorName(err) });
                             std.process.exit(1);
                         };
+                    }
+                    if (l.ocg2.enabled) {
+                        if (!onyx_server.daemon.config_boot.ocg2RuntimeModeSupported(l.ocg2.mode)) {
+                            std.debug.print(
+                                "config ERROR in {s}: OCG2 {s} mode is reserved; this release exposes observation only\n",
+                                .{ path, @tagName(l.ocg2.mode) },
+                            );
+                            std.process.exit(1);
+                        }
+                        var check_identity = if (l.parsed.node.secret_key) |secret|
+                            onyx_server.daemon.node_identity.fromConfig(secret, l.parsed.mesh.realm) catch |err| {
+                                std.debug.print("config ERROR in {s}: OCG2 local node secret: {s}\n", .{ path, @errorName(err) });
+                                std.process.exit(1);
+                            }
+                        else identity_blk: {
+                            const key_path = onyx_server.daemon.node_keyfile.derivePath(allocator, path) catch |err| {
+                                std.debug.print("config ERROR in {s}: cannot derive OCG2 node keyfile path: {s}\n", .{ path, @errorName(err) });
+                                std.process.exit(1);
+                            };
+                            defer allocator.free(key_path);
+                            var seed = onyx_server.daemon.node_keyfile.loadExisting(
+                                allocator,
+                                init.io,
+                                std.Io.Dir.cwd(),
+                                key_path,
+                            ) catch |err| {
+                                std.debug.print("config ERROR in {s}: OCG2 requires existing node key {s}: {s}\n", .{ path, key_path, @errorName(err) });
+                                std.process.exit(1);
+                            };
+                            defer std.crypto.secureZero(u8, &seed);
+                            break :identity_blk onyx_server.daemon.node_identity.fromSeed(seed, l.parsed.mesh.realm) catch |err| {
+                                std.debug.print("config ERROR in {s}: OCG2 node identity: {s}\n", .{ path, @errorName(err) });
+                                std.process.exit(1);
+                            };
+                        };
+                        defer check_identity.deinit();
+                        const role = onyx_server.daemon.config_boot.validateOcg2LocalIdentity(
+                            l.ocg2,
+                            &check_identity,
+                        ) catch |err| {
+                            std.debug.print("config ERROR in {s}: OCG2 authority identity: {s}\n", .{ path, @errorName(err) });
+                            std.process.exit(1);
+                        };
+                        std.debug.print("config OCG2: {s}\n", .{@tagName(role)});
                     }
                     std.debug.print("config OK: {s}\n", .{path});
                     return;
@@ -372,10 +419,12 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.config_resolver = resolver;
                 std.debug.print("onyx-server: loaded config from {s}\n", .{path});
             } else |err| {
-                std.debug.print("onyx-server: config error in {s} ({s}); using defaults\n", .{ path, @errorName(err) });
+                std.debug.print("onyx-server: fatal config error in {s} ({s})\n", .{ path, @errorName(err) });
+                return err;
             }
         } else |err| {
-            std.debug.print("onyx-server: cannot read config {s} ({s}); using defaults\n", .{ path, @errorName(err) });
+            std.debug.print("onyx-server: fatal — cannot read explicit config {s} ({s})\n", .{ path, @errorName(err) });
+            return err;
         }
     }
 
@@ -424,21 +473,47 @@ pub fn main(init: std.process.Init) !void {
     // policy holds even when secured S2S is NOT configured (the case it most
     // matters for — it then drops all S2S instead of falling back to plaintext).
     if (held) |h| srv_cfg.require_secured = h.parsed.mesh.require_secured;
+    const dprop_requested = if (held) |h|
+        srv_cfg.sasl_enabled and h.parsed.sasl.account_db != null
+    else
+        false;
+    const ocg2_requested = if (held) |h| h.ocg2.enabled else false;
     const configured_key: ?[]const u8 = if (held) |h| h.parsed.node.secret_key else null;
     if (configured_key) |sk| {
         if (onyx_server.daemon.node_identity.fromConfig(sk, mesh_realm)) |ident| {
             node_id_holder = ident;
             std.debug.print("onyx-server: PQ-secured S2S enabled (node identity configured)\n", .{});
         } else |err| {
+            if (ocg2_requested) {
+                std.debug.print("onyx-server: fatal — OCG2 configured node identity is invalid ({s})\n", .{@errorName(err)});
+                return err;
+            }
             std.debug.print("onyx-server: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
         }
     } else auto: {
         const key_path = onyx_server.daemon.node_keyfile.derivePath(allocator, srv_cfg.config_path) catch break :auto;
         defer allocator.free(key_path);
-        const loaded_key = onyx_server.daemon.node_keyfile.loadOrCreate(allocator, init.io, std.Io.Dir.cwd(), key_path) catch |err| {
-            std.debug.print("onyx-server: node keyfile error in {s} ({s}); S2S stays plaintext\n", .{ key_path, @errorName(err) });
-            break :auto;
-        };
+        // OCG2 never creates identity material implicitly. Its authority/receiver
+        // role must be checkable against an already-provisioned private node seed;
+        // ordinary non-OCG2 boots retain historical load-or-create behavior.
+        const loaded_key = if (ocg2_requested)
+            onyx_server.daemon.node_keyfile.LoadResult{
+                .seed = onyx_server.daemon.node_keyfile.loadExisting(
+                    allocator,
+                    init.io,
+                    std.Io.Dir.cwd(),
+                    key_path,
+                ) catch |err| {
+                    std.debug.print("onyx-server: fatal — OCG2 requires existing node key {s} ({s})\n", .{ key_path, @errorName(err) });
+                    return err;
+                },
+                .source = .loaded,
+            }
+        else
+            onyx_server.daemon.node_keyfile.loadOrCreate(allocator, init.io, std.Io.Dir.cwd(), key_path) catch |err| {
+                std.debug.print("onyx-server: node keyfile error in {s} ({s}); S2S stays plaintext\n", .{ key_path, @errorName(err) });
+                break :auto;
+            };
         if (onyx_server.daemon.node_identity.fromSeed(loaded_key.seed, mesh_realm)) |ident| {
             node_id_holder = ident;
             switch (loaded_key.source) {
@@ -455,6 +530,27 @@ pub fn main(init: std.process.Init) !void {
             if (h.parsed.mesh.mesh_pass) |mp| srv_cfg.mesh_pass = mp;
         }
     }
+    if (dprop_requested and (srv_cfg.node_identity == null or srv_cfg.node_identity.?.shortId() == 0)) {
+        std.debug.print("onyx-server: fatal — configured SASL account storage requires a non-zero DPROP1 node identity\n", .{});
+        return error.DurableDeviceActivationFailed;
+    }
+    var ocg2_role: ?onyx_server.daemon.config_boot.Ocg2LocalRole = null;
+    if (ocg2_requested) {
+        if (!onyx_server.daemon.config_boot.ocg2RuntimeModeSupported(held.?.ocg2.mode)) {
+            std.debug.print(
+                "onyx-server: fatal — OCG2 {s} mode is configured but this release exposes observation only\n",
+                .{@tagName(held.?.ocg2.mode)},
+            );
+            return error.Ocg2RuntimeModeUnavailable;
+        }
+        ocg2_role = onyx_server.daemon.config_boot.validateOcg2LocalIdentity(
+            held.?.ocg2,
+            srv_cfg.node_identity,
+        ) catch |err| {
+            std.debug.print("onyx-server: fatal — OCG2 local authority identity validation failed ({s})\n", .{@errorName(err)});
+            return err;
+        };
+    }
 
     // The WebTransport (QUIC/HTTP3) listener is started AFTER the server is up
     // (it bridges to the daemon's bound IRC port via loopback TCP). See below,
@@ -466,6 +562,20 @@ pub fn main(init: std.process.Init) !void {
     // pointer is copied into every connection).
     var account_store: ?onyx_server.daemon.services.OroStore = null;
     defer if (account_store) |*s| s.deinit();
+    // The DPROP1 image is process-owned and outlives both Services and Server.
+    // It remains absent unless an account OroStore and a non-zero persisted node
+    // identity are both available; once selected, every load error is fatal.
+    var durable_device_state: ?onyx_server.daemon.durable_credential_props.State = null;
+    defer if (durable_device_state) |*state| state.deinit();
+    // Process-owned inactive OCG2 image. Services borrows it only after exact
+    // marker/snapshot activation. The bounded observer below may borrow Services,
+    // but it exposes no session, mesh, minting, or projection capability.
+    var durable_oper_state: ?onyx_server.daemon.durable_oper_authority.State = null;
+    defer if (durable_oper_state) |*state| state.deinit();
+    // Runtime carries bounded 256-entry scratch inventories, so allocate it only
+    // for explicit observe mode. Disabled deployments pay neither heap nor stack.
+    var ocg2_observer: ?*onyx_server.daemon.ocg2_runtime.Runtime = null;
+    defer if (ocg2_observer) |observer| onyx_server.daemon.ocg2_runtime.destroy(observer);
     var account_services: onyx_server.daemon.services.Services = undefined;
     var account_checker: onyx_server.daemon.sasl_bridge.ServicesPlainChecker = undefined;
     var external_bridge: onyx_server.daemon.sasl_bridge.ServicesExternalLookup = undefined;
@@ -502,6 +612,82 @@ pub fn main(init: std.process.Init) !void {
                 account_services.attachScramStore(&scram_store);
                 account_services.attachCertfpBinds(&certfp_binds);
                 account_services.attachKeyTransparencyLog(&key_transparency_log);
+                if (dprop_requested) {
+                    const identity = srv_cfg.node_identity orelse unreachable;
+                    const local_origin = identity.shortId();
+                    if (local_origin == 0) {
+                        std.debug.print("onyx-server: fatal — DPROP1 authority requires a non-zero node identity\n", .{});
+                        return error.DurableDeviceActivationFailed;
+                    }
+                    durable_device_state = onyx_server.daemon.durable_credential_props_boot.load(
+                        allocator,
+                        &account_store.?,
+                        local_origin,
+                    ) catch |err| {
+                        std.debug.print("onyx-server: fatal — DPROP1 strict boot restore failed ({s})\n", .{@errorName(err)});
+                        return err;
+                    };
+                    account_services.attachDurableCredentialProps(&durable_device_state.?);
+                    srv_cfg.durable_device_boot = .{ .authoritative = .{
+                        .state = &durable_device_state.?,
+                        .local_origin_node = local_origin,
+                    } };
+                }
+                if (ocg2_requested) {
+                    const activation = onyx_server.daemon.config_boot.activateOcg2Store(
+                        allocator,
+                        &account_store.?,
+                        h.ocg2,
+                    ) catch |err| {
+                        std.debug.print("onyx-server: fatal — OCG2 strict durable activation failed ({s})\n", .{@errorName(err)});
+                        return err;
+                    };
+                    durable_oper_state = activation.state;
+                    account_services.activateDurableOperAuthority(&durable_oper_state.?) catch |err| {
+                        std.debug.print("onyx-server: fatal — OCG2 Services activation failed ({s})\n", .{@errorName(err)});
+                        return err;
+                    };
+                    switch (h.ocg2.mode) {
+                        .disabled => return error.Ocg2RuntimeActivationFailed,
+                        .observe => {
+                            const observer = try onyx_server.daemon.ocg2_runtime.createObserve(
+                                allocator,
+                                &account_services,
+                            );
+                            ocg2_observer = observer;
+                            // Pair the wall sample with the immediately-following
+                            // monotonic origin. Later timer ticks advance elapsed
+                            // from this exact point, not from allocation/boot work.
+                            const initial_realtime_ms: u64 = @intCast(@max(
+                                @as(i64, 0),
+                                onyx_server.substrate.platform.realtimeMillis(),
+                            ));
+                            const origin_ms: u64 = @intCast(@max(
+                                @as(i64, 0),
+                                onyx_server.substrate.platform.monotonicMillis(),
+                            ));
+                            const initial = observer.tick(initial_realtime_ms, 0);
+                            switch (initial) {
+                                .complete => |summary| std.debug.print(
+                                    "onyx-server: OCG2 observe runtime primed ({s}; {s}; {d} durable record(s); no privilege consumer)\n",
+                                    .{ @tagName(activation.source), @tagName(ocg2_role.?), summary.baseline_count },
+                                ),
+                                .retryable => |reason| {
+                                    std.debug.print("onyx-server: fatal — OCG2 observe runtime could not establish its initial durable horizon ({s})\n", .{@tagName(reason)});
+                                    return error.Ocg2RuntimeActivationFailed;
+                                },
+                                .failed => |reason| {
+                                    std.debug.print("onyx-server: fatal — OCG2 observe runtime failed during initial inspection ({s})\n", .{@tagName(reason)});
+                                    return error.Ocg2RuntimeActivationFailed;
+                                },
+                                .disabled => return error.Ocg2RuntimeActivationFailed,
+                            }
+                            srv_cfg.ocg2_runtime = observer;
+                            srv_cfg.ocg2_runtime_monotonic_origin_ms = origin_ms;
+                        },
+                        .project, .mint => unreachable,
+                    }
+                }
                 // Seed config-declared oper certfp bindings so SASL EXTERNAL works
                 // certfp-only without a prior runtime CERTADD. Coexists with (never
                 // wipes) runtime CERTADD binds; malformed entries warn-and-skip.
@@ -521,6 +707,10 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.account_services = &account_services;
                 std.debug.print("onyx-server: SASL account store opened ({s}); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL + SESSION-TOKEN live\n", .{db});
             } else |err| {
+                if (dprop_requested or ocg2_requested) {
+                    std.debug.print("onyx-server: fatal — configured account store required for durable authority state could not open ({s})\n", .{@errorName(err)});
+                    return err;
+                }
                 std.debug.print("onyx-server: account store error ({s}); SASL disabled\n", .{@errorName(err)});
             }
         }

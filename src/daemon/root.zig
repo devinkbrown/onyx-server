@@ -152,10 +152,193 @@ pub const world = @import("world.zig");
 // (modules/ has no root.zig; helix/ is auto-imported by genroots).
 pub const module_manifest = @import("modules/manifest.zig");
 pub const key_transparency = @import("key_transparency.zig");
+/// Standalone DPROP1 codec/state. Exporting it here compiles and tests the leaf
+/// module; it does not wire persistence, server runtime, mesh, or authority.
+pub const durable_credential_props = @import("durable_credential_props.zig");
+pub const durable_credential_props_boot = @import("durable_credential_props_boot.zig");
+pub const durable_oper_authority = @import("durable_oper_authority.zig");
+pub const durable_oper_authority_boot = @import("durable_oper_authority_boot.zig");
+pub const oper_session_provenance = @import("oper_session_provenance.zig");
+/// Allocation-free, projection-free coordinator for staged OCG2 observation.
+/// The module deliberately exposes no session, mesh, minting, or grant surface.
+pub const ocg2_runtime = @import("ocg2_runtime.zig");
+/// Transactional, allocation-bounded OCG2 projection queue.  The leaf is
+/// exported for the integrator but owns no session, mesh, issuer, or minting
+/// capability.
+pub const ocg2_projection_runtime = @import("ocg2_projection_runtime.zig");
+
+// Compile the inactive issuer leaf without publishing the module or its Impl.
+comptime {
+    const issuer = @import("ocg2_authority_issuer.zig");
+    _ = issuer.Ocg2AuthorityIssuer;
+    if (!@hasDecl(issuer.Ocg2AuthorityIssuer, "executeAuthorized"))
+        @compileError("OCG2 issuer must expose executeAuthorized");
+    if (@hasDecl(@This(), "ocg2_authority_issuer"))
+        @compileError("OCG2 issuer must stay unexported from daemon root");
+    for (.{
+        "issue",         "grant",       "revoke",
+        "issueGrant",    "issueRevoke", "executeGrant",
+        "executeRevoke", "transmit",    "executeAuthorized",
+    }) |name| {
+        if (@hasDecl(issuer, name))
+            @compileError("OCG2 issuer must not expose an alternate public issue surface");
+    }
+}
+
+// Compile the inactive reconcile/expiry schedule leaf without publishing it.
+comptime {
+    const std = @import("std");
+    const schedule = @import("ocg2_reconcile_schedule.zig");
+    _ = schedule.build;
+    if (@hasDecl(@This(), "ocg2_reconcile_schedule"))
+        @compileError("OCG2 reconcile schedule must stay unexported from daemon root");
+    const allowed = .{
+        "Phase",   "InvalidReason", "ReinspectHint",
+        "Summary", "BuildResult",   "build",
+    };
+    const names = @typeInfo(schedule).@"struct".decl_names;
+    if (names.len != allowed.len)
+        @compileError("OCG2 reconcile schedule public surface is not the exact allowlist");
+    for (names) |name| {
+        var found = false;
+        for (allowed) |allowed_name| {
+            if (std.mem.eql(u8, name, allowed_name)) found = true;
+        }
+        if (!found)
+            @compileError("OCG2 reconcile schedule exposes a public declaration outside the allowlist");
+    }
+    if (@typeInfo(schedule.ReinspectHint).@"struct".decl_names.len != 0)
+        @compileError("ReinspectHint must not expose public methods");
+}
+
+// Compile the inactive reconcile workset leaf without publishing it.
+comptime {
+    const std = @import("std");
+    const workset = @import("ocg2_reconcile_workset.zig");
+    _ = workset.build;
+    if (@hasDecl(@This(), "ocg2_reconcile_workset"))
+        @compileError("OCG2 reconcile workset must stay unexported from daemon root");
+    const allowed = .{
+        "Cause",   "InvalidReason", "BaselineEntry", "WorkItem",
+        "Summary", "BuildResult",   "max_entries",   "build",
+    };
+    const names = @typeInfo(workset).@"struct".decl_names;
+    if (names.len != allowed.len)
+        @compileError("OCG2 reconcile workset public surface is not the exact allowlist");
+    for (names) |name| {
+        var found = false;
+        for (allowed) |allowed_name| {
+            if (std.mem.eql(u8, name, allowed_name)) found = true;
+        }
+        if (!found)
+            @compileError("OCG2 reconcile workset exposes a public declaration outside the allowlist");
+    }
+    if (@typeInfo(workset.BaselineEntry).@"struct".decl_names.len != 0)
+        @compileError("BaselineEntry must not expose public methods");
+    if (@typeInfo(workset.WorkItem).@"struct".decl_names.len != 0)
+        @compileError("WorkItem must not expose public methods");
+    for (.{ workset.BaselineEntry, workset.WorkItem, workset.Summary, workset.BuildResult }) |T| {
+        const info = @typeInfo(T);
+        switch (info) {
+            .@"struct" => |struct_info| {
+                for (struct_info.field_types) |field_type| {
+                    switch (@typeInfo(field_type)) {
+                        .pointer => @compileError("OCG2 workset public structs must not hold pointers or slices"),
+                        else => {},
+                    }
+                }
+            },
+            .@"union" => |union_info| {
+                for (union_info.field_types) |field_type| {
+                    switch (@typeInfo(field_type)) {
+                        .pointer => @compileError("OCG2 workset public unions must not hold pointers or slices"),
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    for (.{
+        "apply",          "execute",           "grant",
+        "revoke",         "mint",              "transmit",
+        "session",        "callback",          "Visitor",
+        "ProjectionData", "DurableOperLookup", "Services",
+        "Store",          "reconcile",         "executeAuthorized",
+    }) |name| {
+        if (@hasDecl(workset, name))
+            @compileError("OCG2 reconcile workset must not expose a runtime privilege surface");
+    }
+}
+
+// Compile the TEST-ONLY transaction/expiry conformance model without publishing it.
+comptime {
+    const std = @import("std");
+    const dst = @import("ocg2_transaction_dst.zig");
+    _ = dst.run;
+    _ = dst.step;
+    if (@hasDecl(@This(), "ocg2_transaction_dst"))
+        @compileError("OCG2 transaction DST must stay unexported from daemon root");
+    const allowed = .{
+        "Phase", "Input", "Output", "World", "step", "run",
+    };
+    const names = @typeInfo(dst).@"struct".decl_names;
+    if (names.len != allowed.len)
+        @compileError("OCG2 transaction DST public surface is not the exact allowlist");
+    for (names) |name| {
+        var found = false;
+        for (allowed) |allowed_name| {
+            if (std.mem.eql(u8, name, allowed_name)) found = true;
+        }
+        if (!found)
+            @compileError("OCG2 transaction DST exposes a public declaration outside the allowlist");
+    }
+    if (@typeInfo(dst.Input).@"struct".decl_names.len != 0)
+        @compileError("Input must not expose public methods");
+    if (@typeInfo(dst.Output).@"struct".decl_names.len != 0)
+        @compileError("Output must not expose public methods");
+    if (@typeInfo(dst.World).@"struct".decl_names.len != 0)
+        @compileError("World must not expose public methods");
+    for (.{ dst.Input, dst.Output, dst.World }) |T| {
+        const info = @typeInfo(T);
+        switch (info) {
+            .@"struct" => |struct_info| {
+                for (struct_info.field_types) |field_type| {
+                    switch (@typeInfo(field_type)) {
+                        .pointer => @compileError("OCG2 transaction DST public structs must not hold pointers or slices"),
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    for (.{
+        "apply",          "execute",           "grant",
+        "revoke",         "mint",              "transmit",
+        "session",        "callback",          "Visitor",
+        "ProjectionData", "DurableOperLookup", "Services",
+        "Store",          "reconcile",         "executeAuthorized",
+    }) |name| {
+        if (@hasDecl(dst, name))
+            @compileError("OCG2 transaction DST must not expose a runtime privilege surface");
+    }
+}
 
 test {
     _ = module_manifest;
     _ = key_transparency;
+    _ = durable_credential_props;
+    _ = durable_credential_props_boot;
+    _ = durable_oper_authority;
+    _ = durable_oper_authority_boot;
+    _ = oper_session_provenance;
+    _ = ocg2_runtime;
+    _ = ocg2_projection_runtime;
+    _ = @import("ocg2_authority_issuer.zig");
+    _ = @import("ocg2_reconcile_schedule.zig");
+    _ = @import("ocg2_reconcile_workset.zig");
+    _ = @import("ocg2_transaction_dst.zig");
     // gen:tests:begin
     _ = account_verify;
     _ = acme_cli;
@@ -297,4 +480,159 @@ test {
     _ = world_rcu;
     _ = world;
     // gen:tests:end
+}
+
+test "OCG2ISSUER external import cannot reach identity signer hooks or impl" {
+    const std = @import("std");
+    const issuer = @import("ocg2_authority_issuer.zig");
+    try std.testing.expect(!@hasDecl(@This(), "ocg2_authority_issuer"));
+    try std.testing.expect(switch (@typeInfo(issuer.Ocg2AuthorityIssuer)) {
+        .@"opaque" => true,
+        else => false,
+    });
+    try std.testing.expect(@hasDecl(issuer.Ocg2AuthorityIssuer, "executeAuthorized"));
+    try std.testing.expect(!@hasDecl(issuer, "executeAuthorized"));
+    inline for (.{
+        "identity",    "services",       "clock",
+        "registry",    "mutex",          "poisoned",
+        "closed",      "after_allocate", "after_commit",
+        "hook_ctx",    "hooks",          "sign_kp",
+        "declassify",  "Impl",           "asImpl",
+        "testHooks",   "testWipeSigner", "issue",
+        "grant",       "revoke",         "issueGrant",
+        "issueRevoke", "executeGrant",   "executeRevoke",
+        "transmit",
+    }) |name| {
+        try std.testing.expect(!@hasDecl(issuer.Ocg2AuthorityIssuer, name));
+        try std.testing.expect(!@hasDecl(issuer, name));
+    }
+}
+
+test "OCG2SCHED external import cannot reach apply grant session or export" {
+    const std = @import("std");
+    const schedule = @import("ocg2_reconcile_schedule.zig");
+    try std.testing.expect(!@hasDecl(@This(), "ocg2_reconcile_schedule"));
+    const allowed = .{
+        "Phase",   "InvalidReason", "ReinspectHint",
+        "Summary", "BuildResult",   "build",
+    };
+    const names = @typeInfo(schedule).@"struct".decl_names;
+    try std.testing.expectEqual(@as(usize, allowed.len), names.len);
+    inline for (names) |name| {
+        var found = false;
+        inline for (allowed) |allowed_name| {
+            if (std.mem.eql(u8, name, allowed_name)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(schedule.ReinspectHint).@"struct".decl_names.len);
+    try std.testing.expect(!@hasDecl(schedule, "TransactionCopy"));
+    try std.testing.expect(!@hasDecl(schedule, "max_account_len"));
+    try std.testing.expect(!@hasDecl(schedule, "max_wire_len"));
+    try std.testing.expect(!@hasDecl(schedule, "digest_len"));
+    try std.testing.expect(!@hasDecl(schedule, "authority_pubkey_len"));
+    try std.testing.expect(!@hasDecl(schedule.ReinspectHint, "account"));
+    inline for (.{
+        "apply",   "execute",        "grant",
+        "revoke",  "mint",           "transmit",
+        "session", "callback",       "executeAuthorized",
+        "issue",   "ProjectionData", "DurableOperLookup",
+        "Visitor", "reconcile",      "buildAlloc",
+    }) |name| {
+        try std.testing.expect(!@hasDecl(schedule, name));
+    }
+}
+
+test "OCG2WORK external import cannot reach apply grant session or export" {
+    const std = @import("std");
+    const workset = @import("ocg2_reconcile_workset.zig");
+    try std.testing.expect(!@hasDecl(@This(), "ocg2_reconcile_workset"));
+    const allowed = .{
+        "Cause",   "InvalidReason", "BaselineEntry", "WorkItem",
+        "Summary", "BuildResult",   "max_entries",   "build",
+    };
+    const names = @typeInfo(workset).@"struct".decl_names;
+    try std.testing.expectEqual(@as(usize, allowed.len), names.len);
+    inline for (names) |name| {
+        var found = false;
+        inline for (allowed) |allowed_name| {
+            if (std.mem.eql(u8, name, allowed_name)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(workset.BaselineEntry).@"struct".decl_names.len);
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(workset.WorkItem).@"struct".decl_names.len);
+    try std.testing.expectEqual(workset.max_entries, @import("durable_oper_authority.zig").max_records);
+    try std.testing.expect(!@hasDecl(workset, "Phase"));
+    try std.testing.expect(!@hasDecl(workset, "ReinspectHint"));
+    try std.testing.expect(!@hasDecl(workset, "TransactionCopy"));
+    inline for (@typeInfo(workset.BaselineEntry).@"struct".field_types) |field_type| {
+        try std.testing.expect(switch (@typeInfo(field_type)) {
+            .pointer => false,
+            else => true,
+        });
+    }
+    inline for (@typeInfo(workset.WorkItem).@"struct".field_types) |field_type| {
+        try std.testing.expect(switch (@typeInfo(field_type)) {
+            .pointer => false,
+            else => true,
+        });
+    }
+    inline for (.{
+        "apply",          "execute",           "grant",
+        "revoke",         "mint",              "transmit",
+        "session",        "callback",          "Visitor",
+        "ProjectionData", "DurableOperLookup", "Services",
+        "Store",          "reconcile",         "executeAuthorized",
+    }) |name| {
+        try std.testing.expect(!@hasDecl(workset, name));
+    }
+}
+
+test "S6C6 external import cannot reach runtime privilege surface" {
+    const std = @import("std");
+    const dst = @import("ocg2_transaction_dst.zig");
+    try std.testing.expect(!@hasDecl(@This(), "ocg2_transaction_dst"));
+    const allowed = .{
+        "Phase", "Input", "Output", "World", "step", "run",
+    };
+    const names = @typeInfo(dst).@"struct".decl_names;
+    try std.testing.expectEqual(@as(usize, allowed.len), names.len);
+    inline for (names) |name| {
+        var found = false;
+        inline for (allowed) |allowed_name| {
+            if (std.mem.eql(u8, name, allowed_name)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(dst.Input).@"struct".decl_names.len);
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(dst.Output).@"struct".decl_names.len);
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(dst.World).@"struct".decl_names.len);
+    inline for (@typeInfo(dst.Input).@"struct".field_types) |field_type| {
+        try std.testing.expect(switch (@typeInfo(field_type)) {
+            .pointer => false,
+            else => true,
+        });
+    }
+    inline for (@typeInfo(dst.Output).@"struct".field_types) |field_type| {
+        try std.testing.expect(switch (@typeInfo(field_type)) {
+            .pointer => false,
+            else => true,
+        });
+    }
+    inline for (@typeInfo(dst.World).@"struct".field_types) |field_type| {
+        try std.testing.expect(switch (@typeInfo(field_type)) {
+            .pointer => false,
+            else => true,
+        });
+    }
+    inline for (.{
+        "apply",          "execute",           "grant",
+        "revoke",         "mint",              "transmit",
+        "session",        "callback",          "Visitor",
+        "ProjectionData", "DurableOperLookup", "Services",
+        "Store",          "reconcile",         "executeAuthorized",
+    }) |name| {
+        try std.testing.expect(!@hasDecl(dst, name));
+    }
 }

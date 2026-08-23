@@ -274,7 +274,7 @@ pub const ResponseBuilder = struct {
         try validateTargetBuild(target);
 
         try self.writeOpen(ref, target);
-        for (messages) |message| try self.writeMessage(target, message);
+        for (messages) |message| try self.writeMessage(ref, target, message);
         try self.writeClose(ref);
         return self.slice();
     }
@@ -289,13 +289,15 @@ pub const ResponseBuilder = struct {
         try self.checkLineLen(start);
     }
 
-    fn writeMessage(self: *ResponseBuilder, target: []const u8, message: Message) BuildError!void {
+    fn writeMessage(self: *ResponseBuilder, ref: []const u8, target: []const u8, message: Message) BuildError!void {
         try validateMessage(message);
         var timestamp_buf: [24]u8 = undefined;
         const timestamp = try formatTimestamp(message.timestamp_ms, &timestamp_buf);
 
         const start = self.writer.len;
-        try self.writer.append("@time=");
+        try self.writer.append("@batch=");
+        try self.writer.append(ref);
+        try self.writer.append(";time=");
         try self.writer.append(timestamp);
         try self.writer.append(";msgid=");
         try self.writer.append(message.msgid);
@@ -429,15 +431,25 @@ fn validMsgid(msgid: []const u8, max_len: usize) bool {
 
 fn validateBatchRef(ref: []const u8) BuildError!void {
     if (ref.len == 0 or ref.len > max_batch_ref_len) return error.INVALID_PARAMS;
-    for (ref) |byte| {
-        if (byte <= ' ' or byte == 0x7f or byte == '+' or byte == '-') return error.INVALID_PARAMS;
-    }
+    for (ref) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-' => {},
+        else => return error.INVALID_PARAMS,
+    };
 }
 
 fn validateMessage(message: Message) BuildError!void {
     if (!validMsgid(message.msgid, max_msgid_len)) return error.INVALID_PARAMS;
     if (!validAtom(message.sender, max_sender_len)) return error.INVALID_PARAMS;
+    if (!validCommand(message.command)) return error.INVALID_PARAMS;
     if (!validText(message.text)) return error.INVALID_PARAMS;
+}
+
+fn validCommand(command: []const u8) bool {
+    if (command.len == 0) return false;
+    for (command) |byte| {
+        if (!std.ascii.isAlphanumeric(byte)) return false;
+    }
+    return true;
 }
 
 fn validAtom(atom: []const u8, max_len: usize) bool {
@@ -596,7 +608,7 @@ test "response builder writes exact chathistory batch bytes" {
 
     try std.testing.expectEqualStrings(
         "BATCH +sxtUfAeXBgNoD chathistory #channel\r\n" ++
-            "@time=2015-06-26T19:40:31.230Z;msgid=abc123 :foo!foo@example.com PRIVMSG #channel :I like turtles.\r\n" ++
+            "@batch=sxtUfAeXBgNoD;time=2015-06-26T19:40:31.230Z;msgid=abc123 :foo!foo@example.com PRIVMSG #channel :I like turtles.\r\n" ++
             "BATCH -sxtUfAeXBgNoD\r\n",
         line,
     );
@@ -608,8 +620,20 @@ test "response builder rejects bad output and fields" {
 
     var out: [256]u8 = undefined;
     try std.testing.expectError(error.INVALID_TARGET, writeBatch(&out, "ref", "*", &.{}));
-    try std.testing.expectError(error.INVALID_PARAMS, writeBatch(&out, "bad ref", "#channel", &.{}));
+    _ = try writeBatch(&out, "safe-ref-1", "#channel", &.{});
+    for ([_][]const u8{ "", "bad ref", "bad;ref", "bad=ref", "bad/ref", "bad_ref", "bad.ref", "bad\x7fref" }) |bad_ref| {
+        try std.testing.expectError(error.INVALID_PARAMS, writeBatch(&out, bad_ref, "#channel", &.{}));
+    }
+    var overlong_ref: [max_batch_ref_len + 1]u8 = undefined;
+    @memset(&overlong_ref, 'a');
+    try std.testing.expectError(error.INVALID_PARAMS, writeBatch(&out, &overlong_ref, "#channel", &.{}));
     try std.testing.expectError(error.INVALID_PARAMS, writeBatch(&out, "ref", "#channel", &.{
         .{ .timestamp_ms = 0, .msgid = "bad;id", .sender = "foo", .text = "hi" },
+    }));
+    try std.testing.expectError(error.INVALID_PARAMS, writeBatch(&out, "ref", "#channel", &.{
+        .{ .timestamp_ms = 0, .msgid = "m1", .sender = "foo", .command = "PRIVMSG\r\nNOTICE", .text = "hi" },
+    }));
+    try std.testing.expectError(error.INVALID_PARAMS, writeBatch(&out, "ref", "#channel", &.{
+        .{ .timestamp_ms = 0, .msgid = "m1", .sender = "foo", .command = "BAD COMMAND", .text = "hi" },
     }));
 }

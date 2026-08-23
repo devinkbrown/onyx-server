@@ -1,0 +1,255 @@
+{
+  "schema": "onyx-client-server-contract/v2",
+  "revision": 3,
+  "transport": {
+    "websocket": "one IRC message per frame; no trailing frame bytes"
+  },
+  "capabilities": {
+    "required_for_first_party_client": [
+      "message-tags",
+      "server-time",
+      "batch",
+      "labeled-response",
+      "echo-message",
+      "draft/chathistory"
+    ],
+    "vendor": {
+      "onyx/session-sync": "same-account attachment synchronization",
+      "onyx/bouncer": "automatic history rewind",
+      "onyx/topics": "named conversation tags and history",
+      "onyx/e2ee": "permits the +onyx/e2ee message tag and E2EEGROUP eligibility"
+    }
+  },
+  "server": {
+    "group_control": "production_active",
+    "group_control_semantics": "authenticated membership policy and opaque E2EEGROUP control-record delivery are live, including mesh hop custody and exact-once replay metadata",
+    "local_authoring_default": true,
+    "local_authoring_quiesce": "operator-only E2EEGROUP ON|OFF|STATUS; inbound relay, ACK, and retry stay live while quiesced"
+  },
+  "client": {
+    "group_control_observer": {
+      "status": "production_wired",
+      "owner": "connection_and_account_owned_bridge",
+      "server_reply_authentication": "E2EEKEY replies are accepted only from the exact server prefix learned from 001",
+      "consumes": [
+        "E2EE.KEYPACKAGE",
+        "E2EE.COMMIT",
+        "E2EE.WELCOME"
+      ],
+      "does_not_consume": "inbound E2EEGROUP"
+    },
+    "group_control_runtime": {
+      "status": "production_wired",
+      "trusted_directory_verification": "production_wired",
+      "genesis_session_provisioning": "production_wired",
+      "genesis_semantics": "authenticated OGC1-v2 commit and welcome pairs may provision an ephemeral epoch-1 GroupSession only for epoch 0 to 1, priorEpoch 0, a zero prior commit hash, and exact routing, identity, commit, membership, body, context, and epoch-key-commitment binding",
+      "higher_epoch_semantics": "requires an existing current session or explicit recovery",
+      "session_persistence": "activation_hold"
+    },
+    "group_message_crypto": {
+      "envelope_helpers": "implemented",
+      "store_seal": "production_wired_required_rooms",
+      "store_open": "production_wired_ephemeral_session",
+      "outbound": "required rooms seal through the private connection-owned runtime, tag onyx/e2ee=mls, and fail closed without a live session; plaintext is not queued or scheduled at rest",
+      "inbound": "ONYXROOM1 remains ciphertext in store text; a matching live session may attach transient plaintext after exact async ownership revalidation, otherwise it renders locked"
+    }
+  },
+  "eligibility": {
+    "guest": {
+      "onyx_e2ee_negotiation": "allowed",
+      "reusable_session_required": false,
+      "authoring": "FAIL E2EEGROUP NOT_LOGGED_IN",
+      "recipient": "ineligible; no reusable session row"
+    },
+    "authenticated_no_reusable_session": {
+      "fail_closed": true,
+      "negotiation": "FAIL E2EEGROUP SESSION_UNAVAILABLE; connection closes before autojoin or further participation",
+      "authoring_defense": "WARN E2EEGROUP TEMPORARILY_UNAVAILABLE; a reusable session is required for group E2EE"
+    }
+  },
+  "session": {
+    "commands": [
+      "SESSION TOKEN",
+      "SESSION MTOKEN",
+      "SESSION RESUME <token>"
+    ],
+    "resume": {
+      "invariant": "A successful same-account resume preserves the logical attachment without duplicate JOIN or MODE events.",
+      "live_sibling": "attach without disconnecting the source",
+      "detached_ghost": "restore snapshot then replace the ghost; the token remains reusable",
+      "mesh_token": "non-local-length hex is a mesh-sealed reclaim credential, not a one-shot replay nonce"
+    },
+    "replay_live_separation": {
+      "live_commands": "processLiveLine is the only client-command admission path",
+      "history_replay": "CHATHISTORY and bouncer rewind replay stored events; they do not re-author live commands",
+      "helix_e2ee_group": "EGRG Helix checkpoints are replay metadata only; opaque payloads and hop-custody wires never enter Helix",
+      "session_resume": "snapshot or live-sibling attach; original JOIN/PART/QUIT live commands are not replayed"
+    }
+  },
+  "e2ee_group": {
+    "content_envelope": "ONYXROOM1",
+    "message_tag": "+onyx/e2ee=mls",
+    "message_tag_semantics": "internal MLS-family marker only; does not claim RFC 9420 wire interoperability",
+    "trusted_signer": {
+      "requirement": "mandatory_external",
+      "semantics": "verification requires an externally supplied trusted Ed25519 public key; the wire signer_pub must equal that key and is never account authentication by itself"
+    },
+    "server_secrets": "none",
+    "persistence": {
+      "group_secrets": "none",
+      "offline_recipient": "none",
+      "opaque_control_payload": "none_durable",
+      "allowed_transient": [
+        "bounded_ads1_attachment_spool",
+        "ram_mesh_hop_custody_until_ack"
+      ],
+      "helix_checkpoint": "replay_metadata_only"
+    },
+    "required_policy": {
+      "status": "production_active",
+      "admission": "tag_and_body",
+      "tag": "+onyx/e2ee=mls",
+      "body": "canonical ONYXROOM1 envelope",
+      "body_validation": "exact prefix, canonical unpadded base64url, version 1, decoded length at least 33 bytes, and bounded by the server message limit",
+      "server_validation": "structural only; the daemon neither decrypts nor authenticates ciphertext",
+      "local_privmsg_failure": "FAIL PRIVMSG E2EE_REQUIRED",
+      "local_notice_failure": "silent_drop",
+      "mesh_relay_failure": "permanent_reject",
+      "tagmsg": "admitted as a tag-only command without a text envelope"
+    },
+    "control_records": [
+      "key-package",
+      "welcome",
+      "commit"
+    ],
+    "control_command": {
+      "name": "E2EEGROUP",
+      "ircx_required": true,
+      "cap_required": "onyx/e2ee",
+      "forms": [
+        "<channel> <key-package|commit> <from-device> :<opaque-base64url>",
+        "<channel> welcome <from-device> <to-account> <to-device> :<opaque-base64url>"
+      ],
+      "limits": {
+        "channel_bytes": 128,
+        "device_id_bytes": 32,
+        "account_bytes": 64,
+        "payload_b64url_chars": 4096
+      },
+      "payload_encoding": "canonical base64url without padding",
+      "delivery": {
+        "channel_record": ":<source-prefix> E2EE.KEYPACKAGE|E2EE.COMMIT <channel> <from-account> <from-device> :<opaque-base64url>",
+        "welcome_record": ":<source-prefix> E2EE.WELCOME <channel> <from-account> <from-device> <to-account> <to-device> :<opaque-base64url>",
+        "recipient_gate": "onyx/e2ee negotiated, locally joined to the channel, and attached to a reusable session",
+        "welcome_absence": "explicit TARGET_UNAVAILABLE failure; no offline-recipient persistence"
+      }
+    }
+  },
+  "presence": {
+    "quit": {
+      "scope": "identity_wide",
+      "delivery": "exactly_once",
+      "mesh_marker": "ONYX-QUIT",
+      "client_visible": "one identity-wide QUIT; per-channel membership withdrawals converge separately",
+      "sibling_attachment": "handoff without identity-wide QUIT"
+    },
+    "part": {
+      "scope": "channel_local",
+      "channels": "comma-separated list with a shared reason",
+      "intent": "one-way exact-token withdrawal of the named channels only"
+    }
+  },
+  "message_policy_vectors": {
+    "accepted": {
+      "required_room_ciphertext": {
+        "line": "@+onyx/e2ee=mls PRIVMSG #secure :ONYXROOM1 AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "outcome": "accepted"
+      },
+      "required_room_tagmsg": {
+        "line": "@+typing=active TAGMSG #secure",
+        "outcome": "accepted"
+      }
+    },
+    "rejected": {
+      "tagged_plaintext": {
+        "line": "@+onyx/e2ee=mls PRIVMSG #secure :plaintext",
+        "fail": "FAIL PRIVMSG E2EE_REQUIRED"
+      },
+      "untagged_envelope": {
+        "line": "PRIVMSG #secure :ONYXROOM1 AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "fail": "FAIL PRIVMSG E2EE_REQUIRED"
+      },
+      "wrong_tag_value": {
+        "line": "@+onyx/e2ee=1 PRIVMSG #secure :ONYXROOM1 AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "fail": "FAIL PRIVMSG E2EE_REQUIRED"
+      },
+      "malformed_envelope": {
+        "line": "@+onyx/e2ee=mls PRIVMSG #secure :ONYXROOM1 not+base64url",
+        "fail": "FAIL PRIVMSG E2EE_REQUIRED"
+      }
+    }
+  },
+  "command_vectors": {
+    "accepted": {
+      "key_package_channel": {
+        "line": "E2EEGROUP #secure key-package phone :AQIDBA",
+        "delivery": ":Alice!alice@localhost E2EE.KEYPACKAGE #secure alice phone :AQIDBA"
+      },
+      "commit_channel": {
+        "line": "E2EEGROUP #secure commit phone :b3BhcXVl",
+        "delivery": ":Alice!alice@localhost E2EE.COMMIT #secure alice phone :b3BhcXVl"
+      },
+      "welcome_targeted": {
+        "line": "E2EEGROUP #secure welcome phone Bob tablet :d2VsY29tZQ",
+        "delivery": ":Alice!alice@localhost E2EE.WELCOME #secure alice phone Bob tablet :d2VsY29tZQ"
+      },
+      "commit_payload_bound": {
+        "line": "E2EEGROUP #secure commit phone :<payload>",
+        "payload_repeat": {
+          "char": "A",
+          "count": 4096
+        },
+        "delivery_verb": "E2EE.COMMIT"
+      }
+    },
+    "rejected": {
+      "bad_payload_noncanonical": {
+        "line": "E2EEGROUP #secure commit phone :not+base64url",
+        "fail": "FAIL E2EEGROUP BAD_PAYLOAD"
+      },
+      "device_not_owned": {
+        "line": "E2EEGROUP #secure commit missing :AQIDBA",
+        "fail": "FAIL E2EEGROUP DEVICE_NOT_OWNED"
+      },
+      "welcome_unknown_device": {
+        "line": "E2EEGROUP #secure welcome phone bob missing :AQIDBA",
+        "fail": "FAIL E2EEGROUP TARGET_UNAVAILABLE"
+      },
+      "welcome_target_not_in_channel": {
+        "line": "E2EEGROUP #secure welcome phone carol laptop :AQIDBA",
+        "fail": "FAIL E2EEGROUP TARGET_UNAVAILABLE"
+      },
+      "guest_authoring": {
+        "line": "E2EEGROUP #secure commit phone :AQIDBA",
+        "fail": "FAIL E2EEGROUP NOT_LOGGED_IN"
+      },
+      "missing_cap": {
+        "line": "E2EEGROUP #secure commit phone :AQIDBA",
+        "fail": "FAIL E2EEGROUP CAP_REQUIRED"
+      },
+      "missing_ircx": {
+        "line": "E2EEGROUP #secure commit phone :AQIDBA",
+        "fail": "FAIL E2EEGROUP IRCX_REQUIRED"
+      },
+      "sender_not_on_channel": {
+        "line": "E2EEGROUP #secure commit phone :AQIDBA",
+        "fail": "FAIL E2EEGROUP NOT_ON_CHANNEL"
+      },
+      "authenticated_no_reusable_session": {
+        "line": "CAP REQ :onyx/e2ee",
+        "fail": "FAIL E2EEGROUP SESSION_UNAVAILABLE",
+        "closes_connection": true
+      }
+    }
+  }
+}

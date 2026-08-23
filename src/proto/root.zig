@@ -281,6 +281,7 @@ pub const services_alias = @import("services_alias.zig");
 pub const session_portability = @import("session_portability.zig");
 pub const session_reclaim_attachment = @import("session_reclaim_attachment.zig");
 pub const session_reclaim_mesh = @import("session_reclaim_mesh.zig");
+pub const session_resume_credential = @import("session_resume_credential.zig");
 pub const session_replica_frame = @import("session_replica_frame.zig");
 pub const setname_chghost_notify = @import("setname_chghost_notify.zig");
 pub const sframe = @import("sframe.zig");
@@ -636,6 +637,7 @@ test {
     _ = session_portability;
     _ = session_reclaim_attachment;
     _ = session_reclaim_mesh;
+    _ = session_resume_credential;
     _ = session_replica_frame;
     _ = setname_chghost_notify;
     _ = sframe;

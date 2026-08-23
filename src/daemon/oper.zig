@@ -137,6 +137,30 @@ pub const OperPrivileges = struct {
     }
 };
 
+/// OCG2 deliberately exports only moderation/continuity authority. Lifecycle,
+/// mesh, services, grant-management, visibility, audit, and subscription bits
+/// remain local to the authenticating node.
+pub const ocg2_exportable_privileges = OperPrivileges.initMany(&.{
+    .client_moderate,
+    .channel_moderate,
+    .client_kill,
+    .oper_override,
+    .limit_exempt,
+});
+
+pub const ocg2_exportable_bits = ocg2_exportable_privileges.toBits();
+
+pub const Ocg2ExportError = error{NonExportablePrivilege};
+
+/// Convert a typed local privilege set to the exact OCG2 subset. Refuse the
+/// whole record if any local-only bit is present; silently narrowing a grant
+/// would make the signed statement differ from operator intent.
+pub fn ocg2ExportBits(privileges: OperPrivileges) Ocg2ExportError!u64 {
+    const bits = privileges.toBits();
+    if (bits & ~ocg2_exportable_bits != 0) return error.NonExportablePrivilege;
+    return bits;
+}
+
 /// One account-to-operator-class binding. Slices are borrowed by the registry.
 pub const OperBinding = struct {
     account_name: []const u8,
@@ -361,6 +385,37 @@ fn isBoundedAccountName(comptime params: Params, account_name: []const u8) bool 
 
 fn accountNameEqual(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+test "OCG2 export policy permits only frozen cross-mesh privileges" {
+    const codec = @import("../proto/oper_cred_share.zig");
+    const expected = OperPrivileges.initMany(&.{
+        .client_moderate,
+        .channel_moderate,
+        .client_kill,
+        .oper_override,
+        .limit_exempt,
+    });
+    try std.testing.expectEqual(expected.toBits(), ocg2_exportable_bits);
+    try std.testing.expectEqual(codec.ocg2_exportable_bits, ocg2_exportable_bits);
+    try std.testing.expectEqual(ocg2_exportable_bits, try ocg2ExportBits(expected));
+    try std.testing.expectEqual(@as(u64, 0), try ocg2ExportBits(.empty));
+    inline for (.{
+        Privilege.server_rehash,
+        .server_restart,
+        .server_shutdown,
+        .mesh_admin,
+        .service_admin,
+        .server_admin,
+        .oper_grant,
+        .oper_spy,
+        .event_subscribe,
+        .audit_read,
+    }) |local_only| {
+        var mixed = expected;
+        mixed.insert(local_only);
+        try std.testing.expectError(error.NonExportablePrivilege, ocg2ExportBits(mixed));
+    }
 }
 
 test "privilege bitmask round-trips through toBits/fromBits" {

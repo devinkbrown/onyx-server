@@ -21,6 +21,9 @@
 const std = @import("std");
 
 const Ed25519 = std.crypto.sign.Ed25519;
+const node_identity = @import("../daemon/node_identity.zig");
+const node_short_id = @import("../crypto/node_short_id.zig");
+const node_sign = @import("../crypto/sign.zig");
 
 /// Length of a raw Ed25519 signature.
 pub const signature_len = Ed25519.Signature.encoded_length;
@@ -246,6 +249,258 @@ pub fn verify(pubkey: Ed25519.PublicKey, bytes: []const u8, now_ms: u64) VerifyE
 
     if (now_ms >= fields.expiry_ms) return error.Expired;
     return fields;
+}
+
+// ---------------------------------------------------------------------------
+// OCG2 — inactive canonical authority records
+// ---------------------------------------------------------------------------
+
+/// OCG1 remains recognizable only so a future ingress lane can count legacy
+/// traffic. No OCG1 field is promoted into the OCG2 authority model here.
+pub const WireGeneration = enum { unknown, legacy_ocg1, ocg2 };
+
+pub const ocg2_domain = "ONYX-OPER-GRANT-v2\x00";
+pub const ocg2_max_account_len: usize = 32;
+pub const ocg2_max_class_len: usize = 32;
+pub const ocg2_max_title_len: usize = 96;
+pub const ocg2_max_future_skew_ms: u64 = 5 * 60 * 1000;
+pub const ocg2_max_ttl_ms: u64 = 24 * 60 * 60 * 1000;
+pub const ocg2_pubkey_len: usize = Ed25519.PublicKey.encoded_length;
+pub const ocg2_exportable_bits: u64 =
+    (@as(u64, 1) << 3) | // client_moderate
+    (@as(u64, 1) << 4) | // channel_moderate
+    (@as(u64, 1) << 5) | // client_kill
+    (@as(u64, 1) << 13) | // oper_override
+    (@as(u64, 1) << 14); // limit_exempt
+
+pub const Ocg2Kind = enum(u8) { grant = 1, tombstone = 2 };
+
+pub const Ocg2Fields = struct {
+    kind: Ocg2Kind,
+    account: []const u8,
+    revision: u64,
+    privilege_bits: u64,
+    class: []const u8,
+    title: []const u8,
+    authority_node_id: u64,
+    authority_pubkey: [ocg2_pubkey_len]u8,
+    issued_ms: u64,
+    expiry_ms: u64,
+};
+
+pub const Ocg2Error = error{
+    BufferTooSmall,
+    BadFormat,
+    BadSignature,
+    WrongAuthority,
+    InvalidAccount,
+    InvalidText,
+    InvalidRevision,
+    InvalidPrivileges,
+    InvalidTime,
+    Expired,
+    SignFailed,
+};
+
+const ocg2_fixed_len = ocg2_domain.len + 1 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 1 + ocg2_pubkey_len;
+pub const ocg2_max_wire_len = ocg2_fixed_len + ocg2_max_account_len + ocg2_max_class_len + ocg2_max_title_len + signature_len;
+
+pub fn classifyWire(bytes: []const u8) WireGeneration {
+    if (bytes.len >= ocg2_domain.len and std.mem.eql(u8, bytes[0..ocg2_domain.len], ocg2_domain)) return .ocg2;
+    if (bytes.len >= 4 and std.mem.readInt(u32, bytes[0..4], .big) == magic) return .legacy_ocg1;
+    return .unknown;
+}
+
+fn ocg2ValidAccount(account: []const u8) bool {
+    if (account.len == 0 or account.len > ocg2_max_account_len) return false;
+    for (account) |byte| {
+        const canonical = (byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or
+            byte == '_' or byte == '.' or byte == '-';
+        if (!canonical) return false;
+    }
+    return true;
+}
+
+fn ocg2ValidText(value: []const u8, max_len: usize) bool {
+    if (value.len > max_len) return false;
+    for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
+
+fn ocg2ShortId(public_key: [ocg2_pubkey_len]u8) u64 {
+    return node_short_id.shortId(node_identity.nodeIdFromPublicKey(public_key));
+}
+
+fn validateOcg2(fields: Ocg2Fields, now_ms: u64) Ocg2Error!void {
+    if (!ocg2ValidAccount(fields.account)) return error.InvalidAccount;
+    if (fields.revision == 0) return error.InvalidRevision;
+    if (!ocg2ValidText(fields.class, ocg2_max_class_len) or
+        !ocg2ValidText(fields.title, ocg2_max_title_len)) return error.InvalidText;
+    if (fields.authority_node_id == 0 or ocg2ShortId(fields.authority_pubkey) != fields.authority_node_id)
+        return error.WrongAuthority;
+    const latest_issue = std.math.add(u64, now_ms, ocg2_max_future_skew_ms) catch std.math.maxInt(u64);
+    if (fields.issued_ms > latest_issue) return error.InvalidTime;
+    switch (fields.kind) {
+        .grant => {
+            if (fields.class.len == 0) return error.InvalidText;
+            if (fields.privilege_bits == 0 or fields.privilege_bits & ~ocg2_exportable_bits != 0)
+                return error.InvalidPrivileges;
+            if (fields.expiry_ms <= fields.issued_ms) return error.InvalidTime;
+            if (fields.expiry_ms <= now_ms) return error.Expired;
+            if (fields.expiry_ms - fields.issued_ms > ocg2_max_ttl_ms) return error.InvalidTime;
+        },
+        .tombstone => {
+            if (fields.privilege_bits != 0 or fields.expiry_ms != 0 or
+                fields.class.len != 0 or fields.title.len != 0) return error.BadFormat;
+        },
+    }
+}
+
+fn encodeOcg2Signed(out: []u8, fields: Ocg2Fields) Ocg2Error!usize {
+    var pos: usize = 0;
+    const Put = struct {
+        fn raw(dst: []u8, at: *usize, bytes: []const u8) Ocg2Error!void {
+            if (bytes.len > dst.len -| at.*) return error.BufferTooSmall;
+            @memcpy(dst[at.*..][0..bytes.len], bytes);
+            at.* += bytes.len;
+        }
+        fn byte(dst: []u8, at: *usize, value: u8) Ocg2Error!void {
+            return raw(dst, at, &.{value});
+        }
+        fn u64be(dst: []u8, at: *usize, value: u64) Ocg2Error!void {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, value, .big);
+            return raw(dst, at, &bytes);
+        }
+        fn field(dst: []u8, at: *usize, value: []const u8) Ocg2Error!void {
+            if (value.len > std.math.maxInt(u8)) return error.BadFormat;
+            try byte(dst, at, @intCast(value.len));
+            try raw(dst, at, value);
+        }
+    };
+    try Put.raw(out, &pos, ocg2_domain);
+    try Put.byte(out, &pos, @intFromEnum(fields.kind));
+    try Put.u64be(out, &pos, fields.authority_node_id);
+    try Put.u64be(out, &pos, fields.revision);
+    try Put.u64be(out, &pos, fields.issued_ms);
+    try Put.u64be(out, &pos, fields.expiry_ms);
+    try Put.u64be(out, &pos, fields.privilege_bits);
+    try Put.field(out, &pos, fields.account);
+    try Put.field(out, &pos, fields.class);
+    try Put.field(out, &pos, fields.title);
+    try Put.raw(out, &pos, &fields.authority_pubkey);
+    return pos;
+}
+
+pub fn validateOcg2Fields(fields: Ocg2Fields, now_ms: u64) Ocg2Error!void {
+    return validateOcg2(fields, now_ms);
+}
+
+pub fn signOcg2(kp: Ed25519.KeyPair, fields: Ocg2Fields, now_ms: u64, out: []u8) Ocg2Error!usize {
+    if (!std.mem.eql(u8, &kp.public_key.toBytes(), &fields.authority_pubkey)) return error.WrongAuthority;
+    try validateOcg2(fields, now_ms);
+    const signed_len = try encodeOcg2Signed(out, fields);
+    if (signature_len > out.len -| signed_len) return error.BufferTooSmall;
+    const sig = kp.sign(out[0..signed_len], null) catch return error.SignFailed;
+    @memcpy(out[signed_len..][0..signature_len], &sig.toBytes());
+    return signed_len + signature_len;
+}
+
+/// Sign one canonical OCG2 record with the process node key. Signing uses
+/// `kp.sign` directly and never declassifies or copies the seed.
+pub fn signOcg2WithNodeKey(
+    kp: *const node_sign.KeyPair,
+    fields: Ocg2Fields,
+    now_ms: u64,
+    out: []u8,
+) Ocg2Error!usize {
+    if (!std.crypto.timing_safe.eql(
+        [ocg2_pubkey_len]u8,
+        kp.public_key,
+        fields.authority_pubkey,
+    )) return error.WrongAuthority;
+    try validateOcg2(fields, now_ms);
+    const signed_len = try encodeOcg2Signed(out, fields);
+    if (signature_len > out.len -| signed_len) return error.BufferTooSmall;
+    const sig = kp.sign(out[0..signed_len]) catch return error.SignFailed;
+    @memcpy(out[signed_len..][0..signature_len], &sig);
+    return signed_len + signature_len;
+}
+
+pub fn verifyOcg2(
+    bytes: []const u8,
+    expected_authority: Ed25519.PublicKey,
+    expected_authority_node_id: u64,
+    now_ms: u64,
+) Ocg2Error!Ocg2Fields {
+    if (bytes.len < ocg2_fixed_len + signature_len or classifyWire(bytes) != .ocg2) return error.BadFormat;
+    const signed_len = bytes.len - signature_len;
+    var pos: usize = ocg2_domain.len;
+    const Take = struct {
+        fn raw(src: []const u8, at: *usize, len: usize) Ocg2Error![]const u8 {
+            if (len > src.len -| at.*) return error.BadFormat;
+            const value = src[at.*..][0..len];
+            at.* += len;
+            return value;
+        }
+        fn byte(src: []const u8, at: *usize) Ocg2Error!u8 {
+            return (try raw(src, at, 1))[0];
+        }
+        fn u64be(src: []const u8, at: *usize) Ocg2Error!u64 {
+            return std.mem.readInt(u64, (try raw(src, at, 8))[0..8], .big);
+        }
+        fn field(src: []const u8, at: *usize) Ocg2Error![]const u8 {
+            return raw(src, at, try byte(src, at));
+        }
+    };
+    const kind: Ocg2Kind = switch (try Take.byte(bytes[0..signed_len], &pos)) {
+        1 => .grant,
+        2 => .tombstone,
+        else => return error.BadFormat,
+    };
+    const authority_node_id = try Take.u64be(bytes[0..signed_len], &pos);
+    const revision = try Take.u64be(bytes[0..signed_len], &pos);
+    const issued_ms = try Take.u64be(bytes[0..signed_len], &pos);
+    const expiry_ms = try Take.u64be(bytes[0..signed_len], &pos);
+    const privilege_bits = try Take.u64be(bytes[0..signed_len], &pos);
+    const account = try Take.field(bytes[0..signed_len], &pos);
+    const class = try Take.field(bytes[0..signed_len], &pos);
+    const title = try Take.field(bytes[0..signed_len], &pos);
+    const authority_pubkey = (try Take.raw(bytes[0..signed_len], &pos, ocg2_pubkey_len))[0..ocg2_pubkey_len].*;
+    if (pos != signed_len) return error.BadFormat;
+    if (authority_node_id != expected_authority_node_id or
+        !std.mem.eql(u8, &authority_pubkey, &expected_authority.toBytes())) return error.WrongAuthority;
+    const signature = Ed25519.Signature.fromBytes(bytes[signed_len..][0..signature_len].*);
+    signature.verifyStrict(bytes[0..signed_len], expected_authority) catch return error.BadSignature;
+    const fields = Ocg2Fields{
+        .kind = kind,
+        .account = account,
+        .revision = revision,
+        .privilege_bits = privilege_bits,
+        .class = class,
+        .title = title,
+        .authority_node_id = authority_node_id,
+        .authority_pubkey = authority_pubkey,
+        .issued_ms = issued_ms,
+        .expiry_ms = expiry_ms,
+    };
+    try validateOcg2(fields, now_ms);
+    return fields;
+}
+
+pub const Ocg2RevisionRelation = enum { distinct_account, older, newer, replay, equivocation };
+
+pub fn ocg2RevisionRelation(a: Ocg2Fields, b: Ocg2Fields) Ocg2RevisionRelation {
+    if (!std.mem.eql(u8, a.account, b.account)) return .distinct_account;
+    if (a.revision < b.revision) return .older;
+    if (a.revision > b.revision) return .newer;
+    if (a.kind == b.kind and a.privilege_bits == b.privilege_bits and
+        std.mem.eql(u8, a.class, b.class) and std.mem.eql(u8, a.title, b.title) and
+        a.authority_node_id == b.authority_node_id and
+        std.mem.eql(u8, &a.authority_pubkey, &b.authority_pubkey) and
+        a.issued_ms == b.issued_ms and a.expiry_ms == b.expiry_ms) return .replay;
+    return .equivocation;
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +731,200 @@ fn expectFieldsEqual(a: GrantFields, b: GrantFields) !void {
     try testing.expectEqual(a.incarnation, b.incarnation);
     try testing.expectEqual(a.issued_ms, b.issued_ms);
     try testing.expectEqual(a.expiry_ms, b.expiry_ms);
+}
+
+fn ocg2TestFields(kp: Ed25519.KeyPair) Ocg2Fields {
+    const public_key = kp.public_key.toBytes();
+    return .{
+        .kind = .grant,
+        .account = "oper_alice",
+        .revision = 7,
+        .privilege_bits = (@as(u64, 1) << 3) | (@as(u64, 1) << 5) | (@as(u64, 1) << 14),
+        .class = "netadmin",
+        .title = "Network Guardian",
+        .authority_node_id = ocg2ShortId(public_key),
+        .authority_pubkey = public_key,
+        .issued_ms = 1_000_000,
+        .expiry_ms = 1_060_000,
+    };
+}
+
+/// Test-only authority signer for adversarial decoder fixtures. Production
+/// authoring always goes through `signOcg2`; this deliberately bypasses policy
+/// while retaining exact canonical framing and a valid authority signature.
+fn signOcg2UncheckedForTest(kp: Ed25519.KeyPair, fields: Ocg2Fields, out: []u8) !usize {
+    const signed_len = try encodeOcg2Signed(out, fields);
+    if (signature_len > out.len -| signed_len) return error.BufferTooSmall;
+    const signature = try kp.sign(out[0..signed_len], null);
+    @memcpy(out[signed_len..][0..signature_len], &signature.toBytes());
+    return signed_len + signature_len;
+}
+
+fn expectOcg2AccountRejectedBoth(
+    kp: Ed25519.KeyPair,
+    account: []const u8,
+    now_ms: u64,
+) !void {
+    var fields = ocg2TestFields(kp);
+    fields.account = account;
+    var wire: [ocg2_max_wire_len + 1]u8 = undefined;
+    try testing.expectError(error.InvalidAccount, signOcg2(kp, fields, now_ms, &wire));
+    const len = try signOcg2UncheckedForTest(kp, fields, &wire);
+    try testing.expectError(
+        error.InvalidAccount,
+        verifyOcg2(wire[0..len], kp.public_key, fields.authority_node_id, now_ms),
+    );
+}
+
+test "OCG2 deterministic known answer and exact configured authority" {
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x42)));
+    const fields = ocg2TestFields(kp);
+    var first: [ocg2_max_wire_len]u8 = undefined;
+    var second: [ocg2_max_wire_len]u8 = undefined;
+    const first_len = try signOcg2(kp, fields, fields.issued_ms, &first);
+    const second_len = try signOcg2(kp, fields, fields.issued_ms, &second);
+    try testing.expectEqual(first_len, second_len);
+    try testing.expectEqualSlices(u8, first[0..first_len], second[0..second_len]);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(first[0..first_len], &digest, .{});
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0x5a, 0x8a, 0x49, 0xe4, 0xc5, 0xcd, 0x60, 0xfd,
+        0x15, 0x9c, 0x01, 0x02, 0x4d, 0xdb, 0xba, 0xe5,
+        0xb2, 0x13, 0x91, 0x79, 0x7e, 0x01, 0xd2, 0xfc,
+        0xef, 0xe8, 0xd2, 0x1f, 0x4d, 0x39, 0xbe, 0xac,
+    }, &digest);
+    const decoded = try verifyOcg2(first[0..first_len], kp.public_key, fields.authority_node_id, fields.issued_ms);
+    try testing.expectEqual(fields.kind, decoded.kind);
+    try testing.expectEqualStrings(fields.account, decoded.account);
+    try testing.expectEqual(fields.revision, decoded.revision);
+    try testing.expectEqual(fields.privilege_bits, decoded.privilege_bits);
+    const other = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x43)));
+    try testing.expectError(error.WrongAuthority, verifyOcg2(first[0..first_len], other.public_key, fields.authority_node_id, fields.issued_ms));
+    try testing.expectError(error.WrongAuthority, verifyOcg2(first[0..first_len], kp.public_key, fields.authority_node_id ^ 1, fields.issued_ms));
+}
+
+test "OCG2 canonical account text privilege and time policy rejects adversarial inputs" {
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x44)));
+    const now: u64 = 1_000_000;
+    var out: [ocg2_max_wire_len]u8 = undefined;
+    var fields = ocg2TestFields(kp);
+    fields.issued_ms = now + ocg2_max_future_skew_ms;
+    fields.expiry_ms = fields.issued_ms + ocg2_max_ttl_ms;
+    fields.privilege_bits = ocg2_exportable_bits;
+    _ = try signOcg2(kp, fields, now, &out);
+    fields = ocg2TestFields(kp);
+    fields.account = "abcdefghijklmnopqrstuvwxyz012345";
+    _ = try signOcg2(kp, fields, now, &out);
+    inline for (.{
+        "",
+        "Oper_Alice",
+        "oper/alice",
+        "oper:alice",
+        "oper@alice",
+        "oper alice",
+        "abcdefghijklmnopqrstuvwxyz0123456",
+    }) |bad_account| try expectOcg2AccountRejectedBoth(kp, bad_account, now);
+    fields = ocg2TestFields(kp);
+    fields.class = "bad\nclass";
+    try testing.expectError(error.InvalidText, signOcg2(kp, fields, now, &out));
+    fields = ocg2TestFields(kp);
+    fields.class = &(@as([ocg2_max_class_len + 1]u8, @splat('x')));
+    try testing.expectError(error.InvalidText, signOcg2(kp, fields, now, &out));
+    fields = ocg2TestFields(kp);
+    fields.title = &(@as([ocg2_max_title_len + 1]u8, @splat('x')));
+    try testing.expectError(error.InvalidText, signOcg2(kp, fields, now, &out));
+    fields = ocg2TestFields(kp);
+    fields.revision = 0;
+    try testing.expectError(error.InvalidRevision, signOcg2(kp, fields, now, &out));
+    fields = ocg2TestFields(kp);
+    fields.privilege_bits |= @as(u64, 1) << 0;
+    try testing.expectError(error.InvalidPrivileges, signOcg2(kp, fields, now, &out));
+    fields = ocg2TestFields(kp);
+    fields.privilege_bits |= @as(u64, 1) << 63;
+    try testing.expectError(error.InvalidPrivileges, signOcg2(kp, fields, now, &out));
+    fields = ocg2TestFields(kp);
+    fields.authority_node_id ^= 1;
+    try testing.expectError(error.WrongAuthority, signOcg2(kp, fields, now, &out));
+    fields = ocg2TestFields(kp);
+    fields.issued_ms = now + ocg2_max_future_skew_ms + 1;
+    fields.expiry_ms = fields.issued_ms + 1;
+    try testing.expectError(error.InvalidTime, signOcg2(kp, fields, now, &out));
+    fields = ocg2TestFields(kp);
+    fields.expiry_ms = fields.issued_ms + ocg2_max_ttl_ms + 1;
+    try testing.expectError(error.InvalidTime, signOcg2(kp, fields, now, &out));
+    fields = ocg2TestFields(kp);
+    fields.issued_ms = now - 2;
+    fields.expiry_ms = now;
+    try testing.expectError(error.Expired, signOcg2(kp, fields, now, &out));
+}
+
+test "OCG2 tombstone is canonical and framing rejects truncation trailing and tampering" {
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x45)));
+    const now: u64 = 1_000_000;
+    var fields = ocg2TestFields(kp);
+    fields.kind = .tombstone;
+    fields.privilege_bits = 0;
+    fields.class = "";
+    fields.title = "";
+    fields.expiry_ms = 0;
+    var wire: [ocg2_max_wire_len + 1]u8 = undefined;
+    const len = try signOcg2(kp, fields, now, &wire);
+    const decoded = try verifyOcg2(wire[0..len], kp.public_key, fields.authority_node_id, now);
+    try testing.expectEqual(Ocg2Kind.tombstone, decoded.kind);
+    try testing.expectError(error.BadFormat, verifyOcg2(wire[0 .. len - 1], kp.public_key, fields.authority_node_id, now));
+    wire[len] = 0;
+    try testing.expectError(error.BadFormat, verifyOcg2(wire[0 .. len + 1], kp.public_key, fields.authority_node_id, now));
+    var bad = fields;
+    bad.privilege_bits = 1 << 3;
+    try testing.expectError(error.BadFormat, signOcg2(kp, bad, now, &wire));
+    bad = fields;
+    bad.expiry_ms = 1;
+    try testing.expectError(error.BadFormat, signOcg2(kp, bad, now, &wire));
+    const grant = ocg2TestFields(kp);
+    const grant_len = try signOcg2(kp, grant, now, &wire);
+    wire[ocg2_domain.len + 1 + 8 + 8 + 8 + 8] ^= 1;
+    try testing.expectError(error.BadSignature, verifyOcg2(wire[0..grant_len], kp.public_key, grant.authority_node_id, now));
+}
+
+test "OCG2 legacy recognition is metric only and equal revision divergence is equivocation input" {
+    var ocg1: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ocg1, magic, .big);
+    try testing.expectEqual(WireGeneration.legacy_ocg1, classifyWire(&ocg1));
+    try testing.expectEqual(WireGeneration.unknown, classifyWire("OCG0"));
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x46)));
+    var a = ocg2TestFields(kp);
+    var b = a;
+    try testing.expectEqual(Ocg2RevisionRelation.replay, ocg2RevisionRelation(a, b));
+    b.title = "Different signed title";
+    try testing.expectEqual(Ocg2RevisionRelation.equivocation, ocg2RevisionRelation(a, b));
+    b.revision += 1;
+    try testing.expectEqual(Ocg2RevisionRelation.older, ocg2RevisionRelation(a, b));
+    a.account = "other_oper";
+    try testing.expectEqual(Ocg2RevisionRelation.distinct_account, ocg2RevisionRelation(a, b));
+}
+
+test "OCG2ISSUER validateOcg2Fields and node-key signer share the canonical policy" {
+    const seed = @as([32]u8, @splat(0x47));
+    const std_kp = try Ed25519.KeyPair.generateDeterministic(seed);
+    var node_kp = try node_sign.KeyPair.fromSeed(seed);
+    defer node_kp.deinit();
+    const fields = ocg2TestFields(std_kp);
+    try validateOcg2Fields(fields, fields.issued_ms);
+    var std_wire: [ocg2_max_wire_len]u8 = undefined;
+    var node_wire: [ocg2_max_wire_len]u8 = undefined;
+    const std_len = try signOcg2(std_kp, fields, fields.issued_ms, &std_wire);
+    const node_len = try signOcg2WithNodeKey(&node_kp, fields, fields.issued_ms, &node_wire);
+    try testing.expectEqual(std_len, node_len);
+    try testing.expectEqualSlices(u8, std_wire[0..std_len], node_wire[0..node_len]);
+    const decoded = try verifyOcg2(node_wire[0..node_len], std_kp.public_key, fields.authority_node_id, fields.issued_ms);
+    try testing.expectEqualStrings(fields.account, decoded.account);
+    var bad = fields;
+    bad.privilege_bits |= 1;
+    try testing.expectError(error.InvalidPrivileges, validateOcg2Fields(bad, fields.issued_ms));
+    try testing.expectError(error.InvalidPrivileges, signOcg2WithNodeKey(&node_kp, bad, fields.issued_ms, &node_wire));
+    var other = try node_sign.KeyPair.fromSeed(@as([32]u8, @splat(0x48)));
+    defer other.deinit();
+    try testing.expectError(error.WrongAuthority, signOcg2WithNodeKey(&other, fields, fields.issued_ms, &node_wire));
 }
 
 test "sign and verify round-trip recovers all fields" {

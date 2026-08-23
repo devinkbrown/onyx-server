@@ -143,7 +143,10 @@ pub const registry = [_]Descriptor{
     // by pre-bump binaries; `session_capsule.decode` is version-aware.
     // v3 (2026-07): appends the portable-resume issuance bit so the successor
     // preserves detach-time mesh replication policy. Legacy v1/v2 decode false.
-    .{ .kind = .sessions, .schema_id = 0x4853_4553, .current_version = 3, .min_supported = 1, .max_supported = 3 },
+    // v4 appends each row's optional exact 16-byte stable attachment id so
+    // resumed siblings retain their physical identity across an upgrade.
+    // Legacy v1-v3 decode it as null.
+    .{ .kind = .sessions, .schema_id = 0x4853_4553, .current_version = 4, .min_supported = 1, .max_supported = 4 },
     // v2 (2026-07): `tls_snapshot.encode` gained two trailing kTLS-offload flag
     // bytes (tx/rx) — but the encoder was widened WITHOUT bumping this version, so
     // a pre-bump predecessor seals the flag-bearing blob while STILL stamping
@@ -599,6 +602,24 @@ test "tls_session is a rolling v1..2 descriptor that accepts a pre-bump v1 capsu
     legacy.min_supported = 1;
     legacy.max_supported = 1;
     try std.testing.expectEqual(@as(u16, 1), try negotiate(d, legacy));
+}
+
+test "sessions is a rolling v1 through v4 descriptor" {
+    const d = descriptor(.sessions);
+    try std.testing.expectEqual(@as(u16, 4), d.current_version);
+    try std.testing.expectEqual(@as(u16, 1), d.min_supported);
+    try std.testing.expectEqual(@as(u16, 4), d.max_supported);
+
+    for (1..4) |legacy_version| {
+        var legacy = Header.init(.sessions);
+        legacy.version = @intCast(legacy_version);
+        legacy.min_supported = @intCast(legacy_version);
+        legacy.max_supported = @intCast(legacy_version);
+        try std.testing.expectEqual(
+            @as(u16, @intCast(legacy_version)),
+            try negotiate(d, legacy),
+        );
+    }
 }
 
 test "validate is forward-tolerant of a too-new version (rejection is above this layer)" {

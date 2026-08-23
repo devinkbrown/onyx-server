@@ -49,7 +49,7 @@ pub const ReserveError = std.mem.Allocator.Error || error{
     Equivocation,
 };
 
-pub const TransferError = error{Equivocation};
+pub const TransferError = std.mem.Allocator.Error || error{Equivocation};
 
 pub const AttachmentRemap = struct {
     old_client: ClientId,
@@ -130,6 +130,78 @@ const Entry = struct {
     sequence: u64,
     event_id: EventId,
     bytes: []u8,
+};
+
+const AttachmentTransferPlan = struct {
+    client: ClientId,
+    keep: bool = true,
+};
+
+/// Fully checked attachment transfer waiting to join the caller's larger
+/// resume transaction. Preparation owns the only allocation and does not
+/// mutate the spool. `commit` only frees merged duplicates and compacts the
+/// existing list, so it is allocation-free and cannot fail. Logically
+/// non-copyable: keep one mutable value and always install
+/// `defer prepared.deinit()` immediately.
+pub const PreparedAttachmentTransfer = struct {
+    const State = enum { prepared, committed, aborted };
+
+    spool: *Spool,
+    plans: []AttachmentTransferPlan,
+    result: TransferResult,
+    final_total_bytes: usize,
+    final_attachment_count: usize,
+    reset_fair_cursor: bool,
+    expected_len: usize,
+    expected_total_bytes: usize,
+    expected_attachment_count: usize,
+    expected_next_sequence: u64,
+    expected_fair_cursor: usize,
+    state: State = .prepared,
+
+    pub fn commit(self: *PreparedAttachmentTransfer) TransferResult {
+        std.debug.assert(self.state == .prepared);
+        // The integration lane must remain serialized from prepare through the
+        // joint no-fail publication with the session registry.
+        std.debug.assert(self.spool.entries.items.len == self.expected_len);
+        std.debug.assert(self.spool.total_bytes == self.expected_total_bytes);
+        std.debug.assert(self.spool.attachment_count == self.expected_attachment_count);
+        std.debug.assert(self.spool.next_sequence == self.expected_next_sequence);
+        std.debug.assert(self.spool.fair_cursor == self.expected_fair_cursor);
+        std.debug.assert(self.plans.len == self.spool.entries.items.len);
+
+        var write_index: usize = 0;
+        for (self.spool.entries.items, self.plans) |entry, plan| {
+            if (!plan.keep) {
+                self.spool.allocator.free(entry.bytes);
+                continue;
+            }
+            var retained = entry;
+            retained.client = plan.client;
+            self.spool.entries.items[write_index] = retained;
+            write_index += 1;
+        }
+        self.spool.entries.items.len = write_index;
+        self.spool.total_bytes = self.final_total_bytes;
+        self.spool.attachment_count = self.final_attachment_count;
+        if (self.reset_fair_cursor) self.spool.fair_cursor = 0;
+
+        const result = self.result;
+        self.spool.allocator.free(self.plans);
+        self.state = .committed;
+        return result;
+    }
+
+    pub fn abort(self: *PreparedAttachmentTransfer) void {
+        if (self.state != .prepared) return;
+        self.spool.allocator.free(self.plans);
+        self.state = .aborted;
+    }
+
+    pub fn deinit(self: *PreparedAttachmentTransfer) void {
+        if (self.state == .prepared) self.abort();
+        self.* = undefined;
+    }
 };
 
 /// Fully allocated delivery reservation waiting to join the caller's larger
@@ -449,66 +521,80 @@ pub const Spool = struct {
         };
     }
 
-    /// Transactionally move every pending record from a detached physical id to
-    /// its replacement id. Equal destination rows merge without duplicating the
-    /// event, preserving the earlier global order; differing bytes reject the
-    /// entire transfer before any row changes.
+    /// Prepare an exact old-to-new attachment transfer without publishing any
+    /// change. Equal destination rows are preplanned as one retained earlier
+    /// event; differing bytes reject the entire plan. The returned ticket owns
+    /// all memory required by its allocation-free/no-fail commit.
+    pub fn prepareAttachmentTransfer(
+        self: *Spool,
+        old_client: ClientId,
+        new_client: ClientId,
+    ) TransferError!PreparedAttachmentTransfer {
+        const plans = try self.allocator.alloc(AttachmentTransferPlan, self.entries.items.len);
+        errdefer self.allocator.free(plans);
+        for (self.entries.items, plans) |entry, *plan| plan.* = .{ .client = entry.client };
+
+        const old_exists = self.hasClient(old_client);
+        const new_exists = self.hasClient(new_client);
+        var transferred: usize = 0;
+        var merged: usize = 0;
+        var discarded_bytes: usize = 0;
+
+        if (old_client != new_client) {
+            for (self.entries.items, 0..) |old, index| {
+                if (old.client != old_client) continue;
+                transferred += 1;
+                const destination_index = self.indexOf(new_client, old.event_id) orelse {
+                    plans[index].client = new_client;
+                    continue;
+                };
+                const destination = self.entries.items[destination_index];
+                if (!std.mem.eql(u8, old.bytes, destination.bytes)) return error.Equivocation;
+
+                merged += 1;
+                if (destination_index < index) {
+                    plans[index].keep = false;
+                    discarded_bytes += old.bytes.len;
+                } else {
+                    plans[destination_index].keep = false;
+                    discarded_bytes += destination.bytes.len;
+                    plans[index].client = new_client;
+                }
+            }
+        } else {
+            transferred = self.pendingCountFor(old_client);
+        }
+
+        return .{
+            .spool = self,
+            .plans = plans,
+            .result = .{
+                .transferred = transferred,
+                .exact_duplicates_merged = merged,
+            },
+            .final_total_bytes = self.total_bytes - discarded_bytes,
+            .final_attachment_count = self.attachment_count -
+                @as(usize, @intFromBool(old_client != new_client and old_exists and new_exists)),
+            .reset_fair_cursor = old_client != new_client,
+            .expected_len = self.entries.items.len,
+            .expected_total_bytes = self.total_bytes,
+            .expected_attachment_count = self.attachment_count,
+            .expected_next_sequence = self.next_sequence,
+            .expected_fair_cursor = self.fair_cursor,
+        };
+    }
+
+    /// Convenience transaction when this spool is the only authority involved.
+    /// Resume integration should instead hold its external mutation lock from
+    /// `prepareAttachmentTransfer` through the joint session/spool commit.
     pub fn transferAttachment(
         self: *Spool,
         old_client: ClientId,
         new_client: ClientId,
     ) TransferError!TransferResult {
-        if (old_client == new_client) return .{
-            .transferred = self.pendingCountFor(old_client),
-            .exact_duplicates_merged = 0,
-        };
-
-        const old_exists = self.hasClient(old_client);
-        const new_exists = self.hasClient(new_client);
-        const attachment_count_before = self.attachment_count;
-
-        // Complete conflict preflight. The mutation phase below cannot fail.
-        for (self.entries.items) |old| {
-            if (old.client != old_client) continue;
-            if (self.indexOf(new_client, old.event_id)) |destination_index| {
-                if (!std.mem.eql(u8, old.bytes, self.entries.items[destination_index].bytes))
-                    return error.Equivocation;
-            }
-        }
-
-        var transferred: usize = 0;
-        var merged: usize = 0;
-        var index: usize = 0;
-        while (index < self.entries.items.len) {
-            if (self.entries.items[index].client != old_client) {
-                index += 1;
-                continue;
-            }
-            transferred += 1;
-            const event_id = self.entries.items[index].event_id;
-            const destination = self.indexOf(new_client, event_id);
-            if (destination == null) {
-                self.entries.items[index].client = new_client;
-                index += 1;
-                continue;
-            }
-
-            merged += 1;
-            const destination_index = destination.?;
-            if (destination_index < index) {
-                self.removeAt(index); // keep the earlier destination row
-            } else {
-                // The old row is earlier. Drop the later exact duplicate, then
-                // re-key the preserved earlier row to the resumed attachment.
-                self.removeAt(destination_index);
-                self.entries.items[index].client = new_client;
-                index += 1;
-            }
-        }
-        self.fair_cursor = 0;
-        self.attachment_count = attachment_count_before -
-            @as(usize, @intFromBool(old_exists and new_exists));
-        return .{ .transferred = transferred, .exact_duplicates_merged = merged };
+        var prepared = try self.prepareAttachmentTransfer(old_client, new_client);
+        defer prepared.deinit();
+        return prepared.commit();
     }
 
     /// Simultaneously replace every live attachment id through one complete
@@ -1242,6 +1328,150 @@ test "attachment delivery spool transfers detached resume atomically" {
     const after = try spool.encodeCheckpoint(testing.allocator);
     defer testing.allocator.free(after);
     try testing.expectEqualSlices(u8, before, after);
+}
+
+test "prepared attachment transfer abort leaves spool byte-identical" {
+    var spool = try Spool.init(testing.allocator, .{
+        .max_attachments = 4,
+        .max_records = 8,
+        .max_total_bytes = 128,
+        .max_record_bytes = 32,
+    });
+    defer spool.deinit();
+    _ = try spool.reserveBatch(&.{
+        .{ .client = 10, .event_id = eventId(1), .bytes = "one\r\n" },
+        .{ .client = 20, .event_id = eventId(2), .bytes = "two\r\n" },
+    });
+    var page: [1]PendingRecord = undefined;
+    _ = spool.collectPending(&page);
+    const fair_cursor_before = spool.fair_cursor;
+    const before = try spool.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(before);
+
+    var prepared = try spool.prepareAttachmentTransfer(10, 30);
+    prepared.abort();
+    prepared.deinit();
+
+    const after = try spool.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    try testing.expectEqual(fair_cursor_before, spool.fair_cursor);
+}
+
+test "prepared attachment transfer conflict leaves spool byte-identical" {
+    var spool = try Spool.init(testing.allocator, .{
+        .max_attachments = 4,
+        .max_records = 8,
+        .max_total_bytes = 128,
+        .max_record_bytes = 32,
+    });
+    defer spool.deinit();
+    _ = try spool.reserveBatch(&.{
+        .{ .client = 10, .event_id = eventId(1), .bytes = "source\r\n" },
+        .{ .client = 20, .event_id = eventId(1), .bytes = "conflict\r\n" },
+    });
+    const before = try spool.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(before);
+
+    try testing.expectError(error.Equivocation, spool.prepareAttachmentTransfer(10, 20));
+
+    const after = try spool.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "prepared attachment transfer OOM leaves spool byte-identical" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var spool = try Spool.init(failing.allocator(), .{
+        .max_attachments = 4,
+        .max_records = 8,
+        .max_total_bytes = 128,
+        .max_record_bytes = 32,
+    });
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        spool.deinit();
+    }
+    _ = try spool.reserveBatch(&.{
+        .{ .client = 10, .event_id = eventId(1), .bytes = "source\r\n" },
+        .{ .client = 20, .event_id = eventId(2), .bytes = "other\r\n" },
+    });
+    const before = try spool.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(before);
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, spool.prepareAttachmentTransfer(10, 30));
+    failing.fail_index = std.math.maxInt(usize);
+
+    const after = try spool.encodeCheckpoint(testing.allocator);
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "prepared attachment transfer commit moves old rows to new exactly" {
+    var spool = try Spool.init(testing.allocator, .{
+        .max_attachments = 4,
+        .max_records = 8,
+        .max_total_bytes = 128,
+        .max_record_bytes = 32,
+    });
+    defer spool.deinit();
+    _ = try spool.reserveBatch(&.{
+        .{ .client = 10, .event_id = eventId(1), .bytes = "one\r\n" },
+        .{ .client = 30, .event_id = eventId(3), .bytes = "other\r\n" },
+        .{ .client = 10, .event_id = eventId(2), .bytes = "two\r\n" },
+    });
+
+    var prepared = try spool.prepareAttachmentTransfer(10, 20);
+    defer prepared.deinit();
+    try testing.expect(spool.contains(10, eventId(1)));
+    try testing.expect(!spool.contains(20, eventId(1)));
+    const result = prepared.commit();
+
+    try testing.expectEqual(@as(usize, 2), result.transferred);
+    try testing.expectEqual(@as(usize, 0), result.exact_duplicates_merged);
+    try testing.expectEqual(@as(usize, 0), spool.pendingCountFor(10));
+    try testing.expectEqual(@as(usize, 2), spool.pendingCountFor(20));
+    try testing.expectEqual(@as(usize, 1), spool.pendingCountFor(30));
+    try testing.expectEqual(@as(ClientId, 20), spool.entries.items[0].client);
+    try testing.expectEqual(@as(u64, 1), spool.entries.items[0].sequence);
+    try testing.expectEqualStrings("one\r\n", spool.entries.items[0].bytes);
+    try testing.expectEqual(@as(ClientId, 30), spool.entries.items[1].client);
+    try testing.expectEqual(@as(u64, 2), spool.entries.items[1].sequence);
+    try testing.expectEqual(@as(ClientId, 20), spool.entries.items[2].client);
+    try testing.expectEqual(@as(u64, 3), spool.entries.items[2].sequence);
+    try testing.expectEqualStrings("two\r\n", spool.entries.items[2].bytes);
+}
+
+test "prepared attachment transfer merges one duplicate event exactly once" {
+    var spool = try Spool.init(testing.allocator, .{
+        .max_attachments = 4,
+        .max_records = 8,
+        .max_total_bytes = 128,
+        .max_record_bytes = 32,
+    });
+    defer spool.deinit();
+    _ = try spool.reserveBatch(&.{
+        .{ .client = 10, .event_id = eventId(1), .bytes = "shared\r\n" },
+        .{ .client = 20, .event_id = eventId(1), .bytes = "shared\r\n" },
+        .{ .client = 10, .event_id = eventId(2), .bytes = "unique\r\n" },
+    });
+
+    var prepared = try spool.prepareAttachmentTransfer(10, 20);
+    defer prepared.deinit();
+    const result = prepared.commit();
+
+    try testing.expectEqual(@as(usize, 2), result.transferred);
+    try testing.expectEqual(@as(usize, 1), result.exact_duplicates_merged);
+    try testing.expectEqual(@as(usize, 2), spool.len());
+    try testing.expectEqual(@as(usize, 2), spool.pendingCountFor(20));
+    try testing.expectEqual(@as(usize, 1), spool.attachmentCount());
+    try testing.expectEqual(@as(u64, 1), spool.entries.items[0].sequence);
+    try testing.expectEqual(eventId(1), spool.entries.items[0].event_id);
+    try testing.expectEqualStrings("shared\r\n", spool.entries.items[0].bytes);
+    try testing.expectEqual(@as(u64, 3), spool.entries.items[1].sequence);
+    try testing.expectEqual(eventId(2), spool.entries.items[1].event_id);
+    try testing.expectEqualStrings("unique\r\n", spool.entries.items[1].bytes);
 }
 
 test "attachment delivery spool discard is no-fail complete and preserves unrelated FIFO" {

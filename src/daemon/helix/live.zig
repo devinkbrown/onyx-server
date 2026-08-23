@@ -268,29 +268,49 @@ pub const env_state_fds = "ONYX_HELIX_STATE_FDS";
 /// losing even one fd would strand that connection across a refused upgrade.
 pub const max_inherited_state_fds = 4096;
 
-/// Exact machine-readable answer returned by the daemon's private upgrade
-/// capability probe. A predecessor requires this complete line before it makes
-/// any client, mesh, listener, or arena descriptor inheritable. Keep this token
-/// in lockstep with the mandatory outer capsule and fd-ownership contracts.
-/// `clients-v5` promises exact client-tail validation through the canonical
-/// `was_websocket` discriminator; a target lacking it must never receive fds.
+/// Exact machine-readable answers returned by the daemon's private upgrade
+/// capability probe. A predecessor requires its complete line before it makes
+/// any client, mesh, listener, or arena descriptor inheritable. Keep these
+/// tokens in lockstep with the mandatory outer capsule and fd-ownership
+/// contracts. `clients-v5` promises exact client-tail validation through the
+/// canonical `was_websocket` discriminator; a target lacking it must never
+/// receive fds.
+///
+/// The current image advertises both tokens. That is intentionally asymmetric:
+/// a deployed predecessor whose writer emits HSSN v3 still finds the exact
+/// legacy line and may hand state to this v4 reader, while this predecessor
+/// requires the current line and therefore refuses a legacy v3-only target
+/// before any fd loses CLOEXEC. Never make the current verifier accept the
+/// predecessor token.
 pub const upgrade_capability_arg = "--helix-upgrade-capabilities-v1";
-const upgrade_capability_caps =
+const predecessor_v3_upgrade_capability_caps =
     "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2";
+pub const predecessor_v3_upgrade_capability_token =
+    "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_v3_upgrade_capability_caps;
+const upgrade_capability_caps =
+    "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,sessions-v4,state-fd-manifest-v1,webhook-store-v1,world-v2";
 pub const upgrade_capability_token =
     "ONYX_HELIX_UPGRADE_CAPS=" ++ upgrade_capability_caps;
+/// Current-first for diagnostics; the trailing legacy line is the narrow
+/// forward-upgrade bridge consumed by deployed v3 predecessors.
+pub const upgrade_capability_advertisement =
+    upgrade_capability_token ++ "\n" ++ predecessor_v3_upgrade_capability_token;
+
+fn hasCompleteOutputLine(output: []const u8, expected: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (std.mem.eql(u8, line, expected)) return true;
+    }
+    return false;
+}
 
 /// Require the capability token as a complete output line. Substring matching
 /// would let a diagnostic such as "missing TOKEN" accidentally authorize a
 /// handoff to an incompatible image. English ONYX_ brand only — no Japanese
 /// product aliases.
 pub fn hasUpgradeCapabilityLine(output: []const u8) bool {
-    var lines = std.mem.splitScalar(u8, output, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
-        if (std.mem.eql(u8, line, upgrade_capability_token)) return true;
-    }
-    return false;
+    return hasCompleteOutputLine(output, upgrade_capability_token);
 }
 
 /// Execute an already-open target image in private capability mode. The child
@@ -1085,6 +1105,37 @@ test "upgrade capability token must occupy a complete output line" {
     // operators can still cold-restart it.
     try std.testing.expect(!hasUpgradeCapabilityLine(
         "ONYX_HELIX_UPGRADE_CAPS=mesh-checkpoint-v2,property-state-v2,state-fd-manifest-v1\n",
+    ));
+}
+
+test "HSSN v3 predecessor accepts current v4 reader advertisement" {
+    // Model the deployed predecessor's exact-line verifier rather than calling
+    // the current verifier: old code knows only this frozen token. The v4 image
+    // must retain it in its probe output or an in-place v3 -> v4 upgrade would
+    // be unnecessarily refused.
+    try std.testing.expect(hasCompleteOutputLine(
+        upgrade_capability_advertisement ++ "\n",
+        predecessor_v3_upgrade_capability_token,
+    ));
+    try std.testing.expect(hasCompleteOutputLine(
+        upgrade_capability_advertisement ++ "\n",
+        upgrade_capability_token,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "sessions-v4") != null);
+}
+
+test "HSSN v4 predecessor rejects rollback to v3-only reader" {
+    // A legacy target emits only the frozen predecessor line. The current
+    // verifier must not treat that forward-compatibility advertisement as a
+    // current reader capability; openCompatibleUpgradeTarget consequently
+    // refuses it before performUpgradeAfterCompatibleTarget can clear CLOEXEC.
+    const legacy_only = predecessor_v3_upgrade_capability_token ++ "\n";
+    try std.testing.expect(!hasUpgradeCapabilityLine(legacy_only));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement ++ "\n"));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        predecessor_v3_upgrade_capability_token,
+        upgrade_capability_token,
     ));
 }
 

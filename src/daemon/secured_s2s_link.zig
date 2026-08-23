@@ -609,6 +609,14 @@ pub const SecuredLink = struct {
         try self.drainInner();
     }
 
+    /// Mark completion of one full outbound membership snapshot and seal the
+    /// authenticated marker after every preceding membership record.
+    pub fn sendMembershipSync(self: *SecuredLink) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendMembershipSync();
+        try self.drainInner();
+    }
+
     /// Announce aggregate local boolean MODE flags for `channel` over the
     /// secured CRDT link (no-op until established). Outbound bytes accumulate in
     /// `out`.

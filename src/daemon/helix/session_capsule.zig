@@ -30,6 +30,7 @@
 //!   each session:  token(u16 len + bytes) client(u64) signon_unix(i64) detached(u8)
 //!                  [v2+] fd(i32) snapshot(u32 len + bytes)
 //!                  [v3+] portable_resume(u8)
+//!                  [v4+] attachment_id_present(u8) [attachment_id(16)]
 //!
 //! v2 (2026-07) appends, per session, the attached connection's socket fd (the
 //! Helix join key back to the carried client snapshot; -1 when detached) and
@@ -39,7 +40,9 @@
 //! trailing fields and reconstructs them at their defaults (fd = -1, empty
 //! snapshot). v3 appends whether a portable resume credential was issued, so a
 //! hot-upgraded live session still replicates its snapshot on a later detach.
-//! `decodeCurrent` is the fail-closed v3 entry point: it requires every v3 field,
+//! v4 carries the stable physical attachment id byte-for-byte when one exists;
+//! legacy v1-v3 records reconstruct it as null. `decodeCurrent` is the
+//! fail-closed v4 entry point: it requires every v4 field,
 //! canonical boolean bytes, exact declared regions/count, and EOF. The tolerant
 //! `decode` remains available only for explicitly-versioned legacy records.
 
@@ -49,7 +52,7 @@ const std = @import("std");
 pub const magic = [_]u8{ 'H', 'S', 'S', 'N' };
 
 /// Wire format version written by `encode`. Bump on any layout change.
-pub const version: u8 = 3;
+pub const version: u8 = 4;
 
 /// Oldest wire version `decode` still accepts.
 pub const min_version: u8 = 1;
@@ -59,6 +62,9 @@ const max_str_len: usize = 0xFFFF;
 
 /// Maximum encodable session count (u16 on the wire).
 const max_sessions: usize = 0xFFFF;
+
+/// Stable physical attachment ids are exactly 128 bits on every current wire.
+pub const attachment_id_len: usize = 16;
 
 /// Errors produced by the codec.
 pub const Error = error{
@@ -96,6 +102,9 @@ pub const SessionEntry = struct {
     snapshot: []const u8 = &.{},
     /// v3: a mesh-sealed resume credential was revealed for this session.
     portable_resume: bool = false,
+    /// v4: stable physical attachment identity, preserved byte-for-byte. Null
+    /// is reserved for legacy rows that predate attachment-aware persistence.
+    attachment_id: ?[attachment_id_len]u8 = null,
 };
 
 /// One account's full session record, ready to migrate across an upgrade.
@@ -139,18 +148,20 @@ pub const SessionCapsule = struct {
             try writeLongStr(out, &pos, entry.snapshot);
             // v3: portable-resume issuance bit
             try writeByte(out, &pos, @intFromBool(entry.portable_resume));
+            // v4: optional exact stable attachment identity
+            try writeByte(out, &pos, @intFromBool(entry.attachment_id != null));
+            if (entry.attachment_id) |attachment_id| try writeBytes(out, &pos, &attachment_id);
         }
 
         return out[0..pos];
     }
 
-    /// Exact encoded byte length of `self` (v3 layout — the trailing `+ 1` per
-    /// session is the v3 portable-resume byte), for sizing `encode`'s output
-    /// buffer.
+    /// Exact encoded byte length of `self` using the current v4 layout.
     pub fn encodedLen(self: SessionCapsule) usize {
         var n: usize = magic.len + 1 + 2 + self.account.len + 2;
         for (self.sessions) |entry| {
-            n += 2 + entry.token.len + 8 + 8 + 1 + 4 + 4 + entry.snapshot.len + 1;
+            n += 2 + entry.token.len + 8 + 8 + 1 + 4 + 4 + entry.snapshot.len + 1 + 1;
+            if (entry.attachment_id != null) n += attachment_id_len;
         }
         return n;
     }
@@ -187,6 +198,7 @@ pub const SessionCapsule = struct {
             const fd: i32 = if (got_version >= 2) try readI32(bytes, &pos) else -1;
             const snapshot: []const u8 = if (got_version >= 2) try readLongStr(bytes, &pos) else &.{};
             const portable_resume = if (got_version >= 3) (try readByte(bytes, &pos)) != 0 else false;
+            const attachment_id = if (got_version >= 4) try readAttachmentId(bytes, &pos) else null;
             sessions_out[i] = .{
                 .token = token,
                 .signon_unix = signon_unix,
@@ -195,18 +207,20 @@ pub const SessionCapsule = struct {
                 .fd = fd,
                 .snapshot = snapshot,
                 .portable_resume = portable_resume,
+                .attachment_id = attachment_id,
             };
         }
 
         return .{ .account = account, .sessions = sessions_out[0..count] };
     }
 
-    /// Parse exactly the v3 layout emitted by this binary.
+    /// Parse exactly the v4 layout emitted by this binary.
     ///
     /// This decoder is allocation-free and returns only borrowed views. Unlike
     /// `decode`, it does not reconstruct omitted legacy fields: fd, snapshot,
-    /// and portable-resume must be structurally present for every counted row,
-    /// both boolean bytes must be canonical, and EOF must follow the final row.
+    /// portable-resume, and attachment-id presence must be structurally present
+    /// for every counted row, all boolean bytes must be canonical, and EOF must
+    /// follow the final row.
     pub fn decodeCurrent(bytes: []const u8, sessions_out: []SessionEntry) Error!SessionCapsule {
         var pos: usize = 0;
 
@@ -227,6 +241,7 @@ pub const SessionCapsule = struct {
             const fd = try readI32(bytes, &pos);
             const snapshot = try readLongStr(bytes, &pos);
             const portable_resume = try readBoolean(bytes, &pos);
+            const attachment_id = try readAttachmentId(bytes, &pos);
             sessions_out[i] = .{
                 .token = token,
                 .signon_unix = signon_unix,
@@ -235,6 +250,7 @@ pub const SessionCapsule = struct {
                 .fd = fd,
                 .snapshot = snapshot,
                 .portable_resume = portable_resume,
+                .attachment_id = attachment_id,
             };
         }
 
@@ -382,11 +398,16 @@ fn readLongStr(bytes: []const u8, pos: *usize) Error![]const u8 {
     return readBytes(bytes, pos, len);
 }
 
+fn readAttachmentId(bytes: []const u8, pos: *usize) Error!?[attachment_id_len]u8 {
+    if (!try readBoolean(bytes, pos)) return null;
+    return (try readBytes(bytes, pos, attachment_id_len))[0..attachment_id_len].*;
+}
+
 // --- tests ------------------------------------------------------------------
 
 test "round-trip an account with two sessions (one detached, one attached)" {
     const sessions = [_]SessionEntry{
-        .{ .token = "tok-attached-0001", .signon_unix = 1_700_000_000, .detached = false, .client = 42, .portable_resume = true },
+        .{ .token = "tok-attached-0001", .signon_unix = 1_700_000_000, .detached = false, .client = 42, .portable_resume = true, .attachment_id = @splat(0xa5) },
         .{ .token = "tok-detached-0002", .signon_unix = 1_700_009_999, .detached = true, .client = 99 },
     };
     const original = SessionCapsule{ .account = "alice", .sessions = &sessions };
@@ -405,12 +426,34 @@ test "round-trip an account with two sessions (one detached, one attached)" {
     try std.testing.expectEqual(false, decoded.sessions[0].detached);
     try std.testing.expectEqual(@as(u64, 42), decoded.sessions[0].client);
     try std.testing.expect(decoded.sessions[0].portable_resume);
+    try std.testing.expectEqualSlices(u8, &sessions[0].attachment_id.?, &decoded.sessions[0].attachment_id.?);
 
     try std.testing.expectEqualStrings(sessions[1].token, decoded.sessions[1].token);
     try std.testing.expectEqual(sessions[1].signon_unix, decoded.sessions[1].signon_unix);
     try std.testing.expectEqual(true, decoded.sessions[1].detached);
     try std.testing.expectEqual(@as(u64, 99), decoded.sessions[1].client);
     try std.testing.expect(!decoded.sessions[1].portable_resume);
+    try std.testing.expect(decoded.sessions[1].attachment_id == null);
+}
+
+test "v4 round-trip preserves optional exact attachment id bytes" {
+    const exact = [_]u8{
+        0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff, 0x10, 0x20,
+        0x30, 0x40, 0x50, 0x60, 0x70, 0x90, 0xa0, 0xb0,
+    };
+    const sessions = [_]SessionEntry{
+        .{ .token = "present", .signon_unix = 1, .detached = false, .client = 7, .attachment_id = exact },
+        .{ .token = "legacy", .signon_unix = 2, .detached = true, .client = 8, .attachment_id = null },
+    };
+    const original = SessionCapsule{ .account = "exact", .sessions = &sessions };
+    var buf: [256]u8 = undefined;
+    const wire = try original.encode(&buf);
+    try std.testing.expectEqual(original.encodedLen(), wire.len);
+
+    var out: [2]SessionEntry = undefined;
+    const decoded = try SessionCapsule.decodeCurrent(wire, &out);
+    try std.testing.expectEqualSlices(u8, &exact, &decoded.sessions[0].attachment_id.?);
+    try std.testing.expect(decoded.sessions[1].attachment_id == null);
 }
 
 test "round-trip preserves duplicate tokens for simultaneous attachments" {
@@ -515,12 +558,17 @@ test "v2 round-trip carries the join fd and a byte-identical restore snapshot" {
     try std.testing.expectEqualSlices(u8, restore, decoded.sessions[1].snapshot);
 }
 
-/// Hand-build a v1 record (the pre-snapshot layout): a v1 session body is
-/// exactly a v2 body minus its trailing fd(i32) + snapshot(u32 len + bytes).
-fn buildV1(buf: []u8, account: []const u8, entries: []const SessionEntry) ![]const u8 {
+/// Hand-build a genuine legacy record without any v4 attachment-id suffix.
+fn buildLegacy(
+    buf: []u8,
+    wire_version: u8,
+    account: []const u8,
+    entries: []const SessionEntry,
+) ![]const u8 {
+    std.debug.assert(wire_version >= 1 and wire_version <= 3);
     var pos: usize = 0;
     try writeBytes(buf, &pos, &magic);
-    try writeByte(buf, &pos, 1); // v1
+    try writeByte(buf, &pos, wire_version);
     try writeStr(buf, &pos, account);
     try writeU16(buf, &pos, @intCast(entries.len));
     for (entries) |e| {
@@ -528,8 +576,17 @@ fn buildV1(buf: []u8, account: []const u8, entries: []const SessionEntry) ![]con
         try writeU64(buf, &pos, e.client);
         try writeI64(buf, &pos, e.signon_unix);
         try writeByte(buf, &pos, @intFromBool(e.detached));
+        if (wire_version >= 2) {
+            try writeI32(buf, &pos, e.fd);
+            try writeLongStr(buf, &pos, e.snapshot);
+        }
+        if (wire_version >= 3) try writeByte(buf, &pos, @intFromBool(e.portable_resume));
     }
     return buf[0..pos];
+}
+
+fn buildV1(buf: []u8, account: []const u8, entries: []const SessionEntry) ![]const u8 {
+    return buildLegacy(buf, 1, account, entries);
 }
 
 test "cross-version: a v1 (pre-snapshot) record still decodes, defaults reconstructed" {
@@ -553,6 +610,27 @@ test "cross-version: a v1 (pre-snapshot) record still decodes, defaults reconstr
     try std.testing.expectEqual(@as(usize, 0), decoded.sessions[0].snapshot.len);
     try std.testing.expectEqual(@as(i32, -1), decoded.sessions[1].fd);
     try std.testing.expectEqual(@as(usize, 0), decoded.sessions[1].snapshot.len);
+}
+
+test "cross-version: genuine v1 through v3 records decode attachment id as null" {
+    const sessions = [_]SessionEntry{.{
+        .token = "legacy",
+        .signon_unix = 123,
+        .detached = true,
+        .client = 55,
+        .fd = -1,
+        .snapshot = "snapshot",
+        .portable_resume = true,
+        .attachment_id = @splat(0xcc),
+    }};
+    var buf: [256]u8 = undefined;
+    var out: [1]SessionEntry = undefined;
+    for (1..4) |legacy_version| {
+        const wire = try buildLegacy(&buf, @intCast(legacy_version), "legacy", &sessions);
+        const decoded = try SessionCapsule.decode(wire, &out);
+        try std.testing.expectEqual(@as(usize, 1), decoded.sessions.len);
+        try std.testing.expect(decoded.sessions[0].attachment_id == null);
+    }
 }
 
 test "cross-version: a truncated v2 snapshot field is Truncated, never a panic" {
@@ -584,7 +662,7 @@ test "decode returns TooMany when sessions_out is too small" {
     try std.testing.expectError(error.TooMany, SessionCapsule.decode(wire, &out));
 }
 
-test "decodeCurrent round-trips every exact v3 session field" {
+test "decodeCurrent round-trips every exact v4 session field" {
     const sessions = [_]SessionEntry{
         .{
             .token = "shared-token-001",
@@ -593,6 +671,7 @@ test "decodeCurrent round-trips every exact v3 session field" {
             .client = 101,
             .fd = 41,
             .portable_resume = true,
+            .attachment_id = @splat(0x11),
         },
         .{
             .token = "shared-token-001",
@@ -602,6 +681,7 @@ test "decodeCurrent round-trips every exact v3 session field" {
             .fd = -1,
             .snapshot = "byte-exact detached restore state",
             .portable_resume = false,
+            .attachment_id = @splat(0x22),
         },
     };
     const original = SessionCapsule{ .account = "mesh-account", .sessions = &sessions };
@@ -620,10 +700,11 @@ test "decodeCurrent round-trips every exact v3 session field" {
         try std.testing.expectEqual(want.fd, got.fd);
         try std.testing.expectEqualSlices(u8, want.snapshot, got.snapshot);
         try std.testing.expectEqual(want.portable_resume, got.portable_resume);
+        try std.testing.expectEqualSlices(u8, &want.attachment_id.?, &got.attachment_id.?);
     }
 }
 
-test "decodeCurrent rejects every proper v3 prefix and trailing data" {
+test "decodeCurrent rejects every proper v4 prefix and trailing data" {
     const sessions = [_]SessionEntry{.{
         .token = "",
         .signon_unix = 0,
@@ -636,7 +717,7 @@ test "decodeCurrent rejects every proper v3 prefix and trailing data" {
     const original = SessionCapsule{ .account = "", .sessions = &sessions };
     var wire_buf: [64]u8 = undefined;
     const wire = try original.encode(&wire_buf);
-    try std.testing.expectEqual(@as(usize, 37), wire.len);
+    try std.testing.expectEqual(@as(usize, 38), wire.len);
 
     var out: [1]SessionEntry = undefined;
     for (0..wire.len) |end| {
@@ -644,13 +725,13 @@ test "decodeCurrent rejects every proper v3 prefix and trailing data" {
     }
     _ = try SessionCapsule.decodeCurrent(wire, &out);
 
-    var trailing: [38]u8 = undefined;
+    var trailing: [39]u8 = undefined;
     @memcpy(trailing[0..wire.len], wire);
     trailing[wire.len] = 0;
     try std.testing.expectError(error.TrailingData, SessionCapsule.decodeCurrent(&trailing, &out));
 }
 
-test "decodeCurrent rejects noncanonical detached and portable flags" {
+test "decodeCurrent rejects noncanonical detached portable and attachment flags" {
     const sessions = [_]SessionEntry{.{
         .token = "",
         .signon_unix = 0,
@@ -661,10 +742,11 @@ test "decodeCurrent rejects noncanonical detached and portable flags" {
     }};
     var wire_buf: [64]u8 = undefined;
     const wire = try (SessionCapsule{ .account = "", .sessions = &sessions }).encode(&wire_buf);
-    try std.testing.expectEqual(@as(usize, 37), wire.len);
+    try std.testing.expectEqual(@as(usize, 38), wire.len);
     var out: [1]SessionEntry = undefined;
 
-    // Empty-account/empty-token v3 exact offsets: detached=27, portable=36.
+    // Empty-account/empty-token v4 exact offsets: detached=27, portable=36,
+    // attachment-id presence=37.
     wire_buf[27] = 2;
     try std.testing.expectError(
         error.InvalidBoolean,
@@ -672,6 +754,12 @@ test "decodeCurrent rejects noncanonical detached and portable flags" {
     );
     wire_buf[27] = 0;
     wire_buf[36] = 0xff;
+    try std.testing.expectError(
+        error.InvalidBoolean,
+        SessionCapsule.decodeCurrent(wire_buf[0..wire.len], &out),
+    );
+    wire_buf[36] = 0;
+    wire_buf[37] = 2;
     try std.testing.expectError(
         error.InvalidBoolean,
         SessionCapsule.decodeCurrent(wire_buf[0..wire.len], &out),
@@ -689,15 +777,15 @@ test "decodeCurrent enforces current version lengths and count exactly" {
     }};
     var pristine_buf: [64]u8 = undefined;
     const pristine = try (SessionCapsule{ .account = "", .sessions = &sessions }).encode(&pristine_buf);
-    try std.testing.expectEqual(@as(usize, 37), pristine.len);
-    var malformed: [37]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 38), pristine.len);
+    var malformed: [38]u8 = undefined;
     @memcpy(&malformed, pristine);
     var out: [1]SessionEntry = undefined;
 
     malformed[magic.len] = version - 1;
     try std.testing.expectError(error.BadVersion, SessionCapsule.decodeCurrent(&malformed, &out));
-    // The explicitly legacy reader remains version-tolerant and ignores the v3
-    // byte after the complete v2 row.
+    // The explicitly legacy reader remains version-tolerant and ignores the v4
+    // attachment-presence byte after the complete v3 row.
     _ = try SessionCapsule.decode(&malformed, &out);
     @memcpy(&malformed, pristine);
 
