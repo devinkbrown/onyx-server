@@ -2697,6 +2697,21 @@ pub const ConnState = struct {
     /// Stats: `onS2sEstablished` counted for this peer so close drops
     /// `s2s_links_active` exactly once (TCP accept alone does not establish).
     s2s_established_counted: bool = false,
+    /// Process-local gauge ownership. These latches are deliberately not part of
+    /// Helix: the successor rebuilds the gauges from every committed adopted
+    /// slot, then ordinary close paths release exactly the ownership they hold.
+    /// A pre-admission/refused socket can therefore never decrement some other
+    /// live client's gauge, and an immediate refusal cannot leak a +1 forever.
+    stats_client_counted: bool = false,
+    stats_s2s_tcp_counted: bool = false,
+    /// A secured RTT probe has been authored into the link's retained ciphertext
+    /// but has not yet crossed the whole-record SendQ commit edge. Do not start
+    /// its receipt deadline (or author another probe) until staging succeeds.
+    s2s_probe_pending: bool = false,
+    /// Remaining retained ciphertext through the END of that probe record. This
+    /// exact boundary lets the pager commit the probe even when later records
+    /// were appended behind it and remain backpressured in SecuredLink.outbound.
+    s2s_probe_pending_bytes: usize = 0,
     /// True when this S2S link is being torn down by `resolveS2sCollision` as a
     /// duplicate (the same peer is still reachable via the surviving link). Its
     /// `closeConn` must NOT emit a netsplit — the members never actually left, so
@@ -7095,7 +7110,20 @@ pub const LinuxServer = struct {
         while (it.next()) |entry| {
             const c = entry.value;
             if (c.closing) continue; // already tearing down
-            if (c.s2s != null or c.s2s_secured != null) continue; // server links exempt
+            if (c.s2s != null or c.s2s_secured != null) {
+                // TCP ESTABLISHED is not peer liveness: a vanished/restarted peer
+                // can leave a half-open socket indefinitely. RTT probes below set
+                // one outstanding application-level receipt barrier; any bytes
+                // received on the already-authenticated stream clear it in
+                // handleRecv. Actively shutdown
+                // an expired link so its armed recv completes and normal close /
+                // retained anti-entropy / redial recovery runs.
+                if (self.s2sPeerLivenessExpired(c, now)) {
+                    self.logMeshEvent(.peer_down, establishedPeerName(c) orelse "pending-peer", "mesh liveness probe timed out");
+                    self.closeConn(c.token, "Mesh liveness timeout") catch {};
+                }
+                continue;
+            }
             // Per-class timeout overrides (0 = inherit the `[limits]` global). The
             // default class_policy on an unregistered conn inherits the global,
             // which is correct — the class is not matched until registration.
@@ -8029,6 +8057,15 @@ pub const LinuxServer = struct {
         conn.connected_at_ms = self.nowMs();
         conn.last_activity_ms = conn.connected_at_ms;
         conn.last_message_ms = conn.connected_at_ms;
+        if (!is_s2s) {
+            // The active gauge describes physical open client slots, including a
+            // trusted-PROXY preamble or TLS handshake still in progress. Acquire
+            // ownership as soon as the fully initialized slot exists; every later
+            // rejection/error either closes through closeConn or explicitly drops
+            // this same latch before freeing the slot.
+            self.noteClientAccepted(conn);
+        }
+        errdefer self.dropClientStats(conn);
 
         if (is_s2s and self.s2sSecured()) {
             self.captureClientHost(conn);
@@ -8054,7 +8091,7 @@ pub const LinuxServer = struct {
                     conn.io_activation_pending = true;
                     conn.activation_recv_required = true;
                     self.wakeReactor();
-                    self.stats.onS2sAccept();
+                    self.noteS2sTcpOpened(conn);
                     self.traceLog(.info, .s2s, "s2s secured peer accepted (activation staged)");
                     return;
                 },
@@ -8064,11 +8101,11 @@ pub const LinuxServer = struct {
                 conn.io_activation_pending = true;
                 conn.activation_recv_required = true;
                 self.wakeReactor();
-                self.stats.onS2sAccept();
+                self.noteS2sTcpOpened(conn);
                 self.traceLog(.info, .s2s, "s2s secured peer accepted (send staged)");
                 return;
             };
-            self.stats.onS2sAccept();
+            self.noteS2sTcpOpened(conn);
             self.traceLog(.info, .s2s, "s2s secured peer accepted");
             return;
         }
@@ -8097,11 +8134,11 @@ pub const LinuxServer = struct {
             // fails, so deinit can never observe a freed link.
             errdefer conn.s2s = null;
             self.armRecv(conn) catch {
-                self.stats.onS2sAccept();
+                self.noteS2sTcpOpened(conn);
                 self.traceLog(.info, .s2s, "s2s peer accepted (activation staged)");
                 return;
             };
-            self.stats.onS2sAccept();
+            self.noteS2sTcpOpened(conn);
             self.traceLog(.info, .s2s, "s2s peer accepted");
             return;
         }
@@ -8495,9 +8532,9 @@ pub const LinuxServer = struct {
         // recorded above before tearing the fd down (clone_limit only counts on
         // the accept path, never here).
         self.releaseThrottle(conn);
+        self.noteClientRefusedBeforeLive(conn);
         closeFd(conn.fd);
         _ = self.rx().clients.free(id);
-        self.stats.onAccept();
         return true;
     }
 
@@ -8525,9 +8562,9 @@ pub const LinuxServer = struct {
         } else {
             tls.* = tls_conn.TlsConn.init(self.allocator, tls_cfg) catch {
                 self.allocator.destroy(tls);
+                self.noteClientRefusedBeforeLive(conn);
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
-                self.stats.onAccept();
                 return false;
             };
         }
@@ -8543,7 +8580,7 @@ pub const LinuxServer = struct {
             conn.activation_recv_required = true;
             self.wakeReactor();
         };
-        self.stats.onAccept();
+        self.noteClientAccepted(conn);
         self.traceLog(.info, .net, "tls client accepted");
         return true;
     }
@@ -8572,9 +8609,9 @@ pub const LinuxServer = struct {
                     self.allocator.destroy(tls);
                     conn.ws = null;
                     self.allocator.destroy(ws);
+                    self.noteClientRefusedBeforeLive(conn);
                     closeFd(conn.fd);
                     _ = self.rx().clients.free(id);
-                    self.stats.onAccept();
                     return false;
                 };
             }
@@ -8592,7 +8629,7 @@ pub const LinuxServer = struct {
             conn.activation_recv_required = true;
             self.wakeReactor();
         };
-        self.stats.onAccept();
+        self.noteClientAccepted(conn);
         self.traceLog(.info, .net, "ws client accepted");
         return true;
     }
@@ -8607,7 +8644,7 @@ pub const LinuxServer = struct {
                 conn.activation_recv_required = false;
                 self.wakeReactor();
             };
-            self.stats.onAccept();
+            self.noteClientAccepted(conn);
             return true;
         }
         if (self.reputationOn()) {
@@ -8622,7 +8659,7 @@ pub const LinuxServer = struct {
                         conn.activation_recv_required = false;
                         self.wakeReactor();
                     };
-                    self.stats.onAccept();
+                    self.noteClientAccepted(conn);
                     return true;
                 }
             }
@@ -8642,7 +8679,7 @@ pub const LinuxServer = struct {
                         conn.activation_recv_required = false;
                         self.wakeReactor();
                     };
-                    self.stats.onAccept();
+                    self.noteClientAccepted(conn);
                     return true;
                 },
                 error.NoSpaceLeft => {},
@@ -8654,7 +8691,7 @@ pub const LinuxServer = struct {
             conn.activation_recv_required = true;
             self.wakeReactor();
         };
-        self.stats.onAccept();
+        self.noteClientAccepted(conn);
         self.traceLog(.info, .net, "client accepted");
         return true;
     }
@@ -8789,6 +8826,36 @@ pub const LinuxServer = struct {
         self.relay_v2_replay_mu.unlock();
         conn.relay_v2_unbound_bound = true;
         self.forwardAcceptedRelayV2(&.{});
+    }
+
+    /// Acquire this physical client's process-local gauge ownership exactly once.
+    /// The monotonic total and the active gauge deliberately move together here.
+    fn noteClientAccepted(self: *LinuxServer, conn: *ConnState) void {
+        if (conn.stats_client_counted) return;
+        conn.stats_client_counted = true;
+        self.stats.onAccept();
+    }
+
+    /// Release exactly this slot's active-gauge ownership. An uncounted
+    /// pre-admission socket is a no-op and can never subtract another live slot.
+    fn dropClientStats(self: *LinuxServer, conn: *ConnState) void {
+        if (!conn.stats_client_counted) return;
+        conn.stats_client_counted = false;
+        self.stats.onClose(false, false);
+    }
+
+    /// Record refusal of a completely initialized physical slot. The total was
+    /// acquired when the slot became live; only its active ownership is released.
+    fn noteClientRefusedBeforeLive(self: *LinuxServer, conn: *ConnState) void {
+        self.dropClientStats(conn);
+    }
+
+    /// Acquire TCP-level S2S gauge ownership exactly once. Establishment remains
+    /// a separate transition below, so an AKE-stuck slot is visible as tcp=1/link=0.
+    fn noteS2sTcpOpened(self: *LinuxServer, conn: *ConnState) void {
+        if (conn.stats_s2s_tcp_counted) return;
+        conn.stats_s2s_tcp_counted = true;
+        self.stats.onS2sAccept();
     }
 
     /// Count a mesh-routable peer once for metrics + journal. Idempotent per conn.
@@ -13390,8 +13457,12 @@ pub const LinuxServer = struct {
                 conn.s2s_secured = null;
                 if (!conn.s2s_dedup) self.updatePartitionTransitions(); // detect a split this drop caused
                 closeFd(conn.fd);
+                if (conn.stats_s2s_tcp_counted) {
+                    conn.stats_s2s_tcp_counted = false;
+                    conn.s2s_established_counted = false;
+                    self.stats.onClose(true, was_est);
+                }
                 _ = self.rx().clients.free(id);
-                self.stats.onClose(true, was_est);
                 // The removed slot must be absent before recomputing. A dedup
                 // loser never republishes: the collision winner already
                 // replaced the route at establishment, and teardown must not
@@ -13419,12 +13490,16 @@ pub const LinuxServer = struct {
                 conn.s2s = null;
                 if (!conn.s2s_dedup) self.updatePartitionTransitions(); // detect a split this drop caused
                 closeFd(conn.fd);
+                if (conn.stats_s2s_tcp_counted) {
+                    conn.stats_s2s_tcp_counted = false;
+                    conn.s2s_established_counted = false;
+                    self.stats.onClose(true, was_est);
+                }
                 _ = self.rx().clients.free(id);
-                self.stats.onClose(true, was_est);
                 if (publish_peer_snapshot) self.publishPeerCount();
                 return;
             }
-            self.stats.onClose(false, false);
+            self.dropClientStats(conn);
             self.stats.onQuit();
             conn.session_list_cache.reset();
             // Free any in-flight inbound multiline batch buffer.
@@ -14794,6 +14869,21 @@ pub const LinuxServer = struct {
                 if (!link.consumeOutboundPrefix(prefix.len)) {
                     conn.closing = true;
                     return false;
+                }
+                if (conn.s2s_probe_pending) {
+                    std.debug.assert(conn.s2s_probe_pending_bytes != 0);
+                    if (prefix.len >= conn.s2s_probe_pending_bytes) {
+                        // The prefix is a whole-record boundary and has crossed
+                        // the exact end of the probe. Later records may remain in
+                        // SecuredLink.outbound; they cannot delay this receipt
+                        // clock or cause a fast answer to race a phantom deadline.
+                        conn.s2s_probe_pending = false;
+                        conn.s2s_probe_pending_bytes = 0;
+                        conn.awaiting_pong = true;
+                        conn.ping_sent_ms = self.nowMs();
+                    } else {
+                        conn.s2s_probe_pending_bytes -= prefix.len;
+                    }
                 }
                 self.armSendIfNeeded(conn) catch {
                     conn.closing = true;
@@ -27988,6 +28078,19 @@ pub const LinuxServer = struct {
         // without closing it; ordinary connection teardown owns them from here.
         self.clearInheritedStateFdManifest();
 
+        // Active gauges are process-local derived state, not Helix authority.
+        // Rebuild client ownership only after the single no-fail adoption commit:
+        // a rejected candidate must never become observable as a live connection.
+        // Preserved S2S slots publish separately below with their established
+        // routes, keeping tcp-active and links-active as distinct transitions.
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.value.s2s != null or slot.value.s2s_secured != null) continue;
+                self.noteClientAccepted(&slot.value);
+            }
+        }
+
         // Queue rolling-old SESSION_MIGRATE authority before any inherited link
         // becomes operationally visible. A transient post-commit queue failure
         // closes only that preserved link; normal re-dial repairs it without ever
@@ -28880,7 +28983,7 @@ pub const LinuxServer = struct {
         self.publishPeerCount();
         self.updatePartitionTransitions();
         self.bindRelayV2UnboundIfReady(conn, link);
-        self.stats.onS2sAccept();
+        self.noteS2sTcpOpened(conn);
         self.noteS2sEstablished(conn, rname, "helix-resume");
         self.traceLog(.info, .s2s, "s2s secured peer preserved across upgrade");
     }
@@ -29123,7 +29226,7 @@ pub const LinuxServer = struct {
             errdefer peer.s2s_secured = null;
             try self.armConnect(peer);
             // Outbound dial opens a TCP S2S slot (not yet Mooring-established).
-            self.stats.onS2sAccept();
+            self.noteS2sTcpOpened(peer);
             return peer.token;
         }
 
@@ -29146,7 +29249,7 @@ pub const LinuxServer = struct {
         errdefer peer.s2s = null;
 
         try self.armConnect(peer);
-        self.stats.onS2sAccept();
+        self.noteS2sTcpOpened(peer);
         return peer.token;
     }
 
@@ -48875,6 +48978,20 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    /// Begin no-allocation S2S teardown while preserving exact io_uring storage
+    /// ownership. shutdown wakes an armed recv; the matching completion performs
+    /// the ordinary closeConn finalization once every kernel reference is gone.
+    fn requestS2sClose(self: *LinuxServer, conn: *ConnState, reason: []const u8) void {
+        // closeConn already separates request-close from final teardown using the
+        // exact kernel-ownership latches. In particular, an SQ-pressure slot can
+        // be activation-pending with no armed operation: finalize it immediately
+        // instead of clearing the only maintenance signal and waiting for a CQE
+        // that cannot exist.
+        if (!conn.closing or conn.close_reason.len == 0) retainCloseReason(conn, reason);
+        const token = conn.token;
+        self.closeConn(token, conn.close_reason) catch {};
+    }
+
     /// Collapse the duplicate S2S link that forms when both nodes auto-dial each
     /// other: each side ends up with two established links to the same peer (one
     /// it dialed, one the peer dialed), so LINKS/LUSERS over-count and a link is
@@ -48882,26 +48999,54 @@ pub const LinuxServer = struct {
     /// link to the same `remote_name`; if found, keep the connection initiated by
     /// the lexicographically-smaller server name and close the other. Both nodes
     /// compute the same survivor, so exactly one physical link remains and the
-    /// mesh never fully splits. Returns true when `new_conn` itself was the loser
-    /// (so the caller stops driving it). Best-effort within this reactor.
+    /// mesh never fully splits. A closing or liveness-expired predecessor is not
+    /// a viable survivor, however: the newly authenticated link replaces it
+    /// regardless of direction. This is what breaks the half-open-socket loop in
+    /// which every healthy redial was previously collapsed against a zombie TCP
+    /// ESTABLISHED fd. Returns true when `new_conn` itself was the loser (so the
+    /// caller stops driving it). Best-effort within this reactor.
     fn resolveS2sCollision(self: *LinuxServer, new_conn: *ConnState, remote_name: []const u8) bool {
         if (remote_name.len == 0) return false;
+        var new_loses = false;
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const other = entry.value;
             if (other == new_conn) continue;
             const oname = establishedPeerName(other) orelse continue;
             if (!std.mem.eql(u8, oname, remote_name)) continue;
+            const old_unusable = other.closing or other.s2s_dedup or
+                self.s2sPeerLivenessExpired(other, self.nowMs());
+            if (old_unusable) {
+                other.s2s_dedup = true; // the replacement keeps the peer reachable
+                self.requestS2sClose(other, "Stale duplicate link replaced");
+                self.logMeshEvent(.peer_down, remote_name, "stale duplicate link replaced");
+                // There may also be a healthy survivor for this peer. Continue
+                // the scan so the new link is still resolved against every viable
+                // route instead of publication hiding two relay-capable sockets.
+                continue;
+            }
             // Only collapse a clean initiator+responder pair; if both somehow hold
             // the same role, leave them (counting dedup still hides the dup) rather
             // than risk closing the only usable link.
-            if (new_conn.s2s_initiator == other.s2s_initiator) return false;
+            if (new_conn.s2s_initiator == other.s2s_initiator) continue;
             const keep_initiator = std.mem.lessThan(u8, self.serverName(), remote_name);
             const loser = if (new_conn.s2s_initiator == keep_initiator) other else new_conn;
             loser.s2s_dedup = true; // collapsed duplicate: suppress its netsplit on close
-            loser.closing = true;
+            if (loser == new_conn) {
+                // Finish the scan without touching new_conn again. Marking the
+                // decision first avoids freeing the current drive's link object
+                // while the iterator still compares remaining predecessors.
+                new_loses = true;
+                continue;
+            }
+            self.requestS2sClose(loser, "Duplicate link collapsed");
             self.logMeshEvent(.peer_down, remote_name, "duplicate link collapsed");
-            return loser == new_conn;
+        }
+        if (new_loses) {
+            new_conn.s2s_dedup = true;
+            self.requestS2sClose(new_conn, "Duplicate link collapsed");
+            self.logMeshEvent(.peer_down, remote_name, "duplicate link collapsed");
+            return true;
         }
         return false;
     }
@@ -49069,6 +49214,19 @@ pub const LinuxServer = struct {
     /// hard-refreshed status page usually sees a sample within one load.
     const peer_rtt_probe_interval_ms: i64 = if (builtin.is_test) 50 else 15_000;
 
+    /// An established S2S link is live only while its most recent application
+    /// probe has recoverable inbound evidence. Kernel TCP state and successful
+    /// local writes are deliberately insufficient: both can survive a remote
+    /// restart as a half-open socket. Any bytes received on the already-authenticated
+    /// stream clear awaiting_pong in handleRecv; until then the original probe
+    /// timestamp is never extended.
+    fn s2sPeerLivenessExpired(self: *const LinuxServer, conn: *const ConnState, now_ms: i64) bool {
+        if (!conn.awaiting_pong) return false;
+        if (establishedPeerName(conn) == null) return false;
+        const grace_ms = @max(@as(i64, 1), self.config.ping_timeout_ms);
+        return now_ms - conn.ping_sent_ms > grace_ms;
+    }
+
     /// Emit timestamped PING probes on every established mesh peer and flush the
     /// resulting outbound. Reactor-0-only caller (S2S slots live there).
     fn maybeProbeMeshPeerRtt(self: *LinuxServer) void {
@@ -49079,10 +49237,38 @@ pub const LinuxServer = struct {
         const now_u: u64 = @intCast(@max(@as(i64, 0), now));
         for (self.rx().clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
+            if (slot.value.closing) continue;
+            if (slot.value.s2s_probe_pending) {
+                // The exact probe ciphertext survived a previous congestion/OOM
+                // turn inside SecuredLink. Its receipt clock begins only after
+                // the complete record crosses into this connection's SendQ.
+                if (self.flushMeshBurstStage(&slot.value)) {
+                    std.debug.assert(!slot.value.s2s_probe_pending);
+                    std.debug.assert(slot.value.s2s_probe_pending_bytes == 0);
+                    std.debug.assert(slot.value.awaiting_pong);
+                } else if (slot.value.closing) {
+                    self.requestS2sClose(&slot.value, "Mesh probe queue failure");
+                }
+                continue;
+            }
+            // Do not keep moving the receipt deadline while the peer is silent.
+            // A second queued write is no stronger evidence than the first.
+            if (slot.value.awaiting_pong) continue;
             if (slot.value.s2s_secured) |link| {
                 if (!link.established()) continue;
                 link.probeRtt(now_u) catch continue;
-                _ = self.flushMeshBurstStage(&slot.value);
+                const probe_boundary = link.outbound().len;
+                if (probe_boundary == 0) continue;
+                slot.value.s2s_probe_pending = true;
+                slot.value.s2s_probe_pending_bytes = probe_boundary;
+                if (!self.flushMeshBurstStage(&slot.value)) {
+                    if (slot.value.closing)
+                        self.requestS2sClose(&slot.value, "Mesh probe queue failure");
+                    continue;
+                }
+                std.debug.assert(!slot.value.s2s_probe_pending);
+                std.debug.assert(slot.value.s2s_probe_pending_bytes == 0);
+                std.debug.assert(slot.value.awaiting_pong);
                 self.syncPeerRtt(link.remoteName(), link.lastRttMs());
             } else if (slot.value.s2s) |link| {
                 if (!link.established()) continue;
@@ -49092,6 +49278,8 @@ pub const LinuxServer = struct {
                     continue;
                 };
                 link.clearOutbound();
+                slot.value.awaiting_pong = true;
+                slot.value.ping_sent_ms = now;
                 self.syncPeerRtt(link.remoteName(), link.lastRttMs());
             }
         }
@@ -52479,6 +52667,26 @@ const SessionReplayTestPair = struct {
     }
 };
 
+fn pumpSecuredTestLinks(
+    allocator: std.mem.Allocator,
+    a: *secured_s2s_link.SecuredLink,
+    b: *secured_s2s_link.SecuredLink,
+) !void {
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        if (a.outbound().len == 0 and b.outbound().len == 0) return;
+        const a_out = try allocator.dupe(u8, a.outbound());
+        defer allocator.free(a_out);
+        const b_out = try allocator.dupe(u8, b.outbound());
+        defer allocator.free(b_out);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_out.len != 0) try b.feed(a_out, @as(u64, @intCast(rounds + 21)));
+        if (b_out.len != 0) try a.feed(b_out, @as(u64, @intCast(rounds + 21)));
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn copyTestSendQ(allocator: std.mem.Allocator, conn: *const ConnState) ![]u8 {
     const inline_bytes = conn.send_buf[conn.send_offset..conn.send_len];
     const total = try std.math.add(usize, inline_bytes.len, conn.send_overflow.items.len);
@@ -52637,12 +52845,16 @@ test "secured establish collision winner teardown trust lifecycle" {
     const old_conn = server.rx().clients.get(old_id).?;
     old_conn.s2s_secured = &old_pair.a;
     old_conn.s2s_initiator = false;
+    old_conn.recv_armed = true; // keep the stack fixture kernel-owned until cleanup
     const winner_id = try server.rx().clients.alloc(ConnState.init(-1));
     const winner = server.rx().clients.get(winner_id).?;
     winner.s2s_secured = &winner_pair.a;
     winner.s2s_initiator = true;
     defer {
-        if (server.rx().clients.get(old_id)) |live| live.s2s_secured = null;
+        if (server.rx().clients.get(old_id)) |live| {
+            live.s2s_secured = null;
+            live.recv_armed = false;
+        }
         if (server.rx().clients.get(winner_id)) |live| live.s2s_secured = null;
         _ = server.rx().clients.free(old_id);
         _ = server.rx().clients.free(winner_id);
@@ -52671,6 +52883,499 @@ test "secured establish collision winner teardown trust lifecycle" {
     try std.testing.expectEqual(@as(u8, 0), server.mesh_peer_name_lens[0]);
     // The caller-owned pre-teardown view cannot race the same storage rewrite.
     try std.testing.expectEqualStrings("replay-b.test", winning_names.name(0));
+}
+
+test "secured mesh probe deadline actively tears down a silent established socket" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x67, 0x68);
+    defer pair.deinit();
+    var sim_time = reactor_mod.SimReactor.init(10_000);
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .reactor = sim_time.reactor(),
+        .ping_timeout_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.s2s_secured = &pair.a;
+    // Retain deterministic probe ciphertext in the daemon SendQ and model the
+    // ordinary armed receive whose completion owns final close after shutdown.
+    conn.send_armed = true;
+    conn.recv_armed = true;
+    defer {
+        if (server.rx().clients.get(id)) |live| {
+            live.s2s_secured = null;
+            live.send_armed = false;
+            live.recv_armed = false;
+            _ = server.rx().clients.free(id);
+        }
+    }
+
+    server.maybeProbeMeshPeerRtt();
+    try std.testing.expect(conn.awaiting_pong);
+    const original_deadline = conn.ping_sent_ms;
+    sim_time.advance(LinuxServer.peer_rtt_probe_interval_ms);
+    server.maybeProbeMeshPeerRtt();
+    // A second local write cannot extend a receipt deadline without inbound proof.
+    try std.testing.expectEqual(original_deadline, conn.ping_sent_ms);
+    try std.testing.expect(!conn.closing);
+
+    sim_time.advance(server.config.ping_timeout_ms + 1);
+    server.sweepTimeouts();
+    try std.testing.expect(conn.closing);
+    try std.testing.expectEqualStrings("Mesh liveness timeout", conn.close_reason);
+}
+
+test "secured mesh probe deadline starts only after whole record reaches SendQ" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x6b, 0x6c);
+    defer pair.deinit();
+    var sim_time = reactor_mod.SimReactor.init(15_000);
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .reactor = sim_time.reactor(),
+        .ping_timeout_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.s2s_secured = &pair.a;
+    conn.send_armed = true;
+    conn.sendq_cap = 1;
+    conn.send_buf[0] = 'x';
+    conn.send_len = 1;
+    defer {
+        if (server.rx().clients.get(id)) |live| {
+            live.s2s_secured = null;
+            live.send_armed = false;
+            _ = server.rx().clients.free(id);
+        }
+    }
+
+    server.maybeProbeMeshPeerRtt();
+    try std.testing.expect(conn.s2s_probe_pending);
+    try std.testing.expect(!conn.awaiting_pong);
+    try std.testing.expect(pair.a.outbound().len != 0);
+
+    // While our probe is retained, an inbound peer PING generates a PONG record
+    // behind it. This is the exact ordering that requires a byte-exact marker:
+    // committing the probe cannot wait for the later record to drain.
+    try pair.b.probeRtt(@intCast(sim_time.clock_ms));
+    const peer_ping = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(peer_ping);
+    pair.b.clearOutbound();
+    server.driveS2sSecured(conn, &pair.a, peer_ping);
+    try std.testing.expect(conn.s2s_probe_pending);
+    const probe_boundary = conn.s2s_probe_pending_bytes;
+    try std.testing.expect(probe_boundary != 0);
+    try std.testing.expect(pair.a.outbound().len > probe_boundary);
+
+    // Give the pager capacity for exactly the retained probe record, not the
+    // trailing PONG. The shared prefix-commit edge must arm immediately even
+    // though flush returns backpressured with a suffix still retained.
+    resetTestSendQ(conn);
+    conn.sendq_cap = probe_boundary;
+    try std.testing.expect(!server.flushMeshBurstStage(conn));
+    try std.testing.expect(!conn.s2s_probe_pending);
+    try std.testing.expectEqual(@as(usize, 0), conn.s2s_probe_pending_bytes);
+    try std.testing.expect(conn.awaiting_pong);
+    try std.testing.expect(pair.a.outbound().len != 0); // trailing PONG retained
+    try std.testing.expectEqual(sim_time.clock_ms, conn.ping_sent_ms);
+
+    const probe_wire = try copyTestSendQ(allocator, conn);
+    defer allocator.free(probe_wire);
+    resetTestSendQ(conn);
+    try pair.b.feed(probe_wire, @intCast(sim_time.clock_ms));
+    const response_wire = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(response_wire);
+    pair.b.clearOutbound();
+    try std.testing.expect(response_wire.len != 0);
+    try std.testing.expect(response_wire.len <= conn.recv_buf.len);
+    // Keep the trailing PONG backpressured while the fast probe answer enters.
+    conn.sendq_cap = 1;
+    conn.send_buf[0] = 'x';
+    conn.send_len = 1;
+    @memcpy(conn.recv_buf[0..response_wire.len], response_wire);
+    conn.recv_armed = true;
+    server.rx().socket_io_quiescing = true;
+    defer server.rx().socket_io_quiescing = false;
+    try server.handleRecv(.{
+        .token = conn.token,
+        .res = @intCast(response_wire.len),
+        .more = false,
+    });
+    server.rx().socket_io_quiescing = false;
+    try std.testing.expect(!conn.s2s_probe_pending);
+    try std.testing.expect(!conn.awaiting_pong);
+
+    // Draining the later record must never re-arm the already-answered probe.
+    resetTestSendQ(conn);
+    conn.sendq_cap = default_sendq_cap;
+    try std.testing.expect(server.flushMeshBurstStage(conn));
+    try std.testing.expect(!conn.s2s_probe_pending);
+    try std.testing.expect(!conn.awaiting_pong);
+    resetTestSendQ(conn);
+
+    // No timeout exists after the answer. At the next cadence a real new probe,
+    // not an empty flush of stale metadata, must enter SendQ with its deadline.
+    sim_time.advance(server.config.ping_timeout_ms + 1);
+    server.sweepTimeouts();
+    try std.testing.expect(!conn.closing);
+    sim_time.advance(LinuxServer.peer_rtt_probe_interval_ms);
+    server.maybeProbeMeshPeerRtt();
+    try std.testing.expect(conn.awaiting_pong);
+    try std.testing.expect(conn.send_len > conn.send_offset or conn.send_overflow.items.len != 0);
+}
+
+test "secured live establishment replaces an expired deterministic collision winner" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    // The old outbound leg is the deterministic survivor for aaa.test, which is
+    // exactly the production failure mode: absent liveness, every fresh inbound
+    // secured link would be collapsed against it.
+    var remote_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x6a)), "session-replay-test");
+    defer remote_identity.deinit();
+    var local_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x69)), "session-replay-test");
+    defer local_identity.deinit();
+    const remote_prekey = try remote_identity.signedPrekey(1, 10, 1000, LinuxServer.s2s_bands, LinuxServer.s2s_features);
+    const local_prekey = try local_identity.signedPrekey(2, 10, 1000, LinuxServer.s2s_bands, LinuxServer.s2s_features);
+    var old_remote = try secured_s2s_link.SecuredLink.init(.{
+        .allocator = allocator,
+        .role = .initiator,
+        .identity = &remote_identity,
+        .local_prekey = remote_prekey,
+        .cfg = .{
+            .realm = remote_identity.realm,
+            .supported_bands = LinuxServer.s2s_bands,
+            .supported_features = LinuxServer.s2s_features,
+            .mesh_pass = "session-replay-secret",
+            .now_ms = 20,
+        },
+        .rng = std.testing.io,
+        .server_name = "replay-b.test",
+    });
+    defer old_remote.deinit();
+    const old_local = try allocator.create(secured_s2s_link.SecuredLink);
+    var old_local_initialized = false;
+    var old_local_owned_by_server = false;
+    errdefer {
+        if (!old_local_owned_by_server) {
+            if (old_local_initialized) old_local.deinit();
+            allocator.destroy(old_local);
+        }
+    }
+    old_local.* = try secured_s2s_link.SecuredLink.init(.{
+        .allocator = allocator,
+        .role = .responder,
+        .identity = &local_identity,
+        .local_prekey = local_prekey,
+        .cfg = .{
+            .realm = local_identity.realm,
+            .supported_bands = LinuxServer.s2s_bands,
+            .supported_features = LinuxServer.s2s_features,
+            .mesh_pass = "session-replay-secret",
+            .now_ms = 20,
+        },
+        .rng = std.testing.io,
+        .server_name = "aaa.test",
+    });
+    old_local_initialized = true;
+    try pumpSecuredTestLinks(allocator, &old_remote, old_local);
+    try std.testing.expect(old_local.established());
+    var remote = try secured_s2s_link.SecuredLink.init(.{
+        .allocator = allocator,
+        .role = .initiator,
+        .identity = &remote_identity,
+        .local_prekey = remote_prekey,
+        .cfg = .{
+            .realm = remote_identity.realm,
+            .supported_bands = LinuxServer.s2s_bands,
+            .supported_features = LinuxServer.s2s_features,
+            .mesh_pass = "session-replay-secret",
+            .now_ms = 20,
+        },
+        .rng = std.testing.io,
+        .server_name = "replay-b.test",
+    });
+    defer remote.deinit();
+    var replacement = try secured_s2s_link.SecuredLink.init(.{
+        .allocator = allocator,
+        .role = .responder,
+        .identity = &local_identity,
+        .local_prekey = local_prekey,
+        .cfg = .{
+            .realm = local_identity.realm,
+            .supported_bands = LinuxServer.s2s_bands,
+            .supported_features = LinuxServer.s2s_features,
+            .mesh_pass = "session-replay-secret",
+            .now_ms = 20,
+        },
+        .rng = std.testing.io,
+        .server_name = "aaa.test",
+    });
+    defer replacement.deinit();
+
+    var sim_time = reactor_mod.SimReactor.init(20_000);
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "aaa.test",
+        .node_id = local_identity.shortId(),
+        .node_identity = &local_identity,
+        .crypto_io = std.testing.io,
+        .reactor = sim_time.reactor(),
+        .ping_timeout_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var old_socket: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &old_socket)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(old_socket[1]);
+    const old_id = try server.rx().clients.alloc(ConnState.init(old_socket[0]));
+    const old_conn = server.rx().clients.get(old_id).?;
+    old_conn.overflow_allocator = allocator;
+    old_conn.token = try tokenFromId(old_id);
+    old_conn.s2s_secured = old_local;
+    old_local_owned_by_server = true;
+    old_conn.s2s_initiator = true;
+    old_conn.awaiting_pong = true;
+    old_conn.ping_sent_ms = sim_time.clock_ms - server.config.ping_timeout_ms - 1;
+    // Model the SQ-pressure gap the old teardown used to orphan: activation is
+    // pending, but no kernel operation owns inline ConnState storage.
+    old_conn.io_activation_pending = true;
+    old_conn.activation_recv_required = true;
+    server.noteS2sTcpOpened(old_conn);
+    server.noteS2sEstablished(old_conn, old_local.remoteName(), "secured-test-old");
+
+    const replacement_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const replacement_conn = server.rx().clients.get(replacement_id).?;
+    replacement_conn.overflow_allocator = allocator;
+    replacement_conn.token = try tokenFromId(replacement_id);
+    replacement_conn.s2s_secured = &replacement;
+    replacement_conn.s2s_initiator = false;
+    replacement_conn.send_armed = true;
+    server.noteS2sTcpOpened(replacement_conn);
+    defer {
+        if (server.rx().clients.get(old_id)) |live| {
+            // Failure-only cleanup: on success collision teardown already freed
+            // this heap-owned link and its socket.
+            live.s2s_secured = null;
+            closeFd(live.fd);
+            _ = server.rx().clients.free(old_id);
+            old_local.deinit();
+            allocator.destroy(old_local);
+            old_local_owned_by_server = false;
+        }
+        if (server.rx().clients.get(replacement_id)) |live| {
+            live.s2s_secured = null;
+            live.send_armed = false;
+        }
+        _ = server.rx().clients.free(replacement_id);
+    }
+
+    var rounds: usize = 0;
+    while (!replacement.established() and rounds < 64) : (rounds += 1) {
+        var progressed = false;
+        if (replacement.outbound().len != 0) {
+            if (!server.flushMeshBurstStage(replacement_conn)) return error.TestUnexpectedResult;
+        }
+        {
+            const to_remote = try copyTestSendQ(allocator, replacement_conn);
+            defer allocator.free(to_remote);
+            resetTestSendQ(replacement_conn);
+            if (to_remote.len != 0) {
+                progressed = true;
+                try remote.feed(to_remote, @intCast(rounds + 21));
+            }
+        }
+        {
+            const to_server = try allocator.dupe(u8, remote.outbound());
+            defer allocator.free(to_server);
+            remote.clearOutbound();
+            if (to_server.len != 0) {
+                progressed = true;
+                server.driveS2sSecured(replacement_conn, &replacement, to_server);
+                if (replacement_conn.closing) return error.TestUnexpectedResult;
+            }
+        }
+        if (!progressed) return error.TestUnexpectedResult;
+    }
+
+    try std.testing.expect(replacement.established());
+    // The stale predecessor had no armed CQE to wake. Replacement must therefore
+    // finalize it synchronously instead of orphaning an activation-pending slot.
+    try std.testing.expect(server.rx().clients.get(old_id) == null);
+    try std.testing.expect(!replacement_conn.closing);
+    try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
+    try std.testing.expectEqualStrings(
+        "replay-b.test",
+        server.mesh_peer_names[0][0..server.mesh_peer_name_lens[0]],
+    );
+    var metrics: std.ArrayList(u8) = .empty;
+    defer metrics.deinit(allocator);
+    try server.stats.writePrometheus(allocator, &metrics);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_s2s_tcp_active 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_s2s_links_active 1\n") != null);
+}
+
+test "secured collision scan passes stale loser before resolving viable route" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var stale_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x71, 0x72);
+    defer stale_pair.deinit();
+    var viable_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x73, 0x74);
+    defer viable_pair.deinit();
+    var new_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x75, 0x76);
+    defer new_pair.deinit();
+    var sim_time = reactor_mod.SimReactor.init(30_000);
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "aaa.test",
+        .reactor = sim_time.reactor(),
+        .ping_timeout_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const stale_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const stale = server.rx().clients.get(stale_id).?;
+    stale.token = try tokenFromId(stale_id);
+    stale.s2s_secured = &stale_pair.a;
+    stale.s2s_initiator = false;
+    stale.recv_armed = true;
+    stale.awaiting_pong = true;
+    stale.ping_sent_ms = sim_time.clock_ms - server.config.ping_timeout_ms - 1;
+
+    const viable_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const viable = server.rx().clients.get(viable_id).?;
+    viable.token = try tokenFromId(viable_id);
+    viable.s2s_secured = &viable_pair.a;
+    viable.s2s_initiator = false;
+    viable.recv_armed = true;
+
+    const new_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const new_conn = server.rx().clients.get(new_id).?;
+    new_conn.token = try tokenFromId(new_id);
+    new_conn.s2s_secured = &new_pair.a;
+    new_conn.s2s_initiator = true; // preferred direction for aaa.test
+    defer {
+        for ([_]client_model.ClientId{ stale_id, viable_id, new_id }) |id| {
+            if (server.rx().clients.get(id)) |live| {
+                live.s2s_secured = null;
+                live.recv_armed = false;
+                _ = server.rx().clients.free(id);
+            }
+        }
+    }
+
+    try std.testing.expect(!server.resolveS2sCollision(new_conn, "replay-b.test"));
+    try std.testing.expect(stale.closing);
+    try std.testing.expect(stale.s2s_dedup);
+    try std.testing.expect(viable.closing);
+    try std.testing.expect(viable.s2s_dedup);
+    try std.testing.expect(!new_conn.closing);
+    try std.testing.expect(!new_conn.s2s_dedup);
+}
+
+test "client active gauge follows physical slot ownership through close and refusal" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var live_pair: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &live_pair)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(live_pair[1]);
+    const live_id = try server.rx().clients.alloc(ConnState.init(live_pair[0]));
+    const live = server.rx().clients.get(live_id).?;
+    live.overflow_allocator = allocator;
+    live.token = try tokenFromId(live_id);
+    try std.testing.expect(try server.startAcceptedPlain(live, false));
+    // Re-entering an admission helper must not double-own the gauge.
+    server.noteClientAccepted(live);
+
+    var metrics: std.ArrayList(u8) = .empty;
+    defer metrics.deinit(allocator);
+    try server.stats.writePrometheus(allocator, &metrics);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_connections_active 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_connections_total 1\n") != null);
+
+    // A slot that never acquired gauge ownership (for example, an older
+    // pre-admission error path) must not subtract some other live connection.
+    var uncounted_pair: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &uncounted_pair)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(uncounted_pair[1]);
+    const uncounted_id = try server.rx().clients.alloc(ConnState.init(uncounted_pair[0]));
+    const uncounted = server.rx().clients.get(uncounted_id).?;
+    uncounted.overflow_allocator = allocator;
+    uncounted.token = try tokenFromId(uncounted_id);
+    try server.closeConn(uncounted.token, "uncounted gauge test close");
+    metrics.clearRetainingCapacity();
+    try server.stats.writePrometheus(allocator, &metrics);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_connections_active 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_connections_total 1\n") != null);
+
+    try server.closeConn(live.token, "gauge test close");
+    metrics.clearRetainingCapacity();
+    try server.stats.writePrometheus(allocator, &metrics);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_connections_active 0\n") != null);
+
+    var refused_pair: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &refused_pair)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(refused_pair[1]);
+    server.draining = true;
+    try server.handleAccept(.{ .token = tls_listener_token, .res = refused_pair[0], .more = false });
+    try std.testing.expectEqual(@as(usize, 0), server.rx().clients.len());
+
+    metrics.clearRetainingCapacity();
+    try server.stats.writePrometheus(allocator, &metrics);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_connections_active 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_connections_total 2\n") != null);
 }
 
 test "non-dedup S2S close immediately removes published peer" {
@@ -94044,6 +94749,11 @@ test "secured accept using final SQ slot retains partial I/O ownership" {
     try std.testing.expect(accepted.io_activation_pending);
     try std.testing.expect(!accepted.activation_recv_required); // only SEND remains
     try std.testing.expectEqual(@as(u32, 8), server.rx().ring.inner.sq_ready());
+    var metrics: std.ArrayList(u8) = .empty;
+    defer metrics.deinit(allocator);
+    try server.stats.writePrometheus(allocator, &metrics);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_s2s_tcp_active 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_s2s_links_active 0\n") != null);
 }
 
 test "configured boot dial cursor reaches three peers behind a fast failure" {
@@ -97489,6 +98199,11 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
     server.config.inherited_state_fd_manifest_present = true;
     server.config.inherited_state_fd_manifest_valid = true;
     try server.adoptInheritedSessions();
+    var adopted_metrics: std.ArrayList(u8) = .empty;
+    defer adopted_metrics.deinit(alloc);
+    try server.stats.writePrometheus(alloc, &adopted_metrics);
+    try std.testing.expect(std.mem.indexOf(u8, adopted_metrics.items, "onyx_connections_active 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, adopted_metrics.items, "onyx_connections_total 1\n") != null);
     // adopt binds this thread to the server's reactor; unbind so later
     // main-thread calls (and the teardown defers) resolve per-instance.
     current_reactor = null;
