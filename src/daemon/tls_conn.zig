@@ -288,7 +288,7 @@ pub const TlsConn = struct {
         }
 
         // Process complete records front-to-back, consuming each from recv_buf.
-        while (completeRecordLen(self.recv_buf.items)) |wire_len| {
+        while (try completeRecordLen(self.recv_buf.items)) |wire_len| {
             if (self.handshakeDone()) {
                 try self.decryptRecord(self.recv_buf.items[0..wire_len]);
             } else {
@@ -456,7 +456,7 @@ pub const TlsConn = struct {
         var pos: usize = 0;
         const buf = self.recv_buf.items;
         while (true) {
-            const wire = completeRecordLen(buf[pos..]) orelse return .need_more;
+            const wire = try completeRecordLen(buf[pos..]) orelse return .need_more;
             const rec = buf[pos .. pos + wire];
             if (rec[0] != @intFromEnum(tls_record.ContentType.handshake)) return error.BadRecord;
             const frag = rec[tls_record.record_header_len..];
@@ -517,12 +517,30 @@ fn classifyClientHello(body: []const u8) TlsConn.Detected {
     return .tls12;
 }
 
-/// Length on the wire of the first complete TLS record in `buf`, or null when
-/// fewer than a full record's worth of bytes are present yet. Validates only the
-/// 5-byte framing header; the inner server validates content type and body.
-fn completeRecordLen(buf: []const u8) ?usize {
+/// Length on the wire of the first complete TLS record in `buf`.
+///
+/// Returns null ONLY when more bytes are genuinely needed. A structurally
+/// invalid header is an error, never a null: this framer runs in FRONT of both
+/// inner engines, so anything it reports as merely "incomplete" is retained in
+/// `recv_buf` and waited on indefinitely. A peer that declares a body it never
+/// sends parks that many bytes per connection until the idle timeout, and the
+/// inner engine's own header checks never get to run because the record never
+/// completes.
+///
+///   * RFC 8446 §5 / RFC 5246 §6.2.1: the content type set is {20,21,22,23} for
+///     both engines, so a byte outside it can only come from a peer inventing
+///     one — terminate rather than wait for the body.
+///   * RFC 8446 §5.2 / RFC 5246 §6.2.3: TLSCiphertext.length is capped at
+///     2^14+256 on both arms, but the wire field is a u16, so a peer can declare
+///     0xFFFF and make us hold ~64 KiB for a record we are guaranteed to reject.
+///
+/// The legacy version byte is deliberately NOT checked here — it differs between
+/// the two arms (TLS 1.2 accepts 0x0301–0x0303) and is the inner engine's call.
+fn completeRecordLen(buf: []const u8) Error!?usize {
     if (buf.len < tls_record.record_header_len) return null;
+    if (tls_record.ContentType.fromWire(buf[0]) == null) return error.BadRecord;
     const body_len = std.mem.readInt(u16, buf[3..5], .big);
+    if (body_len > tls_record.max_ciphertext_len) return error.BadRecord;
     const wire_len = tls_record.record_header_len + @as(usize, body_len);
     if (buf.len < wire_len) return null;
     return wire_len;
@@ -1537,7 +1555,7 @@ test "write splits plaintext larger than the record limit into multiple records"
     var reassembled: std.ArrayList(u8) = .empty;
     defer reassembled.deinit(alloc);
     var pos: usize = 0;
-    while (completeRecordLen(cipher[pos..])) |wire_len| {
+    while (try completeRecordLen(cipher[pos..])) |wire_len| {
         const rec = cipher[pos .. pos + wire_len];
         const pt = try client.decrypt(rec);
         defer alloc.free(pt);
@@ -1808,4 +1826,104 @@ test "TLS 1.2 session ticket resumes across dual TlsConn instances (RFC 5077)" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial corpus (`zig build test-exploit`).
+//
+// `TlsConn` is the daemon's real listener edge: it frames records BEFORE either
+// inner engine sees them, so a header the framer mistakes for "incomplete" is
+// held in `recv_buf` until the idle timeout rather than rejected.
+// ---------------------------------------------------------------------------
+
+test "exploit: an oversize record declaration cannot park 64 KiB in the daemon framer" {
+    // The wire length field is a u16, so a peer can declare 0xFFFF while both
+    // engines cap TLSCiphertext at 2^14+256. Uncapped, this header alone made the
+    // daemon wait for ~64 KiB of a record guaranteed to be rejected, and the
+    // inner engine's own cap never ran because the record never completed.
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x51)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+
+    // Only the 5-byte header is ever sent; the declaration alone must fail.
+    const header = [_]u8{ 22, 0x03, 0x03, 0xFF, 0xFF };
+    try std.testing.expectError(error.BadRecord, conn.onInbound(&header));
+}
+
+test "exploit: the daemon framer rejects an unknown record content type" {
+    // An unrecognized outer type must terminate, not be treated as "need more".
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x52)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+
+    for ([_]u8{ 0, 19, 24, 25, 0xFF }) |bad_type| {
+        var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+        defer conn.deinit();
+        const rec = [_]u8{ bad_type, 0x03, 0x03, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF };
+        try std.testing.expectError(error.BadRecord, conn.onInbound(&rec));
+    }
+}
+
+test "exploit: a hostile record after a valid ClientHello is rejected mid-handshake" {
+    // The engine is selected and the server flight already emitted, so this
+    // exercises the steady-state framing loop rather than `detectVersion`.
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x53)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const flight = try conn.onInbound(ch);
+    try std.testing.expect(flight.handshake_bytes.len != 0);
+
+    const oversize = [_]u8{ 23, 0x03, 0x03, 0xFF, 0xFF };
+    try std.testing.expectError(error.BadRecord, conn.onInbound(&oversize));
+}
+
+test "exploit: a legitimate maximum-size record is still accepted (no regression)" {
+    // The cap must sit exactly at 2^14+256, not below it: a full-size application
+    // record is legal on both arms and must survive the new check.
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x54)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const flight = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(flight.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+    try std.testing.expect(conn.handshakeDone());
+
+    // A full plaintext record encrypts to just under the ciphertext cap.
+    const payload = try alloc.alloc(u8, tls_record.max_plaintext_len);
+    defer alloc.free(payload);
+    @memset(payload, 'A');
+    const sealed = try client.encrypt(payload);
+    defer alloc.free(sealed);
+    const body_len = std.mem.readInt(u16, sealed[3..5], .big);
+    try std.testing.expect(body_len <= tls_record.max_ciphertext_len);
+
+    const out = try conn.onInbound(sealed);
+    try std.testing.expectEqual(payload.len, out.plaintext.len);
 }

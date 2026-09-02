@@ -659,11 +659,18 @@ test "exploit: distinct sequence numbers never collide onto one nonce" {
     }
 }
 
-test "exploit: the record header is AEAD-bound — a truncated body does not open" {
-    // additional_data is the serialized 5-byte header, so the declared length is
-    // authenticated. An attacker who shortens a record (and fixes up the length
-    // field so framing still parses) must get an auth failure, not a truncated
-    // plaintext.
+test "exploit: a truncated record does not open" {
+    // An attacker who shortens a record (and fixes up the length field so framing
+    // still parses) must get an auth failure, not a truncated plaintext.
+    //
+    // Note this proves truncation-rejection, NOT that the AAD binds the declared
+    // length: `openRecord` takes the tag as the trailing 16 bytes of whatever is
+    // delivered, so a chopped record already fails on a mangled tag. The
+    // length/body-mismatch claim is carried by the framing test above, and it is
+    // in fact unreachable through this path at all — `parseCiphertext` pins
+    // `record.len == record_header_len + declared_length` and `headerBytes()`
+    // recomputes the AAD length from the delivered slice, so a peer can never
+    // present a disagreeing pair to the AEAD in the first place.
     const testing = std.testing;
     const allocator = testing.allocator;
     const A = aead.Aead(.chacha20_poly1305);

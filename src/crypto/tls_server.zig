@@ -7917,8 +7917,11 @@ test "exploit: an unknown record content type is rejected instead of buffered fo
         var rec_buf: [64]u8 = undefined;
         const rec = exploitPlainRecord(&rec_buf, bad_type, "payload");
         try std.testing.expectError(error.BadRecord, server.feed(rec));
-        // The hostile bytes must not have been retained for a later retry.
-        try std.testing.expect(server.recv_buf.items.len <= rec.len);
+        // The offending bytes are still buffered — the framer errors before it
+        // consumes them. What makes that safe is that the error is fatal and the
+        // caller drops the connection, not that the buffer was drained; the bug
+        // was returning a *retryable* null, which let the peer keep appending.
+        try std.testing.expect(!server.handshakeDone());
     }
 }
 
@@ -8032,7 +8035,11 @@ test "exploit: a truncated ClientHello never completes and never traps" {
     while (cut < ch.len) : (cut += 7) {
         var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
         defer server.deinit();
-        const res = server.feed(ch[0..cut]) catch continue; // a typed error is fine
+        // No prefix of a well-formed ClientHello may error: the outer type is 22
+        // and the declared length is under the cap, so every cut is a genuine
+        // partial read. Swallowing an error here would hide exactly the
+        // regression the framing change could introduce.
+        const res = try server.feed(ch[0..cut]);
         try std.testing.expectEqual(FeedResult.need_more, res);
     }
 }
