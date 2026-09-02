@@ -49137,6 +49137,13 @@ pub const LinuxServer = struct {
     /// before the release-store of the count so cross-shard readers observe a
     /// consistent (count, names) pair.
     fn publishPeerCount(self: *LinuxServer) void {
+        // S2S peer links live only on reactor 0 (see the load-bearing comment
+        // at `server.zig:6239-6252`). The `onTimerTick` call site already
+        // gates this, but that is not the only path to this function — guard
+        // internally too, or a sibling reactor's zero-peer view overwrites the
+        // shared `mesh_peer_*` tables and erases mesh identity for every
+        // shard's cross-shard reads. docs/audit/timer-guard-0.7.md P0-TG-2.
+        if (self.rx() != &self.reactors[0]) return;
         var seen: [32][]const u8 = undefined;
         var seen_node_ids: [32]u64 = @splat(0);
         var seen_public_keys: [32][crypto_sign.public_key_len]u8 =
@@ -49297,6 +49304,12 @@ pub const LinuxServer = struct {
     /// Emit timestamped PING probes on every established mesh peer and flush the
     /// resulting outbound. Reactor-0-only caller (S2S slots live there).
     fn maybeProbeMeshPeerRtt(self: *LinuxServer) void {
+        // S2S peer links live only on reactor 0. Guard internally, and check
+        // it BEFORE the throttle counter — not just at the `onTimerTick` call
+        // site — so a sibling reactor with no peer links can never consume
+        // `last_peer_rtt_probe_ms` while probing nothing (guard theft).
+        // docs/audit/timer-guard-0.7.md P0-TG-2.
+        if (self.rx() != &self.reactors[0]) return;
         const now = self.nowMs();
         if (self.last_peer_rtt_probe_ms != 0 and now - self.last_peer_rtt_probe_ms < peer_rtt_probe_interval_ms)
             return;
@@ -52884,6 +52897,63 @@ test "secured establishment immediately publishes authenticated trust route" {
         "replay-a.test",
         server.mesh_peer_names[0][0..server.mesh_peer_name_lens[0]],
     );
+}
+
+test "mesh peer-count publish and RTT probe refuse a sibling (non-reactor-0) caller" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+
+    // Seed the shared mesh identity/RTT state as reactor 0 would have already
+    // published it, then call both functions with `current_reactor` pinned to
+    // reactor 1 — the shard that never holds an S2S link. docs/audit/
+    // timer-guard-0.7.md P0-TG-2: neither call may move anything from here,
+    // and the RTT throttle specifically must not advance ahead of its guard
+    // (guard theft) even though nothing on this shard gets probed.
+    current_reactor = &server.reactors[0];
+    lockSpin(&server.mesh_peer_identity_mu);
+    const seeded_name = "reactor0-peer.test";
+    @memcpy(server.mesh_peer_names[0][0..seeded_name.len], seeded_name);
+    server.mesh_peer_name_lens[0] = @intCast(seeded_name.len);
+    server.net_peer_count.store(1, .release);
+    server.mesh_peer_identity_mu.unlock();
+    server.last_peer_rtt_probe_ms = 12_345;
+
+    // A connection on the sibling reactor that WOULD be probed and WOULD zero
+    // the published peer table if the guard were absent — proves the internal
+    // guard, not merely an empty client table on reactor 1, stops the work.
+    current_reactor = &server.reactors[1];
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    defer _ = server.rx().clients.free(id);
+
+    server.publishPeerCount();
+    server.maybeProbeMeshPeerRtt();
+
+    try std.testing.expectEqual(@as(u8, seeded_name.len), server.mesh_peer_name_lens[0]);
+    try std.testing.expectEqualStrings(seeded_name, server.mesh_peer_names[0][0..seeded_name.len]);
+    try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 12_345), server.last_peer_rtt_probe_ms);
+
+    // Called from the owning reactor, both are free to act: the stale peer
+    // identity is replaced by today's (empty, on this fixture) reactor-0
+    // roster, and the RTT throttle legitimately advances.
+    current_reactor = &server.reactors[0];
+    server.publishPeerCount();
+    server.maybeProbeMeshPeerRtt();
+    try std.testing.expectEqual(@as(u32, 0), server.net_peer_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), server.mesh_peer_name_lens[0]);
+    try std.testing.expect(server.last_peer_rtt_probe_ms != 12_345);
 }
 
 test "secured establish collision winner teardown trust lifecycle" {
