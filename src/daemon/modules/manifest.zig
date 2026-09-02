@@ -46,3 +46,22 @@ pub const Live = blk: {
     @setEvalBranchQuota(200_000);
     break :blk registry.Registry(&enabled);
 };
+
+test {
+    // Importing a module file for its `module` declaration does NOT register
+    // that file's `test` blocks with the test runner — only an explicit
+    // reference does. Without this block every modules/*.zig test silently
+    // never runs. Keep one line per enabled module.
+    _ = query_info;
+    _ = channel_ops;
+    _ = messaging;
+    _ = accounts;
+    _ = ircx;
+    _ = oper_security;
+    _ = user_query;
+    _ = feature_misc;
+    _ = introspect;
+    _ = upgrade;
+    _ = services_ext;
+    _ = webhook;
+}

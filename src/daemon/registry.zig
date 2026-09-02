@@ -1057,9 +1057,10 @@ pub fn loadOrder(comptime mods: []const Module) [mods.len]usize {
                 best = i;
             }
         }
-        // A validated set always has a ready module; guard anyway so a caller
-        // that skipped validation gets a compile error instead of a hang.
-        const chosen = best orelse @compileError("SerpentRegistry: loadOrder found no ready module (unvalidated cycle?)");
+        // A validated set always has a ready module. Reaching this means the
+        // caller skipped `validate` and handed us a cycle: fault instead of
+        // spinning. At comptime this is a compile error; at runtime a panic.
+        const chosen = best orelse unreachable;
         order[count] = chosen;
         placed[chosen] = true;
         count += 1;
@@ -1688,4 +1689,181 @@ test "validator detects a dependency cycle between two modules" {
     try std.testing.expect(
         std.mem.eql(u8, "alpha", err.module_id) or std.mem.eql(u8, "beta", err.module_id),
     );
+}
+
+// --- Aliases, warden class, and load order --------------------------------
+
+const aliasModule = Module{
+    .id = "alias.host",
+    .commands = &.{
+        .{
+            .name = "PING",
+            .min_params = 1,
+            .access = .oper,
+            .warden_class = .free,
+            .aliases = &.{ "PNG", "P" },
+            .handler = pingHandler,
+        },
+        .{
+            .name = "SAY",
+            .warden_class = .messaging,
+            .handler = pongHandler,
+        },
+    },
+};
+
+test "command aliases resolve to the canonical handler and are flagged as aliases" {
+    const Reg = Registry(&.{aliasModule});
+    var ctx = TestCtx{};
+
+    // Every alias dispatches the canonical handler with the canonical arity.
+    for ([_][]const u8{ "PING", "PNG", "P", "png" }) |name| {
+        const result = try Reg.dispatch(&ctx, name, &.{"x"});
+        try std.testing.expectEqual(DispatchResult.handled, result);
+    }
+    try std.testing.expectEqual(@as(usize, 4), ctx.command_count);
+
+    // An alias resolves to the canonical row, so introspection can collapse it.
+    const via_alias = Reg.lookupCommand("PNG") orelse return error.MissingAlias;
+    try std.testing.expectEqualStrings("PING", via_alias.spec.name);
+
+    try std.testing.expect(Reg.isAlias("PNG"));
+    try std.testing.expect(Reg.isAlias("p"));
+    try std.testing.expect(!Reg.isAlias("PING"));
+    try std.testing.expect(!Reg.isAlias("NOPE"));
+
+    // Aliases do not add command rows, only lookup entries.
+    try std.testing.expectEqual(@as(usize, 2), Reg.commands.len);
+    try std.testing.expectEqual(@as(comptime_int, 2), Reg.alias_count);
+
+    // An alias cannot be a weaker door: it carries the canonical access + arity.
+    const plain = DispatchCaps{ .registered = true, .oper = false };
+    try std.testing.expect(!commandAvailable(via_alias.spec, plain));
+    try std.testing.expectEqual(
+        DispatchResult{ .too_few_params = 1 },
+        try Reg.dispatch(&ctx, "PNG", &.{}),
+    );
+}
+
+test "wardenClassFor reports the declared anti-abuse class through aliases" {
+    const Reg = Registry(&.{aliasModule});
+
+    try std.testing.expectEqual(WardenClass.free, Reg.wardenClassFor("PING").?);
+    try std.testing.expectEqual(WardenClass.free, Reg.wardenClassFor("PNG").?);
+    try std.testing.expectEqual(WardenClass.messaging, Reg.wardenClassFor("SAY").?);
+    try std.testing.expectEqual(@as(?WardenClass, null), Reg.wardenClassFor("NOPE"));
+
+    // Default stays `.normal` so existing specs keep their metering story.
+    try std.testing.expectEqual(WardenClass.normal, (CommandSpec{
+        .name = "X",
+        .handler = pongHandler,
+    }).warden_class);
+    try std.testing.expectEqualStrings("channel_churn", WardenClass.channel_churn.token());
+}
+
+const aliasShadowsCommandModule = Module{
+    .id = "shadow",
+    .commands = &.{
+        .{ .name = "OTHER", .aliases = &.{"PING"}, .handler = pongHandler },
+    },
+};
+
+test "validator rejects an alias that shadows a canonical command in another module" {
+    // Declared AFTER the alias, to prove the check is order-independent.
+    const err = validate(&.{ aliasShadowsCommandModule, coreModule }) orelse
+        return error.ExpectedDuplicateAlias;
+    try std.testing.expectEqual(ValidationKind.duplicate_alias, err.kind);
+    try std.testing.expectEqualStrings("PING", err.name);
+}
+
+const aliasCollidesAcrossModulesModule = Module{
+    .id = "other.host",
+    .commands = &.{
+        .{ .name = "QUERY", .aliases = &.{"PNG"}, .handler = pongHandler },
+    },
+};
+
+test "validator rejects an alias that collides with another module's alias" {
+    const err = validate(&.{ aliasModule, aliasCollidesAcrossModulesModule }) orelse
+        return error.ExpectedDuplicateAlias;
+    try std.testing.expectEqual(ValidationKind.duplicate_alias, err.kind);
+    try std.testing.expectEqualStrings("PNG", err.name);
+    // The FIRST declaration wins; the second is the reported offender.
+    try std.testing.expectEqualStrings("other.host", err.module_id);
+}
+
+const aliasSelfCollisionModule = Module{
+    .id = "self.collide",
+    .commands = &.{
+        .{ .name = "A", .aliases = &.{"dup"}, .handler = pongHandler },
+        .{ .name = "B", .aliases = &.{"DUP"}, .handler = pongHandler },
+    },
+};
+
+test "validator rejects two aliases colliding inside one module, case-insensitively" {
+    const err = validate(&.{aliasSelfCollisionModule}) orelse
+        return error.ExpectedDuplicateAlias;
+    try std.testing.expectEqual(ValidationKind.duplicate_alias, err.kind);
+    try std.testing.expectEqualStrings("DUP", err.name);
+}
+
+test "a clean module set with aliases passes validation" {
+    try std.testing.expectEqual(@as(?ValidationError, null), validate(&.{aliasModule}));
+}
+
+const orderRoot = Module{ .id = "root", .priority = .last };
+const orderMid = Module{ .id = "mid", .requires = &.{"root"}, .priority = .normal };
+const orderLeaf = Module{ .id = "leaf", .requires = &.{"mid"}, .priority = .first };
+
+test "loadOrder topologically sorts dependencies before dependents" {
+    // Manifest order is deliberately reversed relative to the dependency edges.
+    const mods = [_]Module{ orderLeaf, orderMid, orderRoot };
+    const order = loadOrder(&mods);
+
+    var position: [3]usize = undefined;
+    for (order, 0..) |mi, i| position[mi] = i;
+
+    // root (index 2) before mid (1) before leaf (0), despite priority saying
+    // the opposite: a dependency edge outranks a priority preference.
+    try std.testing.expect(position[2] < position[1]);
+    try std.testing.expect(position[1] < position[0]);
+}
+
+const indepEarly = Module{ .id = "e", .priority = .early };
+const indepLate = Module{ .id = "l", .priority = .late };
+const indepFirst = Module{ .id = "f", .priority = .first };
+
+test "loadOrder honors declared priority among independent modules" {
+    const mods = [_]Module{ indepLate, indepEarly, indepFirst };
+    const order = loadOrder(&mods);
+
+    // first < early < late regardless of manifest position.
+    try std.testing.expectEqualStrings("f", mods[order[0]].id);
+    try std.testing.expectEqualStrings("e", mods[order[1]].id);
+    try std.testing.expectEqualStrings("l", mods[order[2]].id);
+}
+
+test "loadOrder is a stable permutation of the live module set" {
+    const order = loadOrder(&.{ coreModule, capModule, lateModule });
+    try std.testing.expectEqual(@as(usize, 3), order.len);
+
+    var seen: [3]bool = @splat(false);
+    for (order) |mi| {
+        try std.testing.expect(!seen[mi]);
+        seen[mi] = true;
+    }
+    for (seen) |s| try std.testing.expect(s);
+
+    // cap requires core, so core must precede it.
+    var position: [3]usize = undefined;
+    for (order, 0..) |mi, i| position[mi] = i;
+    try std.testing.expect(position[0] < position[1]);
+}
+
+test "Registry exposes the load order of its module set" {
+    const Reg = Registry(&.{ coreModule, capModule });
+    try std.testing.expectEqual(@as(usize, 2), Reg.load_order.len);
+    // core (0) is a dependency of cap (1), so it loads first.
+    try std.testing.expectEqual(@as(usize, 0), Reg.load_order[0]);
+    try std.testing.expectEqual(@as(usize, 1), Reg.load_order[1]);
 }
