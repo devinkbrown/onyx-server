@@ -343,6 +343,31 @@ pub const CommandCategory = enum {
     }
 };
 
+/// Anti-abuse cost class for a command, mirroring the weights `flood_guard`
+/// actually charges to the command bucket (see `GuardConfig.privmsg_weight`,
+/// `join_weight`, and `default_weight` in `flood_guard.zig`).
+///
+/// This is a DECLARATION for introspection and for future centralised metering:
+/// `flood_guard` still classifies by verb internally, so declaring a class here
+/// does not change what a client is charged today. It exists so `COMMANDS` can
+/// tell an operator how expensive a verb is, and so the metering can later be
+/// driven from the registry instead of a hard-coded verb list.
+pub const WardenClass = enum {
+    /// Not metered at all (pre-registration handshake verbs, PONG).
+    free,
+    /// Charged `default_weight` — the ordinary case.
+    normal,
+    /// Charged `privmsg_weight` — carries user-visible message payload.
+    messaging,
+    /// Charged `join_weight` — drives channel membership churn (raid/cycle
+    /// pressure), so it is deliberately more expensive than `normal`.
+    channel_churn,
+
+    pub fn token(self: WardenClass) []const u8 {
+        return @tagName(self);
+    }
+};
+
 /// Command declaration exported by a module.
 pub const CommandSpec = struct {
     name: []const u8,
@@ -368,6 +393,21 @@ pub const CommandSpec = struct {
     /// so risking divergence from) the check itself. `null` means "no privilege
     /// beyond whatever `access` requires".
     oper_privilege: ?oper.Privilege = null,
+    /// Alternate names that resolve to this exact handler. Aliases share the
+    /// canonical spec wholesale — same access, arity, feature gate and handler —
+    /// so an alias can never be a weaker door into the same verb. They occupy
+    /// the same namespace as canonical names and collisions are a compile error
+    /// (`duplicate_alias`). Introspection lists an alias against its canonical
+    /// row rather than as a separate command.
+    aliases: []const []const u8 = &.{},
+    /// Multi-line help body for `HELP <command>`. Empty means "only `summary`
+    /// is available"; callers must not assume a trailing newline.
+    help_long: []const u8 = "",
+    /// Declared anti-abuse cost class. See `WardenClass`.
+    warden_class: WardenClass = .normal,
+    /// Set when this verb is retained only for compatibility; names the command
+    /// that supersedes it so introspection can steer operators to the new one.
+    deprecated_by: ?[]const u8 = null,
     handler: CommandHandler,
 };
 
@@ -517,6 +557,9 @@ pub const ValidationKind = enum {
     module_conflict,
     dependency_cycle,
     duplicate_command,
+    /// A command alias collided with a canonical command name or with another
+    /// alias. Left unchecked, one of the two would silently win the lookup map.
+    duplicate_alias,
     duplicate_cap,
     duplicate_channel_mode,
     duplicate_user_mode,
@@ -602,6 +645,29 @@ pub fn validate(comptime mods: []const Module) ?ValidationError {
                     .other_module_id = other,
                     .name = command.name,
                 };
+            }
+
+            // Aliases live in the same lookup namespace as canonical names, so
+            // check each one against BOTH namespaces across the whole module
+            // set -- not just earlier declarations. An alias that shadows a
+            // canonical command declared later would otherwise slip through.
+            for (command.aliases, 0..) |alias, alias_index| {
+                if (findCanonicalCommand(mods, alias)) |other| {
+                    return .{
+                        .kind = .duplicate_alias,
+                        .module_id = module.id,
+                        .other_module_id = other,
+                        .name = alias,
+                    };
+                }
+                if (findPriorAlias(mods, module_index, command_index, alias_index, alias)) |other| {
+                    return .{
+                        .kind = .duplicate_alias,
+                        .module_id = module.id,
+                        .other_module_id = other,
+                        .name = alias,
+                    };
+                }
             }
         }
 
@@ -701,12 +767,25 @@ pub fn Registry(comptime mods: []const Module) type {
     // Replaces the former O(commands) linear scan with a length-bucketed
     // StaticStringMap lookup, so every dispatched command is resolved in
     // O(commands-of-equal-length) instead of O(total commands).
+    // Aliases are folded into the SAME map as canonical names and point at the
+    // canonical row, so an alias and its command are indistinguishable to
+    // dispatch (identical access, arity, feature gate and handler).
     const command_index_map = comptime blk: {
         const Pair = struct { []const u8, usize };
-        var pairs: [command_table.len]Pair = undefined;
-        for (command_table, 0..) |entry, i| pairs[i] = .{ entry.spec.name, i };
+        var pairs: [command_table.len + countAliases(mods)]Pair = undefined;
+        var n: usize = 0;
+        for (command_table, 0..) |entry, i| {
+            pairs[n] = .{ entry.spec.name, i };
+            n += 1;
+            for (entry.spec.aliases) |alias| {
+                pairs[n] = .{ alias, i };
+                n += 1;
+            }
+        }
         break :blk std.StaticStringMapWithEql(usize, std.static_string_map.eqlAsciiIgnoreCase).initComptime(pairs);
     };
+
+    const order_table = comptime loadOrder(mods);
 
     return struct {
         pub const modules = mods;
@@ -718,11 +797,31 @@ pub fn Registry(comptime mods: []const Module) type {
         pub const numerics = numeric_table;
         pub const isupport = isupport_table;
         pub const stats = stats_table;
+        /// Indices into `modules` in dependency-resolved load order.
+        pub const load_order = order_table;
+        /// Total declared aliases, for introspection summaries.
+        pub const alias_count = countAliases(mods);
 
         /// O(1)-ish command resolution via the comptime StaticStringMap.
+        /// Resolves aliases to their canonical row.
         pub fn lookupCommand(name: []const u8) ?CommandEntry {
             const idx = command_index_map.get(name) orelse return null;
             return commands[idx];
+        }
+
+        /// Whether `name` resolves to a command but is NOT that command's
+        /// canonical name. Lets introspection avoid printing an alias as if it
+        /// were a distinct command.
+        pub fn isAlias(name: []const u8) bool {
+            const entry = lookupCommand(name) orelse return false;
+            return !std.ascii.eqlIgnoreCase(entry.spec.name, name);
+        }
+
+        /// Declared anti-abuse class for `name`, resolving through aliases.
+        /// `null` when the command is unknown.
+        pub fn wardenClassFor(name: []const u8) ?WardenClass {
+            const entry = lookupCommand(name) orelse return null;
+            return entry.spec.warden_class;
         }
 
         /// Resolve and run a command, enforcing its declared `access` level
@@ -793,6 +892,7 @@ fn validationMessage(comptime err: ValidationError) []const u8 {
         .module_conflict => "SerpentRegistry: conflicting modules selected",
         .dependency_cycle => "SerpentRegistry: dependency cycle in module requires",
         .duplicate_command => "SerpentRegistry: duplicate command name",
+        .duplicate_alias => "SerpentRegistry: command alias collides with an existing command or alias",
         .duplicate_cap => "SerpentRegistry: duplicate capability name",
         .duplicate_channel_mode => "SerpentRegistry: duplicate channel mode letter",
         .duplicate_user_mode => "SerpentRegistry: duplicate user mode letter",
@@ -872,6 +972,99 @@ fn findPriorCommand(
         }
     }
     return null;
+}
+
+/// Whether ANY module declares `name` as a canonical command. Unlike
+/// `findPriorCommand` this scans the entire set, because an alias must not
+/// shadow a canonical name regardless of declaration order.
+fn findCanonicalCommand(comptime mods: []const Module, name: []const u8) ?[]const u8 {
+    for (mods) |module| {
+        for (module.commands) |command| {
+            if (std.ascii.eqlIgnoreCase(command.name, name)) return module.id;
+        }
+    }
+    return null;
+}
+
+/// Whether an earlier-declared alias already claims `name`. Ordering is
+/// (module, command, alias) lexicographic, so the FIRST declaration wins and
+/// the second is the reported error.
+fn findPriorAlias(
+    comptime mods: []const Module,
+    module_index: usize,
+    command_index: usize,
+    alias_index: usize,
+    name: []const u8,
+) ?[]const u8 {
+    for (mods, 0..) |module, mi| {
+        if (mi > module_index) break;
+        for (module.commands, 0..) |command, ci| {
+            if (mi == module_index and ci > command_index) break;
+            const limit = if (mi == module_index and ci == command_index)
+                alias_index
+            else
+                command.aliases.len;
+            for (command.aliases[0..limit]) |alias| {
+                if (std.ascii.eqlIgnoreCase(alias, name)) return module.id;
+            }
+        }
+    }
+    return null;
+}
+
+/// Total number of declared aliases across the module set.
+fn countAliases(comptime mods: []const Module) comptime_int {
+    var total: comptime_int = 0;
+    for (mods) |module| {
+        for (module.commands) |command| total += command.aliases.len;
+    }
+    return total;
+}
+
+/// Dependency-ordered module load sequence: a topological sort of the `requires`
+/// graph, breaking ties by declared `priority` and then by manifest position so
+/// the result is deterministic.
+///
+/// Assumes the set already validated (dependencies resolve, no cycles); a
+/// missing dependency is skipped rather than faulted here because `validate`
+/// reports it with a better message. Returns indices into `mods`.
+pub fn loadOrder(comptime mods: []const Module) [mods.len]usize {
+    @setEvalBranchQuota(20000);
+    var order: [mods.len]usize = undefined;
+    var placed = @as([mods.len]bool, @splat(false));
+    var count: usize = 0;
+
+    while (count < mods.len) {
+        // Pick the best still-unplaced module whose dependencies are all
+        // placed: lowest priority value first, then earliest manifest index.
+        var best: ?usize = null;
+        for (mods, 0..) |module, i| {
+            if (placed[i]) continue;
+            var ready = true;
+            for (module.requires) |required| {
+                const dep = moduleIndex(mods, required) orelse continue;
+                if (!placed[dep]) {
+                    ready = false;
+                    break;
+                }
+            }
+            if (!ready) continue;
+            if (best) |b| {
+                const bp = @intFromEnum(mods[b].priority);
+                const ip = @intFromEnum(module.priority);
+                if (ip < bp) best = i;
+            } else {
+                best = i;
+            }
+        }
+        // A validated set always has a ready module; guard anyway so a caller
+        // that skipped validation gets a compile error instead of a hang.
+        const chosen = best orelse @compileError("SerpentRegistry: loadOrder found no ready module (unvalidated cycle?)");
+        order[count] = chosen;
+        placed[chosen] = true;
+        count += 1;
+    }
+    return order;
 }
 
 /// Whether an earlier-declared stats provider already claims `stat`'s
