@@ -47,6 +47,7 @@ pub const Action = enum {
     access_add,
     access_delete,
     access_clear,
+    access_copy,
     forcejoin,
     forcepart,
     forceop,
@@ -79,6 +80,7 @@ pub const Action = enum {
             .access_add => "access_add",
             .access_delete => "access_delete",
             .access_clear => "access_clear",
+            .access_copy => "access_copy",
             .forcejoin => "forcejoin",
             .forcepart => "forcepart",
             .forceop => "forceop",
@@ -118,6 +120,7 @@ pub const Action = enum {
             .forceop => 25,
             .forcedeop => 26,
             .forcetopic => 27,
+            .access_copy => 28,
             .other => 255,
         };
     }

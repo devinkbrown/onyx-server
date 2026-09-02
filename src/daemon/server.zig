@@ -32092,6 +32092,57 @@ pub const LinuxServer = struct {
                     "CLEAR *";
                 self.auditAccessChange(conn, .access_clear, sel.channel, detail);
             },
+            .copy => |c| {
+                // A template copy writes every level including FOUNDER, so gate it
+                // on the FOUNDER tier of the DESTINATION rather than the per-level
+                // rank a single ADD needs — otherwise an op could seed itself a
+                // FOUNDER entry by copying a channel it controls. The source is
+                // gated as a read (LIST rank) for the same reason ACCESS LIST is:
+                // an ACL is not public.
+                if (!self.accessCanManage(id, conn, c.destination, .founder)) {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{c.destination}, "You're not channel operator");
+                    return;
+                }
+                if (!self.accessCanManage(id, conn, c.source, null)) {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{c.source}, "You're not channel operator");
+                    return;
+                }
+                if (overrideActive(conn) and
+                    (self.accessOverrideWouldBypass(id, c.destination, .founder) or
+                        self.accessOverrideWouldBypass(id, c.source, null)))
+                {
+                    var od_buf: [192]u8 = undefined;
+                    const od = std.fmt.bufPrint(&od_buf, "COPY {s}", .{c.source}) catch "COPY";
+                    self.auditOverrideUse(conn, "ACCESS", c.destination, od);
+                }
+                const result = self.access.copyFrom(c.destination, c.source, c.mode) catch {
+                    // Fail closed and SAY so: `copyFrom` sizes the template up
+                    // front, so a store that cannot fit it leaves the destination
+                    // untouched rather than half-copied.
+                    try self.failReply(conn, "ACCESS", "ACCESS_COPY_FAILED", "Cannot copy ACCESS template");
+                    return;
+                };
+                // Deliberately NO bare 805 here. A client folds 803 -> 804* -> 805
+                // and commits whatever it buffered, so an 805 with no preceding
+                // burst commits an EMPTY list — which is correct after CLEAR but
+                // would wipe the client's view of an ACL that COPY just populated.
+                // The NOTE reports the outcome; the client re-LISTs to see it.
+                var note_buf: [192]u8 = undefined;
+                const note = std.fmt.bufPrint(
+                    &note_buf,
+                    "copied {d} entries from {s}, removed {d}; re-run ACCESS {s} LIST",
+                    .{ result.copied, c.source, result.removed, c.destination },
+                ) catch "ACCESS template copied";
+                try self.noteReply(conn, "ACCESS", "ACCESS_COPIED", note);
+                var detail_buf: [256]u8 = undefined;
+                const detail = std.fmt.bufPrint(&detail_buf, "COPY {s} {s} copied={d} removed={d}", .{
+                    c.source,
+                    if (c.mode == .replace) "REPLACE" else "MERGE",
+                    result.copied,
+                    result.removed,
+                }) catch "COPY";
+                self.auditAccessChange(conn, .access_copy, c.destination, detail);
+            },
         }
     }
 
@@ -47287,6 +47338,22 @@ pub const LinuxServer = struct {
         }
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "WARN {s} {s} :{s}\r\n", .{ command, code, reason }) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// Emit an advisory IRCv3 `NOTE` standard reply. `NOTE` carries information
+    /// about an operation that SUCCEEDED, so it must never be the only signal a
+    /// client needs to act on. Same CWE-93 fail-closed guard as `failReply`.
+    fn noteReply(self: *LinuxServer, conn: *ConnState, command: []const u8, code: []const u8, reason: []const u8) !void {
+        if (dispatch.hasControlByte(command) or dispatch.hasControlByte(code) or dispatch.hasControlByte(reason)) return;
+        if (!conn.session.hasCap(.standard_replies)) {
+            var notice_buf: [default_reply_bytes]u8 = undefined;
+            const notice = std.fmt.bufPrint(&notice_buf, "NOTE {s} {s}: {s}", .{ command, code, reason }) catch return;
+            try self.noticeTo(conn, notice);
+            return;
+        }
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "NOTE {s} {s} :{s}\r\n", .{ command, code, reason }) catch return;
         try appendToConn(conn, line);
     }
 
