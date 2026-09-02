@@ -23,6 +23,7 @@ here.
 | [`onyx/docs/ROADMAP-2026-Q4.md`](../../onyx/docs/ROADMAP-2026-Q4.md) | onyx | Full client feature spine (C-01…C-33) + two release tracks (CP-xx, CL-xx); in-flight work; cross-cutting wire contracts |
 | [`onyx/docs/FEATURE-ROADMAP.md`](../../onyx/docs/FEATURE-ROADMAP.md) | onyx | Client-half unified view; priority tables for C-xx items |
 | [`docs/features/INVENTED-FEATURES-CATALOG.md`](features/INVENTED-FEATURES-CATALOG.md) | onyx-server | F-01…F-68 speculative features grounded at HEAD; Top-20 game-changer shortlist for 0.8+ |
+| [`docs/features/GAME-CHANGERS-50.md`](features/GAME-CHANGERS-50.md) | both | GB/GS/GC-01…50: cross-repo 50 game-changers (15 `Both` · 20 `Server` · 15 `Client`); Top-10 must-ship-for-0.7 shortlist; declared overlap table against F-01…F-68 — see § Relationship to F-01…F-68 in that file |
 | [`onyx/docs/era3-40-game-changers.md`](../../onyx/docs/era3-40-game-changers.md) | onyx | Era-3 client game-changer acceptance ledger (40 items) |
 | [`onyx/docs/PRODUCT_OVERHAUL_ROADMAP.md`](../../onyx/docs/PRODUCT_OVERHAUL_ROADMAP.md) | onyx | Product phases P0–P6, positioning, and visual direction |
 | [`onyx/docs/PUBLIC_LAUNCH_ROADMAP.md`](../../onyx/docs/PUBLIC_LAUNCH_ROADMAP.md) | onyx | Desktop/packaging/signing claim ledger |
@@ -112,6 +113,7 @@ None of these are required for 0.7. They are tracked so wave-planner can slot
 them into 0.8+ without re-discovery.
 
 - **Daemon F-01…F-68:** [`docs/features/INVENTED-FEATURES-CATALOG.md`](features/INVENTED-FEATURES-CATALOG.md) — full catalog grounded at HEAD. The **Top-20 game-changer shortlist** (ranked by operator value × novelty / cost) is at the top of that file. Highlights: F-39 deep metrics histograms, F-15 account trust ledger, F-52 scheduled delivery, F-08 proofmark federation.
+- **Cross-repo 50 game-changers:** [`docs/features/GAME-CHANGERS-50.md`](features/GAME-CHANGERS-50.md) — GB/GS/GC-01…50 spanning daemon and client; carries a **declared overlap table against F-01…F-68** (§ Relationship to F-01…F-68 in that file). Client companion: [`onyx/docs/features/GAME-CHANGERS-50.md`](../../onyx/docs/features/GAME-CHANGERS-50.md).
 - **Client Era-3 game-changers:** [`onyx/docs/era3-40-game-changers.md`](../../onyx/docs/era3-40-game-changers.md) — the 40-item acceptance ledger for client-side game-changers.
 - **Shortlist integration point:** [`docs/ROADMAP-2026-Q4.md` § Invented features](ROADMAP-2026-Q4.md#invented-features--p0-shortlist) lists five high-priority daemon invented features (F-39, F-15, F-52, F-08, F-24) ready to slot into 0.8 wave planning without design work.
 
