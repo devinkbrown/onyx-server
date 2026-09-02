@@ -87,7 +87,8 @@ authoritative.
 - [ISUPPORT (005)](reference/protocol/isupport.md)
 - [Capabilities (IRCv3)](reference/protocol/caps.md)
 - [Halloy capability matrix](reference/client-interop-halloy.md) — third-party interop (Halloy vs live CAP/ISUPPORT/commands)
-- [IRCv3](reference/ircv3.md) — capability and message-tag support
+- [IRCv3 profile](reference/ircv3.md) — Onyx Server IRCv3 surface, exclusions, and wire limits
+- [CAP registry](reference/protocol/caps.md) — live `CAP LS` table from `cap_specs`
 - [IRCX](reference/ircx/README.md) — the IRCX protocol surface (PROP, ACCESS, EVENT, AUTH)
 - [Native media MAC](reference/native-media-mac.md) — the media authentication tag
 - [Web Push](reference/web-push.md) — browser push for offline DMs (RFC 8291/8292, VAPID discovery)
@@ -100,6 +101,7 @@ authoritative.
 
 ## Project
 
+- [Q4 2026 feature roadmap](ROADMAP-2026-Q4.md) — daemon feature waves (Now / Next / Later / Moonshot), priorities, and cross-stack dependencies
 - [Project README](../README.md)
 - [Contributing](../CONTRIBUTING.md)
 - [Runbook](RUNBOOK.md)
