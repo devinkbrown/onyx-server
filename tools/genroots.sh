@@ -12,6 +12,11 @@ gen() {
   local entries=()
   for f in "$dir"/*.zig; do
     b=$(basename "$f"); [ "$b" = root.zig ] && continue; [ "$b" = main.zig ] && continue
+    # src/substrate/bench.zig is a standalone executable root (`zig build bench`)
+    # with its own `onyx_server` import, like src/cli below. Re-exporting it from
+    # substrate/root.zig would put `@import("onyx_server")` INSIDE the onyx_server
+    # module, where that name is not available — breaking `zig build test`.
+    [ "$dir" = "$SRC/substrate" ] && [ "$b" = bench.zig ] && continue
     entries+=("${b%.zig}|$b")
   done
   for sub in "$dir"/*/; do

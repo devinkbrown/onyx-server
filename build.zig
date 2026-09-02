@@ -694,6 +694,51 @@ pub fn build(b: *std.Build) void {
     const ct_check_step = b.step("ct-check", "Run the opt-in dudect-style constant-time verification harness (roadmap 0.4)");
     ct_check_step.dependOn(&ct_check_run.step);
 
+    // `zig build bench` — the 0.7 measurement harness (release plan P0-1). It
+    // measures the inbound line parse, outbound cap-variant tag composition, the
+    // channel fan-out framing shape at widths 1..4096, the cross-shard delivery
+    // fabric round-trip, and the loopback connection-accept rate. See the module
+    // doc comment in src/substrate/bench.zig for what each row does and does NOT
+    // cover, and docs/dev/benchmarks.md for how to run and read it.
+    //
+    // Deliberately a SEPARATE step, NOT part of `zig build test` (and not part of
+    // `all-checks`): a wall-clock measurement is inherently noisy and folding it
+    // into the full suite would make the suite flaky. Wiring it as a regression
+    // tripwire is future work, and only once a baseline has proven stable across
+    // machines. Same separation `ct-check` already uses.
+    //
+    // The harness gets its OWN ReleaseFast module rather than importing the shared
+    // `mod` (which inherits -Doptimize and is Debug when unset). A Debug-built
+    // benchmark measures Debug codegen, which is not what ships — the same
+    // reasoning that gives `ct-check` and `release` their own modules. `-Doptimize`
+    // is honored when passed explicitly so a Debug-vs-ReleaseFast comparison is
+    // still possible on purpose; the run prints the mode it measured.
+    const bench_optimize = if (b.user_input_options.contains("optimize")) optimize else .ReleaseFast;
+    const bench_onyx_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .link_libc = needs_libc,
+    });
+    bench_onyx_mod.addImport("build_info", build_info_mod);
+    const bench_exe = b.addExecutable(.{
+        .name = "onyx-server-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/substrate/bench.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "onyx_server", .module = bench_onyx_mod }},
+        }),
+    });
+    // Installed into zig-out/bin so `tools/bench.sh` can invoke it directly (and
+    // re-run it under `taskset`/`nice` without going through the build graph).
+    const bench_install = b.addInstallArtifact(bench_exe, .{});
+    const bench_run = b.addRunArtifact(bench_exe);
+    bench_run.step.dependOn(&bench_install.step);
+    const bench_step = b.step("bench", "Run the 0.7 measurement harness: parse, tag compose, fan-out framing, cross-shard handoff, accept rate (P0-1)");
+    bench_step.dependOn(&bench_run.step);
+
     // `zig build fuzz` — the coverage-guided fuzz targets (roadmap 0.2 follow-up).
     // These are the `cov-fuzz:` tests in src/crypto/tls_fuzz.zig: one
     // `std.testing.fuzz` target per attacker-facing wire parser (X.509, TLS
