@@ -55,6 +55,17 @@ const Sha384 = hkdf_tls13.Sha384;
 /// Largest TLS 1.3 transcript-hash / traffic-secret length we handle (SHA-384).
 const max_hash_len = Sha384.hash_len;
 
+/// Fail-closed cap on how many handshake messages one post-handshake record may
+/// coalesce. RFC 8446 §5.1 permits several messages per record, and a real
+/// server does send a couple of NewSessionTickets back to back, but nothing
+/// legitimate approaches this bound. Each KeyUpdate costs six HKDF-Expand-Label
+/// derivations plus a sealed reply record, and each NewSessionTicket costs a
+/// PSK derivation and a ticket store; a KeyUpdate is five bytes on the wire, so
+/// an uncapped loop lets one maximal 2^14-byte record buy ~3.2k rotations and
+/// ~85 KiB of queued egress. Capping the count bounds the work a single record
+/// from a hostile server can purchase.
+const max_post_handshake_msgs_per_record: usize = 8;
+
 /// Opt-in handshake tracing (set by out-of-band tools like acme_runner).
 pub var debug_log: bool = false;
 
@@ -575,6 +586,12 @@ pub const Client = struct {
     transcript: std.ArrayList(u8) = .empty,
     recv_buf: std.ArrayList(u8) = .empty,
     hs_plain: std.ArrayList(u8) = .empty,
+    /// Count of unencrypted change_cipher_spec records the peer has sent, over
+    /// the whole connection. Unbounded, this is a channel a hostile (or
+    /// MITM-substituted) server can use to stall an outbound handshake
+    /// indefinitely — which for the ACME client means a certificate renewal that
+    /// never completes. See `tls_record.max_change_cipher_spec_records`.
+    ccs_records_seen: usize = 0,
 
     // Traffic secrets are stored at the maximum hash length (SHA-384); only the
     // first `selected_suite.hashLen()` bytes are live for a given connection.
@@ -1105,11 +1122,15 @@ pub const Client = struct {
     /// post_handshake_auth, so even CertificateRequest is illegal here), or
     /// trailing partial bytes (this engine performs no cross-record
     /// post-handshake reassembly, so they would otherwise be silently lost) all
-    /// abort the connection.
+    /// abort the connection, as does a record coalescing more than
+    /// `max_post_handshake_msgs_per_record` messages (KeyUpdate/ticket flood).
     fn handlePostHandshake(self: *Client, fragment: []const u8) Error!void {
         if (fragment.len == 0) return error.BadHandshake;
         var off: usize = 0;
+        var seen: usize = 0;
         while (parseHandshakeMaybe(fragment, &off)) |msg| {
+            seen += 1;
+            if (seen > max_post_handshake_msgs_per_record) return error.BadHandshake;
             if (msg.typ == .key_update) {
                 if (msg.body.len != 1) return error.BadHandshake;
                 const request = msg.body[0];
@@ -1771,10 +1792,21 @@ pub const Client = struct {
 
     const ServerHelloStep = enum { need_more, proceed, retry };
 
+    /// Validate one middlebox-compatibility change_cipher_spec record before the
+    /// caller drops it. RFC 8446 §5 permits exactly the single byte 0x01 and
+    /// requires an abort on any other value; the per-connection count cap keeps
+    /// the "drop and continue" branches bounded so a peer cannot stall us here.
+    fn acceptCompatCcs(self: *Client, fragment: []const u8) Error!void {
+        if (!tls_record.isLegalCompatCcs(fragment)) return error.BadRecord;
+        self.ccs_records_seen += 1;
+        if (self.ccs_records_seen > tls_record.max_change_cipher_spec_records) return error.BadRecord;
+    }
+
     fn tryConsumeServerHello(self: *Client) Error!ServerHelloStep {
         while (true) {
-            const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
+            const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
             if (rec.content_type == .change_cipher_spec) {
+                try self.acceptCompatCcs(rec.fragment);
                 consumePrefix(&self.recv_buf, rec.wire_len);
                 continue;
             }
@@ -1906,8 +1938,9 @@ pub const Client = struct {
             while (try self.tryProcessPlainHandshake()) {}
             if (self.state == .connected) return try self.writeClientFinishedRecord();
 
-            const rec = completePlainRecord(self.recv_buf.items) orelse return null;
+            const rec = try completePlainRecord(self.recv_buf.items) orelse return null;
             if (rec.content_type == .change_cipher_spec) {
+                try self.acceptCompatCcs(rec.fragment);
                 consumePrefix(&self.recv_buf, rec.wire_len);
                 continue;
             }
@@ -2751,12 +2784,25 @@ fn writePlainRecord(allocator: Allocator, typ: tls_record.ContentType, fragment:
     return out;
 }
 
-fn completePlainRecord(buf: []const u8) ?PlainRecord {
+/// Frame one complete plaintext record out of `buf`.
+///
+/// Returns null ONLY when more bytes are genuinely needed. A structurally
+/// invalid header is an error, never a null — conflating "invalid" with
+/// "incomplete" leaves the offending bytes in `recv_buf` forever, so a hostile
+/// (or MITM-substituted) server streaming records with an unknown outer content
+/// type grows that buffer without bound while the handshake neither advances nor
+/// fails. For the ACME client that is a renewal that never completes.
+///
+///   * RFC 8446 §5: an unexpected record type MUST terminate the connection.
+///   * RFC 8446 §5.2: TLSCiphertext.length MUST NOT exceed 2^14+256; the wire
+///     field is a u16, so the cap has to be applied explicitly.
+fn completePlainRecord(buf: []const u8) Error!?PlainRecord {
     if (buf.len < tls_record.record_header_len) return null;
+    const typ = tls_record.ContentType.fromWire(buf[0]) orelse return error.BadRecord;
     const len = std.mem.readInt(u16, buf[3..5], .big);
+    if (len > tls_record.max_ciphertext_len) return error.BadRecord;
     const total = tls_record.record_header_len + @as(usize, len);
     if (buf.len < total) return null;
-    const typ = tls_record.ContentType.fromWire(buf[0]) orelse return null;
     return .{ .content_type = typ, .fragment = buf[5..total], .wire_len = total };
 }
 
@@ -4099,6 +4145,63 @@ test "TLS 1.3 post-handshake: unknown types, empty and truncated fragments are f
     const ku_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 3, .handshake, ku.items);
     defer allocator.free(ku_rec);
     try std.testing.expectEqual(AppRead.control, try client.decryptApp(ku_rec));
+}
+
+test "exploit: TLS 1.3 post-handshake coalesced KeyUpdate flood from the server is rejected" {
+    // Hostile-server regression, mirroring the server-side cap. A KeyUpdate is
+    // five bytes on the wire, so one maximal record can coalesce thousands; each
+    // costs six HKDF-Expand-Label derivations and, when update_requested, an
+    // AEAD-sealed reply appended to our egress queue. Uncapped that is a CPU
+    // multiplier plus a bandwidth amplifier bought with a single record. The cap
+    // must reject the flood while still accepting a legitimately coalesced batch
+    // (RFC 8446 §5.1 permits several messages per record).
+    const allocator = std.testing.allocator;
+
+    const Fragment = struct {
+        fn build(a: Allocator, n: usize) !std.ArrayList(u8) {
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(a);
+            for (0..n) |_| {
+                try writeHandshake(a, &buf, .key_update, &[_]u8{@intFromEnum(KeyUpdateRequest.requested)});
+            }
+            return buf;
+        }
+    };
+
+    const connected = struct {
+        fn open(a: Allocator) !Client {
+            var c = try Client.init(a, .{ .server_name = "example.com", .trust_anchors = &.{} });
+            errdefer c.deinit();
+            c.state = .connected;
+            c.selected_suite = .tls_aes_128_gcm_sha256;
+            c.server_app_keys.key[0..Aes128Gcm.key_length].* = @as([Aes128Gcm.key_length]u8, @splat(0x5A));
+            c.server_app_keys.iv = @as([12]u8, @splat(0xA5));
+            return c;
+        }
+    };
+
+    // One over the cap aborts the connection before the rotation loop's tail.
+    {
+        var client = try connected.open(allocator);
+        defer client.deinit();
+        var frag = try Fragment.build(allocator, max_post_handshake_msgs_per_record + 1);
+        defer frag.deinit(allocator);
+        const rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .handshake, frag.items);
+        defer allocator.free(rec);
+        try std.testing.expectError(error.BadHandshake, client.decryptApp(rec));
+    }
+
+    // A maximal legitimate batch still succeeds and queues its replies.
+    {
+        var client = try connected.open(allocator);
+        defer client.deinit();
+        var frag = try Fragment.build(allocator, max_post_handshake_msgs_per_record);
+        defer frag.deinit(allocator);
+        const rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .handshake, frag.items);
+        defer allocator.free(rec);
+        try std.testing.expectEqual(AppRead.control, try client.decryptApp(rec));
+        try std.testing.expect(client.post_handshake_send.items.len > 0);
+    }
 }
 
 /// Build a minimal TLS 1.3 ServerHello body (legacy_version, random, echoed
@@ -6450,4 +6553,87 @@ test "TLS 1.3 client rejects a name-constrained CA's cross-domain leaf (F1 contr
         error.BadCertificate,
         verifyChainToTrustAnchors(&chain, &anchors, "login.victim-bank.com", null),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial corpus (`zig build test-exploit`).
+//
+// The client half is what reaches out to an ACME CA and to mail relays, so its
+// hostile peer is a malicious (or MITM-substituted) *server*. A stall here is a
+// certificate renewal that never completes, so the framing layer must fail
+// closed rather than wait forever.
+// ---------------------------------------------------------------------------
+
+/// Hand-frame one plaintext record: [type][0x0303][len16][body].
+fn exploitPlainRecord(out: []u8, typ: u8, body: []const u8) []const u8 {
+    out[0] = typ;
+    std.mem.writeInt(u16, out[1..3], 0x0303, .big);
+    std.mem.writeInt(u16, out[3..5], @intCast(body.len), .big);
+    @memcpy(out[5..][0..body.len], body);
+    return out[0 .. 5 + body.len];
+}
+
+test "exploit: a hostile server cannot stall the client with a change_cipher_spec flood" {
+    // Unbounded middlebox-compatibility CCS records would let a server keep an
+    // outbound handshake alive indefinitely without ever answering it.
+    const alloc = std.testing.allocator;
+    var client = try Client.init(alloc, .{ .server_name = "stall.test", .trust_anchors = &.{} });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+
+    var rec_buf: [16]u8 = undefined;
+    const ccs = exploitPlainRecord(&rec_buf, 20, &.{0x01});
+
+    var sent: usize = 0;
+    while (sent < tls_record.max_change_cipher_spec_records) : (sent += 1) {
+        _ = client.feed(ccs) catch |err| {
+            std.debug.print("legitimate CCS {d} rejected: {s}\n", .{ sent, @errorName(err) });
+            return err;
+        };
+    }
+    try std.testing.expectError(error.BadRecord, client.feed(ccs));
+}
+
+test "exploit: a hostile server cannot stall the client with unknown record types" {
+    // The same "invalid vs incomplete" conflation on the client: an unrecognized
+    // outer content type must terminate, not accumulate in `recv_buf` forever.
+    const alloc = std.testing.allocator;
+    for ([_]u8{ 0, 1, 24, 99, 0xFF }) |bad_type| {
+        var client = try Client.init(alloc, .{ .server_name = "stall.test", .trust_anchors = &.{} });
+        defer client.deinit();
+        const ch = try client.start();
+        defer alloc.free(ch);
+
+        var rec_buf: [64]u8 = undefined;
+        const rec = exploitPlainRecord(&rec_buf, bad_type, "payload");
+        try std.testing.expectError(error.BadRecord, client.feed(rec));
+    }
+}
+
+test "exploit: a server record declaring more than 2^14+256 is rejected by the client" {
+    const alloc = std.testing.allocator;
+    var client = try Client.init(alloc, .{ .server_name = "stall.test", .trust_anchors = &.{} });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+
+    const header = [_]u8{ 22, 0x03, 0x03, 0xFF, 0xFF };
+    try std.testing.expectError(error.BadRecord, client.feed(&header));
+}
+
+test "exploit: a change_cipher_spec with an illegal body is rejected by the client" {
+    const alloc = std.testing.allocator;
+    var big_body: [512]u8 = @splat(0x01);
+    const cases: []const []const u8 = &.{ &.{}, &.{0x00}, &.{0x02}, &.{ 0x01, 0x01 }, &big_body };
+    for (cases) |body| {
+        var client = try Client.init(alloc, .{ .server_name = "stall.test", .trust_anchors = &.{} });
+        defer client.deinit();
+        const ch = try client.start();
+        defer alloc.free(ch);
+
+        var rec_buf: [1024]u8 = undefined;
+        const rec = exploitPlainRecord(&rec_buf, 20, body);
+        try std.testing.expectError(error.BadRecord, client.feed(rec));
+    }
 }

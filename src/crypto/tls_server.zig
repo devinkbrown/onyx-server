@@ -60,6 +60,18 @@ const max_client_flight_cert_len: usize = 256 * 1024;
 /// discard channel to a small, fixed amount.
 const max_rejected_early_data_bytes: u64 = 16 * 1024;
 
+/// Fail-closed cap on how many handshake messages one post-handshake record may
+/// coalesce. RFC 8446 §5.1 permits several messages per record, but a peer has
+/// no legitimate reason to pack more than a couple: each KeyUpdate costs six
+/// HKDF-Expand-Label derivations (three to rotate our read secret, three more
+/// for the reply's write rotation) plus an AEAD-sealed reply record. A
+/// KeyUpdate is five bytes on the wire, so an uncapped loop lets one maximal
+/// 2^14-byte record buy ~3.2k rotations and ~85 KiB of queued egress — a ~5x
+/// bandwidth amplification and an unbounded CPU multiplier from a single
+/// record. Capping the count keeps the work one record can purchase bounded;
+/// a peer wanting more rotations must pay a full record for each.
+const max_post_handshake_msgs_per_record: usize = 8;
+
 const HashAlg = enum { sha256, sha384 };
 const tls_record = @import("tls_record.zig");
 const tls_keyshare = @import("../proto/tls_keyshare.zig");
@@ -585,6 +597,13 @@ pub const Server = struct {
 
     transcript: std.ArrayList(u8) = .empty,
     recv_buf: std.ArrayList(u8) = .empty,
+    /// Count of unencrypted change_cipher_spec records this peer has sent, over
+    /// the whole connection. RFC 8446 lets a TLS 1.3 peer interleave these for
+    /// middlebox compatibility and has us drop them, which — unbounded — is a
+    /// channel an unauthenticated peer can use to hold a pre-handshake
+    /// connection alive forever without ever advancing the state machine. See
+    /// `tls_record.max_change_cipher_spec_records`.
+    ccs_records_seen: usize = 0,
 
     /// Post-handshake records the server must send back (a KeyUpdate reply when
     /// the client requested one). Drained by the caller via `takePendingSend`.
@@ -987,11 +1006,12 @@ pub const Server = struct {
 
         if (self.state == .wait_client_hello) {
             while (true) {
-                const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
+                const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
                 if (rec.content_type != .change_cipher_spec) break;
+                try self.acceptCompatCcs(rec.fragment);
                 consumePrefix(&self.recv_buf, rec.wire_len);
             }
-            const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
+            const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
             if (rec.content_type != .handshake) return error.BadRecord;
             var off: usize = 0;
             const msg = try parseHandshake(rec.fragment, &off);
@@ -1033,11 +1053,12 @@ pub const Server = struct {
 
         if (self.state == .wait_second_client_hello) {
             while (true) {
-                const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
+                const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
                 if (rec.content_type != .change_cipher_spec) break;
+                try self.acceptCompatCcs(rec.fragment);
                 consumePrefix(&self.recv_buf, rec.wire_len);
             }
-            const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
+            const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
             if (rec.content_type != .handshake) return error.BadRecord;
             var off: usize = 0;
             const msg = try parseHandshake(rec.fragment, &off);
@@ -1066,8 +1087,9 @@ pub const Server = struct {
                     continue;
                 }
             }
-            const rec = completePlainRecord(self.recv_buf.items) orelse break;
+            const rec = try completePlainRecord(self.recv_buf.items) orelse break;
             if (rec.content_type == .change_cipher_spec) {
+                try self.acceptCompatCcs(rec.fragment);
                 consumePrefix(&self.recv_buf, rec.wire_len);
                 continue;
             }
@@ -1349,11 +1371,15 @@ pub const Server = struct {
     /// other legal post-handshake message toward us — we never send a
     /// post-handshake CertificateRequest), or trailing partial bytes (no
     /// cross-record post-handshake reassembly exists, so they would otherwise be
-    /// silently lost) all abort the connection.
+    /// silently lost) all abort the connection, as does a record coalescing more
+    /// than `max_post_handshake_msgs_per_record` messages (KeyUpdate flood).
     fn handlePostHandshake(self: *Server, fragment: []const u8) Error!void {
         if (fragment.len == 0) return error.BadHandshake;
         var off: usize = 0;
+        var seen: usize = 0;
         while (parseHandshakeMaybe(fragment, &off)) |msg| {
+            seen += 1;
+            if (seen > max_post_handshake_msgs_per_record) return error.BadHandshake;
             if (msg.typ != .key_update) return error.BadHandshake;
             if (msg.body.len != 1) return error.BadHandshake;
             const request = msg.body[0];
@@ -2745,11 +2771,23 @@ pub const Server = struct {
         try self.transcript.appendSlice(self.allocator, bytes);
     }
 
+    /// Validate one middlebox-compatibility change_cipher_spec record before the
+    /// caller drops it. RFC 8446 §5 permits exactly the single byte 0x01 and
+    /// requires an abort on any other value; the per-connection count cap turns
+    /// the "drop and continue" branches into a bounded allowance rather than an
+    /// indefinite keep-alive an unauthenticated peer controls.
+    fn acceptCompatCcs(self: *Server, fragment: []const u8) Error!void {
+        if (!tls_record.isLegalCompatCcs(fragment)) return error.BadRecord;
+        self.ccs_records_seen += 1;
+        if (self.ccs_records_seen > tls_record.max_change_cipher_spec_records) return error.BadRecord;
+    }
+
     fn processAcceptedEarlyRecords(self: *Server) Error!void {
         const suite = self.selected_suite orelse return error.BadState;
         while (!self.early_data_done) {
-            const rec = completePlainRecord(self.recv_buf.items) orelse return;
+            const rec = try completePlainRecord(self.recv_buf.items) orelse return;
             if (rec.content_type == .change_cipher_spec) {
+                try self.acceptCompatCcs(rec.fragment);
                 consumePrefix(&self.recv_buf, rec.wire_len);
                 continue;
             }
@@ -2804,8 +2842,9 @@ pub const Server = struct {
     /// per-ticket/per-config value, sized comfortably above any real 0-RTT
     /// payload while still bounding a hostile peer's discard channel.
     fn skipRejectedEarlyRecords(self: *Server) Error!void {
-        while (completePlainRecord(self.recv_buf.items)) |rec| {
+        while (try completePlainRecord(self.recv_buf.items)) |rec| {
             if (rec.content_type == .change_cipher_spec) {
+                try self.acceptCompatCcs(rec.fragment);
                 consumePrefix(&self.recv_buf, rec.wire_len);
                 continue;
             }
@@ -3222,12 +3261,27 @@ fn writePlainRecord(allocator: Allocator, typ: tls_record.ContentType, fragment:
     return out;
 }
 
-fn completePlainRecord(buf: []const u8) ?PlainRecord {
+/// Frame one complete plaintext record out of `buf`.
+///
+/// Returns null ONLY when more bytes are genuinely needed. A structurally
+/// invalid header is an error, never a null — conflating "invalid" with
+/// "incomplete" leaves the offending bytes in the caller's receive buffer
+/// forever, so a peer streaming records with an unknown outer content type
+/// grows `recv_buf` without bound while the connection neither advances nor
+/// fails. That is reachable before any authentication, so it is enforced at the
+/// first moment the 5-byte header is readable:
+///
+///   * RFC 8446 §5: an unexpected record type MUST terminate the connection.
+///   * RFC 8446 §5.2: TLSCiphertext.length MUST NOT exceed 2^14+256. The wire
+///     field is a u16, so without this an attacker can declare 0xFFFF and make
+///     us hold ~64 KiB per connection for a record we are guaranteed to reject.
+fn completePlainRecord(buf: []const u8) Error!?PlainRecord {
     if (buf.len < tls_record.record_header_len) return null;
+    const typ = tls_record.ContentType.fromWire(buf[0]) orelse return error.BadRecord;
     const len = std.mem.readInt(u16, buf[3..5], .big);
+    if (len > tls_record.max_ciphertext_len) return error.BadRecord;
     const total = tls_record.record_header_len + @as(usize, len);
     if (buf.len < total) return null;
-    const typ = tls_record.ContentType.fromWire(buf[0]) orelse return null;
     return .{ .content_type = typ, .fragment = buf[5..total], .wire_len = total };
 }
 
@@ -6081,7 +6135,7 @@ test "loopback: handshake completes over secp256r1 key exchange" {
 /// True when `flight` begins with a plaintext handshake record carrying a
 /// ServerHello whose random is the HelloRetryRequest magic value (RFC 8446).
 fn firstHandshakeIsHelloRetryRequest(flight: []const u8) bool {
-    const rec = completePlainRecord(flight) orelse return false;
+    const rec = (completePlainRecord(flight) catch return false) orelse return false;
     if (rec.content_type != .handshake) return false;
     var off: usize = 0;
     const msg = parseHandshake(rec.fragment, &off) catch return false;
@@ -6542,6 +6596,79 @@ test "TLS 1.3 post-handshake: server rejects non-KeyUpdate messages, empty and t
     const out = try server.decrypt(ku_rec);
     defer allocator.free(out);
     try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "exploit: TLS 1.3 post-handshake coalesced KeyUpdate flood in one record is rejected" {
+    // Hostile-input regression. A KeyUpdate is five bytes on the wire, so a
+    // single maximal record can coalesce thousands of them; each one costs six
+    // HKDF-Expand-Label derivations and, when update_requested, an AEAD-sealed
+    // reply appended to our egress queue. Uncapped that is a CPU multiplier and
+    // a ~5x bandwidth amplifier bought with one record. The per-record cap must
+    // reject the flood while still accepting a legitimately coalesced batch.
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const allocator = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x72)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "flood.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x03},
+        .key_pair = kp,
+        .dns_names = &.{"flood.test"},
+    });
+
+    // Build one fragment holding `n` back-to-back KeyUpdate(update_requested)
+    // messages — the amplifying variant, since each one also queues a reply.
+    const Fragment = struct {
+        fn build(a: Allocator, n: usize) !std.ArrayList(u8) {
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(a);
+            for (0..n) |_| {
+                try writeHandshake(a, &buf, .key_update, &[_]u8{@intFromEnum(KeyUpdateRequest.requested)});
+            }
+            return buf;
+        }
+    };
+
+    const connected = struct {
+        fn open(a: Allocator, cert: []const u8, key: Ed25519.KeyPair) !Server {
+            var s = try Server.init(a, .{ .cert_chain = &.{cert}, .signing_key = key });
+            errdefer s.deinit();
+            s.state = .connected;
+            s.selected_suite = .tls_aes_128_gcm_sha256;
+            s.client_app_keys.key[0..Aes128Gcm.key_length].* = @as([Aes128Gcm.key_length]u8, @splat(0x5A));
+            s.client_app_keys.iv = @as([12]u8, @splat(0xA5));
+            return s;
+        }
+    };
+
+    // One over the cap is fatal — the flood never reaches the rotation loop's
+    // tail, and the connection aborts rather than servicing it.
+    {
+        var server = try connected.open(allocator, der, kp);
+        defer server.deinit();
+        var frag = try Fragment.build(allocator, max_post_handshake_msgs_per_record + 1);
+        defer frag.deinit(allocator);
+        const rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 0, .handshake, frag.items);
+        defer allocator.free(rec);
+        try std.testing.expectError(error.BadHandshake, server.decrypt(rec));
+    }
+
+    // A maximal legitimate batch still succeeds: the cap bounds abuse without
+    // breaking RFC 8446 §5.1 coalescing, and every reply is queued for send.
+    {
+        var server = try connected.open(allocator, der, kp);
+        defer server.deinit();
+        var frag = try Fragment.build(allocator, max_post_handshake_msgs_per_record);
+        defer frag.deinit(allocator);
+        const rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 0, .handshake, frag.items);
+        defer allocator.free(rec);
+        const out = try server.decrypt(rec);
+        defer allocator.free(out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+        try std.testing.expect(server.post_handshake_send.items.len > 0);
+    }
 }
 
 test "loopback: RFC 8879 cert compression — server sends CompressedCertificate, client inflates" {
@@ -7740,4 +7867,202 @@ test "gnutls-cli interop: RSA-2048 leaf TLS 1.3 handshake (CertificateVerify acc
     // forces gnutls to require rsa_pss_rsae_sha256 for the CertificateVerify.
     try std.testing.expect(try gnutlsRsaLeafHandshake(null, false));
     try std.testing.expect(try gnutlsRsaLeafHandshake("NORMAL:-SIGN-ALL:+SIGN-RSA-PSS-RSAE-SHA256", false));
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial corpus (`zig build test-exploit`).
+//
+// The TLS server is the first code an unauthenticated network peer reaches, so
+// every hostile framing shape it can be fed gets a pinned fail-closed test here.
+// ---------------------------------------------------------------------------
+
+/// Minimal self-signed leaf + key for driving a real `Server` in the tests
+/// below. `cert_buf` must outlive the returned DER.
+fn exploitServerFixture(cert_buf: []u8, seed: u8) !struct { der: []const u8, kp: Ed25519.KeyPair } {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(seed)));
+    const der = try x509_selfsign.buildSelfSigned(cert_buf, .{
+        .common_name = "exploit.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x11},
+        .key_pair = kp,
+        .dns_names = &.{"exploit.test"},
+    });
+    return .{ .der = der, .kp = kp };
+}
+
+/// Hand-frame one plaintext record: [type][0x0303][len16][body].
+fn exploitPlainRecord(out: []u8, typ: u8, body: []const u8) []const u8 {
+    out[0] = typ;
+    std.mem.writeInt(u16, out[1..3], 0x0303, .big);
+    std.mem.writeInt(u16, out[3..5], @intCast(body.len), .big);
+    @memcpy(out[5..][0..body.len], body);
+    return out[0 .. 5 + body.len];
+}
+
+test "exploit: an unknown record content type is rejected instead of buffered forever" {
+    // `completePlainRecord` used to return null for an unrecognized outer content
+    // type, which `feed` cannot distinguish from "incomplete record". Nothing was
+    // consumed, so a peer streaming type-0xFF records grew `recv_buf` without
+    // bound while the connection neither advanced nor failed — an unauthenticated
+    // pre-handshake memory-exhaustion channel. RFC 8446 §5 requires terminating.
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x40);
+
+    for ([_]u8{ 0, 1, 19, 24, 99, 0xFF }) |bad_type| {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+        defer server.deinit();
+        var rec_buf: [64]u8 = undefined;
+        const rec = exploitPlainRecord(&rec_buf, bad_type, "payload");
+        try std.testing.expectError(error.BadRecord, server.feed(rec));
+        // The hostile bytes must not have been retained for a later retry.
+        try std.testing.expect(server.recv_buf.items.len <= rec.len);
+    }
+}
+
+test "exploit: a record declaring more than 2^14+256 is rejected at the framing layer" {
+    // The wire length field is a u16, so a peer can declare 0xFFFF. RFC 8446 §5.2
+    // caps TLSCiphertext.length at 2^14+256; without the cap we would hold ~64 KiB
+    // per connection waiting to complete a record we are guaranteed to reject.
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x41);
+    var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+    defer server.deinit();
+
+    // Only the 5-byte header is sent; the oversize declaration alone must fail.
+    const header = [_]u8{ 22, 0x03, 0x03, 0xFF, 0xFF };
+    try std.testing.expectError(error.BadRecord, server.feed(&header));
+}
+
+test "exploit: a change_cipher_spec flood cannot hold a pre-handshake connection open" {
+    // RFC 8446 middlebox-compatibility CCS records are dropped by the receiver.
+    // Unbounded, that is a keep-alive channel an unauthenticated peer controls:
+    // the state machine stays alive, never advances, and never errors.
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x42);
+    var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+    defer server.deinit();
+
+    var rec_buf: [16]u8 = undefined;
+    const ccs = exploitPlainRecord(&rec_buf, 20, &.{0x01});
+
+    // Up to the cap each CCS is absorbed and we simply want more bytes.
+    var sent: usize = 0;
+    while (sent < tls_record.max_change_cipher_spec_records) : (sent += 1) {
+        try std.testing.expectEqual(FeedResult.need_more, try server.feed(ccs));
+    }
+    // One past the cap fails closed.
+    try std.testing.expectError(error.BadRecord, server.feed(ccs));
+}
+
+test "exploit: a change_cipher_spec with an illegal body is rejected" {
+    // RFC 8446 §5: the only droppable CCS is the single byte 0x01. Any other
+    // value MUST abort. Without the check a CCS is a free, arbitrary-length
+    // channel the receiver parses and discards without ever inspecting it.
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x43);
+
+    var big_body: [512]u8 = @splat(0x01);
+    const cases: []const []const u8 = &.{
+        &.{}, // empty
+        &.{0x00}, // wrong value
+        &.{0x02},
+        &.{0xFF},
+        &.{ 0x01, 0x01 }, // right value, wrong length
+        &big_body, // bulk payload smuggled in a droppable record
+    };
+    for (cases) |body| {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+        defer server.deinit();
+        var rec_buf: [1024]u8 = undefined;
+        const rec = exploitPlainRecord(&rec_buf, 20, body);
+        try std.testing.expectError(error.BadRecord, server.feed(rec));
+    }
+}
+
+test "exploit: a legitimate CCS-prefixed handshake still completes (no regression)" {
+    // The hardening above must not break middlebox-compatibility mode, which is
+    // the whole reason these records are tolerated at all.
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x44);
+    var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+    defer server.deinit();
+    const tls_client = @import("tls_client.zig");
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "exploit.test", .trust_anchors = &.{fx.der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+
+    // One CCS ahead of the ClientHello, exactly as a compatibility-mode peer sends.
+    var rec_buf: [16]u8 = undefined;
+    const ccs = exploitPlainRecord(&rec_buf, 20, &.{0x01});
+    var wire = try alloc.alloc(u8, ccs.len + ch.len);
+    defer alloc.free(wire);
+    @memcpy(wire[0..ccs.len], ccs);
+    @memcpy(wire[ccs.len..], ch);
+
+    const flight = switch (try server.feed(wire)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(flight);
+    try std.testing.expect(flight.len > 0);
+}
+
+test "exploit: a truncated ClientHello never completes and never traps" {
+    // Every prefix of a real ClientHello must leave the server asking for more
+    // bytes (or failing closed) — never reading past the buffer, never asserting.
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x45);
+    const tls_client = @import("tls_client.zig");
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "exploit.test", .trust_anchors = &.{fx.der} });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+
+    var cut: usize = 1;
+    while (cut < ch.len) : (cut += 7) {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+        defer server.deinit();
+        const res = server.feed(ch[0..cut]) catch continue; // a typed error is fine
+        try std.testing.expectEqual(FeedResult.need_more, res);
+    }
+}
+
+test "exploit: a plaintext handshake record where an encrypted one is required is rejected" {
+    // After the server flight the client's remaining messages are protected. A
+    // peer replaying an UNENCRYPTED handshake record at that point must not be
+    // routed into the handshake parser, or the Finished check could be bypassed.
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x46);
+    var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+    defer server.deinit();
+    const tls_client = @import("tls_client.zig");
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "exploit.test", .trust_anchors = &.{fx.der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const flight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    alloc.free(flight);
+    try std.testing.expectEqual(State.wait_client_finished, server.state);
+
+    // A bare plaintext handshake record carrying a forged Finished.
+    var rec_buf: [64]u8 = undefined;
+    const forged = [_]u8{ 20, 0, 0, 4, 0xAA, 0xBB, 0xCC, 0xDD }; // Finished, 4-byte body
+    const rec = exploitPlainRecord(&rec_buf, 22, &forged);
+    try std.testing.expectError(error.BadRecord, server.feed(rec));
+    try std.testing.expect(!server.handshakeDone());
 }

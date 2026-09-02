@@ -148,6 +148,27 @@ pub fn recordContentLimit12(peer_record_size_limit: usize) usize {
 pub const record_size_limit_min: u16 = 64;
 pub const record_size_limit_max: u16 = max_plaintext_len + 1;
 
+/// RFC 8446 §5 / Appendix D.4: in "middlebox compatibility mode" a TLS 1.3 peer
+/// may interleave *unencrypted* change_cipher_spec records into the handshake,
+/// and the receiver drops them. The spec is exact about what is droppable: the
+/// record must carry the single byte 0x01, and "an implementation which receives
+/// any other change_cipher_spec value or which receives a protected
+/// change_cipher_spec record MUST abort with an unexpected_message alert".
+///
+/// Both halves matter for a hostile peer. Without the value check, a CCS record
+/// is a free arbitrary-length channel that the receiver parses and discards
+/// without ever looking at it; without a count cap, an unauthenticated peer can
+/// hold a pre-handshake connection open forever, feeding CCS records that keep
+/// the state machine alive while it never advances and never errors. A
+/// legitimate peer sends exactly one (a server that also answers a
+/// HelloRetryRequest sends two), so this bound is far above anything real.
+pub const max_change_cipher_spec_records: usize = 8;
+
+/// True when `fragment` is the one CCS body RFC 8446 §5 permits: exactly 0x01.
+pub fn isLegalCompatCcs(fragment: []const u8) bool {
+    return fragment.len == 1 and fragment[0] == 0x01;
+}
+
 pub const Error = aead.Error || error{
     BadRecordHeader,
     InvalidContentType,
@@ -432,6 +453,302 @@ test "padding strip returns content before type byte" {
     try testing.expectEqual(ContentType.handshake, opened.content_type);
     try testing.expectEqualSlices(u8, "ping", opened.content);
     try testing.expectEqual(@as(usize, 4), opened.padding_len);
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial corpus (`zig build test-exploit`).
+//
+// Every test below drives a hostile record at the TLS 1.3 record layer and
+// asserts it FAILS CLOSED with a typed error — never a panic, never a silently
+// accepted forgery, never a decrypt-then-trust. The record layer is the first
+// code an unauthenticated network peer reaches, so each attack class the RFC
+// names gets a pinned negative test here.
+// ---------------------------------------------------------------------------
+
+/// Seal one record with a throwaway key so a test can then corrupt it. Returns
+/// the wire record inside `record_out` (caller-owned).
+fn exploitSealFixture(
+    cipher: *const aead.Aead(.chacha20_poly1305),
+    iv: Nonce96,
+    seq: u64,
+    content_type: ContentType,
+    plaintext: []const u8,
+    inner_scratch: []u8,
+    record_out: []u8,
+) Error![]u8 {
+    return sealRecord(.chacha20_poly1305, cipher, iv, seq, content_type, plaintext, 0, inner_scratch, record_out);
+}
+
+test "exploit: record header declaring more than 2^14+256 is rejected" {
+    // RFC 8446 §5.2 caps TLSCiphertext.length at 2^14+256. A peer declaring more
+    // is trying to make us size a buffer from an unvalidated wire integer.
+    var rec: [record_header_len]u8 = undefined;
+    rec[0] = @intFromEnum(outer_content_type);
+    std.mem.writeInt(u16, rec[1..3], legacy_record_version, .big);
+    std.mem.writeInt(u16, rec[3..5], max_ciphertext_len + 1, .big);
+    try std.testing.expectError(error.RecordOverflow, parseCiphertext(&rec));
+
+    // 0xFFFF — the largest value the 16-bit length field can express.
+    std.mem.writeInt(u16, rec[3..5], 0xFFFF, .big);
+    try std.testing.expectError(error.RecordOverflow, parseCiphertext(&rec));
+}
+
+test "exploit: record length disagreeing with the delivered byte count is rejected" {
+    // Both directions of a framing desync: a length larger than the bytes we
+    // hold (over-read attempt) and a length smaller (trailing-byte smuggling,
+    // where the leftover would otherwise be silently dropped or reinterpreted).
+    var over: [record_header_len + 4]u8 = undefined;
+    over[0] = @intFromEnum(outer_content_type);
+    std.mem.writeInt(u16, over[1..3], legacy_record_version, .big);
+    std.mem.writeInt(u16, over[3..5], 64, .big); // claims 64, carries 4
+    try std.testing.expectError(error.BadRecordHeader, parseCiphertext(&over));
+
+    std.mem.writeInt(u16, over[3..5], 2, .big); // claims 2, carries 4
+    try std.testing.expectError(error.BadRecordHeader, parseCiphertext(&over));
+
+    // A bare header with a truncated body, and an empty buffer.
+    try std.testing.expectError(error.BadRecordHeader, parseCiphertext(over[0..3]));
+    try std.testing.expectError(error.BadRecordHeader, parseCiphertext(&.{}));
+}
+
+test "exploit: record with a non-application_data outer type is rejected" {
+    // RFC 8446 §5.2: every protected record MUST carry outer type
+    // application_data(23). Accepting handshake(22)/alert(21) on the outer type
+    // would let a peer steer our record dispatch from OUTSIDE the AEAD, before
+    // anything is authenticated.
+    for ([_]u8{ 20, 21, 22, 0, 24, 255 }) |bad_type| {
+        var rec: [record_header_len + 8]u8 = @splat(0);
+        rec[0] = bad_type;
+        std.mem.writeInt(u16, rec[1..3], legacy_record_version, .big);
+        std.mem.writeInt(u16, rec[3..5], 8, .big);
+        try std.testing.expectError(
+            if (ContentType.fromWire(bad_type) == null) error.BadRecordHeader else error.InvalidContentType,
+            parseCiphertext(&rec),
+        );
+    }
+}
+
+test "exploit: record with a forged legacy version is rejected" {
+    // The legacy_record_version is fixed at 0x0303 on the wire for TLS 1.3. A
+    // peer varying it is probing for a version-dispatch path.
+    for ([_]u16{ 0x0301, 0x0302, 0x0304, 0x0000, 0xFFFF }) |bad_version| {
+        var rec: [record_header_len + 8]u8 = @splat(0);
+        rec[0] = @intFromEnum(outer_content_type);
+        std.mem.writeInt(u16, rec[1..3], bad_version, .big);
+        std.mem.writeInt(u16, rec[3..5], 8, .big);
+        try std.testing.expectError(error.BadRecordHeader, parseCiphertext(&rec));
+    }
+}
+
+test "exploit: a record shorter than the AEAD tag is rejected before any open" {
+    // A body shorter than tag_length would underflow `len - tag_length`. This
+    // must be caught structurally, never by trusting the subtraction.
+    const A = aead.Aead(.chacha20_poly1305);
+    var cipher = A.init(@as([A.key_length]u8, @splat(0x11)));
+    defer cipher.deinit();
+    const iv = hex("000102030405060708090a0b");
+    var out: [64]u8 = undefined;
+
+    var body_len: usize = 0;
+    while (body_len < A.tag_length) : (body_len += 1) {
+        var rec: [record_header_len + 16]u8 = @splat(0);
+        rec[0] = @intFromEnum(outer_content_type);
+        std.mem.writeInt(u16, rec[1..3], legacy_record_version, .big);
+        std.mem.writeInt(u16, rec[3..5], @intCast(body_len), .big);
+        try std.testing.expectError(
+            error.BadRecordHeader,
+            openRecord(.chacha20_poly1305, &cipher, iv, 0, rec[0 .. record_header_len + body_len], &out),
+        );
+    }
+}
+
+test "exploit: an all-zero inner plaintext (padding with no content type) is rejected" {
+    // The TLS 1.3 depad scan must not fall off the front of the buffer when a
+    // peer sends nothing but padding. `found == 0` is the only safe outcome, and
+    // it must be an error rather than a zero-length application record.
+    var inner: [32]u8 = @splat(0);
+    try std.testing.expectError(error.InvalidInnerPlaintext, decodeInnerPlaintext(&inner));
+    try std.testing.expectError(error.InvalidInnerPlaintext, decodeInnerPlaintext(inner[0..1]));
+    try std.testing.expectError(error.InvalidInnerPlaintext, decodeInnerPlaintext(inner[0..0]));
+}
+
+test "exploit: change_cipher_spec smuggled as an inner content type is rejected" {
+    // RFC 8446 §5.4: CCS is never a legal TLSInnerPlaintext type. A peer that
+    // could smuggle one inside a protected record would reach the CCS-handling
+    // path from within the encrypted stream.
+    var inner = [_]u8{ 'x', @intFromEnum(ContentType.change_cipher_spec) };
+    try std.testing.expectError(error.InvalidContentType, decodeInnerPlaintext(&inner));
+
+    // ...and an inner type byte outside the enum entirely.
+    for ([_]u8{ 0, 1, 24, 200, 255 }) |bad| {
+        var probe = [_]u8{ 'x', bad };
+        try std.testing.expectError(error.InvalidContentType, decodeInnerPlaintext(&probe));
+    }
+
+    // The encoder must refuse to produce one in the first place.
+    var scratch: [16]u8 = undefined;
+    try std.testing.expectError(
+        error.InvalidContentType,
+        encodeInnerPlaintext(.change_cipher_spec, "x", 0, &scratch),
+    );
+}
+
+test "exploit: the sequence number is AEAD-bound — replaying a record at another seq fails" {
+    // Per-record nonce = write_iv XOR seq. A record captured at seq N must not
+    // open at any other sequence position: that is what stops an attacker from
+    // reordering, replaying, or dropping records inside a live stream.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const A = aead.Aead(.chacha20_poly1305);
+    var cipher = A.init(@as([A.key_length]u8, @splat(0x5C)));
+    defer cipher.deinit();
+    const iv = hex("0b0a090807060504030201ff");
+    const plaintext = "sequence-bound payload";
+    const inner_len = plaintext.len + 1;
+
+    const inner = try allocator.alloc(u8, inner_len);
+    defer allocator.free(inner);
+    const record_buf = try allocator.alloc(u8, record_header_len + inner_len + A.tag_length);
+    defer allocator.free(record_buf);
+    const opened_buf = try allocator.alloc(u8, inner_len);
+    defer allocator.free(opened_buf);
+
+    const record = try exploitSealFixture(&cipher, iv, 42, .application_data, plaintext, inner, record_buf);
+
+    // The genuine position opens.
+    _ = try openRecord(.chacha20_poly1305, &cipher, iv, 42, record, opened_buf);
+
+    // Every neighbouring position — and the wrap-around boundary — must not.
+    for ([_]u64{ 0, 41, 43, 1 << 32, std.math.maxInt(u64) }) |wrong_seq| {
+        try testing.expectError(
+            error.AuthFailed,
+            openRecord(.chacha20_poly1305, &cipher, iv, wrong_seq, record, opened_buf),
+        );
+    }
+}
+
+test "exploit: distinct sequence numbers never collide onto one nonce" {
+    // Nonce reuse is catastrophic for both AEADs here (it recovers the GCM
+    // authentication key outright). The seq->nonce map must be injective, so a
+    // record counter can never be walked onto a previously used nonce.
+    const iv = hex("aabbccddeeff001122334455");
+    var seen = std.AutoHashMap(Nonce96, u64).init(std.testing.allocator);
+    defer seen.deinit();
+
+    const probes = [_]u64{
+        0,                        1,
+        2,                        255,
+        256,                      65535,
+        65536,                    0x0000_0000_FFFF_FFFF,
+        0x0000_0001_0000_0000,    0x00FF_FFFF_FFFF_FFFF,
+        std.math.maxInt(u64) - 1, std.math.maxInt(u64),
+    };
+    for (probes) |seq| {
+        const nonce = deriveNonce(iv, seq);
+        if (try seen.fetchPut(nonce, seq)) |prev| {
+            std.debug.print("nonce collision: seq {d} and seq {d}\n", .{ prev.value, seq });
+            return error.NonceCollision;
+        }
+    }
+
+    // The counter only ever touches the low 8 bytes; the leading 4 IV bytes are
+    // never perturbed, so a seq can never alias into the salt region.
+    const base = deriveNonce(iv, 0);
+    for (probes) |seq| {
+        try std.testing.expectEqualSlices(u8, base[0..4], deriveNonce(iv, seq)[0..4]);
+    }
+}
+
+test "exploit: the record header is AEAD-bound — a truncated body does not open" {
+    // additional_data is the serialized 5-byte header, so the declared length is
+    // authenticated. An attacker who shortens a record (and fixes up the length
+    // field so framing still parses) must get an auth failure, not a truncated
+    // plaintext.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const A = aead.Aead(.chacha20_poly1305);
+    var cipher = A.init(@as([A.key_length]u8, @splat(0x77)));
+    defer cipher.deinit();
+    const iv = hex("112233445566778899aabbcc");
+    const plaintext = "truncate me if you can";
+    const inner_len = plaintext.len + 1;
+
+    const inner = try allocator.alloc(u8, inner_len);
+    defer allocator.free(inner);
+    const record_buf = try allocator.alloc(u8, record_header_len + inner_len + A.tag_length);
+    defer allocator.free(record_buf);
+    const opened_buf = try allocator.alloc(u8, inner_len);
+    defer allocator.free(opened_buf);
+
+    const record = try exploitSealFixture(&cipher, iv, 3, .application_data, plaintext, inner, record_buf);
+    try testing.expect(record.len == record_buf.len);
+
+    // Chop four bytes off the body and re-declare the shorter length so the
+    // framing check passes; only the AAD binding can catch this.
+    const shortened = record_buf[0 .. record_buf.len - 4];
+    std.mem.writeInt(u16, shortened[3..5], @intCast(shortened.len - record_header_len), .big);
+    try testing.expectError(
+        error.AuthFailed,
+        openRecord(.chacha20_poly1305, &cipher, iv, 3, shortened, opened_buf),
+    );
+}
+
+test "exploit: oversized plaintext and inner-plaintext are refused by the encoder" {
+    // A caller (or a peer-driven size) above the protocol maximum must be a
+    // typed error, never a heap write past the caller's scratch.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const huge = try allocator.alloc(u8, max_plaintext_len + 1);
+    defer allocator.free(huge);
+    @memset(huge, 'A');
+    const scratch = try allocator.alloc(u8, max_ciphertext_len + 512);
+    defer allocator.free(scratch);
+
+    try testing.expectError(
+        error.PlaintextTooLong,
+        encodeInnerPlaintext(.application_data, huge, 0, scratch),
+    );
+    // At the maximum content length, padding that pushes the inner plaintext
+    // past 2^14+256 must also be refused.
+    try testing.expectError(
+        error.RecordOverflow,
+        encodeInnerPlaintext(.application_data, huge[0..max_plaintext_len], 512, scratch),
+    );
+    // An output buffer too small for the encoded inner plaintext is an error,
+    // not a truncated write.
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(
+        error.OutputTooSmall,
+        encodeInnerPlaintext(.application_data, "hello", 0, &tiny),
+    );
+}
+
+test "exploit: an inner plaintext whose content exceeds 2^14 is rejected after decrypt" {
+    // A record may legally carry up to 2^14+256 encrypted bytes, but the
+    // recovered CONTENT is capped at 2^14. A peer packing content into the
+    // padding allowance must be rejected rather than handed upstream.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const inner = try allocator.alloc(u8, max_plaintext_len + 8);
+    defer allocator.free(inner);
+    @memset(inner, 'B');
+    inner[inner.len - 1] = @intFromEnum(ContentType.application_data);
+    try testing.expectError(error.PlaintextTooLong, decodeInnerPlaintext(inner));
+}
+
+test "exploit: peer-advertised record_size_limit can never widen our records" {
+    // RFC 8449. The limit is peer-controlled, so it must only ever shrink our
+    // fragment size — a hostile 0/1/0xFFFF must not produce a larger bound than
+    // the protocol maximum, nor a zero-length fragmentation loop.
+    for ([_]usize{ 0, 1, 2, 64, record_size_limit_max, 0xFFFF, std.math.maxInt(usize) }) |limit| {
+        const l13 = recordContentLimit(limit);
+        try std.testing.expect(l13 >= 1);
+        try std.testing.expect(l13 <= max_plaintext_len);
+
+        const l12 = recordContentLimit12(limit);
+        try std.testing.expect(l12 >= 1);
+        try std.testing.expect(l12 <= max_plaintext_len);
+    }
 }
 
 test {
