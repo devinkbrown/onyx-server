@@ -15,6 +15,14 @@
 //! `false`, while still honoring stop-on-veto ordering semantics.
 const std = @import("std");
 const ircx_gate = @import("../proto/ircx_gate.zig");
+const oper = @import("oper.zig");
+const stats_provider = @import("stats_provider.zig");
+
+/// Re-exported so a module declaring `stats:` needs only `registry`.
+pub const StatsSpec = stats_provider.Spec;
+pub const StatsEntry = stats_provider.Entry;
+pub const StatsKind = stats_provider.Kind;
+pub const StatsCategory = stats_provider.Category;
 
 /// Command handler used by registry dispatch.
 pub const CommandHandler = *const fn (ctx: *anyopaque, invocation: CommandInvocation) anyerror!void;
@@ -112,6 +120,11 @@ pub const ModeClass = enum {
 };
 
 /// Typed hook identifiers. Each id has a payload type via `HookPayload`.
+///
+/// This is the module bus event set: a module subscribes by declaring a
+/// `HookBinding` and emits through `module_bus.Bus`, so cross-module signalling
+/// never needs a new call site inside `server.zig`. Adding an id here forces
+/// every exhaustive `HookPayload` switch to be updated (by design).
 pub const HookId = enum {
     client_pre_register,
     client_registered,
@@ -119,11 +132,16 @@ pub const HookId = enum {
     channel_pre_join,
     channel_joined,
     channel_part,
+    channel_created,
+    channel_destroyed,
     message_pre_deliver,
     nick_pre_change,
     nick_changed,
     oper_elevated,
     config_reloaded,
+    module_reloaded,
+    mesh_peer_up,
+    mesh_peer_down,
     upgrade_capsule_export,
     upgrade_capsule_import,
 };
@@ -176,6 +194,19 @@ pub const ChannelPartPayload = struct {
     reason: []const u8 = "",
 };
 
+/// `channel_created` payload. Fired once, when a channel first comes into
+/// existence (the creating JOIN/CREATE), not on every subsequent join.
+pub const ChannelCreatedPayload = struct {
+    creator_id: u64,
+    channel: []const u8,
+};
+
+/// `channel_destroyed` payload. Fired when the last member leaves and the
+/// channel record is reclaimed. Informational.
+pub const ChannelDestroyedPayload = struct {
+    channel: []const u8,
+};
+
 /// `message_pre_deliver` payload. Veto-capable: drop the message.
 pub const MessagePreDeliverPayload = struct {
     source_id: u64,
@@ -210,6 +241,32 @@ pub const ConfigReloadedPayload = struct {
     generation: u64 = 0,
 };
 
+/// `module_reloaded` payload. Fired after a REHASH sweep settles, reporting
+/// whether the sweep committed or rolled back. Informational: subscribers learn
+/// that config-derived state may have changed without re-reading the config.
+pub const ModuleReloadedPayload = struct {
+    generation: u64 = 0,
+    /// Modules whose `on_reload` ran and committed.
+    reloaded: usize = 0,
+    /// True when the whole sweep committed; false when it rolled back.
+    committed: bool = true,
+};
+
+/// `mesh_peer_up` payload. A direct Undertow peer link reached the established
+/// state. `short_id` is the mesh link identity (never the long node id) so a
+/// subscriber compares the same value the mesh itself routes on.
+pub const MeshPeerUpPayload = struct {
+    short_id: u64,
+    name: []const u8 = "",
+};
+
+/// `mesh_peer_down` payload. A direct peer link dropped or was reaped.
+pub const MeshPeerDownPayload = struct {
+    short_id: u64,
+    name: []const u8 = "",
+    reason: []const u8 = "",
+};
+
 /// `upgrade_capsule_export` payload. Lets modules serialize state on drain.
 pub const UpgradeCapsuleExportPayload = struct {
     capsule_version: u32 = 0,
@@ -231,15 +288,60 @@ pub fn HookPayload(comptime id: HookId) type {
         .channel_pre_join => *ChannelPreJoinPayload,
         .channel_joined => *ChannelJoinedPayload,
         .channel_part => *ChannelPartPayload,
+        .channel_created => *ChannelCreatedPayload,
+        .channel_destroyed => *ChannelDestroyedPayload,
         .message_pre_deliver => *MessagePreDeliverPayload,
         .nick_pre_change => *NickPreChangePayload,
         .nick_changed => *NickChangedPayload,
         .oper_elevated => *OperElevatedPayload,
         .config_reloaded => *ConfigReloadedPayload,
+        .module_reloaded => *ModuleReloadedPayload,
+        .mesh_peer_up => *MeshPeerUpPayload,
+        .mesh_peer_down => *MeshPeerDownPayload,
         .upgrade_capsule_export => *UpgradeCapsuleExportPayload,
         .upgrade_capsule_import => *UpgradeCapsuleImportPayload,
     };
 }
+
+/// Whether a hook id is veto-capable — i.e. its payload carries `approved`.
+/// Keeps `module_bus.Bus.approve` from being used on an informational event
+/// (a compile error there is better than a silently ignored veto).
+pub fn hookIsVetoCapable(comptime id: HookId) bool {
+    return @hasField(@typeInfo(HookPayload(id)).pointer.child, "approved");
+}
+
+/// Functional grouping of a single command, for `COMMANDS`/HELP browsing. This
+/// is per-command and orthogonal to `Module.category` (one module may export
+/// commands from several groups — `oper_security` exports both `.moderation`
+/// and `.diagnostic` verbs).
+pub const CommandCategory = enum {
+    /// Connection registration and session lifecycle (NICK/USER/QUIT/CAP).
+    session,
+    /// Channel membership and channel state (JOIN/PART/MODE/TOPIC).
+    channel,
+    /// Message delivery (PRIVMSG/NOTICE/TAGMSG).
+    messaging,
+    /// Account registration, login, and account settings.
+    account,
+    /// Network/user/channel information queries (WHO/WHOIS/LIST/INFO).
+    query,
+    /// Operator moderation and enforcement (WARD/KILL/SHUN/FORCE*).
+    moderation,
+    /// Server and mesh administration (REHASH/CONNECT/SQUIT/UPGRADE).
+    admin,
+    /// IRCX extension surface (PROP/ACCESS/EVENT/DATA).
+    ircx,
+    /// Introspection and diagnostics (STATS/MODULES/COMMANDS/OROWASM).
+    diagnostic,
+    /// Voice/video/media signalling.
+    media,
+    /// Anything that does not fit a group above.
+    misc,
+
+    pub fn token(self: CommandCategory) []const u8 {
+        return @tagName(self);
+    }
+};
 
 /// Command declaration exported by a module.
 pub const CommandSpec = struct {
@@ -254,6 +356,18 @@ pub const CommandSpec = struct {
     feature: ?[]const u8 = null,
     /// One-line human description for registry-driven introspection (COMMANDS).
     summary: []const u8 = "",
+    /// Functional grouping for `COMMANDS`/HELP browsing.
+    category: CommandCategory = .misc,
+    /// The specific operator privilege the handler enforces internally, when it
+    /// enforces one beyond `access = .oper`.
+    ///
+    /// This is DOCUMENTATION, not a second enforcement path: the registry's
+    /// gated dispatcher enforces `access` only, and the handler remains the sole
+    /// authority on its own privilege check. Declaring it here lets `COMMANDS`
+    /// tell an operator *which* privilege a verb needs without duplicating (and
+    /// so risking divergence from) the check itself. `null` means "no privilege
+    /// beyond whatever `access` requires".
+    oper_privilege: ?oper.Privilege = null,
     handler: CommandHandler,
 };
 
@@ -366,12 +480,33 @@ pub const Module = struct {
     usermodes: []const UserModeSpec = &.{},
     numerics: []const NumericSpec = &.{},
     isupport: []const ISupportSpec = &.{},
+    /// Counters and gauges this module contributes to `/STATS` and to the
+    /// Prometheus endpoint. Names are checked for uniqueness and for legal
+    /// Prometheus/IRC-token syntax at COMPILE TIME. See `stats_provider.zig`.
+    stats: []const stats_provider.Spec = &.{},
 
-    // Lifecycle hooks. The daemon passes a `*Core` as the `*anyopaque` ctx.
+    // ---- Lifecycle ----------------------------------------------------------
+    // Every lifecycle fn receives the host as its erased `*anyopaque` ctx (the
+    // live daemon passes `*server.LinuxServer`), exactly like a command handler.
+    // Phases run in manifest order; `on_deinit` runs in manifest order too, so a
+    // module that must tear down after its dependents should declare `.late`.
+    //
+    // A lifecycle fn MUST be idempotent with respect to repeated `on_reload`:
+    // REHASH can fire any number of times over a process lifetime.
+
+    /// Reserved for per-module registration-time setup that must run before any
+    /// other phase. Not yet driven by the daemon — declaring it is currently a
+    /// no-op, so do not rely on it for correctness.
     on_register: ?LifecycleFn = null,
+    /// Runs once during server startup, before listeners are armed.
     on_init: ?LifecycleFn = null,
+    /// Runs once after the server is fully up and accepting connections.
     on_ready: ?LifecycleFn = null,
+    /// Runs on every successful configuration REHASH. Must be idempotent and
+    /// must NOT drop or mutate live connections: REHASH is a zero-disconnect
+    /// operation. Re-read config, re-derive cached policy, and return.
     on_reload: ?LifecycleFn = null,
+    /// Runs once during orderly shutdown. Cannot fail.
     on_deinit: ?DeinitFn = null,
 };
 
@@ -386,6 +521,14 @@ pub const ValidationKind = enum {
     duplicate_channel_mode,
     duplicate_user_mode,
     duplicate_numeric,
+    /// Two modules declared the same Prometheus metric name or the same short
+    /// STATS token. Either collision would make one provider silently shadow
+    /// the other in a scrape.
+    duplicate_stat,
+    /// A stats provider declared a name that is not a legal Prometheus metric
+    /// name / STATS token. Caught at comptime because a malformed name breaks
+    /// the whole exposition document, not just its own line.
+    invalid_stat_name,
 };
 
 /// First registry validation failure found.
@@ -505,6 +648,33 @@ pub fn validate(comptime mods: []const Module) ?ValidationError {
                 };
             }
         }
+
+        for (module.stats, 0..) |stat, stat_index| {
+            // Syntax first: a malformed name is a defect regardless of whether
+            // it also collides, and the collision message would be misleading.
+            if (!stats_provider.validPromName(stat.prom)) {
+                return .{
+                    .kind = .invalid_stat_name,
+                    .module_id = module.id,
+                    .name = stat.prom,
+                };
+            }
+            if (!stats_provider.validIrcToken(stat.irc)) {
+                return .{
+                    .kind = .invalid_stat_name,
+                    .module_id = module.id,
+                    .name = stat.irc,
+                };
+            }
+            if (findPriorStat(mods, module_index, stat_index, stat)) |other| {
+                return .{
+                    .kind = .duplicate_stat,
+                    .module_id = module.id,
+                    .other_module_id = other,
+                    .name = stat.prom,
+                };
+            }
+        }
     }
 
     return null;
@@ -525,6 +695,7 @@ pub fn Registry(comptime mods: []const Module) type {
     const usermode_table = comptime buildUserModeTable(mods);
     const numeric_table = comptime buildNumericTable(mods);
     const isupport_table = comptime buildISupportTable(mods);
+    const stats_table = comptime buildStatsTable(mods);
 
     // Comptime case-insensitive command name -> command_table index map.
     // Replaces the former O(commands) linear scan with a length-bucketed
@@ -546,6 +717,7 @@ pub fn Registry(comptime mods: []const Module) type {
         pub const usermodes = usermode_table;
         pub const numerics = numeric_table;
         pub const isupport = isupport_table;
+        pub const stats = stats_table;
 
         /// O(1)-ish command resolution via the comptime StaticStringMap.
         pub fn lookupCommand(name: []const u8) ?CommandEntry {
@@ -625,6 +797,8 @@ fn validationMessage(comptime err: ValidationError) []const u8 {
         .duplicate_channel_mode => "SerpentRegistry: duplicate channel mode letter",
         .duplicate_user_mode => "SerpentRegistry: duplicate user mode letter",
         .duplicate_numeric => "SerpentRegistry: duplicate numeric",
+        .duplicate_stat => "SerpentRegistry: duplicate stat name",
+        .invalid_stat_name => "SerpentRegistry: invalid stat name",
     };
 }
 
@@ -695,6 +869,27 @@ fn findPriorCommand(
         const limit = if (current_module_index == module_index) command_index else module.commands.len;
         for (module.commands[0..limit]) |command| {
             if (std.ascii.eqlIgnoreCase(command.name, name)) return module.id;
+        }
+    }
+    return null;
+}
+
+/// Whether an earlier-declared stats provider already claims `stat`'s
+/// Prometheus name OR its short STATS token. Both namespaces must be unique:
+/// a duplicate `prom` shadows a metric in a scrape, and a duplicate `irc`
+/// makes two different metrics indistinguishable in the oper dump.
+fn findPriorStat(
+    comptime mods: []const Module,
+    module_index: usize,
+    stat_index: usize,
+    stat: stats_provider.Spec,
+) ?[]const u8 {
+    for (mods, 0..) |module, current_module_index| {
+        if (current_module_index > module_index) break;
+        const limit = if (current_module_index == module_index) stat_index else module.stats.len;
+        for (module.stats[0..limit]) |prior| {
+            if (std.mem.eql(u8, prior.prom, stat.prom)) return module.id;
+            if (std.ascii.eqlIgnoreCase(prior.irc, stat.irc)) return module.id;
         }
     }
     return null;
@@ -806,6 +1001,24 @@ fn countISupport(comptime mods: []const Module) comptime_int {
     return total;
 }
 
+fn countStats(comptime mods: []const Module) comptime_int {
+    var total = 0;
+    for (mods) |module| total += module.stats.len;
+    return total;
+}
+
+fn buildStatsTable(comptime mods: []const Module) [countStats(mods)]stats_provider.Entry {
+    var table: [countStats(mods)]stats_provider.Entry = undefined;
+    var index = 0;
+    for (mods) |module| {
+        for (module.stats) |stat| {
+            table[index] = .{ .module_id = module.id, .spec = stat };
+            index += 1;
+        }
+    }
+    return table;
+}
+
 fn buildCommandTable(comptime mods: []const Module) [countCommands(mods)]CommandEntry {
     var table: [countCommands(mods)]CommandEntry = undefined;
     var index = 0;
@@ -912,12 +1125,18 @@ const TestCtx = struct {
     command_count: usize = 0,
     order: [8]u8 = undefined,
     order_len: usize = 0,
+    stat_value: i128 = 0,
 
     fn record(self: *TestCtx, value: u8) void {
         self.order[self.order_len] = value;
         self.order_len += 1;
     }
 };
+
+fn readTestStat(ctx: *anyopaque) i128 {
+    const self: *TestCtx = @ptrCast(@alignCast(ctx));
+    return self.stat_value;
+}
 
 fn pingHandler(ctx: *anyopaque, invocation: CommandInvocation) anyerror!void {
     const self: *TestCtx = @ptrCast(@alignCast(ctx));
@@ -1008,6 +1227,48 @@ const duplicateCommandModule = Module{
     .id = "dupe",
     .commands = &.{
         .{ .name = "ping", .handler = pongHandler },
+    },
+};
+
+const statsModuleA = Module{
+    .id = "stats.a",
+    .stats = &.{
+        .{ .prom = "onyx_test_a", .irc = "t_a", .help = "test stat a", .read = readTestStat },
+    },
+};
+
+const statsModuleB = Module{
+    .id = "stats.b",
+    .stats = &.{
+        .{ .prom = "onyx_test_b", .irc = "t_b", .help = "test stat b", .read = readTestStat },
+    },
+};
+
+const duplicatePromStatModule = Module{
+    .id = "stats.dupe_prom",
+    .stats = &.{
+        .{ .prom = "onyx_test_a", .irc = "t_c", .help = "collides on prom", .read = readTestStat },
+    },
+};
+
+const duplicateIrcStatModule = Module{
+    .id = "stats.dupe_irc",
+    .stats = &.{
+        .{ .prom = "onyx_test_c", .irc = "T_A", .help = "collides on irc (case-insensitive)", .read = readTestStat },
+    },
+};
+
+const invalidPromStatModule = Module{
+    .id = "stats.bad_prom",
+    .stats = &.{
+        .{ .prom = "0starts_with_digit", .irc = "t_bad", .help = "bad prom name", .read = readTestStat },
+    },
+};
+
+const invalidIrcStatModule = Module{
+    .id = "stats.bad_irc",
+    .stats = &.{
+        .{ .prom = "onyx_test_bad_irc", .irc = "ns:token", .help = "bad irc token", .read = readTestStat },
     },
 };
 
@@ -1130,6 +1391,55 @@ test "validator recognizes duplicate command names without failing this file" {
     try std.testing.expect(std.ascii.eqlIgnoreCase("PING", err.name));
     try std.testing.expectEqualStrings("dupe", err.module_id);
     try std.testing.expectEqualStrings("core", err.other_module_id);
+}
+
+test "Registry.stats aggregates every module's declared providers" {
+    const R = Registry(&.{ statsModuleA, statsModuleB });
+    try std.testing.expectEqual(@as(usize, 2), R.stats.len);
+    try std.testing.expectEqualStrings("stats.a", R.stats[0].module_id);
+    try std.testing.expectEqualStrings("onyx_test_a", R.stats[0].spec.prom);
+    try std.testing.expectEqualStrings("stats.b", R.stats[1].module_id);
+    try std.testing.expectEqualStrings("onyx_test_b", R.stats[1].spec.prom);
+
+    var ctx = TestCtx{ .stat_value = 5 };
+    try std.testing.expectEqual(@as(i128, 5), R.stats[0].spec.read(&ctx));
+}
+
+test "validator rejects a duplicate stats Prometheus name across modules" {
+    const err = validate(&.{ statsModuleA, duplicatePromStatModule }) orelse
+        return error.ExpectedDuplicateStat;
+
+    try std.testing.expectEqual(ValidationKind.duplicate_stat, err.kind);
+    try std.testing.expectEqualStrings("stats.dupe_prom", err.module_id);
+    try std.testing.expectEqualStrings("stats.a", err.other_module_id);
+    try std.testing.expectEqualStrings("onyx_test_a", err.name);
+}
+
+test "validator rejects a duplicate stats STATS token across modules, case-insensitively" {
+    const err = validate(&.{ statsModuleA, duplicateIrcStatModule }) orelse
+        return error.ExpectedDuplicateStat;
+
+    try std.testing.expectEqual(ValidationKind.duplicate_stat, err.kind);
+    try std.testing.expectEqualStrings("stats.dupe_irc", err.module_id);
+    try std.testing.expectEqualStrings("stats.a", err.other_module_id);
+}
+
+test "validator rejects a malformed Prometheus stat name" {
+    const err = validate(&.{invalidPromStatModule}) orelse
+        return error.ExpectedInvalidStatName;
+
+    try std.testing.expectEqual(ValidationKind.invalid_stat_name, err.kind);
+    try std.testing.expectEqualStrings("stats.bad_prom", err.module_id);
+    try std.testing.expectEqualStrings("0starts_with_digit", err.name);
+}
+
+test "validator rejects a malformed STATS irc token" {
+    const err = validate(&.{invalidIrcStatModule}) orelse
+        return error.ExpectedInvalidStatName;
+
+    try std.testing.expectEqual(ValidationKind.invalid_stat_name, err.kind);
+    try std.testing.expectEqualStrings("stats.bad_irc", err.module_id);
+    try std.testing.expectEqualStrings("ns:token", err.name);
 }
 
 // Veto handlers for the typed-payload test. An early hook denies the join and
