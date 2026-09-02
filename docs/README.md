@@ -101,7 +101,10 @@ authoritative.
 
 ## Project
 
-- [Q4 2026 feature roadmap](ROADMAP-2026-Q4.md) — daemon feature waves (Now / Next / Later / Moonshot), priorities, and cross-stack dependencies
+- [**0.7 unified feature roadmap**](FEATURE-ROADMAP.md) — authoritative cross-repo P0/P1/P2 table, owner agents, gates, drift reconciliation; the single document to read before touching any 0.7 planning
+- [Q4 2026 feature roadmap](ROADMAP-2026-Q4.md) — daemon feature spine (S-01…S-30, P-xx, H-xx, L-xx) with detailed descriptions; linked from the unified roadmap
+- [0.7 release plan](releases/0.7-RELEASE-PLAN.md) — release thesis, version audit, gap analysis, Wave 1 dispatch table
+- [Invented features catalog](features/INVENTED-FEATURES-CATALOG.md) — F-01 … F-68 speculative features grounded against HEAD; the Top-20 game-changer shortlist is at the top
 - [Project README](../README.md)
 - [Contributing](../CONTRIBUTING.md)
 - [Runbook](RUNBOOK.md)
