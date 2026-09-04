@@ -16886,10 +16886,11 @@ pub const LinuxServer = struct {
                 self.broadcastChannel(ch.channel, line, null) catch return;
                 if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, 0, ch.status, ch.setter);
                 // A remote oper carries no grantable channel status, so the diff
-                // above won't show its `*`. Announce the derived +Y when the grant
-                // is already known at join time (the grant-apply path covers the
-                // reverse order, where the grant lands after the JOIN).
-                if (self.isOverrideOper(ch.nick)) self.emitOperPrefixMode(ch.channel, ch.nick, true);
+                // above won't show its `*`. Announce the derived +Y when a live
+                // grant already names this account (applyMeshGrant covers the
+                // reverse order, where the grant lands after the JOIN). Local
+                // isOverrideOper never matches a remote nick.
+                if (self.remoteHasOverridePrefix(ch.account)) self.emitOperPrefixMode(ch.channel, ch.nick, true);
             },
             .parted => {
                 if (std.mem.eql(u8, ch.setter, mesh_quit_setter)) {
@@ -17144,6 +17145,41 @@ pub const LinuxServer = struct {
         for (nicks.items) |nick| self.announceOperPrefixAllChannels(nick, add);
     }
 
+    /// Same as `announceOperPrefixForAccount`, but only remote roster nicks.
+    /// A mesh grant must never mint +Y/-Y for a locally-homed attachment —
+    /// those stay configured-local (`isOverrideOper`).
+    fn announceRemoteOperPrefixForAccount(self: *LinuxServer, account: []const u8, add: bool) void {
+        if (account.len == 0) return;
+        var nicks: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer nicks.deinit(self.allocator);
+        var seen = CiNameSet.init(self.allocator);
+        defer seen.deinit();
+
+        var cit = self.world.channelIterator();
+        while (cit.next()) |cv| {
+            for (self.reactors) |*reactor| {
+                for (reactor.clients.slots.items) |*slot| {
+                    if (!slot.occupied) continue;
+                    const members = blk: {
+                        if (slot.value.s2s_secured) |link| {
+                            if (link.established()) break :blk link.channelMembers(cv.name);
+                        } else if (slot.value.s2s) |link| {
+                            if (link.established()) break :blk link.channelMembers(cv.name);
+                        }
+                        continue;
+                    };
+                    for (members) |member| {
+                        if (member.account.len == 0 or !std.ascii.eqlIgnoreCase(member.account, account)) continue;
+                        const gop = seen.getOrPut(member.nick) catch break;
+                        if (!gop.found_existing) nicks.append(self.allocator, member.nick) catch break;
+                    }
+                }
+            }
+        }
+
+        for (nicks.items) |nick| self.announceOperPrefixAllChannels(nick, add);
+    }
+
     fn emitRemoteChannelModeFlags(self: *LinuxServer, channel: []const u8, remote_name: []const u8, prev: u16, now: u16) void {
         const added = now & ~prev;
         const removed = prev & ~now;
@@ -17373,9 +17409,13 @@ pub const LinuxServer = struct {
         // longer spams a spurious ":server MODE #chan +Q <nick>". A genuine remote
         // join is still announced from 0 (full prefix modes).
         for (run) |*ch| {
-            if (ch.status == 0) continue;
-            const prev: u4 = if (self.nickIsLiveLocal(ch.nick)) ch.prev_status else 0;
-            self.emitRemoteModeDiff(channel, ch.nick, server_host, prev, ch.status, ch.setter);
+            if (ch.status != 0) {
+                const prev: u4 = if (self.nickIsLiveLocal(ch.nick)) ch.prev_status else 0;
+                self.emitRemoteModeDiff(channel, ch.nick, server_host, prev, ch.status, ch.setter);
+            }
+            if (!self.nickIsLiveLocal(ch.nick) and self.remoteHasOverridePrefix(ch.account)) {
+                self.emitOperPrefixMode(channel, ch.nick, true);
+            }
         }
     }
 
@@ -18253,7 +18293,7 @@ pub const LinuxServer = struct {
                 if (rm.username.len != 0) rm.username else world_projection.remote_user_placeholder,
                 if (rm.host.len != 0) rm.host else if (remote_name.len != 0) remote_name else default_host,
                 modes,
-                self.isOverrideOper(rm.nick),
+                self.isOverrideOper(rm.nick) or self.remoteHasOverridePrefix(rm.account),
             );
         }
     }
@@ -20928,6 +20968,7 @@ pub const LinuxServer = struct {
                 geo_text = buildGeoWhois(&geo_buf, city, region, country, asn_info.asn, asn_info.asorg);
             }
         }
+        const oper_display = self.remoteOperDisplay(remote.account);
         const subject = whois.WhoisSubject{
             .nick = remote.nick,
             .user = if (remote.username.len != 0) remote.username else world_projection.remote_user_placeholder,
@@ -20938,12 +20979,15 @@ pub const LinuxServer = struct {
             // 330 "is logged in as <account>" for a remote member whose account the
             // mesh propagated (cap_member_account) — matches a local user's WHOIS.
             .account = if (remote.account.len != 0) remote.account else null,
-            // OCG1 is compatibility telemetry only during Step 5. Remote
-            // operator projection remains inactive until the accepted OCG2
-            // activation step supplies an authoritative runtime source.
-            .is_oper = false,
-            .is_admin = false,
-            .oper_title = null,
+            // Display-only projection from a live signed grant. Privilege
+            // (KICK immunity, DATA, isOverrideOper) stays configured-local;
+            // OCG2 activation remains separately held.
+            .is_oper = oper_display != null,
+            .is_admin = if (oper_display) |oper| oper.is_admin else false,
+            .oper_title = if (oper_display) |oper|
+                if (oper.title.len > 0) oper.title else null
+            else
+                null,
             // Idle/signon are per-connection state the origin node doesn't replicate,
             // so suppress RPL_WHOISIDLE rather than render a bogus "idle 0, epoch".
             .show_idle = false,
@@ -20974,7 +21018,6 @@ pub const LinuxServer = struct {
         prefix_store: [][2]u8,
     ) usize {
         var n: usize = 0;
-        const is_oper = self.isOverrideOper(nick);
         var cit = self.world.channelIterator();
         outer: while (cit.next()) |cv| {
             if (n >= out.len) break;
@@ -20994,7 +21037,7 @@ pub const LinuxServer = struct {
                         if (!std.ascii.eqlIgnoreCase(rm.nick, nick)) continue;
                         const modes = world_model.MemberModes{ .bits = @as(u8, rm.status) };
                         var plen: usize = 0;
-                        if (is_oper) {
+                        if (self.isOverrideOper(nick) or self.remoteHasOverridePrefix(rm.account)) {
                             prefix_store[n][plen] = '*';
                             plen += 1;
                         }
@@ -35781,9 +35824,15 @@ pub const LinuxServer = struct {
         const accepted = self.oper_grants.upsert(fields) != .stale_ignored;
         if (accepted) {
             self.logMeshEvent(.oper_grant_in, fields.account, fields.issuer_node);
-            // OCG1 is compatibility telemetry only. It may converge in the
-            // legacy registry, but it cannot mutate session privilege or emit a
-            // derived operator prefix. OCG2 activation remains separately held.
+            // Display-only: project `*` / +Y for remote roster nicks that
+            // share this account. Never mutate local session privilege —
+            // KICK/DATA/isOverrideOper stay configured-local. OCG2 activation
+            // remains separately held.
+            if (fields.privilege_bits == 0) {
+                self.announceRemoteOperPrefixForAccount(fields.account, false);
+            } else if (oper_mod.OperPrivileges.fromBits(fields.privilege_bits).has(.oper_override)) {
+                self.announceRemoteOperPrefixForAccount(fields.account, true);
+            }
         }
         return accepted;
     }
@@ -51617,10 +51666,34 @@ pub const LinuxServer = struct {
         return .regular;
     }
 
+    /// Display projection of a live signed mesh grant. Privilege bits of 0 are
+    /// a tombstone. Never use this for KICK/DATA/session authority.
+    const RemoteOperDisplay = struct {
+        is_admin: bool,
+        is_override: bool,
+        title: []const u8,
+    };
+
+    fn remoteOperDisplay(self: *LinuxServer, account: []const u8) ?RemoteOperDisplay {
+        if (account.len == 0) return null;
+        const grant = self.oper_grants.lookup(account, self.grantNowU64()) orelse return null;
+        if (grant.privilege_bits == 0) return null;
+        const priv = oper_mod.OperPrivileges.fromBits(grant.privilege_bits);
+        return .{
+            .is_admin = priv.has(.server_admin),
+            .is_override = priv.has(.oper_override),
+            .title = grant.title,
+        };
+    }
+
+    fn remoteHasOverridePrefix(self: *LinuxServer, account: []const u8) bool {
+        const display = self.remoteOperDisplay(account) orelse return false;
+        return display.is_override;
+    }
+
     /// Whether `nick` is a locally projected IRC operator holding oper_override.
-    /// Step 5 consumes only configured-local session authority. Inactive OCG1
-    /// records may still relay, persist, and survive Helix, but never feed this
-    /// runtime decision or any downstream +Y/NAMES/WHOIS/KICK behavior.
+    /// Authority only: KICK immunity, DATA admission, local NAMES `*`. Remote
+    /// display uses `remoteOperDisplay` / `remoteHasOverridePrefix` instead.
     fn isOverrideOper(self: *LinuxServer, nick: []const u8) bool {
         for (self.reactors) |*reactor| {
             var it = reactor.clients.iterator();
@@ -91610,9 +91683,8 @@ test "mesh OCG1 GRANT converges records but never authorizes sessions or prefixe
     const stored_add = server.oper_grants.lookup("DisplayTarget", now) orelse return error.TestExpectedGrant;
     try std.testing.expectEqual(override_bits, stored_add.privilege_bits);
 
-    // A grant that arrives BEFORE a remote JOIN likewise remains telemetry.
-    // This catches the old later-JOIN path that consulted isOverrideOper and
-    // manufactured a synthetic +Y after the ordinary JOIN.
+    // A grant that arrives BEFORE a remote JOIN must still project +Y once
+    // the JOIN is emitted, so the nicklist does not wait for a later NAMES.
     const remote_add_len = try oper_cred_share.sign(signer, .{
         .account = "RemoteLegacy",
         .privilege_bits = override_bits,
@@ -91639,7 +91711,7 @@ test "mesh OCG1 GRANT converges records but never authorizes sessions or prefixe
     };
     server.emitRemoteMembership(&remote_join, "origin.example");
     try expectContains(watcher.send_buf[0..watcher.send_len], "RemoteLegacy!remote@remote.example JOIN :#mesh-grant");
-    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y RemoteLegacy") == null);
+    try expectContains(watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y RemoteLegacy");
 
     // A higher-incarnation refresh with unchanged privileges is silent.
     resetTestSendQ(watcher);
@@ -91698,8 +91770,8 @@ test "mesh OCG1 GRANT converges records but never authorizes sessions or prefixe
     try std.testing.expect(!alternate.session.isOper());
     try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "MODE #mesh-grant +Y") == null);
 
-    // A preloaded active-looking OCG1 record cannot affect later snapshots,
-    // WHOIS, reserved DATA admission, or KICK immunity.
+    // A preloaded grant cannot elevate a local session, authorize DATA, or
+    // grant KICK immunity. Display `*` / 313 stay configured-local for this nick.
     resetTestSendQ(watcher);
     try server.sendNames(watcher, "#mesh-grant");
     try expectContains(watcher.send_buf[0..watcher.send_len], "DisplayTarget");
@@ -91739,7 +91811,7 @@ test "mesh OCG1 GRANT converges records but never authorizes sessions or prefixe
     try std.testing.expectEqual(@as(u64, 0), stored_tombstone.privilege_bits);
 }
 
-test "remote WHOIS never projects an inactive OCG1 operator record" {
+test "remote WHOIS projects a live mesh grant as display-only oper status" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     defer current_reactor = null;
 
@@ -91786,8 +91858,7 @@ test "remote WHOIS never projects an inactive OCG1 operator record" {
     const reply = watcher.send_buf[0..watcher.send_len];
     try expectContains(reply, " 311 Watcher RemoteLegacy remote remote.users.test ");
     try expectContains(reply, " 318 Watcher RemoteLegacy ");
-    try std.testing.expect(std.mem.indexOf(u8, reply, " 313 Watcher RemoteLegacy ") == null);
-    try std.testing.expect(std.mem.indexOf(u8, reply, "is an IRC operator") == null);
+    try expectContains(reply, " 313 Watcher RemoteLegacy :is Legacy Network Administrator");
 }
 
 test "threaded server: IRCX EVENT subscription numerics" {
