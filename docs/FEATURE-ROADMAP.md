@@ -16,8 +16,8 @@ IRCX adaptation, and the harden pass live in
 still lists the original tag blockers; the major tracks are additional 0.7
 work, not a later version.
 
-**Current versions:** daemon `0.7.0-rc.1` (`build.zig.zon`) · client `0.1.3`
-(`onyx/package.json`) · target `0.7.0`.
+**Current versions:** daemon `0.7.0` (`build.zig.zon`) · client `0.1.3`
+(`onyx/package.json`).
 
 ---
 

@@ -10,10 +10,11 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 
 ---
 
-## 0.7.0-rc.1 (2026-09-04)
+## 0.7.0 (2026-09-04)
 
-Stabilization candidate for the 0.7 release. Not a public GitHub Release tag
-yet; version tracks `build.zig.zon`. Promote to `0.7.0` only at tag.
+Source version promoted from the `0.7.0-rc.1` stabilization line. Tracks
+`build.zig.zon`. Not a GitHub Release asset and not deployed to
+`orochi.service`. The rc.1 notes below are the same contract.
 
 - **Helix capability bridge.** Advertises current + frozen 0.5.8
   `predecessor_v4` (`sessions-v4`) + `predecessor_v3`. Staged rehearsal of
