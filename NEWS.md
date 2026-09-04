@@ -13,20 +13,26 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 ## 0.7.0-rc.1 (2026-09-04)
 
 Stabilization candidate for the 0.7 release. Not a public GitHub Release tag
-yet; version tracks `build.zig.zon`. Promote to `0.7.0` at tag after the §8
-checklist (full suite count, staged 0.5.8→0.7 USR2 rehearsal, reproducible
-`packaging/release.sh`).
+yet; version tracks `build.zig.zon`. Promote to `0.7.0` only at tag.
 
-- **Helix capability bridge.** The current upgrade advertisement keeps the
-  frozen 0.5.8 (`sessions-v4`) token as `predecessor_v4_*` plus the older v3
-  line so a deployed 0.5.8 predecessor still finds its exact probe line.
+- **Helix capability bridge.** Advertises current + frozen 0.5.8
+  `predecessor_v4` (`sessions-v4`) + `predecessor_v3`. Staged rehearsal of
+  real musl `0.5.8+ea249b2` → `0.7.0-rc.1+1e4215a0` passed `UPGRADE` and
+  `SIGUSR2` with zero dropped sessions
+  (`docs/audit/upgrade-0.5.8-to-0.7.0-rc.1.md`). Not `orochi.service`.
 - **Armor TLS roadmap complete** against live source (phases 0–5). Fail-closed
-  OCSP/CRL/name-constraints/kTLS TX; CT options wired through `http_fetch`.
+  OCSP/CRL/name-constraints/kTLS TX+RX; CT options wired through `http_fetch`.
   DTLS stays cut (media-plane only).
-- **`zig build test-dst`** — seed-replayable ≥2-reactor timer-guard DST over
-  the 29 audit sites plus the two P0-TG-2 internals.
-- **Ownership-safe io_uring config keys** `io.defer_taskrun` / `io.sqpoll`
-  (parse + `--check-config`; live-ring apply remains `server.zig`).
+- **`zig build test-dst`** — seed-replayable ≥2-reactor timer-guard model
+  (31 sites). This is not live `onTimerTick` on `LinuxServer`.
+- **Ownership-safe io_uring flags** `io.defer_taskrun` / `io.sqpoll` parse and
+  project onto `server.Config.features`; `RingCore.init` fail-closes on kernel
+  reject. `cqe_batch` default stays 256 until an idle P0-1 before/after.
+- **P0-1 benches.** Offline `zig build bench` plus live-daemon
+  `zig build bench-live` (TLS / shards / `ring_entries`×`cqe_batch`,
+  JOIN+PRIVMSG RTT, RSS) — `docs/audit/bench-baseline-0.7.0-rc.1.md`,
+  `docs/audit/bench-live-0.7.0-rc.1.md`.
+- **Exploit corpus classified** (`docs/research/exploit-suite-blueprint.md` §7).
 - Substrate `io/ring.zig` marked an unfinished prototype, not the daemon
   backend.
 
