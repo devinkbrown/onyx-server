@@ -17,13 +17,12 @@
 #   tools/bench.sh -o docs/audit/x.md    # also write it to a file
 #   tools/bench.sh --runs 3              # more consecutive runs
 #   tools/bench.sh --quick               # fewer samples (a smoke, not a baseline)
+#   tools/bench.sh --live                # throwaway daemon: TLS / shards / ring axes
+#   tools/bench.sh --live --quick        # one plaintext live cell
 #
-# Passes through the harness's own env knobs (ONYX_BENCH_SAMPLES,
-# ONYX_BENCH_ITERS, ONYX_BENCH_ACCEPT_ITERS, ONYX_BENCH_ONLY); see
-# docs/dev/benchmarks.md.
-#
-# This never starts the daemon and never opens a fixed port: every socket the
-# harness creates is loopback on an ephemeral port.
+# Offline mode (`zig build bench`) never starts the daemon. `--live` boots a
+# throwaway `onyx-server` on 127.0.0.1 with kernel-assigned ports (never
+# 6667/6680/6697, never `orochi.service`). See docs/dev/benchmarks.md.
 
 set -euo pipefail
 
@@ -32,15 +31,19 @@ cd "$ROOT"
 
 RUNS=2
 OUT=""
+LIVE=0
+QUICK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--out) OUT="${2:?--out needs a path}"; shift 2 ;;
     --runs) RUNS="${2:?--runs needs a count}"; shift 2 ;;
-    --quick) export ONYX_BENCH_SAMPLES="${ONYX_BENCH_SAMPLES:-5}"
+    --live) LIVE=1; shift ;;
+    --quick) QUICK=1
+             export ONYX_BENCH_SAMPLES="${ONYX_BENCH_SAMPLES:-5}"
              export ONYX_BENCH_ITERS="${ONYX_BENCH_ITERS:-1000}"
              export ONYX_BENCH_ACCEPT_ITERS="${ONYX_BENCH_ACCEPT_ITERS:-100}"
              RUNS=1; shift ;;
-    -h|--help) sed -n '5,27p' "$0"; exit 0 ;;
+    -h|--help) sed -n '5,30p' "$0"; exit 0 ;;
     *) echo "bench.sh: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -106,6 +109,18 @@ emit() {
   echo 'scaling, end-to-end round-trip, io_uring submit cost), and how to read the'
   echo 'min/p50/p99 columns.'
 }
+
+if [ "$LIVE" -eq 1 ]; then
+  echo "bench.sh: building the live-daemon image (ReleaseFast; the first build is slow)..." >&2
+  LIVE_ARGS=()
+  [ "$QUICK" -eq 1 ] && LIVE_ARGS+=(--quick)
+  [ -n "$OUT" ] && LIVE_ARGS+=(-o "$OUT")
+  if ! zig build bench-live -- "${LIVE_ARGS[@]+"${LIVE_ARGS[@]}"}"; then
+    echo "bench.sh: 'zig build bench-live' failed; re-run it directly to see the error" >&2
+    exit 1
+  fi
+  exit 0
+fi
 
 # Warm the build cache up front, at trivial sample counts, so the slow ReleaseFast
 # compile is not attributed to run 1 — and so a compile failure aborts the script

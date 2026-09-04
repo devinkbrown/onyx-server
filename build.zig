@@ -762,6 +762,30 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the 0.7 measurement harness: parse, tag compose, fan-out framing, cross-shard handoff, accept rate (P0-1)");
     bench_step.dependOn(&bench_run.step);
 
+    // `zig build bench-live` — throwaway loopback daemon for the P0-1 axes the
+    // offline harness cannot see (TLS / shards / ring_entries×cqe_batch, JOIN/
+    // PRIVMSG RTT, RSS). Not part of `zig build test` or `bench`. The daemon is
+    // its own ReleaseFast image (same optimize rule as `bench`) so a Debug
+    // `zig-out/bin/onyx-server` is never measured by accident. Pass `-- --quick`
+    // for one plaintext cell.
+    const bench_live_exe = b.addExecutable(.{
+        .name = "onyx-server-bench-live",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "onyx_server", .module = bench_onyx_mod }},
+        }),
+    });
+    const bench_live_run = b.addSystemCommand(&.{"python3"});
+    bench_live_run.addFileArg(b.path("tools/bench_live.py"));
+    bench_live_run.addArg("--bin");
+    bench_live_run.addArtifactArg(bench_live_exe);
+    bench_live_run.addPassthruArgs();
+    const bench_live_step = b.step("bench-live", "Live-daemon P0-1 axes: TLS/shards/ring JOIN+PRIVMSG RTT + RSS (throwaway loopback; not orochi)");
+    bench_live_step.dependOn(&bench_live_run.step);
+
     // `zig build fuzz` — the coverage-guided fuzz targets (roadmap 0.2 follow-up).
     // These are the `cov-fuzz:` tests in src/crypto/tls_fuzz.zig: one
     // `std.testing.fuzz` target per attacker-facing wire parser (X.509, TLS

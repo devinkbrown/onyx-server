@@ -18,6 +18,9 @@ zig build bench                  # build ReleaseFast + run every row
 tools/bench.sh                   # same, twice, with machine provenance
 tools/bench.sh -o docs/audit/bench-baseline-0.5.8.md
 tools/bench.sh --quick           # smoke check, NOT a baseline
+zig build bench-live             # throwaway daemon: TLS / shards / ring axes
+zig build bench-live -- --quick  # one plaintext live cell
+tools/bench.sh --live -o docs/audit/bench-live-0.7.0-rc.1.md
 ```
 
 `zig build bench` compiles the harness as its own ReleaseFast module and installs it to
@@ -33,8 +36,9 @@ measurement is inherently noisy, and folding it into the full suite would make t
 flaky. Wiring the harness as a regression tripwire is future work, and only after a baseline
 has proven stable across machines. This is the same separation `zig build ct-check` uses.
 
-Nothing here boots the daemon or opens a fixed port — every socket the harness creates is
-loopback on an ephemeral port.
+The offline step never boots the daemon or opens a fixed port — every socket that
+harness creates is loopback on an ephemeral port. Live axes use `zig build bench-live`
+(see below), which boots a throwaway node the same way.
 
 ### Tuning
 
@@ -143,14 +147,30 @@ Named gaps. Do not write a claim about any of these from this harness:
   multi-core command throughput. Do not write a "scales with shards" claim from it.
 - **End-to-end message round-trip latency** through a real socket and reactor.
 - **io_uring submit/complete cost** — deliberately untouched, P0-2.
-- **Live-daemon axes** still open: TLS mode (off / userspace / kTLS), shard
-  count under load, and `ring_entries` × `cqe_batch` on a running node. Do not
-  claim those from this harness.
+- **Live-daemon axes** — not this harness. Use `zig build bench-live` /
+  `tools/bench.sh --live` (`tools/bench_live.py`). That boots a throwaway
+  `onyx-server` on 127.0.0.1 with kernel-assigned ports (never 6667/6680/6697,
+  never `orochi.service`), `--check-config` before every boot.
 
 The full P0-1 acceptance criterion in the release plan also names connection-accept rate,
 per-message round-trip latency, fan-out throughput, and RSS per connection with TLS/kTLS and
-`num_shards` controls. This harness covers accept rate and fan-out framing throughput; the
-round-trip, RSS, and TLS/shard control dimensions require a live daemon and remain open.
+`num_shards` controls. This harness covers accept rate and fan-out framing throughput.
+`bench-live` covers register→001 latency, JOIN+PRIVMSG RTT, RSS idle vs N clients, and the
+TLS / `num_shards` / `ring_entries`×`cqe_batch` matrix. kTLS is the configured intent
+(`txrx`); the cell `note` records whether the kernel actually attached ULP.
+
+## Live-daemon recipe
+
+```sh
+zig build bench-live -- --quick
+tools/bench.sh --live -o docs/audit/bench-live-0.7.0-rc.1.md
+```
+
+Default matrix: plaintext at shards 1 and 2, `ring_entries` 32 vs 128, `cqe_batch`
+256 vs 512, plus userspace TLS and kTLS-intent on the default io pair. `--quick`
+is one plaintext cell (smoke, not a baseline). A TLS cell that cannot handshake
+(for example Python `ssl` vs an Ed25519 bootstrap leaf) is recorded as a failed
+cell — never silently skipped. Do not fold `bench-live` into `zig build test`.
 
 ## Recording a baseline
 
