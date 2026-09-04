@@ -519,6 +519,23 @@ pub const AcmeBootConfig = struct {
     http01_conn_read_timeout_sec: u32 = (config_format.Config.Acme{}).http01_conn_read_timeout_sec,
 };
 
+/// Neutral `[io]` flag projection for ownership-safe io_uring setup
+/// (`defer_taskrun`+`SINGLE_ISSUER`, `sqpoll`). `server.Config` already carries
+/// `ring_entries` / `cqe_batch`; the feature bits live on the inline Ringlane
+/// `RingFeatures` in `server.zig` and must be applied there by the integrator
+/// after a fail-closed `io_uring_setup` probe. Default false = byte-identical.
+pub const IoBootConfig = struct {
+    defer_taskrun: bool = false,
+    sqpoll: bool = false,
+};
+
+pub fn mapIoBootConfig(cfg: config_format.Config) IoBootConfig {
+    return .{
+        .defer_taskrun = cfg.io.defer_taskrun,
+        .sqpoll = cfg.io.sqpoll,
+    };
+}
+
 pub fn mapAcmeBootConfig(cfg: config_format.Config) AcmeBootConfig {
     return .{
         .enabled = cfg.acme.enabled,
@@ -558,6 +575,9 @@ pub const Loaded = struct {
     acme: AcmeBootConfig = .{},
     /// Neutral IRCv3 STS boot projection; `main.zig` consumes this to enable STS.
     sts: StsBootConfig = .{},
+    /// Parsed `[io]` ownership-safe ring flags. Probe-and-apply is
+    /// `server.zig` (integrator); this struct only carries intent.
+    io: IoBootConfig = .{},
     /// Number of worker reactor shards to spin up (`ReactorPool` size). 1 = the
     /// single-reactor model. `server.Config` carries no thread-topology field,
     /// so the parsed `[limits].num_shards` rides here for `main.zig` to consume.
@@ -657,6 +677,7 @@ pub fn loadFromText(
         .tls = mapTlsBootConfig(parsed),
         .acme = mapAcmeBootConfig(parsed),
         .sts = mapStsBootConfig(parsed),
+        .io = mapIoBootConfig(parsed),
         .num_shards = parsed.limits.num_shards,
     };
 }
@@ -806,6 +827,8 @@ test "config text overlays the server config" {
     _ = &rx;
     try testing.expect(loaded.config.native_media_require_mac);
     try testing.expectEqual(@as(u16, 512), loaded.config.cqe_batch);
+    try testing.expect(!loaded.io.defer_taskrun);
+    try testing.expect(!loaded.io.sqpoll);
     try testing.expectEqual(@as(usize, 512), loaded.config.memo_config.max_text_bytes);
     try testing.expectEqual(@as(usize, 48), loaded.config.memo_config.max_from_bytes);
     try testing.expectEqual(@as(usize, 16), loaded.config.memo_config.max_per_account);
@@ -830,6 +853,25 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(usize, 1), loaded.tls.ech_keys.len);
     try testing.expectEqualStrings("/etc/onyx/echconfig.bin", loaded.tls.ech_keys[0].config_path);
     try testing.expectEqual(@as([32]u8, @splat(0x22)), loaded.tls.ech_keys[0].private_key);
+}
+
+test "io defer_taskrun and sqpoll project onto Loaded.io without touching cqe_batch default" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[io]
+        \\defer_taskrun = true
+        \\sqpoll = true
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expect(loaded.io.defer_taskrun);
+    try testing.expect(loaded.io.sqpoll);
+    try testing.expectEqual(@as(u16, 256), loaded.config.cqe_batch);
 }
 
 test "media listen overlays media port and candidate host" {

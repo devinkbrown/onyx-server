@@ -9,8 +9,15 @@ carries the authoritative P0/P1/P2 priority tables with owner agents and build
 gates; the per-item detail lives in the documents linked below, not duplicated
 here.
 
-**Current versions:** daemon `0.5.8` (`build.zig.zon:18`) · client `0.1.3`
-(`onyx/package.json:3`) · target `0.7.0`.
+**0.7 is an extremely major release** (same version number). Portable
+performance, per-OS kernel features, Armor TLS/CLI, IRCX expansion, client
+IRCX adaptation, and the harden pass live in
+[`releases/0.7-MAJOR-ROADMAP.md`](releases/0.7-MAJOR-ROADMAP.md). This index
+still lists the original tag blockers; the major tracks are additional 0.7
+work, not a later version.
+
+**Current versions:** daemon `0.7.0-rc.1` (`build.zig.zon`) · client `0.1.3`
+(`onyx/package.json`) · target `0.7.0`.
 
 ---
 
@@ -18,8 +25,10 @@ here.
 
 | Document | Repo | What it covers |
 | --- | --- | --- |
+| [`docs/releases/0.7-MAJOR-ROADMAP.md`](releases/0.7-MAJOR-ROADMAP.md) | both | **0.7 major expansion:** PX portable I/O, KX kernel unique features (Linux/BSD/Windows), AX Armor TLS+CLI, IX daemon IRCX, CX client IRCX, HX harden/correctness |
+| [`onyx/docs/ROADMAP-0.7-IRCX.md`](../../onyx/docs/ROADMAP-0.7-IRCX.md) | onyx | Client IRCX adaptation slice (CX-1…CX-10) |
 | [`docs/ROADMAP-2026-Q4.md`](ROADMAP-2026-Q4.md) | onyx-server | Full daemon feature spine (S-01…S-30) + three release tracks (P-xx, H-xx, L-xx); exit criteria; cross-cutting wire contracts |
-| [`docs/releases/0.7-RELEASE-PLAN.md`](releases/0.7-RELEASE-PLAN.md) | onyx-server | Release thesis, version audit, gap analysis (D-1…D-8), P0/P1/P2 backlog, dependency graph, risk register, Wave 1 dispatch table |
+| [`docs/releases/0.7-RELEASE-PLAN.md`](releases/0.7-RELEASE-PLAN.md) | onyx-server | Original 0.7 thesis, version audit, gap analysis (D-1…D-8), P0/P1/P2 backlog, Wave 1 dispatch; now a subset of the major plan |
 | [`onyx/docs/ROADMAP-2026-Q4.md`](../../onyx/docs/ROADMAP-2026-Q4.md) | onyx | Full client feature spine (C-01…C-33) + two release tracks (CP-xx, CL-xx); in-flight work; cross-cutting wire contracts |
 | [`onyx/docs/FEATURE-ROADMAP.md`](../../onyx/docs/FEATURE-ROADMAP.md) | onyx | Client-half unified view; priority tables for C-xx items |
 | [`docs/features/INVENTED-FEATURES-CATALOG.md`](features/INVENTED-FEATURES-CATALOG.md) | onyx-server | F-01…F-68 speculative features grounded at HEAD; Top-20 game-changer shortlist for 0.8+ |
@@ -57,7 +66,25 @@ verifiable artifact; see the linked detail documents for the full description.
 | **C-02** | Store strangler — first three domains (connection, roster, messages). Extract behind facades; `store.ts` shrinks; no behavior change; NAMES append guard and `useStore` reactivity contract preserved. Detail: [C-02](../../onyx/docs/ROADMAP-2026-Q4.md#c-02--store-strangler-first-three-domains). | `onyx-store` | `pnpm typecheck && pnpm test` |
 | **C-10** | Group E2EE product path. Room owner enables encryption, sees exact member+device set, re-key on member removal, fail-closed on seal failure. **Server dependency cleared: S-12 is DONE (see [§ Drift reconciled](#drift-reconciled)).** Detail: [C-10](../../onyx/docs/ROADMAP-2026-Q4.md#c-10--group-e2ee-product-path). | `onyx-crypto` | `pnpm typecheck && pnpm test && pnpm check:server-contract-v2` |
 
-**P0 count: 11 daemon + 3 client = 14 active P0 items.**
+**Original P0 count: 11 daemon + 3 client.** The major-release tracks below
+are additional 0.7 work (same tag).
+
+---
+
+## 0.7 major expansion (same version)
+
+Full accept conditions: [`releases/0.7-MAJOR-ROADMAP.md`](releases/0.7-MAJOR-ROADMAP.md).
+
+| Track | IDs | What 0.7 adds |
+| --- | --- | --- |
+| **PX** portable performance | PX-0…PX-6 | `IoBackend` trait; Linux ownership-safe io flags; Windows IOCP; BSD/macOS kqueue; portable Helix fail-closed; per-OS benches |
+| **KX** kernel unique features | KX-L1…L12, KX-B0…B5, KX-O1…O4, KX-W1…W5, KX-X1…X3 | Linux FASTOPEN/Landlock/seccomp/MSG_RING/kTLS rekey/`openat2`/pidfd; FreeBSD `SO_REUSEPORT_LB`/Capsicum/KTLS; OpenBSD pledge/unveil; Windows IOCP/RIO/Job objects; boot capability matrix |
+| **AX** Armor TLS + CLI | AX-0…AX-8 | `armor ocsp`/`crl`/`s_client`/`s_server`; CLI sandbox; CT/`http_fetch`; BoGo CI; `enc` stays stubbed |
+| **IX** expanded IRCX (daemon) | IX-1…IX-10 | Draft matrix; MODEX/LISTX/WHISPER/DATA/ACCESS/SACCESS/auditorium/PROP/EVENT/AUTH/HELP completeness + hostile tests |
+| **CX** client IRCX | CX-1…CX-10 | LISTX browser, MODEX UI, WHISPER compose, PROP settings, EVENT for people, ACCESS finish, auditorium roster, DATA lines, identity+PROP, slash verbs |
+| **HX** harden / correctness | HX-1…HX-19 | Outbound CRLF, per-command IRCX exploits, mesh/Helix/media/auth hunt, client XSS/store poison, timer-guard real gates, full-suite count |
+
+**Still not 0.7:** multishot recv, provided-buffer rings, PQ signing, full DTLS listener, mechanical `server.zig` split.
 
 ---
 
@@ -103,7 +130,9 @@ Full descriptions in the linked roadmaps.
 
 **Client P2:** [C-08](../../onyx/docs/ROADMAP-2026-Q4.md#c-08--render-budget-under-windowing) render budget · [C-11](../../onyx/docs/ROADMAP-2026-Q4.md#c-11--multi-device-dm-parity) multi-device DM parity · [C-13](../../onyx/docs/ROADMAP-2026-Q4.md#c-13--vault-retention-and-storage-pressure-ux) vault retention UX · [C-15](../../onyx/docs/ROADMAP-2026-Q4.md#c-15--presence-and-typing-at-mesh-scale) presence at mesh scale · [C-16](../../onyx/docs/ROADMAP-2026-Q4.md#c-16--composer-rich-input-parity) composer rich input · [C-18](../../onyx/docs/ROADMAP-2026-Q4.md#c-18--oper-desk-mesh-operations) oper desk mesh operations · [C-19](../../onyx/docs/ROADMAP-2026-Q4.md#c-19--pwa-update-and-offline-correctness) PWA offline correctness.
 
-**Wave 3/4 and moonshot items** (post-0.7): [S-19…S-30](ROADMAP-2026-Q4.md#wave-3--later), [C-20…C-31](../../onyx/docs/ROADMAP-2026-Q4.md#wave-3--later). Not required for 0.7.
+**0.7 major tracks** (same tag, not 0.8): [PX / IX / CX / HX](releases/0.7-MAJOR-ROADMAP.md) — Windows/BSD I/O, expanded IRCX, client LISTX/MODEX/WHISPER/PROP, exploit hunt.
+
+**Wave 3/4 and moonshot items** (post-0.7): [S-19…S-30](ROADMAP-2026-Q4.md#wave-3--later), [C-20…C-31](../../onyx/docs/ROADMAP-2026-Q4.md#wave-3--later). Invented F-52+ (schedule/threads/canvas) stay post-0.7 unless an IX/CX sliver requires them. Multishot recv / buf_ring stay deferred.
 
 ---
 

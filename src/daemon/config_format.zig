@@ -455,6 +455,12 @@ pub const Config = struct {
     pub const Io = struct {
         ring_entries: u32 = 32,
         cqe_batch: u32 = 256,
+        /// IORING_SETUP_DEFER_TASKRUN (+ SINGLE_ISSUER). Default off. The
+        /// daemon probe must fail closed if the kernel rejects the flags.
+        /// Applying the flags is `server.zig` (onyx-server-integrator).
+        defer_taskrun: bool = false,
+        /// IORING_SETUP_SQPOLL. Default off; same fail-closed probe seam.
+        sqpoll: bool = false,
     };
 
     /// Decaying IP-reputation penalty weights.
@@ -1333,6 +1339,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [io]
     cfg.io.ring_entries = @intCast(try uintField(doc, "io.ring_entries", cfg.io.ring_entries, 8, 4096));
     cfg.io.cqe_batch = @intCast(try uintField(doc, "io.cqe_batch", cfg.io.cqe_batch, 16, 4096));
+    if (doc.getBool("io.defer_taskrun")) |b| cfg.io.defer_taskrun = b;
+    if (doc.getBool("io.sqpoll")) |b| cfg.io.sqpoll = b;
 
     // [reputation]
     cfg.reputation.registration_timeout_penalty = try floatField(doc, "reputation.registration_timeout_penalty", cfg.reputation.registration_timeout_penalty, 0, 1000);
@@ -3659,11 +3667,17 @@ test "parseToml: [io] / [reputation] / sweep_interval lift" {
     try testing.expectEqual(@as(u32, 256), cfg.limits.sasl_decode_max_bytes);
     try testing.expectEqual(@as(u32, 256), cfg.io.ring_entries);
     try testing.expectEqual(@as(u32, 512), cfg.io.cqe_batch);
+    try testing.expect(!cfg.io.defer_taskrun);
+    try testing.expect(!cfg.io.sqpoll);
     try testing.expectEqual(@as(f64, 80.0), cfg.reputation.registration_timeout_penalty);
     try testing.expectEqual(@as(f64, 10.0), cfg.reputation.clone_refuse_penalty);
     // out-of-range ring_entries rejected
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[io]\nring_entries=4\n", .{}));
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[io]\ncqe_batch=8\n", .{}));
+    var flagged = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[io]\ndefer_taskrun=true\nsqpoll=true\n", .{});
+    defer flagged.deinit(allocator);
+    try testing.expect(flagged.io.defer_taskrun);
+    try testing.expect(flagged.io.sqpoll);
     // Cannot promise SASL payloads beyond the compiled router buffer.
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[limits]\nsasl_decode_max_bytes=4096\n", .{}));
 }

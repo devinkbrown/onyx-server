@@ -143,6 +143,9 @@ Named gaps. Do not write a claim about any of these from this harness:
   multi-core command throughput. Do not write a "scales with shards" claim from it.
 - **End-to-end message round-trip latency** through a real socket and reactor.
 - **io_uring submit/complete cost** — deliberately untouched, P0-2.
+- **Live-daemon axes** still open: TLS mode (off / userspace / kTLS), shard
+  count under load, and `ring_entries` × `cqe_batch` on a running node. Do not
+  claim those from this harness.
 
 The full P0-1 acceptance criterion in the release plan also names connection-accept rate,
 per-message round-trip latency, fan-out throughput, and RSS per connection with TLS/kTLS and

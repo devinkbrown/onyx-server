@@ -276,25 +276,40 @@ pub const max_inherited_state_fds = 4096;
 /// canonical `was_websocket` discriminator; a target lacking it must never
 /// receive fds.
 ///
-/// The current image advertises both tokens. That is intentionally asymmetric:
-/// a deployed predecessor whose writer emits HSSN v3 still finds the exact
-/// legacy line and may hand state to this v4 reader, while this predecessor
-/// requires the current line and therefore refuses a legacy v3-only target
-/// before any fd loses CLOEXEC. Never make the current verifier accept the
+/// The current image advertises the current token plus frozen predecessor
+/// lines. That is intentionally asymmetric: a deployed 0.5.8 predecessor
+/// whose writer emits the v4 token (current + `sessions-v4`) still finds
+/// that exact line when probing a later 0.7 image, and a still-older v3
+/// writer (no `sessions-v4`) still finds the v3 line. This predecessor
+/// requires the current line and therefore refuses a legacy-only target
+/// before any fd loses CLOEXEC. Never make the current verifier accept a
 /// predecessor token.
 pub const upgrade_capability_arg = "--helix-upgrade-capabilities-v1";
 const predecessor_v3_upgrade_capability_caps =
     "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2";
 pub const predecessor_v3_upgrade_capability_token =
     "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_v3_upgrade_capability_caps;
+/// Frozen 0.5.8 / HSSN v4 token. Keep this byte-identical even after the
+/// current token grows a later capability, or a deployed 0.5.8 predecessor
+/// refuses the target and the only remaining path is a session-dropping
+/// restart.
+const predecessor_v4_upgrade_capability_caps =
+    "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,sessions-v4,state-fd-manifest-v1,webhook-store-v1,world-v2";
+pub const predecessor_v4_upgrade_capability_token =
+    "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_v4_upgrade_capability_caps;
 const upgrade_capability_caps =
     "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,sessions-v4,state-fd-manifest-v1,webhook-store-v1,world-v2";
 pub const upgrade_capability_token =
     "ONYX_HELIX_UPGRADE_CAPS=" ++ upgrade_capability_caps;
-/// Current-first for diagnostics; the trailing legacy line is the narrow
-/// forward-upgrade bridge consumed by deployed v3 predecessors.
+/// Current-first for diagnostics; trailing frozen lines are the narrow
+/// forward-upgrade bridges consumed by deployed v4 (0.5.8) and v3
+/// predecessors. Duplicate current/v4 lines are expected while they still
+/// match and stay required so a later current-token change does not drop
+/// the 0.5.8 exact-line match.
 pub const upgrade_capability_advertisement =
-    upgrade_capability_token ++ "\n" ++ predecessor_v3_upgrade_capability_token;
+    upgrade_capability_token ++ "\n" ++
+    predecessor_v4_upgrade_capability_token ++ "\n" ++
+    predecessor_v3_upgrade_capability_token;
 
 fn hasCompleteOutputLine(output: []const u8, expected: []const u8) bool {
     var lines = std.mem.splitScalar(u8, output, '\n');
@@ -1124,6 +1139,19 @@ test "HSSN v3 predecessor accepts current v4 reader advertisement" {
     try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "sessions-v4") != null);
 }
 
+test "HSSN v4 predecessor accepts current advertisement via frozen 0.5.8 token" {
+    // A deployed 0.5.8 predecessor compiled in the current token (with
+    // sessions-v4). Probe output must keep that exact line as predecessor_v4
+    // even after the current token later grows, or USR2 is refused fleet-wide.
+    try std.testing.expect(hasCompleteOutputLine(
+        upgrade_capability_advertisement ++ "\n",
+        predecessor_v4_upgrade_capability_token,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, predecessor_v4_upgrade_capability_caps, "sessions-v4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, predecessor_v3_upgrade_capability_caps, "sessions-v4") == null);
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement ++ "\n"));
+}
+
 test "HSSN v4 predecessor rejects rollback to v3-only reader" {
     // A legacy target emits only the frozen predecessor line. The current
     // verifier must not treat that forward-compatibility advertisement as a
@@ -1131,6 +1159,12 @@ test "HSSN v4 predecessor rejects rollback to v3-only reader" {
     // refuses it before performUpgradeAfterCompatibleTarget can clear CLOEXEC.
     const legacy_only = predecessor_v3_upgrade_capability_token ++ "\n";
     try std.testing.expect(!hasUpgradeCapabilityLine(legacy_only));
+    // After the current token grows past the frozen 0.5.8 line, a v4-only
+    // target must also be refused. While they still match, the current
+    // verifier accepting that line is the same as accepting current.
+    if (!std.mem.eql(u8, predecessor_v4_upgrade_capability_token, upgrade_capability_token)) {
+        try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_v4_upgrade_capability_token ++ "\n"));
+    }
     try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement ++ "\n"));
     try std.testing.expect(!std.mem.eql(
         u8,

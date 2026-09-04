@@ -15,8 +15,13 @@ mesh, Helix USR2, OCG2 staging, group E2EE authority, a media plane with live
 DTLS terminators. The tree is **842 Zig files / ~590k lines**, and almost every
 subsystem listed in Waves 1–4 below already has a substantial kernel in it.
 
-0.7 is deliberately **not** another capability series. It is the release where
-the daemon stops growing outward and gets *measured, proven, and finished*:
+0.7 is deliberately **not** another *new-subsystem* series. It is the
+extremely major release (still `0.7.0`) where the daemon is *measured, proven,
+portable, IRCX-complete, and hardened*. New capability trees stay out; finishing
+IRCX, a Windows/BSD reactor, and the exploit hunt are in. Expansion tracks:
+[`releases/0.7-MAJOR-ROADMAP.md`](releases/0.7-MAJOR-ROADMAP.md).
+
+The original three tracks still apply:
 
 
 | Track           | Prefix | Question it answers              | Why it is 0.7                                                                                                   |

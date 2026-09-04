@@ -20,6 +20,7 @@ const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
 const tls_client = @import("../crypto/tls_client.zig");
 const tls12_client = @import("../crypto/tls12_client.zig");
+const sct = @import("../crypto/sct.zig");
 const http1 = @import("../proto/http1_client.zig");
 const net = std.Io.net;
 
@@ -90,6 +91,12 @@ pub const Options = struct {
     crl: ?[]const u8 = null,
     /// When true AND `crl` is set, an unusable CRL fails the handshake closed.
     require_crl: bool = false,
+    /// Optional pinned CT logs for the TLS 1.3 client. Empty (default) skips
+    /// the SCT path so ACME/HTTPS stay byte-identical. TLS 1.2 has no SCT
+    /// wire; these fields are ignored on the 1.2 fallback.
+    ct_logs: []const sct.CtLog = &.{},
+    enforce_sct: bool = false,
+    require_sct: u8 = 0,
 };
 
 /// Perform one GET to `host` and return the full HTTP response (headers+body,
@@ -252,6 +259,9 @@ fn getTls(
         .now_unix_seconds = wallClockSeconds(),
         .crl = opts.crl,
         .require_crl = opts.require_crl,
+        .ct_logs = opts.ct_logs,
+        .enforce_sct = opts.enforce_sct,
+        .require_sct = opts.require_sct,
     });
     defer tc.deinit();
     if (opts.insecure_skip_verify) tc.skipServerCertVerifyForTest();
@@ -624,4 +634,13 @@ test "parseUrl splits scheme/host/port/path with defaults" {
     try std.testing.expectEqualStrings("/a/b?c=d", q.path);
 
     try std.testing.expectError(error.BadUrl, parseUrl("ftp://nope"));
+}
+
+test "http_fetch Options default CT and CRL policy is fail-open" {
+    const opts = Options{};
+    try std.testing.expectEqual(@as(usize, 0), opts.ct_logs.len);
+    try std.testing.expect(!opts.enforce_sct);
+    try std.testing.expectEqual(@as(u8, 0), opts.require_sct);
+    try std.testing.expect(opts.crl == null);
+    try std.testing.expect(!opts.require_crl);
 }

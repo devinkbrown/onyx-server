@@ -510,6 +510,8 @@ pub fn build(b: *std.Build) void {
         "resume",
         "capsule",
         "handoff",
+        "HSSN",
+        "capability",
     };
     const helix_tests = b.addTest(.{
         .root_module = mod,
@@ -526,6 +528,26 @@ pub fn build(b: *std.Build) void {
     const run_helix_tests_verbose = b.addRunArtifact(helix_tests_verbose);
     const test_helix_verbose_step = b.step("test-helix-verbose", "Run focused Helix/upgrade tests with per-test progress output");
     test_helix_verbose_step.dependOn(&run_helix_tests_verbose.step);
+
+    const dst_test_filters: []const []const u8 = &.{
+        "DST:",
+        "DST ",
+        " DST",
+        "timer-guard",
+        "multi-shard USR2",
+        "same seed reproduces",
+        "partition prevents delivery",
+        "clock advances monotonically",
+        "drop rate roughly",
+        "node reactor remains valid",
+    };
+    const dst_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = dst_test_filters,
+    });
+    const run_dst_tests = b.addRunArtifact(dst_tests);
+    const test_dst_step = b.step("test-dst", "Run seed-replayable DST, Sim, and ≥2-reactor timer-guard tests");
+    test_dst_step.dependOn(&run_dst_tests.step);
 
     // `armor` — the standalone Armor crypto toolkit CLI (openssl-parity verbs,
     // every one a thin front-end over the src/crypto substrate). Declared like

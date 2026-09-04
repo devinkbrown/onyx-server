@@ -119,6 +119,7 @@ pub const ssrc_map = @import("ssrc_map.zig");
 pub const string_intern = @import("string_intern.zig");
 pub const tdigest = @import("tdigest.zig");
 pub const timer = @import("timer.zig");
+pub const timer_guard_dst = @import("timer_guard_dst.zig");
 pub const timer_wheel = @import("timer_wheel.zig");
 pub const timing_wheel = @import("timing_wheel.zig");
 pub const topk = @import("topk.zig");
@@ -261,6 +262,7 @@ test {
     _ = string_intern;
     _ = tdigest;
     _ = timer;
+    _ = timer_guard_dst;
     _ = timer_wheel;
     _ = timing_wheel;
     _ = topk;

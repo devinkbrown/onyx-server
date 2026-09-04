@@ -10,6 +10,26 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 
 ---
 
+## 0.7.0-rc.1 (2026-09-04)
+
+Stabilization candidate for the 0.7 release. Not a public GitHub Release tag
+yet; version tracks `build.zig.zon`. Promote to `0.7.0` at tag after the §8
+checklist (full suite count, staged 0.5.8→0.7 USR2 rehearsal, reproducible
+`packaging/release.sh`).
+
+- **Helix capability bridge.** The current upgrade advertisement keeps the
+  frozen 0.5.8 (`sessions-v4`) token as `predecessor_v4_*` plus the older v3
+  line so a deployed 0.5.8 predecessor still finds its exact probe line.
+- **Armor TLS roadmap complete** against live source (phases 0–5). Fail-closed
+  OCSP/CRL/name-constraints/kTLS TX; CT options wired through `http_fetch`.
+  DTLS stays cut (media-plane only).
+- **`zig build test-dst`** — seed-replayable ≥2-reactor timer-guard DST over
+  the 29 audit sites plus the two P0-TG-2 internals.
+- **Ownership-safe io_uring config keys** `io.defer_taskrun` / `io.sqpoll`
+  (parse + `--check-config`; live-ring apply remains `server.zig`).
+- Substrate `io/ring.zig` marked an unfinished prototype, not the daemon
+  backend.
+
 ## 0.5.8 (2026-08-29)
 
 Rolling production line after the 0.5.7 E2EEGROUP cutover — mesh session

@@ -17,7 +17,7 @@ voice/video), adds class-based connection policy with bounded growable SendQ/Rec
 nick-delay protection, and replaces the legacy TS6 server-to-server protocol with the
 native **Undertow + Mooring** cryptographic mesh.
 
-**Quick links:** [Download v0.5.6 (latest published)](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6) · source **0.5.8** (`build.zig.zon`) · [Quickstart](docs/guide/00-quickstart.md) ·
+**Quick links:** [Download v0.5.6 (latest published)](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6) · source **0.7.0-rc.1** (`build.zig.zon`) · [Quickstart](docs/guide/00-quickstart.md) ·
 [Documentation](docs/README.md) · [Architecture](docs/architecture/00-overview.md) ·
 [Command reference](docs/reference/commands/_index.md) ·
 [Contributing](CONTRIBUTING.md) · [Runbook](docs/RUNBOOK.md) ·
@@ -38,16 +38,16 @@ docker build -f packaging/Dockerfile -t onyx-server:latest .
 docker run -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
 ```
 
-**Native (fastest to a running node).** Current source version is **0.5.8**
+**Native (fastest to a running node).** Current source version is **0.7.0-rc.1**
 (`build.zig.zon:18`). The latest published GitHub Release is still
 [`v0.5.6`](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6); build
-locally for 0.5.8:
+locally for 0.7.0-rc.1:
 
 ```sh
 git clone https://github.com/devinkbrown/onyx-server && cd onyx-server
-packaging/release.sh                                   # → dist/onyx-server-0.5.8-x86_64-linux-musl
-./dist/onyx-server-0.5.8-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
-./dist/onyx-server-0.5.8-x86_64-linux-musl packaging/onyx-server.quickstart.toml
+packaging/release.sh                                   # → dist/onyx-server-0.7.0-rc.1-x86_64-linux-musl
+./dist/onyx-server-0.7.0-rc.1-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
+./dist/onyx-server-0.7.0-rc.1-x86_64-linux-musl packaging/onyx-server.quickstart.toml
 ```
 
 Or download the published **v0.5.6** prebuilt:

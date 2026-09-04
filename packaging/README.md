@@ -14,10 +14,10 @@ run is the one from source.
 | `zig build package --prefix <dir>` | staged `bin/onyx-server` + reference config + systemd unit | Production install from a built tree |
 | `packaging/release.sh` | `dist/onyx-server-<version>-x86_64-linux-musl` + `SHA256SUMS` + SBOM + provenance | Reproducible attested static binary |
 
-Current source version is **0.5.8** (`build.zig.zon:18`). The first verified
+Current source version is **0.7.0-rc.1** (`build.zig.zon:18`). The first verified
 prebuilt on GitHub remains the public
 [`v0.5.6` Release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6);
-build locally with `packaging/release.sh` for **0.5.8**.
+build locally with `packaging/release.sh` for **0.7.0-rc.1**.
 It includes the static musl binary, quickstart config, checksum manifest,
 CycloneDX SBOM, and provenance statement. The manifest is reproducible and was
 download-smoked through IRC and WebSocket before publication. It is **not yet
@@ -46,12 +46,12 @@ risking a silent fall-through to the built-in DEFAULT identity.
 
 ## Quickstart (native)
 
-**Build current (0.5.8):**
+**Build current (0.7.0-rc.1):**
 
 ```sh
 packaging/release.sh
-./dist/onyx-server-0.5.8-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
-./dist/onyx-server-0.5.8-x86_64-linux-musl packaging/onyx-server.quickstart.toml
+./dist/onyx-server-0.7.0-rc.1-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
+./dist/onyx-server-0.7.0-rc.1-x86_64-linux-musl packaging/onyx-server.quickstart.toml
 ```
 
 **Or download the latest published GitHub Release (v0.5.6):**

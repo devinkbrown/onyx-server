@@ -1,14 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Ringlane io_uring reactor (skeleton).
+//! Unfinished Ringlane io_uring prototype — not the production backend.
 //!
-//! Ringlane is Onyx Server's Linux fast path (planning/05, "Ringlane I/O"): one
-//! io_uring per shard, multishot accept/recv, provided-buffer rings, batched
-//! send, optional zero-copy send. This file is the io_uring-backed core that the
-//! `Reactor` seam (`src/substrate/reactor.zig`) will eventually dispatch to on
-//! Linux. Non-Linux targets keep using the portable reactor; nothing here
-//! pretends io_uring exists off-Linux.
+//! The live daemon ring lives inline in `src/daemon/server.zig`. Do not adopt
+//! this module as a drop-in: `OpKind` has no `.connect` / `.poll` / cancel
+//! (Helix quiesce is unimplementable on it), `narrow()` is not a kernel probe,
+//! `buf_ring.registerAll` never registers with the kernel, and accept flags
+//! are `0` (the daemon passes `SOCK.CLOEXEC` to avoid split-brain after
+//! execve). Multishot receive and provided-buffer rings stay out of 0.7.
+//!
+//! Kept as a design sketch and a home for the pure user_data / FdToken /
+//! RingFeatures tests. The `Reactor` seam (`src/substrate/reactor.zig`) does
+//! not dispatch here.
 //!
 //! Design rules followed here:
 //!   - Feature gating is a comptime `RingFeatures` profile. Unsupported branches
