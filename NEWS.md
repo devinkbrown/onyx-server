@@ -10,6 +10,70 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 
 ---
 
+## 0.5.8 (2026-08-29)
+
+Rolling production line after the 0.5.7 E2EEGROUP cutover — mesh session
+durability, encrypted-room history, nicklist correctness, and stale-link recovery
+on the live dual-node fleet. No public GitHub Release asset yet; version tracks
+`build.zig.zon` and deploy evidence under `docs/ops/release-v0.5.8-*.md`.
+
+- **Guest E2EE capability negotiation.** Unauthenticated guests may negotiate
+  `onyx/e2ee` without a reusable session; authenticated clients without an
+  attached session still fail closed on that path
+  (`docs/ops/release-v0.5.8-guest-e2ee-hotfix.md`).
+- **Encrypted room history at wire scale.** Required room ciphertext is enforced
+  before formatting; oversized payloads are gated; large replays stream safely;
+  CHATHISTORY batches are standards-compliant
+  (`docs/ops/release-v0.5.8-encrypted-history-capacity.md`,
+  `docs/ops/release-v0.5.8-history-batch-membership.md`).
+- **Session and roster durability across mesh resume.** Detached resume is
+  atomic; exact session rows revoke cleanly; cross-reactor session drops are
+  transacted; roster teardown and exact resume durability fail closed; resumed
+  session identities converge; EXTERNAL picks a canonical session across
+  N-node mesh
+  (`docs/ops/release-v0.5.8-atomic-detached-resume.md`,
+  `docs/ops/release-v0.5.8-exact-session-row-revoke.md`,
+  `docs/ops/release-v0.5.8-cross-reactor-session-drop.md`,
+  `docs/ops/release-v0.5.8-roster-session-finalization.md`,
+  `docs/ops/release-v0.5.8-exact-resume-durability.md`,
+  `docs/ops/release-v0.5.8-session-roster-convergence.md`,
+  `docs/ops/release-v0.5.8-external-canonical-session.md`).
+- **Nicklist and STATS correctness.** JOIN nicklist desync closed; `STATS m`
+  emits four discrete 212 params; remote `QUIT` preserves userlist semantics
+  (`docs/ops/release-v0.5.8-nicklist-stats-m.md`,
+  `docs/ops/release-v0.5.8-mesh-quit-events.md`).
+- **Stale mesh liveness recovery.** Application-level S2S receipt deadline,
+  duplicate-candidate scan, and safe teardown paths recover from asymmetric
+  half-open peer state without a full fleet cold restart
+  (`docs/ops/release-v0.5.8-stale-mesh-liveness.md`).
+- **Nicklist repair and sparse relay safety.** Completed peer snapshots repair
+  nicklists; trusted relays survive sparse topology; relay sender homes converge
+  in fixtures.
+- **OCG2 observe runtime.** Fail-closed OCG2 observation runtime added
+  (`docs/ops/release-v0.5.8-ocg2-observe-runtime.md`).
+- **IRCX and operator surfaces.** EVENT/PROP/ACCESS/SACCESS/SPROP upgrades;
+  stats provider registry and module metadata; module bus with lifecycle driver.
+
+## 0.5.7 (2026-07-28)
+
+Durable E2EE group opaque control (E2EEGROUP v2 authority) on the production
+mesh — first activation via coordinated cold cutover, not Helix USR2 on that
+wave.
+
+- **E2EEGROUP v2 mesh authority.** Hop custody, ingress receipts, and pending
+  exact capacity are enforced fail-closed; Helix carries the
+  `e2ee-group-authority-v2` capability token; mixed-fleet peers without the
+  extension do not negotiate the current path.
+- **Operator barrier and authoring release.** `group_authoring_enabled=false`
+  validated as the v2 successor startup barrier; authoring enabled later via
+  rolling restart once both nodes were on the new banner.
+- **Dual-node production cutover.** Both `0.5.6` predecessors stopped together
+  before install; banner `0.5.7+b457c33` on `eshmaki.me` and `ircx.us`.
+
+Live activation evidence:
+[`docs/ops/release-v0.5.7-e2ee-group-control.md`](docs/ops/release-v0.5.7-e2ee-group-control.md),
+[`docs/ops/e2ee-group-authority-v2-activation.md`](docs/ops/e2ee-group-authority-v2-activation.md).
+
 ## 0.5.6 (2026-07-19)
 
 Certificate-authenticated IRC clients can now resume one logical session across

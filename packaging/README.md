@@ -14,8 +14,10 @@ run is the one from source.
 | `zig build package --prefix <dir>` | staged `bin/onyx-server` + reference config + systemd unit | Production install from a built tree |
 | `packaging/release.sh` | `dist/onyx-server-<version>-x86_64-linux-musl` + `SHA256SUMS` + SBOM + provenance | Reproducible attested static binary |
 
-The first verified prebuilt is the public
-[`v0.5.6` GitHub Release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6).
+Current source version is **0.5.8** (`build.zig.zon:18`). The first verified
+prebuilt on GitHub remains the public
+[`v0.5.6` Release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6);
+build locally with `packaging/release.sh` for **0.5.8**.
 It includes the static musl binary, quickstart config, checksum manifest,
 CycloneDX SBOM, and provenance statement. The manifest is reproducible and was
 download-smoked through IRC and WebSocket before publication. It is **not yet
@@ -44,14 +46,21 @@ risking a silent fall-through to the built-in DEFAULT identity.
 
 ## Quickstart (native)
 
+**Build current (0.5.8):**
+
 ```sh
-# 1. Download the published static binary, quickstart, and checksum manifest.
+packaging/release.sh
+./dist/onyx-server-0.5.8-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
+./dist/onyx-server-0.5.8-x86_64-linux-musl packaging/onyx-server.quickstart.toml
+```
+
+**Or download the latest published GitHub Release (v0.5.6):**
+
+```sh
 release=https://github.com/devinkbrown/onyx-server/releases/download/v0.5.6
 curl -fLO "$release/onyx-server-0.5.6-x86_64-linux-musl"
 curl -fLO "$release/onyx-server.quickstart.toml"
 curl -fLO "$release/SHA256SUMS"
-
-# 2. Verify the downloaded binary, make it executable, preflight, and run.
 grep ' onyx-server-0.5.6-x86_64-linux-musl$' SHA256SUMS | sha256sum -c -
 chmod +x onyx-server-0.5.6-x86_64-linux-musl
 ./onyx-server-0.5.6-x86_64-linux-musl --check-config onyx-server.quickstart.toml
