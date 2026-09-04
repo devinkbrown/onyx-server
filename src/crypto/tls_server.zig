@@ -72,6 +72,16 @@ const max_rejected_early_data_bytes: u64 = 16 * 1024;
 /// a peer wanting more rotations must pay a full record for each.
 const max_post_handshake_msgs_per_record: usize = 8;
 
+/// RFC 8446 §4.6.1: "Servers MUST NOT use any value greater than 604800
+/// seconds (7 days)." Applied to both the advertised NewSessionTicket lifetime
+/// and the acceptance window so an over-long operator config cannot keep a
+/// stolen ticket (and its PSK) alive past the spec bound.
+const max_ticket_lifetime_seconds: u32 = 604_800;
+
+fn effectiveTicketLifetimeSeconds(configured: u32) u32 {
+    return @min(configured, max_ticket_lifetime_seconds);
+}
+
 const HashAlg = enum { sha256, sha384 };
 const tls_record = @import("tls_record.zig");
 const tls_keyshare = @import("../proto/tls_keyshare.zig");
@@ -1994,7 +2004,7 @@ pub const Server = struct {
             const issued_s = @divTrunc(opened.opened.issued_unix_ms, 1000);
             if (issued_s != 0) {
                 if (now_s < issued_s) return null;
-                if (now_s - issued_s > @as(i64, self.config.ticket_lifetime_seconds)) return null;
+                if (now_s - issued_s > @as(i64, effectiveTicketLifetimeSeconds(self.config.ticket_lifetime_seconds))) return null;
             }
             // RFC 8446 §8.2–8.3 0-RTT freshness window. Un-obfuscate the client's
             // reported age with the ticket's sealed age_add and compare it to the
@@ -2742,7 +2752,7 @@ pub const Server = struct {
 
         var ticket_body_buf: [512]u8 = undefined;
         const ticket_body = try tls_session_ticket.encode(&ticket_body_buf, .{
-            .ticket_lifetime = self.config.ticket_lifetime_seconds,
+            .ticket_lifetime = effectiveTicketLifetimeSeconds(self.config.ticket_lifetime_seconds),
             .ticket_age_add = ticket_age_add,
             .ticket_nonce = &ticket_nonce,
             .ticket = sealed,
@@ -5281,6 +5291,107 @@ test "loopback: an expired resumption ticket is rejected (lifetime enforced)" {
     };
     defer alloc.free(rsflight);
     try std.testing.expect(!resumed_server.acceptedSessionTicket());
+}
+
+/// Issue one ticket against a server configured with `configured_lifetime`, then
+/// try to resume it `resume_after_s` later against a server holding the same
+/// ticket key and the same (over-long) config. Returns the lifetime the server
+/// actually advertised and whether the late resumption was accepted.
+fn ticketLifetimePolicyProbe(
+    configured_lifetime: u32,
+    resume_after_s: i64,
+) !struct { advertised: u32, resumed: bool } {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0xB2)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0xB2, 0x14 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    const t0: i64 = 1_700_000_000;
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .ticket_lifetime_seconds = configured_lifetime,
+        .now_unix_seconds = t0,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    _ = try client.decryptApp(ticket_record);
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    // The stored blob carries the lifetime the server put on the wire.
+    const advertised = (try tls_resumption.decodeStoredSession(stored)).ticket_lifetime;
+
+    var resumed_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .ticket_lifetime_seconds = configured_lifetime,
+        .now_unix_seconds = t0 + resume_after_s,
+    });
+    defer resumed_server.deinit();
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    try resumed_client.setSessionTicket(stored, 0);
+
+    const rch = try resumed_client.start();
+    defer alloc.free(rch);
+    const rsflight = switch (try resumed_server.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rsflight);
+    return .{ .advertised = advertised, .resumed = resumed_server.acceptedSessionTicket() };
+}
+
+test "exploit: an over-long ticket_lifetime cannot breach the RFC 8446 4.6.1 ceiling" {
+    // RFC 8446 §4.6.1: "Servers MUST NOT use any value greater than 604800
+    // seconds (7 days)." An operator config of 30 days must be clamped on BOTH
+    // halves — the advertised lifetime and the acceptance window — or a stolen
+    // ticket stays resumable (and the PSK stays live) far past the spec bound.
+    const thirty_days: u32 = 30 * 24 * 3600;
+    const seven_days: i64 = 604_800;
+
+    // Just past the ceiling: unclamped, 604801 < 2592000 would still resume.
+    const late = try ticketLifetimePolicyProbe(thirty_days, seven_days + 1);
+    try std.testing.expectEqual(@as(u32, 604_800), late.advertised);
+    try std.testing.expect(!late.resumed);
+
+    // Inside the ceiling the ticket must still work — the clamp bounds the
+    // window, it does not break resumption.
+    const early = try ticketLifetimePolicyProbe(thirty_days, seven_days - 1000);
+    try std.testing.expectEqual(@as(u32, 604_800), early.advertised);
+    try std.testing.expect(early.resumed);
 }
 
 /// Shared harness for the RFC 8446 §8.2–8.3 freshness-window tests: issue a
