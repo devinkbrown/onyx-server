@@ -248,6 +248,7 @@ pub fn build(b: *std.Build) void {
         "delegated credential",
         "record_size_limit",
         "raw public key",
+        "exploit:",
     };
     const tls_tests = b.addTest(.{
         .root_module = mod,

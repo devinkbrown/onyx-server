@@ -130,6 +130,10 @@ pub fn httpsRequest(
         .trust_anchors = trust_anchors,
         .alpn_protocols = &.{"http/1.1"},
         .now_unix_seconds = wallClockSeconds(),
+        // ACME directory TLS stays fail-open on CRL (no CDP cache here).
+        // http_fetch.Options.crl / require_crl is the opt-in wire for fetchers
+        // that already hold a caller-supplied CRL.
+        .require_crl = false,
     });
     defer tc.deinit();
 

@@ -35,7 +35,7 @@ comptime {
 
 /// Errors surfaced by the adapter: the inner 1.3 + 1.2 handshake/record errors
 /// plus the allocator errors from growing the internal buffers.
-pub const Error = tls_server.Error || tls12_server.Error || Allocator.Error;
+pub const Error = tls_server.Error || tls12_server.Error || Allocator.Error || error{KtlsTxOffloaded};
 
 /// What a single `onInbound()` produced. Both slices point into internal buffers
 /// and stay valid only until the next `onInbound()` / `write()` call; the caller
@@ -78,6 +78,9 @@ pub const TlsConn = struct {
     plain_buf: std.ArrayList(u8) = .empty,
     /// Scratch for outbound ciphertext, rebuilt per `write()` call.
     write_buf: std.ArrayList(u8) = .empty,
+    /// Set after a successful `enableKtlsTx`. `write()` must not userspace-AEAD
+    /// the same bytes the kernel will encrypt.
+    ktls_tx_offloaded: bool = false,
 
     /// TLS 1.3-only adapter (back-compatible): the engine is fixed to the TLS 1.3
     /// server and a 1.2 ClientHello is rejected.
@@ -166,11 +169,12 @@ pub const TlsConn = struct {
     /// drained all userspace-sealed bytes (handshake flight + NewSessionTicket)
     /// from the socket first and the socket must be ESTABLISHED, or the kernel
     /// would encrypt the already-ciphertext tail. Only TLS 1.3 is supported.
-    pub fn enableKtlsTx(self: *const TlsConn, fd: linux.fd_t) KtlsError!void {
+    pub fn enableKtlsTx(self: *TlsConn, fd: linux.fd_t) KtlsError!void {
         var buf: [ktls.max_crypto_info_len]u8 = undefined;
         const encoded = try self.buildKtlsTxCryptoInfo(&buf);
         try ktls.attachUlp(fd);
         try ktls.attachTx(fd, encoded);
+        self.ktls_tx_offloaded = true;
     }
 
     /// Attach Linux kTLS RX offload to `fd`, so the kernel decrypts inbound
@@ -385,6 +389,7 @@ pub const TlsConn = struct {
 
     /// Encrypt `plaintext` into one or more application_data records.
     pub fn write(self: *TlsConn, plaintext: []const u8) Error![]const u8 {
+        if (self.ktls_tx_offloaded) return error.KtlsTxOffloaded;
         if (!self.handshakeDone()) return error.BadState;
         self.write_buf.clearRetainingCapacity();
 
@@ -947,6 +952,31 @@ test "enableKtlsRx fails closed when inbound is not at a record boundary" {
     try conn.recv_buf.appendSlice(alloc, &[_]u8{ 0x17, 0x03, 0x03, 0x00, 0x10 });
     try std.testing.expect(conn.hasBufferedInbound());
     try std.testing.expectError(error.KtlsDirtyInbound, conn.enableKtlsRx(@as(linux.fd_t, -1)));
+}
+
+test "exploit: write after kTLS TX attach fails closed instead of double-encrypting" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3a)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh_out = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh_out.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+    try std.testing.expect(conn.handshakeDone());
+
+    conn.ktls_tx_offloaded = true;
+    try std.testing.expectError(error.KtlsTxOffloaded, conn.write("do-not-double-encrypt"));
 }
 
 test "kTLS RX offload: the kernel decrypts client records into recv() plaintext" {

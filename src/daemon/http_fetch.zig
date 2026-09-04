@@ -85,6 +85,11 @@ pub const Options = struct {
     connect_timeout_ms: u31 = 5000,
     recv_timeout_ms: u31 = 10000,
     max_response_bytes: usize = 512 * 1024,
+    /// Optional leaf CRL (DER) forwarded to both TLS clients. Empty/absent is
+    /// the historical fail-open ACME/HTTPS posture.
+    crl: ?[]const u8 = null,
+    /// When true AND `crl` is set, an unusable CRL fails the handshake closed.
+    require_crl: bool = false,
 };
 
 /// Perform one GET to `host` and return the full HTTP response (headers+body,
@@ -175,6 +180,8 @@ fn getTls12(
         .trust_anchors = opts.trust_anchors,
         .alpn_protocols = &.{"http/1.1"},
         .now_unix_seconds = wallClockSeconds(),
+        .crl = opts.crl,
+        .require_crl = opts.require_crl,
     });
     defer tc.deinit();
     if (opts.insecure_skip_verify) tc.skipServerCertVerifyForTest();
@@ -243,6 +250,8 @@ fn getTls(
         .trust_anchors = opts.trust_anchors,
         .alpn_protocols = &.{"http/1.1"},
         .now_unix_seconds = wallClockSeconds(),
+        .crl = opts.crl,
+        .require_crl = opts.require_crl,
     });
     defer tc.deinit();
     if (opts.insecure_skip_verify) tc.skipServerCertVerifyForTest();

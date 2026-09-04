@@ -264,12 +264,16 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
         /// NameConstraints extension (2.5.29.30) dNSName subtrees. Only meaningful
         /// when `name_constraints_present`. When `nc_permitted_dns_count > 0`, a
         /// constrained dNSName must match one permitted subtree; it must match no
-        /// excluded subtree. Other GeneralName types are not enforced here.
+        /// excluded subtree. `nc_unsupported_name_form` is set when a GeneralName
+        /// is not a dNSName, or a GeneralSubtree carries minimum/maximum — RFC
+        /// 5280 §4.2.1.10 requires those forms to be enforced or the chain
+        /// rejected, and this parser does not match iPAddress/rfc822Name/URI.
         name_constraints_present: bool,
         nc_permitted_dns: [MaxNameConstraints][]const u8,
         nc_permitted_dns_count: usize,
         nc_excluded_dns: [MaxNameConstraints][]const u8,
         nc_excluded_dns_count: usize,
+        nc_unsupported_name_form: bool,
 
         pub fn parse(der: []const u8) Error!Self {
             var cert = Self{
@@ -304,6 +308,7 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
                 .nc_permitted_dns_count = 0,
                 .nc_excluded_dns = undefined,
                 .nc_excluded_dns_count = 0,
+                .nc_unsupported_name_form = false,
             };
             try parseInto(Self, &cert, der);
             return cert;
@@ -1062,8 +1067,9 @@ fn parseTlsFeature(comptime CertType: type, cert: *CertType, parent: DerReader, 
 
 /// NameConstraints (RFC 5280 §4.2.1.10): SEQUENCE { permittedSubtrees [0],
 /// excludedSubtrees [1] }, each GeneralSubtrees = SEQUENCE OF GeneralSubtree.
-/// Only dNSName bases are retained; minimum/maximum and other name types are
-/// ignored (we do not enforce base distances).
+/// dNSName bases with default minimum=0 / absent maximum are retained.
+/// Any other GeneralName form, or a present minimum/maximum, sets
+/// `nc_unsupported_name_form` so `enforceNameConstraints` fails closed.
 fn parseNameConstraints(comptime CertType: type, cert: *CertType, parent: DerReader, value: []const u8) Error!void {
     var inner = try nestedBytes(parent, value);
     const seq_tlv = try inner.readExpected(Tag.sequence);
@@ -1075,31 +1081,37 @@ fn parseNameConstraints(comptime CertType: type, cert: *CertType, parent: DerRea
         const tag = try nc.peekTag();
         const tlv = try nc.readTlv();
         if (tag == Tag.context_0_constructed) {
-            try collectDnsSubtrees(CertType, nc, tlv, &cert.nc_permitted_dns, &cert.nc_permitted_dns_count);
+            try collectDnsSubtrees(CertType, cert, nc, tlv, &cert.nc_permitted_dns, &cert.nc_permitted_dns_count);
         } else if (tag == Tag.context_1_constructed) {
-            try collectDnsSubtrees(CertType, nc, tlv, &cert.nc_excluded_dns, &cert.nc_excluded_dns_count);
+            try collectDnsSubtrees(CertType, cert, nc, tlv, &cert.nc_excluded_dns, &cert.nc_excluded_dns_count);
         }
     }
 }
 
 fn collectDnsSubtrees(
     comptime CertType: type,
+    cert: *CertType,
     parent: DerReader,
     subtrees_tlv: Tlv,
     out: *[MaxNameConstraints][]const u8,
     count: *usize,
 ) Error!void {
-    _ = CertType;
     var subs = try parent.child(subtrees_tlv);
     while (subs.hasRemaining()) {
         const gs_tlv = try subs.readExpected(Tag.sequence);
         var gs = try subs.child(gs_tlv);
-        const base = try gs.readTlv(); // GeneralName (minimum/maximum ignored)
+        const base = try gs.readTlv();
         if (base.tag == Tag.san_dns_name) {
             if (count.* >= out.len) return error.TooManySan;
             out[count.*] = base.value;
             count.* += 1;
+        } else {
+            cert.nc_unsupported_name_form = true;
         }
+        // RFC 5280 §4.2.1.10: within this profile minimum MUST be zero and
+        // maximum MUST be absent. Any leftover GeneralSubtree field is a
+        // distance we do not enforce — fail closed at verify time.
+        if (gs.hasRemaining()) cert.nc_unsupported_name_form = true;
     }
 }
 
@@ -2136,4 +2148,27 @@ fn cdpTestSkeletonFields(a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
     try cdpTestTlv(a, out, Tag.integer, &[_]u8{0x01}); // serialNumber
     var i: usize = 0;
     while (i < 5) : (i += 1) try cdpTestTlv(a, out, Tag.sequence, "");
+}
+
+test "exploit: NameConstraints iPAddress and non-zero minimum set unsupported form" {
+    // SEQUENCE { permittedSubtrees [0] IMPLICIT GeneralSubtrees }
+    // [0] content is GeneralSubtree items directly (not a nested SEQUENCE OF).
+    const ip_nc = [_]u8{
+        0x30, 0x0a, 0xa0, 0x08, 0x30, 0x06, 0x87, 0x04, 0xc0, 0x00, 0x02, 0x01,
+    };
+    var ip_cert = std.mem.zeroes(Certificate);
+    try parseNameConstraints(Certificate, &ip_cert, DerReader.init(&ip_nc), &ip_nc);
+    try std.testing.expect(ip_cert.name_constraints_present);
+    try std.testing.expect(ip_cert.nc_unsupported_name_form);
+    try std.testing.expectEqual(@as(usize, 0), ip_cert.nc_permitted_dns_count);
+
+    // dNSName plus minimum [0] INTEGER 1 — RFC 5280 forbids a non-zero minimum.
+    const min_nc = [_]u8{
+        0x30, 0x0c, 0xa0, 0x0a, 0x30, 0x08, 0x82, 0x03, 'a', '.', 'b', 0x80, 0x01, 0x01,
+    };
+    var min_cert = std.mem.zeroes(Certificate);
+    try parseNameConstraints(Certificate, &min_cert, DerReader.init(&min_nc), &min_nc);
+    try std.testing.expect(min_cert.name_constraints_present);
+    try std.testing.expect(min_cert.nc_unsupported_name_form);
+    try std.testing.expectEqual(@as(usize, 1), min_cert.nc_permitted_dns_count);
 }

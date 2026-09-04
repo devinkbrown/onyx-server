@@ -167,6 +167,12 @@ pub const Options = struct {
     /// missing or broken CRL never breaks an otherwise-valid handshake. Borrowed
     /// for the call; the client copies it.
     crl: ?[]const u8 = null,
+    /// When true AND `crl` is set, a missing clock, unparseable CRL, wrong-issuer
+    /// signature, or stale window fails the handshake closed (`BadCertificate`)
+    /// instead of being ignored. Default false keeps the historical fail-open
+    /// ACME/HTTPS posture (byte-identical when off). A listed serial still
+    /// always revokes, with or without this flag.
+    require_crl: bool = false,
     /// RFC 7250 raw public keys. When true, the ClientHello offers
     /// `server_certificate_type = [RawPublicKey, X509]`, permitting the server
     /// to reply with a bare `SubjectPublicKeyInfo` in place of an X.509 chain.
@@ -410,6 +416,9 @@ pub const Client = struct {
     /// leaf must present at least this many valid SCTs from distinct pinned logs
     /// or the handshake fails closed (see `Options.require_sct`).
     require_sct: u8 = 0,
+    /// When true, a configured CRL that cannot be authenticated and judged
+    /// current fails the handshake (see `Options.require_crl`).
+    require_crl: bool = false,
 
     state: State = .idle,
     /// Wall-clock time (Unix seconds) for certificate validity checks, or null to
@@ -673,6 +682,7 @@ pub const Client = struct {
             .ct_logs = ct_logs_owned,
             .enforce_sct = options.enforce_sct,
             .require_sct = options.require_sct,
+            .require_crl = options.require_crl,
             .verify_time = options.now_unix_seconds,
             .offer_raw_public_key = options.offer_raw_public_key,
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
@@ -2290,7 +2300,7 @@ pub const Client = struct {
             const leaf = try x509.parse(chain[0]);
             const issuer_der = if (chain.len > 1) chain[1] else chain[0];
             const issuer_parts = try extractCertParts(issuer_der);
-            try checkCrlRevocation(crl_der, issuer_parts.spki_der, leaf.serial_der, self.verify_time);
+            try checkCrlRevocation(crl_der, issuer_parts.spki_der, leaf.serial_der, self.verify_time, self.require_crl);
         }
         // Opt-in SCT (Certificate Transparency) verification, pooling SCTs from
         // ALL THREE RFC 6962 §3 sources — the embedded X.509 extension (precert
@@ -2958,11 +2968,29 @@ fn parseTicketEarlyDataLimit(extensions: []const u8) Error!u32 {
 /// an outbound HTTPS/ACME client: soft-fail revocation, hard-fail forgery (the
 /// chain verifier already enforced the latter; a CRL can only ever authenticate a
 /// *revocation*, never clear a bad chain).
-fn checkCrlRevocation(crl_der: []const u8, issuer_spki_der: []const u8, leaf_serial_der: []const u8, now_unix: ?i64) Error!void {
-    const now = now_unix orelse return; // no trustworthy clock → can't judge currency
-    const parsed = crl.parse(crl_der) catch return; // fail-open: unparseable CRL
-    crl.verifyParsedCrlSignature(parsed, issuer_spki_der) catch return; // fail-open: not authentic for this issuer
-    if (!crl.crlIsCurrent(parsed, now)) return; // fail-open: stale or not-yet-valid
+fn checkCrlRevocation(
+    crl_der: []const u8,
+    issuer_spki_der: []const u8,
+    leaf_serial_der: []const u8,
+    now_unix: ?i64,
+    require: bool,
+) Error!void {
+    const now = now_unix orelse {
+        if (require) return error.BadCertificate;
+        return;
+    };
+    const parsed = crl.parse(crl_der) catch {
+        if (require) return error.BadCertificate;
+        return;
+    };
+    crl.verifyParsedCrlSignature(parsed, issuer_spki_der) catch {
+        if (require) return error.BadCertificate;
+        return;
+    };
+    if (!crl.crlIsCurrent(parsed, now)) {
+        if (require) return error.BadCertificate;
+        return;
+    }
     if (crl.isSerialRevoked(parsed, leaf_serial_der)) return error.CertificateRevoked;
 }
 
@@ -2976,11 +3004,14 @@ fn parseCertificateStatusOcsp(data: []const u8) Error![]const u8 {
 
 /// Authenticate a stapled OCSP response and enforce the leaf's serial status.
 ///
-/// Absence is handled by the caller. A signed `good`, signed `unknown`, or a
-/// signed response with no matching SingleResponse soft-passes; a matching
-/// `revoked` SingleResponse fails closed.
+/// Absence is handled by the caller. A present staple is an authenticated
+/// statement about *this* leaf: a matching `revoked` fails closed, a matching
+/// `unknown` or a response for another serial is `BadCertificate` (staple
+/// confusion), and a matching `good` is accepted. When `now_unix` is set the
+/// staple must also be current (`thisUpdate ≤ now < nextUpdate`, same window
+/// as `ocsp.isStapleServable`) — a stale authentic `good` is not a live status.
 ///
-/// `now_unix` (the client's validity clock) enables delegated-responder
+/// `now_unix` (the client's validity clock) also enables delegated-responder
 /// authorization (RFC 6960 §4.2.2.2 — most public CAs), which needs a clock to
 /// check the responder cert's validity window. Without a clock we fall back to
 /// direct-issuer signing only (fail-closed: a delegated staple is rejected rather
@@ -2998,13 +3029,21 @@ fn verifyOcspStapleForLeaf(staple_der: []const u8, issuer_spki_der: []const u8, 
         ocsp.verifyResponseSignature(parsed, issuer_spki_der);
     if (!authenticated) return error.BadCertificate;
     try enforceOcspStatusForSerial(parsed, leaf_serial);
+    if (now_unix) |now| {
+        // Status is `good` for this serial; still reject a stale/not-yet-valid
+        // window. `isStapleServable` re-authenticates — a false here is the
+        // freshness gate, not a second policy.
+        if (!ocsp.isStapleServable(staple_der, issuer_spki_der, leaf_serial, now, 60))
+            return error.BadCertificate;
+    }
 }
 
 fn enforceOcspStatusForSerial(parsed: anytype, leaf_serial: []const u8) Error!void {
-    const status = ocsp.statusForSerial(parsed, leaf_serial) orelse return;
+    const status = ocsp.statusForSerial(parsed, leaf_serial) orelse return error.BadCertificate;
     switch (status) {
         .revoked => return error.CertificateRevoked,
-        .good, .unknown => return,
+        .unknown => return error.BadCertificate,
+        .good => return,
     }
 }
 
@@ -4023,7 +4062,7 @@ test "must_staple leaf without stapled OCSP rejects" {
     try enforceOcspMustStaplePolicy(parsed.must_staple, "opaque-staple");
 }
 
-test "OCSP staple status decision rejects revoked and soft-passes good or absent" {
+test "OCSP staple status decision rejects revoked, unknown, and sibling serial" {
     var parsed = ocsp.Parsed{
         .der = &.{},
         .response_status = .successful,
@@ -4047,7 +4086,45 @@ test "OCSP staple status decision rejects revoked and soft-passes good or absent
 
     parsed.responses[0].cert_status = .good;
     try enforceOcspStatusForSerial(parsed, &[_]u8{0x10});
-    try enforceOcspStatusForSerial(parsed, &[_]u8{0x11});
+    try std.testing.expectError(error.BadCertificate, enforceOcspStatusForSerial(parsed, &[_]u8{0x11}));
+
+    parsed.responses[0].cert_status = .unknown;
+    try std.testing.expectError(error.BadCertificate, enforceOcspStatusForSerial(parsed, &[_]u8{0x10}));
+}
+
+test "exploit: a present OCSP staple for the wrong serial cannot satisfy must-staple" {
+    var parsed = ocsp.Parsed{
+        .der = &.{},
+        .response_status = .successful,
+        .basic_response_der = null,
+        .tbs_response_data_der = &.{},
+        .signature_algorithm_oid = &.{},
+        .signature_value = &.{},
+        .responses = undefined,
+        .response_count = 1,
+    };
+    parsed.responses[0] = .{
+        .hash_algorithm_oid = &.{},
+        .issuer_name_hash = &.{},
+        .issuer_key_hash = &.{},
+        .serial = &[_]u8{0xAA},
+        .cert_status = .good,
+        .this_update = "20260102030405Z",
+        .next_update = "20270102030405Z",
+    };
+    try enforceOcspMustStaplePolicy(true, "present");
+    try std.testing.expectError(error.BadCertificate, enforceOcspStatusForSerial(parsed, &[_]u8{0x10}));
+}
+
+test "exploit: require_crl fails closed on an unusable CRL instead of ignoring it" {
+    try std.testing.expectError(
+        error.BadCertificate,
+        checkCrlRevocation(&[_]u8{ 0x30, 0x00 }, &[_]u8{}, &[_]u8{0x2A}, null, true),
+    );
+    try std.testing.expectError(
+        error.BadCertificate,
+        checkCrlRevocation(&[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, &[_]u8{}, &[_]u8{0x2A}, 1_767_225_601, true),
+    );
 }
 
 test "DNS wildcard matching is single-label only" {
@@ -4297,6 +4374,35 @@ test "TLS 1.3 ServerHello after HRR must keep the HRR cipher suite (RFC 8446 §4
     defer allocator.free(kept);
     const shared = try client.parseServerHello(kept);
     try std.testing.expectEqual(@as(usize, 32), shared.len);
+}
+
+test "exploit: a ServerHello after HRR with no key_share never derives traffic secrets" {
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+    defer client.deinit();
+    client.hrr_seen = true;
+    client.hrr_suite = .tls_aes_128_gcm_sha256;
+    client.retry_key_share_group = .x25519;
+
+    var exts: std.ArrayList(u8) = .empty;
+    defer exts.deinit(allocator);
+    try appendU16(allocator, &exts, @intFromEnum(tls_extension.ExtensionType.supported_versions));
+    try appendU16(allocator, &exts, 2);
+    try appendU16(allocator, &exts, tls_supported_versions.tls13);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendU16(allocator, &body, tls_record.legacy_record_version);
+    try body.appendSlice(allocator, &(@as([32]u8, @splat(0x42))));
+    try body.append(allocator, @intCast(client.legacy_session_id.len));
+    try body.appendSlice(allocator, &client.legacy_session_id);
+    try appendU16(allocator, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
+    try body.append(allocator, 0);
+    try appendU16(allocator, &body, @intCast(exts.items.len));
+    try body.appendSlice(allocator, exts.items);
+
+    try std.testing.expectError(error.MissingExtension, client.parseServerHello(body.items));
+    try std.testing.expect(client.selected_suite == null);
 }
 
 test "TLS 1.3 ServerHello key_share group must be one the ClientHello offered (RFC 8446 §4.2.8)" {
@@ -4638,9 +4744,9 @@ fn crlTestSignedCrlWithRevoked(
 test "checkCrlRevocation fail-open: no clock and unparseable CRL never error" {
     // No trustworthy clock → cannot judge currency → fail-open (returns before
     // touching the CRL) even against a syntactically valid-looking input.
-    try checkCrlRevocation(&[_]u8{ 0x30, 0x00 }, &[_]u8{}, &[_]u8{0x2A}, null);
+    try checkCrlRevocation(&[_]u8{ 0x30, 0x00 }, &[_]u8{}, &[_]u8{0x2A}, null, false);
     // Clock present but the bytes are not a CRL → parse fails → fail-open.
-    try checkCrlRevocation(&[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, &[_]u8{}, &[_]u8{0x2A}, 1_767_225_601);
+    try checkCrlRevocation(&[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, &[_]u8{}, &[_]u8{0x2A}, 1_767_225_601, false);
 }
 
 test "checkCrlRevocation revokes only a listed serial under an authentic, current CRL" {
@@ -4656,9 +4762,9 @@ test "checkCrlRevocation revokes only a listed serial under an authentic, curren
     const now = parsed.this_update.epoch_seconds + 1; // inside [thisUpdate, nextUpdate)
 
     // Positive: an authentic, current CRL that lists the leaf serial MUST revoke.
-    try std.testing.expectError(error.CertificateRevoked, checkCrlRevocation(der, spki, &[_]u8{0x2A}, now));
+    try std.testing.expectError(error.CertificateRevoked, checkCrlRevocation(der, spki, &[_]u8{0x2A}, now, false));
     // A serial absent from the CRL passes cleanly.
-    try checkCrlRevocation(der, spki, &[_]u8{0x2B}, now);
+    try checkCrlRevocation(der, spki, &[_]u8{0x2B}, now, false);
 }
 
 test "checkCrlRevocation fail-open on wrong issuer key or a stale window" {
@@ -4675,13 +4781,13 @@ test "checkCrlRevocation fail-open on wrong issuer key or a stale window" {
     const attacker = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x77)));
     const attacker_spki = try crlTestEd25519Spki(a, attacker.public_key.toBytes());
     defer a.free(attacker_spki);
-    try checkCrlRevocation(der, attacker_spki, &[_]u8{0x2A}, now);
+    try checkCrlRevocation(der, attacker_spki, &[_]u8{0x2A}, now, false);
 
     // Correct issuer key but the CRL is stale (now == nextUpdate) → fail-open.
     const spki = try crlTestEd25519Spki(a, kp.public_key.toBytes());
     defer a.free(spki);
     const stale = parsed.next_update.?.epoch_seconds;
-    try checkCrlRevocation(der, spki, &[_]u8{0x2A}, stale);
+    try checkCrlRevocation(der, spki, &[_]u8{0x2A}, stale, false);
 }
 
 // ---------------------------------------------------------------------------

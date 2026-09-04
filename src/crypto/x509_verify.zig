@@ -331,6 +331,11 @@ pub fn buildPathFacts(chain: []const []const u8, out: []CaPathFact) usize {
 /// rejected but TLS 1.2 silently accepted.
 pub fn enforceNameConstraints(issuer: x509.Certificate, leaf: x509.Certificate) Error!void {
     if (!issuer.name_constraints_present) return;
+    // RFC 5280 §4.2.1.10: a constraint we cannot match (iPAddress, rfc822Name,
+    // directoryName, URI, or a non-zero minimum / present maximum) must not be
+    // ignored — otherwise a name-constrained CA can mint an out-of-scope IP
+    // or mailbox that this DNS-only matcher would silently accept.
+    if (issuer.nc_unsupported_name_form) return error.BadCertificate;
     var li: usize = 0;
     while (li < leaf.san_dns_count) : (li += 1) {
         const name = leaf.san_dns[li];
@@ -454,6 +459,19 @@ test "enforceNameConstraints applies permitted + excluded dNSName subtrees" {
     const plain = std.mem.zeroes(x509.Certificate);
     leaf.san_dns[0] = "anything.test";
     try enforceNameConstraints(plain, leaf);
+}
+
+test "exploit: NameConstraints with an unenforced name form fail closed" {
+    var issuer = std.mem.zeroes(x509.Certificate);
+    issuer.name_constraints_present = true;
+    issuer.nc_unsupported_name_form = true;
+    issuer.nc_permitted_dns[0] = "example.com";
+    issuer.nc_permitted_dns_count = 1;
+
+    var leaf = std.mem.zeroes(x509.Certificate);
+    leaf.san_dns[0] = "host.example.com";
+    leaf.san_dns_count = 1;
+    try std.testing.expectError(error.BadCertificate, enforceNameConstraints(issuer, leaf));
 }
 
 fn requireSignature(info: LinkInfo) Error!void {
@@ -1444,6 +1462,19 @@ test "unsupported signature algorithm is rejected with UnsupportedSigAlg" {
     try std.testing.expectError(
         error.UnsupportedSigAlg,
         verifyCertSignature(info.tbs_der, info.signature_der, &md5_rsa, info.sig_alg_params, info.spki_der),
+    );
+}
+
+test "exploit: sha1WithRSAEncryption certificate signatures are rejected" {
+    const fixture = try testDer();
+    defer fixture.deinit();
+    const info = try linkInfo(fixture.der);
+    // 1.2.840.113549.1.1.5 — sha1WithRSAEncryption. Dispatch must not fall
+    // through to a PKCS#1 SHA-1 verify even if the SPKI is RSA-shaped.
+    const sha1_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05 };
+    try std.testing.expectError(
+        error.UnsupportedSigAlg,
+        verifyCertSignature(info.tbs_der, info.signature_der, &sha1_rsa, info.sig_alg_params, info.spki_der),
     );
 }
 

@@ -21,6 +21,8 @@ const rsa_verify = @import("rsa_verify.zig");
 const rsa_sign = @import("rsa_sign.zig");
 const x509 = @import("x509.zig");
 const x509_verify = @import("x509_verify.zig");
+const ocsp = @import("ocsp.zig");
+const crl = @import("crl.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -31,6 +33,9 @@ const sig_rsa_pkcs1_sha384: u16 = 0x0501;
 
 /// RFC 5077 SessionTicket extension type.
 const ext_session_ticket: u16 = 0x0023;
+
+/// RFC 6066 status_request (OCSP stapling).
+const ext_status_request: u16 = 0x0005;
 
 /// RFC 7627 extended_master_secret extension type (always empty).
 const ext_extended_master_secret: u16 = 0x0017;
@@ -76,6 +81,7 @@ pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     BadSignature,
     BadState,
     CertificateNameMismatch,
+    CertificateRevoked,
     DowngradeDetected,
     EmptyCertificateChain,
     EmsRequired,
@@ -107,6 +113,13 @@ pub const Options = struct {
     /// fallback to the classic (Triple-Handshake-exposed) derivation. Set false
     /// only for legacy interop; EMS is still used whenever the server echoes it.
     require_extended_master_secret: bool = true,
+    /// Optional caller-supplied CRL (DER) for leaf revocation, matching the
+    /// TLS 1.3 client. A listed serial always revokes. Other CRL defects are
+    /// ignored unless `require_crl` is set.
+    crl: ?[]const u8 = null,
+    /// When true AND `crl` is set, a missing clock, unparseable CRL,
+    /// wrong-issuer signature, or stale window fails closed (`BadCertificate`).
+    require_crl: bool = false,
 };
 
 pub const FeedResult = union(enum) {
@@ -246,11 +259,23 @@ pub const Client = struct {
     client_cert_der: ?[]const u8 = null,
     client_key: ?ClientCertKey = null,
 
+    /// RFC 6066: the ServerHello echoed an empty status_request, so a
+    /// CertificateStatus MUST follow Certificate.
+    server_signaled_ocsp: bool = false,
+    leaf_must_staple: bool = false,
+    leaf_serial: ?[]u8 = null,
+    issuer_spki: ?[]u8 = null,
+    ocsp_staple: ?[]u8 = null,
+    crl: ?[]u8 = null,
+    require_crl: bool = false,
+
     pub fn init(allocator: Allocator, options: Options) Error!Client {
         var random: [32]u8 = undefined;
         try osEntropy(&random);
         const name = try allocator.dupe(u8, options.server_name);
         errdefer allocator.free(name);
+        const crl_copy: ?[]u8 = if (options.crl) |der| try allocator.dupe(u8, der) else null;
+        errdefer if (crl_copy) |d| allocator.free(d);
         return .{
             .allocator = allocator,
             .server_name = name,
@@ -260,6 +285,8 @@ pub const Client = struct {
             .require_ems = options.require_extended_master_secret,
             .key_pair = try ecdh_p256.generate(),
             .client_random = random,
+            .crl = crl_copy,
+            .require_crl = options.require_crl,
         };
     }
 
@@ -268,6 +295,10 @@ pub const Client = struct {
         if (self.selected_alpn) |p| self.allocator.free(p);
         if (self.resume_ticket) |t| self.allocator.free(t);
         if (self.captured_session_ticket) |t| self.allocator.free(t);
+        if (self.leaf_serial) |s| self.allocator.free(s);
+        if (self.issuer_spki) |s| self.allocator.free(s);
+        if (self.ocsp_staple) |s| self.allocator.free(s);
+        if (self.crl) |d| self.allocator.free(d);
         self.recv_buf.deinit(self.allocator);
         self.transcript.deinit(self.allocator);
         self.hs_plain.deinit(self.allocator);
@@ -596,6 +627,10 @@ pub const Client = struct {
         try self.writeAlpnExtension(&exts);
         try writeRecordSizeLimitExtension(self.allocator, &exts);
         try self.writeSessionTicketExtension(&exts);
+        // RFC 6066 status_request: status_type=ocsp, empty responder_id_list,
+        // empty request_extensions. Always offered so a must-staple leaf can
+        // be satisfied and a present staple can be authenticated.
+        try writeExtension(self.allocator, &exts, ext_status_request, &[_]u8{ 1, 0, 0, 0, 0 });
         try appendU16(self.allocator, out, @intCast(exts.items.len));
         try out.appendSlice(self.allocator, exts.items);
     }
@@ -653,6 +688,13 @@ pub const Client = struct {
                 try self.parseCertificate(msg.body);
                 try self.transcript.appendSlice(self.allocator, msg.raw);
             },
+            .certificate_status => {
+                if (self.resuming) return error.BadHandshake;
+                if (self.leaf_key == null) return error.BadHandshake;
+                if (self.ocsp_staple != null) return error.BadHandshake;
+                try self.parseCertificateStatus(msg.body);
+                try self.transcript.appendSlice(self.allocator, msg.raw);
+            },
             .server_key_exchange => {
                 if (self.resuming) return error.BadHandshake;
                 try self.verifyServerKeyExchange(msg.body);
@@ -669,6 +711,10 @@ pub const Client = struct {
             .server_hello_done => {
                 if (self.resuming) return error.BadHandshake;
                 if (msg.body.len != 0) return error.BadHandshake;
+                if (self.server_signaled_ocsp and self.ocsp_staple == null)
+                    return error.BadCertificate;
+                if (self.leaf_must_staple and self.ocsp_staple == null)
+                    return error.BadCertificate;
                 try self.transcript.appendSlice(self.allocator, msg.raw);
                 self.state = .wait_server_ccs;
             },
@@ -784,6 +830,11 @@ pub const Client = struct {
                     if (body.len != 0) return error.BadHandshake;
                     self.ems_negotiated = true;
                 },
+                ext_status_request => {
+                    // RFC 6066: empty echo announces CertificateStatus.
+                    if (body.len != 0) return error.BadHandshake;
+                    self.server_signaled_ocsp = true;
+                },
                 0xff01 => {
                     // RFC 5746 §3.4: on the initial handshake the server's
                     // renegotiated_connection MUST be empty; anything else means
@@ -822,6 +873,7 @@ pub const Client = struct {
         if (chain.len == 0) return error.EmptyCertificateChain;
         if (!self.skip_cert_verify_for_test) {
             try verifyChainToTrustAnchors(chain, self.trust_anchors, self.server_name, self.now_unix_seconds);
+            try self.captureLeafRevocationInputs(chain);
         }
         const leaf = try x509_verify.linkInfo(chain[0]);
         self.leaf_key = try parsePublicKeyFromSpki(leaf.spki_der);
@@ -837,6 +889,34 @@ pub const Client = struct {
                 self.leaf_key = .{ .rsa = .{ .n = self.leaf_rsa_n[0..n.len], .e = self.leaf_rsa_e[0..e.len] } };
             }
         }
+    }
+
+    fn captureLeafRevocationInputs(self: *Client, chain: []const []u8) Error!void {
+        const leaf = try x509.parse(chain[0]);
+        self.leaf_must_staple = leaf.must_staple;
+        if (self.leaf_serial) |old| self.allocator.free(old);
+        self.leaf_serial = try self.allocator.dupe(u8, leaf.serial_der);
+        const issuer_der = if (chain.len >= 2) chain[1] else chain[0];
+        const issuer = try x509.parse(issuer_der);
+        if (self.issuer_spki) |old| self.allocator.free(old);
+        self.issuer_spki = try self.allocator.dupe(u8, issuer.spki_der);
+        if (self.crl) |der| {
+            try checkCrlRevocation(der, issuer.spki_der, leaf.serial_der, self.now_unix_seconds, self.require_crl);
+        }
+    }
+
+    fn parseCertificateStatus(self: *Client, body: []const u8) Error!void {
+        const staple = try parseCertificateStatusOcsp(body);
+        const copy = try self.allocator.dupe(u8, staple);
+        errdefer self.allocator.free(copy);
+        if (self.skip_cert_verify_for_test) {
+            self.ocsp_staple = copy;
+            return;
+        }
+        const issuer_spki = self.issuer_spki orelse return error.BadCertificate;
+        const serial = self.leaf_serial orelse return error.BadCertificate;
+        try verifyOcspStapleForLeaf(staple, issuer_spki, serial, self.now_unix_seconds);
+        self.ocsp_staple = copy;
     }
 
     fn verifyServerKeyExchange(self: *Client, body: []const u8) Error!void {
@@ -1097,6 +1177,63 @@ fn parseHandshakeMaybe(bytes: []const u8, off: *usize) ?HandshakeMsg {
 /// never handshake with a 1.3-capable server that stamps it unconditionally (as
 /// this project's own 1.2 server does). Passing `true` (once the client offers
 /// 1.3) activates the conformant abort with no other edits.
+fn parseCertificateStatusOcsp(data: []const u8) Error![]const u8 {
+    if (data.len < 4) return error.BadCertificate;
+    if (data[0] != 1) return error.BadCertificate;
+    const len = (@as(usize, data[1]) << 16) | (@as(usize, data[2]) << 8) | data[3];
+    if (data.len != 4 + len or len == 0) return error.BadCertificate;
+    return data[4..];
+}
+
+fn checkCrlRevocation(
+    crl_der: []const u8,
+    issuer_spki_der: []const u8,
+    leaf_serial_der: []const u8,
+    now_unix: ?i64,
+    require: bool,
+) Error!void {
+    const now = now_unix orelse {
+        if (require) return error.BadCertificate;
+        return;
+    };
+    const parsed = crl.parse(crl_der) catch {
+        if (require) return error.BadCertificate;
+        return;
+    };
+    crl.verifyParsedCrlSignature(parsed, issuer_spki_der) catch {
+        if (require) return error.BadCertificate;
+        return;
+    };
+    if (!crl.crlIsCurrent(parsed, now)) {
+        if (require) return error.BadCertificate;
+        return;
+    }
+    if (crl.isSerialRevoked(parsed, leaf_serial_der)) return error.CertificateRevoked;
+}
+
+fn verifyOcspStapleForLeaf(staple_der: []const u8, issuer_spki_der: []const u8, leaf_serial: []const u8, now_unix: ?i64) Error!void {
+    const parsed = ocsp.parse(staple_der) catch return error.BadCertificate;
+    const authenticated = if (now_unix) |now|
+        ocsp.verifyResponseSignatureWithChain(parsed, issuer_spki_der, now)
+    else
+        ocsp.verifyResponseSignature(parsed, issuer_spki_der);
+    if (!authenticated) return error.BadCertificate;
+    try enforceOcspStatusForSerial(parsed, leaf_serial);
+    if (now_unix) |now| {
+        if (!ocsp.isStapleServable(staple_der, issuer_spki_der, leaf_serial, now, 60))
+            return error.BadCertificate;
+    }
+}
+
+fn enforceOcspStatusForSerial(parsed: anytype, leaf_serial: []const u8) Error!void {
+    const status = ocsp.statusForSerial(parsed, leaf_serial) orelse return error.BadCertificate;
+    switch (status) {
+        .revoked => return error.CertificateRevoked,
+        .unknown => return error.BadCertificate,
+        .good => return,
+    }
+}
+
 fn checkDowngradeSentinel(offered_higher: bool, server_random: *const [32]u8) Error!void {
     if (!offered_higher) return;
     const tail = server_random[24..32];
@@ -1907,4 +2044,95 @@ fn feedOneHandshakeRecord(client: *Client, allocator: Allocator, fragment: []con
     try rec.appendSlice(allocator, &len_buf);
     try rec.appendSlice(allocator, fragment);
     return client.feed(rec.items);
+}
+
+fn clientHelloHasExtension(hello_record: []const u8, ext_type: u16) bool {
+    if (hello_record.len < 9) return false;
+    const rec_len = (@as(usize, hello_record[3]) << 8) | hello_record[4];
+    if (hello_record.len < 5 + rec_len) return false;
+    const hs = hello_record[5 .. 5 + rec_len];
+    if (hs.len < 4) return false;
+    const body = hs[4..];
+    if (body.len < 2 + 32 + 1) return false;
+    var off: usize = 2 + 32;
+    const sid_len = body[off];
+    off += 1 + sid_len;
+    if (off + 2 > body.len) return false;
+    const suites_len = (@as(usize, body[off]) << 8) | body[off + 1];
+    off += 2 + suites_len;
+    if (off + 1 > body.len) return false;
+    const comp_len = body[off];
+    off += 1 + comp_len;
+    if (off + 2 > body.len) return false;
+    const ext_len = (@as(usize, body[off]) << 8) | body[off + 1];
+    off += 2;
+    if (off + ext_len > body.len) return false;
+    const exts = body[off .. off + ext_len];
+    var i: usize = 0;
+    while (i + 4 <= exts.len) {
+        const typ = (@as(u16, exts[i]) << 8) | exts[i + 1];
+        const len = (@as(usize, exts[i + 2]) << 8) | exts[i + 3];
+        i += 4;
+        if (i + len > exts.len) return false;
+        if (typ == ext_type) return true;
+        i += len;
+    }
+    return false;
+}
+
+test "exploit: TLS 1.2 ClientHello offers OCSP status_request" {
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{
+        .server_name = "staple.test",
+        .trust_anchors = &[_][]const u8{},
+    });
+    defer client.deinit();
+    const hello = try client.start();
+    defer allocator.free(hello);
+    try std.testing.expect(clientHelloHasExtension(hello, ext_status_request));
+}
+
+test "exploit: TLS 1.2 require_crl fails closed on an unusable CRL" {
+    try std.testing.expectError(
+        error.BadCertificate,
+        checkCrlRevocation(&[_]u8{ 0x30, 0x00 }, &[_]u8{}, &[_]u8{0x2A}, null, true),
+    );
+    try std.testing.expectError(
+        error.BadCertificate,
+        checkCrlRevocation(&[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, &[_]u8{}, &[_]u8{0x2A}, 1_767_225_601, true),
+    );
+}
+
+test "exploit: TLS 1.2 CertificateStatus for the wrong serial fails closed" {
+    var parsed = ocsp.Parsed{
+        .der = &.{},
+        .response_status = .successful,
+        .basic_response_der = null,
+        .tbs_response_data_der = &.{},
+        .signature_algorithm_oid = &.{},
+        .signature_value = &.{},
+        .responses = undefined,
+        .response_count = 1,
+    };
+    parsed.responses[0] = .{
+        .hash_algorithm_oid = &.{},
+        .issuer_name_hash = &.{},
+        .issuer_key_hash = &.{},
+        .serial = &[_]u8{0xAA},
+        .cert_status = .good,
+        .this_update = "20260102030405Z",
+        .next_update = "20270102030405Z",
+    };
+    try std.testing.expectError(error.BadCertificate, enforceOcspStatusForSerial(parsed, &[_]u8{0x10}));
+    parsed.responses[0].cert_status = .unknown;
+    try std.testing.expectError(error.BadCertificate, enforceOcspStatusForSerial(parsed, &[_]u8{0xAA}));
+    parsed.responses[0].cert_status = .revoked;
+    try std.testing.expectError(error.CertificateRevoked, enforceOcspStatusForSerial(parsed, &[_]u8{0xAA}));
+}
+
+test "exploit: TLS 1.2 CertificateStatus body must be status_type=ocsp" {
+    try std.testing.expectError(error.BadCertificate, parseCertificateStatusOcsp(&[_]u8{ 2, 0, 0, 1, 0x00 }));
+    try std.testing.expectError(error.BadCertificate, parseCertificateStatusOcsp(&[_]u8{ 1, 0, 0, 0 }));
+    const ok = [_]u8{ 1, 0, 0, 0x03, 0x30, 0x01, 0x00 };
+    try std.testing.expectEqualSlices(u8, ok[4..], try parseCertificateStatusOcsp(&ok));
 }
