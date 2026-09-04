@@ -4254,6 +4254,14 @@ pub const LinuxServer = struct {
         return current_reactor orelse &self.reactors[0];
     }
 
+    /// True only on reactor 0's thread. Unlike `rx()`, an unset
+    /// `current_reactor` is false — a background worker or test helper must
+    /// not steal shared `last_*_ms` maintenance guards. I/O handlers keep
+    /// the `rx()` fallback. docs/audit/timer-guard-0.7.md P0-TG-4.
+    fn isMaintenanceReactor(self: *const LinuxServer) bool {
+        return current_reactor == &self.reactors[0];
+    }
+
     /// Effective worker-reactor count, clamped to `[1, max_shards]`. Multi-reactor
     /// is correct under the multithreading "Phase B" coarse lock: `onCompletion`
     /// takes `world.lockWrite` once around the WHOLE completion, so every reactor
@@ -5256,7 +5264,7 @@ pub const LinuxServer = struct {
     }
 
     fn retryWebhookResumeIfPending(self: *LinuxServer) void {
-        if (self.rx() != &self.reactors[0]) return;
+        if (!self.isMaintenanceReactor()) return;
         if (!self.webhook_resume_pending.load(.acquire)) return;
         // CompletionHandler holds World around onTimerTick.
         self.tryResumeWebhookAfterUpgrade(true);
@@ -6141,7 +6149,7 @@ pub const LinuxServer = struct {
     /// terminal Runtime (or an impossible local monotonic rollback) is logged
     /// once and never driven again.
     fn tickOcg2Runtime(self: *LinuxServer) bool {
-        if (self.rx() != &self.reactors[0]) return false;
+        if (!self.isMaintenanceReactor()) return false;
         if (self.ocg2_runtime_terminal_logged) return false;
         const runtime = self.ocg2_runtime orelse return false;
         const origin_ms = self.ocg2_runtime_monotonic_origin_ms orelse return false;
@@ -6184,11 +6192,11 @@ pub const LinuxServer = struct {
         // atomically consumes the request so a single signal fires exactly one
         // upgrade. On success `performUpgrade` execve's and never returns; a
         // failure is logged and the daemon keeps serving.
-        if (self.rx() == &self.reactors[0] and upgrade_signal_requested.swap(false, .seq_cst)) {
+        if (self.isMaintenanceReactor() and upgrade_signal_requested.swap(false, .seq_cst)) {
             self.deferUpgrade(.signal);
         }
-        if (self.rx() == &self.reactors[0]) self.maybeReloadAcmeTls();
-        if (self.rx() == &self.reactors[0]) self.maybeSwapOcspStaple();
+        if (self.isMaintenanceReactor()) self.maybeReloadAcmeTls();
+        if (self.isMaintenanceReactor()) self.maybeSwapOcspStaple();
         self.retryFailedSessionHandoffs();
         self.sweepTimeouts();
         self.sweepDeferredSessionAutojoins();
@@ -6199,9 +6207,9 @@ pub const LinuxServer = struct {
         self.retryDirtyLocalChannelProjections();
         // Evict lapsed nick-delay holds (reactor-0 only, like other shared-state
         // maintenance; runs under the same world write lock as hold/check/release).
-        if (self.rx() == &self.reactors[0] and self.config.nick_delay_ms != 0) _ = self.nick_delay.sweep(self.nowMs());
+        if (self.isMaintenanceReactor() and self.config.nick_delay_ms != 0) _ = self.nick_delay.sweep(self.nowMs());
         // Prune the throttle's expired/empty per-IP state on the same cadence.
-        if (self.rx() == &self.reactors[0]) {
+        if (self.isMaintenanceReactor()) {
             _ = self.tickOcg2Runtime();
             if (self.conn_throttle) |*t| t.prune(self.nowMs());
             // Evict unlocked, decayed-to-floor login-throttle records too.
@@ -6223,19 +6231,19 @@ pub const LinuxServer = struct {
         // gate may match on any shard) so timed ACCESS entries expire; reclaim
         // lapsed entries on reactor 0 under the same world lock as other sweeps.
         self.access.now_seconds = self.accessNowSeconds();
-        if (self.rx() == &self.reactors[0]) _ = self.access.pruneExpired();
+        if (self.isMaintenanceReactor()) _ = self.access.pruneExpired();
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
         // rate-capped per peer, no-op while a dial is in flight or established).
         _ = self.sweepMeshAutoConnect(false, 1);
         // Mesh RTT samples for status.json / MESH: timestamped PING→PONG on each
         // established peer. Reactor-0-only (S2S links live here); cadence is short
         // enough for a live status page but well below CRDT anti-entropy load.
-        if (self.rx() == &self.reactors[0]) self.maybeProbeMeshPeerRtt();
+        if (self.isMaintenanceReactor()) self.maybeProbeMeshPeerRtt();
         // Publish the distinct-peer count for cross-shard LUSERS reads. Reactor 0
         // owns the peer links, so it is the only reactor that can compute this;
         // other shards read the published atomic. Converges within one tick of a
         // peer establishing/dropping.
-        if (self.rx() == &self.reactors[0]) self.publishPeerCount();
+        if (self.isMaintenanceReactor()) self.publishPeerCount();
         // Mesh anti-entropy: periodically re-burst this node's local channel
         // state to every established peer so anything missed during a split or a
         // reconnect race converges within the cadence instead of staying out of
@@ -6248,9 +6256,10 @@ pub const LinuxServer = struct {
         // peer links) starves reactor 0's real re-burst below the intended cadence.
         // The receiver then never sees a re-affirmation within `stale_member_ttl_ms`
         // and reaps every live peer-homed member (empty NAMES + broken cross-node
-        // PRIVMSG). Gating both the guard and the work to reactor 0 keeps the send
-        // cadence honest — mirroring the reactor-0-only sweeps above.
-        if (self.rx() == &self.reactors[0]) {
+        // PRIVMSG). Gating both the guard and the work through
+        // `isMaintenanceReactor` (not `rx()`, which treats an unset threadlocal
+        // as reactor 0) keeps the send cadence honest.
+        if (self.isMaintenanceReactor()) {
             const now = self.nowMs();
             // Cross-mesh oper-grant refresh: minted grants expire after
             // `oper_grant_ttl_ms`, so on a link that stays up longer than the
@@ -6448,6 +6457,25 @@ pub const LinuxServer = struct {
         return n;
     }
 
+    /// Registered local (non-S2S) clients and opers across EVERY reactor.
+    /// `rx().clients` is shard-local; LUSERS peaks and the public stats page
+    /// must report the node total. World lock already held by the timer.
+    fn tallyRegisteredLocalClients(self: *LinuxServer) struct { clients: u64, opers: u64 } {
+        var clients: u64 = 0;
+        var opers: u64 = 0;
+        for (self.reactors) |*r| {
+            var it = r.clients.iterator();
+            while (it.next()) |e| {
+                const c = e.value;
+                if (c.s2s != null or c.s2s_secured != null) continue;
+                if (!c.session.registered()) continue;
+                clients += 1;
+                if (c.session.isOper()) opers += 1;
+            }
+        }
+        return .{ .clients = clients, .opers = opers };
+    }
+
     fn maybeWriteStats(self: *LinuxServer) void {
         // Per-channel statistics: flush index.json + <slug>.json into the
         // channel-stats dir on the stats cadence. Runs under the completion-wide
@@ -6514,7 +6542,7 @@ pub const LinuxServer = struct {
         // snapshots racing the same target) and throttled to the stats cadence.
         // The write itself is atomic (tmp+rename, see `saveEventHistory`), and
         // reactor 0's snapshot captures events raised on every shard.
-        if (self.config.event_history_path.len != 0 and self.rx() == &self.reactors[0]) {
+        if (self.config.event_history_path.len != 0 and self.isMaintenanceReactor()) {
             const enow = self.nowMs();
             if (self.event_history_last_write_ms == 0 or enow - self.event_history_last_write_ms >= self.config.stats_interval_ms) {
                 self.event_history_last_write_ms = enow;
@@ -6524,7 +6552,7 @@ pub const LinuxServer = struct {
         // Flush any elapsed flood-collapse windows (reactor 0) into a single
         // ".flood/.warn" summary each — published as >= warn so they bypass the
         // collapser (no self-collapse).
-        if (self.rx() == &self.reactors[0]) {
+        if (self.isMaintenanceReactor()) {
             var summaries: [16]event_collapse_mod.Summary = undefined;
             const n = self.event_collapse.flush(platform.realtimeMillis(), &summaries);
             for (summaries[0..n]) |*s| {
@@ -6560,8 +6588,9 @@ pub const LinuxServer = struct {
         if (self.stats_last_write_ms != 0 and now - self.stats_last_write_ms < self.config.stats_interval_ms) return;
         self.stats_last_write_ms = now;
 
-        var clients: u64 = 0;
-        var opers: u64 = 0;
+        const pop = self.tallyRegisteredLocalClients();
+        const clients = pop.clients;
+        const opers = pop.opers;
         // Country tally (parallel arrays): code slice borrowed from the loaded
         // GeoIP database bytes, which outlive this render. Bounded; overflow
         // beyond the cap is folded into the "??" (unknown) bucket.
@@ -6570,23 +6599,25 @@ pub const LinuxServer = struct {
         var cc_counts: [max_countries]u32 = undefined;
         var cc_n: usize = 0;
         const geodb = self.ensureGeoip();
-        var it = self.rx().clients.iterator();
-        while (it.next()) |e| {
-            const c = e.value;
-            if (c.s2s != null or c.s2s_secured != null) continue;
-            if (!c.session.registered()) continue;
-            clients += 1;
-            if (c.session.isOper()) opers += 1;
-            if (geodb) |db| {
-                var code: []const u8 = "??";
-                if (parseGeoIp(c.session.realHost())) |gip| {
-                    if (db.lookupInfo(gip) catch null) |gi| {
-                        if (gi.country_iso) |iso| if (iso.len > 0) {
-                            code = iso;
-                        };
+        // Same all-reactor walk as the population tally: GeoIP buckets must
+        // not under-count shards 1..N. docs/audit/timer-guard-0.7.md P0-TG-1.
+        for (self.reactors) |*r| {
+            var it = r.clients.iterator();
+            while (it.next()) |e| {
+                const c = e.value;
+                if (c.s2s != null or c.s2s_secured != null) continue;
+                if (!c.session.registered()) continue;
+                if (geodb) |db| {
+                    var code: []const u8 = "??";
+                    if (parseGeoIp(c.session.realHost())) |gip| {
+                        if (db.lookupInfo(gip) catch null) |gi| {
+                            if (gi.country_iso) |iso| if (iso.len > 0) {
+                                code = iso;
+                            };
+                        }
                     }
+                    tallyCountry(&cc_codes, &cc_counts, &cc_n, code);
                 }
-                tallyCountry(&cc_codes, &cc_counts, &cc_n, code);
             }
         }
         if (clients > self.stats_peak_clients) self.stats_peak_clients = clients;
@@ -6707,7 +6738,7 @@ pub const LinuxServer = struct {
     }
 
     fn maybeRunBackups(self: *LinuxServer) void {
-        if (self.config.backup_dir.len == 0 or self.rx() != &self.reactors[0]) return;
+        if (self.config.backup_dir.len == 0 or !self.isMaintenanceReactor()) return;
         const io = self.config.crypto_io orelse return;
         const now = self.nowMs();
         if (self.backup_last_write_ms != 0 and now - self.backup_last_write_ms < self.config.backup_interval_ms) return;
@@ -29339,7 +29370,7 @@ pub const LinuxServer = struct {
 
     fn sweepMeshAutoConnect(self: *LinuxServer, force: bool, budget: usize) bool {
         if (self.mesh_dials.len == 0) return true;
-        if (self.rx() != &self.reactors[0]) return true;
+        if (!self.isMaintenanceReactor()) return true;
         if (budget == 0) return false;
         const now = self.nowMs();
 
@@ -49143,7 +49174,7 @@ pub const LinuxServer = struct {
         // internally too, or a sibling reactor's zero-peer view overwrites the
         // shared `mesh_peer_*` tables and erases mesh identity for every
         // shard's cross-shard reads. docs/audit/timer-guard-0.7.md P0-TG-2.
-        if (self.rx() != &self.reactors[0]) return;
+        if (!self.isMaintenanceReactor()) return;
         var seen: [32][]const u8 = undefined;
         var seen_node_ids: [32]u64 = @splat(0);
         var seen_public_keys: [32][crypto_sign.public_key_len]u8 =
@@ -49309,7 +49340,7 @@ pub const LinuxServer = struct {
         // site — so a sibling reactor with no peer links can never consume
         // `last_peer_rtt_probe_ms` while probing nothing (guard theft).
         // docs/audit/timer-guard-0.7.md P0-TG-2.
-        if (self.rx() != &self.reactors[0]) return;
+        if (!self.isMaintenanceReactor()) return;
         const now = self.nowMs();
         if (self.last_peer_rtt_probe_ms != 0 and now - self.last_peer_rtt_probe_ms < peer_rtt_probe_interval_ms)
             return;
@@ -52954,6 +52985,90 @@ test "mesh peer-count publish and RTT probe refuse a sibling (non-reactor-0) cal
     try std.testing.expectEqual(@as(u32, 0), server.net_peer_count.load(.acquire));
     try std.testing.expectEqual(@as(u8, 0), server.mesh_peer_name_lens[0]);
     try std.testing.expect(server.last_peer_rtt_probe_ms != 12_345);
+}
+
+test "stats_peak_clients counts registered clients across shards" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try rehashTmpPath(allocator, tmp, ".");
+    defer allocator.free(dir);
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .stats_web_dir = dir,
+        .crypto_io = std.testing.io,
+        .stats_interval_ms = 1,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+
+    current_reactor = &server.reactors[0];
+    const a_id = try addTestLocalClient(&server, "Alice", "alice");
+    server.connFor(a_id).?.session.registration.registered = true;
+
+    current_reactor = &server.reactors[1];
+    const b_id = try addTestLocalClient(&server, "Bob", "bob");
+    server.connFor(b_id).?.session.registration.registered = true;
+
+    const rendered = server.tallyRegisteredLocalClients();
+    try std.testing.expectEqual(@as(u64, 2), rendered.clients);
+    try std.testing.expectEqual(@as(usize, 1), server.reactors[0].clients.len());
+    try std.testing.expectEqual(@as(usize, 1), server.reactors[1].clients.len());
+
+    // Peak is raised on the web-stats path from the all-shard tally, not
+    // from `rx().clients` (which here is shard 1 only).
+    server.maybeWriteStats();
+    try std.testing.expectEqual(@as(u64, 2), server.stats_peak_clients);
+}
+
+test "isMaintenanceReactor is false off reactor 0 and onTimerTick leaves shared last_*_ms still" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .event_history_path = "event-history.snapshot",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+
+    try std.testing.expect(!server.isMaintenanceReactor());
+    current_reactor = &server.reactors[1];
+    try std.testing.expect(!server.isMaintenanceReactor());
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.isMaintenanceReactor());
+
+    current_reactor = &server.reactors[1];
+    try std.testing.expectEqual(@as(i64, 0), server.last_membership_resync_ms);
+    try std.testing.expectEqual(@as(i64, 0), server.last_oper_grant_refresh_ms);
+    try std.testing.expectEqual(@as(i64, 0), server.last_peer_rtt_probe_ms);
+    try std.testing.expectEqual(@as(i64, 0), server.last_session_replica_refresh_ms);
+    try std.testing.expectEqual(@as(i64, 0), server.last_session_attachment_lease_refresh_ms);
+    try std.testing.expectEqual(@as(i64, 0), server.event_history_last_write_ms);
+
+    server.onTimerTick();
+
+    try std.testing.expectEqual(@as(i64, 0), server.last_membership_resync_ms);
+    try std.testing.expectEqual(@as(i64, 0), server.last_oper_grant_refresh_ms);
+    try std.testing.expectEqual(@as(i64, 0), server.last_peer_rtt_probe_ms);
+    try std.testing.expectEqual(@as(i64, 0), server.last_session_replica_refresh_ms);
+    try std.testing.expectEqual(@as(i64, 0), server.last_session_attachment_lease_refresh_ms);
+    try std.testing.expectEqual(@as(i64, 0), server.event_history_last_write_ms);
 }
 
 test "secured establish collision winner teardown trust lifecycle" {
@@ -61976,6 +62091,8 @@ test "periodic timer tick re-mints live oper grants inside the TTL" {
             else => return err,
         };
         defer server.deinit();
+        defer current_reactor = null;
+        current_reactor = &server.reactors[0];
 
         const id = try addTestLocalClient(&server, "kain", "kain");
         const conn = server.connFor(id).?;
@@ -61998,9 +62115,8 @@ test "periodic timer tick re-mints live oper grants inside the TTL" {
             .expiry_ms = now + 1_000,
         });
 
-        // Drive the periodic tick. Tests run without a reactor thread, so
-        // rx() IS reactors[0]: the singleton reactor-0 guard passes and the
-        // grant-refresh cadence guard (starting at 0) is due immediately.
+        // Drive the periodic tick as reactor 0. `isMaintenanceReactor` does
+        // not treat an unset threadlocal as reactor 0 (P0-TG-4).
         server.onTimerTick();
 
         // The re-mint superseded the seeded grant with a fresh full-TTL
