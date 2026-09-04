@@ -30,7 +30,8 @@ fn topUsage(w: *Writer) Writer.Error!void {
         \\  asn1parse   dump a DER structure
         \\  ocsp        display/verify a stapled OCSP response (no HTTP fetch)
         \\  crl         display/verify an X.509 CRL (no HTTP fetch)
-        \\  s_client / s_server / enc   not yet implemented (exit 3)
+        \\  s_client    TLS client (loopback handshake; live -connect is follow-up)
+        \\  s_server / enc   not yet implemented (exit 3)
         \\
         \\exit codes: 0 ok, 1 failed, 2 usage, 3 not implemented
         \\
@@ -89,6 +90,10 @@ fn dispatch(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8, args: []const [
     if (std.mem.eql(u8, cmd, "crl")) {
         if (wantsHelp(args)) return cli.crl_cmd.usage(out);
         return cli.crl_cmd.run(gpa, io, try cli.crl_cmd.parseArgs(args), out);
+    }
+    if (std.mem.eql(u8, cmd, "s_client")) {
+        if (wantsHelp(args)) return cli.s_client_cmd.usage(out);
+        return cli.s_client_cmd.run(gpa, io, try cli.s_client_cmd.parseArgs(args), out);
     }
     if (cli.stub_cmds.isStub(cmd)) return cli.stub_cmds.run(cmd, out);
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
@@ -152,6 +157,7 @@ fn usageFor(cmd: []const u8, w: *Writer) Writer.Error!void {
     if (std.mem.eql(u8, cmd, "asn1parse")) return cli.asn1parse_cmd.usage(w);
     if (std.mem.eql(u8, cmd, "ocsp")) return cli.ocsp_cmd.usage(w);
     if (std.mem.eql(u8, cmd, "crl")) return cli.crl_cmd.usage(w);
+    if (std.mem.eql(u8, cmd, "s_client")) return cli.s_client_cmd.usage(w);
     return topUsage(w);
 }
 
@@ -169,8 +175,9 @@ test "armor dispatch routes ciphers and rejects unknown commands" {
 
     aw.clearRetainingCapacity();
     try testing.expectError(error.Usage, dispatch(testing.allocator, std.testing.io, "nonsense", &.{}, &aw.writer));
-    try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "s_client", &.{}, &aw.writer));
+    try testing.expectError(error.Usage, dispatch(testing.allocator, std.testing.io, "s_client", &.{}, &aw.writer));
     try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "enc", &.{}, &aw.writer));
+    try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "s_server", &.{}, &aw.writer));
 
     aw.clearRetainingCapacity();
     try dispatch(testing.allocator, std.testing.io, "ocsp", &.{"--help"}, &aw.writer);

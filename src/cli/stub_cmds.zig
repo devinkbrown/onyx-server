@@ -17,7 +17,7 @@ const common = @import("common.zig");
 
 const Writer = common.Writer;
 
-pub const stubs = [_][]const u8{ "s_client", "s_server", "enc" };
+pub const stubs = [_][]const u8{ "s_server", "enc" };
 
 pub fn isStub(cmd: []const u8) bool {
     for (stubs) |s| {
@@ -39,7 +39,8 @@ pub fn run(cmd: []const u8, out: *Writer) !void {
 const testing = std.testing;
 
 test "armorcli stubs answer deterministically" {
-    try testing.expect(isStub("s_client"));
+    try testing.expect(isStub("s_server"));
+    try testing.expect(!isStub("s_client"));
     try testing.expect(!isStub("x509"));
     try testing.expect(!isStub("ocsp"));
     try testing.expect(!isStub("crl"));

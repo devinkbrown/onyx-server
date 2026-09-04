@@ -18,6 +18,7 @@ pub const ciphers_cmd = @import("ciphers_cmd.zig");
 pub const asn1parse_cmd = @import("asn1parse_cmd.zig");
 pub const ocsp_cmd = @import("ocsp_cmd.zig");
 pub const crl_cmd = @import("crl_cmd.zig");
+pub const s_client_cmd = @import("s_client_cmd.zig");
 pub const stub_cmds = @import("stub_cmds.zig");
 
 test {
@@ -33,5 +34,6 @@ test {
     _ = asn1parse_cmd;
     _ = ocsp_cmd;
     _ = crl_cmd;
+    _ = s_client_cmd;
     _ = stub_cmds;
 }
