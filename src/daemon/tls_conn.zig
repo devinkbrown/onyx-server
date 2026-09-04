@@ -122,6 +122,9 @@ pub const TlsConn = struct {
     pub const KtlsError = error{
         /// The engine isn't a connected TLS 1.3 session (1.2 offload is deferred).
         KtlsUnsupportedEngine,
+        /// Inbound userspace buffer holds a partial TLS record — attaching kTLS RX
+        /// mid-record would desync `app_read_seq` from the kernel.
+        KtlsDirtyInbound,
     } || ktls.Error || ktls.AttachError;
 
     /// Map a `tls_server` kTLS param bundle to an encoded kernel `crypto_info`.
@@ -176,6 +179,7 @@ pub const TlsConn = struct {
     /// so the kernel takes over from `app_read_seq` with no partial record left in
     /// userspace. Only TLS 1.3 is supported.
     pub fn enableKtlsRx(self: *const TlsConn, fd: linux.fd_t) KtlsError!void {
+        if (self.hasBufferedInbound()) return error.KtlsDirtyInbound;
         var buf: [ktls.max_crypto_info_len]u8 = undefined;
         const encoded = try self.buildKtlsRxCryptoInfo(&buf);
         try ktls.attachUlp(fd);
@@ -917,6 +921,32 @@ test "kTLS TX offload: the kernel encrypts server writes and tls_client decrypts
     const got = try client.decrypt(rec[0..n]);
     defer alloc.free(got);
     try std.testing.expectEqualStrings(msg, got);
+}
+
+test "enableKtlsRx fails closed when inbound is not at a record boundary" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x39)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh_out = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh_out.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+    try std.testing.expect(conn.handshakeDone());
+
+    try conn.recv_buf.appendSlice(alloc, &[_]u8{ 0x17, 0x03, 0x03, 0x00, 0x10 });
+    try std.testing.expect(conn.hasBufferedInbound());
+    try std.testing.expectError(error.KtlsDirtyInbound, conn.enableKtlsRx(@as(linux.fd_t, -1)));
 }
 
 test "kTLS RX offload: the kernel decrypts client records into recv() plaintext" {

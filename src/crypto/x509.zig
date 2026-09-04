@@ -46,6 +46,8 @@ pub const Error = error{
     UnsupportedKey,
     /// SubjectPublicKeyInfo is structurally malformed for its key family.
     InvalidKey,
+    /// A critical X.509 extension OID this parser does not implement (RFC 5280 §4.2).
+    UnsupportedCriticalExtension,
 };
 
 pub const Sha256Digest = hash.Sha256.Digest;
@@ -670,11 +672,10 @@ fn scanExtensionsForSct(parent: DerReader, ext_tlv: Tlv) Error!?[]const u8 {
         var one = try extensions.child(one_tlv);
         const oid_tlv = try one.readExpected(Tag.oid);
         try validateOid(oid_tlv.value);
-        if (one.hasRemaining() and try one.peekTag() == Tag.boolean) {
-            _ = try parseBoolean(try one.readTlv());
-        }
+        const critical = try readExtensionCriticalField(&one);
         const value = try one.readExpected(Tag.octet_string);
         try one.expectEmpty();
+        try rejectUnsupportedCriticalExtension(critical, oid_tlv.value);
         if (std.mem.eql(u8, oid_tlv.value, &sct_list_extension_oid)) {
             return try parseSctList(value.value);
         }
@@ -962,35 +963,70 @@ fn parseExtensions(comptime CertType: type, cert: *CertType, parent: DerReader, 
         const oid_tlv = try one.readExpected(Tag.oid);
         try validateOid(oid_tlv.value);
 
-        if (one.hasRemaining() and try one.peekTag() == Tag.boolean) {
-            _ = try parseBoolean(try one.readTlv());
-        }
+        const critical = try readExtensionCriticalField(&one);
 
         const value = try one.readExpected(Tag.octet_string);
         try one.expectEmpty();
 
+        var handled = false;
         if (std.mem.eql(u8, oid_tlv.value, &Oid.subject_alt_name)) {
             try parseSubjectAltName(CertType, cert, one, value.value);
+            handled = true;
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.basic_constraints)) {
             const bc = try parseBasicConstraints(one, value.value);
             cert.basic_constraints_ca = bc.ca;
             cert.basic_constraints_path_len = bc.path_len;
+            handled = true;
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.key_usage)) {
             try parseKeyUsage(CertType, cert, one, value.value);
+            handled = true;
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.extended_key_usage)) {
             try parseExtendedKeyUsage(CertType, cert, one, value.value);
+            handled = true;
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.name_constraints)) {
             try parseNameConstraints(CertType, cert, one, value.value);
+            handled = true;
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.authority_info_access)) {
             try parseAuthorityInfoAccess(CertType, cert, one, value.value);
+            handled = true;
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.tls_feature)) {
             try parseTlsFeature(CertType, cert, one, value.value);
+            handled = true;
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.delegation_usage)) {
             // RFC 9345 §4.2: presence authorizes delegated credentials. The
             // extension value is an empty/NULL body carrying no data we act on.
             cert.delegation_usage = true;
+            handled = true;
         }
+        if (!handled) try rejectUnsupportedCriticalExtension(critical, oid_tlv.value);
     }
+}
+
+/// True when `parseExtensions` recognizes an extension OID (handled or
+/// intentionally ignored). Used to enforce RFC 5280 §4.2 critical semantics.
+fn extensionOidIsSupported(oid_value: []const u8) bool {
+    if (std.mem.eql(u8, oid_value, &Oid.subject_alt_name)) return true;
+    if (std.mem.eql(u8, oid_value, &Oid.basic_constraints)) return true;
+    if (std.mem.eql(u8, oid_value, &Oid.key_usage)) return true;
+    if (std.mem.eql(u8, oid_value, &Oid.extended_key_usage)) return true;
+    if (std.mem.eql(u8, oid_value, &Oid.name_constraints)) return true;
+    if (std.mem.eql(u8, oid_value, &Oid.authority_info_access)) return true;
+    if (std.mem.eql(u8, oid_value, &Oid.tls_feature)) return true;
+    if (std.mem.eql(u8, oid_value, &Oid.delegation_usage)) return true;
+    if (std.mem.eql(u8, oid_value, &Oid.crl_distribution_points)) return true;
+    if (std.mem.eql(u8, oid_value, &sct_list_extension_oid)) return true;
+    return false;
+}
+
+fn readExtensionCriticalField(one: *DerReader) Error!bool {
+    if (one.hasRemaining() and try one.peekTag() == Tag.boolean) {
+        return try parseBoolean(try one.readTlv());
+    }
+    return false;
+}
+
+fn rejectUnsupportedCriticalExtension(critical: bool, oid_value: []const u8) Error!void {
+    if (critical and !extensionOidIsSupported(oid_value)) return error.UnsupportedCriticalExtension;
 }
 
 /// authorityInfoAccess (RFC 5280 §4.2.2.1): capture the id-ad-ocsp responder URI
@@ -1581,6 +1617,37 @@ test "findSctListExtension fails closed on malformed certificate DER" {
     try std.testing.expectError(error.Truncated, findSctListExtension(&[_]u8{ 0x30, 0x02, 0x30, 0x00 }));
 }
 
+/// Build one Extension TLV with an optional critical BOOLEAN (RFC 5280 §4.2).
+fn buildExtensionTlv(a: std.mem.Allocator, oid: []const u8, critical: bool, extn_value: []const u8) []u8 {
+    var body: std.ArrayList(u8) = .empty;
+    body.appendSlice(a, derTlv(a, Tag.oid, oid)) catch unreachable;
+    if (critical) body.appendSlice(a, derTlv(a, Tag.boolean, &[_]u8{0xff})) catch unreachable;
+    body.appendSlice(a, derTlv(a, Tag.octet_string, extn_value)) catch unreachable;
+    return derTlv(a, Tag.sequence, body.items);
+}
+
+test "unknown critical extension fails closed during extension scan" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const unknown_oid = [_]u8{ 0x55, 0x1D, 0x63 };
+    const extension = buildExtensionTlv(a, &unknown_oid, true, "");
+    const ext_seq = derTlv(a, Tag.sequence, extension);
+    const cert = buildCertWithExtensions(a, ext_seq);
+    try std.testing.expectError(error.UnsupportedCriticalExtension, findExtensionValue(cert, &[_]u8{ 0x55, 0x1D, 0x13 }));
+}
+
+test "non-critical unknown extension is ignored during extension scan" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const unknown_oid = [_]u8{ 0x55, 0x1D, 0x64 };
+    const extension = buildExtensionTlv(a, &unknown_oid, false, "");
+    const ext_seq = derTlv(a, Tag.sequence, extension);
+    const cert = buildCertWithExtensions(a, ext_seq);
+    try std.testing.expectEqual(@as(?[]const u8, null), try findExtensionValue(cert, &[_]u8{ 0x55, 0x1D, 0x13 }));
+}
+
 // -- Precert TBS reconstruction tests ---------------------------------------
 
 /// Append canonical minimal DER length octets for `len` (short form <128; else
@@ -1850,11 +1917,10 @@ fn scanExtensionsFor(parent: DerReader, ext_tlv: Tlv, oid: []const u8) Error!?[]
         var one = try extensions.child(one_tlv);
         const oid_tlv = try one.readExpected(Tag.oid);
         try validateOid(oid_tlv.value);
-        if (one.hasRemaining() and try one.peekTag() == Tag.boolean) {
-            _ = try parseBoolean(try one.readTlv());
-        }
+        const critical = try readExtensionCriticalField(&one);
         const value = try one.readExpected(Tag.octet_string);
         try one.expectEmpty();
+        try rejectUnsupportedCriticalExtension(critical, oid_tlv.value);
         if (std.mem.eql(u8, oid_tlv.value, oid)) return value.value;
     }
     return null;

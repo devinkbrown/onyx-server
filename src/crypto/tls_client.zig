@@ -2276,6 +2276,10 @@ pub const Client = struct {
         if (!self.skip_cert_verify_for_test) {
             try verifyChainToTrustAnchors(chain, self.trust_anchors, self.effectiveVerifyName(), self.verify_time);
         }
+        {
+            const leaf = try x509.parse(chain[0]);
+            try enforceOcspMustStaplePolicy(leaf.must_staple, leaf_ocsp_staple);
+        }
         if (leaf_ocsp_staple) |staple| {
             const leaf = try x509.parse(chain[0]);
             const issuer_der = if (chain.len > 1) chain[1] else chain[0];
@@ -2981,6 +2985,11 @@ fn parseCertificateStatusOcsp(data: []const u8) Error![]const u8 {
 /// check the responder cert's validity window. Without a clock we fall back to
 /// direct-issuer signing only (fail-closed: a delegated staple is rejected rather
 /// than trusted with an unverifiable responder-cert lifetime).
+/// RFC 7633: when the leaf advertises OCSP must-staple, a missing staple is fatal.
+fn enforceOcspMustStaplePolicy(must_staple: bool, staple: ?[]const u8) Error!void {
+    if (must_staple and staple == null) return error.BadCertificate;
+}
+
 fn verifyOcspStapleForLeaf(staple_der: []const u8, issuer_spki_der: []const u8, leaf_serial: []const u8, now_unix: ?i64) Error!void {
     const parsed = try ocsp.parse(staple_der);
     const authenticated = if (now_unix) |now|
@@ -3993,6 +4002,25 @@ test "EncryptedExtensions server_certificate_type selection flips only the negot
     var bb = try tls_extension.Builder.begin(&buf_bad);
     try bb.addTyped(.server_certificate_type, &[_]u8{0x63});
     try std.testing.expectError(error.BadHandshake, client.parseEncryptedExtensions(try bb.finish()));
+}
+
+test "must_staple leaf without stapled OCSP rejects" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xa5)));
+    var buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&buf, .{
+        .common_name = "must-staple.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x01},
+        .key_pair = kp,
+        .dns_names = &.{"must-staple.test"},
+        .must_staple = true,
+    });
+    const parsed = try x509.parse(der);
+    try std.testing.expect(parsed.must_staple);
+    try std.testing.expectError(error.BadCertificate, enforceOcspMustStaplePolicy(parsed.must_staple, null));
+    try enforceOcspMustStaplePolicy(parsed.must_staple, "opaque-staple");
 }
 
 test "OCSP staple status decision rejects revoked and soft-passes good or absent" {
