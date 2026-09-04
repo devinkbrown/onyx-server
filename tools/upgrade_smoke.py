@@ -13,7 +13,16 @@ verifies the hot re-exec:
   * session state is carried across the handoff (sealed/recovered log lines),
   * the port stays bound (same PID) and still serves IRC after the upgrade.
 
-Usage: python3 tools/upgrade_smoke.py [path-to-onyx-binary]
+Usage:
+  python3 tools/upgrade_smoke.py [path-to-onyx-binary]
+  python3 tools/upgrade_smoke.py <predecessor> <successor>
+
+A two-argument run copies the predecessor into a private launch path, boots
+it, atomically replaces that path with the successor, then issues UPGRADE.
+That is the staged 0.5.8 → 0.7 Helix rehearsal. Set `ONYX_HELIX_TRIGGER=usr2`
+to send SIGUSR2 instead of the UPGRADE command (same `performUpgrade` path).
+Never touches orochi.service.
+
 Exit code 0 = PASS.
 """
 import base64
@@ -24,6 +33,7 @@ import re
 import resource
 import shutil
 import socket
+import signal
 import ssl
 import subprocess
 import sys
@@ -43,6 +53,7 @@ BOUNCE_ACCT = "bounce"
 BOUNCE_PASSWORD = "secretpass1"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "zig-out", "bin", "onyx")
+SUCCESSOR = sys.argv[2] if len(sys.argv) > 2 else None
 
 
 @dataclass
@@ -298,7 +309,13 @@ def _run_smoke():
     if not os.path.exists(BIN):
         print(f"FAIL: binary not found: {BIN} (run `zig build` first)")
         return 1
+    if SUCCESSOR and not os.path.exists(SUCCESSOR):
+        print(f"FAIL: successor binary not found: {SUCCESSOR}")
+        return 1
     RUN = make_private_run(Path(ROOT))
+    live_bin = RUN.directory / "onyx-server"
+    shutil.copy2(BIN, live_bin)
+    os.chmod(live_bin, 0o755)
     port, tls_port, ws_port = RUN.ports
     db = RUN.database
     config = RUN.config
@@ -339,7 +356,7 @@ def _run_smoke():
 
     try:
         with open_private_log(log) as log_file:
-            proc = launch_gated(RUN, [BIN, str(config)], log_file, raise_stack_limit)
+            proc = launch_gated(RUN, [str(live_bin), str(config)], log_file, raise_stack_limit)
     except BaseException:
         raise
     time.sleep(2.5)
@@ -456,15 +473,27 @@ def _run_smoke():
         fillers.append(fc)
     print(f"PASS: {FILLER_CLIENTS} filler clients registered before UPGRADE")
 
-    b.sendall(b"UPGRADE\r\n")
-    # Read the requester's progress NOTICE before the socket dies at execve —
-    # it surfaces a refusal ("UPGRADE refused/failed: ...") that would otherwise
-    # look like a silent no-op.
-    note = recv_until(b, b"UPGRADE", timeout=3)
-    for line in note.splitlines():
-        if "UPGRADE" in line:
-            print(f"note: {line.strip()}")
-    b.close()
+    if SUCCESSOR:
+        staged = live_bin.with_name("onyx-server.new")
+        shutil.copy2(SUCCESSOR, staged)
+        os.chmod(staged, 0o755)
+        os.replace(staged, live_bin)
+        print(f"PASS: staged successor over launch path ({SUCCESSOR})")
+
+    if os.environ.get("ONYX_HELIX_TRIGGER", "upgrade").lower() == "usr2":
+        os.kill(proc.pid, signal.SIGUSR2)
+        print("note: sent SIGUSR2 (same performUpgrade path as orochi.service reload)")
+        b.close()
+    else:
+        b.sendall(b"UPGRADE\r\n")
+        # Read the requester's progress NOTICE before the socket dies at execve —
+        # it surfaces a refusal ("UPGRADE refused/failed: ...") that would otherwise
+        # look like a silent no-op.
+        note = recv_until(b, b"UPGRADE", timeout=3)
+        for line in note.splitlines():
+            if "UPGRADE" in line:
+                print(f"note: {line.strip()}")
+        b.close()
 
     # Give the execve time to land + the successor to adopt + boot.
     time.sleep(2.5)
