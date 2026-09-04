@@ -455,11 +455,11 @@ pub const Config = struct {
     pub const Io = struct {
         ring_entries: u32 = 32,
         cqe_batch: u32 = 256,
-        /// IORING_SETUP_DEFER_TASKRUN (+ SINGLE_ISSUER). Default off. The
-        /// daemon probe must fail closed if the kernel rejects the flags.
-        /// Applying the flags is `server.zig` (onyx-server-integrator).
+        /// IORING_SETUP_DEFER_TASKRUN (+ SINGLE_ISSUER). Default off.
+        /// `config_boot` copies this onto `server.Config.features`;
+        /// `RingCore.init` fail-closes if the kernel rejects the flags.
         defer_taskrun: bool = false,
-        /// IORING_SETUP_SQPOLL. Default off; same fail-closed probe seam.
+        /// IORING_SETUP_SQPOLL. Default off; same fail-closed init probe.
         sqpoll: bool = false,
     };
 

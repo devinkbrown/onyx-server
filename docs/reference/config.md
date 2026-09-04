@@ -322,8 +322,8 @@ Source: struct at `src/daemon/config_format.zig:153`, parsing at `src/daemon/con
 |---|---|---:|---|---|
 | `ring_entries` | integer | `32` | `8..4096` | io_uring SQ entries per reactor (`src/daemon/server.zig:981`). |
 | `cqe_batch` | integer | `256` | `16..4096` | Maximum io_uring completion events reaped per event-loop drain. Larger values improve burst throughput; smaller values cap per-iteration work. |
-| `defer_taskrun` | bool | `false` | — | Parse-only `IORING_SETUP_DEFER_TASKRUN` (+ SINGLE_ISSUER). The live ring must fail closed if the kernel rejects the flags (`server.zig`, integrator). |
-| `sqpoll` | bool | `false` | — | Parse-only `IORING_SETUP_SQPOLL`. Same fail-closed probe seam. |
+| `defer_taskrun` | bool | `false` | — | `IORING_SETUP_DEFER_TASKRUN` (+ SINGLE_ISSUER). `config_boot` copies this onto `server.Config.features`. `RingCore.init` fail-closes if the kernel rejects the flags. Default off. |
+| `sqpoll` | bool | `false` | — | `IORING_SETUP_SQPOLL`. Same projection and fail-closed init probe. Default off; do not enable until a P0-1 before/after exists. |
 
 ## `[reputation]`
 

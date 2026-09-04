@@ -264,6 +264,12 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.limits.sweep_interval_ms != 0) out.sweep_interval_ms = @intCast(cfg.limits.sweep_interval_ms);
     out.ring_entries = @intCast(cfg.io.ring_entries);
     out.cqe_batch = @intCast(cfg.io.cqe_batch);
+    // Ownership-safe setup flags. `RingCore.init` (`server.zig`) is the
+    // fail-closed probe: `IoUring.init` with these flags returns
+    // `error.Unsupported` instead of silently narrowing to baseline.
+    // Default false = byte-identical. Do not raise `cqe_batch` here.
+    out.features.defer_taskrun = cfg.io.defer_taskrun;
+    out.features.sqpoll = cfg.io.sqpoll;
     out.reg_timeout_penalty = cfg.reputation.registration_timeout_penalty;
     out.clone_refuse_penalty = cfg.reputation.clone_refuse_penalty;
     out.session_max_accounts = cfg.sessions.max_accounts;
@@ -520,10 +526,9 @@ pub const AcmeBootConfig = struct {
 };
 
 /// Neutral `[io]` flag projection for ownership-safe io_uring setup
-/// (`defer_taskrun`+`SINGLE_ISSUER`, `sqpoll`). `server.Config` already carries
-/// `ring_entries` / `cqe_batch`; the feature bits live on the inline Ringlane
-/// `RingFeatures` in `server.zig` and must be applied there by the integrator
-/// after a fail-closed `io_uring_setup` probe. Default false = byte-identical.
+/// (`defer_taskrun`+`SINGLE_ISSUER`, `sqpoll`). `mapToServerConfig` also
+/// copies these onto `server.Config.features` so `RingCore.init` is the
+/// fail-closed kernel probe. Default false = byte-identical.
 pub const IoBootConfig = struct {
     defer_taskrun: bool = false,
     sqpoll: bool = false,
@@ -575,8 +580,9 @@ pub const Loaded = struct {
     acme: AcmeBootConfig = .{},
     /// Neutral IRCv3 STS boot projection; `main.zig` consumes this to enable STS.
     sts: StsBootConfig = .{},
-    /// Parsed `[io]` ownership-safe ring flags. Probe-and-apply is
-    /// `server.zig` (integrator); this struct only carries intent.
+    /// Parsed `[io]` ownership-safe ring flags. Also copied onto
+    /// `config.features`; `RingCore.init` refuse-closes if the kernel
+    /// rejects the setup flags.
     io: IoBootConfig = .{},
     /// Number of worker reactor shards to spin up (`ReactorPool` size). 1 = the
     /// single-reactor model. `server.Config` carries no thread-topology field,
@@ -829,6 +835,8 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(u16, 512), loaded.config.cqe_batch);
     try testing.expect(!loaded.io.defer_taskrun);
     try testing.expect(!loaded.io.sqpoll);
+    try testing.expect(!loaded.config.features.defer_taskrun);
+    try testing.expect(!loaded.config.features.sqpoll);
     try testing.expectEqual(@as(usize, 512), loaded.config.memo_config.max_text_bytes);
     try testing.expectEqual(@as(usize, 48), loaded.config.memo_config.max_from_bytes);
     try testing.expectEqual(@as(usize, 16), loaded.config.memo_config.max_per_account);
@@ -855,7 +863,7 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as([32]u8, @splat(0x22)), loaded.tls.ech_keys[0].private_key);
 }
 
-test "io defer_taskrun and sqpoll project onto Loaded.io without touching cqe_batch default" {
+test "io defer_taskrun and sqpoll project onto Loaded.io and Config.features without touching cqe_batch default" {
     const allocator = testing.allocator;
     const text =
         \\[node]
@@ -871,6 +879,8 @@ test "io defer_taskrun and sqpoll project onto Loaded.io without touching cqe_ba
     defer loaded.deinit(allocator);
     try testing.expect(loaded.io.defer_taskrun);
     try testing.expect(loaded.io.sqpoll);
+    try testing.expect(loaded.config.features.defer_taskrun);
+    try testing.expect(loaded.config.features.sqpoll);
     try testing.expectEqual(@as(u16, 256), loaded.config.cqe_batch);
 }
 

@@ -462,9 +462,8 @@ reputation_half_life = "1m"    # decay half-life of the reputation penalty
 [io]
 ring_entries = 32      # io_uring SQ entries per reactor (8..4096)
 cqe_batch = 256        # max CQEs reaped per event-loop drain (16..4096)
-# Ownership-safe kernel flags (P0-2). Default off. The daemon must probe
-# fail-closed and refuse the key if the kernel rejects the setup flags.
-# Wiring into the live ring is server.zig (integrator).
+# Ownership-safe kernel flags (P0-2). Default off. Copied onto the live
+# ring features; RingCore.init fail-closes if the kernel rejects them.
 # defer_taskrun = false  # IORING_SETUP_DEFER_TASKRUN (+ SINGLE_ISSUER)
 # sqpoll = false         # IORING_SETUP_SQPOLL
 

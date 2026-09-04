@@ -202,6 +202,7 @@ fn expectX509Error(err: x509.Error) void {
         error.OutputTooSmall,
         error.UnsupportedKey,
         error.InvalidKey,
+        error.UnsupportedCriticalExtension,
         => {},
     }
 }
