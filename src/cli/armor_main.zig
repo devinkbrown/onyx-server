@@ -28,7 +28,9 @@ fn topUsage(w: *Writer) Writer.Error!void {
         \\  rand        cryptographically-random bytes (raw/-hex/-base64)
         \\  ciphers     list supported TLS suites, groups, signature schemes
         \\  asn1parse   dump a DER structure
-        \\  s_client / s_server / enc / ocsp / crl   not yet implemented (exit 3)
+        \\  ocsp        display/verify a stapled OCSP response (no HTTP fetch)
+        \\  crl         display/verify an X.509 CRL (no HTTP fetch)
+        \\  s_client / s_server / enc   not yet implemented (exit 3)
         \\
         \\exit codes: 0 ok, 1 failed, 2 usage, 3 not implemented
         \\
@@ -79,6 +81,14 @@ fn dispatch(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8, args: []const [
     if (std.mem.eql(u8, cmd, "asn1parse")) {
         if (wantsHelp(args)) return cli.asn1parse_cmd.usage(out);
         return cli.asn1parse_cmd.run(gpa, io, try cli.asn1parse_cmd.parseArgs(args), out);
+    }
+    if (std.mem.eql(u8, cmd, "ocsp")) {
+        if (wantsHelp(args)) return cli.ocsp_cmd.usage(out);
+        return cli.ocsp_cmd.run(gpa, io, try cli.ocsp_cmd.parseArgs(args), out);
+    }
+    if (std.mem.eql(u8, cmd, "crl")) {
+        if (wantsHelp(args)) return cli.crl_cmd.usage(out);
+        return cli.crl_cmd.run(gpa, io, try cli.crl_cmd.parseArgs(args), out);
     }
     if (cli.stub_cmds.isStub(cmd)) return cli.stub_cmds.run(cmd, out);
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
@@ -140,6 +150,8 @@ fn usageFor(cmd: []const u8, w: *Writer) Writer.Error!void {
     if (std.mem.eql(u8, cmd, "rand")) return cli.rand_cmd.usage(w);
     if (std.mem.eql(u8, cmd, "ciphers")) return cli.ciphers_cmd.usage(w);
     if (std.mem.eql(u8, cmd, "asn1parse")) return cli.asn1parse_cmd.usage(w);
+    if (std.mem.eql(u8, cmd, "ocsp")) return cli.ocsp_cmd.usage(w);
+    if (std.mem.eql(u8, cmd, "crl")) return cli.crl_cmd.usage(w);
     return topUsage(w);
 }
 
@@ -158,6 +170,14 @@ test "armor dispatch routes ciphers and rejects unknown commands" {
     aw.clearRetainingCapacity();
     try testing.expectError(error.Usage, dispatch(testing.allocator, std.testing.io, "nonsense", &.{}, &aw.writer));
     try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "s_client", &.{}, &aw.writer));
+    try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "enc", &.{}, &aw.writer));
+
+    aw.clearRetainingCapacity();
+    try dispatch(testing.allocator, std.testing.io, "ocsp", &.{"--help"}, &aw.writer);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "usage: armor ocsp") != null);
+    aw.clearRetainingCapacity();
+    try dispatch(testing.allocator, std.testing.io, "crl", &.{"--help"}, &aw.writer);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "usage: armor crl") != null);
 }
 
 test "armor per-command --help renders without touching inputs" {

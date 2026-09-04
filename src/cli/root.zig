@@ -16,6 +16,8 @@ pub const verify_cmd = @import("verify_cmd.zig");
 pub const rand_cmd = @import("rand_cmd.zig");
 pub const ciphers_cmd = @import("ciphers_cmd.zig");
 pub const asn1parse_cmd = @import("asn1parse_cmd.zig");
+pub const ocsp_cmd = @import("ocsp_cmd.zig");
+pub const crl_cmd = @import("crl_cmd.zig");
 pub const stub_cmds = @import("stub_cmds.zig");
 
 test {
@@ -29,5 +31,7 @@ test {
     _ = rand_cmd;
     _ = ciphers_cmd;
     _ = asn1parse_cmd;
+    _ = ocsp_cmd;
+    _ = crl_cmd;
     _ = stub_cmds;
 }

@@ -1119,7 +1119,9 @@ test "isStapleServable rejects revoked, wrong-serial, and tampered responses" {
     try std.testing.expect(!isStapleServable(no_next, spki, &[_]u8{0x44}, in_window, 0));
 }
 
-fn testSignedOcspResponse(
+/// Test-only mint: a BasicOCSPResponse signed by `kp` (Ed25519). Used by
+/// substrate KATs and by `armor ocsp` CLI tests. Not a production builder.
+pub fn testSignedOcspResponse(
     allocator: std.mem.Allocator,
     kp: Ed25519.KeyPair,
     serial: []const u8,
@@ -1491,7 +1493,7 @@ test "delegated OCSP: byName + EXPLICIT-byKey accept; ResponderID-mismatch and w
     }
 }
 
-fn testEd25519Spki(allocator: std.mem.Allocator, public_key: [Ed25519.PublicKey.encoded_length]u8) ![]u8 {
+pub fn testEd25519Spki(allocator: std.mem.Allocator, public_key: [Ed25519.PublicKey.encoded_length]u8) ![]u8 {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
     try appendAlgId(allocator, &body, &oid_ed25519, false);

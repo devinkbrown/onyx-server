@@ -161,6 +161,31 @@ pub fn wallClockSeconds() i64 {
     return @divTrunc(onyx_server.substrate.platform.realtimeMillis(), 1000);
 }
 
+/// Decode a hex serial (`44`, `0x44`, `01:02`) to owned DER INTEGER contents.
+/// Fail-closed: empty, odd-length, or non-hex input is `error.Usage`.
+pub fn parseHexSerial(gpa: Allocator, text: []const u8) ![]u8 {
+    var start: usize = 0;
+    if (text.len >= 2 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X')) start = 2;
+    var nibble_count: usize = 0;
+    for (text[start..]) |c| {
+        if (c == ':' or c == ' ') continue;
+        nibble_count += 1;
+    }
+    if (nibble_count == 0 or nibble_count % 2 != 0) return error.Usage;
+    const out = try gpa.alloc(u8, nibble_count / 2);
+    errdefer gpa.free(out);
+    var hex_buf: [256]u8 = undefined;
+    if (nibble_count > hex_buf.len) return error.Usage;
+    var i: usize = 0;
+    for (text[start..]) |c| {
+        if (c == ':' or c == ' ') continue;
+        hex_buf[i] = c;
+        i += 1;
+    }
+    _ = std.fmt.hexToBytes(out, hex_buf[0..i]) catch return error.Usage;
+    return out;
+}
+
 /// Tiny forward-only argument cursor shared by the subcommand parsers.
 pub const ArgCursor = struct {
     args: []const []const u8,
@@ -220,6 +245,22 @@ test "armorcli oid helpers render known and unknown OIDs" {
     aw.clearRetainingCapacity();
     try writeOidDotted(&aw.writer, &.{ 0x2a, 0x86 });
     try testing.expect(std.mem.endsWith(u8, aw.written(), "<bad-oid>"));
+}
+
+test "armorcli parseHexSerial accepts 0x, colon, and bare hex" {
+    const gpa = testing.allocator;
+    const a = try parseHexSerial(gpa, "44");
+    defer gpa.free(a);
+    try testing.expectEqualSlices(u8, &.{0x44}, a);
+    const b = try parseHexSerial(gpa, "0x0102");
+    defer gpa.free(b);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, b);
+    const c = try parseHexSerial(gpa, "01:02:03");
+    defer gpa.free(c);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03 }, c);
+    try testing.expectError(error.Usage, parseHexSerial(gpa, ""));
+    try testing.expectError(error.Usage, parseHexSerial(gpa, "4"));
+    try testing.expectError(error.Usage, parseHexSerial(gpa, "zz"));
 }
 
 test "armorcli writeKeyFile writes the private key owner-only (0o600)" {

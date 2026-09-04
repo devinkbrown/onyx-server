@@ -683,13 +683,25 @@ test "crl crlIsCurrent enforces the thisUpdate..nextUpdate window" {
     try std.testing.expect(!crlIsCurrent(no_next, no_next.this_update.epoch_seconds + 1));
 }
 
-fn testSignedCrl(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPair) ![]u8 {
+/// Test-only mint: a CertificateList signed by `kp` (Ed25519). Used by
+/// substrate KATs and by `armor crl` CLI tests. Not a production builder.
+pub fn testSignedCrl(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPair) ![]u8 {
     var tbs_body: std.ArrayList(u8) = .empty;
     defer tbs_body.deinit(allocator);
     try appendDerTlv(allocator, &tbs_body, x509.Tag.integer, &[_]u8{1});
     try appendAlgId(allocator, &tbs_body, &oid_ed25519, false);
     try appendDerSeq(allocator, &tbs_body, "");
     try appendDerTlv(allocator, &tbs_body, x509.Tag.utc_time, "260101000000Z");
+    try appendDerTlv(allocator, &tbs_body, x509.Tag.utc_time, "270101000000Z");
+
+    var revoked_entry: std.ArrayList(u8) = .empty;
+    defer revoked_entry.deinit(allocator);
+    try appendDerTlv(allocator, &revoked_entry, x509.Tag.integer, &[_]u8{0x05});
+    try appendDerTlv(allocator, &revoked_entry, x509.Tag.utc_time, "260102000000Z");
+    var revoked_list: std.ArrayList(u8) = .empty;
+    defer revoked_list.deinit(allocator);
+    try appendDerSeq(allocator, &revoked_list, revoked_entry.items);
+    try appendDerSeq(allocator, &tbs_body, revoked_list.items);
 
     var tbs: std.ArrayList(u8) = .empty;
     defer tbs.deinit(allocator);
@@ -708,7 +720,7 @@ fn testSignedCrl(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPa
     return out.toOwnedSlice(allocator);
 }
 
-fn testEd25519Spki(allocator: std.mem.Allocator, public_key: [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8) ![]u8 {
+pub fn testEd25519Spki(allocator: std.mem.Allocator, public_key: [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8) ![]u8 {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
     try appendAlgId(allocator, &body, &oid_ed25519, false);

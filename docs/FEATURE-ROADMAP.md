@@ -79,7 +79,7 @@ Full accept conditions: [`releases/0.7-MAJOR-ROADMAP.md`](releases/0.7-MAJOR-ROA
 | --- | --- | --- |
 | **PX** portable performance | PX-0…PX-6 | `IoBackend` trait; Linux ownership-safe io flags; Windows IOCP; BSD/macOS kqueue; portable Helix fail-closed; per-OS benches |
 | **KX** kernel unique features | KX-L1…L12, KX-B0…B5, KX-O1…O4, KX-W1…W5, KX-X1…X3 | Linux FASTOPEN/Landlock/seccomp/MSG_RING/kTLS rekey/`openat2`/pidfd; FreeBSD `SO_REUSEPORT_LB`/Capsicum/KTLS; OpenBSD pledge/unveil; Windows IOCP/RIO/Job objects; boot capability matrix |
-| **AX** Armor TLS + CLI | AX-0…AX-8 | `armor ocsp`/`crl`/`s_client`/`s_server`; CLI sandbox; CT/`http_fetch`; BoGo CI; `enc` stays stubbed |
+| **AX** Armor TLS + CLI | AX-0…AX-8 | AX-0/AX-1 **done** (`armor ocsp`/`crl` verify fail-closed). Remain: `s_client`/`s_server`; CLI sandbox; CT/`http_fetch` (AX-5 landed in source); BoGo CI; `enc` stays stubbed |
 | **IX** expanded IRCX (daemon) | IX-1…IX-10 | Draft matrix; MODEX/LISTX/WHISPER/DATA/ACCESS/SACCESS/auditorium/PROP/EVENT/AUTH/HELP completeness + hostile tests |
 | **CX** client IRCX | CX-1…CX-10 | LISTX browser, MODEX UI, WHISPER compose, PROP settings, EVENT for people, ACCESS finish, auditorium roster, DATA lines, identity+PROP, slash verbs |
 | **HX** harden / correctness | HX-1…HX-19 | Outbound CRLF, per-command IRCX exploits, mesh/Helix/media/auth hunt, client XSS/store poison, timer-guard real gates, full-suite count |
