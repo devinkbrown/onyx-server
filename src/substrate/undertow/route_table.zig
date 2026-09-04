@@ -238,9 +238,13 @@ pub const Member = struct {
     realname: []u8,
     /// The member's VISIBLE (cloaked) host ("" = unknown).
     host: []u8,
-    /// The member's authenticated ACCOUNT ("" = not logged in / unknown). Drives
-    /// account-aware collision reconcile (see resolveIncomingNick).
+    /// Display account ("" = unknown). Used for WHOIS 330 / oper-prefix grant→nick
+    /// mapping. Collision short-circuits consult this only when `account_trusted`.
     account: []u8,
+    /// True only when a residence proof verified this account on an
+    /// origin-authenticated claim (Design C / F1). Display may keep `account`
+    /// without this bit; `resolveIncomingNick` must not.
+    account_trusted: bool = false,
     /// The member's REAL (uncloaked) host/IP ("" = unknown/withheld). SENSITIVE:
     /// only ever populated from an oper-info-capable SECURED link, and surfaced
     /// only to operators (remote WHOIS 338/320). See [proto/membership_event].
@@ -281,6 +285,8 @@ pub const MemberIdentity = struct {
     realname: []const u8 = "",
     host: []const u8 = "",
     account: []const u8 = "",
+    /// See `Member.account_trusted`. Default false keeps collision fail-closed.
+    account_trusted: bool = false,
     /// REAL (uncloaked) host/IP — sensitive; only set/propagated over a secured,
     /// oper-info-capable link and only ever shown to operators. "" = unknown.
     real_host: []const u8 = "",
@@ -604,7 +610,12 @@ pub const RouteTable = struct {
         while (it.next()) |entry| {
             for (entry.value_ptr.entries.items) |m| {
                 if (!std.ascii.eqlIgnoreCase(m.nick, nick)) continue;
-                const cand = nick_collision.Claim{ .node_id = m.node, .hlc = m.hlc, .account = m.account };
+                // Collision identity ignores display-only accounts (F1).
+                const cand = nick_collision.Claim{
+                    .node_id = m.node,
+                    .hlc = m.hlc,
+                    .account = if (m.account_trusted) m.account else "",
+                };
                 if (best == null or nick_collision.higherPriority(cand, best.?)) best = cand;
             }
         }
@@ -1019,6 +1030,7 @@ pub const RouteTable = struct {
                     member.realname = owned_ident.realname;
                     member.host = owned_ident.host;
                     member.account = owned_ident.account;
+                    member.account_trusted = ident.account_trusted;
                     identities_transferred = next_exact;
                 } else if (member.node == incumbent_node and std.ascii.eqlIgnoreCase(member.nick, new_nick)) {
                     self.allocator.free(member.nick);
@@ -1361,6 +1373,7 @@ pub const RouteTable = struct {
                     replaceOwned(self.allocator, &row.realname, identity.realname) catch {};
                     replaceOwned(self.allocator, &row.host, identity.host) catch {};
                     replaceOwned(self.allocator, &row.account, identity.account) catch {};
+                    row.account_trusted = identity.account_trusted;
                 }
             }
         }
@@ -1590,6 +1603,7 @@ pub const RouteTable = struct {
                 try replaceOwned(self.allocator, &cur.account, ident.account);
                 try replaceOwned(self.allocator, &cur.real_host, ident.real_host);
                 try replaceOwned(self.allocator, &cur.certfp, ident.certfp);
+                cur.account_trusted = ident.account_trusted;
                 cur.session_token = ident.session_token;
                 cur.node = node;
                 cur.status = status;
@@ -1677,6 +1691,7 @@ pub const RouteTable = struct {
             .realname = owned_real,
             .host = owned_host,
             .account = owned_account,
+            .account_trusted = ident.account_trusted,
             .real_host = owned_real_host,
             .certfp = owned_certfp,
             .session_token = ident.session_token,
@@ -3704,7 +3719,7 @@ test "resolveIncomingNick collapses a same-account cross-node collision via keep
     // node 10 on the SAME account would normally lose and get a UID — but because
     // it is the same identity, the table reports `remote_same_account` (no UID, no
     // incumbent displacement) and lets hlc LWW in applyMembership converge.
-    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain" }, 0);
+    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain", .account_trusted = true }, 0);
     try std.testing.expectEqual(NickDecision.remote_same_account, table.resolveIncomingNick("kain", 10, 100, "kain", true));
     // A different account still contests normally (lower hlc loser → UID).
     _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "mallory", true));
@@ -3727,9 +3742,15 @@ test "resolveIncomingNick: an UNTRUSTED account never unlocks a same-identity sh
     // Cross-node collision: an unverified same-account claim contests like a
     // stranger (deterministic tiebreak → UID for the lower claim), never
     // `remote_same_account` coexistence.
-    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain" }, 0);
+    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain", .account_trusted = true }, 0);
     _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "kain", false));
     try std.testing.expectEqual(NickDecision.remote_same_account, table.resolveIncomingNick("kain", 10, 100, "kain", true));
+
+    // Display-only incumbent (signed peer, no residence) also grants no coexistence.
+    var display_only = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer display_only.deinit();
+    _ = try display_only.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain", .account_trusted = false }, 0);
+    _ = try expectRename(display_only.resolveIncomingNick("kain", 10, 100, "kain", true));
 }
 
 test "resolveIncomingNick sticky trust: an ESTABLISHED member's re-affirm is keep, independent of account trust (mesh R1)" {
@@ -3741,7 +3762,7 @@ test "resolveIncomingNick sticky trust: an ESTABLISHED member's re-affirm is kee
     var stub = LocalNickStub{ .held = "kain", .acct = "kain", .hlc = 100 };
     table.setLocalNickResolver(stub.resolver());
     try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 20, 100, "kain", true));
-    _ = try table.applyMembership("#chat", "kain", 20, 0, 100, true, .{ .account = "kain" }, 0);
+    _ = try table.applyMembership("#chat", "kain", 20, 0, 100, true, .{ .account = "kain", .account_trusted = true }, 0);
 
     // A later re-affirm from the SAME node whose proof has EXPIRED (trusted=false
     // now) must NOT re-run the account gate and UID-flip the live member: the

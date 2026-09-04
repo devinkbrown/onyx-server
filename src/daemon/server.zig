@@ -1665,9 +1665,10 @@ pub const Config = struct {
     /// `!news` is served from these files (robust full coverage) instead of
     /// in-daemon TLS fetches. `[geo] news_cache_dir`.
     geo_news_cache_dir: []const u8 = "",
-    /// Path for persisting inactive legacy OCG1 records (GRANT/REVOKE). When
-    /// set, non-tombstone records are written here and reloaded at boot for
-    /// compatibility telemetry; they never authorize sessions.
+    /// Path for persisting mesh display OCG1 grants (GRANT/REVOKE). When set,
+    /// non-tombstone records are written here and reloaded at boot so remote
+    /// `*` / `+Y` projection can resume after restart. Local OPER/DEOPER
+    /// remains the authorization path.
     oper_grants_path: []const u8 = "",
     /// Path for persisting the Event Spine history ring (`[oper]
     /// event_history_path`); loaded at boot, rewritten on the stats cadence.
@@ -4815,7 +4816,7 @@ pub const LinuxServer = struct {
                 .max_per_account = self.config.session_max_per_account,
             });
         }
-        // Restore inactive legacy OCG1 records persisted by a previous run.
+        // Restore mesh display OCG1 grants persisted by a previous run.
         self.loadGrants();
         // Restore per-channel statistics persisted by a previous run so they
         // survive a restart or USR2 hot-upgrade.
@@ -9057,32 +9058,36 @@ pub const LinuxServer = struct {
     /// Encode current local oper grants for one secured peer. The surrounding
     /// retryable burst stage owns encrypted-record pagination and clears no
     /// ciphertext until it has entered that peer's SendQ.
+    ///
+    /// Re-signs the live registry entries this node already issued — it does
+    /// NOT mint a higher incarnation on the 30s anti-entropy cadence. Reminting
+    /// every burst made peers treat an unchanged privilege refresh as
+    /// `superseded` and re-broadcast synthetic `MODE +Y` forever.
     fn sendLocalOperBurstTo(self: *LinuxServer, conn: *ConnState) bool {
         const link = conn.s2s_secured orelse return true;
         const kp = self.meshSignKey() orelse return true;
+        const now = self.grantNowU64();
+        const me = protocol_inventory.currentServerName();
+        var it = self.oper_grants.liveIterator(now);
+        while (it.next()) |fields| {
+            if (!std.ascii.eqlIgnoreCase(fields.issuer_node, me)) continue;
+            if (fields.privilege_bits == 0) continue; // tombstones are not anti-entropy cargo
+            var buf: [oper_cred_share.max_grant_len]u8 = undefined;
+            const n = oper_cred_share.sign(kp, fields, &buf) catch return false;
+            link.sendOperGrant(buf[0..n]) catch return false;
+        }
+        // Catch a live local oper whose grant was never minted (boot race /
+        // keyless→keyed transition). Real elevation still goes through
+        // mintOperGrant; this only fills a missing registry row once.
         for (self.reactors) |*reactor| {
-            var it = reactor.clients.iterator();
-            while (it.next()) |entry| {
+            var clients = reactor.clients.iterator();
+            while (clients.next()) |entry| {
                 const client = entry.value;
                 if (client.s2s != null or client.s2s_secured != null) continue;
                 if (!client.session.registered() or !client.session.isOper()) continue;
                 const account = client.session.account() orelse continue;
-                const now = self.grantNowU64();
-                self.grant_incarnation = @max(now, self.grant_incarnation + 1);
-                const fields = oper_cred_share.GrantFields{
-                    .account = account,
-                    .privilege_bits = client.session.oper_priv.toBits(),
-                    .class = client.session.operClass(),
-                    .title = client.session.operTitle(),
-                    .issuer_node = protocol_inventory.currentServerName(),
-                    .incarnation = self.grant_incarnation,
-                    .issued_ms = now,
-                    .expiry_ms = now + oper_grant_ttl_ms,
-                };
-                _ = self.oper_grants.upsert(fields);
-                var buf: [oper_cred_share.max_grant_len]u8 = undefined;
-                const n = oper_cred_share.sign(kp, fields, &buf) catch return false;
-                link.sendOperGrant(buf[0..n]) catch return false;
+                if (self.oper_grants.lookup(account, now) != null) continue;
+                self.mintOperGrant(account, client.session.oper_priv, client.session.operClass(), client.session.operTitle());
             }
         }
         return true;
@@ -11014,10 +11019,10 @@ pub const LinuxServer = struct {
     }
 
     /// Resolve the residence-trusted account for `nick` at one exact mesh node.
-    /// Remote roster rows blank accounts whose residence proof did not verify;
-    /// only non-empty, origin-matching rows are eligible here. If independently
-    /// converged links disagree, fail closed instead of choosing an account and
-    /// exposing another conversation's `$dm:acct` history.
+    /// Remote roster rows may keep a display account without residence trust;
+    /// only `account_trusted` origin-matching rows are eligible here. If
+    /// independently converged links disagree, fail closed instead of choosing
+    /// an account and exposing another conversation's `$dm:acct` history.
     fn trustedRemoteAccountAtNode(self: *LinuxServer, nick: []const u8, node: u64) ?[]const u8 {
         var found: ?[]const u8 = null;
         for (self.reactors) |*reactor| {
@@ -11031,7 +11036,7 @@ pub const LinuxServer = struct {
                     break :blk link.findRemoteMember(nick);
                 } else continue;
                 const remote = member orelse continue;
-                if (remote.node != node or remote.account.len == 0) continue;
+                if (remote.node != node or !remote.account_trusted or remote.account.len == 0) continue;
                 if (found) |account| {
                     if (!std.ascii.eqlIgnoreCase(account, remote.account)) return null;
                 } else {
@@ -20928,12 +20933,12 @@ pub const LinuxServer = struct {
     /// visible host — falling back to the placeholder/origin-server forms only
     /// when the origin never supplied identity), 312 with the actual home
     /// server, RPL_WHOISCHANNELS (319) from the mesh roster, RPL_WHOISACCOUNT
-    /// (330) when the member's account propagated, and 318. Step 5 deliberately
-    /// does not project inactive OCG1 records into remote operator status. To an OPERATOR requester
-    /// it ALSO surfaces the deanonymized identity a secured oper-info link propagated:
-    /// the real host/IP (338), GeoIP/ASN (320, computed locally from that IP), and
-    /// the TLS cert fingerprint (276). Idle/away/671 are per-connection state remote
-    /// nodes don't replicate, so they are omitted.
+    /// (330) when the member's account propagated, RPL_WHOISOPERATOR (313) when
+    /// a live mesh display grant covers the account, and 318. To an OPERATOR
+    /// requester it ALSO surfaces the deanonymized identity a secured oper-info
+    /// link propagated: the real host/IP (338), GeoIP/ASN (320, computed locally
+    /// from that IP), and the TLS cert fingerprint (276). Idle/away/671 are
+    /// per-connection state remote nodes don't replicate, so they are omitted.
     fn sendRemoteWhois(
         self: *LinuxServer,
         conn: *ConnState,
@@ -35821,27 +35826,50 @@ pub const LinuxServer = struct {
         const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(peer_pubkey) catch return false;
         const now: u64 = self.grantNowU64();
         const fields = oper_cred_share.verify(pk, bytes, now) catch return false;
+        const prev_override = self.grantHasOverride(fields.account, now);
         const accepted = self.oper_grants.upsert(fields) != .stale_ignored;
         if (accepted) {
             self.logMeshEvent(.oper_grant_in, fields.account, fields.issuer_node);
-            // Display-only: project `*` / +Y for remote roster nicks that
-            // share this account. Never mutate local session privilege —
-            // KICK/DATA/isOverrideOper stay configured-local. OCG2 activation
-            // remains separately held.
-            if (fields.privilege_bits == 0) {
-                self.announceRemoteOperPrefixForAccount(fields.account, false);
-            } else if (oper_mod.OperPrivileges.fromBits(fields.privilege_bits).has(.oper_override)) {
-                self.announceRemoteOperPrefixForAccount(fields.account, true);
-            }
+            // Display-only: project `*` / +Y for remote roster nicks on an
+            // override edge only. Privilege stays configured-local.
+            self.projectRemoteOperPrefixEdge(
+                fields.account,
+                prev_override,
+                fields.privilege_bits != 0 and
+                    oper_mod.OperPrivileges.fromBits(fields.privilege_bits).has(.oper_override),
+            );
         }
         return accepted;
     }
 
-    /// Mint + store an inactive legacy OCG1 record for compatibility telemetry.
-    /// Stored locally and broadcast to peers, but never accepted as authority.
-    /// Best-effort: silently no-ops without a node key.
+    fn grantHasOverride(self: *const LinuxServer, account: []const u8, now: u64) bool {
+        const prev = self.oper_grants.lookup(account, now) orelse return false;
+        return oper_mod.OperPrivileges.fromBits(prev.privilege_bits).has(.oper_override);
+    }
+
+    /// Announce remote `*` / +Y only when the override-display bit flips.
+    /// Same-privilege anti-entropy remints stay silent.
+    fn projectRemoteOperPrefixEdge(
+        self: *LinuxServer,
+        account: []const u8,
+        prev_override: bool,
+        now_override: bool,
+    ) void {
+        if (now_override and !prev_override) {
+            self.announceRemoteOperPrefixForAccount(account, true);
+        } else if (!now_override and prev_override) {
+            self.announceRemoteOperPrefixForAccount(account, false);
+        }
+    }
+
+    /// Mint + store a signed mesh oper grant for display projection across peers.
+    /// Privilege (KICK/DATA/session authority) stays configured-local; the grant
+    /// drives remote WHOIS 313 / NAMES `*` / `MODE +Y` only. Best-effort: silently
+    /// skips the wire broadcast without a node key, but still records locally and
+    /// projects the display edge for remotes already on this node's roster.
     fn mintOperGrant(self: *LinuxServer, account: []const u8, privileges: oper_mod.OperPrivileges, class_name: []const u8, title: []const u8) void {
         const now: u64 = self.grantNowU64();
+        const prev_override = self.grantHasOverride(account, now);
         // Strictly-increasing incarnation so a later GRANT/REVOKE always wins,
         // even when issued within the same millisecond.
         self.grant_incarnation = @max(now, self.grant_incarnation + 1);
@@ -35857,6 +35885,7 @@ pub const LinuxServer = struct {
         };
         // Record locally first so a single node (no [node] key) still grants.
         _ = self.oper_grants.upsert(fields);
+        self.projectRemoteOperPrefixEdge(account, prev_override, privileges.has(.oper_override));
         // Sign once and broadcast to every authenticated peer so they recognize
         // this grant (best-effort; no node key => local-only, no propagation).
         const kp = self.meshSignKey() orelse return;
@@ -36167,9 +36196,10 @@ pub const LinuxServer = struct {
         });
     }
 
-    /// GRANT <account> <class> [priv,priv,...] — retain an inactive legacy OCG1
-    /// record for compatibility telemetry. Requires `oper_grant`, but never
-    /// projects authority into a session; OCG2 activation is separately gated.
+    /// GRANT <account> <class> [priv,priv,...] — mint a mesh oper grant that
+    /// peers project as remote WHOIS 313 / NAMES `*` / `MODE +Y`. Requires
+    /// `oper_grant`. Does not elevate a local session; configured `[[opers]]`
+    /// remain the authority plane for KICK/DATA/isOverrideOper.
     pub fn handleGrant(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.hasPriv(.oper_grant)) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied (oper_grant required)");
@@ -36200,14 +36230,14 @@ pub const LinuxServer = struct {
         var b: [256]u8 = undefined;
         try self.noticeTo(conn, std.fmt.bufPrint(
             &b,
-            "GRANT: stored inactive legacy record for {s} (class {s}); no authority activated",
+            "GRANT: mesh display grant stored for {s} (class {s}); local session authority unchanged",
             .{ account, class },
-        ) catch "GRANT: stored inactive legacy record; no authority activated");
+        ) catch "GRANT: mesh display grant stored; local session authority unchanged");
     }
 
-    /// REVOKE <account> — supersede an inactive legacy OCG1 record with a
-    /// zero-privilege tombstone. Configured `[[opers]]` accounts remain outside
-    /// this compatibility plane and cannot be revoked by this command.
+    /// REVOKE <account> — supersede a mesh display grant with a zero-privilege
+    /// tombstone (peers drop remote `*` / +Y). Configured `[[opers]]` accounts
+    /// remain outside this plane and cannot be revoked by this command.
     pub fn handleRevoke(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.hasPriv(.oper_grant)) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied (oper_grant required)");
@@ -36227,10 +36257,10 @@ pub const LinuxServer = struct {
         self.mintOperGrant(account, oper_mod.OperPrivileges.empty, "revoked", "");
         self.persistGrants();
         var b: [256]u8 = undefined;
-        try self.noticeTo(conn, std.fmt.bufPrint(&b, "REVOKE: stored inactive legacy tombstone for {s}", .{account}) catch "REVOKE: stored inactive legacy tombstone");
+        try self.noticeTo(conn, std.fmt.bufPrint(&b, "REVOKE: mesh display grant tombstoned for {s}", .{account}) catch "REVOKE: mesh display grant tombstoned");
     }
 
-    /// GRANTS — list non-tombstone inactive legacy OCG1 records.
+    /// GRANTS — list non-tombstone mesh display grants.
     pub fn handleGrants(self: *LinuxServer, conn: *ConnState) !void {
         try self.noticeTo(conn, "Runtime operator grants:");
         const now: u64 = self.grantNowU64();
@@ -36247,10 +36277,9 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, std.fmt.bufPrint(&b, "End of grants ({d}).", .{count}) catch "End of grants.");
     }
 
-    /// Persist inactive non-tombstone legacy OCG1 records to `[oper] grants_path` (tab-
-    /// separated account/privbits/class/title, one per line). Tombstones
-    /// (privilege_bits == 0) are omitted, so a revoked account is simply absent
-    /// and is not restored. No-op when no path is configured.
+    /// Persist non-tombstone mesh display grants this node issued to
+    /// `[oper] grants_path` (tab-separated account/privbits/class/title).
+    /// Tombstones (privilege_bits == 0) are omitted. No-op when no path is set.
     fn persistGrants(self: *LinuxServer) void {
         if (self.config.oper_grants_path.len == 0) return;
         // Accumulate into a growable buffer: a fixed buffer silently dropped
@@ -36273,9 +36302,9 @@ pub const LinuxServer = struct {
         writeFileAbs(self.allocator, self.config.oper_grants_path, out.items);
     }
 
-    /// Reload persisted legacy OCG1 records at boot for compatibility telemetry.
-    /// Re-minting does not project session authority. Called once from `start`;
-    /// no-op without a configured path / readable file.
+    /// Reload persisted mesh display grants at boot. Re-minting does not elevate
+    /// local sessions; remote `*` / +Y projection follows the override edge.
+    /// Called once from `start`; no-op without a configured path / readable file.
     fn loadGrants(self: *LinuxServer) void {
         if (self.config.oper_grants_path.len == 0) return;
         const io = self.config.crypto_io orelse return;
@@ -36296,7 +36325,7 @@ pub const LinuxServer = struct {
             self.mintOperGrant(account, oper_mod.OperPrivileges.fromBits(bits), class, title);
             restored += 1;
         }
-        if (restored != 0) srvLog("onyx-server: restored {d} inactive legacy OCG1 record(s)\n", .{restored});
+        if (restored != 0) srvLog("onyx-server: restored {d} mesh display OCG1 grant(s)\n", .{restored});
     }
 
     /// Restore the per-channel statistics snapshot persisted by a previous run,
@@ -61647,13 +61676,12 @@ test "UPGRADE resume: peer RESYNC re-burst of unchanged remote state emits zero 
     try std.testing.expectEqualStrings("", quiet);
 
     // Genuine member/topic changes after adoption still surface exactly once.
-    // The OCG1 tombstone remains telemetry and cannot emit a derived -Y.
+    // Revoking override must emit a single derived -Y for the remote oper.
     fx.successor.world.lockWrite();
     const op_voice: u4 = @truncate(chanmode.MemberModes.fromModes(&.{ .op, .voice }).bits);
     try pair.b.sendMembership("#root", "trev", op_voice, 950, true, ResyncQuietFixture.trev_ident, "kain");
     try pair.b.sendTopic("#root", "calm seas", "trev", 2000, 951, true);
     try fx.feedAndDrain(alloc, 952);
-    // Revocation tombstone: retained compatibility telemetry only.
     try std.testing.expect(try fx.applyRemintedGrant(102, 0));
     fx.successor.world.unlockWrite();
 
@@ -61663,14 +61691,14 @@ test "UPGRADE resume: peer RESYNC re-burst of unchanged remote state emits zero 
     try std.testing.expect(std.mem.indexOf(u8, changed, "TOPIC #root :calm seas") != null);
     // Exactly once each.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, changed, "TOPIC #root"));
-    try std.testing.expect(std.mem.indexOf(u8, changed, "-Y trev") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, changed, "MODE #root -Y trev"));
     // And still no spurious re-JOIN anywhere in the whole exchange.
     try std.testing.expect(std.mem.indexOf(u8, changed, "JOIN") == null);
     try std.testing.expect(std.mem.indexOf(u8, changed, "NICK") == null);
     try std.testing.expect(std.mem.indexOf(u8, changed, "+Y") == null);
 }
 
-test "UPGRADE resume without carried OCG1 registry still never projects +Y" {
+test "UPGRADE resume: first override grant after missing registry projects +Y once" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
@@ -61683,8 +61711,8 @@ test "UPGRADE resume without carried OCG1 registry still never projects +Y" {
     var fx = try ResyncQuietFixture.init(alloc, &pair);
     defer fx.deinit(alloc);
 
-    // Deliberately DO NOT prime the grant registry (the pre-fix successor
-    // state), and model a pre-carry World by clearing the carried topic.
+    // Deliberately DO NOT prime the grant registry — the first live override
+    // grant must project remote `*` / +Y (display edge), not stay silent.
     try fx.successor.world.setTopic("#root", "", "", 0);
     resetTestSendQ(fx.alice);
 
@@ -61697,12 +61725,23 @@ test "UPGRADE resume without carried OCG1 registry still never projects +Y" {
     ));
     fx.successor.world.unlockWrite();
 
-    // The un-carried topic legitimately re-announces, but an OCG1 re-mint is
-    // inactive telemetry and cannot announce a derived operator prefix.
-    const noisy = try copyTestSendQ(alloc, fx.alice);
-    defer alloc.free(noisy);
-    try std.testing.expect(std.mem.indexOf(u8, noisy, "MODE #root +Y trev") == null);
-    try std.testing.expect(std.mem.indexOf(u8, noisy, "TOPIC #root :stormy weather") != null);
+    const first = try copyTestSendQ(alloc, fx.alice);
+    defer alloc.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "TOPIC #root :stormy weather") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, "MODE #root +Y trev"));
+
+    // Same-privilege remint (30s anti-entropy) must stay silent.
+    resetTestSendQ(fx.alice);
+    fx.successor.world.lockWrite();
+    try std.testing.expect(try fx.applyRemintedGrant(
+        102,
+        oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits(),
+    ));
+    fx.successor.world.unlockWrite();
+
+    const quiet_refresh = try copyTestSendQ(alloc, fx.alice);
+    defer alloc.free(quiet_refresh);
+    try std.testing.expectEqualStrings("", quiet_refresh);
 }
 
 test "UPGRADE timer deferral still dispatches later recv CQE in copied batch" {
@@ -91516,7 +91555,7 @@ test "threaded server: legacy GRANT remains inactive and cannot arm override" {
     a.reset();
     t.reset();
     try writeAllFd(fd_a, "GRANT target netadmin\r\n");
-    try recvUntil(&a, "stored inactive legacy record for target", 300);
+    try recvUntil(&a, "mesh display grant stored for target", 300);
     try writeAllFd(fd_t, "PING :grant-inactive\r\n");
     try recvUntil(&t, "PONG", 200);
     try std.testing.expect(std.mem.indexOf(u8, t.written(), " 381 T ") == null);
@@ -91528,7 +91567,7 @@ test "threaded server: legacy GRANT remains inactive and cannot arm override" {
     a.reset();
     t.reset();
     try writeAllFd(fd_a, "GRANT target ircop client_kill\r\n");
-    try recvUntil(&a, "stored inactive legacy record for target", 300);
+    try recvUntil(&a, "mesh display grant stored for target", 300);
     try writeAllFd(fd_t, "PING :narrow-inactive\r\n");
     try recvUntil(&t, "PONG", 200);
     try std.testing.expect(std.mem.indexOf(u8, t.written(), "MODE T -j") == null);
@@ -91579,12 +91618,13 @@ test "threaded server: legacy GRANT and REVOKE never announce oper prefix transi
     try writeAllFd(fd_bystander, "JOIN #grants\r\n");
     try recvUntil(&bystander, " 366 Watcher #grants ", 200);
 
-    // OCG1 records are retained for compatibility telemetry only. Neither a
-    // grant nor a tombstone can project session authority or derived +Y/-Y.
+    // Local GRANT/REVOKE store mesh display grants. They must not elevate a
+    // local session (OPER/DEOPER remains authority) and must not project +Y/-Y
+    // for locally-homed attachments — those stay configured-local.
     admin.reset();
     bystander.reset();
     try writeAllFd(fd_admin, "GRANT target ircop client_kill\r\n");
-    try recvUntil(&admin, "stored inactive legacy record for target", 300);
+    try recvUntil(&admin, "mesh display grant stored for target", 300);
     try writeAllFd(fd_admin, "PING :grant-observe-inactive\r\n");
     try recvUntil(&admin, "PONG", 200);
     try std.testing.expect(std.mem.indexOf(u8, admin.written(), " OBSERVE oper ") == null);
@@ -91595,7 +91635,7 @@ test "threaded server: legacy GRANT and REVOKE never announce oper prefix transi
     admin.reset();
     bystander.reset();
     try writeAllFd(fd_admin, "GRANT target ircop client_kill,oper_override\r\n");
-    try recvUntil(&admin, "stored inactive legacy record for target", 300);
+    try recvUntil(&admin, "mesh display grant stored for target", 300);
     try writeAllFd(fd_admin, "PING :override-observe-inactive\r\n");
     try recvUntil(&admin, "PONG", 200);
     try std.testing.expect(std.mem.indexOf(u8, admin.written(), " OBSERVE oper ") == null);
@@ -91606,7 +91646,7 @@ test "threaded server: legacy GRANT and REVOKE never announce oper prefix transi
     admin.reset();
     bystander.reset();
     try writeAllFd(fd_admin, "REVOKE target\r\n");
-    try recvUntil(&admin, "stored inactive legacy tombstone for target", 300);
+    try recvUntil(&admin, "mesh display grant tombstoned for target", 300);
     try writeAllFd(fd_admin, "PING :revoke-observe-inactive\r\n");
     try recvUntil(&admin, "PONG", 200);
     try std.testing.expect(std.mem.indexOf(u8, admin.written(), " OBSERVE oper ") == null);
@@ -91727,6 +91767,23 @@ test "mesh OCG1 GRANT converges records but never authorizes sessions or prefixe
     }, &wire_buf);
     try std.testing.expect(server.applyMeshGrant(wire_buf[0..refresh_len], signer.public_key.toBytes()));
     try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "+Y") == null);
+
+    // RemoteLegacy was already projected; a same-privilege remint stays silent
+    // (the 30s anti-entropy spam class).
+    resetTestSendQ(watcher);
+    const remote_refresh_len = try oper_cred_share.sign(signer, .{
+        .account = "RemoteLegacy",
+        .privilege_bits = override_bits,
+        .class = "netadmin",
+        .title = "",
+        .issuer_node = "grant-origin.test",
+        .incarnation = 2,
+        .issued_ms = now,
+        .expiry_ms = now + Server.oper_grant_ttl_ms,
+    }, &wire_buf);
+    try std.testing.expect(server.applyMeshGrant(wire_buf[0..remote_refresh_len], signer.public_key.toBytes()));
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "+Y") == null);
+    try std.testing.expect(std.mem.indexOf(u8, watcher.send_buf[0..watcher.send_len], "-Y") == null);
 
     // A higher-incarnation legacy record still converges without changing any
     // live session projection.

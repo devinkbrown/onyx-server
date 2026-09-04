@@ -3054,14 +3054,15 @@ pub const S2sPeer = struct {
         var surfaced_nick: ?[]const u8 = null;
         var skip_displace = false;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
-        // P2 (F1 store-side blank): the account PERSISTED into the route table is
-        // the wire account ONLY when this claim's residence proof verifies; else
-        // "". A forged (untrusted) incumbent is therefore stored account-less and
-        // can NEVER later let a TRUSTED newcomer `remote_same_account`-merge with
-        // it on a third node (route_table compares against the STORED incumbent
-        // account). Blank by default so a part (present=false) is also account-
-        // less; set below for a trusted present claim.
+        // Roster account persistence:
+        // - Residence-trusted (SESSION_REPLICA_V2 proof) → store wire account
+        //   with account_trusted=true (collision short-circuits may use it).
+        // - Origin-authenticated signed peer (Mooring + signing) → store wire
+        //   account for display (oper `*` / WHOIS 330 / grant→nick) with
+        //   account_trusted=false so F1 collision stays fail-closed.
+        // - Otherwise blank: forged/unauthenticated claims stay account-less.
         var store_account: []const u8 = "";
+        var store_account_trusted = false;
         const residence = self.accountResidenceDecision(ev.account, ev.nick, ev.origin_node);
         // A non-v2 claim for an identity already governed by retained signed
         // token authority is a downgrade, not an ordinary untrusted collision.
@@ -3093,14 +3094,17 @@ pub const S2sPeer = struct {
             prior_alias = true;
         }
         if (ev.present) {
-            // Design C (F1): the plaintext wire `account` is only honored by the
-            // same-identity collision short-circuits when a residence proof
-            // verifies for exactly this (account, origin) — per claim, over an
-            // origin-authenticated link, against receiver-owned keys. When
-            // false, resolveIncomingNick blanks the account internally so the
-            // claim takes the conservative UID path.
+            // Design C (F1): collision short-circuits require residence trust.
+            // Roster display account is broader: a Mooring-authenticated signed
+            // peer is already the origin of the MEMBERSHIP claim, so its wire
+            // account is safe to persist for oper-prefix / WHOIS projection.
             const account_trusted = residence == .trusted;
-            store_account = if (account_trusted) ev.account else "";
+            const peer_authenticated = self.peer_supports_signing and self.remote_node_id != 0;
+            store_account_trusted = account_trusted;
+            store_account = if (account_trusted or (peer_authenticated and ev.account.len != 0))
+                ev.account
+            else
+                "";
             if (!prior_alias) switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc, ev.account, account_trusted)) {
                 .keep => {},
                 .rename_to_uid => |uid| {
@@ -3133,7 +3137,8 @@ pub const S2sPeer = struct {
                         .username = ev.username,
                         .realname = ev.realname,
                         .host = ev.host,
-                        .account = store_account, // P2: only the trusted account is persisted
+                        .account = store_account,
+                        .account_trusted = store_account_trusted,
                         .real_host = ev.real_host,
                         .certfp = ev.certfp,
                         .session_token = session_token,
@@ -3153,7 +3158,8 @@ pub const S2sPeer = struct {
             .username = ev.username,
             .realname = ev.realname,
             .host = ev.host,
-            .account = store_account, // P2: blanked unless residence-trusted
+            .account = store_account,
+            .account_trusted = store_account_trusted,
             .real_host = ev.real_host,
             .certfp = ev.certfp,
             .session_token = session_token,
@@ -3265,6 +3271,7 @@ pub const S2sPeer = struct {
             .realname = incumbent.realname,
             .host = incumbent.host,
             .account = incumbent.account,
+            .account_trusted = incumbent.account_trusted,
         };
 
         var incumbent_delta = try self.ownedNickDelta(new_nick, incumbent_uid, incumbent_ident);
@@ -3830,12 +3837,9 @@ pub const S2sPeer = struct {
         // mesh node) makes the RENAMER the loser: redirect it to its mesh UID
         // instead of clobbering the holder. A same-node incumbent is the user's
         // own prior nick, never a collision (resolveIncomingNick handles both).
-        // Design C (F1): the wire account is only honored by the same-identity
-        // short-circuits when a residence proof verifies (per claim, receiver-
-        // owned keys, origin-authenticated link); else it is blanked internally
-        // and the claim takes the conservative UID path. P2: the account PERSISTED
-        // via renameNick is likewise the wire account only when trusted, so a
-        // forged rename is stored account-less (no later coexistence merge).
+        // Design C (F1): collision short-circuits honor the wire account only when
+        // residence verifies. Display may still keep a signed-peer account with
+        // account_trusted=false so grant→nick / WHOIS work without opening F1.
         const old_residence = self.accountResidenceDecision(ev.account, ev.old_nick, ev.origin_node);
         const new_residence = self.accountResidenceDecision(ev.account, ev.new_nick, ev.origin_node);
         // A downgraded rename can move a retained signed identity away from its
@@ -3844,11 +3848,17 @@ pub const S2sPeer = struct {
         // rename remains bound to the new identity claim.
         if (old_residence == .reject or new_residence == .reject) return;
         const account_trusted = new_residence == .trusted;
+        const peer_authenticated = self.peer_supports_signing and self.remote_node_id != 0;
+        const store_account: []const u8 = if (account_trusted or (peer_authenticated and ev.account.len != 0))
+            ev.account
+        else
+            "";
         const ident = MemberIdentity{
             .username = ev.username,
             .realname = ev.realname,
             .host = ev.host,
-            .account = if (account_trusted) ev.account else "",
+            .account = store_account,
+            .account_trusted = account_trusted,
         };
         var old_nick: []const u8 = ev.old_nick;
         var old_uid_buf: [nick_collision_uid_len]u8 = undefined;
@@ -8281,7 +8291,7 @@ test "a same-account MEMBERSHIP that is NOT newer keeps the live local session (
     try std.testing.expectEqualStrings("kain", changes[0].nick); // real nick, NOT a UID
 }
 
-test "P2 (F1): an UNTRUSTED MEMBERSHIP is STORED account-less (no verifier ⇒ blanked)" {
+test "P2 (F1): an UNTRUSTED MEMBERSHIP keeps display account without collision trust" {
     const allocator = std.testing.allocator;
     var tc = TestClock{ .now_ms = 10 };
     var a_state = ChannelCrdt.init(allocator, 1);
@@ -8307,16 +8317,17 @@ test "P2 (F1): an UNTRUSTED MEMBERSHIP is STORED account-less (no verifier ⇒ b
     try b.startHandshake(b_to_a.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x8EE);
 
-    // No residence verifier ⇒ the wire account is untrusted. It must be blanked in
-    // the STORE, not just at resolve time: a forged incumbent persisted account-less
-    // can never let a later TRUSTED newcomer remote_same_account-merge with it.
+    // No residence verifier ⇒ the wire account is untrusted for collision, but a
+    // Mooring-authenticated signed peer still stores it for display (grant→nick).
+    // F1: account_trusted stays false so a forged incumbent cannot remote_same_account.
     try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x8EF);
 
     const members = b.channelMembers("#room");
     try std.testing.expectEqual(@as(usize, 1), members.len);
     try std.testing.expectEqualStrings("kain", members[0].nick);
-    try std.testing.expectEqualStrings("", members[0].account); // blanked, NOT the wire "kain"
+    try std.testing.expectEqualStrings("kain", members[0].account); // display account retained
+    try std.testing.expect(!members[0].account_trusted); // collision must not honor it
 
     const changes = try b.takeMembershipChanges();
     defer {
@@ -8363,6 +8374,7 @@ test "P2 (F1): a TRUSTED MEMBERSHIP is STORED with the real account (verified �
     try std.testing.expectEqual(@as(usize, 1), members.len);
     try std.testing.expectEqualStrings("kain", members[0].nick);
     try std.testing.expectEqualStrings("kain", members[0].account); // real account preserved
+    try std.testing.expect(members[0].account_trusted);
 
     const changes = try b.takeMembershipChanges();
     defer {
@@ -8397,13 +8409,16 @@ test "P2 (F1): a forged UNTRUSTED incumbent grants NO coexistence to a later TRU
     try b.startHandshake(b_to_a.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xAEE);
 
-    // Node a forges an UNTRUSTED account=kain (no verifier yet) — stored blanked.
+    // Node a forges an UNTRUSTED account=kain (no verifier yet) — display may
+    // retain the string, but account_trusted stays false so identityNickClaim
+    // blanks it for collision.
     try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 100, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xAEF);
     {
         const members = b.channelMembers("#room");
         try std.testing.expectEqual(@as(usize, 1), members.len);
-        try std.testing.expectEqualStrings("", members[0].account); // forged incumbent is account-less
+        try std.testing.expectEqualStrings("kain", members[0].account);
+        try std.testing.expect(!members[0].account_trusted);
     }
     {
         const changes = try b.takeMembershipChanges();
@@ -8411,10 +8426,9 @@ test "P2 (F1): a forged UNTRUSTED incumbent grants NO coexistence to a later TRU
         allocator.free(changes);
     }
 
-    // The forged incumbent (a, account="") must grant NO same-account coexistence
-    // to a genuinely TRUSTED newcomer from a different node — because the stored
-    // incumbent account is blank, `remote_same_account` cannot fire. The newcomer
-    // is contested on the deterministic (hlc,node) tiebreak, never merged.
+    // The forged incumbent must grant NO same-account coexistence to a genuinely
+    // TRUSTED newcomer from a different node — identityNickClaim ignores the
+    // display-only account, so remote_same_account cannot fire.
     const decision = b.routes.resolveIncomingNick("kain", b_short ^ 0x1, 200, "kain", true);
     try std.testing.expect(decision != .remote_same_account);
 }
