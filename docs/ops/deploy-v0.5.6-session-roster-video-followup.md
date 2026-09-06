@@ -7,6 +7,10 @@ delivery after certificate-backed session resume. It also records the paired
 Onyx client deployment that makes Edge video-call startup visible immediately
 and keeps the video stage docked instead of covering chat.
 
+> **Historical snapshot (2026-07).** This record preserves the exact release-time
+> paths and service names. Do not use it as a current deployment target; current
+> fleet paths are maintained in [`onyx-server-paths.md`](onyx-server-paths.md).
+
 ## Immutable release inputs
 
 | Item | Value |

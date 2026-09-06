@@ -79,6 +79,16 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Example: `AUDIT PROOF JSON 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`
 - Sources: `src/daemon/modules/oper_security.zig:178`, `src/daemon/server.zig:27536`
 
+## SESSIONS
+
+- Syntax: `SESSIONS [oper|user] [tls|clear] [nick-glob] [account=<glob>] [ip=<glob>] [sort=connected] [limit=N]`
+- Description: Read-only operator connection inventory across all reactor shards. It excludes S2S links, reports registered clients with nick/account/IP/TLS/operator state, applies optional filters, sorts by connection age, and caps output with `limit=` (default bounded by the handler).
+- Privileges: Oper.
+- Replies: `RPL_TRACEUSER 205` rows followed by `RPL_ENDOFTRACE 262`; invalid filters and over-large result sets are server notices.
+- Errors: `ERR_NOPRIVILEGES 481` and invalid-filter/too-many-match notices.
+- Example: `SESSIONS tls account=alice sort=connected limit=20`
+- Sources: `src/daemon/modules/oper_security.zig:179`, `src/daemon/server.zig:29116` (`handleSessions`), `src/daemon/svc_sessionview.zig`
+
 ## KILL
 
 - Syntax: `KILL <nick> [:reason]`

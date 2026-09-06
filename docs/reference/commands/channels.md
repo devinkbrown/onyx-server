@@ -160,6 +160,16 @@ The channel command module registers the base membership and moderation commands
 - Example: `RENAME #old #new :new name`
 - Sources: `src/daemon/modules/channel_ops.zig:68`, `src/daemon/server.zig:13869`
 
+## CHANBADWORDS
+
+- Syntax: `CHANBADWORDS <#channel> <ADD|DEL|LIST> [pattern]`
+- Description: Maintains a durable, case-insensitive substring filter for one channel. Matching messages from non-operators/non-opers are blocked; the list survives restart through account services.
+- Privileges: Channel operator or network oper; the caller must be on the channel for ordinary channel-op checks.
+- Replies: Notices for each listed pattern and add/delete outcome, followed by an end marker for `LIST`.
+- Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`, or temporary service errors.
+- Example: `CHANBADWORDS #zig ADD slur`
+- Sources: `src/daemon/modules/channel_ops.zig:69`, `src/daemon/server.zig:22100` (`handleChanbadwords`), `src/daemon/svc_chanbadwords.zig`
+
 ## AKICK
 
 - Syntax: `CHANNEL AKICK <#channel> <ADD|DEL|LIST> [mask] [reason...]`

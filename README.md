@@ -17,7 +17,7 @@ voice/video), adds class-based connection policy with bounded growable SendQ/Rec
 nick-delay protection, and replaces the legacy TS6 server-to-server protocol with the
 native **Undertow + Mooring** cryptographic mesh.
 
-**Quick links:** [Download v0.5.6 (latest published)](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6) · source **0.7.0** (`build.zig.zon`) · [Quickstart](docs/guide/00-quickstart.md) ·
+**Quick links:** [Download v0.5.6 (latest published)](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6) · source **0.7.0** (`build.zig.zon`) · [verified live fleet](docs/ops/onyx-server-paths.md) · [Quickstart](docs/guide/00-quickstart.md) ·
 [Documentation](docs/README.md) · [Architecture](docs/architecture/00-overview.md) ·
 [Command reference](docs/reference/commands/_index.md) ·
 [Contributing](CONTRIBUTING.md) · [Runbook](docs/RUNBOOK.md) ·
@@ -73,6 +73,15 @@ provenance attestation — see [`packaging/`](packaging/README.md) to rebuild an
 verify it yourself (`packaging/verify-release.sh`).
 The current public release is checksum-verified but unsigned; the packaging guide
 states the exact trust boundary and independent rebuild path.
+
+### Current verified fleet
+
+As of **2026-09-06**, `eshmaki.me` and `ircx.us` are both running
+`0.7.0+ae78d490` from `onyx-server.service`. Their `/proc/<pid>/exe` files match
+SHA-256 `0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c` and
+both report `links_active=1`, `peers_up=1`, `partitioned=0` on the loopback
+metrics endpoint. This is a live-deployment baseline, not a promise that a
+fresh clone is already deployed; the checkout itself is at `4d469f79`.
 
 ## Highlights
 
@@ -172,8 +181,11 @@ The [`docs/`](docs/README.md) tree is grounded in, and cites, the live source:
 `USR2` hot-upgrades, serving IRCv3/IRCX clients and a browser WebSocket client. The
 surface includes full IRCv3 + IRCX + SASL, in-process channel/nick services, class-based
 connection policy, a single runtime flood guard, `+j` network raid protection, and
-spam-trap honeypots. The tree is 900+ Zig source files (300+ daemon modules) with a
-deterministic-simulation test suite, all building under Zig 0.17-dev.
+spam-trap honeypots. The checkout currently contains 857 tracked Zig files (848
+under `src/`, including 229 daemon files and 13 enabled dispatch modules) with a
+deterministic-simulation test suite, all building under Zig 0.17-dev. The exact
+unit names, paths, image hash, and mesh gauges are maintained in
+[`docs/ops/onyx-server-paths.md`](docs/ops/onyx-server-paths.md).
 
 ## Contributing
 

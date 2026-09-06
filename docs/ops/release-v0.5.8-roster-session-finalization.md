@@ -1,5 +1,10 @@
 # Roster and session finalization rollout
 
+> **Historical release record (reconciled 2026-09-06).** This immutable
+> deployment note is retained for its exact artifact and acceptance evidence.
+> It predates the current 0.7.0 fleet; use [`onyx-server-paths.md`](onyx-server-paths.md)
+> for current paths, hash, service state, and mesh health.
+
 Deployed 2026-08-14 from source commit `793d26d` (`0.5.8+793d26d`).
 
 ## Scope

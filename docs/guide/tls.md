@@ -140,7 +140,14 @@ A hardened TLS 1.2 client and server engine also exists as standalone modules (`
 
 **Certificate validation (client):** chain-to-trust-anchor signature checks (RSA-PSS/PKCS#1, ECDSA P-256/P-384, Ed25519), SAN dNSName matching, validity-window enforcement when a wall clock is supplied (the live HTTPS and ACME paths pass one), ExtendedKeyUsage `serverAuth` on the leaf, `keyCertSign` plus basicConstraints on path CAs, and X.509 Name Constraints (permitted/excluded dNSName subtrees).
 
-**Revocation and transparency parsers:** clean-room, fail-closed parsing modules exist for OCSP responses (`crypto/ocsp.zig`, RFC 6960), X.509 CRLs (`crypto/crl.zig`, RFC 5280), and Certificate Transparency SCTs (`crypto/sct.zig`, RFC 6962). These parse and expose status and structure; cryptographic signature verification and live wiring into the handshake are not yet enabled.
+**Revocation and transparency:** clean-room parsers exist for OCSP responses
+(`crypto/ocsp.zig`, RFC 6960), X.509 CRLs (`crypto/crl.zig`, RFC 5280), and
+Certificate Transparency SCTs (`crypto/sct.zig`, RFC 6962). The `armor ocsp`
+and `armor crl` commands now perform fail-closed offline signature/status and
+freshness checks when given `-verify -CAfile`; they never fetch HTTP data. Daemon
+handshake revocation enforcement (including policy/config wiring) is still not
+enabled, so a parsed or CLI-verified response is not evidence that live client
+handshakes are being revoked.
 
 ## Delegated credential helper
 
@@ -176,9 +183,21 @@ armor verify -CAfile ca.pem cert.pem                # verify a chain against a C
 armor ciphers                                       # list supported suites, groups, sig schemes
 armor dgst -sha256 file                             # digest (HMAC key is read from a file, never argv)
 armor asn1parse -in cert.der                        # dump a DER structure
+armor ocsp -in response.der -inform DER -text       # inspect a stapled OCSP response
+armor ocsp -in response.der -inform DER -verify -CAfile ca.pem
+armor crl -in revoked.crl -inform DER -verify -CAfile ca.pem
+armor s_client -connect 127.0.0.1:6697 -servername irc.example.net -CAfile ca.pem
 ```
 
-The full verb set is `x509`, `genpkey`, `pkey`, `req`, `dgst`, `verify`, `rand`, `ciphers`, and `asn1parse`; `s_client`, `s_server`, `enc`, `ocsp`, and `crl` are reserved and exit `3` (not implemented). Run `armor <cmd> --help` for per-command options. Exit codes are scriptable: `0` ok, `1` operation failed, `2` usage error, `3` not implemented (`src/cli/armor_main.zig:33`). Its focused tests run under `zig build test-cli`.
+The implemented verb set is `x509`, `genpkey`, `pkey`, `req`, `dgst`, `verify`,
+`rand`, `ciphers`, `asn1parse`, `ocsp`, `crl`, and `s_client`. `ocsp`/`crl` are
+offline display/verify tools; `s_client` currently proves a loopback TLS client
+handshake and accepts `-connect`, `-servername`, `-CAfile`, and `-alpn`, but its
+live public-connect follow-up is not complete. `s_server` and `enc` remain
+explicit stubs and exit `3` (not implemented). Run `armor <cmd> --help` for
+per-command options. Exit codes are scriptable: `0` ok, `1` operation failed,
+`2` usage error, `3` not implemented (`src/cli/armor_main.zig:33`). Focused
+coverage runs under `zig build test-cli`.
 
 ## STS
 

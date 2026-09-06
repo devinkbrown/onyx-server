@@ -22,21 +22,24 @@ description: >
   - Ed25519 ctx sign: `orochi-ed25519ctx-v1` with dual-verify of legacy `onyx-ed25519ctx-v1`
   - SPAKE: `orochi-spake2-*`; frozen tsumugi/MZ labels stay for interop only
 
-## Live dual-node (production mesh)
+## Live dual-node (production mesh; verified 2026-09-06)
 | Node | Host | Runtime dir | Unit | Binary | Config |
 |------|------|-------------|------|--------|--------|
-| A | eshmaki.me (this box) | `/home/kain/orochi-run` | `orochi.service` | `…/orochi` | `orochi.local.toml` |
-| B | ircx.us | `/home/trev/orochi-run` (SSH `trev@ircx.us`) | `orochi.service` | peer binary | peer toml |
+| A | eshmaki.me (this box) | `/home/kain/onyx-server-run` | `onyx-server.service` | `…/onyx-server` | `onyx-server.local.toml` |
+| B | ircx.us | `/home/trev/onyx-server-run` (SSH `trev@ircx.us`) | `onyx-server.service` | `…/onyx-server` | `onyx-server.local.toml` |
 
 - Metrics (loopback): `http://127.0.0.1:9130/metrics`
 - Gauges: `onyx_s2s_tcp_active` = open TCP slots; `onyx_s2s_links_active` = Mooring-established only
 - Journal success: `mesh S2S established (secured) peer=…`
 - Stuck `tcp_active>0` + `links_active=0` → AKE / trust-root / handshake skew (not "down" TCP)
 - Health: `MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics`
+- Current verified image on both nodes: `0.7.0+ae78d490`, SHA-256
+  `0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c`.
 - Chat (optional): `tools/mesh_chat_smoke.py` — SASL via `MESH_SMOKE_SASL_*` or guest auto when unset
 - Prefer **Helix USR2** reload when image token allows; cold-restart only per RUNBOOK
 - Deploy checklist: `docs/ops/mesh-metrics-deploy-checklist.md` + `docs/RUNBOOK.md`
-- Packaging unit may still say `onyx-server.service`; **live** units are `orochi.service`
+- Packaged and live unit names are both `onyx-server.service`; do not infer current
+  topology from historical `orochi.service` records.
 
 ## Gates
 | Iterate | Ship |

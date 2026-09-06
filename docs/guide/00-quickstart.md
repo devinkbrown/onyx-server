@@ -56,8 +56,10 @@ zig build run -- etc/onyx-server.reference.toml
 
 `src/main.zig` treats the first non-command argument as the config file path. It
 reads up to 1 MiB, parses the file, maps it onto `server.Config`, and stores the
-path for live `REHASH`. If the file is missing or invalid, boot logs the error
-and keeps defaults instead of aborting.
+path for live `REHASH`. The development CLI logs a missing/invalid file and keeps
+defaults, but the packaged production unit runs `--check-config` in
+`ExecStartPre` and therefore fails closed before binding if validation fails.
+Always run `--check-config` explicitly before a reload or cold start.
 
 The default listener port is `6680` before config overlay. The boot sequence then
 installs the configured network name, ISUPPORT limits, mesh identity, SASL
@@ -92,10 +94,13 @@ After the basic setup, define connection classes under `[class.<name>]` to contr
 - For a public node: [Production TLS card](tls.md#production-tls-card) (DNS, ACME,
   `ws_plain = false`) — also summarized in [`packaging/README.md`](../../packaging/README.md).
 - Download the verified static binary and quickstart from the public
-  [`v0.5.7` release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.7),
+  [`v0.5.6` release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6),
   or independently rebuild it with `packaging/release.sh`. The published path
   passed checksum, reproducibility, config, IRC, and WebSocket download smoke;
   it is currently unsigned, so do not imply signature-backed provenance.
 - Read the [runbook](../RUNBOOK.md) before deploying or hot-upgrading a live node.
+- For the verified two-node production baseline, use
+  [`docs/ops/onyx-server-paths.md`](../ops/onyx-server-paths.md); its current
+  image is separate from the public `v0.5.6` download channel.
 - Read [testing.md](testing.md) for the focused roadmap gates and long-run verbose
   assurance lanes.

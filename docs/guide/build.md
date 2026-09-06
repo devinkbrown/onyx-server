@@ -13,33 +13,48 @@ only for the platform syscalls that require it.
 
 ## Common targets
 
+The table below is reconciled with `zig build --help` (2026-09-06). Every focused
+test lane has a `-verbose` sibling; verbose lanes print each test and timing.
+
 | Command | What it does | Source |
 |---|---|---|
-| `zig build` | Builds and installs `zig-out/bin/onyx-server` and the `armor` crypto CLI (`zig-out/bin/armor`). | `build.zig` |
-| `zig build run -- <config.toml>` | Builds, installs, then runs the daemon with forwarded args. | `build.zig` |
-| `zig build test` | Runs module tests and executable-root tests. | `build.zig` |
-| `zig build test -Dtest-filter=<text>` | Runs tests whose names contain the filter. | `build.zig` |
-| `zig build test-mod -Dtest-filter=<text>` | Runs only the library/module test artifact with the optional filter. | `build.zig` |
-| `zig build test-exe -Dtest-filter=<text>` | Runs only the executable-root test artifact with the optional filter. | `build.zig` |
-| `zig build test-tls` | Runs focused Armor TLS/mTLS/ECH/RPK/DC tests. | `build.zig` |
-| `zig build test-server` | Runs focused daemon/server integration and auth tests. | `build.zig` |
-| `zig build test-config` | Runs focused TOML/config parsing and boot-projection tests. | `build.zig` |
-| `zig build test-ircx` | Runs focused IRCX, PROP, ACCESS, DATA, LISTX, MODEX, and SACCESS tests. | `build.zig` |
-| `zig build test-event-spine` | Runs focused event-spine, EVENT, observe, and playback tests. | `build.zig` |
-| `zig build test-mesh` | Runs focused Undertow mesh, S2S, repair, and secured-link tests. | `build.zig` |
-| `zig build test-media` | Runs focused media, DTLS-SRTP, SFU, native-media, WebTransport, RTP, and RTCP tests. | `build.zig` |
-| `zig build test-services` | Runs focused services, account, SASL, TOTP, WebAuthn, session, and MEMO tests. | `build.zig` |
-| `zig build test-helix` | Runs focused Helix upgrade, migration, resume, capsule, and handoff tests. | `build.zig` |
-| `zig build test-cli` | Runs the `armor` crypto CLI toolkit tests. | `build.zig` |
-| `zig build test-smoke` | Runs `check` plus focused TLS/server/config suites. | `build.zig` |
-| `zig build test-roadmap` | Runs `check` plus focused server roadmap suites. | `build.zig` |
-| `zig build all-checks` | Runs deterministic pre-push checks: `check`, WASM build, full tests, bounded fuzz replay, and BoGo shim self-tests. | `build.zig` |
-| `zig build test-verbose` | Runs full tests with per-test progress output. | `build.zig` |
-| `zig build all-checks-verbose` | Runs deterministic pre-push checks with per-test progress output for the full suite. | `build.zig` |
-| `zig build check` | Type-checks the daemon without emitting a binary. | `build.zig` |
-| `zig build wasm` | Builds browser-facing CadenceVox/CadenceVis codec and transport WASM modules. | `build.zig` |
-| `zig build release` | Builds an optimized stripped daemon with `ReleaseFast`. | `build.zig` |
-| `zig build package` | Stages the ReleaseFast daemon, reference config, and systemd unit into the install prefix. | `build.zig` |
+| `zig build` / `zig build install` | Install the debug daemon and `armor` CLI into `zig-out/bin`. | `build.zig` |
+| `zig build uninstall` | Remove artifacts from the selected install prefix. | `build.zig` |
+| `zig build run -- <config.toml>` | Build/install, then run the daemon with forwarded args. | `build.zig` |
+| `zig build test-mod [-Dtest-filter=<text>]` | Run only library/module tests. | `build.zig` |
+| `zig build test-exe [-Dtest-filter=<text>]` | Run only executable-root tests. | `build.zig` |
+| `zig build test-tls` | Armor TLS, mTLS, ECH, RPK, delegated-credential, and record-size tests. | `build.zig` |
+| `zig build test-server` | Daemon/server integration and authentication tests. | `build.zig` |
+| `zig build test-exploit` / `test-attack` | Adversarial exploit corpus; `test-attack` is an alias. | `build.zig` |
+| `zig build test-config` | TOML parsing, boot projection, and reference-config tests. | `build.zig` |
+| `zig build test-ircx` | IRCX, PROP, ACCESS, DATA, LISTX, MODEX, and SACCESS tests. | `build.zig` |
+| `zig build test-event-spine` | Event Spine, EVENT, observe, policy, and playback tests. | `build.zig` |
+| `zig build test-mesh` | Undertow mesh, S2S, repair, and secured-link tests. | `build.zig` |
+| `zig build test-media` | Media, DTLS-SRTP, SFU, native media, WebTransport, RTP, and RTCP tests. | `build.zig` |
+| `zig build test-services` | Services, account auth, SASL, TOTP, WebAuthn, sessions, and MEMO tests. | `build.zig` |
+| `zig build test-session` | Reusable-session, migration, replica, World restore, and Helix session tests. | `build.zig` |
+| `zig build test-helix` | Helix upgrade, migration, resume, capsule, and handoff tests. | `build.zig` |
+| `zig build test-dst` | Seed-replayable DST, simulator, and multi-reactor timer-guard tests. | `build.zig` |
+| `zig build test-cli` | `armor` crypto CLI toolkit tests. | `build.zig` |
+| `zig build test` | Full module plus executable-root test suite. | `build.zig` |
+| `zig build test-smoke` | `check` plus fast TLS/server/config smoke suites. | `build.zig` |
+| `zig build test-roadmap` | `check` plus focused server-roadmap suites. | `build.zig` |
+| `zig build test-verbose` | Full suite with per-test progress output. | `build.zig` |
+| `zig build test-*-verbose` | Verbose sibling for each focused lane, including smoke and roadmap. | `build.zig` |
+| `zig build wasm` | Build browser CadenceVox/CadenceVis codec and transport WASM modules. | `build.zig` |
+| `zig build check` | Type-check the daemon without emitting a binary. | `build.zig` |
+| `zig build ct-check` | Opt-in dudect-style constant-time statistical harness. | `build.zig` |
+| `zig build bench` | Offline 0.7 parse, tag, fan-out, cross-shard, and accept-rate measurements. | `build.zig` |
+| `zig build bench-live [-- --quick]` | Throwaway loopback daemon axes: TLS, shards, ring settings, JOIN/PRIVMSG RTT, RSS. | `build.zig` |
+| `zig build fuzz` / `zig build fuzz --fuzz` | Bounded TLS-parser corpus replay, or coverage-guided mode. | `build.zig` |
+| `zig build quic-interop-server` | Build standalone QUIC/HTTP3 interop server. | `build.zig` |
+| `zig build quic-interop-wt-server` | Build standalone WebTransport browser interop server. | `build.zig` |
+| `zig build bogo-shim` | Build the standalone BoGo TLS shim. | `build.zig` |
+| `zig build bogo-shim-test` | Build and self-drive BoGo shim loopback exit-code smokes. | `build.zig` |
+| `zig build all-checks` | Deterministic pre-push gate: check, WASM, full tests, bounded fuzz, BoGo self-tests. | `build.zig` |
+| `zig build all-checks-verbose` | Same deterministic gate with full test progress. | `build.zig` |
+| `zig build release` | Build an optimized, stripped `ReleaseFast` daemon. | `build.zig` |
+| `zig build package` | Stage daemon, reference config, and systemd unit into the install prefix. | `build.zig` |
 
 `-Dtest-filter=<text>` is a build option. Do not pass `-- --test-filter`; that
 does not configure the build graph and can run far more than intended. See the

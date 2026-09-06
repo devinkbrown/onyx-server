@@ -5,15 +5,20 @@ organized as a **feature spine in four waves** plus three **release tracks**
 (performance, hardening, polish) that cut across every wave. Ambitious about
 where the stack goes; honest about what is in the tree today.
 
-Current daemon version: **0.5.8** (`build.zig.zon:18`). The target of this
-document is **0.7.0**.
+Current daemon version: **0.7.0** (`build.zig.zon:18`), source HEAD
+`4d469f79` (reconciled 2026-09-06). The original 0.7 acceptance work is
+closed; this roadmap remains the forward-looking feature spine and labels
+historical gap analyses where they no longer describe the tree.
 
 ## What 0.7 is
 
 0.5.x has been a *capability* series: TLS 1.3 + ECH + PQ verify, the Undertow
 mesh, Helix USR2, OCG2 staging, group E2EE authority, a media plane with live
-DTLS terminators. The tree is **842 Zig files / ~590k lines**, and almost every
-subsystem listed in Waves 1–4 below already has a substantial kernel in it.
+DTLS terminators. At the 2026-09-06 reconciliation the source tree contains
+**851 Zig files / 598,630 lines**; `src/daemon/server.zig` is **102,407 lines**.
+The historical 0.5.x counts in older design notes are retained only as snapshots.
+Almost every subsystem listed in Waves 1–4 below already has a substantial kernel
+in it.
 
 0.7 is deliberately **not** another *new-subsystem* series. It is the
 extremely major release (still `0.7.0`) where the daemon is *measured, proven,
@@ -27,9 +32,9 @@ The original three tracks still apply:
 | Track           | Prefix | Question it answers              | Why it is 0.7                                                                                                   |
 | --------------- | ------ | -------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | **Feature**     | `S-xx` | What can the daemon do?          | Close the half-activated subsystems (OCG2, group E2EE, DST) rather than open new ones.                          |
-| **Performance** | `P-xx` | What does it cost?               | There is **no** `bench` **step in** `build.zig` — every performance claim in this repo is currently unmeasured. |
-| **Hardening**   | `H-xx` | What breaks it?                  | The adversarial corpus is 45 tests; coverage-guided fuzzing is blocked upstream; DST has no build step.         |
-| **Polish**      | `L-xx` | Can a human use and maintain it? | `src/daemon/server.zig` is **102,152 lines**; `HELP` covers **6 topics** against **159 registered commands**.   |
+| **Performance** | `P-xx` | What does it cost?               | `zig build bench` and `zig build bench-live` now provide reproducible offline and loopback measurements; new claims still require an artifact. |
+| **Hardening**   | `H-xx` | What breaks it?                  | The classified exploit gate reports 158/158; `zig build test-dst` provides a seeded ≥2-reactor timer-guard model. |
+| **Polish**      | `L-xx` | Can a human use and maintain it? | `HELP`/command metadata and the current registry are maintained in the command reference; source remains a large monolith by design. |
 
 
 The four tracks are ordered by how much they gate a release, not by how
@@ -41,7 +46,7 @@ Companion: **[onyx](../../onyx/docs/ROADMAP-2026-Q4.md)** `docs/ROADMAP-2026-Q4.
 client half. Items whose wire contract spans both repos are listed once in each
 file and reconciled in [§ Cross-cutting](#cross-cutting-server--client-wire-contracts).
 The unified per-release view across both repos is
-`[releases/0.7-ROADMAP.md](releases/0.7-ROADMAP.md)`.
+[`releases/0.7-MAJOR-ROADMAP.md`](releases/0.7-MAJOR-ROADMAP.md).
 
 This roadmap does **not** supersede the existing planning documents; it sits
 above them and points into them:
@@ -127,16 +132,17 @@ path, and each one's blast radius is the whole daemon.
 **P0** · `src/`, `build.zig` · **client: none**
 
 `zig build test-exploit` (alias `test-attack`) exists and runs a filter on
-`"exploit:"` (`build.zig:302-311`). It currently selects **45** tests spread
+`"exploit:"`. The current classified gate reports **158/158** tests spread
 across at least ten modules — `substrate/undertow/s2s_peer.zig`, `route_table.zig`,
 `burst.zig`, `daemon/flood_guard.zig`, `daemon/server.zig`, `proto/names_reply.zig`,
 `proto/sasl_mechrouter.zig`, `proto/irc_line.zig`, `proto/membership_event.zig`,
 `proto/color_strip.zig`.
 
 `[research/exploit-suite-blueprint.md](research/exploit-suite-blueprint.md)`
-specifies a dedicated `src/security/exploit/` tree with a harness. **That
-directory does not exist.** The corpus is real but structurally scattered, which
-means nobody can answer "what attack classes are covered?" without grepping.
+describes a dedicated `src/security/exploit/` tree as design intent. That
+directory is still not the source layout; the committed manifest and the
+`test-exploit` gate are the current coverage index, so the historical 45-test
+count below must not be used as a present-day total.
 
 **Accept:** a corpus index — either the blueprint's tree or an equivalent
 manifest — that names each attack class, its coverage, and its gaps. The
@@ -649,11 +655,10 @@ into 0.8+ without re-discovering them.
 
 # Track P — Performance
 
-**The premise of this track is that we do not currently know how fast the daemon
-is.** `build.zig` defines thirty-odd steps — `test-`* lanes, `check`, `wasm`,
-`fuzz`, `ct-check`, `bogo-shim`, `release`, `package` — and **not one of them is
-a benchmark.** Every performance claim in this repository is therefore an
-assertion, including the ones in this file.
+**The original premise of this track was that we did not know how fast the daemon
+was.** That gap is closed: `zig build bench` and `zig build bench-live` now cover
+offline and throwaway loopback workloads. Every new performance claim still needs
+an artifact with workload, host, and configuration details.
 
 So P-01 is not merely first by convention; nothing else in this track can be
 accepted without it. An item here that says "reduce X" and cannot show a
@@ -674,10 +679,10 @@ reframe what "optimize the daemon" even means in 0.7:
 **P0** · `build.zig`, new `bench/` · **client: none**
 **Owner:** `onyx-server-perf` · **Complexity:** M · **Gate:** `zig build bench` (new)
 
-There is no `bench` step in `build.zig`. Grepping the file for `bench` or `perf`
-returns exactly one hit, and it is the word "perform" inside a comment on line 6.
-The daemon has `hdr_histogram.zig` and `ddsketch.zig` in `src/substrate/`, so
-the measurement primitives are already in-tree and unused for this purpose.
+The current `bench` and `bench-live` steps are wired in `build.zig`, with the
+standalone workload and shell wrapper documented in
+[`dev/benchmarks.md`](dev/benchmarks.md). The historical no-benchmark finding is
+retained only in the release-plan audit; it is no longer a current gap.
 
 The lane must be **reproducible and committed**, not a script someone ran once:
 a fixed workload, a fixed seed, a machine-readable result, and a checked-in
@@ -981,9 +986,10 @@ allocation to a budgeted path fails `zig build bench`, not review.
 **P3** · `build.zig`, `src/daemon/server.zig` · **client: none**
 **Owner:** `zig-coder` · **Complexity:** M · **Gate:** `zig build check`
 
-Developer iteration speed is a performance surface too. `server.zig` at 102,152
-lines is a single compilation unit that nearly every focused test lane pulls in,
-and the full suite is ~6,280 tests (`build.zig:718`).
+Developer iteration speed is a performance surface too. `server.zig` at 102,407
+lines is a single compilation unit that nearly every focused test lane pulls in.
+The full-suite count is intentionally read from the current `zig build test
+--summary all` output rather than hard-coded here (`build.zig:718`).
 
 **Accept:** measured `zig build check` and `zig build test` wall-clock before and
 after L-01's decomposition, on a stated machine. This item is mostly a
@@ -1112,21 +1118,19 @@ threshold and its sample count rather than reporting a bare pass.
 ### H-05 — Deterministic simulation as a build step
 
 **P0** · `src/substrate/sim.zig`, `src/substrate/fault_loom.zig`, `build.zig` · **client: none**
-**Owner:** `onyx-server-dst` · **Complexity:** L · **Gate:** `zig build dst` (new)
+**Owner:** `onyx-server-dst` · **Complexity:** L · **Gate:** `zig build test-dst`
 
 S-15 in the feature spine covers this; it is repeated here because it is a
-**hardening prerequisite**, not just a feature. `fault_loom.zig` has three
-consumers, all Helix DST harnesses, and there is no `dst` step in `build.zig` —
-so DST cases run inside the ordinary suite with no way to vary a seed or run a
-campaign.
+**hardening prerequisite**, not just a feature. The current `test-dst` step runs
+the bounded timer-guard model at `N>=2` and prints deterministic failure seeds.
+It does not claim to execute live `LinuxServer.onTimerTick` I/O.
 
 For a daemon whose hardest failures are mesh convergence, USR2-under-fault, and
 cross-shard ordering, seeded replay is the difference between "we fixed it" and
 "we saw it once."
 
-**Accept:** `zig build dst` runs seeded campaigns over a configurable seed range
-and **prints the failing seed**. A red campaign replays deterministically from
-that seed alone.
+**Accept (landed):** `zig build test-dst` runs the seeded model and **prints the
+failing seed**. A red campaign replays deterministically from that seed alone.
 
 ### H-06 — USR2 under fault injection
 
@@ -1225,9 +1229,11 @@ previous run is visible. **No corpus-wide pass is claimed without the artifact.*
 # Track L — Polish
 
 **The premise of this track is that a daemon a human cannot navigate, and a
-command surface a user cannot discover, are both defects.** The two headline
-numbers are `src/daemon/server.zig` at **102,152 lines** and `HELP` at **6
-topics** against **159 registered commands**.
+command surface a user cannot discover, are both defects.** The historical
+headline numbers were `HELP` at **6 topics** against **159 registered commands**;
+at the 2026-09-06 reconciliation `src/daemon/server.zig` is **102,407 lines**,
+the current module registry contains 158 names, and the command reference is
+reconciled to that registry.
 
 Neither is a bug in the sense that anything computes the wrong answer. Both are
 the kind of debt that makes every *other* item in this file more expensive, which
@@ -1238,8 +1244,8 @@ is why they belong in a release rather than in a someday list.
 **P0** · `src/daemon/server.zig` · **client: none**
 **Owner:** `zig-coder` · **Complexity:** XL (0.7 takes the first slice) · **Gate:** `zig build check` + `zig build test`
 
-`src/daemon/server.zig` is **102,152 lines** — roughly **17%** of the entire
-590,831-line Zig tree in one file, and more than ten times the next largest
+`src/daemon/server.zig` is **102,407 lines** — roughly **17%** of the entire
+598,630-line Zig tree in one file, and more than ten times the next largest
 (`src/daemon/services.zig`, 9,765).
 
 It contains, verified: the `ConnState` struct (`:2447`), a private io_uring
@@ -1551,7 +1557,8 @@ must land in the v2 contract before its client item is marked done.
 
 ## Gates
 
-Per-subsystem focused lanes that exist today, all from `build.zig`:
+Per-subsystem focused lanes that exist today, all from `build.zig` (reconciled
+2026-09-06):
 
 ```bash
 zig build check              # type-check, no binary
@@ -1568,19 +1575,19 @@ zig build test-services      # services, account, SASL, TOTP, WebAuthn, session,
 zig build test-session       # reusable-session, migration, replica, World restore
 zig build test-cli           # the armor CLI toolkit
 zig build test-smoke         # fast semantic + TLS/server/config smoke
-zig build test               # full suite (~6,280 tests)
+   zig build test               # full suite (count reported by the gate)
 zig build fuzz               # bounded corpus replay; --fuzz for coverage-guided
 zig build ct-check           # opt-in dudect-style constant-time harness
 zig build bogo-shim-test     # BoGo shim loopback self-tests
 zig build all-checks         # check + wasm + full tests + bounded fuzz + BoGo self-tests
 ```
 
-**Two lanes this roadmap proposes and that do not exist yet.** Both are
-themselves roadmap items, not assumed infrastructure:
+**The two lanes proposed by the original snapshot now exist:**
 
 ```bash
 zig build bench              # P-01 — reproducible workloads vs a committed baseline
-zig build dst                # H-05 — seeded simulation campaigns, prints failing seed
+zig build bench-live         # live loopback workload matrix
+zig build test-dst           # H-05 — seeded timer-guard model, prints failing seed
 ```
 
 Deployment is a separate, human-gated decision. `--check-config` runs **first** —
@@ -1641,41 +1648,41 @@ if it cannot be pointed at, it is not met.
 standards WebRTC interop (S-27), and the full `server.zig` decomposition. 0.7 is
 finish-and-prove, not finish-everything.
 
-## Known documentation drift
+## Known documentation drift (historical findings; reconciled 2026-09-06)
 
-Found while grounding this roadmap, recorded here rather than silently fixed.
-Each carries a severity and the agent that owns the fix; **this document does not
-change code.**
+Found while grounding this roadmap. The entries are retained as audit history;
+current status is stated inline and source remains authoritative. **This document
+does not change code.**
 
-**MEDIUM — stale claim in a design doc.**
+**MEDIUM — stale claim in a design doc (closed).**
 `[dev/tls-roadmap.md](dev/tls-roadmap.md)` Phase 4 item 4.3 describes DTLS as
 "full DTLS 1.2/1.3 + DTLS-SRTP lib, **no live listener**." That is stale:
 `src/daemon/media_plane.zig:22-23` imports `dtls12_server` and `dtls13_server`,
 and `media_plane.zig:111-116` carries a live `dtls_enabled` flag, a per-peer
 `dtls_server.Terminator`, and its session table. The library is wired into the
-media plane. *Owner:* `doc-writer`*.*
+media plane, while a full public DTLS listener remains intentionally cut.
+*Owner:* `doc-writer`*.*
 
-**MEDIUM — blueprint describes a tree that does not exist.**
+**MEDIUM — blueprint describes a tree that does not exist (design intent).**
 `[research/exploit-suite-blueprint.md](research/exploit-suite-blueprint.md)`
-specifies a `src/security/exploit/` tree. That directory does not exist; the
-corpus is 45 `test "exploit:` cases distributed across production modules and
-selected by the `build.zig:304` filter. See S-01 and H-01. *Owner:*
-`onyx-server-hardener` *(decide tree-or-manifest), then* `doc-writer`*.*
+specifies a `src/security/exploit/` tree. That directory is not the current source
+layout; the classified manifest and `zig build test-exploit` (158/158) are the
+accepted coverage surface. See S-01 and H-01. *Owner:* `onyx-server-hardener`
+*(manifest path accepted), then* `doc-writer`*.*
 
-**LOW — hub omissions.** `[README.md](README.md)` does not link `docs/audit/` or
-`docs/ops/`, both of which contain current operational material — `docs/ops/`
-alone holds 24 release runbooks. See L-09. *Owner:* `doc-writer`*.*
+**LOW — hub omissions (closed).** `[README.md](README.md)` now links the
+canonical live-fleet and operational references; audit/runbook links remain under
+`docs/`. See L-09. *Owner:* `doc-writer`*.*
 
-**HIGH — dead performance surface.** Every `RingFeatures` fast path in
+**HIGH — dead performance surface (still deferred).** Every `RingFeatures` fast path in
 `src/daemon/server.zig:866-872` is unreachable at runtime. `baseline` is
 all-false (`:875`), the server config field defaults to it (`:1972`), it is
 passed unchanged into `RingCore.init` (`:4359`), and the `[io]` config section
 exposes only `cqe_batch` (`config_format.zig:1335`,
 `etc/onyx-server.reference.toml:462-464`). **Expected:** a runtime-probed
-feature set on a modern kernel. **Actual:** plain accept/recv/send on every
-deployment. **Trigger:** any deployment — this is the default and only path.
-This is a *capability* gap rather than a correctness bug, and no document in
-`docs/` currently claims otherwise, so it is not a doc correction — it is P-02.
+feature set on a modern kernel. **Actual:** plain accept/recv/send on the current
+deployment; only ownership-safe flags are exposed. This remains a capability gap,
+not a documentation claim, and multishot/buf-ring stay deferred.
 *Owner:* `onyx-server-reactor`*.*
 
 **MEDIUM — duplicated subsystem.** Two io_uring implementations coexist:
@@ -1685,12 +1692,13 @@ on the daemon's path) and the private `ringlane` namespace at
 `user_data` codec and the fail-closed `probe` narrowing — is the one not
 running. See P-06. *Owner:* `onyx-server-reactor`*.*
 
-**MEDIUM — DST seam incomplete.** `src/substrate/reactor.zig` covers only
+**MEDIUM — DST seam incomplete (bounded model shipped).** `src/substrate/reactor.zig` covers only
 monotonic and wall-clock time; `submit/poll/accept/recv/send` are deferred to
 "M1 when Ringlane (io_uring) is implemented" (`reactor.zig:9-10`). Any
 documentation implying the daemon can currently run its **I/O** against the
-deterministic simulator would be wrong — time is abstracted, I/O is not. See
-H-05, P-06. *Owner:* `onyx-server-dst`*.*
+deterministic simulator would be wrong — time is abstracted, I/O is not. The
+`test-dst` lane covers the timer-guard model only. See H-05, P-06. *Owner:*
+`onyx-server-dst`*.*
 
 **LOW — upstream toolchain defect, correctly documented in-tree.**
 Coverage-guided `zig build fuzz --fuzz` builds and starts, then crashes in

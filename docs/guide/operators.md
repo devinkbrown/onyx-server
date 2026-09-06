@@ -188,7 +188,7 @@ Operator sessions and S2S links are exempt. The sweep reuses the registration ch
 
 ## Host cloaking
 
-By default every client's real IP is hidden behind an HMAC [cloak](../reference/host-cloaking.md), configured under `[cloak]`. Two 0.4.0 changes affect operators.
+By default every client's real IP is hidden behind an HMAC [cloak](../reference/host-cloaking.md), configured under `[cloak]`. Two changes first introduced in 0.4.0 (and retained in the current 0.7.0 source line) affect operators.
 
 ### Argon2id key derivation (migration note)
 

@@ -5,6 +5,17 @@
 This runbook describes the shipped tree. For full configuration details, use
 [reference/config.md](reference/config.md) and `etc/onyx-server.reference.toml`.
 
+## Verified fleet baseline (2026-09-06)
+
+Both production nodes are `active/running` under `onyx-server.service` and run
+`0.7.0+ae78d490` from their `onyx-server-run` directories. The executable SHA-256
+on both nodes is
+`0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c`.
+Loopback metrics show `tcp_active=1`, `links_active=1`, `peers_up=1`,
+`partitioned=0`, and one mesh component on each side. The source checkout may be
+newer; the canonical paths/evidence table is
+[docs/ops/onyx-server-paths.md](ops/onyx-server-paths.md).
+
 ## Operator Model
 
 Onyx Server runs as a long-lived network daemon with:

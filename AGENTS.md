@@ -2,7 +2,7 @@
 
 ## Product naming
 
-- **Engine / product:** **Onyx Server** (pure-Zig IRC/IRCX mesh daemon). Binary/package names: `onyx-server`. Live process may still be named `orochi`.
+- **Engine / product:** **Onyx Server** (pure-Zig IRC/IRCX mesh daemon). Binary/package names and live process name: `onyx-server`. `orochi` remains only in frozen protocol labels and explicitly historical records.
 - **Network / client brand:** **Onyx** (consumer-facing). IRCXNet is retired public identity only.
 - **English subsystem codenames** (docs/comments): **Undertow**, **Ripple**, **Concord**, **Mooring**, **Armor**, **Helix**, **Ringlane**, **CadenceVox** / **CadenceVis**. Map: `docs/reference/glossary.md`.
 - **Keep as-is (not product renames):** `onyx-*` agent/skill IDs; wire/config literals (`onyx/*` caps/tags, crypto domain labels, `ONYX_*` env); frozen dual-verify domains (`orochi-ed25519ctx-v1` + legacy `onyx-ed25519ctx-v1`).
@@ -63,14 +63,18 @@ After toolkit changes:
 
 ## Live dual-node (short)
 
-| Node | Runtime | Unit |
-|------|---------|------|
-| eshmaki.me | `/home/kain/orochi-run` | `orochi.service` |
-| ircx.us (`trev@ircx.us`) | peer `orochi-run` | `orochi.service` |
+| Node | Runtime | Binary | Config | Unit |
+|------|---------|--------|--------|------|
+| eshmaki.me | `/home/kain/onyx-server-run` | `…/onyx-server` | `…/onyx-server.local.toml` | `onyx-server.service` |
+| ircx.us (`trev@ircx.us`) | `/home/trev/onyx-server-run` | `…/onyx-server` | `…/onyx-server.local.toml` | `onyx-server.service` |
 
 Metrics: `:9130/metrics` — `links_active` = established Mooring; `tcp_active` = TCP only.  
 Health: `MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics`  
-Details: `docs/ops/mesh-metrics-deploy-checklist.md`, skill `onyx-server-mesh-ops`.
+As verified on 2026-09-06, both nodes run `0.7.0+ae78d490` with artifact SHA-256
+`0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c` and report
+`links_active=1`, `peers_up=1`, and `partitioned=0`. Details and refresh commands:
+`docs/ops/onyx-server-paths.md`, `docs/ops/mesh-metrics-deploy-checklist.md`, and
+skill `onyx-server-mesh-ops`.
 
 ## Git and deployment safety
 

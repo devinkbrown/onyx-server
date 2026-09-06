@@ -1,5 +1,10 @@
 # Onyx Server 0.5.7 — E2EEGROUP opaque control
 
+> **Historical release record (reconciled 2026-09-06).** This immutable
+> deployment note is retained for its exact artifact and acceptance evidence.
+> It predates the current 0.7.0 fleet; use [`onyx-server-paths.md`](onyx-server-paths.md)
+> for current paths, hash, service state, and mesh health.
+
 **Status:** dual-node production deploy **completed** (2026-07-28). This document
 keeps the original pre-deploy product truth below and adds the executed
 activation record.
@@ -170,8 +175,9 @@ These gaps remain after the dual-node server deploy above:
 
 - Daemon semver: `build.zig.zon` → `0.5.7` (banner / package truth; git short hash
   appended at build time). Live dual-node banner: `0.5.7+b457c33`.
-- Quickstart download links: `README.md`, `docs/guide/00-quickstart.md` → `v0.5.7`
-  (link targets only; this note does **not** assert a published Release asset).
+- Quickstart download links: `README.md`, `docs/guide/00-quickstart.md` → the
+  currently published `v0.5.6` asset (link targets only; this note does **not**
+  assert a published `v0.5.7` Release asset).
 - Client package: `/home/kain/onyx/package.json` → `0.1.1`.
 - Shared contract: keep client copy byte-identical to
   `docs/reference/protocol/onyx-client-contract.v1.json`

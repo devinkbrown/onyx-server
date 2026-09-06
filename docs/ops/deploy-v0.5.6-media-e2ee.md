@@ -6,6 +6,11 @@ This is the executed two-node release record for attachment-safe client-held
 media encryption. It records observed production paths, including legacy unit
 and binary names; those literals are not new product naming.
 
+> **Historical snapshot (2026-07).** The paths and unit names below are immutable
+> evidence for that release. Current production uses `onyx-server.service` and
+> `/home/kain/onyx-server-run` / `/home/trev/onyx-server-run`; see
+> [`onyx-server-paths.md`](onyx-server-paths.md).
+
 ## Immutable release inputs
 
 | Item | Value |

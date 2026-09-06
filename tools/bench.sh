@@ -22,7 +22,7 @@
 #
 # Offline mode (`zig build bench`) never starts the daemon. `--live` boots a
 # throwaway `onyx-server` on 127.0.0.1 with kernel-assigned ports (never
-# 6667/6680/6697, never `orochi.service`). See docs/dev/benchmarks.md.
+# 6667/6680/6697, never a production service unit). See docs/dev/benchmarks.md.
 
 set -euo pipefail
 

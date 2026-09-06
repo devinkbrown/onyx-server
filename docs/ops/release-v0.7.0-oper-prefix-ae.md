@@ -1,5 +1,10 @@
 # Onyx Server 0.7.0 — oper prefix AE / grant→nick fix
 
+> **Historical release record (reconciled 2026-09-06).** This immutable
+> deployment note is retained for its exact artifact and acceptance evidence.
+> It predates the current 0.7.0 fleet; use [`onyx-server-paths.md`](onyx-server-paths.md)
+> for current paths, hash, service state, and mesh health.
+
 Deployment date: 2026-09-04
 
 ## Scope

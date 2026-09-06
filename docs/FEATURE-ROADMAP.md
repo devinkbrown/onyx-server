@@ -19,6 +19,13 @@ work, not a later version.
 **Current versions:** daemon `0.7.0` (`build.zig.zon`) · client `0.1.3`
 (`onyx/package.json`).
 
+**Status snapshot (2026-09-06):** the original daemon P0-0…P0-7 acceptance work is
+closed in source. Source HEAD is `4d469f79`; both production nodes run the same
+`0.7.0+ae78d490` artifact under `onyx-server.service` (see
+[`docs/ops/onyx-server-paths.md`](ops/onyx-server-paths.md)). There is no public
+GitHub `v0.7.0` tag recorded yet. Deferred work remains explicitly labeled below;
+this index is not a claim that every 0.7 major-track item is complete.
+
 ---
 
 ## Document index
@@ -31,7 +38,7 @@ work, not a later version.
 | [`docs/releases/0.7-RELEASE-PLAN.md`](releases/0.7-RELEASE-PLAN.md) | onyx-server | Original 0.7 thesis, version audit, gap analysis (D-1…D-8), P0/P1/P2 backlog, Wave 1 dispatch; now a subset of the major plan |
 | [`onyx/docs/ROADMAP-2026-Q4.md`](../../onyx/docs/ROADMAP-2026-Q4.md) | onyx | Full client feature spine (C-01…C-33) + two release tracks (CP-xx, CL-xx); in-flight work; cross-cutting wire contracts |
 | [`onyx/docs/FEATURE-ROADMAP.md`](../../onyx/docs/FEATURE-ROADMAP.md) | onyx | Client-half unified view; priority tables for C-xx items |
-| [`docs/features/INVENTED-FEATURES-CATALOG.md`](features/INVENTED-FEATURES-CATALOG.md) | onyx-server | F-01…F-68 speculative features grounded at HEAD; Top-20 game-changer shortlist for 0.8+ |
+| [`docs/features/INVENTED-FEATURES-CATALOG.md`](features/INVENTED-FEATURES-CATALOG.md) | onyx-server | F-01…F-68 speculative features grounded at a historical capture and reconciled to current source; Top-20 game-changer shortlist for 0.8+ |
 | [`docs/features/GAME-CHANGERS-50.md`](features/GAME-CHANGERS-50.md) | both | GB/GS/GC-01…50: cross-repo 50 game-changers (15 `Both` · 20 `Server` · 15 `Client`); Top-10 must-ship-for-0.7 shortlist; declared overlap table against F-01…F-68 — see § Relationship to F-01…F-68 in that file |
 | [`onyx/docs/era3-40-game-changers.md`](../../onyx/docs/era3-40-game-changers.md) | onyx | Era-3 client game-changer acceptance ledger (40 items) |
 | [`onyx/docs/PRODUCT_OVERHAUL_ROADMAP.md`](../../onyx/docs/PRODUCT_OVERHAUL_ROADMAP.md) | onyx | Product phases P0–P6, positioning, and visual direction |
@@ -39,22 +46,22 @@ work, not a later version.
 
 ---
 
-## P0 — tag blockers
+## P0 — tag blockers (historical checklist; closed)
 
-Items that must land before the 0.7.0 tag. Every accept condition is a
-verifiable artifact; see the linked detail documents for the full description.
+These were the pre-tag blockers. Every original daemon P0 item is now closed; the
+acceptance commands and detail links remain useful audit pointers.
 
 ### Daemon P0
 
 | # | Item | Owner | Owned slice | Gate |
 | --- | --- | --- | --- | --- |
-| **P0-1** | Benchmark harness — `zig build bench`. Reproducible accept/fan-out/RSS baselines; no perf claim ships without it. | `onyx-server-perf` | `build.zig`, `src/substrate/bench.zig` (new), `tools/bench.sh` (new), `docs/audit/bench-baseline-0.5.8.md` (new) | `zig build bench && zig build check` |
-| **P0-2** | Ringlane unification + modern feature adoption. Retire the inline `server.zig:860` shadow; wire the substrate `ring.zig` capability probe; add `[io]` config keys for multishot accept/recv and buf_ring, **default-off**. Preserves exact-cancel-by-`user_data` and Helix USR2. | `onyx-server-reactor` (lead) · `onyx-server-perf` (measurement) | `src/substrate/io/ring.zig`, `src/daemon/server.zig` (ring seam only), `src/daemon/config_format.zig`, `src/daemon/config_boot.zig` | `zig build test && zig build test-helix && zig build bench` |
-| **P0-3** | Multi-reactor timer-guard audit. Every timer-driven shared/mesh-state mutation is reactor-0-gated or reactor-local, enumerated in one table. **Gates P0-2.** | `onyx-server-mesh` (audit) · `zig-coder` (fixes) | `docs/audit/timer-guard-0.7.md` (new); fixes in `src/daemon/server.zig` if found | `zig build test-mesh` |
-| **P0-4** | DST as a first-class lane — `zig build dst`. Seeded campaigns; failing seed printed. Covers mesh convergence after partition, USR2 under fault injection, and cross-shard delivery ordering. | `onyx-server-dst` | `build.zig` (dst step), `src/substrate/sim.zig`, `src/substrate/fault_loom.zig`, campaign entry points | `zig build dst` |
-| **P0-5** | Exploit corpus classification gate. Per-class counts in `test-exploit`; an unclassified `test "exploit:"` fails the build. Closes [S-01](ROADMAP-2026-Q4.md#s-01--consolidate-the-adversarial-exploit-corpus) and [H-01](ROADMAP-2026-Q4.md#h-01--classify-the-exploit-corpus). | `onyx-server-hardener` | `docs/reference/exploit-corpus.md` (new), `tools/exploit_index.sh` (new), `build.zig` (gate hook) | `zig build test-exploit` |
-| **P0-6** | Land in-flight uncommitted work: `tls_server.zig` (+91), `tls_client.zig` (+17); `server.zig` (+130) — WHOIS unterminated-reply fix, `RPL_YOUREOPER` text, oper-prefix replay on resume. | `armor-tls` (TLS) · `zig-coder` (server) — review: `onyx-server-crypto-reviewer` | `src/crypto/tls_server.zig`, `src/crypto/tls_client.zig`, `src/daemon/server.zig` | `zig build test-tls && zig build test-server && zig build test-exploit` |
-| **P0-7** | Version and release-notes drift. `NEWS.md` entries for 0.5.7 and 0.5.8 reconstructed from git log; `README.md` (v0.5.7) and `packaging/README.md` (v0.5.6) repointed to current. | `doc-writer` | `NEWS.md`, `README.md`, `packaging/README.md` | (documentation — no build gate) |
+| **P0-1** | **Closed 2026-09-04.** Benchmark harness and offline/live artifacts. | `onyx-server-perf` | `build.zig`, `src/substrate/bench.zig`, `tools/bench.sh`, `docs/audit/bench-*.md` | `zig build bench && zig build bench-live` |
+| **P0-2** | **Closed 2026-09-04.** Ownership-safe `io.defer_taskrun`/`io.sqpoll` projection and fail-closed runtime probe; multishot/buf-ring remain deferred. | `onyx-server-reactor` · `onyx-server-perf` | `src/daemon/config_*`, `src/daemon/server.zig` | `zig build test-server && zig build test-config` |
+| **P0-3** | **Closed 2026-09-04.** Timer-guard audit and ≥2-reactor seeded model. | `onyx-server-mesh` · `onyx-server-dst` | `docs/audit/timer-guard-0.7.md`, `src/substrate/timer_guard_dst.zig` | `zig build test-dst` |
+| **P0-4** | **Closed 2026-09-04.** Armor TLS exploit hardening landed. | `armor-tls` | `src/crypto/` | `zig build test-tls && zig build test-exploit` |
+| **P0-5** | **Closed 2026-09-04.** Exploit corpus classified; gate reports 158/158. | `onyx-server-hardener` | `docs/research/exploit-suite-blueprint.md` | `zig build test-exploit` |
+| **P0-6** | **Closed 2026-09-04.** In-flight TLS/server changes landed and reviewed. | `armor-tls` · `zig-coder` | `src/crypto/`, `src/daemon/server.zig` | `zig build test-tls && zig build test-server` |
+| **P0-7** | **Closed 2026-09-06.** Version, release notes, operations, and command-reference drift reconciled. | `doc-writer` | `NEWS.md`, `README.md`, `docs/`, `CONTRIBUTING.md` | `git diff --check` + docs sweep |
 | **H-02** | Close named exploit-coverage gaps: Helix capsule confusion, media-plane malformed inputs, OCG2 authority forgery, mesh `require_signed_frames` fail-closed test. Each needs a rejection test before S-05 advances OCG2 past observe. Detail: [H-02](ROADMAP-2026-Q4.md#h-02--close-the-named-coverage-gaps). | `onyx-server-hardener` | `src/crypto/`, `src/daemon/helix/`, `src/daemon/media_plane.zig`, `src/daemon/ocg2_*.zig` | `zig build test-exploit` |
 | **H-06** | USR2 under fault injection. A campaign injects allocation failure, partial write, and a capsule version mismatch during each upgrade stage; outcome is zero-drop success or clean abort — never a panic. Covers all enabled P0-2 io_uring features. Detail: [H-06](ROADMAP-2026-Q4.md#h-06--usr2-under-fault-injection). | `onyx-server-dst` · `onyx-server-helix-reviewer` | `src/daemon/helix/`, `src/substrate/fault_loom.zig` | `zig build dst && zig build test-helix` |
 
@@ -99,10 +106,10 @@ descriptions in the linked roadmaps.
 | --- | --- | --- | --- |
 | [P1-1 / S-04](ROADMAP-2026-Q4.md#s-04--warden-and-flood-introspection-surface) | Warden + flood introspection surface | `onyx-server-warden` · `onyx-server-ircx` | `zig build test-ircx` |
 | [P1-2 / S-09](ROADMAP-2026-Q4.md#s-09--link-health-and-mesh-observability) | Link health + mesh observability | `onyx-server-mesh` | `zig build test-mesh` |
-| [P1-3](releases/0.7-RELEASE-PLAN.md#p1--targeted-for-07) | Concurrency ceiling Phase C: written decision from P0-1 numbers | `onyx-server-reactor` · `stack-architect` | `docs/design/multireactor-phase-c.md` (new) |
+| [P1-3](releases/0.7-RELEASE-PLAN.md#p1--strongly-wanted-cut-only-under-schedule-pressure) | Concurrency ceiling Phase C: written decision from P0-1 numbers | `onyx-server-reactor` · `stack-architect` | `docs/design/multireactor-phase-c.md` (new) |
 | [P1-4 / S-14](ROADMAP-2026-Q4.md#s-14--helix-capsule-versioning-discipline) | Helix capsule-version discipline check | `onyx-server-helix-reviewer` · `zig-coder` | `zig build test-helix` |
-| [P1-5](releases/0.7-RELEASE-PLAN.md#p1--targeted-for-07) | `[io]` and `[limits]` config surface for new knobs | `onyx-server-config` | `zig build test-config` |
-| [P1-6](releases/0.7-RELEASE-PLAN.md#p1--targeted-for-07) | Documentation drift repair (D-4 stale comment, tls-roadmap DTLS claim) | `doc-writer` | (manual) |
+| [P1-5](releases/0.7-RELEASE-PLAN.md#p1--strongly-wanted-cut-only-under-schedule-pressure) | `[io]` and `[limits]` config surface for new knobs | `onyx-server-config` | `zig build test-config` |
+| [P1-6](releases/0.7-RELEASE-PLAN.md#p1--strongly-wanted-cut-only-under-schedule-pressure) | Documentation drift repair (D-4 stale comment, tls-roadmap DTLS claim) | `doc-writer` | (manual) |
 | [L-05](ROADMAP-2026-Q4.md#l-05--whois-completeness-and-consistency) | `WHOIS` completeness and consistency | `onyx-server-ircx` | `zig build test-ircx` |
 | [L-06](ROADMAP-2026-Q4.md#l-06--operator-ergonomics) | Operator ergonomics (35 oper commands with dry-run + audit trail) | `onyx-server-ircx` | `zig build test-ircx` |
 | [L-12](ROADMAP-2026-Q4.md#l-12--release-runbook-for-07) | Release runbook for 0.7 | `doc-writer` · `onyx-server-deploy` | `docs/ops/release-v0.7.0.md` (new) |
@@ -141,7 +148,7 @@ Full descriptions in the linked roadmaps.
 None of these are required for 0.7. They are tracked so wave-planner can slot
 them into 0.8+ without re-discovery.
 
-- **Daemon F-01…F-68:** [`docs/features/INVENTED-FEATURES-CATALOG.md`](features/INVENTED-FEATURES-CATALOG.md) — full catalog grounded at HEAD. The **Top-20 game-changer shortlist** (ranked by operator value × novelty / cost) is at the top of that file. Highlights: F-39 deep metrics histograms, F-15 account trust ledger, F-52 scheduled delivery, F-08 proofmark federation.
+- **Daemon F-01…F-68:** [`docs/features/INVENTED-FEATURES-CATALOG.md`](features/INVENTED-FEATURES-CATALOG.md) — full speculative catalog with a current-source reconciliation note. The **Top-20 game-changer shortlist** (ranked by operator value × novelty / cost) is at the top of that file. Highlights: F-39 deep metrics histograms, F-15 account trust ledger, F-52 scheduled delivery, F-08 proofmark federation.
 - **Cross-repo 50 game-changers:** [`docs/features/GAME-CHANGERS-50.md`](features/GAME-CHANGERS-50.md) — GB/GS/GC-01…50 spanning daemon and client; carries a **declared overlap table against F-01…F-68** (§ Relationship to F-01…F-68 in that file). Client companion: [`onyx/docs/features/GAME-CHANGERS-50.md`](../../onyx/docs/features/GAME-CHANGERS-50.md).
 - **Client Era-3 game-changers:** [`onyx/docs/era3-40-game-changers.md`](../../onyx/docs/era3-40-game-changers.md) — the 40-item acceptance ledger for client-side game-changers.
 - **Shortlist integration point:** [`docs/ROADMAP-2026-Q4.md` § Invented features](ROADMAP-2026-Q4.md#invented-features--p0-shortlist) lists five high-priority daemon invented features (F-39, F-15, F-52, F-08, F-24) ready to slot into 0.8 wave planning without design work.
@@ -166,9 +173,9 @@ Contract verification: `pnpm check:server-contract` and
 
 ---
 
-## 0.7 exit criteria
+## 0.7 exit criteria (historical; accepted)
 
-The full gate checklist is in [`docs/releases/0.7-RELEASE-PLAN.md` § Gate checklist](releases/0.7-RELEASE-PLAN.md#10-gate-checklist-before-the-070-tag). Every line must be green on a clean tree at the tagging commit.
+The full pre-tag checklist is retained in [`docs/releases/0.7-RELEASE-PLAN.md`](releases/0.7-RELEASE-PLAN.md). Current source/live evidence is in the paths and release documents linked above.
 
 **Summary of non-mechanical gates:**
 
@@ -176,7 +183,7 @@ The full gate checklist is in [`docs/releases/0.7-RELEASE-PLAN.md` § Gate check
 - R-1 cleared: a USR2-under-fault DST campaign covers `buf_ring` enabled before that flag is documented as production-ready.
 - `--check-config` accepts the reference config and every new `[io]` key.
 - `NEWS.md` carries 0.5.7, 0.5.8, and 0.7.0 entries; every performance number traces to a P0-1 artifact.
-- No document contradicts HEAD (P1-6 closed).
+- Documentation synchronization is re-verified in the 2026-09-06 pass; historical snapshots are labeled rather than silently rewritten.
 - `docs/RUNBOOK.md` records the 0.5.x ↔ 0.7.x hot-upgrade compatibility boundary.
 
 **Explicitly not required for 0.7:** Wave 3/4 items, PQ signing (S-26), standards WebRTC interop (S-27), full `server.zig` decomposition, `zig build bench` as a hard CI gate (baseline first), BoGo full-corpus pass claim.
@@ -185,7 +192,7 @@ The full gate checklist is in [`docs/releases/0.7-RELEASE-PLAN.md` § Gate check
 
 ## Drift reconciled
 
-Findings from [`docs/releases/0.7-RELEASE-PLAN.md` § Gap analysis](releases/0.7-RELEASE-PLAN.md#4-gap-analysis--roadmap-versus-head) that affect this document.
+Findings from [`docs/releases/0.7-RELEASE-PLAN.md` § Gap analysis](releases/0.7-RELEASE-PLAN.md#6-gap-analysis--roadmap-vs-head) that affect this document.
 
 ### D-6 — S-12 reclassified from P0 to DONE
 

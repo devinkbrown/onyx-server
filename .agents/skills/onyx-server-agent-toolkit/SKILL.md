@@ -17,7 +17,9 @@ Design rules:
 - Separate implementer, fresh reviewer, gate runner, deployer, and docs authority. Deployment never implies source-edit authority.
 - Prefer a small reusable roster plus task skills over a permanent agent for every directory.
 - **Token-lean agents (standing):** agent bodies stay dense (≤~3 KiB typical; zig-coder ≤~5 KiB). Put deep maps/invariants in skills (`onyx-server-agent-core` + domain skills including `onyx-server-mesh-ops`). Keep routing power in a short MUST-BE-USED description + 1–2 tiny examples + negative boundary — descriptions load on every parent turn. Archives of pre-compact agents live under `~/.claude/agents/_archive/`.
-- Keep `.agents/ROSTER.md` and `AGENTS.md` in sync with live dual-node paths (`orochi.service`, `/home/kain/orochi-run`, metrics `:9130`).
+- Keep `.agents/ROSTER.md`, `AGENTS.md`, and `docs/ops/onyx-server-paths.md` in
+  sync with live dual-node paths (`onyx-server.service`,
+  `/home/kain/onyx-server-run`, `/home/trev/onyx-server-run`, metrics `:9130`).
 
 Use `.agents/skills` as the canonical project skill tree and expose it to Claude through `.claude/skills`. After every authority or launcher change run:
 

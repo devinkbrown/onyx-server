@@ -1,5 +1,12 @@
 # Onyx Server Full-Codebase Security & Correctness Audit
 
+> **Historical audit snapshot.** This review is pinned to `f558447` / `0.5.6`
+> and records the source and deployment assumptions visible on 2026-07-18. It
+> is not a current release or vulnerability-coverage statement. The current
+> source/live distinction, image hash, and mesh health are maintained in
+> [`docs/ops/onyx-server-paths.md`](../ops/onyx-server-paths.md); current attack
+> coverage is tracked by `zig build test-exploit` and the Q4 roadmap.
+
 **Date:** 2026-07-18
 **Revision audited:** `f558447` — *"fix: TLS/crypto audit hardening"* (v0.5.6)
 **Method:** Read-only static trace, adversarial. Six independent Fable-model auditors, one per subsystem, several fanning out their own sub-auditors. No build, sanitizer, or live multi-reactor run.

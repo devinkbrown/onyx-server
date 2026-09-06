@@ -1,5 +1,10 @@
 # OCG2 observe-runtime rollout
 
+> **Historical release record (reconciled 2026-09-06).** This immutable
+> deployment note is retained for its exact artifact and acceptance evidence.
+> It predates the current 0.7.0 fleet; use [`onyx-server-paths.md`](onyx-server-paths.md)
+> for current paths, hash, service state, and mesh health.
+
 Deployment completed at `2026-08-14T08:17:49Z` from source commit
 `17f077719a12fd32528ea2472bdfcc08f24a5844` (`0.5.8+17f0777`).
 

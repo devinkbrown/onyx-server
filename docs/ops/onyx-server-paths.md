@@ -2,6 +2,11 @@
 
 **Product name: Onyx Server.** There is no production service named after legacy codenames.
 
+This is the canonical current-topology document. It was refreshed from both
+systemd units, `/proc/<pid>/exe`, executable hashes, and loopback metrics on
+**2026-09-06**. Re-run the commands below after any deployment; release notes
+preserve the exact historical inputs and are not substitutes for this table.
+
 | | eshmaki.me | ircx.us |
 |--|------------|---------|
 | **systemd unit** | `onyx-server.service` | `onyx-server.service` |
@@ -11,6 +16,22 @@
 | **Metrics** | `http://127.0.0.1:9130/metrics` | same (loopback) |
 | **TLS IRC** | `:6697` | `:6697` |
 | **WSS** | `:8080` | `:8080` |
+
+## Verified fleet baseline (2026-09-06)
+
+| Evidence | eshmaki.me | ircx.us |
+|---|---|---|
+| Service state | `active/running` (`onyx-server.service`) | `active/running` (`onyx-server.service`) |
+| Running image | `0.7.0+ae78d490` | `0.7.0+ae78d490` |
+| Executable SHA-256 | `0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c` | same |
+| `tcp_active` | `1` | `1` |
+| `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
+| `partitioned` / `components` | `0 / 1` | `0 / 1` |
+
+The repository source is now at `4d469f79` (documentation after the deployed
+`ae78d490` code). A new build from this checkout will identify itself as
+`0.7.0+4d469f79`; that is a source fact, not a claim that it is installed on the
+fleet.
 
 ## Day-2 ops
 
@@ -23,6 +44,9 @@ sudo systemctl reload onyx-server   # SIGUSR2 via ExecReload
 
 # Config check without restart
 /home/kain/onyx-server-run/onyx-server --check-config /home/kain/onyx-server-run/onyx-server.local.toml
+
+# Peer config check (run over SSH)
+ssh trev@ircx.us /home/trev/onyx-server-run/onyx-server --check-config /home/trev/onyx-server-run/onyx-server.local.toml
 
 # Dual-node mesh
 MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics

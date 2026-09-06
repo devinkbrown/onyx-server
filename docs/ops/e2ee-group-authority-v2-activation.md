@@ -10,6 +10,12 @@ remains **not** the first-rollout path and is still out of scope for that
 completed cold wave. Detailed inventory and post-activation metrics:
 `docs/ops/release-v0.5.7-e2ee-group-control.md`.
 
+**Current-state pointer (reconciled 2026-09-06):** this is an immutable first-
+activation record, not the current fleet inventory. Both production nodes now run
+`0.7.0+ae78d490` under `onyx-server.service` with one established peer and
+`partitioned=0`; see [`onyx-server-paths.md`](onyx-server-paths.md). The current
+command surface is indexed in [`../reference/commands/_index.md`](../reference/commands/_index.md).
+
 ## First production activation record (2026-07-28)
 
 | Item | Fact |

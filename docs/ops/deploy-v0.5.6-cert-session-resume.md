@@ -6,6 +6,11 @@ This is the executed two-node release record for certificate-backed SASL
 EXTERNAL session resume. It records observed production paths, including legacy
 unit and binary names; those literals are not new product naming.
 
+> **Historical snapshot (2026-07).** The paths and unit names below are immutable
+> evidence for that release. Current production uses `onyx-server.service` and
+> `/home/kain/onyx-server-run` / `/home/trev/onyx-server-run`; see
+> [`onyx-server-paths.md`](onyx-server-paths.md).
+
 ## Immutable release inputs
 
 | Item | Value |
@@ -46,8 +51,8 @@ Helix image; this release was intentionally activated by hard restart.
 ## Activation result
 
 The verified artifact was copied beside each live binary, checked against the
-release SHA, atomically renamed, and activated with `systemctl restart
-orochi.service`. `ircx.us` was restarted and verified first; `eshmaki.me` was
+release SHA, atomically renamed, and activated with the then-current legacy
+service unit. `ircx.us` was restarted and verified first; `eshmaki.me` was
 then restarted and verified. Both units became `active/running`, reported the
 expected banner and SHA, restored their configured grants, and re-established
 one TCP Mooring connection on port 6900.

@@ -1,7 +1,11 @@
 # Staged 0.5.8 → 0.7.0-rc.1 Helix rehearsal
 
-Throwaway loopback only. Not `orochi.service`. Kernel-assigned ports via
-`tools/upgrade_smoke.py`. Predecessor and successor are the musl artifacts in
+> **Historical snapshot (2026-09-04).** This is a throwaway loopback rehearsal,
+> not a production service-unit deployment. Current production evidence is in
+> [`../ops/onyx-server-paths.md`](../ops/onyx-server-paths.md).
+
+Throwaway loopback only. Kernel-assigned ports via `tools/upgrade_smoke.py`.
+Predecessor and successor are the musl artifacts in
 `dist/` (statically linked, stripped).
 
 ## Binaries
@@ -29,4 +33,4 @@ Both runs: 2 shards, 8 filler clients, live TLS + mid-frame wss, bouncer token,
 Zero dropped sessions on every held socket (plain, TLS, wss mid-frame, all
 fillers). Reclaim token unchanged. Fresh client registered after the swap.
 
-This is not a production USR2 of `orochi.service`.
+This is not a production USR2 service-unit record; it is a deterministic loopback rehearsal.

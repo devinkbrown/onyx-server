@@ -15,13 +15,16 @@ disable-model-invocation: true
 Read: `AGENTS.md`, `docs/RUNBOOK.md`, `docs/ops/mesh-metrics-deploy-checklist.md`,
 `packaging/release.sh` / `verify-release.sh` if used, this skill, `onyx-server-mesh-ops`.
 
-## Live topology (authoritative 2026-07)
+## Live topology (verified 2026-09-06)
 | Role | SSH / host | Runtime | Unit | Start |
 |------|------------|---------|------|-------|
-| Local | eshmaki.me | `/home/kain/orochi-run` | `orochi.service` | `…/orochi …/orochi.local.toml` |
-| Peer | `trev@ircx.us` | `/home/trev/orochi-run` (confirm on host) | `orochi.service` | peer paths |
+| Local | eshmaki.me | `/home/kain/onyx-server-run` | `onyx-server.service` | `…/onyx-server …/onyx-server.local.toml` |
+| Peer | `trev@ircx.us` | `/home/trev/onyx-server-run` | `onyx-server.service` | peer paths |
 
-Packaging may still document `onyx-server.service` / `onyx-server-run` — **prefer live paths above**. Confirm with `systemctl cat orochi.service` before acting.
+Packaging and live deployment use the same `onyx-server.service` and
+`onyx-server-run` paths. Confirm with `systemctl cat onyx-server.service` and
+`docs/ops/onyx-server-paths.md` before acting. Historical `orochi.service`
+records are evidence only and are not current targets.
 
 ## Mandatory order (do not reorder)
 1. **One verified release commit** — clean worktree/build provenance; full gates + critical ReleaseSafe as required; artifact revision matches commit.
@@ -30,7 +33,7 @@ Packaging may still document `onyx-server.service` / `onyx-server-run` — **pre
 4. **`--check-config`** on each live toml with the **new** binary before restart. Config `ParseError` must not silently default identity.
 5. **Restart strategy**
    - Prefer **Helix USR2** when the release notes / image token allow seamless reload.
-   - Otherwise hard-restart `orochi.service` **one node at a time**.
+   - Otherwise hard-restart `onyx-server.service` **one node at a time**.
 6. **Mesh verify** — both units active; expected binary;  
    `MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics`  
    Expect `links_active>=1`, `partitioned=0`. Journal: `mesh S2S established`.

@@ -6,6 +6,10 @@ This is the executed two-node follow-up record for negotiated WebSocket media,
 certificate-backed reusable sessions, immediate Onyx rosters, video-panel
 startup/layout, live stats, and registered-account DM encryption.
 
+> **Historical snapshot (2026-07).** This record preserves the exact release-time
+> paths and service names. Do not use it as a current deployment target; current
+> fleet paths are maintained in [`onyx-server-paths.md`](onyx-server-paths.md).
+
 ## Immutable inputs and verification
 
 | Item | Value |

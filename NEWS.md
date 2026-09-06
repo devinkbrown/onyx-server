@@ -15,13 +15,20 @@ stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
 Source version promoted from the `0.7.0-rc.1` stabilization line. Tracks
 `build.zig.zon`. Deployed 2026-09-04 via Helix to `onyx-server.service` on
 `eshmaki.me` and `ircx.us` (`docs/ops/release-v0.7.0.md`). Not a GitHub
-Release asset. The rc.1 notes below are the same contract.
+Release asset or `v0.7.0` tag. The rc.1 notes below are the same contract.
+The post-release oper-display and oper-prefix follow-ups are recorded in
+[`docs/ops/release-v0.7.0-remote-oper-display.md`](docs/ops/release-v0.7.0-remote-oper-display.md)
+and [`docs/ops/release-v0.7.0-oper-prefix-ae.md`](docs/ops/release-v0.7.0-oper-prefix-ae.md).
+The currently running fleet is `0.7.0+ae78d490` with SHA-256
+`0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c` on both
+nodes; the source tree may advance independently of that deployed image.
 
 - **Helix capability bridge.** Advertises current + frozen 0.5.8
   `predecessor_v4` (`sessions-v4`) + `predecessor_v3`. Staged rehearsal of
   real musl `0.5.8+ea249b2` → `0.7.0-rc.1+1e4215a0` passed `UPGRADE` and
   `SIGUSR2` with zero dropped sessions
-  (`docs/audit/upgrade-0.5.8-to-0.7.0-rc.1.md`). Not `orochi.service`.
+  (`docs/audit/upgrade-0.5.8-to-0.7.0-rc.1.md`). That record is a throwaway
+  loopback rehearsal, not a production service-unit deployment.
 - **Armor TLS roadmap complete** against live source (phases 0–5). Fail-closed
   OCSP/CRL/name-constraints/kTLS TX+RX; CT options wired through `http_fetch`.
   DTLS stays cut (media-plane only).

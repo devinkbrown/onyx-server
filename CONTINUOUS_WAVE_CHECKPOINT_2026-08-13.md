@@ -1,5 +1,12 @@
 # Onyx Server continuous-wave checkpoint — 2026-08-13
 
+> **Historical checkpoint.** This wave is an immutable 2026-08-13 evidence
+> packet, not a current deployment claim. Reconciled 2026-09-06: source HEAD is
+> `4d469f79` (`0.7.0`), and the live pair is `0.7.0+ae78d490` under
+> `onyx-server.service` with current mesh evidence in
+> [`docs/ops/onyx-server-paths.md`](docs/ops/onyx-server-paths.md). Preserve the
+> original hashes, test counts, and rollback paths below as historical records.
+
 ## Repository state
 
 - Branch: `main` at baseline `bbeb30e`.

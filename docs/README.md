@@ -7,10 +7,24 @@ clone of any prior daemon. It speaks IRCv3 + IRCX, runs a custom Undertow CRDT m
 forward-secret Mooring server links, and ships its own pure-Zig TLS (Armor), media codecs
 (CadenceVox/CadenceVis), and in-place upgrade (Helix).
 
+**Current source/live distinction (verified 2026-09-06):** the source manifest is
+`0.7.0` at repository commit `4d469f79`; both production nodes run the separately
+recorded `0.7.0+ae78d490` artifact under `onyx-server.service`. See the
+[canonical production paths and evidence](ops/onyx-server-paths.md) before doing
+day-2 operations. The public GitHub release channel still publishes `v0.5.6`;
+source version, deployed image, and public tag are intentionally reported separately.
+
 The current daemon surface includes `[class.*]` connection classes for registration-time
 resource/admission/flood policy, bounded growable SendQ and RecvQ, optional nick-delay
 holds against camping, and live operator introspection through `STATS Y`, `STATS l`, and
 richer `INFO`.
+
+**Documentation baseline (2026-09-06):** source HEAD is `4d469f79` (`0.7.0`);
+the deployed two-node fleet is separately recorded as `0.7.0+ae78d490` under
+`onyx-server.service`. Current paths, executable hash, and mesh gauges are kept
+in [the production evidence table](ops/onyx-server-paths.md). Release notes,
+audits, and checkpoint files retain immutable historical snapshots and are marked
+as such rather than rewritten to current values.
 
 **New here?** Start with the [Quickstart](guide/00-quickstart.md), then the
 [architecture overview](architecture/00-overview.md). The
@@ -105,7 +119,7 @@ authoritative.
 - [**0.7 unified feature roadmap**](FEATURE-ROADMAP.md) — original cross-repo P0/P1/P2 table plus an index of the major tracks
 - [Q4 2026 feature roadmap](ROADMAP-2026-Q4.md) — daemon feature spine (S-01…S-30, P-xx, H-xx, L-xx) with detailed descriptions; linked from the unified roadmap
 - [0.7 release plan](releases/0.7-RELEASE-PLAN.md) — original upgrade-safety / measurement / corpus plan (now a subset of the major roadmap)
-- [Multi-reactor timer-guard audit (0.7)](audit/timer-guard-0.7.md) — 46 periodic tasks enumerated; 29 reactor-0 guard sites; four P0 gaps (P0-3 input)
+- [Multi-reactor timer-guard audit (0.7)](audit/timer-guard-0.7.md) — historical 2026-09-01 enumeration of 46 periodic tasks and 29 reactor-0 guard sites; its P0-3 seeded model is closed, while the audit remains immutable evidence
 - [Invented features catalog](features/INVENTED-FEATURES-CATALOG.md) — F-01 … F-68 speculative features grounded against HEAD; the Top-20 game-changer shortlist is at the top
 - [Project README](../README.md)
 - [Contributing](../CONTRIBUTING.md)

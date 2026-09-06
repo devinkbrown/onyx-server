@@ -257,6 +257,116 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Example: `IDENTITY ADD primary <64-hex-pubkey> <128-hex-signature>`
 - Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleIdentity`, `src/proto/account_identity.zig`
 
+## RECOVERYCODES
+
+- Syntax: `RECOVERYCODES STATUS | GENERATE [password] | CLEAR [password] | LOGIN <account> <code>`
+- Description: Generates a replacement set of single-use account recovery codes, reports the remaining count, clears the set, or consumes one code to log in without a password or TOTP. Generated codes are shown once as `XXXXX-XXXXX` and are never listed again. `GENERATE` requires TLS; the optional password re-checks the logged-in account.
+- Privileges: `STATUS`, `GENERATE`, and `CLEAR` require a logged-in account; `LOGIN` is usable while logged out.
+- Replies: Notices with the count/codes or `RECOVERYCODES: login ok`; consumed codes are immediately spent.
+- Errors: `FAIL RECOVERYCODES ACCOUNT_REQUIRED`, `INSECURE_TRANSPORT`, `AUTH_FAILED`, `NEED_MORE_PARAMS`, `INVALID_SUBCOMMAND`, and temporary/internal store errors.
+- Example: `RECOVERYCODES GENERATE` then `RECOVERYCODES LOGIN alice ABCDE-FGHJK`
+- Sources: `src/daemon/modules/accounts.zig:137`, `src/daemon/server.zig:23370`, `src/daemon/services.zig` recovery-code store
+
+## SETPASS
+
+- Syntax: `SETPASS <current-password> <new-password>` or, on a client-certificate-verified connection, `SETPASS <new-password>`
+- Description: Changes the logged-in account password. The one-argument form is a recovery path permitted only after SASL EXTERNAL proved a client certificate bound to that account. New passwords must satisfy the normal account policy and differ from the current password.
+- Privileges: Registered client logged in to an account; certificate recovery additionally requires the bound TLS client certificate.
+- Replies: `NOTICE` confirming the password change/reset.
+- Errors: `FAIL SETPASS ACCOUNT_REQUIRED`, `WRONG_PASSWORD`, `INVALID_PASSWORD`, `RESET_NOT_AUTHORIZED`, or `TEMPORARILY_UNAVAILABLE`.
+- Example: `SETPASS old-correct-horse new-correct-horse`
+- Sources: `src/daemon/modules/accounts.zig:140`, `src/daemon/server.zig:36837` (`handleSetpass`)
+
+## SUCCESSOR
+
+- Syntax: `SUCCESSOR <#channel> SHOW | SET <account> | CLEAR`
+- Description: Reads or sets the registered channel founder's successor. When the founder account is dropped, the successor is promoted and the stored successor is cleared. `SET` and `CLEAR` are founder-only unless the caller is an oper.
+- Privileges: Registered client for `SHOW`; channel founder or oper for `SET`/`CLEAR`.
+- Replies: Notices describing the current, changed, or cleared successor.
+- Errors: `FAIL SUCCESSOR ACCOUNT_UNKNOWN`, `NOT_FOUNDER`, `INVALID_VALUE`, `INVALID_SUBCOMMAND`, `NEED_MORE_PARAMS`, or temporary account-store errors.
+- Example: `SUCCESSOR #zig SET alice`
+- Sources: `src/daemon/modules/accounts.zig:142`, `src/daemon/server.zig:36974` (`handleSuccessor`)
+
+## ACCOUNT
+
+- Syntax: `ACCOUNT <SUSPEND|UNSUSPEND|FORBID|UNFORBID|NOEXPIRE|INFO> <account> [on|off]`
+- Description: Operator account-lifecycle administration. Suspension and forbiddance block account authentication at the shared SASL success gate; `NOEXPIRE` toggles expiry exemption; `INFO` returns the complete lifecycle flags.
+- Privileges: Oper with the narrower `service_admin` privilege.
+- Replies: `NOTICE` containing the action, account, registration state, and resulting flags.
+- Errors: `ERR_NOPRIVILEGES 481`, `FAIL ACCOUNT ACCOUNT_UNKNOWN`, `BAD_ACCOUNT_NAME`, `INVALID_VALUE`, `NEED_MORE_PARAMS`, or temporary store errors.
+- Example: `ACCOUNT SUSPEND alice`
+- Sources: `src/daemon/modules/accounts.zig:144`, `src/daemon/server.zig:37119` (`handleAccountAdmin`)
+
+## SESSIONTOKEN
+
+- Syntax: `SESSIONTOKEN`
+- Description: Issues a short-lived account-authentication token for SASL `SESSION-TOKEN`. This credential authenticates the account on a later connection; it does not select or reclaim another live `SESSION` attachment.
+- Privileges: Registered client logged in to an account over TLS.
+- Replies: `NOTICE SESSIONTOKEN <account> <token> expires=<unix-seconds>`.
+- Errors: `FAIL SESSIONTOKEN INSECURE_TRANSPORT`, `NOT_LOGGED_IN`, `TOKEN_ISSUE_FAILED`, or temporary account-store errors.
+- Example: `SESSIONTOKEN`
+- Sources: `src/daemon/modules/accounts.zig:153`, `src/daemon/server.zig:37264` (`handleSessionToken`)
+
+## WEBAUTHN
+
+- Syntax: `WEBAUTHN STATUS | REGISTER [label] | REGISTER-FINISH <cred-id> <client-data-json> <authdata> [attestation] | AUTH <account> | AUTH-FINISH <cred-id> <client-data-json> <authdata> <signature> | LIST | REMOVE <cred-id> | RENAME <cred-id> :<label>`
+- Description: Passkey (WebAuthn) registration and passwordless login. `REGISTER`/`REGISTER-FINISH` bind a credential to the logged-in account; `AUTH`/`AUTH-FINISH` issue and verify a single-use challenge; `LIST`, `REMOVE`, `RENAME`, and `STATUS` manage that account's credentials. Attestation and user-verification requirements follow `[webauthn]` configuration.
+- Privileges: Registration and management require a logged-in account; authentication challenge may name an account while logged out. All ceremonies require a configured WebAuthn relying party and fail closed on malformed base64, origin, RP-ID, credential, or signature data.
+- Replies: `WEBAUTHN` challenge/allow-credential lines, status/list notices, and a normal account login notice after a successful assertion.
+- Errors: `FAIL WEBAUTHN NOT_CONFIGURED`, `NOT_LOGGED_IN`, `NO_PENDING`, `BAD_CREDENTIAL_ID`, `BAD_CLIENT_DATA`, `BAD_AUTHDATA`, `BAD_SIGNATURE`, `BAD_ORIGIN`, `RP_MISMATCH`, `ASSERTION_FAILED`, `UNKNOWN_CREDENTIAL`, `CREDENTIAL_ACCOUNT_MISMATCH`, `INVALID_SUBCOMMAND`, and policy/temporary errors.
+- Example: `WEBAUTHN REGISTER phone`
+- Sources: `src/daemon/modules/accounts.zig:155`, `src/daemon/server.zig:38838` (`handleWebauthn`), `src/crypto/webauthn.zig`, `src/daemon/webauthn_creds.zig`
+
+## E2EEGROUP
+
+- Syntax: `E2EEGROUP <#channel> <KEY-PACKAGE|COMMIT|WELCOME> <from-device> [to-account] [to-device] :<opaque-payload>` (operator control: `E2EEGROUP STATUS|ON|OFF`)
+- Description: Relays bounded opaque group-E2EE control records without decrypting or placing payload material in history. Local authoring is fail-closed behind account login, IRCX, `onyx/e2ee`, reusable-session, channel membership, device ownership, and the live peer-capability barrier. `WELCOME` additionally requires the target account/device to be present.
+- Privileges: Logged-in account with the required capabilities; `STATUS`/`ON`/`OFF` require oper control and `E2EEGROUP ON` is refused until current-capable peers meet the activation barrier.
+- Replies: Exact bounded control-line delivery to eligible attachments; `WARN E2EEGROUP AUTHORING_QUIESCED` or temporary warnings when custody/delivery cannot be staged.
+- Errors: `FAIL E2EEGROUP NOT_LOGGED_IN`, `IRCX_REQUIRED`, `CAP_REQUIRED`, `BAD_CHANNEL`, `BAD_KIND`, `BAD_DEVICE`, `BAD_ACCOUNT`, `BAD_PAYLOAD`, `NOT_ON_CHANNEL`, `DEVICE_NOT_OWNED`, `TARGET_UNAVAILABLE`, or `ORIGIN_REJECTED`.
+- Example: `E2EEGROUP #team COMMIT dev-a :<base64url-record>`
+- Sources: `src/daemon/modules/accounts.zig:158`, `src/daemon/server.zig:38144` (`handleE2eeGroup`), `src/proto/e2ee_group_control.zig`, `src/proto/e2ee_group_relay.zig`
+
+## RECOGNIZE
+
+- Syntax: `RECOGNIZE ADD <mask> | DEL <mask> | LIST`
+- Description: Manages the logged-in account's soft host-recognition masks. A matching unauthenticated nick keeps its protected nick past the grace period but receives no account privileges until SASL authenticates.
+- Privileges: Logged-in account owner.
+- Replies: Notices for list entries and add/delete outcomes.
+- Errors: `ERR_NOPRIVILEGES 481`, `ERR_NEEDMOREPARAMS 461`, invalid-mask/list-full notices, or temporary account-service errors.
+- Example: `RECOGNIZE ADD *!*@trusted.example`
+- Sources: `src/daemon/modules/accounts.zig:162`, `src/daemon/server.zig:21807` (`handleRecognize`)
+
+## LISTCHANS
+
+- Syntax: `LISTCHANS`
+- Description: Lists every registered channel for which the logged-in account has a durable access grant, including the access level, then emits an end marker with the count.
+- Privileges: Logged-in account.
+- Replies: `NOTICE LISTCHANS <#channel> <level>` and `End of LISTCHANS (n)`.
+- Errors: `ERR_NOPRIVILEGES 481` when not identified or temporary account-service errors.
+- Example: `LISTCHANS`
+- Sources: `src/daemon/modules/accounts.zig:163`, `src/daemon/server.zig:22071` (`handleListchans`)
+
+## WEBHOOK
+
+- Syntax: `WEBHOOK CREATE <#channel> [name] | LIST <#channel> | DELETE <id>`
+- Description: Creates and manages Discord-compatible incoming webhook bindings. The create response contains the secret URL once; list output never reveals the token. Channel operators and network opers may manage bindings, subject to configured per-channel/network limits.
+- Privileges: Channel operator or oper for each named channel.
+- Replies: Notices with the one-time URL, non-secret metadata, or deletion result.
+- Errors: `ERR_NEEDMOREPARAMS 461`, channel/operator errors, disabled-feature notice, limit errors, or invalid channel/id notices.
+- Example: `WEBHOOK CREATE #alerts bridge`
+- Sources: `src/daemon/modules/webhook.zig:24`, `src/daemon/server.zig:5371` (`handleWebhook`)
+
+## WEBPUSH
+
+- Syntax: `WEBPUSH SUBSCRIBE <endpoint> <p256dh> <auth> | WEBPUSH UNSUBSCRIBE <endpoint> | WEBPUSH LIST`
+- Description: Stores up to three account-scoped browser Push API subscriptions. Endpoints must be HTTPS; `p256dh` and `auth` are the base64url-unpadded values returned by `PushSubscription.getKey()`. Delivery is best-effort and dead endpoints are pruned.
+- Privileges: Logged-in account; the worker must be enabled on the node.
+- Replies: Notices for stored/removed endpoints and list count.
+- Errors: `FAIL WEBPUSH DISABLED`, `ACCOUNT_REQUIRED`, `NEED_MORE_PARAMS`, `INVALID_ENDPOINT`, `INVALID_KEY`, `TOO_MANY_SUBSCRIPTIONS`, `NOT_SUBSCRIBED`, or `INVALID_SUBCOMMAND`.
+- Example: `WEBPUSH SUBSCRIBE https://push.example/sub <p256dh-b64url> <auth-b64url>`
+- Sources: `src/daemon/modules/feature_misc.zig:62`, `src/daemon/server.zig:45281` (`handleWebpush`), `src/proto/webpush.zig`
+
 ## MEMO
 
 - Syntax: `MEMO [LIST|CLEAR|SEND <account> :message|FORWARD [<account>|OFF|NONE]|IGNORE [ADD|DEL|LIST] [<account>]]`

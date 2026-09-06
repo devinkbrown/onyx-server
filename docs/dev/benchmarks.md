@@ -1,11 +1,10 @@
 # Benchmarks — how to run and interpret `zig build bench`
-*Developer guide for the 0.7 measurement harness (`src/substrate/bench.zig`), release plan P0-1.*
+*Developer guide for the 0.7 measurement harness (`src/substrate/bench.zig`), release plan P0-1. Reconciled 2026-09-06.*
 
-Before this harness, no performance claim about Onyx Server was falsifiable: there was no
-`bench` step, no benchmark source, and no recorded baseline anywhere in the tree. The 0.7
-release plan makes that a P0 blocker — **risk R-4**, "performance claims remain unfalsifiable
-if P0-1 slips" — and gates the Performance theme behind it: `zig build bench` must produce a
-baseline before P0-2 (io_uring wins) may claim anything.
+Before this harness, no performance claim about Onyx Server was falsifiable. That historical
+gap is now closed: `zig build bench` and `zig build bench-live` are real build steps and the
+accepted release artifacts live under `docs/audit/`. New claims still need a machine-specific
+artifact; the live fleet's runtime status is not a benchmark result.
 
 This harness establishes that baseline. It is **measurement only**. It deliberately does not
 touch `src/substrate/io/ring.zig`; wiring the modern io_uring feature set is P0-2, owned by
@@ -16,11 +15,11 @@ onyx-server-reactor.
 ```sh
 zig build bench                  # build ReleaseFast + run every row
 tools/bench.sh                   # same, twice, with machine provenance
-tools/bench.sh -o docs/audit/bench-baseline-0.5.8.md
+tools/bench.sh -o docs/audit/bench-baseline-<version>.md
 tools/bench.sh --quick           # smoke check, NOT a baseline
 zig build bench-live             # throwaway daemon: TLS / shards / ring axes
 zig build bench-live -- --quick  # one plaintext live cell
-tools/bench.sh --live -o docs/audit/bench-live-0.7.0-rc.1.md
+tools/bench.sh --live -o docs/audit/bench-live-<version>.md
 ```
 
 `zig build bench` compiles the harness as its own ReleaseFast module and installs it to
@@ -150,7 +149,7 @@ Named gaps. Do not write a claim about any of these from this harness:
 - **Live-daemon axes** — not this harness. Use `zig build bench-live` /
   `tools/bench.sh --live` (`tools/bench_live.py`). That boots a throwaway
   `onyx-server` on 127.0.0.1 with kernel-assigned ports (never 6667/6680/6697,
-  never `orochi.service`), `--check-config` before every boot.
+  never a production service unit), `--check-config` before every boot.
 
 The full P0-1 acceptance criterion in the release plan also names connection-accept rate,
 per-message round-trip latency, fan-out throughput, and RSS per connection with TLS/kTLS and
@@ -163,7 +162,7 @@ TLS / `num_shards` / `ring_entries`×`cqe_batch` matrix. kTLS is the configured 
 
 ```sh
 zig build bench-live -- --quick
-tools/bench.sh --live -o docs/audit/bench-live-0.7.0-rc.1.md
+tools/bench.sh --live -o docs/audit/bench-live-<version>.md
 ```
 
 Default matrix: plaintext at shards 1 and 2, `ring_entries` 32 vs 128, `cqe_batch`
@@ -175,7 +174,7 @@ cell — never silently skipped. Do not fold `bench-live` into `zig build test`.
 ## Recording a baseline
 
 ```sh
-tools/bench.sh -o docs/audit/bench-baseline-0.5.8.md
+tools/bench.sh -o docs/audit/bench-baseline-<version>.md
 ```
 
 Do it on an idle machine with a known governor, and check the two runs agree before

@@ -59,6 +59,16 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Example: `DIRECTORY`
 - Sources: `src/daemon/modules/query_info.zig:73`, `src/daemon/server.zig:28374`, `src/daemon/server.zig:28388`, `src/daemon/server.zig:28415`
 
+## CHANSTATS
+
+- Syntax: `CHANSTATS <TOPUSERS|WORDS|ACTIVITY|RECORD|HELP> [#channel]`
+- Description: Reads the native channel-statistics aggregate. `TOPUSERS` ranks speakers, `WORDS` ranks words of length four or more, `ACTIVITY` reports non-zero UTC hourly totals, and `RECORD` reports aggregate/busiest-day/peak-hour/member records. `HELP` prints the live syntax.
+- Privileges: Registered client. The command is unavailable when `[stats].channel_dir` is empty; callers need not be on the channel, but only existing channels with data return records.
+- Replies: Server notices; no-data and disabled states are explicit.
+- Errors: Usage is returned as a notice; unregistered callers receive `ERR_NOTREGISTERED 451` when statistics are enabled.
+- Example: `CHANSTATS TOPUSERS #zig`
+- Sources: `src/daemon/modules/query_info.zig:84`, `src/daemon/server.zig:48799` (`handleChanstats`), `src/daemon/chanstats.zig`
+
 ## MOTD
 
 - Syntax: `MOTD`

@@ -2,6 +2,11 @@
 
 Deployment date: 2026-09-04
 
+> **Historical release snapshot.** This note records the first 0.7.0 promotion
+> and its immutable artifact. It is not the current fleet inventory; later
+> follow-ups and the deployed `0.7.0+ae78d490` image are tracked in
+> [`onyx-server-paths.md`](onyx-server-paths.md) and `NEWS.md`.
+
 ## Scope
 
 - Promote live fleet from `0.5.8+b2dfb55` to `0.7.0+e4bb3a01`.
@@ -10,8 +15,8 @@ Deployment date: 2026-09-04
   exploit-corpus classification; live bench + staged USR2 rehearsal already on
   `main`.
 
-No config changes. No GitHub Release tag. Units are `onyx-server.service`
-(not `orochi.service`).
+No config changes. No public GitHub Release tag. Units are
+`onyx-server.service` (the retired legacy unit name is not a current target).
 
 ## Immutable release inputs
 

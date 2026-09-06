@@ -26,6 +26,16 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Example: `ISIRCX`
 - Sources: `src/daemon/server.zig:3335`, `src/daemon/modules/ircx.zig:49`, `src/daemon/server.zig:7698`
 
+## AUTH
+
+- Syntax: `AUTH <package> [mechanism/payload]` (repeat with the package-specific SASL exchange)
+- Description: IRCX's SASL-backed authentication transport. The package name selects the same configured mechanisms exposed by IRCv3 SASL (`PLAIN`, `SCRAM-SHA-256`, and `EXTERNAL` in the IRCX discovery list); payloads are handled by the shared SASL router and account success gate. Use IRCv3 `AUTHENTICATE` when the client does not need IRCX framing.
+- Privileges: IRCX-enabled client; registration/account effects follow the selected SASL mechanism.
+- Replies: `RPL_IRCXAUTH` challenge/success/failure lines and the normal account numerics on completion.
+- Errors: Package parsing, SASL, TLS, and account lockout errors from the shared router; malformed exchanges fail closed.
+- Example: `AUTH PLAIN AGFsaWNlAGNvcnJlY3QtaG9yc2U=`
+- Sources: `src/daemon/modules/ircx.zig:68`, `src/daemon/server.zig:33452` (`handleIrcxAuth`), `src/proto/ircx.zig`, `src/proto/sasl_mechrouter.zig`
+
 ## DATA
 
 - Syntax: `DATA <target> <tag> :<message>`

@@ -49,6 +49,12 @@ surfaces. The direction and coverage plan live in
 
 ## Supported versions
 
-Onyx Server is developed on a rolling basis; fixes land on `main` (current release
-line: **0.4.0**). Operators should track `main` and apply security fixes via the
-session-preserving `USR2` hot-upgrade.
+Onyx Server is developed on a rolling basis; fixes land on `main`. The current
+source release line is **0.7.0** (`build.zig.zon:18`). The currently verified
+production pair (`eshmaki.me` and `ircx.us`) runs the `0.7.0+ae78d490` artifact
+under `onyx-server.service`; the public GitHub artifact channel still publishes
+`v0.5.6`. These are deliberately separate source, deployed-image, and public-tag
+claims. Operators should track `main`, verify the exact image and configuration,
+and apply security fixes through the session-preserving `USR2` hot-upgrade. See
+[`docs/ops/onyx-server-paths.md`](docs/ops/onyx-server-paths.md) for the current
+fleet evidence and rollback boundary.

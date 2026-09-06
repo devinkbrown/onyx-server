@@ -1,5 +1,10 @@
 # v0.5.8 Mesh QUIT Event Hotfix
 
+> **Historical release record (reconciled 2026-09-06).** This immutable
+> deployment note is retained for its exact artifact and acceptance evidence.
+> It predates the current 0.7.0 fleet; use [`onyx-server-paths.md`](onyx-server-paths.md)
+> for current paths, hash, service state, and mesh health.
+
 Deployment completed 2026-07-31.
 
 ## Immutable inputs

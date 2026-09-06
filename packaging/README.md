@@ -25,6 +25,14 @@ cryptographically signed**, so verify the checksum and provenance and use the
 source rebuild path below when your threat model requires independent trust.
 There is still no published registry image; Docker remains build-from-source.
 
+The live fleet is tracked separately from the public artifact channel: on
+2026-09-06 both production nodes were verified on `0.7.0+ae78d490` under
+`onyx-server.service` (artifact SHA-256
+`0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c`). The
+checkout can advance beyond that deployed image; consult
+[`docs/ops/onyx-server-paths.md`](../docs/ops/onyx-server-paths.md) for the
+current runtime evidence before replacing a binary.
+
 The daemon binary is always **`onyx-server`**. The release script only prefixes a
 version and target on the *artifact filename*
 (`onyx-server-0.x.y-x86_64-linux-musl`); install/copy it as `onyx-server` (the

@@ -17,7 +17,7 @@ Companion references:
 - ISUPPORT tokens: [protocol/isupport.md](protocol/isupport.md)
 - Web Push / VAPID: [web-push.md](web-push.md)
 - IRCX PROP/ACCESS: [ircx/README.md](ircx/README.md)
-- First-party Onyx CAP filter: `/home/kain/onyx/src/lib/irc/client.ts` (`_wantedCaps`)
+- First-party Onyx CAP filter: `/home/kain/onyx/src/lib/irc/client.ts` (`_wantedCaps`, current body at lines 1344-1357)
 
 ## Source pins
 
@@ -25,7 +25,7 @@ Companion references:
 |---|---|---|
 | Onyx Server CAPs | `cap_specs` in `src/daemon/dispatch.zig:316-445` (`CapId` at `:243`) | this repository HEAD |
 | Onyx Server SASL mechs | `writeSaslCapValue` at `src/daemon/dispatch.zig:1435-1445` | this repository HEAD |
-| Onyx first-party REQ filter | `_wantedCaps` in `/home/kain/onyx/src/lib/irc/client.ts:1193-1245` | Onyx tree HEAD |
+| Onyx first-party REQ filter | `_wantedCaps` in `/home/kain/onyx/src/lib/irc/client.ts:1344-1357` | Onyx tree HEAD |
 | Halloy REQ set | `Capability` + `Capabilities::create_requested` in [data/src/capabilities.rs](https://github.com/squidowl/halloy/blob/d97e05afcc49e036521cd013235d699c04569d17/data/src/capabilities.rs) | commit `d97e05afcc49e036521cd013235d699c04569d17` (2026-07-20) |
 | Halloy marketing list | [README “IRCv3 Capabilities”](https://github.com/squidowl/halloy/blob/d97e05afcc49e036521cd013235d699c04569d17/README.md) | same commit; **REQ list above wins** when they disagree |
 | Halloy release tag | GitHub release `2026.7.2` (2026-06-08) | use for operator install; CAP tokens re-verified against `main` |

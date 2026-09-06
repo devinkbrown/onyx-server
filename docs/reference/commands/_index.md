@@ -2,9 +2,11 @@
 
 *The complete client command surface of the Onyx Server daemon, sourced from the live dispatch path.*
 
-Onyx Server is a pure-Zig 0.17-dev clean-room IRC daemon, built from first principles — not a clone of any prior daemon. This reference documents only the current registered-client source surface: the `dispatchRegistered` path (`src/daemon/server.zig:3413`), the lower connection command table it falls back to (`src/daemon/dispatch.zig:1233`), and the enabled `SerpentRegistry` modules (`src/daemon/modules/manifest.zig:23`).
+Onyx Server is a pure-Zig 0.17-dev clean-room IRC daemon, built from first principles — not a clone of any prior daemon. This reference documents only the current registered-client source surface: the `dispatchRegistered` path (`src/daemon/server.zig:14267`), the lower connection command table it falls back to (`src/daemon/dispatch.zig:1795`), and the enabled `SerpentRegistry` modules (`src/daemon/modules/manifest.zig:23`).
 
-Registry commands default to registered-client access unless the command table sets `.access = .any` or `.access = .oper` (`src/daemon/registry.zig:239`). Registry dispatch maps too few parameters to `ERR_NEEDMOREPARAMS 461`, denied oper commands to `ERR_NOPRIVILEGES 481`, denied registered commands to `ERR_NOTREGISTERED 451`, and disabled feature-gated commands to `ERR_UNKNOWNCOMMAND 421` (`src/daemon/server.zig:3450`). Numeric names and codes are verified against `src/proto/numeric.zig:9` and the server-local enum (`src/daemon/server.zig:701`).
+Registry commands default to registered-client access unless the command table sets `.access = .any` or `.access = .oper` (`src/daemon/registry.zig:51`, `src/daemon/registry.zig:830`). Registry dispatch maps too few parameters to `ERR_NEEDMOREPARAMS 461`, denied oper commands to `ERR_NOPRIVILEGES 481`, denied registered commands to `ERR_NOTREGISTERED 451`, and disabled feature-gated commands to `ERR_UNKNOWNCOMMAND 421` (`src/daemon/server.zig:14389`). Numeric names and codes are verified against `src/proto/numeric.zig` and the server-local enum (`src/daemon/server.zig:1403`).
+
+Last reconciled **2026-09-06** against the enabled module manifest and command registry. Compatibility aliases are listed individually below even when they share one handler or reference page.
 
 | Command | Summary | Reference |
 |---|---|---|
@@ -144,6 +146,40 @@ Registry commands default to registered-client access unless the command table s
 | `LISTX` | IRCX extended channel list. | [ircx.md](ircx.md#listx) |
 | `MEDIA` | Media control plane. | [media.md](media.md#media) |
 | `ACTIVITY` | Activity/presence updates. | [media.md](media.md#activity) |
+
+### Commands added or split out in the 0.7 registry reconciliation
+
+| Command | Summary | Reference |
+|---|---|---|
+| `ACCOUNT` | Operator account lifecycle flags (`SUSPEND`, `UNSUSPEND`, `FORBID`, `UNFORBID`, `NOEXPIRE`, `INFO`). | [accounts-services.md](accounts-services.md#account) |
+| `AUTH` | IRCX SASL-backed package exchange. | [ircx.md](ircx.md#auth) |
+| `CHANBADWORDS` | Durable per-channel substring filter. | [channels.md](channels.md#chanbadwords) |
+| `CHANSTATS` | Channel `TOPUSERS`, `WORDS`, `ACTIVITY`, and `RECORD` views. | [informational.md](informational.md#chanstats) |
+| `DIRECTORY` | Public discovery-directory summary. | [informational.md](informational.md#directory) |
+| `DLINE` | Warden address-ban compatibility alias. | [oper-moderation.md](oper-moderation.md#kline--dline--xline) |
+| `E2EEGROUP` | Bounded opaque group-E2EE control relay. | [accounts-services.md](accounts-services.md#e2eegroup) |
+| `EDIT` | Message edit operation (already documented in messaging). | [messaging.md](messaging.md#edit) |
+| `JUPE` | Mesh server-name quarantine. | [oper-moderation.md](oper-moderation.md#jupe) |
+| `KLINE` | Warden hostmask-ban compatibility alias. | [oper-moderation.md](oper-moderation.md#kline--dline--xline) |
+| `LISTCHANS` | Registered channels where the caller has access. | [accounts-services.md](accounts-services.md#listchans) |
+| `RECOGNIZE` | Account host-recognition list (`ADD`, `DEL`, `LIST`). | [accounts-services.md](accounts-services.md#recognize) |
+| `RECOVER` | Reclaim a protected registered nick. | [accounts-services.md](accounts-services.md#recover) |
+| `RECOVERYCODES` | Single-use offline account recovery codes. | [accounts-services.md](accounts-services.md#recoverycodes) |
+| `RELEASE` | Release a held registered nick. | [accounts-services.md](accounts-services.md#release) |
+| `RESETPASS` | Email-code password reset. | [accounts-services.md](accounts-services.md#resetpass) |
+| `SEARCH` | Search retained message history (already documented in messaging). | [messaging.md](messaging.md#search) |
+| `SESSIONS` | Oper filtered connection inventory. | [oper-moderation.md](oper-moderation.md#sessions) |
+| `SACCESS` | Operator server-access deny/gag/grant/hold rules. | [oper-moderation.md](oper-moderation.md#saccess) |
+| `SESSIONTOKEN` | TLS account-authentication token issuance. | [accounts-services.md](accounts-services.md#sessiontoken) |
+| `SETPASS` | Change or certificate-recover an account password. | [accounts-services.md](accounts-services.md#setpass) |
+| `SPAMTRAP` | Operator spam-trap registry. | [oper-moderation.md](oper-moderation.md#spamtrap) |
+| `SUCCESSOR` | Registered-channel founder successor. | [accounts-services.md](accounts-services.md#successor) |
+| `TOTP` | Account two-factor enrollment and status. | [accounts-services.md](accounts-services.md#totp) |
+| `UNJUPE` | Remove a mesh server-name quarantine. | [oper-moderation.md](oper-moderation.md#unjupe) |
+| `WEBHOOK` | Discord-compatible incoming webhook bindings. | [accounts-services.md](accounts-services.md#webhook) |
+| `WEBAUTHN` | Passkey registration, authentication, and management. | [accounts-services.md](accounts-services.md#webauthn) |
+| `WEBPUSH` | Browser push subscription lifecycle. | [accounts-services.md](accounts-services.md#webpush) |
+| `XLINE` | Warden realname-ban compatibility alias. | [oper-moderation.md](oper-moderation.md#kline--dline--xline) |
 
 ## In-channel fantasy commands
 

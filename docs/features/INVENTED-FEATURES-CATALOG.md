@@ -1,15 +1,27 @@
 # Onyx Server — invented feature catalog
 
 *A speculative, source-grounded catalog of features the daemon does **not** have
-today. Written by `stack-architect` as design input, not as a commitment.*
+today. Written by `stack-architect` as design input, not as a commitment. The
+catalog is intentionally not a release checklist; use the current roadmap and
+command reference for shipped behavior.*
 
 Companion to [`docs/ROADMAP-2026-Q4.md`](../ROADMAP-2026-Q4.md). The roadmap
 tracks **S-01 … S-30** — subsystems that exist and need finishing. This document
 is the other half: **F-01 … F-68**, things that do not exist at all and that the
 existing substrate makes unusually cheap to build.
 
-Daemon at time of writing: **0.5.8**, 842 Zig files, ~590k lines, ~180 commands
-across 13 dispatch modules (`src/daemon/modules/`).
+**Catalog capture baseline (historical):** daemon `0.5.8`, 842 Zig files,
+~590k lines, and ~180 commands across 13 dispatch modules. Those figures are
+retained to explain the design survey and must not be read as current inventory.
+
+**Current reconciliation (2026-09-06):** source version `0.7.0` at commit
+`4d469f79`; the enabled module manifest registers 158 canonical commands and the
+complete index contains 165 rows including aliases, pre-registration commands,
+and compound service surfaces.
+See [`docs/reference/commands/_index.md`](../reference/commands/_index.md) and
+[`docs/ops/onyx-server-paths.md`](../ops/onyx-server-paths.md) for current source
+and live-fleet evidence. The speculative F-01…F-68 claims below remain design
+proposals unless a current source document says otherwise.
 
 ---
 

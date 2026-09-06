@@ -1,6 +1,10 @@
 # Live-daemon bench — P0-1 remaining axes
 
-Throwaway `onyx-server` on 127.0.0.1, kernel-assigned ports, `--check-config` before each boot. Not `orochi.service`.
+> **Historical snapshot (2026-09-04).** Throwaway loopback measurements only;
+> this artifact is not evidence of a production service-unit deployment. Current
+> live fleet identity and metrics are maintained in [`../ops/onyx-server-paths.md`](../ops/onyx-server-paths.md).
+
+Throwaway `onyx-server` on 127.0.0.1, kernel-assigned ports, `--check-config` before each boot.
 
 clients=8  privmsg_samples=16
 

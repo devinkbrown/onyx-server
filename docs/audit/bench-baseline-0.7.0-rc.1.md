@@ -1,5 +1,9 @@
 # Benchmark baseline — onyx-server 0.7.0-rc.1
 
+> **Historical snapshot (2026-09-04).** This baseline belongs to the rc.1
+> stabilization artifact. Keep its provenance and numbers immutable; use the
+> current `bench` guide and a fresh same-host capture for new comparisons.
+
 Produced by `tools/bench.sh` (`zig build bench`, harness:
 `src/substrate/bench.zig`). Release plan P0-1 / wave W1-1.
 

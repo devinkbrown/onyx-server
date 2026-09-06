@@ -3,7 +3,11 @@
 
 # Multi-reactor timer-guard audit — 0.7
 
-**Status:** complete, 4 P0 fixes open · **Author:** onyx-server-mesh · **Date:** 2026-09-01
+**Status:** historical read-only snapshot (2026-09-01); four P0 findings were
+open in that snapshot and are not a current release-status claim. The seeded
+P0-3 model is now closed in the 0.7 acceptance ledger; any remaining hardening
+work belongs to the current Q4 roadmap. **Reconciled:** 2026-09-06 · **Author:**
+onyx-server-mesh · **Date of audit:** 2026-09-01
 **Base:** `main` at `c221033` — **every `file:line` below was resolved against `git show HEAD:…`,
 not the working tree.** The tree was dirty with concurrent Wave 1 work (`server.zig` +142,
 `registry.zig` +201, `s2s_frame.zig` +9, `tls_*.zig`) while this audit ran, and those insertions
@@ -28,7 +32,11 @@ gap here into a live one.
 document changes no code. The one code change permitted by the task is a cross-link line added to
 the release plan.
 
-**Totals: 46 periodic tasks audited · 4 P0 fixes.**
+**Historical totals:** 46 periodic tasks audited · 4 P0 fixes identified. Keep
+the enumeration and line references as audit evidence; use
+[`../ROADMAP-2026-Q4.md`](../ROADMAP-2026-Q4.md) and
+[`../ops/onyx-server-paths.md`](../ops/onyx-server-paths.md) for current status
+and live topology.
 
 ---
 

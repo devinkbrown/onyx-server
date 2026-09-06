@@ -30,13 +30,19 @@ algorithms — they are product surfaces over algorithms it already owns.** Roug
 these 50 are "wire an existing substrate module to a user-visible or operator-visible
 surface," which is why so many land at M rather than XL.
 
-Two monoliths also shape the plan: `src/daemon/server.zig` is **102,026 lines at HEAD** (`f9ed9bc`)
+Two monoliths also shape the plan: the catalog capture measured
+`src/daemon/server.zig` at **102,026 lines** (`f9ed9bc`)
 and `onyx/src/lib/store/store.ts` is **18,225 lines at HEAD** (`6c88eafa`). Both files carry
 uncommitted working-tree changes, and both roadmaps quote slightly different figures (L-01 says
 102,152; C-02 says 18,335) — treat all such counts as approximate and re-measure before acting.
 Both are load-bearing seams that throttle
 every other feature's velocity, so both appear as first-class entries (GS-01, GC-01) rather
 than as background cleanup.
+
+**Server reconciliation (2026-09-06):** the current checkout measures
+`src/daemon/server.zig` at **102,407 lines** and the source tree at **851 Zig files /
+598,630 lines**. The older figures above remain immutable design-capture context;
+re-measure the separate client checkout before using its count.
 
 ## Relationship to F-01…F-68 (`INVENTED-FEATURES-CATALOG.md`)
 
@@ -60,7 +66,7 @@ Where they meet, this file is the **implementation plan**, not a second idea. De
 | GC-14 Media Room UX | **F-34** Spatial audio rooms | F-34 is the server capability; this is the client surface for it. |
 | GB-05, GB-09, GB-10, GB-13, GB-14, GB-15, GS-01, GS-04, GS-07, GS-11…GS-15, GS-17…GS-20, all GC-* | — | No F-item equivalent found. |
 
-**Seven premises were corrected** after checking HEAD — the last four during an adversarial refute
+**Seven premises were corrected** after checking the catalog-capture HEAD — the last four during an adversarial refute
 pass that found this document's *"does a surface for this already exist?"* search had been far weaker
 than its *"does anything import this substrate module?"* search. They are recorded so nobody
 re-invents them:
@@ -69,7 +75,7 @@ re-invents them:
 |---|---|
 | "Content matching is limited / a performance cliff" | **False.** `src/daemon/content_filter.zig` (Koshi) already builds an Aho-Corasick automaton (`content_filter.zig:13,45,108`) giving O(text) matching regardless of pattern count. GS-18 was **replaced** with a genuinely absent feature. |
 | "Admission is scattered with no policy plane" | **Overstated.** Connection classes already exist as config (`etc/onyx-server.reference.toml:473-485`) with a global accept-time rate gate (`:436`). GS-03 is re-scoped to *unify enforcement + make refusals auditable*, not to invent classes. |
-| "Live captions are missing" | **False on BOTH sides.** The server ships `src/daemon/transcript.zig`; the client ships `src/shell/voice/overlays/CaptionsOverlay.tsx` (268 lines) with `MEDIA CAPTION`/`MEDIA TRANSCRIPT` parsed at `onyx/src/lib/store/store.ts:10444-10473` and a passing `role="log"` live-region test in `VoiceOverlays.test.tsx` — including the exact live-region-scoping case GC-08 listed as outstanding. GB-07 was **replaced**. |
+| "Live captions are missing" | **False on BOTH sides.** The server ships `src/daemon/transcript.zig`; the client ships `src/shell/voice/overlays/CaptionsOverlay.tsx` (268 lines) with `MEDIA CAPTION`/`MEDIA TRANSCRIPT` parsed at `onyx/src/lib/store/store.ts:10698-10719` and a passing `role="log"` live-region test in `VoiceOverlays.test.tsx` — including the exact live-region-scoping case GC-08 listed as outstanding. GB-07 was **replaced**. |
 | "The client needs a Theme Studio" | **False.** `onyx/src/theme/ThemeStudio.tsx` **already exists at 2,854 lines** with the generative palette factory, live preview, JSON import/export, and AA-clean-by-construction contrast; sharing ships too (`ThemeImportDialog.tsx`, `lib/theme/themeShare.ts`). GC-09 was **replaced**. |
 | "Search needs a new `SEARCH` verb and index" | **False.** `src/daemon/search_index.zig` (559 lines, durable `SIDX` checkpoints) exists and `SEARCH` is **registered** at `src/daemon/modules/messaging.zig:68`, with the `draft/search` gate, channel-membership authz, rate limiting, and a bounded envelope already implemented. GB-10 was **re-scoped** to mesh federation only. |
 | "An append-only inclusion-proof log must be built" | **Mostly false.** `src/daemon/key_transparency.zig` (1,300 lines) already appends event digests to a **Merkle Mountain Range** with `proof()`/`verifyInclusion()`, and is on the wire as `KEYTRANS` (`src/daemon/modules/accounts.zig:156`). Only *moderation actions as a leaf type* are missing. GB-03 was **re-scoped** and dropped from the Top 10. |
@@ -200,7 +206,7 @@ tree** (`Cid`, `Event{parents, payload}`, `MissingParents`; 0 external consumers
 **Wire/protocol:** new `REPLAY` verb returning a bounded snapshot + delta stream.
 **Guard rail:** replay-driven roster frames must **APPEND** unless the client initiated the burst —
 a replace-on-every-353 path is exactly what collapsed `#root` to 2 members in production
-(`onyx/src/lib/irc/client.ts:1355-1357`, the `no-implicit-names` seam).
+(`onyx/src/lib/irc/client.ts:1344-1357`, the `no-implicit-names` seam).
 
 ### GB-06 — Raid Shield
 **Pitch:** Mesh-coordinated raid detection that clamps admission network-wide in seconds, with an honest client banner.
@@ -235,7 +241,7 @@ reactor silently winning that guard is precisely the class that reaped mesh peer
 **Scope:** `Both`
 **Why game-changing:** Captions are transient today. The daemon captures them, the client renders
 them, and then they evaporate: the store keeps only `MAX_MEDIA_TRANSCRIPT_ENTRIES = 200` in memory
-(`onyx/src/lib/store/store.ts:2430-2431`), nothing reaches the vault, and the search index has
+(`onyx/src/lib/store/store.ts:2492`), nothing reaches the vault, and the search index has
 **zero** knowledge of transcripts. So "what did we decide on the standup?" is unanswerable in a
 product that already heard the answer. Wiring the transcript log into the existing search index
 turns voice from an ephemeral channel into first-class, greppable room memory — a thing text chat

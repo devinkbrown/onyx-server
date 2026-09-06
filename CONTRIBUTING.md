@@ -37,17 +37,36 @@ source, fix the reference/guide docs or the code, not the evidence.
 <!-- AUTO-GENERATED: build-commands -->
 | Command | Purpose |
 |---|---|
-| `zig build` | Build and install the debug daemon to `zig-out/bin/onyx-server`. |
+| `zig build` / `install` / `uninstall` | Install or remove the debug daemon and `armor` from the selected prefix. |
+| `zig build run -- <config.toml>` | Build/install and run with forwarded daemon arguments. |
 | `zig build check` | Fast semantic analysis without emitting a binary. |
-| `zig build test` | Full module plus executable-root test suite. |
-| `zig build test-smoke --summary all` | Fast roadmap gate: semantic check plus TLS/server/config suites. |
-| `zig build test-roadmap --summary all` | Server-roadmap gate: server/config/IRCX/event/mesh/services/TLS suites. |
-| `zig build test-roadmap-verbose --summary all` | Same roadmap gate with per-test progress and slow-test reporting. |
-| `zig build test-smoke -Doptimize=ReleaseSafe --summary all` | Optimized smoke gate for safety-checked release codegen paths. |
-| `zig build all-checks --summary all` | Deterministic pre-push gate: check, WASM, full tests, bounded fuzz replay, and BoGo shim self-tests. |
-| `zig build all-checks-verbose --summary all` | Full deterministic gate with verbose progress for long tmux/CI runs. |
+| `zig build test-mod[-verbose]` | Library/module tests, optionally with per-test progress. |
+| `zig build test-exe[-verbose]` | Executable-root tests, optionally with per-test progress. |
+| `zig build test-tls[-verbose]` | Armor TLS, mTLS, ECH, RPK, DC, and record-size tests. |
+| `zig build test-server[-verbose]` | Daemon/server integration and auth tests. |
+| `zig build test-exploit` / `test-attack` | Adversarial fail-closed corpus and alias. |
+| `zig build test-config[-verbose]` | TOML, boot projection, and reference-config tests. |
+| `zig build test-ircx[-verbose]` | IRCX, PROP, ACCESS, DATA, LISTX, MODEX, SACCESS tests. |
+| `zig build test-event-spine[-verbose]` | Event Spine, EVENT, observe, and playback tests. |
+| `zig build test-mesh[-verbose]` | Undertow mesh, S2S, repair, and secured-link tests. |
+| `zig build test-media[-verbose]` | Media, DTLS-SRTP, SFU, WebTransport, RTP, and RTCP tests. |
+| `zig build test-services[-verbose]` | Services, account, SASL, TOTP, WebAuthn, session, MEMO tests. |
+| `zig build test-session[-verbose]` | Reusable-session, migration, replica, and World-restore tests. |
+| `zig build test-helix[-verbose]` | Helix upgrade, migration, resume, capsule, handoff tests. |
+| `zig build test-dst` | Seed-replayable DST/simulator/multi-reactor timer-guard tests. |
+| `zig build test-cli[-verbose]` | `armor` CLI tests. |
+| `zig build test[-verbose]` | Full suite, with optional per-test progress. |
+| `zig build test-smoke[-verbose]` | Fast semantic + TLS/server/config smoke gate. |
+| `zig build test-roadmap[-verbose]` | Server-roadmap focused gate. |
+| `zig build wasm` | Build browser codec/transport WASM modules. |
+| `zig build ct-check` | Opt-in statistical constant-time harness. |
+| `zig build bench` / `bench-live` | Offline and throwaway-loopback performance measurements. |
+| `zig build fuzz` | Bounded TLS-parser corpus replay; add `--fuzz` for coverage-guided mode. |
+| `zig build quic-interop-server` / `quic-interop-wt-server` | Build QUIC/HTTP3 and WebTransport interop servers. |
+| `zig build bogo-shim` / `bogo-shim-test` | Build or self-test the BoGo TLS shim. |
+| `zig build all-checks[-verbose]` | Deterministic pre-push gate, optionally verbose. |
 | `zig build release` | Build a stripped ReleaseFast daemon. |
-| `zig build package` | Stage ReleaseFast daemon, reference config, and systemd unit into the install prefix. |
+| `zig build package` | Stage ReleaseFast daemon, reference config, and systemd unit. |
 <!-- /AUTO-GENERATED: build-commands -->
 
 Use `-Dtest-filter="<substring>"` as a build option for focused work:
