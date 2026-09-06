@@ -28,10 +28,11 @@ preserve the exact historical inputs and are not substitutes for this table.
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` / `components` | `0 / 1` | `0 / 1` |
 
-The repository source is now at `4d469f79` (documentation after the deployed
-`ae78d490` code). A new build from this checkout will identify itself as
-`0.7.0+4d469f79`; that is a source fact, not a claim that it is installed on the
-fleet.
+The last source-code change before this documentation reconciliation is
+`ae78d490`, which is also the deployed image baseline. This checkout includes
+documentation-only commits after that code. A new build from the current
+checkout will identify itself with its current Git revision; that is not a claim
+that the newly built image is installed on the fleet.
 
 ## Day-2 ops
 

@@ -8,7 +8,7 @@ forward-secret Mooring server links, and ships its own pure-Zig TLS (Armor), med
 (CadenceVox/CadenceVis), and in-place upgrade (Helix).
 
 **Current source/live distinction (verified 2026-09-06):** the source manifest is
-`0.7.0` at repository commit `4d469f79`; both production nodes run the separately
+`0.7.0` at source-code baseline commit `ae78d490`; both production nodes run the separately
 recorded `0.7.0+ae78d490` artifact under `onyx-server.service`. See the
 [canonical production paths and evidence](ops/onyx-server-paths.md) before doing
 day-2 operations. The public GitHub release channel still publishes `v0.5.6`;
@@ -19,7 +19,7 @@ resource/admission/flood policy, bounded growable SendQ and RecvQ, optional nick
 holds against camping, and live operator introspection through `STATS Y`, `STATS l`, and
 richer `INFO`.
 
-**Documentation baseline (2026-09-06):** source HEAD is `4d469f79` (`0.7.0`);
+**Documentation baseline (2026-09-06):** source-code baseline is `ae78d490` (`0.7.0`);
 the deployed two-node fleet is separately recorded as `0.7.0+ae78d490` under
 `onyx-server.service`. Current paths, executable hash, and mesh gauges are kept
 in [the production evidence table](ops/onyx-server-paths.md). Release notes,

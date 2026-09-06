@@ -5,8 +5,8 @@ organized as a **feature spine in four waves** plus three **release tracks**
 (performance, hardening, polish) that cut across every wave. Ambitious about
 where the stack goes; honest about what is in the tree today.
 
-Current daemon version: **0.7.0** (`build.zig.zon:18`), source HEAD
-`4d469f79` (reconciled 2026-09-06). The original 0.7 acceptance work is
+Current daemon version: **0.7.0** (`build.zig.zon:18`), source-code baseline
+`ae78d490` (reconciled 2026-09-06). The original 0.7 acceptance work is
 closed; this roadmap remains the forward-looking feature spine and labels
 historical gap analyses where they no longer describe the tree.
 

@@ -20,7 +20,7 @@ work, not a later version.
 (`onyx/package.json`).
 
 **Status snapshot (2026-09-06):** the original daemon P0-0…P0-7 acceptance work is
-closed in source. Source HEAD is `4d469f79`; both production nodes run the same
+closed in source. The source-code baseline is `ae78d490`; both production nodes run the same
 `0.7.0+ae78d490` artifact under `onyx-server.service` (see
 [`docs/ops/onyx-server-paths.md`](ops/onyx-server-paths.md)). There is no public
 GitHub `v0.7.0` tag recorded yet. Deferred work remains explicitly labeled below;

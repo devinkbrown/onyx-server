@@ -81,7 +81,8 @@ As of **2026-09-06**, `eshmaki.me` and `ircx.us` are both running
 SHA-256 `0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c` and
 both report `links_active=1`, `peers_up=1`, `partitioned=0` on the loopback
 metrics endpoint. This is a live-deployment baseline, not a promise that a
-fresh clone is already deployed; the checkout itself is at `4d469f79`.
+fresh clone is already deployed; the source-code baseline is `ae78d490` and the
+documentation commit may be newer.
 
 ## Highlights
 
