@@ -82,6 +82,217 @@ pub const Reaction = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Reaction tally  (stored; readable after the live push has returned)
+// ---------------------------------------------------------------------------
+
+/// Wire caps mirrored here so the ledger can bound its own copies. A msgid is
+/// at most the IRCv3 value `msgedit` accepts; a channel name fits the daemon's
+/// fixed channel buffer.
+pub const max_reaction_target_len = 255;
+pub const max_reaction_channel_len = 128;
+pub const max_reaction_channels = 4096;
+pub const max_reaction_targets_per_channel = 4096;
+pub const max_reactions_per_target = 32;
+pub const max_reactors_per_reaction = 4096;
+
+const ReactorSet = std.AutoHashMap(u64, void);
+
+const TargetReactions = struct {
+    reactions: std.StringHashMap(ReactorSet),
+};
+
+const ChannelReactions = struct {
+    targets: std.StringHashMap(TargetReactions),
+};
+
+/// Convergent reaction tally keyed by `(channel, target_msgid, reaction, reactor)`.
+/// `reactor` is the packed client id. Add is idempotent per reactor; remove drops
+/// that reactor. The tally a reader observes is the live reactor count of each
+/// reaction still on that target. Copies are owned by the ledger.
+pub const ReactionLedger = struct {
+    pub const Error = std.mem.Allocator.Error || error{
+        InvalidChannel,
+        InvalidTarget,
+        InvalidReaction,
+        TooManyChannels,
+        TooManyTargets,
+        TooManyReactions,
+        TooManyReactors,
+    };
+
+    allocator: std.mem.Allocator,
+    channels: std.StringHashMap(ChannelReactions),
+
+    pub fn init(allocator: std.mem.Allocator) ReactionLedger {
+        return .{
+            .allocator = allocator,
+            .channels = std.StringHashMap(ChannelReactions).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *ReactionLedger) void {
+        var channels = self.channels.iterator();
+        while (channels.next()) |channel| {
+            self.allocator.free(channel.key_ptr.*);
+            var targets = channel.value_ptr.targets.iterator();
+            while (targets.next()) |target| {
+                self.allocator.free(target.key_ptr.*);
+                var reactions = target.value_ptr.reactions.iterator();
+                while (reactions.next()) |reaction| {
+                    self.allocator.free(reaction.key_ptr.*);
+                    reaction.value_ptr.deinit();
+                }
+                target.value_ptr.reactions.deinit();
+            }
+            channel.value_ptr.targets.deinit();
+        }
+        self.channels.deinit();
+        self.* = undefined;
+    }
+
+    pub fn apply(
+        self: *ReactionLedger,
+        channel: []const u8,
+        reactor: u64,
+        target_msgid: []const u8,
+        reaction: []const u8,
+        op: ReactionOp,
+    ) ReactionLedger.Error!void {
+        try validateReactionKey(channel, target_msgid, reaction);
+        switch (op) {
+            .add => try self.add(channel, reactor, target_msgid, reaction),
+            .remove => self.remove(channel, reactor, target_msgid, reaction),
+        }
+    }
+
+    /// Write the tally for `target_msgid` into `out`.
+    /// Form: `target=<msgid>` plus ` <reaction>=<count>` pairs, reactions in
+    /// byte order, counts of reactors still holding that reaction. An unknown
+    /// target is a zero tally (`target=<msgid>`), not an error.
+    pub fn writeTally(
+        self: *const ReactionLedger,
+        channel: []const u8,
+        target_msgid: []const u8,
+        out: []u8,
+    ) error{NoSpaceLeft}![]const u8 {
+        const head = std.fmt.bufPrint(out, "target={s}", .{target_msgid}) catch return error.NoSpaceLeft;
+        var pos: usize = head.len;
+        const channel_bucket = self.channels.getPtr(channel) orelse return out[0..pos];
+        const target_bucket = channel_bucket.targets.getPtr(target_msgid) orelse return out[0..pos];
+
+        const Item = struct { reaction: []const u8, count: u32 };
+        var items: [max_reactions_per_target]Item = undefined;
+        var n: usize = 0;
+        var it = target_bucket.reactions.iterator();
+        while (it.next()) |entry| {
+            const count = entry.value_ptr.count();
+            if (count == 0) continue;
+            if (n == items.len) break;
+            items[n] = .{
+                .reaction = entry.key_ptr.*,
+                .count = @intCast(count),
+            };
+            n += 1;
+        }
+        std.mem.sort(Item, items[0..n], {}, struct {
+            fn lessThan(_: void, a: Item, b: Item) bool {
+                return std.mem.lessThan(u8, a.reaction, b.reaction);
+            }
+        }.lessThan);
+        for (items[0..n]) |item| {
+            const piece = std.fmt.bufPrint(out[pos..], " {s}={d}", .{ item.reaction, item.count }) catch return error.NoSpaceLeft;
+            pos += piece.len;
+        }
+        return out[0..pos];
+    }
+
+    fn add(
+        self: *ReactionLedger,
+        channel: []const u8,
+        reactor: u64,
+        target_msgid: []const u8,
+        reaction: []const u8,
+    ) ReactionLedger.Error!void {
+        const channel_bucket = try self.ensureChannel(channel);
+        const target_bucket = try self.ensureTarget(channel_bucket, target_msgid);
+        const reactors = try self.ensureReaction(target_bucket, reaction);
+        if (reactors.contains(reactor)) return;
+        if (reactors.count() >= max_reactors_per_reaction) return error.TooManyReactors;
+        try reactors.put(reactor, {});
+    }
+
+    fn remove(
+        self: *ReactionLedger,
+        channel: []const u8,
+        reactor: u64,
+        target_msgid: []const u8,
+        reaction: []const u8,
+    ) void {
+        const channel_entry = self.channels.getEntry(channel) orelse return;
+        const target_entry = channel_entry.value_ptr.targets.getEntry(target_msgid) orelse return;
+        const reaction_entry = target_entry.value_ptr.reactions.getEntry(reaction) orelse return;
+        if (!reaction_entry.value_ptr.remove(reactor)) return;
+        if (reaction_entry.value_ptr.count() != 0) return;
+
+        const reaction_key = reaction_entry.key_ptr.*;
+        reaction_entry.value_ptr.deinit();
+        const reactions = &target_entry.value_ptr.reactions;
+        reactions.removeByPtr(reaction_entry.key_ptr);
+        self.allocator.free(reaction_key);
+        if (reactions.count() != 0) return;
+
+        const target_key = target_entry.key_ptr.*;
+        reactions.deinit();
+        const targets = &channel_entry.value_ptr.targets;
+        targets.removeByPtr(target_entry.key_ptr);
+        self.allocator.free(target_key);
+        if (targets.count() != 0) return;
+
+        const channel_key = channel_entry.key_ptr.*;
+        targets.deinit();
+        self.channels.removeByPtr(channel_entry.key_ptr);
+        self.allocator.free(channel_key);
+    }
+
+    fn ensureChannel(self: *ReactionLedger, channel: []const u8) ReactionLedger.Error!*ChannelReactions {
+        if (self.channels.getPtr(channel)) |bucket| return bucket;
+        if (self.channels.count() >= max_reaction_channels) return error.TooManyChannels;
+        const owned = try self.allocator.dupe(u8, channel);
+        errdefer self.allocator.free(owned);
+        try self.channels.putNoClobber(owned, .{
+            .targets = std.StringHashMap(TargetReactions).init(self.allocator),
+        });
+        return self.channels.getPtr(owned).?;
+    }
+
+    fn ensureTarget(self: *ReactionLedger, channel_bucket: *ChannelReactions, target_msgid: []const u8) ReactionLedger.Error!*TargetReactions {
+        if (channel_bucket.targets.getPtr(target_msgid)) |bucket| return bucket;
+        if (channel_bucket.targets.count() >= max_reaction_targets_per_channel) return error.TooManyTargets;
+        const owned = try self.allocator.dupe(u8, target_msgid);
+        errdefer self.allocator.free(owned);
+        try channel_bucket.targets.putNoClobber(owned, .{
+            .reactions = std.StringHashMap(ReactorSet).init(self.allocator),
+        });
+        return channel_bucket.targets.getPtr(owned).?;
+    }
+
+    fn ensureReaction(self: *ReactionLedger, target_bucket: *TargetReactions, reaction: []const u8) ReactionLedger.Error!*ReactorSet {
+        if (target_bucket.reactions.getPtr(reaction)) |set| return set;
+        if (target_bucket.reactions.count() >= max_reactions_per_target) return error.TooManyReactions;
+        const owned = try self.allocator.dupe(u8, reaction);
+        errdefer self.allocator.free(owned);
+        try target_bucket.reactions.putNoClobber(owned, ReactorSet.init(self.allocator));
+        return target_bucket.reactions.getPtr(owned).?;
+    }
+};
+
+fn validateReactionKey(channel: []const u8, target_msgid: []const u8, reaction: []const u8) ReactionLedger.Error!void {
+    if (channel.len == 0 or channel.len > max_reaction_channel_len) return error.InvalidChannel;
+    if (target_msgid.len == 0 or target_msgid.len > max_reaction_target_len) return error.InvalidTarget;
+    if (reaction.len == 0 or reaction.len > max_reaction_len) return error.InvalidReaction;
+}
+
+// ---------------------------------------------------------------------------
 // Presence  (status + activity)
 // ---------------------------------------------------------------------------
 
@@ -204,4 +415,32 @@ test "default presence is active and idle" {
     const p = Presence{};
     try testing.expectEqual(Availability.active, p.availability);
     try testing.expectEqual(Activity.idle, p.activity);
+}
+
+test "reaction ledger tally counts distinct reactors on one target" {
+    var ledger = ReactionLedger.init(testing.allocator);
+    defer ledger.deinit();
+    const channel = "#chat";
+    const target = "msg-stable-1";
+    try ledger.apply(channel, 1, target, "fire", .add);
+    try ledger.apply(channel, 1, target, "fire", .add);
+    try ledger.apply(channel, 2, target, "fire", .add);
+    try ledger.apply(channel, 2, "msg-other", "fire", .add);
+    try ledger.apply(channel, 1, target, "fire", .remove);
+
+    var buf: [128]u8 = undefined;
+    const tally = try ledger.writeTally(channel, target, &buf);
+    try testing.expectEqualStrings("target=msg-stable-1 fire=1", tally);
+    const other = try ledger.writeTally(channel, "msg-other", &buf);
+    try testing.expectEqualStrings("target=msg-other fire=1", other);
+    const empty = try ledger.writeTally(channel, "msg-none", &buf);
+    try testing.expectEqualStrings("target=msg-none", empty);
+
+    try ledger.apply(channel, 2, target, "fire", .remove);
+    const gone = try ledger.writeTally(channel, target, &buf);
+    try testing.expectEqualStrings("target=msg-stable-1", gone);
+    try ledger.apply(channel, 2, target, "wave", .add);
+    try ledger.apply(channel, 2, target, "fire", .add);
+    const both = try ledger.writeTally(channel, target, &buf);
+    try testing.expectEqualStrings("target=msg-stable-1 fire=1 wave=1", both);
 }

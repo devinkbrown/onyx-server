@@ -137,7 +137,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## LISTX
 
 - Syntax: `LISTX [filter]`
-- Description: IRCX extended channel list. Secret and hidden channels are skipped. Filters use live channel metadata including creation time, topic time, subject/language properties, member count, and registered state; member-count filters and `C`/`T` age filters accept strict `>`/`<` and inclusive `>=`/`<=`. The handler lists the mesh-wide union of local and remote-only channels, caps oversized result sets with `RPL_LISTXTRUNC 816`, and emits `RPL_LISTXPICS 813` after an entry when the channel has a non-empty `PICS` property.
+- Description: IRCX extended channel list. Secret and hidden channels are skipped. Filters use live channel metadata including creation time, topic time, subject/language properties, member count, and registered state; member-count filters and `C`/`T` age filters accept strict `>`/`<` and inclusive `>=`/`<=`. The handler lists the mesh-wide union of local and remote-only channels, caps oversized result sets with `RPL_LISTXTRUNC 816`, and emits `RPL_LISTXPICS 813` after an entry when the channel has a non-empty `PICS` property. A remote-only channel's 812 entry carries the topic the peer published.
 - Privileges: Registered client.
 - Parameters: Optional LISTX filter.
 - Replies: IRCX list start/entry/PICS/truncation/end numerics `811`, `812`, `813`, `816`, `817`.

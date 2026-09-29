@@ -519,6 +519,11 @@ pub const S2sLink = struct {
         return self.peer.channelModeFlags(channel);
     }
 
+    /// Topic this peer has published for `channel` (borrowed; null if none).
+    pub fn channelTopic(self: *const S2sLink, channel: []const u8) ?s2s_peer.TopicView {
+        return self.peer.channelTopic(channel);
+    }
+
     /// Iterator over channel names with a live remote roster on this peer (used
     /// by LIST/LISTX for mesh-wide channel enumeration).
     pub fn channelNames(self: *const S2sLink) s2s_peer.ChannelNameIterator {

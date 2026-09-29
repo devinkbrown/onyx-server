@@ -51,7 +51,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 ## LIST
 
 - Syntax: `LIST [filter[,filter...]]`
-- Description: Lists visible channels from the mesh-wide union of local and remote-only channels. Secret and hidden channels are skipped. ELIST-style filters support member-count thresholds, creation-age `C` filters, topic-age `T` filters, include masks, and `!` exclude masks; malformed filters fail closed instead of falling back to a broad listing.
+- Description: Lists visible channels from the mesh-wide union of local and remote-only channels. Secret and hidden channels are skipped. ELIST-style filters support member-count thresholds, creation-age `C` filters, topic-age `T` filters, include masks, and `!` exclude masks; malformed filters fail closed instead of falling back to a broad listing. A remote-only channel's 322 topic is the topic the peer published.
 - Privileges: Registered client.
 - Parameters: Zero or one comma-separated filter parameter.
 - Replies: `RPL_LISTSTART 321`, `RPL_LIST 322`, `RPL_LISTEND 323`.
@@ -62,7 +62,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 ## LISTX
 
 - Syntax: `LISTX [filter[,filter...]]`
-- Description: Lists visible channels using IRCX extended channel-list numerics. Filters support strict and inclusive member-count thresholds (`>N`, `<N`, `>=N`, `<=N`), creation-age `C` thresholds, topic-age `T` thresholds, `TOPICONLY`, channel/name/topic/subject/language masks, and `R=0`/`R=1` registration state. Results are capped; truncated replies emit `RPL_LISTXTRUNC 816`.
+- Description: Lists visible channels using IRCX extended channel-list numerics. Filters support strict and inclusive member-count thresholds (`>N`, `<N`, `>=N`, `<=N`), creation-age `C` thresholds, topic-age `T` thresholds, `TOPICONLY`, channel/name/topic/subject/language masks, and `R=0`/`R=1` registration state. Results are capped; truncated replies emit `RPL_LISTXTRUNC 816`. A remote-only channel's 812 entry carries the topic the peer published.
 - Privileges: Registered client.
 - Parameters: Zero or one comma-separated filter parameter.
 - Replies: `RPL_LISTXSTART 811`, `RPL_LISTXENTRY 812`, optional `RPL_LISTXPICS 813`, optional `RPL_LISTXTRUNC 816`, `RPL_LISTXEND 817`.
@@ -84,7 +84,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 ## WHOWAS
 
 - Syntax: `WHOWAS <nick> [count]`
-- Description: Looks up recorded WHOWAS snapshots for a nick, most recent first. The optional count is parsed as a decimal value and capped to 16 records; malformed counts fall back to 16.
+- Description: Looks up recorded WHOWAS snapshots for a nick, most recent first. The optional count is parsed as a decimal value and capped to 16 records; malformed counts fall back to 16. The 314 host is the connection's real host, and a logged-in account is reported with 330.
 - Privileges: Registered client.
 - Parameters: Nick and optional count.
 - Replies: `RPL_WHOWASUSER 314` plus `RPL_WHOISSERVER 312` signoff lines when data exists, `ERR_WASNOSUCHNICK 406` when no data exists, and `RPL_ENDOFWHOWAS 369`.

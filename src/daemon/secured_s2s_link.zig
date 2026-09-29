@@ -539,6 +539,11 @@ pub const SecuredLink = struct {
         return if (self.inner) |l| l.channelModeFlags(channel) else null;
     }
 
+    /// Topic the inner peer has published for `channel` (borrowed; null if none).
+    pub fn channelTopic(self: *const SecuredLink, channel: []const u8) ?s2s_peer.TopicView {
+        return if (self.inner) |l| l.channelTopic(channel) else null;
+    }
+
     /// Iterator over channel names with a live remote roster on this peer, or
     /// null when the inner link is absent. Used by LIST/LISTX for mesh-wide
     /// channel enumeration.

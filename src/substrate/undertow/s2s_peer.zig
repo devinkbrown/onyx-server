@@ -33,6 +33,7 @@ pub const MemberIdentity = route_table.MemberIdentity;
 pub const SessionToken = route_table.SessionToken;
 pub const NickClaim = route_table.NickClaim;
 pub const ChannelModeFlags = route_table.ChannelModeFlags;
+pub const TopicView = route_table.TopicView;
 pub const ChannelNameIterator = route_table.RouteTable.ChannelNameIterator;
 pub const RelayMessage = message_relay.RelayMessage;
 pub const InboundMessage = message_relay.Owned;
@@ -3770,7 +3771,15 @@ pub const S2sPeer = struct {
         const payload = self.verifiedPayload(.TOPIC, frame_payload) orelse return;
         const ev = topic_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
-        const outcome = self.routes.applyTopic(ev.channel, ev.origin_node, ev.hlc) catch return;
+        const outcome = self.routes.applyTopic(
+            ev.channel,
+            ev.origin_node,
+            ev.hlc,
+            ev.topic,
+            ev.setter,
+            ev.set_at,
+            ev.present,
+        ) catch return;
         if (outcome == .unchanged) return;
 
         const ch = self.allocator.dupe(u8, ev.channel) catch return;
@@ -3998,6 +4007,11 @@ pub const S2sPeer = struct {
 
     pub fn channelModeFlags(self: *const S2sPeer, channel: []const u8) ?route_table.ChannelModeFlags {
         return self.routes.channelModeFlags(channel);
+    }
+
+    /// Topic this peer has published for `channel` (borrowed; null if none).
+    pub fn channelTopic(self: *const S2sPeer, channel: []const u8) ?TopicView {
+        return self.routes.channelTopic(channel);
     }
 
     /// Iterator over channel names with a live remote roster on this peer (used

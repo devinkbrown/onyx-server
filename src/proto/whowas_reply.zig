@@ -76,6 +76,8 @@ pub const HistoryEntry = struct {
     user: []const u8,
     host: []const u8,
     realname: []const u8,
+    /// Logged-in account at signoff. Empty omits RPL_WHOISLOGGEDIN (330).
+    account: []const u8 = "",
     signoff_time: i64,
     server: []const u8,
 };
@@ -120,6 +122,9 @@ pub fn emitWhowasWith(
     for (entries[0..limit]) |entry| {
         try validateEntryWith(params, entry);
         try sink.send(try writeWhowasUserLineWith(params, scratch, server_name, requester_nick, entry));
+        if (whowasAccountOk(entry.account)) {
+            try sink.send(try writeWhowasAccountLineWith(params, scratch, server_name, requester_nick, entry));
+        }
         if (options.include_signoff) {
             try sink.send(try writeWhowasServerLineWith(params, scratch, server_name, requester_nick, entry));
         }
@@ -159,6 +164,36 @@ pub fn writeWhowasUserLineWith(
     try b.spaceTrailing(entry.realname);
     try b.crlf();
     return b.slice();
+}
+
+/// Build `RPL_WHOISLOGGEDIN` (330): `<nick> <account> :is logged in as`.
+pub fn writeWhowasAccountLineWith(
+    comptime params: Params,
+    out: []u8,
+    server_name: []const u8,
+    requester_nick: []const u8,
+    entry: HistoryEntry,
+) WhowasReplyError![]const u8 {
+    try validateServerNameWith(params, server_name);
+    try validateNickWith(params, requester_nick);
+    try validateNickWith(params, entry.nick);
+    if (!whowasAccountOk(entry.account)) return error.InvalidNick;
+
+    var b = LineBuilder.init(out, params.max_line_bytes);
+    try b.numericPrefix(numeric.Numeric.RPL_WHOISLOGGEDIN, server_name, requester_nick);
+    try b.spaceParam(entry.nick);
+    try b.spaceParam(entry.account);
+    try b.spaceTrailing("is logged in as");
+    try b.crlf();
+    return b.slice();
+}
+
+fn whowasAccountOk(account: []const u8) bool {
+    if (account.len == 0) return false;
+    for (account) |ch| {
+        if (!validParamByte(ch)) return false;
+    }
+    return true;
 }
 
 /// Build optional `RPL_WHOISSERVER` (312): `<nick> <server> :<signoff_time>`.

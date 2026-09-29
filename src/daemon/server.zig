@@ -13729,11 +13729,29 @@ pub const LinuxServer = struct {
         self.whowas.addOnQuit(.{
             .nick = nick,
             .user = conn.session.username(),
-            .host = default_host,
+            .host = whowasRecordedHost(conn),
             .realname = conn.session.realname(),
             .account = conn.session.account() orelse "",
             .signoff_time = @divTrunc(platform.realtimeMillis(), 1000),
         }) catch {};
+    }
+
+    /// Host stored for WHOWAS: the connection's real host when it is a legal
+    /// host token, otherwise the visible host, otherwise the process default.
+    fn whowasRecordedHost(conn: *const ConnState) []const u8 {
+        const real_host = conn.session.realHost();
+        if (whowasHostOk(real_host)) return real_host;
+        const visible = conn.session.host();
+        if (whowasHostOk(visible)) return visible;
+        return default_host;
+    }
+
+    fn whowasHostOk(host: []const u8) bool {
+        if (host.len == 0 or host.len > 255) return false;
+        for (host) |ch| {
+            if (ch == 0 or ch == '\r' or ch == '\n' or ch == ' ' or ch < 0x20 or ch == 0x7f) return false;
+        }
+        return true;
     }
 
     fn broadcastQuit(self: *LinuxServer, id: client_model.ClientId, conn: *const ConnState, reason: []const u8) !void {
@@ -18429,6 +18447,37 @@ pub const LinuxServer = struct {
         return total;
     }
 
+    /// Newest topic a remote peer has published for a channel that may have no
+    /// local world row. The text borrows the peer route table for this turn.
+    fn remotePublishedTopic(self: *LinuxServer, channel: []const u8) ?struct { text: []const u8, set_at: i64 } {
+        var found = false;
+        var best_hlc: u64 = 0;
+        var best_text: []const u8 = "";
+        var best_set: i64 = 0;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const view: ?s2s_peer_mod.TopicView = if (slot.value.s2s_secured) |link| blk: {
+                    if (!link.established()) break :blk null;
+                    break :blk link.channelTopic(channel);
+                } else if (slot.value.s2s) |link| blk: {
+                    if (!link.established()) break :blk null;
+                    break :blk link.channelTopic(channel);
+                } else null;
+                if (view) |v| {
+                    if (!found or v.hlc >= best_hlc) {
+                        found = true;
+                        best_hlc = v.hlc;
+                        best_text = v.topic;
+                        best_set = if (v.present) v.set_at else 0;
+                    }
+                }
+            }
+        }
+        if (!found) return null;
+        return .{ .text = best_text, .set_at = best_set };
+    }
+
     /// Whether a channel that has NO local world record should still be hidden
     /// from LIST/LISTX because the mesh gossiped a `+s` (secret) aggregate for
     /// it. Hidden (`+h`)/private (`+p`) state materializes a local world record
@@ -20623,10 +20672,9 @@ pub const LinuxServer = struct {
                         .topic_set_at = if (v.topic_time > 0) v.topic_time else null,
                     };
                 }
-                // Phase 2: remote-only channels. Topic/created/topic-age are not
-                // replicated for a channel with no local record, so degrade to
-                // empty/0 (the count still aggregates correctly). Secret is honored
-                // via the gossiped MODE aggregate; hidden/private materialize a
+                // Phase 2: remote-only channels. The topic is the text the peer
+                // published; creation time is still unreplicated, so created stays
+                // 0. Secret is honored via the gossiped MODE aggregate; hidden/private materialize a
                 // world record so cannot reach this phase. Eventual-consistency
                 // note: a freshly-created remote +s/+h channel can be briefly
                 // visible here between its MEMBERSHIP burst and the MODE-flags/state
@@ -20637,8 +20685,18 @@ pub const LinuxServer = struct {
                     if (s.server.remoteChannelSecret(name)) continue;
                     const users = s.server.globalMemberCount(name, 0);
                     if (users == 0) continue; // no live members anywhere: nothing to show
-                    if (!s.filters.matches(.{ .name = name, .users = @intCast(users), .created_ago = 0, .topic_age = 0 })) continue;
-                    return .{ .name = name, .users = @intCast(users), .topic = "", .created_at = 0, .topic_set_at = null };
+                    const published = s.server.remotePublishedTopic(name);
+                    const topic = if (published) |t| t.text else "";
+                    const set_at = if (published) |t| t.set_at else 0;
+                    const topic_age = ageSeconds(s.now_seconds, set_at);
+                    if (!s.filters.matches(.{ .name = name, .users = @intCast(users), .created_ago = 0, .topic_age = topic_age })) continue;
+                    return .{
+                        .name = name,
+                        .users = @intCast(users),
+                        .topic = topic,
+                        .created_at = 0,
+                        .topic_set_at = if (set_at > 0 and topic.len != 0) set_at else null,
+                    };
                 }
                 return null;
             }
@@ -20718,10 +20776,10 @@ pub const LinuxServer = struct {
             try self.emitListxEntry(conn, ctx, info);
             emitted += 1;
         }
-        // Phase 2: remote-only channels. Topic/created are not replicated for a
-        // channel with no local record, so degrade to empty/0 (count still
-        // aggregates). Secret is honored via the gossiped MODE aggregate;
-        // hidden/private materialize a world record so cannot reach this phase.
+        // Phase 2: remote-only channels. The 812 topic is the text the peer
+        // published; creation time is still unreplicated. Secret is honored via
+        // the gossiped MODE aggregate; hidden/private materialize a world record
+        // so cannot reach this phase.
         if (!truncated) {
             for (remote_only) |name| {
                 if (self.remoteChannelSecret(name)) continue;
@@ -20730,12 +20788,15 @@ pub const LinuxServer = struct {
                 const entity = ircx_prop_store.Entity{ .kind = .channel, .id = name };
                 const subject = if (self.props.getProp(entity, "SUBJECT")) |ev| ev.value else |_| "";
                 const language = if (self.props.getProp(entity, "LANGUAGE")) |ev| ev.value else |_| "";
+                const published = self.remotePublishedTopic(name);
+                const topic = if (published) |t| t.text else "";
+                const set_at = if (published) |t| t.set_at else 0;
                 const info = listx.ChannelInfo{
                     .name = name,
                     .members = @intCast(members),
-                    .topic = "",
+                    .topic = topic,
                     .created_ms = 0,
-                    .topic_ms = null,
+                    .topic_ms = if (set_at > 0 and topic.len != 0) @as(u64, @intCast(set_at)) * 1000 else null,
                     .subject = subject,
                     .language = language,
                     .registered = false,
@@ -21473,6 +21534,7 @@ pub const LinuxServer = struct {
                 .user = rec.user,
                 .host = rec.host,
                 .realname = rec.realname,
+                .account = rec.account,
                 .signoff_time = rec.signoff_time,
                 .server = self.serverName(),
             };
@@ -50739,8 +50801,23 @@ pub const LinuxServer = struct {
             var buf: [default_reply_bytes]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, "Unsubscribed from activity on {s}", .{channel}) catch return;
             try self.noticeTo(conn, line);
+        } else if (std.ascii.eqlIgnoreCase(sub, "TALLY")) {
+            if (parsed.param_count < 3) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACTIVITY"}, "Not enough parameters");
+                return;
+            }
+            const target = parsed.paramSlice()[2];
+            var tally_buf: [512]u8 = undefined;
+            const tally = self.activity_subs.reactionTally(channel, cid, target, &tally_buf) catch |err| switch (err) {
+                error.NotSubscribed => {
+                    try self.noticeTo(conn, "ACTIVITY: not subscribed");
+                    return;
+                },
+                error.NoSpaceLeft => return,
+            };
+            try self.noticeTo(conn, tally);
         } else {
-            try self.noticeTo(conn, "ACTIVITY: expected SUBSCRIBE or UNSUBSCRIBE");
+            try self.noticeTo(conn, "ACTIVITY: expected SUBSCRIBE, UNSUBSCRIBE, or TALLY");
         }
     }
 
@@ -50764,10 +50841,18 @@ pub const LinuxServer = struct {
     /// Push a reaction ActivityEvent (`:reactor ACTIVITY <#chan> react|unreact
     /// <msgid> <reaction>`) to subscribers. Requires a `+draft/reply` target
     /// msgid; an empty/oversized reaction is dropped.
+    ///
+    /// The tally is recorded before the subscriber check. An empty subscriber
+    /// set used to return first, so a client who subscribed after this returned
+    /// had no stored tally to read.
     fn pushReactionActivity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, react_value: []const u8, reply_target: ?[]const u8, op: activity.ReactionOp) !void {
+        const r = activity.Reaction.fromTagsWithOp(react_value, reply_target, op) catch return;
+        self.activity_subs.recordReaction(channel, monitorIdFromClient(id), r) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {},
+        };
         const subs = self.activity_subs.subscribers(channel);
         if (subs.len == 0) return;
-        const r = activity.Reaction.fromTagsWithOp(react_value, reply_target, op) catch return;
         const verb: []const u8 = if (r.op == .add) "react" else "unreact";
         var prefix_buf: [256]u8 = undefined;
         var line_buf: [default_reply_bytes]u8 = undefined;
@@ -76305,6 +76390,47 @@ test "mesh LIST: remote-only channels join the union with the global count, secr
     const drop = try irc_line.parseLine("LIST >5");
     try server.handleList(asker, &drop);
     try std.testing.expect(std.mem.indexOf(u8, asker.send_buf[0..asker.send_len], "#remote") == null);
+}
+
+test "GAP-P0c remote LISTX carries the peer topic" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{ .allocator = alloc, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "peer.onyx", .config = .{ .require_signed_frames = false } });
+    defer peer.deinit();
+
+    const link = try alloc.create(s2s_link.S2sLink);
+    try link.init(.{ .allocator = alloc, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "self.onyx", .config = .{ .require_signed_frames = false } });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+
+    try peer.start(50);
+    try peer.sendMembership("#remote", "ricky", 0, 100, true, .{ .username = "ricky", .host = "h" }, "");
+    try peer.sendMembership("#remote", "ralph", 0, 100, true, .{ .username = "ralph", .host = "h" }, "");
+    try peer.sendMembership("#plain", "pat", 0, 100, true, .{ .username = "pat", .host = "h" }, "");
+    try peer.sendMembership("#secret", "sam", 0, 100, true, .{ .username = "sam", .host = "h" }, "");
+    try peer.sendChannelModeFlags("#secret", Server.channel_secret_flag_bit, 100);
+    try peer.sendTopic("#remote", "mesh topic", "ricky", 1_700_000_000, 50, true);
+    try peer.sendTopic("#remote", "stale topic", "ricky", 1_600_000_000, 40, true);
+    try pumpLinkPair(&peer, link, alloc);
+    try std.testing.expect(link.established());
+
+    const asker_id = try addTestLocalClient(&server, "Asker", null);
+    const asker = server.rx().clients.get(asker_id).?;
+    const query = try irc_line.parseLine("LISTX");
+    try server.handleListx(asker, &query);
+    const out = asker.send_buf[0..asker.send_len];
+    try expectContains(out, " 812 Asker #remote 2 0 1700000000000 :mesh topic");
+    try expectContains(out, " 812 Asker #plain 1 0 0 :");
+    try std.testing.expect(std.mem.indexOf(u8, out, "stale topic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "#secret") == null);
+    std.debug.print("GAP-P0c branch=listx remote topic\n", .{});
 }
 
 /// Blocking read with a bounded poll budget (so a misbehaving server fails the
@@ -102079,6 +102205,33 @@ test "GAP-P0c KNOCK sends 711 only after local operator notification" {
     std.debug.print("GAP-P0c branch=knock 711 only after a local op is notified\n", .{});
 }
 
+test "GAP-P0c WHOWAS reply includes the account and the real host" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const gone_id = try addTestLocalClient(&server, "Gone", "alice");
+    const gone = server.connFor(gone_id).?;
+    gone.session.registration.registered = true;
+    gone.session.setRealHost("203.0.113.10");
+    gone.session.setVisibleHost("cloak.users.example");
+    try server.closeConn(gone.token, "connection reset");
+
+    const asker_id = try addTestLocalClient(&server, "Asker", null);
+    const asker = server.connFor(asker_id).?;
+    var query = try irc_line.parseLine("WHOWAS Gone");
+    try server.handleWhowas(asker, &query);
+    const out = asker.send_buf[0..asker.send_len];
+    try expectContains(out, " 314 Asker Gone alice 203.0.113.10 * :Gone");
+    try expectContains(out, " 330 Asker Gone alice :is logged in as");
+    try std.testing.expect(std.mem.indexOf(u8, out, "cloak.users.example") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "localhost") == null);
+    std.debug.print("GAP-P0c branch=whowas account and real host\n", .{});
+}
+
 test "rotateTicketKey moves current to previous and generates a fresh key" {
     if (comptime builtin.os.tag == .linux) {
         const allocator = std.testing.allocator;
@@ -103842,6 +103995,52 @@ test "OCG2 server runtime is inert by default and reactor zero owns terminal cad
     try std.testing.expect(server.tickOcg2Runtime());
     try std.testing.expect(server.ocg2_runtime_terminal_logged);
     try std.testing.expect(!server.tickOcg2Runtime());
+}
+
+test "GAP-P0c reaction tally is readable after a late subscribe" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const channel = "#p0c";
+    const target = "msg-stable-1";
+    const alice = try addTestLocalClient(&server, "Alice", null);
+    const bob = try addTestLocalClient(&server, "Bob", null);
+    const alice_conn = server.connFor(alice).?;
+    const bob_conn = server.connFor(bob).?;
+
+    // The shipped writer must store the tally while the subscriber set is empty.
+    try std.testing.expectEqual(@as(usize, 0), server.activity_subs.subscribers(channel).len);
+    try server.pushReactionActivity(alice, alice_conn, channel, "fire", target, .add);
+    try server.pushReactionActivity(bob, bob_conn, channel, "fire", target, .add);
+    try server.pushReactionActivity(alice, alice_conn, channel, "fire", target, .remove);
+    try std.testing.expectEqual(@as(usize, 0), server.activity_subs.subscribers(channel).len);
+
+    const late = try addTestLocalClient(&server, "Late", null);
+    const late_conn = server.connFor(late).?;
+    _ = try server.world.join(channel, worldIdFromClient(late));
+    var denied = try irc_line.parseLine("ACTIVITY TALLY #p0c msg-stable-1");
+    try server.handleActivity(late, late_conn, &denied);
+    try expectContains(late_conn.send_buf[0..late_conn.send_len], "ACTIVITY: not subscribed");
+
+    late_conn.send_len = 0;
+    var sub = try irc_line.parseLine("ACTIVITY SUBSCRIBE #p0c");
+    try server.handleActivity(late, late_conn, &sub);
+    late_conn.send_len = 0;
+    var query = try irc_line.parseLine("ACTIVITY TALLY #p0c msg-stable-1");
+    try server.handleActivity(late, late_conn, &query);
+    const out = late_conn.send_buf[0..late_conn.send_len];
+    try expectContains(out, "target=msg-stable-1 fire=1");
+    std.debug.print("GAP-P0c branch=reaction tally a late subscriber can read\n", .{});
 }
 
 test {

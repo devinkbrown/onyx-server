@@ -10,6 +10,7 @@
 //! `removeClient`. A flat per-channel list keeps ownership trivial — channels
 //! and their subscriber counts are bounded by the caller's config.
 const std = @import("std");
+const activity = @import("../proto/activity.zig");
 
 pub const ClientId = u64;
 
@@ -39,16 +40,25 @@ pub const SubscriptionStore = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     channels: std.StringHashMap(SubscriberList),
+    /// Reaction tallies outlive the subscriber list. A push with nobody
+    /// subscribed still records here, and a subscriber who joins later reads it.
+    reactions: activity.ReactionLedger,
 
     pub fn init(allocator: std.mem.Allocator) SubscriptionStore {
         return initWithConfig(allocator, .{});
     }
 
     pub fn initWithConfig(allocator: std.mem.Allocator, cfg: Config) SubscriptionStore {
-        return .{ .allocator = allocator, .cfg = cfg, .channels = std.StringHashMap(SubscriberList).init(allocator) };
+        return .{
+            .allocator = allocator,
+            .cfg = cfg,
+            .channels = std.StringHashMap(SubscriberList).init(allocator),
+            .reactions = activity.ReactionLedger.init(allocator),
+        };
     }
 
     pub fn deinit(self: *SubscriptionStore) void {
+        self.reactions.deinit();
         var it = self.channels.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -80,6 +90,31 @@ pub const SubscriptionStore = struct {
     pub fn isSubscribed(self: *const SubscriptionStore, channel: []const u8, id: ClientId) bool {
         const list = self.channels.getPtr(channel) orelse return false;
         return list.find(id) != null;
+    }
+
+    /// Record one add or remove against `reaction`'s stable target msgid.
+    /// Does not require any current subscriber.
+    pub fn recordReaction(
+        self: *SubscriptionStore,
+        channel: []const u8,
+        reactor: ClientId,
+        reaction: activity.Reaction,
+    ) activity.ReactionLedger.Error!void {
+        try self.reactions.apply(channel, reactor, reaction.target_msgid, reaction.reaction, reaction.op);
+    }
+
+    /// Tally of `target_msgid` for a subscriber of `channel`.
+    /// `error.NotSubscribed` when `subscriber` has not joined that channel's stream.
+    /// The returned slice aliases `out`.
+    pub fn reactionTally(
+        self: *const SubscriptionStore,
+        channel: []const u8,
+        subscriber: ClientId,
+        target_msgid: []const u8,
+        out: []u8,
+    ) error{ NotSubscribed, NoSpaceLeft }![]const u8 {
+        if (!self.isSubscribed(channel, subscriber)) return error.NotSubscribed;
+        return self.reactions.writeTally(channel, target_msgid, out);
     }
 
     /// Borrowed subscriber id list for `channel` (empty if none). Valid until the
@@ -167,4 +202,20 @@ test "per-channel subscriber cap is enforced" {
     _ = try store.subscribe("#x", 1);
     _ = try store.subscribe("#x", 2);
     try testing.expectError(error.TooManySubscribers, store.subscribe("#x", 3));
+}
+
+test "reaction tally is stored with no subscribers and read after subscribe" {
+    var store = SubscriptionStore.init(testing.allocator);
+    defer store.deinit();
+    const reaction = try activity.Reaction.fromTagsWithOp("fire", "msg-stable-1", .add);
+    try store.recordReaction("#chat", 1, reaction);
+    const removed = try activity.Reaction.fromTagsWithOp("fire", "msg-stable-1", .remove);
+    try store.recordReaction("#chat", 1, removed);
+    const kept = try activity.Reaction.fromTagsWithOp("fire", "msg-stable-1", .add);
+    try store.recordReaction("#chat", 2, kept);
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.NotSubscribed, store.reactionTally("#chat", 9, "msg-stable-1", &buf));
+    try testing.expect(try store.subscribe("#chat", 9));
+    const tally = try store.reactionTally("#chat", 9, "msg-stable-1", &buf);
+    try testing.expectEqualStrings("target=msg-stable-1 fire=1", tally);
 }

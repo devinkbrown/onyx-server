@@ -441,13 +441,39 @@ pub const ChannelModeFlags = struct {
     hlc: u64,
 };
 
-/// LWW clock for a channel's topic. The topic TEXT lives in the daemon's world;
-/// the route table only orders writes so a stale/re-burst TOPIC never clobbers a
-/// newer one. `hlc` is the sole ordering key.
+/// LWW record for a channel's topic. `hlc` is the sole ordering key. The text is
+/// kept here because a channel that exists only on the peer has no local world
+/// row for LIST/LISTX to read. Strings are allocator-owned; empty text is a
+/// zero-length slice and is not freed.
 pub const TopicClock = struct {
     origin_node: NodeId,
     hlc: u64,
+    topic: []u8 = &.{},
+    setter: []u8 = &.{},
+    set_at: i64 = 0,
+    present: bool = false,
 };
+
+/// Borrowed topic published by one peer. Valid until that peer's route table
+/// replaces or clears the channel.
+pub const TopicView = struct {
+    topic: []const u8,
+    setter: []const u8,
+    set_at: i64,
+    present: bool,
+    hlc: u64,
+    origin_node: NodeId,
+};
+
+fn dupeOwnedBytes(allocator: std.mem.Allocator, text: []const u8) Error![]u8 {
+    if (text.len == 0) return &.{};
+    return allocator.dupe(u8, text);
+}
+
+fn freeOwnedBytes(allocator: std.mem.Allocator, text: []u8) void {
+    if (text.len == 0) return;
+    allocator.free(text);
+}
 
 pub const RouteTable = struct {
     const Self = @This();
@@ -557,7 +583,11 @@ pub const RouteTable = struct {
         self.channel_lists.clearRetainingCapacity();
 
         var topics = self.channel_topics.iterator();
-        while (topics.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        while (topics.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            freeOwnedBytes(self.allocator, entry.value_ptr.topic);
+            freeOwnedBytes(self.allocator, entry.value_ptr.setter);
+        }
         self.channel_topics.clearRetainingCapacity();
 
         self.nick_count = 0;
@@ -1990,14 +2020,33 @@ pub const RouteTable = struct {
     pub const ApplyTopicOutcome = enum { changed, unchanged };
 
     /// Apply a TOPIC event for a remote channel, last-writer-wins by `hlc`. Stale
-    /// events (hlc <= stored) are ignored. The topic TEXT mutation happens in the
-    /// daemon's world after draining a `changed` outcome.
-    pub fn applyTopic(self: *Self, chan: []const u8, node: NodeId, hlc: u64) Error!ApplyTopicOutcome {
+    /// events (hlc <= stored) are ignored. The accepted text stays in this table
+    /// so a remote-only channel can still answer LIST/LISTX after the daemon
+    /// drains the change queue. A failed copy leaves the previous record in place.
+    pub fn applyTopic(
+        self: *Self,
+        chan: []const u8,
+        node: NodeId,
+        hlc: u64,
+        text: []const u8,
+        setter: []const u8,
+        set_at: i64,
+        present: bool,
+    ) Error!ApplyTopicOutcome {
         try self.validateName(chan);
         try validateNode(node);
 
         if (self.channel_topics.getPtr(chan)) |cur| {
             if (hlc <= cur.hlc) return .unchanged;
+            const owned_topic = try dupeOwnedBytes(self.allocator, text);
+            errdefer freeOwnedBytes(self.allocator, owned_topic);
+            const owned_setter = try dupeOwnedBytes(self.allocator, setter);
+            freeOwnedBytes(self.allocator, cur.topic);
+            freeOwnedBytes(self.allocator, cur.setter);
+            cur.topic = owned_topic;
+            cur.setter = owned_setter;
+            cur.set_at = set_at;
+            cur.present = present;
             cur.origin_node = node;
             cur.hlc = hlc;
             return .changed;
@@ -2006,8 +2055,33 @@ pub const RouteTable = struct {
         if (self.channel_topics.count() >= self.cfg.max_channels) return error.RouteTableFull;
         const owned = try self.allocator.dupe(u8, chan);
         errdefer self.allocator.free(owned);
-        try self.channel_topics.putNoClobber(owned, .{ .origin_node = node, .hlc = hlc });
+        const owned_topic = try dupeOwnedBytes(self.allocator, text);
+        errdefer freeOwnedBytes(self.allocator, owned_topic);
+        const owned_setter = try dupeOwnedBytes(self.allocator, setter);
+        errdefer freeOwnedBytes(self.allocator, owned_setter);
+        try self.channel_topics.putNoClobber(owned, .{
+            .origin_node = node,
+            .hlc = hlc,
+            .topic = owned_topic,
+            .setter = owned_setter,
+            .set_at = set_at,
+            .present = present,
+        });
         return .changed;
+    }
+
+    /// Topic text last accepted for `chan`, or null when this peer has not
+    /// published one. The slices borrow the route table.
+    pub fn channelTopic(self: *const Self, chan: []const u8) ?TopicView {
+        const cur = self.channel_topics.get(chan) orelse return null;
+        return .{
+            .topic = if (cur.present) cur.topic else "",
+            .setter = cur.setter,
+            .set_at = cur.set_at,
+            .present = cur.present,
+            .hlc = cur.hlc,
+            .origin_node = cur.origin_node,
+        };
     }
 
     /// Rename a remote user across the nick→node map and every channel roster it
