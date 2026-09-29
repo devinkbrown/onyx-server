@@ -2024,10 +2024,9 @@ fn acceptOne(handle: usize) error{ WouldBlock, SocketFailed }!i32 {
         if (WSAGetLastError() == 10035) return error.WouldBlock;
         return error.SocketFailed;
     }
-    if (!setNonblock(sock)) {
-        _ = closesocket(sock);
-        return error.SocketFailed;
-    }
+    // Leave the accepted socket blocking. Nonblocking AFD receive completes
+    // with zero bytes before the PING is queued, and the listen loop treats
+    // that as EOF. FIONBIO stays on the listener only.
     return @intCast(sock);
 }
 
