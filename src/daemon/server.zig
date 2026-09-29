@@ -874,6 +874,7 @@ pub const ReplyCode = Numeric;
 
 const ringlane = @import("ringlane.zig");
 const io_backend = @import("io_backend.zig");
+const sendq = @import("sendq.zig");
 
 const RingFdToken = ringlane.FdToken;
 const RingCore = ringlane.Ring;
@@ -50089,12 +50090,6 @@ pub const LinuxServer = struct {
         if (state == .down) h.partitioned = false;
     }
 
-    /// Bytes waiting in this connection's SendQ. Inline tail plus overflow.
-    fn connSendBacklog(conn: *const ConnState) u64 {
-        const inline_queued = conn.send_len -| conn.send_offset;
-        return std.math.add(u64, inline_queued, conn.send_overflow.items.len) catch std.math.maxInt(u64);
-    }
-
     /// Record that `name` is still reachable. `peer_hlc` is ignored: an older
     /// hybrid logical clock must not freeze the local activity stamp.
     fn notePeerStillHere(self: *LinuxServer, name: []const u8, peer_hlc: u64) void {
@@ -53425,57 +53420,17 @@ fn recvqReset(conn: *ConnState) void {
     conn.line_len = 0;
 }
 
-fn rawAppendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
-    // Enforce the configured ceiling before BOTH the inline and overflow paths.
-    // The old fast path admitted up to the full 8 KiB inline buffer even when a
-    // connection class configured a smaller SendQ. Keep every addition checked:
-    // attacker-controlled lengths must fail closed rather than wrap the bound.
-    const inline_queued = conn.send_len - conn.send_offset;
-    const queued = std.math.add(usize, inline_queued, conn.send_overflow.items.len) catch return error.OutputTooSmall;
-    if (queued > conn.sendq_cap or bytes.len > conn.sendq_cap - queued) return error.OutputTooSmall;
-
-    // Fast path: with nothing already spilled to overflow, reclaim the sent prefix
-    // [0, send_offset) by sliding the unsent tail to the front, then use the inline
-    // buffer if it fits. NEVER compact while a send SQE is armed: the kernel is
-    // still reading send_buf[send_offset..send_len] for the in-flight zero-copy
-    // send, so moving those bytes would corrupt the wire.
-    if (conn.send_overflow.items.len == 0) {
-        if (conn.send_len + bytes.len > conn.send_buf.len and conn.send_offset > 0 and !conn.send_armed) {
-            const tail = conn.send_len - conn.send_offset;
-            std.mem.copyForwards(u8, conn.send_buf[0..tail], conn.send_buf[conn.send_offset..conn.send_len]);
-            conn.send_len = tail;
-            conn.send_offset = 0;
-        }
-        if (conn.send_len + bytes.len <= conn.send_buf.len) {
-            @memcpy(conn.send_buf[conn.send_len .. conn.send_len + bytes.len], bytes);
-            conn.send_len += bytes.len;
-            return;
-        }
-    }
-    // Overflow (real SendQ): the inline buffer is full or busy, so spill to the heap
-    // queue — refilled into the inline buffer on send-completion (the kernel only
-    // ever reads the fixed inline buffer, so this never moves an armed buffer).
-    conn.send_overflow.appendSlice(conn.overflow_allocator, bytes) catch return error.OutputTooSmall;
+/// Bytes waiting in this connection's SendQ. Inline tail plus overflow.
+fn connSendBacklog(conn: *const ConnState) u64 {
+    return sendq.backlog(conn);
 }
 
-/// Reserve the exact SendQ storage needed by one already-sized secured record
-/// before advancing the link's AEAD send counter. Once this succeeds,
-/// `rawAppendToConn` cannot fail for capacity or allocation, so replay never has
-/// to leave counter-owning ciphertext in a shared SecuredLink outbound buffer.
-fn reserveRawAppendToConn(conn: *ConnState, bytes_len: usize) ServerError!void {
-    const inline_queued = conn.send_len - conn.send_offset;
-    const queued = std.math.add(usize, inline_queued, conn.send_overflow.items.len) catch
-        return error.OutputTooSmall;
-    if (queued > conn.sendq_cap or bytes_len > conn.sendq_cap - queued)
-        return error.OutputTooSmall;
+fn rawAppendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
+    return sendq.rawAppend(conn, bytes);
+}
 
-    if (conn.send_overflow.items.len == 0) {
-        if (conn.send_len + bytes_len <= conn.send_buf.len) return;
-        if (!conn.send_armed and conn.send_offset != 0 and
-            inline_queued + bytes_len <= conn.send_buf.len) return;
-    }
-    conn.send_overflow.ensureUnusedCapacity(conn.overflow_allocator, bytes_len) catch
-        return error.OutputTooSmall;
+fn reserveRawAppendToConn(conn: *ConnState, bytes_len: usize) ServerError!void {
+    return sendq.reserve(conn, bytes_len);
 }
 
 /// Exact outer Mooring record size for one signed SESSION_REPLICA object. A v2
@@ -53495,26 +53450,11 @@ fn sessionReplicaSecuredRecordLen(signed_payload_len: usize) ?usize {
     ) catch null;
 }
 
-/// Refill the drained inline `send_buf` with the next chunk of the SendQ overflow.
-/// Called from the send-completion handler with nothing armed, so writing the
-/// inline buffer is safe. The overflow heap is freed entirely once fully drained
-/// so a one-off burst never pins memory.
 fn refillFromOverflow(conn: *ConnState) void {
-    if (conn.send_overflow.items.len == 0) return;
-    const n = @min(conn.send_buf.len, conn.send_overflow.items.len);
-    @memcpy(conn.send_buf[0..n], conn.send_overflow.items[0..n]);
-    conn.send_len = n;
-    conn.send_offset = 0;
-    if (n == conn.send_overflow.items.len) {
-        conn.send_overflow.clearAndFree(conn.overflow_allocator);
-    } else {
-        const remaining = conn.send_overflow.items.len - n;
-        std.mem.copyForwards(u8, conn.send_overflow.items[0..remaining], conn.send_overflow.items[n..]);
-        conn.send_overflow.items.len = remaining;
-    }
+    sendq.refill(conn);
 }
 
-test "SendQ: inline fast path, heap overflow, refill, and per-class cap" {
+test "GAP-X2 SendQ inline fast path, heap overflow, refill, and per-class cap" {
     var conn = ConnState.init(-1);
     conn.overflow_allocator = std.testing.allocator;
     conn.sendq_cap = 20 * 1024; // 20 KiB
@@ -53548,14 +53488,50 @@ test "SendQ: inline fast path, heap overflow, refill, and per-class cap" {
     refillFromOverflow(&conn);
     try std.testing.expectEqual(@as(usize, 4096), conn.send_len);
     try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.capacity);
+    try std.testing.expectEqual(@as(u64, 4096), connSendBacklog(&conn));
+
+    var compact = ConnState.init(-1);
+    compact.overflow_allocator = std.testing.allocator;
+    compact.sendq_cap = 20 * 1024;
+    defer if (compact.send_overflow.capacity > 0) compact.send_overflow.deinit(compact.overflow_allocator);
+    compact.send_buf[100] = 'Q';
+    compact.send_buf[compact.send_buf.len - 1] = 'W';
+    compact.send_offset = 100;
+    compact.send_len = compact.send_buf.len;
+    compact.send_armed = false;
+    try rawAppendToConn(&compact, "Z");
+    try std.testing.expectEqual(@as(usize, 0), compact.send_offset);
+    try std.testing.expectEqual(compact.send_buf.len - 100 + 1, compact.send_len);
+    try std.testing.expectEqual(@as(u8, 'Q'), compact.send_buf[0]);
+    try std.testing.expectEqual(@as(u8, 'W'), compact.send_buf[compact.send_buf.len - 101]);
+    try std.testing.expectEqual(@as(u8, 'Z'), compact.send_buf[compact.send_len - 1]);
+    try std.testing.expectEqual(@as(usize, 0), compact.send_overflow.items.len);
+
+    var armed = ConnState.init(-1);
+    armed.overflow_allocator = std.testing.allocator;
+    armed.sendq_cap = 20 * 1024;
+    defer if (armed.send_overflow.capacity > 0) armed.send_overflow.deinit(armed.overflow_allocator);
+    armed.send_offset = 100;
+    armed.send_len = armed.send_buf.len;
+    armed.send_armed = true;
+    try rawAppendToConn(&armed, "Z");
+    try std.testing.expectEqual(@as(usize, 100), armed.send_offset);
+    try std.testing.expectEqual(armed.send_buf.len, armed.send_len);
+    try std.testing.expectEqualStrings("Z", armed.send_overflow.items);
+    try std.testing.expect(armed.send_armed);
+
+    std.debug.print("GAP-X2 step2 branch=SendQ append reserve refill and backlog moved out of server.zig and the inline overflow cap and armed-buffer rules still hold\n", .{});
 }
 
-test "SendQ: per-class cap also bounds the inline fast path" {
+test "GAP-X2 SendQ per-class cap also bounds the inline fast path" {
     var conn = ConnState.init(-1);
     conn.overflow_allocator = std.testing.allocator;
     conn.sendq_cap = 3;
     defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
 
+    try reserveRawAppendToConn(&conn, 3);
+    try std.testing.expectError(error.OutputTooSmall, reserveRawAppendToConn(&conn, 4));
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
     try std.testing.expectError(error.OutputTooSmall, rawAppendToConn(&conn, "four"));
     try std.testing.expectEqual(@as(usize, 0), conn.send_len);
     try rawAppendToConn(&conn, "abc");
