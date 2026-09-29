@@ -242,6 +242,12 @@ pub const VerifyStore = struct {
     }
 };
 
+pub fn formatToken(random_bytes: []const u8, out: []u8) error{BufferTooSmall}![]u8 {
+    if (random_bytes.len > out.len / 2) return error.BufferTooSmall;
+    encodeHex(random_bytes, out[0 .. random_bytes.len * 2]);
+    return out[0 .. random_bytes.len * 2];
+}
+
 fn encodeHex(bytes: []const u8, out: []u8) void {
     const alphabet = "0123456789abcdef";
     for (bytes, 0..) |byte, index| {

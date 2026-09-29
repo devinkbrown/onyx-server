@@ -127,11 +127,14 @@ pub const Config = struct {
         relay_port: u16 = 587,
         /// false = port 465 implicit TLS (TLS from connect); true = STARTTLS on 587.
         starttls: bool = true,
-        /// Skip TLS certificate verification of the relay. Default false. Required
-        /// (set true) to use AUTH with a NON-loopback relay until trust-anchor
-        /// verification is wired — otherwise AUTH to a remote relay is refused, so
-        /// submission credentials are never sent over an unverified TLS session.
+        /// Skip TLS certificate verification of the relay. Default false.
+        /// AUTH to a non-loopback relay is refused unless this is set or
+        /// `trust_store_path` loads a non-empty trust anchor.
         insecure_skip_verify: bool = false,
+        /// PEM or DER file of relay trust anchors. Empty and unset keep the
+        /// sender from treating a remote certificate as verified. Mail stays
+        /// disabled unless `[mail] enabled` is set.
+        trust_store_path: ?[]const u8 = null,
         /// Envelope sender + `From:` address (e.g. "onyx@example.org").
         from: ?[]const u8 = null,
         /// AUTH credentials for the relay (optional; omitted = no AUTH).
@@ -1009,6 +1012,7 @@ pub const Config = struct {
         if (self.mail.from) |value| allocator.free(value);
         if (self.mail.user) |value| allocator.free(value);
         if (self.mail.pass) |value| allocator.free(value);
+        if (self.mail.trust_store_path) |value| allocator.free(value);
         if (self.webauthn.rp_id) |value| allocator.free(value);
         freeStringList(allocator, self.webauthn.origins);
         if (self.mesh.mesh_pass) |value| allocator.free(value);
@@ -1295,6 +1299,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.mail.relay_port = @intCast(try uintField(doc, "mail.relay_port", cfg.mail.relay_port, 1, 65535));
     if (doc.getBool("mail.starttls")) |b| cfg.mail.starttls = b;
     if (doc.getBool("mail.insecure_skip_verify")) |b| cfg.mail.insecure_skip_verify = b;
+    try setOpt(allocator, resolver, doc.getString("mail.trust_store_path"), &cfg.mail.trust_store_path);
     try setOpt(allocator, resolver, doc.getString("mail.from"), &cfg.mail.from);
     try setOpt(allocator, resolver, doc.getString("mail.user"), &cfg.mail.user);
     try setOpt(allocator, resolver, doc.getString("mail.pass"), &cfg.mail.pass);

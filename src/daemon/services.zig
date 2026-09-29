@@ -10,6 +10,7 @@ const toml = @import("../proto/toml.zig");
 const scram_store_mod = @import("scram_store.zig");
 const sasl = @import("../proto/sasl.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
+const account_verify = @import("account_verify.zig");
 const webauthn_creds = @import("webauthn_creds.zig");
 const durable_credential_props = @import("durable_credential_props.zig");
 const durable_oper_authority = @import("durable_oper_authority.zig");
@@ -2611,6 +2612,23 @@ pub const Services = struct {
         var value_buf: [verify_value_max]u8 = undefined;
         const value = try encodeVerify(record.name.asSlice(), record.email.asSlice(), token, issued_ms, &value_buf);
         try self.store.family(.props).put(key, value);
+    }
+
+    /// Write the pending address and verify token, then mirror the token into
+    /// RAM. A failed address write returns before `issue`, so no token exists.
+    pub fn beginEmailVerification(
+        self: *Services,
+        verifies: *account_verify.VerifyStore,
+        name: []const u8,
+        email: []const u8,
+        random_bytes: []const u8,
+        issued_ms: u64,
+        scratch: []u8,
+    ) (ServiceError || account_verify.Error)![]const u8 {
+        var hex_buf: [128]u8 = undefined;
+        const token = account_verify.formatToken(random_bytes, &hex_buf) catch return error.BufferTooSmall;
+        try self.setAccountEmailPending(name, email, token, issued_ms, scratch);
+        return verifies.issue(name, email, random_bytes, issued_ms);
     }
 
     pub fn confirmAccountEmail(
@@ -5983,6 +6001,36 @@ test "account email verification persists across store reopen" {
         try std.testing.expect(info.account_info.email_verified);
         try std.testing.expectEqual(EmailVerifyResult.no_pending, try services.confirmAccountEmail("ALICE", "abc123", 13, &scratch));
     }
+}
+
+test "DST GAP-D7 a failed pending-address write issues no verification token" {
+    std.debug.print("GAP-D7 branch=a failed pending-address write issues no verification token; live mail stays off\n", .{});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "gap-d7-verify.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+    _ = try services.registerAccountWithEmail("alice", "correct horse battery staple", "alice@example.test", false, &scratch);
+    var verifies = account_verify.VerifyStore.init(std.testing.allocator, .{ .token_bytes = 16 });
+    defer verifies.deinit();
+    var random: [16]u8 = undefined;
+    @memset(&random, 0xab);
+
+    store.cfg.max_record_bytes = 8;
+    try std.testing.expectError(error.RecordTooLarge, services.beginEmailVerification(&verifies, "alice", "other@example.test", &random, 10, &scratch));
+    try std.testing.expect(!verifies.isPending("alice"));
+    try std.testing.expectEqual(EmailVerifyResult.no_pending, try services.confirmAccountEmail("alice", "abcd", 11, &scratch));
+    var info = try services.accountInfo("alice");
+    try std.testing.expectEqualStrings("alice@example.test", info.account_info.email.asSlice());
+
+    store.cfg.max_record_bytes = 16 * 1024 * 1024;
+    const token = try services.beginEmailVerification(&verifies, "alice", "other@example.test", &random, 12, &scratch);
+    try std.testing.expect(verifies.isPending("alice"));
+    try std.testing.expectEqual(EmailVerifyResult.verified, try services.confirmAccountEmail("alice", token, 13, &scratch));
+    info = try services.accountInfo("alice");
+    try std.testing.expectEqualStrings("other@example.test", info.account_info.email.asSlice());
+    try std.testing.expect(info.account_info.email_verified);
 }
 
 test "certfp binding persists across store reopen" {

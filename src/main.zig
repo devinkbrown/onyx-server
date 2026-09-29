@@ -1026,21 +1026,39 @@ pub fn main(init: std.process.Init) !void {
     // Background SMTP submission sender: built only when `[mail]` is enabled with
     // a relay host + sender address. Delivers account email-verification codes
     // out-of-band. Inert otherwise (emails are recorded unverified).
+    var mail_trust: ?[]u8 = null;
+    defer if (mail_trust) |bytes| allocator.free(bytes);
+    var mail_anchor_slot: [1][]const u8 = undefined;
     var mail_send: ?onyx_server.daemon.mail_sender.Sender = null;
     defer if (mail_send) |*m| m.deinit();
     if (held) |h| {
         const m = h.parsed.mail;
         if (m.enabled) {
             if (m.relay_host) |relay| if (m.from) |from| {
+                var anchors: []const []const u8 = &.{};
+                if (m.trust_store_path) |path| {
+                    mail_trust = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20)) catch |err| blk: {
+                        std.debug.print("mail: cannot read trust store {s}: {s}\n", .{ path, @errorName(err) });
+                        break :blk null;
+                    };
+                    if (mail_trust) |bytes| if (bytes.len != 0) {
+                        mail_anchor_slot[0] = bytes;
+                        anchors = &mail_anchor_slot;
+                    };
+                }
                 mail_send = onyx_server.daemon.mail_sender.Sender.init(allocator, .{
                     .relay_host = relay,
                     .relay_port = m.relay_port,
                     .starttls = m.starttls,
                     .insecure_skip_verify = m.insecure_skip_verify,
+                    .trust_anchors = anchors,
                     .ehlo_domain = srv_cfg.server_name,
                     .from = from,
                     .user = m.user,
                     .pass = m.pass,
+                    .failure_wal = "mail-failures.wal",
+                    .failure_io = init.io,
+                    .failure_dir = std.Io.Dir.cwd(),
                 }) catch null;
                 if (mail_send) |*s| {
                     s.start();

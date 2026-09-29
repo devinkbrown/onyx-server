@@ -10,8 +10,9 @@
 //! Structural twin of `rdns.zig` (fixed job ring + worker + start/stop +
 //! `lockSpin`/`sleepMs`, inert when unconfigured); the worker drives
 //! `proto/smtp_client` over a real socket instead of doing a DNS lookup.
-//! Best-effort: any resolve/connect/TLS/SMTP failure drops the job with no
-//! retry (v1). All network I/O happens OUTSIDE the lock.
+//! A resolve/connect/TLS/SMTP failure is written to the failure store when one
+//! is configured. Live mail stays off unless the operator enables it. All
+//! network I/O happens OUTSIDE the lock.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -22,6 +23,7 @@ const smtp_client = @import("../proto/smtp_client.zig");
 const tls_client = @import("../crypto/tls_client.zig");
 const http_fetch = @import("http_fetch.zig");
 const platform = @import("../substrate/platform.zig");
+const store_mod = @import("store.zig");
 
 const job_capacity: usize = 64; // bounded ring; enqueue drops past this
 const io_timeout_ms: u31 = 15000; // per-job connect + recv/send timeout
@@ -36,14 +38,20 @@ pub const Config = struct {
     relay_host: []const u8,
     relay_port: u16 = 587,
     starttls: bool = true,
-    /// Skip relay certificate verification. Real trust-anchor verification is not
-    /// wired up yet, so AUTH over a remote (non-loopback) relay is REFUSED unless
-    /// this is explicitly set true (see `deliver`'s credential-exposure gate).
+    /// Skip relay certificate verification. AUTH over a remote relay is refused
+    /// unless this is set or `trust_anchors` is non-empty.
     insecure_skip_verify: bool = false,
+    /// DER trust anchors for the relay certificate. Empty means a remote AUTH
+    /// session is not verified.
+    trust_anchors: []const []const u8 = &.{},
     ehlo_domain: []const u8,
     from: []const u8,
     user: ?[]const u8 = null,
     pass: ?[]const u8 = null,
+    /// OroStore WAL that receives one props row per failed delivery.
+    failure_wal: ?[]const u8 = null,
+    failure_io: ?std.Io = null,
+    failure_dir: ?std.Io.Dir = null,
 };
 
 /// One queued message; the three strings are allocator-owned copies.
@@ -69,6 +77,7 @@ pub const Sender = struct {
     job_head: usize = 0,
     job_tail: usize = 0,
     job_count: usize = 0,
+    failure_seq: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Sender {
         const jobs = try allocator.alloc(Job, job_capacity);
@@ -152,8 +161,37 @@ pub const Sender = struct {
                 continue;
             };
             defer job.free(self.allocator);
-            self.deliver(job) catch {}; // best-effort: drop on any failure, no retry
+            self.finishJob(job);
         }
+    }
+
+    /// Deliver one job. A failure is appended to the failure store when configured.
+    pub fn settle(self: *Sender, to: []const u8, subject: []const u8, body: []const u8) !void {
+        const job = self.dupeJob(to, subject, body) orelse return error.OutOfMemory;
+        defer job.free(self.allocator);
+        self.finishJob(job);
+    }
+
+    fn finishJob(self: *Sender, job: Job) void {
+        self.deliver(job) catch |err| {
+            self.recordFailure(job, err) catch {};
+        };
+    }
+
+    fn recordFailure(self: *Sender, job: Job, err: anyerror) !void {
+        const io = self.config.failure_io orelse return;
+        const wal = self.config.failure_wal orelse return;
+        const dir = self.config.failure_dir orelse std.Io.Dir.cwd();
+        if (self.failure_seq == std.math.maxInt(u64)) return error.SequenceExhausted;
+        self.failure_seq += 1;
+        var store = try store_mod.OroStore.open(self.allocator, io, dir, wal);
+        defer store.deinit();
+        var key_buf: [48]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "mailfail:{d}", .{self.failure_seq}) catch return error.NoSpaceLeft;
+        var val_buf: [180]u8 = undefined;
+        const to = job.to[0..@min(job.to.len, 80)];
+        const value = std.fmt.bufPrint(&val_buf, "{s} {s}", .{ @errorName(err), to }) catch return error.NoSpaceLeft;
+        try store.put(.props, key, value);
     }
 
     /// Resolve, connect, and run the ESMTP conversation for one job (outside the lock).
@@ -161,12 +199,10 @@ pub const Sender = struct {
         const job_start = platform.monotonicMillis();
         const addr = try http_fetch.resolveHostA(self.config.relay_host, self.config.relay_port, io_timeout_ms);
 
-        // C1: submission credentials must never cross an unverified TLS session to a
-        // REMOTE relay. We cannot verify a remote cert yet (no trust anchors), so when
-        // AUTH would be attempted (`user != null`) against a non-loopback relay and the
-        // operator has not explicitly opted into `insecure_skip_verify`, abort the job
-        // before sending anything — leaking creds to a MITM is worse than not sending.
-        if (self.config.user != null and !isLoopback(addr) and !self.config.insecure_skip_verify)
+        // Submission credentials must not cross an unverified session to a remote
+        // relay. A non-empty trust store, or an explicit insecure opt-in, is required.
+        const verified = self.config.trust_anchors.len != 0 or self.config.insecure_skip_verify;
+        if (self.config.user != null and !isLoopback(addr) and !verified)
             return error.UnverifiedAuthRelay;
 
         const fd = try connectAddr(addr, io_timeout_ms);
@@ -290,15 +326,14 @@ pub const Sender = struct {
     }
 
     /// TLS 1.3 handshake on `fd`, returning a heap-allocated connected client.
-    /// Cert verification is skipped ONLY when `insecure_skip_verify` is set — real
-    /// trust-anchor verification is not yet available, so an unverified session to a
-    /// remote relay is gated upstream (see `deliver`'s credential-exposure check).
+    /// Cert verification uses `trust_anchors`. It is skipped only when
+    /// `insecure_skip_verify` is set.
     fn handshake(self: *Sender, fd: linux.fd_t) !*tls_client.Client {
         const tc = try self.allocator.create(tls_client.Client);
         errdefer self.allocator.destroy(tc);
         tc.* = try tls_client.Client.init(self.allocator, .{
             .server_name = self.config.relay_host,
-            .trust_anchors = &.{},
+            .trust_anchors = self.config.trust_anchors,
             .now_unix_seconds = wallClockSeconds(),
         });
         errdefer tc.deinit();
@@ -355,8 +390,55 @@ fn hasCrlf(s: []const u8) bool {
     return std.mem.indexOfScalar(u8, s, '\r') != null or std.mem.indexOfScalar(u8, s, '\n') != null;
 }
 
+test "DST GAP-D7 configured relay with a trust store records a durable delivery failure" {
+    std.debug.print("GAP-D7 branch=configured relay with a non-empty trust store records a durable delivery failure; empty trust still refuses remote AUTH; live mail stays off\n", .{});
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const anchors = [_][]const u8{"anchor"};
+    var sender = try Sender.init(allocator, .{
+        .relay_host = "127.0.0.1",
+        .relay_port = 1,
+        .ehlo_domain = "onyx.test",
+        .from = "onyx@example.test",
+        .trust_anchors = &anchors,
+        .failure_wal = "mailfail.wal",
+        .failure_io = io,
+        .failure_dir = tmp.dir,
+    });
+    defer sender.deinit();
+    try std.testing.expect(sender.config.trust_anchors.len != 0);
+    try sender.settle("d7@example.test", "verify", "code");
+
+    var opened = try store_mod.OroStore.open(allocator, io, tmp.dir, "mailfail.wal");
+    defer opened.deinit();
+    const row = opened.get(.props, "mailfail:1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, row, "d7@example.test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "ConnectFailed") != null or std.mem.indexOf(u8, row, "SocketUnavailable") != null);
+
+    var refused = try Sender.init(allocator, .{
+        .relay_host = "203.0.113.5",
+        .relay_port = 587,
+        .ehlo_domain = "onyx.test",
+        .from = "onyx@example.test",
+        .user = "submit",
+        .pass = "secret",
+        .failure_wal = "mailfail-auth.wal",
+        .failure_io = io,
+        .failure_dir = tmp.dir,
+    });
+    defer refused.deinit();
+    try std.testing.expect(refused.config.trust_anchors.len == 0);
+    try refused.settle("d7@example.test", "verify", "code");
+    var auth_store = try store_mod.OroStore.open(allocator, io, tmp.dir, "mailfail-auth.wal");
+    defer auth_store.deinit();
+    const auth_row = auth_store.get(.props, "mailfail:1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, auth_row, "UnverifiedAuthRelay") != null);
+}
+
 /// True if `addr` is a loopback address (IPv4 127.0.0.0/8 or IPv6 ::1). Used to
-/// decide whether AUTH over an unverified TLS session is acceptable (C1).
+/// decide whether AUTH over an unverified TLS session is acceptable.
 fn isLoopback(addr: net.IpAddress) bool {
     return switch (addr) {
         .ip4 => |x| x.bytes[0] == 127,

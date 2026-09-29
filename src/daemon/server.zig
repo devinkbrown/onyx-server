@@ -37486,8 +37486,7 @@ pub const LinuxServer = struct {
                     var tok_bytes: [16]u8 = undefined;
                     io.random(&tok_bytes);
                     const now_u: u64 = @intCast(@max(0, self.nowMs()));
-                    if (self.account_verifies.issue(account, email, &tok_bytes, now_u)) |token| {
-                        svc.setAccountEmailPending(account, email, token, now_u, &scratch) catch {};
+                    if (svc.beginEmailVerification(&self.account_verifies, account, email, &tok_bytes, now_u, &scratch)) |token| {
                         var body_buf: [512]u8 = undefined;
                         const body = std.fmt.bufPrint(&body_buf, "Hello {s},\r\n\r\nYour verification code for {s} is: {s}\r\n\r\nConfirm it on IRC with:  VERIFY {s}\r\n\r\nIf you did not request this, ignore this message.\r\n", .{ account, self.serverName(), token, token }) catch "";
                         if (body.len != 0) ms.enqueue(email, "Verify your account", body);
