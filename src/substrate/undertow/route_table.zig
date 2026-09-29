@@ -4130,3 +4130,26 @@ test "same-HLC re-burst after PART tombstone does not resurrect a departed membe
     try std.testing.expectEqual(RouteTable.ApplyOutcome.joined, newer.outcome);
     try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#root").len);
 }
+
+test "GAP-M2 a raised channel ceiling stores the 65th node" {
+    const alloc = std.testing.allocator;
+    var bounded = try RouteTable.init(alloc, .{ .max_nodes_per_channel = 64 });
+    defer bounded.deinit();
+    var n: NodeId = 1;
+    while (n <= 64) : (n += 1) try bounded.updateOnMembershipChange("#m2", n, .join);
+    try std.testing.expectError(error.ChannelFanoutFull, bounded.updateOnMembershipChange("#m2", 65, .join));
+
+    var wide = try RouteTable.init(alloc, .{ .max_nodes_per_channel = 128 });
+    defer wide.deinit();
+    n = 1;
+    while (n <= 65) : (n += 1) try wide.updateOnMembershipChange("#m2", n, .join);
+    var out: [128]NodeId = undefined;
+    const stored = try wide.channelNodes("#m2", &out);
+    try std.testing.expectEqual(@as(usize, 65), stored);
+    try std.testing.expect(containsNode(out[0..stored], 1));
+    try std.testing.expect(containsNode(out[0..stored], 65));
+
+    while (n <= 128) : (n += 1) try wide.updateOnMembershipChange("#m2", n, .join);
+    try std.testing.expectError(error.ChannelFanoutFull, wide.updateOnMembershipChange("#m2", 129, .join));
+    std.debug.print("GAP-M2 branch=raised ceilings store the 65th node and still evict only when full\n", .{});
+}

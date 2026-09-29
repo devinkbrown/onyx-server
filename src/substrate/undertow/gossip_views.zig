@@ -790,3 +790,38 @@ test "Config/BroadcastConfig applyToml overlay mesh.gossip keys" {
     pc.applyToml(&doc);
     try std.testing.expectEqual(@as(i64, 750), pc.graft_retry_ms);
 }
+
+test "GAP-M2 a raised passive view keeps the 65th node" {
+    const alloc = std.testing.allocator;
+    var views = try Views.init(alloc, 1, .{ .active_max = 4, .passive_max = 128 });
+    defer views.deinit();
+    var rng = Rng.init(9);
+
+    var id: NodeId = 10;
+    while (id < 10 + 65) : (id += 1) {
+        try std.testing.expect(views.addPassive(id, &rng) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 65), views.passiveView().len);
+    try std.testing.expect(views.isPassive(10));
+    try std.testing.expect(views.isPassive(74));
+
+    while (id < 10 + 128) : (id += 1) {
+        try std.testing.expect(views.addPassive(id, &rng) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 128), views.passiveView().len);
+
+    var prior: [128]NodeId = undefined;
+    @memcpy(prior[0..], views.passiveView());
+    const extra = id;
+    const dropped = views.addPassive(extra, &rng);
+    try std.testing.expect(dropped != null);
+    try std.testing.expectEqual(@as(usize, 128), views.passiveView().len);
+    try std.testing.expect(views.isPassive(extra));
+    try std.testing.expect(!views.isPassive(dropped.?));
+    var kept: usize = 0;
+    for (prior) |old| {
+        if (views.isPassive(old)) kept += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 127), kept);
+    std.debug.print("GAP-M2 branch=raised ceilings store the 65th node and still evict only when full\n", .{});
+}

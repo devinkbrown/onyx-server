@@ -580,3 +580,29 @@ test "Config.applyToml overlays mesh.gossip bounded-view keys" {
     try std.testing.expectEqual(@as(usize, 3), cfg.shuffle_active_count);
     try std.testing.expectEqual(@as(usize, 4), cfg.shuffle_passive_count); // default
 }
+
+test "GAP-M2 a raised passive capacity keeps the 65th node" {
+    const alloc = std.testing.allocator;
+    var view = try MembershipView.init(alloc, 1, .{ .active_capacity = 4, .passive_capacity = 80 });
+    defer view.deinit();
+    var rng = Rng.init(7);
+
+    var id: NodeId = 2;
+    while (id < 2 + 65) : (id += 1) {
+        try std.testing.expect((try view.learnPassive(id, 1_000, &rng)) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 65), view.passiveCount());
+    try std.testing.expect(view.isPassive(2));
+    try std.testing.expect(view.isPassive(66));
+
+    while (id < 2 + 80) : (id += 1) {
+        try std.testing.expect((try view.learnPassive(id, 1_000, &rng)) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 80), view.passiveCount());
+    const dropped = try view.learnPassive(id, 1_000, &rng);
+    try std.testing.expect(dropped != null);
+    try std.testing.expectEqual(@as(usize, 80), view.passiveCount());
+    try std.testing.expect(view.isPassive(id));
+    try std.testing.expect(!view.isPassive(dropped.?));
+    std.debug.print("GAP-M2 branch=raised ceilings store the 65th node and still evict only when full\n", .{});
+}
