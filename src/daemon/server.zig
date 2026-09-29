@@ -46308,6 +46308,18 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
+        // QUALITY is readable by a channel member or an oper who is not on the
+        // channel. A non-member who is not an oper still gets 442. The check
+        // is here, before the membership gate, because that gate would hide
+        // the summary from every oper who is not in the channel.
+        if (std.ascii.eqlIgnoreCase(sub, "QUALITY")) {
+            if (!self.world.isMember(channel, worldIdFromClient(id)) and !conn.session.isOper()) {
+                try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
+                return;
+            }
+            try self.mediaQuality(conn, channel);
+            return;
+        }
         if (!self.world.isMember(channel, worldIdFromClient(id))) {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
             return;
@@ -46491,6 +46503,19 @@ pub const LinuxServer = struct {
             };
             self.native_media.setSelection(channel, nick, .{ .max_spatial = selected.spatial, .max_temporal = @intCast(selected.temporal) });
             _ = self.media_plane.setReceiverSpatial(channel, nick, selected.spatial);
+            const stored = self.media_rooms.setQuality(channel, nick, .{
+                .loss_pct = loss_pct,
+                .rtt_ms = rtt_ms,
+                .spatial = selected.spatial,
+                .bitrate_kbps = hint.target_bitrate_kbps,
+            }) catch {
+                try self.failReply(conn, "MEDIA", "BAD_ABR", "Could not store the quality sample");
+                return;
+            };
+            if (!stored) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before reporting ABR");
+                return;
+            }
             var detail_buf: [160]u8 = undefined;
             const keyframe = if (hint.request_keyframe) "true" else "false";
             const detail = std.fmt.bufPrint(&detail_buf, "action={s} bitrate={d} fec={d} keyframe={s} spatial<={d} temporal<={d}", .{
@@ -46783,7 +46808,7 @@ pub const LinuxServer = struct {
             else
                 try self.failReply(conn, "MEDIA", "NOT_PUBLISHING", "You are not publishing that kind");
         } else {
-            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, BREAKOUT, POS, HAND, REACT, CAPTION, TRANSCRIPT, CONSENT, RECORD, E2EE-HANDSHAKE, E2EE-GROUPKEY, or ROSTER");
+            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, BREAKOUT, POS, HAND, REACT, CAPTION, TRANSCRIPT, CONSENT, RECORD, QUALITY, E2EE-HANDSHAKE, E2EE-GROUPKEY, or ROSTER");
         }
     }
 
@@ -47606,6 +47631,30 @@ pub const LinuxServer = struct {
         var end_buf: [default_reply_bytes]u8 = undefined;
         const end = std.fmt.bufPrint(&end_buf, "count={d}", .{n + nn}) catch return;
         try self.sendMediaEventReply(conn, "STATS-END", channel, end);
+    }
+
+    /// `MEDIA QUALITY <#chan>` — one latest sample per current member who has
+    /// reported. Loss, RTT, chosen spatial layer, and target bitrate only.
+    /// Ice credentials, SRTP keys, and any other keying material are not fields
+    /// of the sample and are not copied into the reply.
+    fn mediaQuality(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+        var emitted: usize = 0;
+        for (self.media_rooms.roster(channel)) |p| {
+            const sample = self.media_rooms.qualityOf(channel, p.id.slice()) orelse continue;
+            var buf: [default_reply_bytes]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buf, "{s} loss={d} rtt={d} spatial={d} bitrate={d}", .{
+                p.id.slice(),
+                sample.loss_pct,
+                sample.rtt_ms,
+                sample.spatial,
+                sample.bitrate_kbps,
+            }) catch continue;
+            try self.sendMediaEventReply(conn, "QUALITY", channel, detail);
+            emitted += 1;
+        }
+        var end_buf: [64]u8 = undefined;
+        const end = std.fmt.bufPrint(&end_buf, "count={d}", .{emitted}) catch return;
+        try self.sendMediaEventReply(conn, "QUALITY-END", channel, end);
     }
 
     fn mediaRoster(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
@@ -54063,6 +54112,118 @@ test "GAP-V4 recording waits for every member and stops when one joins" {
     try std.testing.expect(std.mem.indexOf(u8, carol.send_buf[0..carol.send_len], "stopped") != null);
 
     std.debug.print("GAP-V4 branch=recording starts only after every member consents, is announced, and stops when a member joins without consent\n", .{});
+}
+
+test "GAP-V5 a participant or oper reads loss rtt and layer without key material" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const carol_id = try addTestLocalClient(&server, "carol", null);
+    const oper_id = try addTestLocalClient(&server, "oper", null);
+    const eve_id = try addTestLocalClient(&server, "eve", null);
+    _ = try server.world.join("#q", worldIdFromClient(alice_id));
+    _ = try server.world.join("#q", worldIdFromClient(bob_id));
+    _ = try server.world.join("#q", worldIdFromClient(carol_id));
+    const alice = server.rx().clients.get(alice_id).?;
+    const bob = server.rx().clients.get(bob_id).?;
+    const carol = server.rx().clients.get(carol_id).?;
+    const oper = server.rx().clients.get(oper_id).?;
+    const eve = server.rx().clients.get(eve_id).?;
+    alice.send_armed = true;
+    bob.send_armed = true;
+    carol.send_armed = true;
+    oper.send_armed = true;
+    eve.send_armed = true;
+    oper.session.is_oper = true;
+
+    const join_a = try irc_line.parseLine("MEDIA JOIN #q voice");
+    const join_b = try irc_line.parseLine("MEDIA JOIN #q voice");
+    const join_c = try irc_line.parseLine("MEDIA JOIN #q voice");
+    try server.handleMedia(alice_id, alice, &join_a);
+    try server.handleMedia(bob_id, bob, &join_b);
+    try server.handleMedia(carol_id, carol, &join_c);
+    try server.native_media.register("#q", "alice", .voice, 11, .{});
+    try server.native_media.register("#q", "bob", .voice, 12, .{});
+    try std.testing.expect(server.media_plane.allocate("#q", "alice") != null);
+    try std.testing.expect(server.media_plane.allocate("#q", "bob") != null);
+
+    // The trailing token is key material a naive echo would leak. It is not a
+    // field of the stored sample.
+    const abr_a = try irc_line.parseLine("MEDIA ABR #q 200 200 20 10 0 ufrag=planted-ufrag ice-pwd=planted-pwd srtp=planted-srtp");
+    const abr_b = try irc_line.parseLine("MEDIA ABR #q 1100 6000 0 20");
+    try server.handleMedia(alice_id, alice, &abr_a);
+    try server.handleMedia(bob_id, bob, &abr_b);
+
+    const alice_q = server.media_rooms.qualityOf("#q", "alice") orelse return error.TestUnexpectedResult;
+    const bob_q = server.media_rooms.qualityOf("#q", "bob") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 20), alice_q.loss_pct);
+    try std.testing.expectEqual(@as(u16, 10), alice_q.rtt_ms);
+    try std.testing.expectEqual(@as(u8, 0), alice_q.spatial);
+    try std.testing.expectEqual(@as(u8, 0), bob_q.loss_pct);
+    try std.testing.expectEqual(@as(u16, 20), bob_q.rtt_ms);
+    try std.testing.expectEqual(@as(u8, 2), bob_q.spatial);
+    try std.testing.expect(server.media_rooms.qualityOf("#q", "carol") == null);
+
+    alice.send_len = 0;
+    const quality = try irc_line.parseLine("MEDIA QUALITY #q");
+    try server.handleMedia(alice_id, alice, &quality);
+    const summary = alice.send_buf[0..alice.send_len];
+    var alice_expect: [96]u8 = undefined;
+    const alice_line = std.fmt.bufPrint(&alice_expect, "alice loss={d} rtt={d} spatial={d} bitrate={d}", .{
+        alice_q.loss_pct, alice_q.rtt_ms, alice_q.spatial, alice_q.bitrate_kbps,
+    }) catch unreachable;
+    var bob_expect: [96]u8 = undefined;
+    const bob_line = std.fmt.bufPrint(&bob_expect, "bob loss={d} rtt={d} spatial={d} bitrate={d}", .{
+        bob_q.loss_pct, bob_q.rtt_ms, bob_q.spatial, bob_q.bitrate_kbps,
+    }) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, summary, alice_line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, bob_line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "count=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "carol") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "ufrag") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "ice-pwd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "srtp") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "planted-ufrag") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "planted-pwd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "planted-srtp") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "keyframe") == null);
+
+    const abr_a2 = try irc_line.parseLine("MEDIA ABR #q 200 200 7 44");
+    try server.handleMedia(alice_id, alice, &abr_a2);
+    const alice_q2 = server.media_rooms.qualityOf("#q", "alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 7), alice_q2.loss_pct);
+    try std.testing.expectEqual(@as(u16, 44), alice_q2.rtt_ms);
+    alice.send_len = 0;
+    try server.handleMedia(alice_id, alice, &quality);
+    const updated = alice.send_buf[0..alice.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, updated, "alice loss=7 rtt=44") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "loss=20") == null);
+
+    oper.send_len = 0;
+    try server.handleMedia(oper_id, oper, &quality);
+    const oper_summary = oper.send_buf[0..oper.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, oper_summary, "alice loss=7 rtt=44") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oper_summary, bob_line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, oper_summary, "ufrag") == null);
+    try std.testing.expect(std.mem.indexOf(u8, oper_summary, "srtp") == null);
+    try std.testing.expect(!server.world.isMember("#q", worldIdFromClient(oper_id)));
+
+    eve.send_len = 0;
+    try server.handleMedia(eve_id, eve, &quality);
+    const refused = eve.send_buf[0..eve.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, refused, "442") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "loss=") == null);
+
+    std.debug.print("GAP-V5 branch=participant and oper read loss rtt spatial bitrate; key material is absent\n", .{});
 }
 
 /// Real encrypted link pair for daemon-level retained-replay tests. Keeping the

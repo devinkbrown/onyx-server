@@ -75,6 +75,14 @@ pub const Recording = struct {
     }
 };
 
+/// One member's latest call-quality sample. No keys, credentials, or payloads.
+pub const Quality = struct {
+    loss_pct: u8 = 0,
+    rtt_ms: u16 = 0,
+    spatial: u8 = 0,
+    bitrate_kbps: u32 = 0,
+};
+
 /// Max distinct codecs a negotiated call profile retains.
 pub const max_profile_codecs: usize = 4;
 
@@ -120,6 +128,9 @@ pub const MediaRooms = struct {
     /// the existence signal; this row is the stored artifact. It is not a
     /// media capture and it is cleared when the call ends.
     recordings: std.StringHashMap(Recording),
+    /// Last congestion sample per member. Loss, RTT, chosen spatial layer,
+    /// and target bitrate only — never keying material.
+    qualities: std.StringHashMap(Quality),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
         return initConfig(allocator, .{});
@@ -137,6 +148,7 @@ pub const MediaRooms = struct {
             .participant_profiles = std.StringHashMap(CallProfile).init(allocator),
             .consents = std.StringHashMap(void).init(allocator),
             .recordings = std.StringHashMap(Recording).init(allocator),
+            .qualities = std.StringHashMap(Quality).init(allocator),
         };
     }
 
@@ -171,6 +183,9 @@ pub const MediaRooms = struct {
         var rec_it = self.recordings.keyIterator();
         while (rec_it.next()) |key| self.allocator.free(key.*);
         self.recordings.deinit();
+        var qit = self.qualities.keyIterator();
+        while (qit.next()) |key| self.allocator.free(key.*);
+        self.qualities.deinit();
         self.* = undefined;
     }
 
@@ -190,7 +205,8 @@ pub const MediaRooms = struct {
             self.profiles.count() == 0 and
             self.participant_profiles.count() == 0 and
             self.consents.count() == 0 and
-            self.recordings.count() == 0;
+            self.recordings.count() == 0 and
+            self.qualities.count() == 0;
     }
 
     /// Build the "channel\x00participant" composite key into `buf`.
@@ -397,6 +413,7 @@ pub const MediaRooms = struct {
         self.clearHand(channel, pid);
         self.clearParticipantProfile(channel, pid);
         self.clearConsent(channel, pid);
+        self.clearQuality(channel, pid);
         if (entry.value_ptr.*.count() == 0) self.dropRoom(entry);
         return true;
     }
@@ -504,6 +521,35 @@ pub const MediaRooms = struct {
 
     fn clearRecording(self: *MediaRooms, channel: []const u8) void {
         if (self.recordings.fetchRemove(channel)) |kv| self.allocator.free(kv.key);
+    }
+
+    /// Remember this member's latest quality sample. False when they are not
+    /// in the call. The sample has no key material.
+    pub fn setQuality(self: *MediaRooms, channel: []const u8, pid: []const u8, sample: Quality) Error!bool {
+        if (!self.isParticipant(channel, pid)) return false;
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return false;
+        const gop = try self.qualities.getOrPut(k);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, k) catch |e| {
+                _ = self.qualities.remove(k);
+                return e;
+            };
+        }
+        gop.value_ptr.* = sample;
+        return true;
+    }
+
+    pub fn qualityOf(self: *const MediaRooms, channel: []const u8, pid: []const u8) ?Quality {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return null;
+        return self.qualities.get(k);
+    }
+
+    fn clearQuality(self: *MediaRooms, channel: []const u8, pid: []const u8) void {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return;
+        if (self.qualities.fetchRemove(k)) |kv| self.allocator.free(kv.key);
     }
 
     fn ensure(self: *MediaRooms, channel: []const u8) Error!*Room {
@@ -659,6 +705,23 @@ test "GAP-V4 recording starts only when every member consented" {
     try testing.expect(m.leaveAll("#c", "bob"));
     try testing.expect(m.leaveAll("#c", "carol"));
     try testing.expect(m.recordingOf("#c") == null);
+    try testing.expect(m.upgradeContinuityReady());
+}
+
+test "GAP-V5 quality sample is per member and clears on leave" {
+    var m = MediaRooms.init(testing.allocator);
+    defer m.deinit();
+    try m.join("#c", "alice", .voice);
+    try testing.expect(!try m.setQuality("#c", "outsider", .{ .loss_pct = 9, .rtt_ms = 9, .spatial = 1, .bitrate_kbps = 9 }));
+    try testing.expect(try m.setQuality("#c", "alice", .{ .loss_pct = 4, .rtt_ms = 30, .spatial = 1, .bitrate_kbps = 500 }));
+    const sample = m.qualityOf("#c", "alice").?;
+    try testing.expectEqual(@as(u8, 4), sample.loss_pct);
+    try testing.expectEqual(@as(u16, 30), sample.rtt_ms);
+    try testing.expectEqual(@as(u8, 1), sample.spatial);
+    try testing.expectEqual(@as(u32, 500), sample.bitrate_kbps);
+    try testing.expect(!m.upgradeContinuityReady());
+    try testing.expect(m.leaveAll("#c", "alice"));
+    try testing.expect(m.qualityOf("#c", "alice") == null);
     try testing.expect(m.upgradeContinuityReady());
 }
 
