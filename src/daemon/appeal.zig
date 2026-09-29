@@ -178,12 +178,15 @@ test "GAP-P7 one appeal per host per window" {
     defer table.deinit();
     const id = try table.file("alice", "banned.example", "please review", 1_000);
     try std.testing.expectError(error.Window, table.file("alice2", "banned.example", "again", 1_000 + 10));
+    try std.testing.expectError(error.Window, table.file("alice2", "banned.example", "still inside", 1_000 + window_ms - 1));
+    const later = try table.file("alice", "banned.example", "next window", 1_000 + window_ms);
+    try std.testing.expect(later != id);
     const other = try table.file("bob", "other.example", "different host", 1_000);
     try std.testing.expect(other != id);
     try table.answer(id, "reviewed");
     var views: [4]View = undefined;
     const n = table.list(&views);
-    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expect(views[0].answered);
     try std.testing.expectEqualStrings("reviewed", views[0].answer);
 }

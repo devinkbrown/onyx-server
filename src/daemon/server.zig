@@ -14923,6 +14923,13 @@ pub const LinuxServer = struct {
                 };
                 return;
             }
+            // A network ban closes the socket at registration. APPEAL is the
+            // one command a new connection can file before that checkpoint.
+            // It must not complete registration or reach a channel.
+            if (std.ascii.eqlIgnoreCase(parsed.command, "APPEAL")) {
+                _ = try self.dispatchModules(id, conn, &parsed, line);
+                return;
+            }
             const external_exchange = conn.session.sasl_pending == .external;
             var prereg_reply_buf: [default_reply_bytes]u8 = undefined;
             var sink = PreregReplySink{ .buf = &prereg_reply_buf };
@@ -112065,47 +112072,76 @@ test "GAP-P7 a banned connection files one appeal and the oper answer is audited
     };
     defer alloc.destroy(server);
     defer server.deinit();
+    var sim = reactor_mod.SimReactor.init(1_700_000_000_000);
+    server.reactor = sim.reactor();
+
+    try server.warden.add(.{
+        .match = .host,
+        .pattern = "banned.example",
+        .scope = .node,
+        .action = .refuse,
+        .reason = "network ban",
+        .set_by = "carol",
+    });
 
     const bob_id = try addTestLocalClient(server, "bob", "bob");
     const bob = server.connFor(bob_id).?;
     _ = try server.world.join("#room", worldIdFromClient(bob_id));
-    try std.testing.expect(try server.world.addBan("#room", "*!*@banned.example", "bob", 1));
+    bob.send_len = 0;
 
-    const alice_id = try addTestLocalClient(server, "alice", "alice");
+    const alice_id = try gapP8Open(server);
     const alice = server.connFor(alice_id).?;
     alice.session.setRealHost("banned.example");
-    const mask = "alice!alice@banned.example";
-    try std.testing.expect(server.world.isBanned("#room", mask));
-    try std.testing.expect(!server.world.isMember("#room", worldIdFromClient(alice_id)));
+    try gapP8Feed(server, alice_id, alice, "NICK alice\r\n");
+    const banned = server.wardMatch(alice) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(banned.action == .refuse);
+    try std.testing.expect(!alice.session.registered());
+    try std.testing.expect(server.world.findNick("alice") == null);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], " 001 ") == null);
 
-    bob.send_len = 0;
-    var filed = try irc_line.parseLine("APPEAL :please review the ban");
-    try server.handleAppeal(alice, &filed);
+    try gapP8Feed(server, alice_id, alice, "APPEAL :please review the ban\r\n");
     const filed_note = alice.send_buf[0..alice.send_len];
     try std.testing.expect(std.mem.indexOf(u8, filed_note, "APPEAL filed 1") != null);
+    try std.testing.expect(!alice.session.registered());
+    try std.testing.expect(server.world.findNick("alice") == null);
+    try std.testing.expect(!server.world.isMember("#room", worldIdFromClient(alice_id)));
     try std.testing.expectEqual(@as(usize, 0), bob.send_len);
 
-    alice.send_len = 0;
-    var again = try irc_line.parseLine("APPEAL :please review again");
-    try server.handleAppeal(alice, &again);
+    try gapP8Feed(server, alice_id, alice, "APPEAL :please review again\r\n");
     try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "already filed") != null);
     try std.testing.expectEqual(@as(usize, 1), server.appeals.count());
 
+    sim.advance(appeal.window_ms - 1);
+    try gapP8Feed(server, alice_id, alice, "APPEAL :still this window\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "already filed") != null);
+    try std.testing.expectEqual(@as(usize, 1), server.appeals.count());
+
+    sim.advance(1);
+    try gapP8Feed(server, alice_id, alice, "APPEAL :the next window\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "APPEAL filed 2") != null);
+    try std.testing.expectEqual(@as(usize, 2), server.appeals.count());
+    try std.testing.expect(!alice.session.registered());
+    try std.testing.expect(server.world.findNick("alice") == null);
+
+    try gapP8Feed(server, alice_id, alice, "PRIVMSG #room :please review the ban\r\n");
+    try gapP8Feed(server, alice_id, alice, "JOIN #room\r\n");
+    try std.testing.expect(!server.world.isMember("#room", worldIdFromClient(alice_id)));
+    try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+
     const carol_id = try addTestLocalClient(server, "carol", "carol");
     const carol = server.connFor(carol_id).?;
+    carol.session.registration.registered = true;
     carol.session.is_oper = true;
-    carol.send_len = 0;
-    var list_line = try irc_line.parseLine("APPEAL LIST");
-    try server.handleAppeal(carol, &list_line);
+    try gapP8Feed(server, carol_id, carol, "APPEAL LIST\r\n");
     const listed = carol.send_buf[0..carol.send_len];
     try std.testing.expect(std.mem.indexOf(u8, listed, "please review the ban") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "the next window") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "open") != null);
 
-    carol.send_len = 0;
-    var answer = try irc_line.parseLine("APPEAL ANSWER 1 :reviewed tomorrow");
-    try server.handleAppeal(carol, &answer);
+    try gapP8Feed(server, carol_id, carol, "APPEAL ANSWER 1 :reviewed tomorrow\r\n");
     try std.testing.expect(std.mem.indexOf(u8, carol.send_buf[0..carol.send_len], "APPEAL answered") != null);
     try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+    try std.testing.expect(server.world.findNick("alice") == null);
 
     var audited = false;
     var i: usize = 0;
@@ -112123,11 +112159,12 @@ test "GAP-P7 a banned connection files one appeal and the oper answer is audited
     if (server.history.latest("#room", hist.len, &hist)) |rows| {
         for (rows) |row| {
             try std.testing.expect(std.mem.indexOf(u8, row.text, "please review") == null);
+            try std.testing.expect(std.mem.indexOf(u8, row.text, "the next window") == null);
             try std.testing.expect(std.mem.indexOf(u8, row.text, "reviewed tomorrow") == null);
         }
     } else |_| {}
     current_reactor = null;
-    std.debug.print("GAP-P7 branch=a banned connection files one appeal without joining and the oper answer is audited\n", .{});
+    std.debug.print("GAP-P7 branch=a network-banned new connection files one appeal per window without joining\n", .{});
 }
 
 fn gapP8Open(server: *Server) !client_model.ClientId {
