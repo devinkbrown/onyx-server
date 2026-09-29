@@ -20,6 +20,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
+const kernel_linux = @import("kernel_linux.zig");
 
 pub const ReusePortError = error{
     Unsupported,
@@ -57,6 +58,7 @@ pub fn createReusePortListener(host: []const u8, port: u16, backlog: u31) ReuseP
 
     var addr = try sockaddrIn6(host, port);
     try bindSocket(fd, &addr);
+    try kernel_linux.applyListenerOptions(fd);
     try listenSocket(fd, backlog);
     return fd;
 }

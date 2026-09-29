@@ -876,6 +876,7 @@ const ringlane = @import("ringlane.zig");
 const io_backend = @import("io_backend.zig");
 const sendq = @import("sendq.zig");
 const search_cmd = @import("search_cmd.zig");
+const kernel_linux = @import("kernel_linux.zig");
 
 const RingFdToken = ringlane.FdToken;
 const RingCore = ringlane.Ring;
@@ -4161,6 +4162,7 @@ pub const LinuxServer = struct {
             // re-arm CLOEXEC so it never leaks into any other child. The next
             // UPGRADE clears it again for exactly the listeners it carries.
             _ = linux.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            try kernel_linux.applyListenerOptions(fd);
             break :blk fd;
         } else try reuseport.createReusePortListener(config.host, config.port, config.backlog);
         errdefer closeFd(listener_fd);
@@ -4197,6 +4199,12 @@ pub const LinuxServer = struct {
         else
             -1;
         errdefer if (ws_listener_fd >= 0) closeFd(ws_listener_fd);
+
+        const incoming_cpu = kernel_linux.shardIncomingCpu(shard_id);
+        try kernel_linux.setIncomingCpu(listener_fd, incoming_cpu);
+        if (s2s_listener_fd >= 0) try kernel_linux.setIncomingCpu(s2s_listener_fd, incoming_cpu);
+        if (tls_listener_fd >= 0) try kernel_linux.setIncomingCpu(tls_listener_fd, incoming_cpu);
+        if (ws_listener_fd >= 0) try kernel_linux.setIncomingCpu(ws_listener_fd, incoming_cpu);
 
         var ring = io_backend.openLinuxRing(config.ring_entries, config.features) catch |err| {
             if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
@@ -52670,6 +52678,30 @@ test "GAP-X1 PortableServer init fails closed through the IoBackend" {
     std.debug.print("GAP-X1 branch=PortableServer init refuses through the IoBackend\n", .{});
 }
 
+fn expectListenerKernelOptions(fd: linux.fd_t, cpu: u32) !void {
+    try std.testing.expectEqual(kernel_linux.fastopen_queue, try kernel_linux.readU32Option(fd, linux.IPPROTO.TCP, linux.TCP.FASTOPEN));
+    try std.testing.expectEqual(kernel_linux.user_timeout_ms, try kernel_linux.readU32Option(fd, linux.IPPROTO.TCP, linux.TCP.USER_TIMEOUT));
+    try std.testing.expectEqual(cpu, try kernel_linux.readU32Option(fd, posix.SOL.SOCKET, linux.SO.INCOMING_CPU));
+}
+
+test "GAP-X3 live listener sets TCP_FASTOPEN, TCP_USER_TIMEOUT, and SO_INCOMING_CPU" {
+    const direct = createListener("127.0.0.1", 0, 8) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeFd(direct);
+    try expectListenerKernelOptions(direct, 0);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try std.testing.expect(server.reactors.len > 0);
+    try expectListenerKernelOptions(server.reactors[0].listener_fd, kernel_linux.shardIncomingCpu(0));
+    std.debug.print("GAP-X3 branch=linux listener sets TCP_FASTOPEN TCP_USER_TIMEOUT and SO_INCOMING_CPU; landlock seccomp madvise msg_ring openat2 pidfd and close_range stay unmet\n", .{});
+}
+
 const CompletionHandler = struct {
     server: *LinuxServer,
     err: ?anyerror = null,
@@ -57667,6 +57699,7 @@ fn createListener(host: []const u8, port: u16, backlog: u31) ServerError!linux.f
 
     var addr = try sockaddrIn6(host, port);
     try bindSocket6(fd, &addr);
+    try kernel_linux.applyListenerOptions(fd);
     try listenSocket(fd, backlog);
     return fd;
 }
