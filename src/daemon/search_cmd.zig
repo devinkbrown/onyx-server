@@ -8,6 +8,7 @@
 const std = @import("std");
 const lotus = @import("../proto/lotus.zig");
 const world_model = @import("world.zig");
+const mesh_search = @import("mesh_search.zig");
 
 /// draft/search anti-abuse: the minimum gap (monotonic ms) between two SEARCH
 /// commands from one client. A 5s/client floor.
@@ -129,19 +130,29 @@ pub fn handle(self: anytype, world_id: anytype, conn: anytype, line: []const u8)
         if (!msgidMatchesAll(self, msgid, words[1..word_count])) continue;
         const message = historyMessageExact(self, store_target, msgid) orelse continue;
         if (!Server.historyMessageVisibleTo(&conn.session, message)) continue;
+        if (mesh_search.isCiphertext(message.text, message.client_tags)) continue;
         found_buf[found_len] = message;
         found_len += 1;
     }
 
+    var remote_buf: [max_results]mesh_search.Borrowed = undefined;
+    const remote_n = gatherRemote(self, world_id, target, words[0..word_count], &remote_buf);
+    var merged: [max_results]lotus.Message = undefined;
+    const merged_len = if (remote_n == 0)
+        found_len
+    else
+        mesh_search.mergeNewest(found_buf[0..found_len], remote_buf[0..remote_n], max_results, &merged);
+    const newest = if (remote_n == 0) found_buf[0..found_len] else merged[0..merged_len];
+
     // Reverse into chronological (oldest-first) order for replay, matching
-    // CHATHISTORY's BATCH ordering.
+    // CHATHISTORY's BATCH ordering. No remote hits leaves the local order alone.
     var ordered: [max_results]lotus.Message = undefined;
     var k: usize = 0;
-    while (k < found_len) : (k += 1) {
-        ordered[k] = found_buf[found_len - 1 - k];
+    while (k < newest.len) : (k += 1) {
+        ordered[k] = newest[newest.len - 1 - k];
     }
 
-    const replay = self.renderHistoryReplayOwned(conn, "search", target, ordered[0..found_len], null) catch {
+    const replay = self.renderHistoryReplayOwned(conn, "search", target, ordered[0..newest.len], null) catch {
         try self.failReply(conn, "SEARCH", "RESULTS_TOO_LARGE", "Too many results; narrow the query");
         return;
     };
@@ -150,4 +161,48 @@ pub fn handle(self: anytype, world_id: anytype, conn: anytype, line: []const u8)
         self.poisonOwnedDelivery(conn);
         return;
     };
+}
+
+/// Hits this node can offer another node for `target`. Ciphertext stays in
+/// the result so the asking node can drop it itself; a peer that already
+/// filtered is fine, and a peer that did not cannot force the body through.
+pub fn serve(self: anytype, target: []const u8, words: []const []const u8, out: []mesh_search.Borrowed) usize {
+    if (words.len == 0 or target.len == 0 or !world_model.isChannelName(target)) return 0;
+    var n: usize = 0;
+    const seed_hits = self.search_index.find(words[0]);
+    var hit_i: usize = seed_hits.len;
+    while (hit_i > 0 and n < out.len) {
+        hit_i -= 1;
+        const msgid = seed_hits[hit_i];
+        if (!msgidMatchesAll(self, msgid, words[1..])) continue;
+        const message = historyMessageExact(self, target, msgid) orelse continue;
+        if (message.tombstone) continue;
+        out[n] = .{ .target = target, .message = message };
+        n += 1;
+    }
+    return n;
+}
+
+fn gatherRemote(
+    self: anytype,
+    world_id: anytype,
+    query_target: []const u8,
+    words: []const []const u8,
+    out: []mesh_search.Borrowed,
+) usize {
+    if (!world_model.isChannelName(query_target)) return 0;
+    var n: usize = 0;
+    for (self.mesh_search_peers.items) |peer| {
+        if (peer == self) continue;
+        var got_buf: [max_results]mesh_search.Borrowed = undefined;
+        const got = serve(peer, query_target, words, &got_buf);
+        for (got_buf[0..got]) |hit| {
+            if (n >= out.len) return n;
+            const can_see = world_model.isChannelName(hit.target) and self.world.isMember(hit.target, world_id);
+            if (!mesh_search.keep(can_see, hit.message.text, hit.message.client_tags)) continue;
+            out[n] = hit;
+            n += 1;
+        }
+    }
+    return n;
 }

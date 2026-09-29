@@ -102,6 +102,7 @@ pub const s2s_link = @import("s2s_link.zig");
 pub const sasl_bridge = @import("sasl_bridge.zig");
 pub const scoped_access = @import("scoped_access.zig");
 pub const scram_store = @import("scram_store.zig");
+pub const mesh_search = @import("mesh_search.zig");
 pub const search_index = @import("search_index.zig");
 pub const secured_s2s_link = @import("secured_s2s_link.zig");
 pub const server = @import("server.zig");
@@ -450,6 +451,7 @@ test {
     _ = sasl_bridge;
     _ = scoped_access;
     _ = scram_store;
+    _ = mesh_search;
     _ = search_index;
     _ = secured_s2s_link;
     _ = server;

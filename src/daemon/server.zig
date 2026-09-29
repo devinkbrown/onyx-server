@@ -4252,6 +4252,9 @@ pub const LinuxServer = struct {
     /// store and, after reactor 0 fires, in history. The due-record rides a
     /// SCHD mesh checkpoint so a USR2 replay does not send it twice.
     schedules: schedule_snapshot.Table = .{},
+    /// Other nodes whose history SEARCH may ask. Each hit is authorized on
+    /// this node. The list is live process state, not a checkpoint.
+    mesh_search_peers: std.ArrayList(*LinuxServer) = .empty,
     /// Strictly-increasing incarnation counter for minted oper grants, so a later
     /// GRANT/REVOKE always supersedes an earlier one (even within one ms).
     grant_incarnation: u64 = 0,
@@ -6144,6 +6147,7 @@ pub const LinuxServer = struct {
         self.bot_registry.deinit();
         self.threads.deinit();
         self.schedules.deinit();
+        self.mesh_search_peers.deinit(self.allocator);
         self.warden.deinit();
         self.spamtrap.deinit();
         self.raid_shield.deinit();
@@ -24153,6 +24157,17 @@ pub const LinuxServer = struct {
     /// thunk calls this wrapper; the parse, cap, and replay live in `search_cmd.zig`.
     pub fn handleSearch(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
         return search_cmd.handle(self, worldIdFromClient(id), conn, line);
+    }
+
+    /// Remember a node this process can ask during SEARCH. A live mesh link
+    /// does not have the other daemon's address; tests and in-process pairs
+    /// attach the peer they can call. Asking yourself is a no-op.
+    pub fn attachMeshSearchPeer(self: *LinuxServer, peer: *LinuxServer) !void {
+        if (peer == self) return;
+        for (self.mesh_search_peers.items) |existing| {
+            if (existing == peer) return;
+        }
+        try self.mesh_search_peers.append(self.allocator, peer);
     }
 
     /// `OPERMOTD` — show the operator MOTD (RPL_OMOTDSTART/OMOTD/ENDOFOMOTD, or
@@ -110159,6 +110174,105 @@ test "GAP-P3 malformed schedule checkpoint rejects the handoff" {
     try std.testing.expectEqual(@as(usize, 0), successor.schedules.count());
     current_reactor = null;
     std.debug.print("GAP-P3 branch=a malformed SCHD image rejects the whole handoff\n", .{});
+}
+
+test "GAP-P5 a search on one node returns an authorized hit from another node" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "search.test" };
+    const asker = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(asker);
+    defer asker.deinit();
+    const peer = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(peer);
+    defer peer.deinit();
+
+    const alice_id = try addTestLocalClient(asker, "alice", "alice");
+    const alice = asker.connFor(alice_id).?;
+    alice.session.registration.registered = true;
+    alice.session.addCap(.search);
+    _ = try asker.world.join("#room", worldIdFromClient(alice_id));
+
+    peer.recordHistoryRelayAt("#room", "bob!bob@peer", "plain-1", "PRIVMSG", "meshonlyphrase", null, 1_700_000_000_000);
+    peer.recordHistoryRelayAt("#room", "bob!bob@peer", "cipher-1", "PRIVMSG", "ONYXROOM1 meshonlyphrase", null, 1_700_000_000_100);
+    try peer.search_index.index("cipher-1", "ONYXROOM1 meshonlyphrase");
+    peer.recordHistoryRelayAt("#hidden", "bob!bob@peer", "secret-1", "PRIVMSG", "secretleak", null, 1_700_000_000_200);
+
+    alice.send_len = 0;
+    try asker.handleSearch(alice_id, alice, "SEARCH #room :meshonlyphrase");
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(alice.send_buf[0..alice.send_len], "meshonlyphrase"));
+
+    alice.last_search_ms = 0;
+    alice.send_len = 0;
+    try asker.attachMeshSearchPeer(peer);
+    try asker.handleSearch(alice_id, alice, "SEARCH #room :meshonlyphrase");
+    const got = alice.send_buf[0..alice.send_len];
+    try std.testing.expectEqual(@as(usize, 1), countSliceForTest(got, "meshonlyphrase"));
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(got, "ONYXROOM1"));
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(got, "secretleak"));
+
+    alice.last_search_ms = 0;
+    alice.send_len = 0;
+    try asker.handleSearch(alice_id, alice, "SEARCH #hidden :secretleak");
+    const denied = alice.send_buf[0..alice.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, denied, "INVALID_TARGET") != null);
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(denied, "secretleak"));
+    current_reactor = null;
+    std.debug.print("GAP-P5 branch=a search on one node returns an authorized peer hit and skips ciphertext\n", .{});
+}
+
+test "GAP-P5 merged search stays inside the hard cap" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "search.test" };
+    const asker = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(asker);
+    defer asker.deinit();
+    const peer = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(peer);
+    defer peer.deinit();
+
+    const alice_id = try addTestLocalClient(asker, "alice", "alice");
+    const alice = asker.connFor(alice_id).?;
+    alice.session.registration.registered = true;
+    alice.session.addCap(.search);
+    _ = try asker.world.join("#room", worldIdFromClient(alice_id));
+    try asker.attachMeshSearchPeer(peer);
+
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        var id_buf: [16]u8 = undefined;
+        var text_buf: [64]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "L{d}", .{i}) catch return error.TestUnexpectedResult;
+        const text = std.fmt.bufPrint(&text_buf, "capword fromlocal {d}", .{i}) catch return error.TestUnexpectedResult;
+        asker.recordHistoryRelayAt("#room", "alice!alice@asker", id, "PRIVMSG", text, null, 1_700_000_000_000 + i);
+        const peer_id = std.fmt.bufPrint(&id_buf, "R{d}", .{i}) catch return error.TestUnexpectedResult;
+        const peer_text = std.fmt.bufPrint(&text_buf, "capword frompeer {d}", .{i}) catch return error.TestUnexpectedResult;
+        peer.recordHistoryRelayAt("#room", "bob!bob@peer", peer_id, "PRIVMSG", peer_text, null, 1_700_000_100_000 + i);
+    }
+
+    alice.send_len = 0;
+    try asker.handleSearch(alice_id, alice, "SEARCH #room :capword");
+    const got = alice.send_buf[0..alice.send_len];
+    try std.testing.expectEqual(@as(usize, 50), countSliceForTest(got, "capword"));
+    try std.testing.expectEqual(@as(usize, 40), countSliceForTest(got, "frompeer"));
+    try std.testing.expectEqual(@as(usize, 10), countSliceForTest(got, "fromlocal"));
+    current_reactor = null;
+    std.debug.print("GAP-P5 branch=local and peer hits share one hard cap and each hit stays authorized\n", .{});
 }
 
 test {
