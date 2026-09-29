@@ -30,6 +30,7 @@ const signed_s2s_frame = @import("../substrate/undertow/signed_frame.zig");
 const s2s_peer_mod = @import("../substrate/undertow/s2s_peer.zig");
 const mesh_uid_alloc = @import("../substrate/undertow/uid_alloc.zig");
 const mesh_clock_mod = @import("../substrate/undertow/mesh_clock.zig");
+const route_table_mod = @import("../substrate/undertow/route_table.zig");
 const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
@@ -18103,19 +18104,17 @@ pub const LinuxServer = struct {
     /// AUTHORITATIVE for the account entity. Without more, any admitted (but
     /// Byzantine) peer could inject `identity.key.<victim>` = its own key AND a
     /// matching `identity.residence.<victim>` proof it signs, and `residenceTrusted`
-    /// would then verify it — defeating F1. Design C's premise (the replicated
-    /// identity pubkey is authoritative) requires TWO preconditions:
+    /// would then verify it — defeating F1. This callback does not treat a
+    /// replicated identity pubkey as account authority.
     ///
-    /// RECEIVER-side residence callback. Only signed SESSION_REPLICA_V2 authority
-    /// is an exact residence proof for a
-    /// live local attachment of that SAME portable token. This is deliberately
-    /// narrower than account equality: the local World owner, its exact token
-    /// group, and one live accepted signed-origin entry must bind account, nick,
-    /// and token. The inner snapshot remains independently validated before World
-    /// projection; collision identity uses only this allocation-free envelope.
-    /// Rowless/detached nodes keep the ordinary MEMBERSHIP projection used for
-    /// remote routing and NAMES; an exact-token participant reconciles that
-    /// compatibility sidecar under the real nick instead of a collision UID.
+    /// RECEIVER-side residence callback. Signed SESSION_REPLICA_V2 authority is
+    /// the only account proof. A live local non-s2s client must match that
+    /// client's own token: a missing proof stays untrusted and does not fall
+    /// through to some other token's offer. A node with no such local holder
+    /// trusts one unique live origin entry whose account and nick match.
+    /// Ambiguous or mismatched store facts are rejected. A compromised origin
+    /// can still sign a replica for its own users. `identity.key.*` and
+    /// `identity.residence.*` props stay untrusted.
     const SessionReplicaResidenceDecision = enum { none, trusted, mismatch };
 
     fn sessionReplicaResidenceDecision(
@@ -18125,19 +18124,38 @@ pub const LinuxServer = struct {
         origin_node: u64,
     ) SessionReplicaResidenceDecision {
         if (nick.len == 0 or origin_node == 0) return .none;
-        const wid = self.world.findNick(nick) orelse return .none;
-        const id = clientIdFromWorld(wid);
-        const conn = self.connFor(id) orelse return .none;
-        if (conn.closing or conn.s2s != null or conn.s2s_secured != null) return .none;
-        const local_account = conn.session.account() orelse return .none;
-        if (!std.ascii.eqlIgnoreCase(conn.session.displayName(), nick)) return .none;
-        const handle = self.sessions.resumeHandleForClient(local_account, monitorIdFromClient(id)) orelse return .none;
-        const entry = self.session_replica_store.getOrigin(handle.token, origin_node) orelse return .none;
+        if (self.world.findNick(nick)) |wid| {
+            const id = clientIdFromWorld(wid);
+            if (self.connFor(id)) |conn| {
+                if (!conn.closing and conn.s2s == null and conn.s2s_secured == null) {
+                    const local_account = conn.session.account() orelse return .none;
+                    if (!std.ascii.eqlIgnoreCase(conn.session.displayName(), nick)) return .none;
+                    const handle = self.sessions.resumeHandleForClient(local_account, monitorIdFromClient(id)) orelse return .none;
+                    const entry = self.session_replica_store.getOrigin(handle.token, origin_node) orelse return .none;
+                    const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+                    if (entry.quarantine_until_ms != null or now_wall > entry.expires_at_ms) return .none;
+                    if (!std.ascii.eqlIgnoreCase(entry.account, local_account) or
+                        !std.ascii.eqlIgnoreCase(entry.nick, nick)) return .mismatch;
+                    return if (account.len != 0 and std.ascii.eqlIgnoreCase(account, local_account)) .trusted else .mismatch;
+                }
+            }
+        }
+        return self.storedReplicaResidence(account, nick, origin_node);
+    }
+
+    fn storedReplicaResidence(
+        self: *LinuxServer,
+        account: []const u8,
+        nick: []const u8,
+        origin_node: u64,
+    ) SessionReplicaResidenceDecision {
+        if (account.len == 0) return .none;
         const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
-        if (entry.quarantine_until_ms != null or now_wall > entry.expires_at_ms) return .none;
-        if (!std.ascii.eqlIgnoreCase(entry.account, local_account) or
-            !std.ascii.eqlIgnoreCase(entry.nick, nick)) return .mismatch;
-        return if (account.len != 0 and std.ascii.eqlIgnoreCase(account, local_account)) .trusted else .mismatch;
+        const identity = self.session_replica_store.uniqueLiveOriginNick(origin_node, nick, now_wall) catch return .mismatch;
+        const live = identity orelse return .none;
+        if (!std.ascii.eqlIgnoreCase(live.entry.account, account) or
+            !std.ascii.eqlIgnoreCase(live.entry.nick, nick)) return .mismatch;
+        return .trusted;
     }
 
     fn sessionReplicaResidenceTrusted(
@@ -54658,6 +54676,115 @@ test "DST GAP-A10 late lease refresh does not emit QUIT while the session is liv
         server.config.node_id,
         live_offer.expires_at_ms + 1,
     ));
+}
+
+test "DST GAP-A3 replica residence keeps two honest nicks and UID-renames a forged account" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var home = try node_identity.fromSeed(@as([32]u8, @splat(0xA3)), "a3-third.test");
+    defer home.deinit();
+    var origin_a = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0xA4)));
+    defer origin_a.deinit();
+    var origin_b = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0xA5)));
+    defer origin_b.deinit();
+    var origin_c = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0xA6)));
+    defer origin_c.deinit();
+    const node_a = message_relay.originShortId(origin_a.public_key);
+    const node_b = message_relay.originShortId(origin_b.public_key);
+    const node_c = message_relay.originShortId(origin_c.public_key);
+    if (node_a == 0 or node_b == 0 or node_c == 0 or node_a == node_b or node_a == node_c or node_b == node_c) {
+        return error.TestUnexpectedResult;
+    }
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = home.shortId(),
+        .node_identity = &home,
+        .server_name = "a3-third.test",
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const token_a: session_migrate.Token = @splat(0xA3);
+    const token_b: session_migrate.Token = @splat(0xA4);
+    try applyTestRemoteSessionReplica(&server, &origin_a, token_a, "alice", "alice", 1);
+    try applyTestRemoteSessionReplica(&server, &origin_b, token_b, "alice", "alice", 2);
+
+    try std.testing.expectEqual(
+        s2s_link.S2sLink.ResidenceDecision.trusted,
+        LinuxServer.residenceTrusted(&server, "alice", "alice", node_a, true),
+    );
+    try std.testing.expectEqual(
+        s2s_link.S2sLink.ResidenceDecision.trusted,
+        LinuxServer.residenceTrusted(&server, "ALICE", "Alice", node_b, true),
+    );
+    try std.testing.expectEqual(
+        s2s_link.S2sLink.ResidenceDecision.untrusted,
+        LinuxServer.residenceTrusted(&server, "alice", "alice", node_c, true),
+    );
+    try std.testing.expectEqual(
+        s2s_link.S2sLink.ResidenceDecision.reject,
+        LinuxServer.residenceTrusted(&server, "mallory", "alice", node_a, true),
+    );
+    try std.testing.expectEqual(
+        s2s_link.S2sLink.ResidenceDecision.untrusted,
+        LinuxServer.residenceTrusted(&server, "", "alice", node_a, true),
+    );
+    try std.testing.expectEqual(
+        s2s_link.S2sLink.ResidenceDecision.reject,
+        LinuxServer.residenceTrusted(&server, "alice", "alice", node_a, false),
+    );
+
+    var table = try route_table_mod.RouteTable.init(allocator, .{});
+    defer table.deinit();
+    _ = try table.applyMembership("#a3", "alice", node_a, 0, 100, true, .{
+        .account = "alice",
+        .account_trusted = true,
+    }, 0);
+    try std.testing.expectEqual(
+        route_table_mod.NickDecision.remote_same_account,
+        table.resolveIncomingNick("alice", node_b, 50, "alice", true),
+    );
+    _ = try table.applyMembership("#a3", "alice", node_b, 0, 50, true, .{
+        .account = "alice",
+        .account_trusted = true,
+    }, 0);
+    const forged = table.resolveIncomingNick("alice", node_c, 9_000, "alice", false);
+    const forged_uid = switch (forged) {
+        .rename_to_uid => |uid| uid,
+        else => return error.TestUnexpectedResult,
+    };
+    _ = try table.applyMembership("#a3", &forged_uid, node_c, 0, 9_000, true, .{
+        .account = "alice",
+        .account_trusted = false,
+    }, 0);
+    const members = table.channelMembers("#a3");
+    var saw_alice = false;
+    var saw_forged = false;
+    for (members) |member| {
+        if (std.mem.eql(u8, member.nick, "alice")) {
+            saw_alice = true;
+            try std.testing.expect(member.node == node_a or member.node == node_b);
+        }
+        if (member.node == node_c) {
+            saw_forged = true;
+            try std.testing.expect(!std.ascii.eqlIgnoreCase(member.nick, "alice"));
+        }
+    }
+    try std.testing.expect(saw_alice);
+    try std.testing.expect(saw_forged);
+
+    const token_ambiguous: session_migrate.Token = @splat(0xA7);
+    try applyTestRemoteSessionReplica(&server, &origin_a, token_ambiguous, "alice", "alice", 3);
+    try std.testing.expectEqual(
+        s2s_link.S2sLink.ResidenceDecision.reject,
+        LinuxServer.residenceTrusted(&server, "alice", "alice", node_a, true),
+    );
+    std.debug.print("GAP-A3 branch=rowless session replica proof; forged account is UID-renamed\n", .{});
 }
 
 test "session attachment lease encode OOM retains exact dirty token until full retry succeeds" {

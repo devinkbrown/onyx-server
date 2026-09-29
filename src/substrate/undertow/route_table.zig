@@ -820,6 +820,12 @@ pub const RouteTable = struct {
             // the newer one — and signal the caller NOT to displace the incumbent
             // (a UID phantom for a logged-in user is exactly what we avoid).
             if (sameAccount(acct, if (inc.account.len != 0) inc.account else null)) return .remote_same_account;
+            // An unproven newcomer does not take the nick from a residence-trusted
+            // holder, including when its HLC is higher. HLC remains the tiebreak
+            // between two untrusted claims.
+            if (inc.account.len != 0 and acct.len == 0) {
+                return .{ .rename_to_uid = nick_collision.loserUid(node, nick) };
+            }
             const newcomer = nick_collision.Claim{ .node_id = node, .hlc = hlc, .account = acct };
             if (!nick_collision.candidateWins(newcomer, inc)) {
                 return .{ .rename_to_uid = nick_collision.loserUid(node, nick) };
@@ -3818,6 +3824,7 @@ test "resolveIncomingNick: an UNTRUSTED account never unlocks a same-identity sh
     // `remote_same_account` coexistence.
     _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain", .account_trusted = true }, 0);
     _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "kain", false));
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 900, "kain", false));
     try std.testing.expectEqual(NickDecision.remote_same_account, table.resolveIncomingNick("kain", 10, 100, "kain", true));
 
     // Display-only incumbent (signed peer, no residence) also grants no coexistence.
