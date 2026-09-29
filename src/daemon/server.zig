@@ -3719,6 +3719,10 @@ pub const LinuxServer = struct {
     /// Throttle stamp for the Event Spine history-ring snapshot save (reactor 0).
     event_history_last_write_ms: i64 = 0,
     warden: warden.Registry,
+    /// Last compact mesh-ban filter a peer exchanged. A hit is not a ban.
+    mesh_ban_filter: ?warden.MeshBanFilter = null,
+    /// Times a filter hit was re-checked against the registry and was not a ban.
+    mesh_ban_filter_rechecks: u64 = 0,
     /// Operator-designated spam-trap (honeypot) registry: nicks/channels a
     /// legitimate user has no reason to contact. A non-oper that touches one
     /// trips the trap (oper alert + offender flagging). Server-wide, so it is
@@ -5672,6 +5676,7 @@ pub const LinuxServer = struct {
         self.attachment_delivery_spool.deinit();
         self.event_spine_replay_guard.deinit();
         self.chanstats.deinit();
+        if (self.mesh_ban_filter) |*filter| filter.deinit();
         self.warden.deinit();
         self.spamtrap.deinit();
         self.raid_shield.deinit();
@@ -9087,9 +9092,20 @@ pub const LinuxServer = struct {
     /// enforces it (mesh-ban anti-entropy, paralleling local oper grants).
     /// Best-effort; node-scope wards are local and never shipped. The burst
     /// driver owns the accumulated ciphertext and retry edge.
+    fn meshBanFilterWire(self: *LinuxServer, buf: *[warden.mesh_ban_filter_wire_len]u8) ?[]const u8 {
+        var filter = warden.buildMeshBanFilter(self.allocator, self.warden.all(), platform.realtimeMillis()) catch return null;
+        defer filter.deinit();
+        return warden.encodeMeshBanFilter(&filter, buf) catch null;
+    }
+
     fn sendMeshWardsTo(self: *LinuxServer, conn: *ConnState) bool {
         const link = conn.s2s_secured orelse return true;
         if (!link.established()) return true;
+        // The compact filter is the first mesh-ban frame. The records below
+        // are the authority; a filter hit never refuses by itself.
+        var filter_buf: [warden.mesh_ban_filter_wire_len]u8 = undefined;
+        const filter_wire = self.meshBanFilterWire(&filter_buf) orelse return false;
+        link.sendWard(filter_wire) catch return false;
         for (self.warden.all()) |w| {
             if (w.scope != .mesh) continue;
             var wire_buf: [warden.max_wire_len]u8 = undefined;
@@ -31538,12 +31554,44 @@ pub const LinuxServer = struct {
         };
     }
 
-    fn enforceWard(self: *LinuxServer, conn: *ConnState) bool {
-        if (self.warden.count() == 0) return false;
-        if (conn.session.isOper()) return false;
-        const hit = self.wardMatch(conn) orelse return false;
+    fn subjectHitsMeshFilter(self: *const LinuxServer, conn: *const ConnState) bool {
+        const filter = self.mesh_ban_filter orelse return false;
+        const fields = [_]struct { match: warden.Match, value: []const u8 }{
+            .{ .match = .address, .value = conn.session.realHost() },
+            .{ .match = .host, .value = conn.session.host() },
+            .{ .match = .account, .value = conn.session.account() orelse "" },
+            .{ .match = .realname, .value = conn.session.realname() },
+            .{ .match = .certfp, .value = conn.session.tls_certfp orelse "" },
+        };
+        for (fields) |field| {
+            if (field.value.len == 0) continue;
+            if (filter.mayContain(field.match, field.value)) return true;
+        }
+        return false;
+    }
 
-        switch (hit.action) {
+    fn enforceWard(self: *LinuxServer, conn: *ConnState) bool {
+        if (conn.session.isOper()) return false;
+        const hit = self.wardMatch(conn);
+        if (hit == null and self.subjectHitsMeshFilter(conn)) {
+            // The filter said this subject may be banned. The registry does
+            // not agree, so this is a false positive and not a refusal.
+            self.mesh_ban_filter_rechecks +|= 1;
+            return false;
+        }
+        const listed = hit orelse return false;
+        if (listed.scope == .mesh) {
+            const filter_ptr: ?*const warden.MeshBanFilter = if (self.mesh_ban_filter) |*f| f else null;
+            switch (warden.decideMeshBan(filter_ptr, &self.warden, listed.match, listed.pattern, platform.realtimeMillis())) {
+                .false_positive => {
+                    self.mesh_ban_filter_rechecks +|= 1;
+                    return false;
+                },
+                .absent, .confirmed => {},
+            }
+        }
+
+        switch (listed.action) {
             .quarantine => {
                 // Admitted but restricted: no JOIN, no PRIVMSG/NOTICE. Enforced
                 // at the JOIN and message gates via session.isRestricted().
@@ -31553,9 +31601,9 @@ pub const LinuxServer = struct {
             .require_auth => {
                 // Authenticated subjects pass; everyone else is refused.
                 if (conn.session.account() != null) return false;
-                return self.closeWarded(conn, hit.reason);
+                return self.closeWarded(conn, listed.reason);
             },
-            .refuse, .expel => return self.closeWarded(conn, hit.reason),
+            .refuse, .expel => return self.closeWarded(conn, listed.reason),
         }
     }
 
@@ -36757,12 +36805,15 @@ pub const LinuxServer = struct {
             .created_ms = ward.created_ms,
             .expires_ms = ward.expires_ms,
         }, &wire_buf) catch return;
+        var filter_buf: [warden.mesh_ban_filter_wire_len]u8 = undefined;
+        const filter_wire = self.meshBanFilterWire(&filter_buf);
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
                 if (!slot.occupied) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
+                if (filter_wire) |fw| link.sendWard(fw) catch {};
                 link.sendWard(wire) catch continue;
                 _ = self.flushSecuredS2sOutboundTo(pid, link);
             }
@@ -36786,16 +36837,32 @@ pub const LinuxServer = struct {
         // ONCE after the whole batch applies rather than per add.
         var need_reap = false;
         for (payloads) |p| {
-            const wire = warden.decodeWire(p) catch {
-                // A malformed mesh-WARD frame from a (signature-)trusted peer is a
-                // security-relevant drop: the network ban it carried will not
-                // converge here. Never silent — leave an oper-visible trace.
-                self.traceLog(.warn, .s2s, "dropped malformed mesh-WARD frame from peer");
-                continue;
-            };
-            if (self.applyRemoteWard(wire)) need_reap = true;
+            if (self.ingestMeshWardPayload(p)) need_reap = true;
         }
         if (need_reap) self.reapWardMatches();
+    }
+
+    /// Apply one inbound mesh-ban payload. A filter frame replaces the compact
+    /// hint and never installs a ward. An add/remove updates the registry.
+    /// Returns true when a successful add should sweep live clients.
+    fn ingestMeshWardPayload(self: *LinuxServer, payload: []const u8) bool {
+        if (payload.len != 0 and payload[0] == @intFromEnum(warden.WireOp.filter)) {
+            const decoded = warden.decodeMeshBanFilter(self.allocator, payload) catch {
+                self.traceLog(.warn, .s2s, "dropped malformed mesh-ban filter from peer");
+                return false;
+            };
+            if (self.mesh_ban_filter) |*old| old.deinit();
+            self.mesh_ban_filter = decoded;
+            return false;
+        }
+        const wire = warden.decodeWire(payload) catch {
+            // A malformed mesh-WARD frame from a (signature-)trusted peer is a
+            // security-relevant drop: the network ban it carried will not
+            // converge here. Never silent — leave an oper-visible trace.
+            self.traceLog(.warn, .s2s, "dropped malformed mesh-WARD frame from peer");
+            return false;
+        };
+        return self.applyRemoteWard(wire);
     }
 
     /// Apply one decoded mesh-WARD record to the local registry. Returns true when
@@ -36804,6 +36871,7 @@ pub const LinuxServer = struct {
     /// false (nothing new to enforce).
     fn applyRemoteWard(self: *LinuxServer, wire: warden.WireWard) bool {
         switch (wire.op) {
+            .filter => return false,
             .remove => {
                 _ = self.warden.remove(wire.match, wire.pattern);
                 return false;
@@ -54800,6 +54868,10 @@ const SessionReplayTestPair = struct {
     fn deinit(self: *SessionReplayTestPair) void {
         self.a.deinit();
         self.b.deinit();
+        // Link deinit unmaps the shared identity signing page. Drop the
+        // dangling pointer so the identity wipe does not unmap it again.
+        self.ida.sign_kp.secret_key.page = null;
+        self.idb.sign_kp.secret_key.page = null;
         self.ida.deinit();
         self.idb.deinit();
     }
@@ -57562,7 +57634,18 @@ test "session replica burst sends every legal mesh ward beyond legacy scratch ca
         for (received) |wire| allocator.free(wire);
         allocator.free(received);
     }
-    try std.testing.expectEqual(ward_count, received.len);
+    // The compact filter is the first mesh-ban frame. Every authoritative add follows it.
+    try std.testing.expectEqual(ward_count + 1, received.len);
+    var filter = try warden.decodeMeshBanFilter(allocator, received[0]);
+    defer filter.deinit();
+    for (0..ward_count) |index| {
+        var pattern_buf: [48]u8 = undefined;
+        const pattern = try std.fmt.bufPrint(&pattern_buf, "192.0.2.{d}", .{index});
+        try std.testing.expect(filter.mayContain(.address, pattern));
+        const wire = try warden.decodeWire(received[index + 1]);
+        try std.testing.expectEqual(warden.WireOp.add, wire.op);
+        try std.testing.expectEqualStrings(pattern, wire.pattern);
+    }
 }
 
 test "session replica replay budgets actual ciphertext with one-frame progress exception" {
@@ -99735,6 +99818,134 @@ test "GAP-O7 handshake and anti-entropy stalls open a breaker and an unsigned fr
     stall_live = false;
     try std.testing.expectEqual(@as(i64, 1), server.stats.mooring_breakers_open.load(.acquire));
     std.debug.print("GAP-O7 branch=breaker open on handshake and anti-entropy stall, backoff retry, unsigned frame refused\n", .{});
+}
+
+test "GAP-O8 mesh ban filter is exchanged before the authoritative list" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var sender = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "ward-filter-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer sender.deinit();
+    current_reactor = &sender.reactors[0];
+
+    try sender.warden.add(.{
+        .match = .address,
+        .pattern = "203.0.113.9",
+        .scope = .mesh,
+        .action = .refuse,
+        .reason = "netban",
+        .set_by = "oper",
+        .created_ms = 1,
+    });
+    try sender.warden.add(.{
+        .match = .address,
+        .pattern = "198.51.100.8",
+        .scope = .node,
+        .action = .expel,
+        .reason = "local",
+        .set_by = "oper",
+        .created_ms = 2,
+    });
+
+    var link_conn = ConnState.init(-1);
+    link_conn.overflow_allocator = allocator;
+    link_conn.send_armed = true;
+    link_conn.s2s_secured = &pair.a;
+    defer link_conn.s2s_secured = null;
+    try std.testing.expect(sender.sendMeshWardsTo(&link_conn));
+
+    const burst = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(burst);
+    pair.a.clearOutbound();
+    try std.testing.expect(burst.len != 0);
+    try pair.b.feed(burst, 800);
+    const received = try pair.b.takeWards();
+    defer {
+        for (received) |wire| allocator.free(wire);
+        allocator.free(received);
+    }
+    try std.testing.expectEqual(@as(usize, 2), received.len);
+    var exchanged = try warden.decodeMeshBanFilter(allocator, received[0]);
+    defer exchanged.deinit();
+    try std.testing.expect(exchanged.mayContain(.address, "203.0.113.9"));
+    try std.testing.expect(!exchanged.mayContain(.address, "198.51.100.8"));
+    const add = try warden.decodeWire(received[1]);
+    try std.testing.expectEqual(warden.WireOp.add, add.op);
+    try std.testing.expectEqualStrings("203.0.113.9", add.pattern);
+
+    var receiver = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer receiver.deinit();
+    current_reactor = &receiver.reactors[0];
+
+    try std.testing.expect(!receiver.ingestMeshWardPayload(received[0]));
+    try std.testing.expectEqual(@as(usize, 0), receiver.warden.count());
+    try std.testing.expect(receiver.mesh_ban_filter != null);
+
+    var client = ConnState.init(-1);
+    client.overflow_allocator = allocator;
+    client.send_armed = true;
+    defer if (client.send_overflow.capacity > 0) client.send_overflow.deinit(allocator);
+    client.session.setRealHost("203.0.113.9");
+    try std.testing.expect(!receiver.enforceWard(&client));
+    try std.testing.expect(!client.closing);
+    try std.testing.expectEqual(@as(u64, 1), receiver.mesh_ban_filter_rechecks);
+
+    try std.testing.expect(receiver.ingestMeshWardPayload(received[1]));
+    try std.testing.expectEqual(@as(usize, 1), receiver.warden.count());
+    try std.testing.expect(receiver.enforceWard(&client));
+    try std.testing.expect(client.closing);
+    try std.testing.expectEqual(@as(u64, 1), receiver.mesh_ban_filter_rechecks);
+
+    var bystander = ConnState.init(-1);
+    bystander.overflow_allocator = allocator;
+    bystander.send_armed = true;
+    defer if (bystander.send_overflow.capacity > 0) bystander.send_overflow.deinit(allocator);
+    bystander.session.setRealHost("192.0.2.1");
+    try std.testing.expect(!receiver.enforceWard(&bystander));
+    try std.testing.expect(!bystander.closing);
+
+    try receiver.warden.add(.{
+        .match = .address,
+        .pattern = "198.51.100.8",
+        .scope = .node,
+        .action = .expel,
+        .reason = "local",
+        .set_by = "oper",
+        .created_ms = 3,
+    });
+    var local = ConnState.init(-1);
+    local.overflow_allocator = allocator;
+    local.send_armed = true;
+    defer if (local.send_overflow.capacity > 0) local.send_overflow.deinit(allocator);
+    local.session.setRealHost("198.51.100.8");
+    try std.testing.expect(receiver.enforceWard(&local));
+    try std.testing.expect(local.closing);
+    try std.testing.expectEqual(@as(u64, 1), receiver.mesh_ban_filter_rechecks);
+
+    current_reactor = null;
+    std.debug.print("GAP-O8 branch=filter exchanged before the ward list; a hit is re-checked and is not the authority\n", .{});
 }
 
 test "SIGUSR2 handler sets the upgrade-request flag; reactor-0 consume is one-shot" {

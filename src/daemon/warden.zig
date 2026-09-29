@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const cidr = @import("../proto/cidr.zig");
+const bloom = @import("../substrate/bloom.zig");
 
 /// Which identity facet a Ward's pattern is tested against.
 pub const Match = enum {
@@ -305,6 +306,9 @@ pub const WireOp = enum(u8) {
     add = 0,
     /// Remove the mesh ward identified by (match, pattern) on the receiving node.
     remove = 1,
+    /// Compact bloom of mesh-ban keys. Exchanged before the authoritative records.
+    /// A hit is not a ban.
+    filter = 2,
 };
 
 /// A decoded mesh-WARD record. String fields borrow the source payload.
@@ -431,6 +435,101 @@ pub fn decodeWire(bytes: []const u8) WireError!WireWard {
         .created_ms = created_ms,
         .expires_ms = expires_ms,
     };
+}
+
+// ── compact mesh-ban filter ────────────────────────────────────────────────
+//
+// Peers exchange this bloom before the full mesh-WARD records. Membership is
+// approximate: `mayContain` has no false negatives for keys inserted at build
+// time and may false-positive. The registry remains the authority.
+
+pub const mesh_ban_filter_bits: usize = 8192;
+pub const mesh_ban_filter_hashes: usize = 4;
+pub const mesh_ban_filter_wire_len: usize = 1 + 2 + 2 + 4 + (mesh_ban_filter_bits / 8);
+
+pub const FilterError = WireError || std.mem.Allocator.Error || bloom.BloomError;
+
+pub const BanDecision = enum {
+    /// The key is not in the filter and not an active mesh ward.
+    absent,
+    /// The authoritative registry has this mesh ward.
+    confirmed,
+    /// The filter reported the key and the registry does not. Re-check only.
+    false_positive,
+};
+
+pub const MeshBanFilter = struct {
+    bloom: bloom.Bloom,
+
+    pub fn deinit(self: *MeshBanFilter) void {
+        self.bloom.deinit();
+        self.* = undefined;
+    }
+
+    pub fn mayContain(self: *const MeshBanFilter, match: Match, pattern: []const u8) bool {
+        var key_buf: [320]u8 = undefined;
+        const key = meshBanKey(&key_buf, match, pattern) orelse return false;
+        return self.bloom.mayContain(key);
+    }
+};
+
+pub fn meshBanKey(buf: []u8, match: Match, pattern: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}\x00{s}", .{ match.token(), pattern }) catch null;
+}
+
+/// Bloom of active mesh-scope ward keys. Node-scope and expired rows are omitted.
+pub fn buildMeshBanFilter(allocator: std.mem.Allocator, wards: []const Ward, now_ms: i64) FilterError!MeshBanFilter {
+    var built = try bloom.Bloom.init(allocator, mesh_ban_filter_bits, mesh_ban_filter_hashes);
+    errdefer built.deinit();
+    var key_buf: [320]u8 = undefined;
+    for (wards) |w| {
+        if (w.scope != .mesh or w.isExpired(now_ms)) continue;
+        const key = meshBanKey(&key_buf, w.match, w.pattern) orelse continue;
+        built.add(key);
+    }
+    return .{ .bloom = built };
+}
+
+pub fn encodeMeshBanFilter(filter: *const MeshBanFilter, out: []u8) WireError![]const u8 {
+    if (out.len < mesh_ban_filter_wire_len) return error.ShortBuffer;
+    if (filter.bloom.bitCount() != mesh_ban_filter_bits or filter.bloom.hashCount() != mesh_ban_filter_hashes) return error.BadField;
+    if (filter.bloom.bits.len != mesh_ban_filter_bits / 8) return error.BadField;
+    out[0] = @intFromEnum(WireOp.filter);
+    std.mem.writeInt(u16, out[1..3], @intCast(mesh_ban_filter_bits), .little);
+    std.mem.writeInt(u16, out[3..5], @intCast(mesh_ban_filter_hashes), .little);
+    const items: u32 = if (filter.bloom.len() > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(filter.bloom.len());
+    std.mem.writeInt(u32, out[5..9], items, .little);
+    @memcpy(out[9..][0 .. mesh_ban_filter_bits / 8], filter.bloom.bits);
+    return out[0..mesh_ban_filter_wire_len];
+}
+
+pub fn decodeMeshBanFilter(allocator: std.mem.Allocator, bytes: []const u8) FilterError!MeshBanFilter {
+    if (bytes.len != mesh_ban_filter_wire_len) return error.Truncated;
+    if (bytes[0] != @intFromEnum(WireOp.filter)) return error.BadField;
+    const bit_count = std.mem.readInt(u16, bytes[1..3], .little);
+    const hash_count = std.mem.readInt(u16, bytes[3..5], .little);
+    if (bit_count != mesh_ban_filter_bits or hash_count != mesh_ban_filter_hashes) return error.BadField;
+    const item_count = std.mem.readInt(u32, bytes[5..9], .little);
+    var built = try bloom.Bloom.init(allocator, mesh_ban_filter_bits, mesh_ban_filter_hashes);
+    errdefer built.deinit();
+    @memcpy(built.bits, bytes[9..][0 .. mesh_ban_filter_bits / 8]);
+    built.item_count = item_count;
+    return .{ .bloom = built };
+}
+
+/// A filter hit refuses nobody by itself. `false_positive` means the bloom
+/// reported the key and the live mesh registry does not; the caller re-checks
+/// and does not refuse. A registry hit is `confirmed` even when the filter misses.
+pub fn decideMeshBan(filter: ?*const MeshBanFilter, registry: *const Registry, match: Match, pattern: []const u8, now_ms: i64) BanDecision {
+    const on_list = if (registry.find(match, pattern)) |w|
+        w.scope == .mesh and !w.isExpired(now_ms)
+    else
+        false;
+    if (filter) |f| {
+        if (f.mayContain(match, pattern) and !on_list) return .false_positive;
+    }
+    if (on_list) return .confirmed;
+    return .absent;
 }
 
 /// Match a facet value against a Ward pattern. An `.address` pattern that
