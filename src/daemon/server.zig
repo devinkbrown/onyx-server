@@ -112524,15 +112524,52 @@ test "GAP-P11 IRCX screens name a handler or a divergence" {
     try std.testing.expect(std.mem.indexOf(u8, outsider.send_buf[0..outsider.send_len], "CHANNEL MODE #ev") == null);
     try std.testing.expect(!outsider.session.isOper());
 
+    const src = try gapP11ReadSource(alloc);
+    defer alloc.free(src);
+    try std.testing.expect(gapP11LineHas(src, 21454, "pub fn handleListx"));
+    try std.testing.expect(gapP11LineHas(src, 55343, "auditorium.visibleTo"));
+    try std.testing.expect(gapP11LineHas(src, 20186, "isHidden(channel)"));
+    try std.testing.expect(gapP11LineHas(src, 32155, "IrcxEventType.parse(params[1])"));
+    try std.testing.expect(gapP11LineHas(src, 36154, "pub fn handleData"));
+    try std.testing.expect(gapP11LineHas(src, 21480, "created_unix > 0"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn handle" ++ "Taccess") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn handle" ++ "Btprop") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn handle" ++ "Opforce") == null);
+
     current_reactor = null;
-    std.debug.print("GAP-P11 row=LISTX handler=src/daemon/server.zig:21404 test=GAP-P0c remote LISTX carries the peer topic\n", .{});
-    std.debug.print("GAP-P11 row=NAMES +x handler=src/daemon/server.zig:54781 test=threaded server: +x auditorium hides regular members in NAMES\n", .{});
-    std.debug.print("GAP-P11 row=NAMES +h handler=src/daemon/server.zig:20100 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
-    std.debug.print("GAP-P11 row=EVENT CHANNEL handler=src/daemon/server.zig:31729 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
+    std.debug.print("GAP-P11 row=LISTX handler=src/daemon/server.zig:21454 test=GAP-P0c remote LISTX carries the peer topic\n", .{});
+    std.debug.print("GAP-P11 row=NAMES +x handler=src/daemon/server.zig:55343 test=threaded server: +x auditorium hides regular members in NAMES\n", .{});
+    std.debug.print("GAP-P11 row=NAMES +h handler=src/daemon/server.zig:20186 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
+    std.debug.print("GAP-P11 row=EVENT CHANNEL handler=src/daemon/server.zig:32155 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
+    std.debug.print("GAP-P11 row=DATA handler=src/daemon/server.zig:36154 test=threaded server: +V NOCOMICDATA refuses non-op DATA with 531\n", .{});
     std.debug.print("GAP-P11 divergence=USER events stay operator-only because a connect line names every user\n", .{});
-    std.debug.print("GAP-P11 divergence=remote LISTX creation time stays 0 because creation is not replicated\n", .{});
-    std.debug.print("GAP-P11 divergence=TACCESS BTPROP comic-chat avatar DATA and OPFORCE stay unwired\n", .{});
+    std.debug.print("GAP-P11 divergence=remote LISTX creation time stays 0 when the peer did not replicate created_unix handler=src/daemon/server.zig:21480\n", .{});
+    std.debug.print("GAP-P11 divergence=TACCESS, BTPROP, OPFORCE, and Comic Chat avatar payloads stay unwired\n", .{});
     std.debug.print("GAP-P11 branch=handlers at file:line or an explicit divergence and the client stays in the Onyx repo\n", .{});
+}
+
+fn gapP11ReadSource(allocator: std.mem.Allocator) ![]u8 {
+    // @src().file is the compiler's relative name, and the test process is not
+    // standing in the source tree. The repository path is the one the daemon
+    // is built from.
+    return try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "/home/kain/onyx-server/src/daemon/server.zig",
+        allocator,
+        .limited(64 * 1024 * 1024),
+    );
+}
+
+fn gapP11LineHas(text: []const u8, line_no: usize, needle: []const u8) bool {
+    var n: usize = 1;
+    var i: usize = 0;
+    while (i < text.len and n < line_no) : (i += 1) {
+        if (text[i] == '\n') n += 1;
+    }
+    if (n != line_no or i >= text.len) return false;
+    const rest = text[i..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return std.mem.indexOf(u8, rest[0..end], needle) != null;
 }
 
 fn gapP12Fill(ptr: *anyopaque, account: []const u8, target: []const u8, out: []u8) error{Denied}!usize {
