@@ -91,6 +91,10 @@ pub const HeadAction = enum(u8) {
         if (std.mem.eql(u8, name, "delete")) return .delete;
         return null;
     }
+
+    pub fn fromInt(value: u8) ?HeadAction {
+        return std.enums.fromInt(HeadAction, value);
+    }
 };
 
 /// The key id echoed in a signed head. The log itself still accepts longer ids.
@@ -217,6 +221,110 @@ pub fn parseSignedHead(
     head.public_key = public_key;
     head.signature = signature;
     return head;
+}
+
+/// Fixed mesh payload for one signed head. The entry count is monotonic per
+/// node id; the signature is the head signature, not a second scheme.
+pub const head_wire_version: u8 = 1;
+pub const head_wire_len: usize = 1 + 8 + 8 + Blake3.digest_length + 1 + 1 + head_key_max + crypto_sign.public_key_len + crypto_sign.signature_len;
+
+pub fn encodeHeadWire(head: SignedHead, out: []u8) error{BufferTooSmall}![]const u8 {
+    if (out.len < head_wire_len) return error.BufferTooSmall;
+    var i: usize = 0;
+    out[i] = head_wire_version;
+    i += 1;
+    std.mem.writeInt(u64, out[i..][0..8], head.node_id, .little);
+    i += 8;
+    std.mem.writeInt(u64, out[i..][0..8], head.entries, .little);
+    i += 8;
+    @memcpy(out[i..][0..head.root.len], &head.root);
+    i += head.root.len;
+    out[i] = @intFromEnum(head.action);
+    i += 1;
+    out[i] = head.key_id_len;
+    i += 1;
+    @memset(out[i..][0..head_key_max], 0);
+    if (head.key_id_len != 0) @memcpy(out[i..][0..head.key_id_len], head.keyId());
+    i += head_key_max;
+    @memcpy(out[i..][0..crypto_sign.public_key_len], &head.public_key);
+    i += crypto_sign.public_key_len;
+    @memcpy(out[i..][0..crypto_sign.signature_len], &head.signature);
+    return out[0..head_wire_len];
+}
+
+pub fn decodeHeadWire(bytes: []const u8) error{BadHead}!SignedHead {
+    if (bytes.len != head_wire_len or bytes[0] != head_wire_version) return error.BadHead;
+    var i: usize = 1;
+    const node_id = std.mem.readInt(u64, bytes[i..][0..8], .little);
+    i += 8;
+    const entries = std.mem.readInt(u64, bytes[i..][0..8], .little);
+    i += 8;
+    var root: Hash = undefined;
+    @memcpy(&root, bytes[i..][0..root.len]);
+    i += root.len;
+    const action = HeadAction.fromInt(bytes[i]) orelse return error.BadHead;
+    i += 1;
+    const key_id_len = bytes[i];
+    i += 1;
+    if (key_id_len > head_key_max) return error.BadHead;
+    const key_field = bytes[i..][0..head_key_max];
+    for (key_field[key_id_len..]) |byte| {
+        if (byte != 0) return error.BadHead;
+    }
+    i += head_key_max;
+    var public_key: crypto_sign.PublicKey = undefined;
+    var signature: crypto_sign.Signature = undefined;
+    @memcpy(&public_key, bytes[i..][0..crypto_sign.public_key_len]);
+    i += crypto_sign.public_key_len;
+    @memcpy(&signature, bytes[i..][0..crypto_sign.signature_len]);
+    var head = try headFromParts(node_id, entries, root, action, key_field[0..key_id_len]);
+    head.public_key = public_key;
+    head.signature = signature;
+    if (!verifyHead(head)) return error.BadHead;
+    return head;
+}
+
+test "GAP-K2 a signed head round-trips and a stale head does not hide a revocation" {
+    var log = KeyTransparencyLog.init(std.testing.allocator);
+    defer log.deinit();
+    var kp = try crypto_sign.KeyPair.fromSeed(@as(crypto_sign.Seed, @splat(0x42)));
+    defer kp.deinit();
+    const bind = try log.append(.{
+        .account = "alice",
+        .kind = .e2ee_device,
+        .action = .bind,
+        .key_id = "phone",
+        .key_hash = materialHash("mls-phone"),
+        .timestamp_ms = 10,
+    });
+    var bind_head = try headFromParts(7, 1, bind.root, .bind, "phone");
+    try signHead(&kp, &bind_head);
+    var wire: [head_wire_len]u8 = undefined;
+    const encoded = try encodeHeadWire(bind_head, &wire);
+    const decoded = try decodeHeadWire(encoded);
+    try std.testing.expectEqual(@as(u64, 7), decoded.node_id);
+    try std.testing.expectEqual(@as(u64, 1), decoded.entries);
+    try log.storePeerHead(decoded);
+
+    const deleted = try log.append(.{
+        .account = "alice",
+        .kind = .e2ee_device,
+        .action = .delete,
+        .key_id = "phone",
+        .key_hash = materialHash("mls-phone"),
+        .timestamp_ms = 11,
+    });
+    var delete_head = try headFromParts(7, 2, deleted.root, .delete, "phone");
+    try signHead(&kp, &delete_head);
+    try log.storePeerHead(delete_head);
+    try std.testing.expectError(error.StaleHead, log.storePeerHead(bind_head));
+    const kept = log.peerHead(7).?;
+    try std.testing.expectEqual(@as(u64, 2), kept.entries);
+    try std.testing.expectEqual(HeadAction.delete, kept.action);
+
+    var flipped = wire;
+    flipped[flipped.len - 1] ^= 0x01;
+    try std.testing.expectError(error.BadHead, decodeHeadWire(&flipped));
 }
 
 pub const Event = struct {
@@ -434,12 +542,25 @@ pub const KeyTransparencyLog = struct {
 
     /// Remember one peer's signed head. The first key for a node id sticks;
     /// a later head must verify under that same key.
-    pub fn storePeerHead(self: *KeyTransparencyLog, head: SignedHead) (error{ BadSignature, KeyMismatch, BadHead } || std.mem.Allocator.Error)!void {
+    pub fn storePeerHead(self: *KeyTransparencyLog, head: SignedHead) (error{ BadSignature, KeyMismatch, BadHead, StaleHead } || std.mem.Allocator.Error)!void {
         if (self.unusable) return error.BadHead;
         if (!verifyHead(head)) return error.BadSignature;
         for (self.peer_heads.items) |*slot| {
             if (slot.node_id != head.node_id) continue;
             if (!std.mem.eql(u8, &slot.public_key, &head.public_key)) return error.KeyMismatch;
+            // Anti-entropy redelivers older heads. A revocation (higher entry
+            // count) must stay visible; an equal count with a different root
+            // is equivocation and is refused.
+            if (head.entries < slot.entries) return error.StaleHead;
+            if (head.entries == slot.entries) {
+                if (std.mem.eql(u8, &slot.root, &head.root) and
+                    slot.action == head.action and
+                    std.mem.eql(u8, slot.keyId(), head.keyId()))
+                {
+                    return;
+                }
+                return error.BadHead;
+            }
             slot.* = head;
             return;
         }

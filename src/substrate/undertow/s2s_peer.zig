@@ -175,6 +175,10 @@ const e2ee_group_extension_reply = "onyx-xcap-e2ee-group-2!";
 const mesh_search_extension_probe = "onyx-xcap-mesh-search-1?";
 const mesh_search_extension_reply = "onyx-xcap-mesh-search-1!";
 const max_search_frames: usize = 1024;
+/// Key-transparency heads. Peers that do not know tag 0x2B never see it.
+const keytrans_head_extension_probe = "onyx-xcap-keytrans-head-1?";
+const keytrans_head_extension_reply = "onyx-xcap-keytrans-head-1!";
+const max_keytrans_heads: usize = 1024;
 const session_replica_v3_probe = "onyx-xcap-session-replica-v3?";
 const session_replica_v3_reply = "onyx-xcap-session-replica-v3!";
 
@@ -626,6 +630,9 @@ pub const S2sPeer = struct {
     /// Remote answered the mesh-search PING extension. Send SEARCH_QUERY only
     /// after this is true so an older peer never receives tags 0x29/0x2A.
     peer_supports_search: bool = false,
+    /// Remote answered the key-transparency head probe. Send KEYTRANS_HEAD
+    /// only after this is true so an older peer never receives tag 0x2B.
+    peer_supports_keytrans_head: bool = false,
     /// Remote advertised frame signing plus the explicit event-spine-v2 bit.
     peer_supports_event_spine_v2: bool = false,
     /// Daemon-supplied residence-proof verifier (Design C / F1). Null (default,
@@ -754,6 +761,9 @@ pub const S2sPeer = struct {
     search_queries: std.ArrayListUnmanaged([]u8) = .empty,
     /// Verified SEARCH_REPLY payloads. The daemon authorizes each hit.
     search_replies: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Verified KEYTRANS_HEAD payloads. The daemon checks the head signature
+    /// and refuses an older entry count. Opaque here.
+    keytrans_heads: std.ArrayListUnmanaged([]u8) = .empty,
     /// Verified MEMO_PUSH payloads received from this peer, awaiting the daemon
     /// to decode and run local Web Push delivery. These are signing-required:
     /// legacy/plaintext peers are ignored so DM previews do not ride unsigned S2S.
@@ -1040,6 +1050,8 @@ pub const S2sPeer = struct {
         self.search_queries.deinit(self.allocator);
         for (self.search_replies.items) |m| self.allocator.free(m);
         self.search_replies.deinit(self.allocator);
+        for (self.keytrans_heads.items) |m| self.allocator.free(m);
+        self.keytrans_heads.deinit(self.allocator);
         for (self.memo_pushes.items) |m| self.allocator.free(m);
         self.memo_pushes.deinit(self.allocator);
         for (self.media_ws_datagrams.items) |m| self.allocator.free(m);
@@ -1282,6 +1294,9 @@ pub const S2sPeer = struct {
                 if (std.mem.eql(u8, frame.payload, mesh_search_extension_probe) and
                     self.signing_key != null)
                     try emitFrame(self.allocator, sink, .PONG, mesh_search_extension_reply);
+                if (std.mem.eql(u8, frame.payload, keytrans_head_extension_probe) and
+                    self.signing_key != null)
+                    try emitFrame(self.allocator, sink, .PONG, keytrans_head_extension_reply);
                 if (std.mem.eql(u8, frame.payload, session_replica_v3_probe) and
                     self.session_replica_attachment_transport_enabled and
                     self.session_replica_transport_enabled and self.signing_key != null and
@@ -1305,6 +1320,9 @@ pub const S2sPeer = struct {
                 if (std.mem.eql(u8, frame.payload, mesh_search_extension_reply) and
                     self.signing_key != null)
                     self.peer_supports_search = true;
+                if (std.mem.eql(u8, frame.payload, keytrans_head_extension_reply) and
+                    self.signing_key != null)
+                    self.peer_supports_keytrans_head = true;
                 if (std.mem.eql(u8, frame.payload, session_replica_v3_reply) and
                     self.session_replica_attachment_transport_enabled and
                     self.peer_supports_signing and self.peer_supports_session_replica_v2)
@@ -1351,6 +1369,7 @@ pub const S2sPeer = struct {
             .WARD => try self.recvWard(frame.payload),
             .SEARCH_QUERY => try self.recvSearchQuery(frame.payload),
             .SEARCH_REPLY => try self.recvSearchReply(frame.payload),
+            .KEYTRANS_HEAD => try self.recvKeyTransHead(frame.payload),
             .RESYNC => {
                 self.resync_requested = true;
                 // RESYNC is also the one-shot capability-refresh request for a
@@ -1959,6 +1978,28 @@ pub const S2sPeer = struct {
 
     pub fn supportsMeshSearch(self: *const S2sPeer) bool {
         return self.established and self.peer_supports_search;
+    }
+
+    fn recvKeyTransHead(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.KEYTRANS_HEAD, frame_payload) orelse return;
+        if (self.keytrans_heads.items.len >= max_keytrans_heads) return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.keytrans_heads.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    pub fn takeKeyTransHeads(self: *S2sPeer) ![][]u8 {
+        return self.keytrans_heads.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a signed key-transparency head. Refused until the peer has answered
+    /// the probe, so an older peer is never sent tag 0x2B.
+    pub fn sendKeyTransHead(self: *S2sPeer, sink: ByteSink, wire: []const u8) !void {
+        if (!self.established or !self.peer_supports_keytrans_head) return error.KeyTransUnavailable;
+        try self.emitSignable(sink, .KEYTRANS_HEAD, wire);
+    }
+
+    pub fn supportsKeyTransHead(self: *const S2sPeer) bool {
+        return self.established and self.peer_supports_keytrans_head;
     }
 
     /// Queue a verified inbound MEMO_PUSH hint for daemon-side Web Push
@@ -4124,6 +4165,7 @@ pub const S2sPeer = struct {
         // Re-authorize the current E2EEGROUP schema on every handshake.
         self.peer_supports_e2ee_group_current = false;
         self.peer_supports_search = false;
+        self.peer_supports_keytrans_head = false;
         self.peer_supports_event_spine_v2 = self.peer_supports_signing and (hs.caps & cap_event_spine_v2) != 0;
         if (self.signedFramesRequired() and !self.peer_supports_signing) {
             return error.SignedFramesRequired;
@@ -4146,6 +4188,8 @@ pub const S2sPeer = struct {
             try emitFrame(self.allocator, sink, .PING, e2ee_group_extension_probe);
         if (self.signing_key != null)
             try emitFrame(self.allocator, sink, .PING, mesh_search_extension_probe);
+        if (self.signing_key != null)
+            try emitFrame(self.allocator, sink, .PING, keytrans_head_extension_probe);
     }
 
     fn rememberRemote(self: *S2sPeer, hs: Handshake, now_ms: u64) !void {
@@ -9239,7 +9283,7 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .MEMO_PUSH,                        .SESSION_REPLICA_OFFER,
         .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE, .OPER_EVENT_V2,
         .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,      .E2EE_GROUP,               .E2EE_GROUP_ACK,                   .MEMBERSHIP_SYNC,
-        .SEARCH_QUERY,        .SEARCH_REPLY,
+        .SEARCH_QUERY,        .SEARCH_REPLY,           .KEYTRANS_HEAD,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug

@@ -162,6 +162,11 @@ pub const FrameType = enum(u8) {
     /// Signed history search reply. Each hit is authorized again by the asker.
     /// Ciphertext stays in the body so the asker can drop it.
     SEARCH_REPLY = 0x2A,
+    /// Signed summary of the sender's key-transparency log. Negotiated by a
+    /// PING extension because the handshake capability byte is full. A later
+    /// head with a higher entry count replaces the stored one; an older head
+    /// does not.
+    KEYTRANS_HEAD = 0x2B,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -211,6 +216,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.MEMBERSHIP_SYNC) => .MEMBERSHIP_SYNC,
             @intFromEnum(FrameType.SEARCH_QUERY) => .SEARCH_QUERY,
             @intFromEnum(FrameType.SEARCH_REPLY) => .SEARCH_REPLY,
+            @intFromEnum(FrameType.KEYTRANS_HEAD) => .KEYTRANS_HEAD,
             else => null,
         };
     }
@@ -414,6 +420,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .MEMBERSHIP_SYNC, .token = "MEMBERSHIP_SYNC", .family = .membership, .auth = .signable, .summary = "Authenticated completion marker for a full peer membership snapshot." },
     .{ .frame_type = .SEARCH_QUERY, .token = "SEARCH_QUERY", .family = .relay, .auth = .signed, .summary = "Signed history search request for one target. Gated by a PING extension, not a new handshake bit." },
     .{ .frame_type = .SEARCH_REPLY, .token = "SEARCH_REPLY", .family = .relay, .auth = .signed, .summary = "Signed history search hits. The asker authorizes each hit and drops ciphertext." },
+    .{ .frame_type = .KEYTRANS_HEAD, .token = "KEYTRANS_HEAD", .family = .relay, .auth = .signed, .summary = "Signed key-transparency log head. Gated by a PING extension. A higher entry count replaces the stored head; an older head does not." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {

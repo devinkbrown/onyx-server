@@ -1225,6 +1225,22 @@ pub const SecuredLink = struct {
         return link.takeSearchReplies();
     }
 
+    pub fn supportsKeyTransHead(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsKeyTransHead();
+    }
+
+    pub fn sendKeyTransHead(self: *SecuredLink, wire: []const u8) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendKeyTransHead(wire);
+        try self.drainInner();
+    }
+
+    pub fn takeKeyTransHeads(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeKeyTransHeads();
+    }
+
     /// Emit a signed Web Push hint for an offline memo/DM over the encrypted
     /// S2S leg. The inner peer requires frame signing, so old/non-signing peers
     /// silently get no hint.

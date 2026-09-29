@@ -1770,12 +1770,28 @@ pub const Services = struct {
         };
     }
 
-    pub fn storeKeyTransparencyHead(self: *Services, head: key_transparency.SignedHead) (error{ Disabled, Unavailable, BadSignature, KeyMismatch, BadHead } || std.mem.Allocator.Error)!void {
+    pub fn storeKeyTransparencyHead(self: *Services, head: key_transparency.SignedHead) (error{ Disabled, Unavailable, BadSignature, KeyMismatch, BadHead, StaleHead } || std.mem.Allocator.Error)!void {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
         const log = self.key_transparency orelse return error.Disabled;
         if (log.unusable) return error.Unavailable;
         try log.storePeerHead(head);
+    }
+
+    /// Unsigned summary of this node's own log. The caller signs it with the
+    /// node identity. An empty log is `Empty` so anti-entropy sends nothing.
+    pub fn keyTransparencyUnsignedLocalHead(self: *Services, node_id: u64) (error{ Disabled, Unavailable, Empty, BadHead } || std.mem.Allocator.Error)!key_transparency.SignedHead {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const log = self.key_transparency orelse return error.Disabled;
+        if (log.unusable) return error.Unavailable;
+        if (log.len() == 0) return error.Empty;
+        const last = log.eventAt(log.len() - 1) catch return error.Unavailable;
+        const action: key_transparency.HeadAction = switch (last.action) {
+            .bind => .bind,
+            .delete => .delete,
+        };
+        return key_transparency.headFromParts(node_id, log.len(), log.root(), action, last.keyId());
     }
 
     pub fn keyTransparencyPeerHead(self: *Services, node_id: u64) error{ Disabled, Unavailable }!?key_transparency.SignedHead {

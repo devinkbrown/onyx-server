@@ -473,6 +473,7 @@ const MeshBurstStage = enum(u4) {
     opers,
     wards,
     clones,
+    keytrans,
 };
 
 /// All fallible storage for one live MONITOR occupancy transition. The plan is
@@ -9651,6 +9652,7 @@ pub const LinuxServer = struct {
         self.drainKills(link);
         self.drainWards(link);
         self.drainMeshSearch(link);
+        self.drainKeyTransHeads(link);
         self.drainMemoPushes(link);
         self.drainMediaWsDatagrams(link);
         self.drainRepairResync(conn, link, true);
@@ -9858,6 +9860,7 @@ pub const LinuxServer = struct {
         self.drainKills(link);
         self.drainWards(link);
         self.drainMeshSearch(link);
+        self.drainKeyTransHeads(link);
         self.drainRepairResync(conn, link, false);
         if (!conn.s2s_burst_done and link.established()) {
             if (self.sendMeshStateBurstTo(conn)) {
@@ -15662,6 +15665,12 @@ pub const LinuxServer = struct {
                         self.sendCloneAntiEntropy(conn, link)
                     else
                         true,
+                    .keytrans => if (conn.s2s_secured) |link|
+                        self.sendKeyTransHeadOn(link)
+                    else if (conn.s2s) |link|
+                        self.sendKeyTransHeadOn(link)
+                    else
+                        true,
                 };
                 if (!encoded) {
                     // Preserve/flush any complete rows emitted before the
@@ -15683,7 +15692,8 @@ pub const LinuxServer = struct {
                 .topics => .opers,
                 .opers => .wards,
                 .wards => .clones,
-                .clones => .idle,
+                .clones => .keytrans,
+                .keytrans => .idle,
             };
             if (conn.mesh_burst_stage == .idle and conn.mesh_burst_restart_pending) {
                 conn.mesh_burst_restart_pending = false;
@@ -24664,6 +24674,53 @@ pub const LinuxServer = struct {
             var old = self.mesh_search_pending.orderedRemove(at);
             self.destroyMeshSearchPending(&old);
         }
+    }
+
+    /// Sign this node's current key-transparency head, or return null when
+    /// there is no identity, no log, or an empty log. Anti-entropy sends nothing
+    /// in those cases.
+    fn localKeyTransHeadWire(self: *LinuxServer, out: []u8) ?[]const u8 {
+        const ident = self.config.node_identity orelse return null;
+        const svc = self.account_services orelse return null;
+        var head = svc.keyTransparencyUnsignedLocalHead(ident.shortId()) catch return null;
+        key_transparency.signHead(&ident.sign_kp, &head) catch return null;
+        return key_transparency.encodeHeadWire(head, out) catch null;
+    }
+
+    /// Anti-entropy carrier for one signed key-transparency head. A peer that
+    /// has not answered the probe is skipped; that is not a burst failure.
+    fn sendKeyTransHeadOn(self: *LinuxServer, link: anytype) bool {
+        var buf: [key_transparency.head_wire_len]u8 = undefined;
+        const wire = self.localKeyTransHeadWire(&buf) orelse return true;
+        link.sendKeyTransHead(wire) catch |err| switch (err) {
+            error.KeyTransUnavailable => return true,
+            else => return false,
+        };
+        return true;
+    }
+
+    fn drainKeyTransHeads(self: *LinuxServer, link: anytype) void {
+        const payloads = link.takeKeyTransHeads() catch return;
+        defer {
+            for (payloads) |payload| self.allocator.free(payload);
+            if (payloads.len != 0) self.allocator.free(payloads);
+        }
+        const svc = self.account_services orelse return;
+        for (payloads) |payload| {
+            const head = key_transparency.decodeHeadWire(payload) catch continue;
+            svc.storeKeyTransparencyHead(head) catch continue;
+        }
+    }
+
+    fn drainKeyTransPeer(self: *LinuxServer, peer: *s2s_peer_mod.S2sPeer) void {
+        const KeyTransPeerBridge = struct {
+            peer: *s2s_peer_mod.S2sPeer,
+            fn takeKeyTransHeads(bridge: *@This()) ![][]u8 {
+                return bridge.peer.takeKeyTransHeads();
+            }
+        };
+        var bridge = KeyTransPeerBridge{ .peer = peer };
+        self.drainKeyTransHeads(&bridge);
     }
 
     /// Answer inbound queries and deliver inbound replies. `link` is the
@@ -41659,6 +41716,7 @@ pub const LinuxServer = struct {
                     error.BadSignature => "BAD_SIGNATURE",
                     error.KeyMismatch => "KEY_MISMATCH",
                     error.BadHead => "BAD_HEAD",
+                    error.StaleHead => "STALE_HEAD",
                     error.OutOfMemory => "INTERNAL_ERROR",
                 };
                 const reason: []const u8 = switch (err) {
@@ -41667,6 +41725,7 @@ pub const LinuxServer = struct {
                     error.BadSignature => "Signed head did not verify",
                     error.KeyMismatch => "That node id is already pinned to a different key",
                     error.BadHead => "Signed head fields are not canonical",
+                    error.StaleHead => "A newer signed head is already stored",
                     error.OutOfMemory => "Could not store the signed head",
                 };
                 return self.failReply(conn, "KEYTRANS", code, reason);
@@ -70115,6 +70174,144 @@ fn gapK2Peer(server: *Server, conn: *ConnState, node: []const u8) ![]const u8 {
     conn.send_len = 0;
     try server.handleKeyTrans(conn, &lv);
     return conn.send_buf[0..conn.send_len];
+}
+
+test "GAP-K2 a revocation is visible on the other node after anti-entropy" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "kt-anti-a.wal");
+    defer store_a.deinit();
+    var store_b = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "kt-anti-b.wal");
+    defer store_b.deinit();
+    var kt_a = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt_a.deinit();
+    var kt_b = key_transparency.KeyTransparencyLog.init(alloc);
+    defer kt_b.deinit();
+    var services_a = services_mod.Services.init(&store_a, null);
+    var services_b = services_mod.Services.init(&store_b, null);
+    services_a.attachKeyTransparencyLog(&kt_a);
+    services_b.attachKeyTransparencyLog(&kt_b);
+
+    const bind = try kt_a.append(.{
+        .account = "alice",
+        .kind = .e2ee_device,
+        .action = .bind,
+        .key_id = "phone",
+        .key_hash = key_transparency.materialHash("mls-phone"),
+        .timestamp_ms = 10,
+    });
+    _ = try kt_a.append(.{
+        .account = "alice",
+        .kind = .e2ee_device,
+        .action = .delete,
+        .key_id = "phone",
+        .key_hash = key_transparency.materialHash("mls-phone"),
+        .timestamp_ms = 11,
+    });
+
+    var ident_a = try node_identity.fromSeed(@as([32]u8, @splat(0x42)), "kt-a");
+    defer ident_a.deinit();
+    var ident_b = try node_identity.fromSeed(@as([32]u8, @splat(0x43)), "kt-b");
+    defer ident_b.deinit();
+
+    const origin = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "kt-a.test",
+        .account_services = &services_a,
+        .node_identity = &ident_a,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(origin);
+    defer origin.deinit();
+    const other = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "kt-b.test",
+        .account_services = &services_b,
+        .node_identity = &ident_b,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(other);
+    defer other.deinit();
+
+    const reader_id = try addTestLocalClient(other, "rita", null);
+    const reader = other.connFor(reader_id).?;
+
+    var now_ms: u64 = 30;
+    var origin_state = s2s_peer_mod.ChannelCrdt.init(alloc, 0x71);
+    defer origin_state.deinit();
+    var other_state = s2s_peer_mod.ChannelCrdt.init(alloc, 0x72);
+    defer other_state.deinit();
+    var to_other = ServerPeerTestBuffer{};
+    defer to_other.deinit();
+    var to_origin = ServerPeerTestBuffer{};
+    defer to_origin.deinit();
+
+    const origin_kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x42)));
+    const other_kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x43)));
+    var origin_peer = try initServerTestPeer(&origin_state, &now_ms, origin_kp, message_relay.originShortId(other_kp.public_key), 1000, "kt-a.test", false);
+    defer origin_peer.deinit();
+    var other_peer = try initServerTestPeer(&other_state, &now_ms, other_kp, message_relay.originShortId(origin_kp.public_key), 2000, "kt-b.test", false);
+    defer other_peer.deinit();
+
+    const KeyTransSend = struct {
+        peer: *s2s_peer_mod.S2sPeer,
+        sink: s2s_peer_mod.ByteSink,
+        fn sendKeyTransHead(bridge: *@This(), wire: []const u8) !void {
+            try bridge.peer.sendKeyTransHead(bridge.sink, wire);
+        }
+    };
+    var send = KeyTransSend{ .peer = &origin_peer, .sink = to_other.sink() };
+    try std.testing.expect(origin.sendKeyTransHeadOn(&send));
+    try std.testing.expectEqual(@as(usize, 0), to_other.bytes.items.len);
+
+    try origin_peer.startHandshake(to_other.sink());
+    try other_peer.startHandshake(to_origin.sink());
+    try pumpServerTestPeers(&origin_peer, &other_peer, &to_other, &to_origin, now_ms, 0x71A0);
+    try std.testing.expect(origin_peer.supportsKeyTransHead());
+    try std.testing.expect(other_peer.supportsKeyTransHead());
+
+    try std.testing.expect(origin.sendKeyTransHeadOn(&send));
+    try pumpServerTestPeers(&origin_peer, &other_peer, &to_other, &to_origin, now_ms, 0x71A1);
+    other.drainKeyTransPeer(&other_peer);
+
+    var node_buf: [32]u8 = undefined;
+    const node_s = std.fmt.bufPrint(&node_buf, "{d}", .{ident_a.shortId()}) catch return error.TestUnexpectedResult;
+    const seen = try gapK2Peer(other, reader, node_s);
+    try expectContains(seen, "action=delete key_id=phone");
+    try expectContains(seen, "entries=2");
+
+    var stale = try key_transparency.headFromParts(ident_a.shortId(), 1, bind.root, .bind, "phone");
+    try key_transparency.signHead(&ident_a.sign_kp, &stale);
+    var stale_buf: [key_transparency.head_wire_len]u8 = undefined;
+    const stale_wire = try key_transparency.encodeHeadWire(stale, &stale_buf);
+    try origin_peer.sendKeyTransHead(to_other.sink(), stale_wire);
+    try pumpServerTestPeers(&origin_peer, &other_peer, &to_other, &to_origin, now_ms, 0x71A2);
+    other.drainKeyTransPeer(&other_peer);
+    const still = try gapK2Peer(other, reader, node_s);
+    try expectContains(still, "action=delete key_id=phone");
+    try expectContains(still, "entries=2");
+    try std.testing.expect(std.mem.indexOf(u8, still, "action=bind") == null);
+
+    var bad_buf: [key_transparency.head_wire_len]u8 = undefined;
+    const current = origin.localKeyTransHeadWire(&bad_buf) orelse return error.TestUnexpectedResult;
+    bad_buf[current.len - 1] ^= 0x01;
+    try origin_peer.sendKeyTransHead(to_other.sink(), bad_buf[0..current.len]);
+    try pumpServerTestPeers(&origin_peer, &other_peer, &to_other, &to_origin, now_ms, 0x71A3);
+    other.drainKeyTransPeer(&other_peer);
+    const after_bad = try gapK2Peer(other, reader, node_s);
+    try expectContains(after_bad, "action=delete key_id=phone");
+    try expectContains(after_bad, "entries=2");
+
+    std.debug.print("GAP-K2 branch=a revocation is visible on the other node after anti-entropy and a stale head does not replace it\n", .{});
 }
 
 fn expectNodeProof(ident: *const node_identity.NodeIdentity, entry: *const svc_operaudit.Entry) !void {
