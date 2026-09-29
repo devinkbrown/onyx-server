@@ -54074,13 +54074,35 @@ const PortableServer = struct {
             _ = self.backend.submit() catch return error.Unsupported;
             self.pending = false;
         }
+        // Wait-for-listen misses a socket that arrived before the ioctl was
+        // posted. Pull the backlog before blocking, then again after dispatch.
+        try self.drainWindowsBacklog();
+        if (self.pending) {
+            _ = self.backend.submit() catch return error.Unsupported;
+            self.pending = false;
+        }
         var evs: [16]io_backend.Reaped = undefined;
         const n = self.backend.reap(&evs, 200) catch return error.Unsupported;
         var i: usize = 0;
         while (i < n) : (i += 1) try self.dispatch(evs[i]);
+        try self.drainWindowsBacklog();
         if (self.pending) {
             _ = self.backend.submit() catch return error.Unsupported;
             self.pending = false;
+        }
+    }
+
+    /// At most one wake's worth of `accept` calls. Further sockets stay in
+    /// the kernel backlog until the next wake. Not a connection ceiling.
+    fn drainWindowsBacklog(self: *PortableServer) ServerError!void {
+        if (comptime builtin.os.tag != .windows) return;
+        var pulled: u16 = 0;
+        while (pulled < 256) : (pulled += 1) {
+            const fd = io_backend.pullAccept(self.listener) catch |err| switch (err) {
+                error.WouldBlock => return,
+                error.SocketFailed => return error.Unsupported,
+            };
+            try self.adopt(fd);
         }
     }
     /// Serve loop `main` runs after `init` returns a listener.
@@ -54275,70 +54297,51 @@ test "GAP-X1 PortableServer answers PING through processLine" {
     };
     defer server.deinit();
     const port = try server.boundPort();
-    const raw = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-    if (posix.errno(raw) != .SUCCESS) return error.SkipZigTest;
-    const client: linux.fd_t = @intCast(raw);
-    defer _ = linux.close(client);
+    try std.testing.expectError(error.SocketFailed, io_backend.pullAccept(-1));
     var addr = linux.sockaddr.in{
         .port = std.mem.nativeToBig(u16, port),
         .addr = std.mem.nativeToBig(u32, 0x7f000001),
     };
-    if (posix.errno(linux.connect(client, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.Unexpected;
     var tv = linux.timeval{ .sec = 2, .usec = 0 };
-    _ = linux.setsockopt(client, posix.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
-    const msg = "PING lane\r\n";
-    var off: usize = 0;
-    while (off < msg.len) {
-        const wrote = linux.write(client, msg[off..].ptr, msg.len - off);
-        switch (posix.errno(wrote)) {
-            .SUCCESS => {
-                if (wrote == 0) return error.Unexpected;
-                off += wrote;
-            },
-            .INTR => continue,
-            else => return error.Unexpected,
+    const rounds = [_][]const u8{ "lane", "two", "third" };
+    for (rounds, 0..) |token, round| {
+        const raw = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+        if (posix.errno(raw) != .SUCCESS) {
+            if (round == 0) return error.SkipZigTest;
+            return error.Unexpected;
         }
-    }
-    var spins: u8 = 0;
-    while (spins < 12) : (spins += 1) try server.runOnce();
-    var got: [128]u8 = @splat(0);
-    const read_rc = linux.read(client, &got, got.len);
-    if (posix.errno(read_rc) != .SUCCESS or read_rc == 0) return error.Unexpected;
-    const text = got[0..read_rc];
-    try std.testing.expect(std.mem.indexOf(u8, text, "PONG") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "lane") != null);
-    _ = linux.shutdown(client, linux.SHUT.RDWR);
-    var drain: u8 = 0;
-    while (drain < 12) : (drain += 1) try server.runOnce();
-    const raw2 = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-    if (posix.errno(raw2) != .SUCCESS) return error.Unexpected;
-    const client2: linux.fd_t = @intCast(raw2);
-    defer _ = linux.close(client2);
-    if (posix.errno(linux.connect(client2, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.Unexpected;
-    _ = linux.setsockopt(client2, posix.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
-    const msg2 = "PING two\r\n";
-    var off2: usize = 0;
-    while (off2 < msg2.len) {
-        const wrote2 = linux.write(client2, msg2[off2..].ptr, msg2.len - off2);
-        switch (posix.errno(wrote2)) {
-            .SUCCESS => {
-                if (wrote2 == 0) return error.Unexpected;
-                off2 += wrote2;
-            },
-            .INTR => continue,
-            else => return error.Unexpected,
+        const client: linux.fd_t = @intCast(raw);
+        defer _ = linux.close(client);
+        if (posix.errno(linux.connect(client, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.Unexpected;
+        _ = linux.setsockopt(client, posix.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        var msg_buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "PING {s}\r\n", .{token}) catch return error.Unexpected;
+        var off: usize = 0;
+        while (off < msg.len) {
+            const wrote = linux.write(client, msg[off..].ptr, msg.len - off);
+            switch (posix.errno(wrote)) {
+                .SUCCESS => {
+                    if (wrote == 0) return error.Unexpected;
+                    off += wrote;
+                },
+                .INTR => continue,
+                else => return error.Unexpected,
+            }
         }
+        var spins: u8 = 0;
+        while (spins < 12) : (spins += 1) try server.runOnce();
+        var got: [128]u8 = @splat(0);
+        const read_rc = linux.read(client, &got, got.len);
+        if (posix.errno(read_rc) != .SUCCESS or read_rc == 0) return error.Unexpected;
+        const text = got[0..read_rc];
+        try std.testing.expect(std.mem.indexOf(u8, text, "PONG") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, token) != null);
+        _ = linux.shutdown(client, linux.SHUT.RDWR);
+        var drain: u8 = 0;
+        while (drain < 12) : (drain += 1) try server.runOnce();
     }
-    var spins2: u8 = 0;
-    while (spins2 < 12) : (spins2 += 1) try server.runOnce();
-    var got2: [128]u8 = @splat(0);
-    const read2 = linux.read(client2, &got2, got2.len);
-    if (posix.errno(read2) != .SUCCESS or read2 == 0) return error.Unexpected;
-    const text2 = got2[0..read2];
-    try std.testing.expect(std.mem.indexOf(u8, text2, "PONG") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text2, "two") != null);
     try std.testing.expectError(error.Unsupported, io_backend.refuseForeignCapsule());
-    std.debug.print("GAP-X1 branch=PortableServer answered PING lane with PONG through processLine on {s}\n", .{@tagName(server.backend.family)});
+    std.debug.print("GAP-X1 branch=PortableServer answered PING lane two third with PONG through processLine on {s}\n", .{@tagName(server.backend.family)});
 }
 
 fn expectListenerKernelOptions(fd: linux.fd_t, cpu: u32) !void {

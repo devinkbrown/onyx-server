@@ -1026,9 +1026,11 @@ const Kqueue = struct {
 /// (operation << 2) | method`. Recv and send are `IOCTL_AFD_RECEIVE` /
 /// `IOCTL_AFD_SEND` (`0x12017` / `0x1201F`). A raw `NtReadFile` on an AFD
 /// socket returns `STATUS_INVALID_PARAMETER`. Timeout arms an NT timer and
-/// does not synthesize a completion packet. Nothing calls
-/// `NtRemoveIoCompletion` on the success path, so a posted request is not
-/// reported as bytes already transferred.
+/// does not synthesize a completion packet. `STATUS_SUCCESS` is a finished
+/// AFD operation and `reap` returns it before waiting. `STATUS_PENDING` is
+/// reported only from `NtRemoveIoCompletion`. A duplicate port packet for
+/// that slot is discarded. The listening socket is nonblocking, so `accept`
+/// on a finished wait cannot stall the thread.
 ///
 /// Open also loads `RIO_EXTENSION_FUNCTION_TABLE` through `WSAIoctl`. A failed
 /// or partial table closes the new port and returns `error.MissingOp`.
@@ -1095,6 +1097,11 @@ const Iocp = struct {
     data_infos: [submit_batch]AfdDataInfo = undefined,
     /// `AFD_LISTEN_RESPONSE_INFO_TL` is a sequence plus a `SOCKADDR`.
     accept_outs: [submit_batch][128]u8 = undefined,
+    /// Finished before the port wait. One slot, one result; this is not a
+    /// connection ceiling.
+    ready: [submit_batch]Reaped = undefined,
+    ready_head: u16 = 0,
+    ready_n: u16 = 0,
 
     pub const submit_batch = 256;
 
@@ -1351,6 +1358,9 @@ const Iocp = struct {
 
     fn closeWindows(self: *Iocp) void {
         const w = std.os.windows;
+        while (self.popReady()) |ev| {
+            if (ev.op == .accept and ev.result >= 0) _ = closesocket(@intCast(ev.result));
+        }
         if (self.port != 0) {
             _ = w.ntdll.NtClose(@ptrFromInt(self.port));
             self.port = 0;
@@ -1427,13 +1437,13 @@ const Iocp = struct {
         const index = try self.claimSlot(packet);
         errdefer self.slot_live[index] = false;
         const iosb = &self.iosbs[index];
-        switch (packet.op) {
-            op_accept => {
+        const done = switch (packet.op) {
+            op_accept => blk: {
                 const out = &self.accept_outs[index];
                 @memset(out, 0);
-                try self.device(packet, iosb, "", out);
+                break :blk try self.device(packet, iosb, "", out);
             },
-            op_recv, op_send => {
+            op_recv, op_send => blk: {
                 if (packet.buf == 0 or packet.length == 0 or packet.ioctl == 0) return error.MissingOp;
                 const wsa = &self.wsa_bufs[index];
                 wsa.* = .{
@@ -1450,9 +1460,9 @@ const Iocp = struct {
                     .tdi_flags = if (packet.op == op_recv) @as(u32, 0x20) else 0,
                 };
                 var none: [0]u8 = .{};
-                try self.device(packet, iosb, std.mem.asBytes(info), &none);
+                break :blk try self.device(packet, iosb, std.mem.asBytes(info), &none);
             },
-            op_poll => {
+            op_poll => blk: {
                 // AFD poll is METHOD_BUFFERED and reads the handle list from
                 // the input. A null input is rejected by the kernel.
                 const info = &self.poll_infos[index];
@@ -1467,10 +1477,37 @@ const Iocp = struct {
                     },
                 };
                 const bytes = std.mem.asBytes(info);
-                try self.device(packet, iosb, bytes, bytes);
+                break :blk try self.device(packet, iosb, bytes, bytes);
             },
             else => return error.MissingOp,
-        }
+        };
+        if (done) try self.finishInline(index);
+    }
+
+    fn finishInline(self: *Iocp, index: u16) !void {
+        const packet = self.slot_pkt[index];
+        const iosb = self.iosbs[index];
+        const ev = finishPosted(packet, iosb);
+        self.slot_live[index] = false;
+        self.pushReady(ev) catch |err| {
+            if (ev.op == .accept and ev.result >= 0) _ = closesocket(@intCast(ev.result));
+            return err;
+        };
+    }
+
+    fn pushReady(self: *Iocp, ev: Reaped) !void {
+        if (self.ready_n >= submit_batch) return error.MissingOp;
+        const idx = (self.ready_head + self.ready_n) % submit_batch;
+        self.ready[idx] = ev;
+        self.ready_n += 1;
+    }
+
+    fn popReady(self: *Iocp) ?Reaped {
+        if (self.ready_n == 0) return null;
+        const ev = self.ready[self.ready_head];
+        self.ready_head = (self.ready_head + 1) % submit_batch;
+        self.ready_n -= 1;
+        return ev;
     }
 
     fn associate(self: *Iocp, handle: usize) !void {
@@ -1507,7 +1544,10 @@ const Iocp = struct {
         self.bound = grown;
     }
 
-    fn device(self: *Iocp, packet: Packet, iosb: *std.os.windows.IO_STATUS_BLOCK, in_buf: []const u8, out: []u8) !void {
+    /// `true` means the ioctl finished inline. The bytes are already in the
+    /// caller buffer and `reap` must observe them without waiting for a port
+    /// packet that may never arrive.
+    fn device(self: *Iocp, packet: Packet, iosb: *std.os.windows.IO_STATUS_BLOCK, in_buf: []const u8, out: []u8) !bool {
         const w = std.os.windows;
         try self.associate(packet.handle);
         iosb.* = std.mem.zeroes(w.IO_STATUS_BLOCK);
@@ -1524,10 +1564,10 @@ const Iocp = struct {
             if (out.len == 0) null else @ptrCast(out.ptr),
             @intCast(out.len),
         );
-        if (status != .SUCCESS and status != .PENDING) {
-            std.debug.print("GAP-X1 windows iocp status=0x{x} op={d}\n", .{ @intFromEnum(status), packet.op });
-            return error.MissingOp;
-        }
+        if (status == .SUCCESS) return true;
+        if (status == .PENDING) return false;
+        std.debug.print("GAP-X1 windows iocp status=0x{x} op={d}\n", .{ @intFromEnum(status), packet.op });
+        return error.MissingOp;
     }
 
     fn cancelOne(self: *Iocp, packet: Packet) !void {
@@ -1573,9 +1613,23 @@ const Iocp = struct {
 
     fn reapWindows(self: *Iocp, out: []Reaped, wait_ms: u32) !u32 {
         var n: u32 = 0;
-        var waited = false;
         while (n < out.len) {
-            const item = try self.takeOne(if (waited) 0 else wait_ms);
+            const ev = self.popReady() orelse break;
+            out[n] = ev;
+            n += 1;
+        }
+        var waited = false;
+        var skips: u16 = 0;
+        while (n < out.len) {
+            const item = self.takeOne(if (waited) 0 else wait_ms) catch |err| switch (err) {
+                error.Unmatched => {
+                    skips += 1;
+                    if (skips > submit_batch) return error.MissingOp;
+                    waited = true;
+                    continue;
+                },
+                else => return err,
+            };
             waited = true;
             if (item) |got| {
                 out[n] = got;
@@ -1603,7 +1657,9 @@ const Iocp = struct {
             self.slot_live[i] = false;
             return finishPosted(packet, iosb);
         }
-        return null;
+        // The port packet was removed. A synchronous success already cleared
+        // its slot, so this copy must not stop the rest of the drain.
+        return error.Unmatched;
     }
 
     fn finishPosted(packet: Packet, iosb: std.os.windows.IO_STATUS_BLOCK) Reaped {
@@ -1620,12 +1676,14 @@ const Iocp = struct {
         };
         if (iosb.u.Status != .SUCCESS) return .{ .op = op, .token = token, .result = -1 };
         if (packet.op == op_accept) {
-            const sock = accept(packet.handle, null, null);
-            if (sock == 0 or sock == std.math.maxInt(usize) or sock > std.math.maxInt(i32)) {
-                if (sock != 0 and sock != std.math.maxInt(usize)) _ = closesocket(sock);
-                return .{ .op = .accept, .token = token, .result = -1 };
-            }
-            return .{ .op = .accept, .token = token, .result = @intCast(sock) };
+            const sock = acceptOne(packet.handle) catch |err| switch (err) {
+                // WSAEWOULDBLOCK. The wait fired after the backlog drain
+                // already took the socket. Same code portableAgain treats
+                // as a retry, not a dead listener.
+                error.WouldBlock => return .{ .op = .accept, .token = token, .result = -11 },
+                error.SocketFailed => return .{ .op = .accept, .token = token, .result = -1 },
+            };
+            return .{ .op = .accept, .token = token, .result = sock };
         }
         if (iosb.Information > std.math.maxInt(i32)) {
             return .{ .op = op, .token = token, .result = std.math.maxInt(i32) };
@@ -1949,6 +2007,37 @@ extern "ws2_32" fn setsockopt(socket: usize, level: i32, name: i32, value: *cons
 extern "ws2_32" fn select(nfds: i32, readfds: ?*RioFdSet, writefds: ?*RioFdSet, exceptfds: ?*RioFdSet, timeout: ?*RioTimeval) callconv(.winapi) i32;
 
 extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+
+extern "ws2_32" fn ioctlsocket(s: usize, cmd: i32, argp: *u32) callconv(.winapi) i32;
+
+fn setNonblock(sock: usize) bool {
+    var on: u32 = 1;
+    const fionbio: i32 = @bitCast(@as(u32, 0x8004667E));
+    return ioctlsocket(sock, fionbio, &on) == 0;
+}
+
+fn acceptOne(handle: usize) error{ WouldBlock, SocketFailed }!i32 {
+    const sock = accept(handle, null, null);
+    const bad = sock == 0 or sock == std.math.maxInt(usize) or sock > std.math.maxInt(i32);
+    if (bad) {
+        if (sock != 0 and sock != std.math.maxInt(usize)) _ = closesocket(sock);
+        if (WSAGetLastError() == 10035) return error.WouldBlock;
+        return error.SocketFailed;
+    }
+    if (!setNonblock(sock)) {
+        _ = closesocket(sock);
+        return error.SocketFailed;
+    }
+    return @intCast(sock);
+}
+
+/// One nonblocking `accept`. `WouldBlock` means the backlog is empty.
+/// Off Windows this is `SocketFailed` and does not call the host `accept`.
+pub fn pullAccept(fd: linux.fd_t) error{ WouldBlock, SocketFailed }!linux.fd_t {
+    if (comptime builtin.os.tag != .windows) return error.SocketFailed;
+    if (fd < 0) return error.SocketFailed;
+    return acceptOne(@intCast(fd));
+}
 
 extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
 
@@ -2282,6 +2371,7 @@ fn listenWindows(host: []const u8, port: u16) ListenError!Listener {
     };
     if (bind(sock, &addr, @sizeOf(RioSockAddr)) != 0) return windowsListenError();
     if (listen(sock, 128) != 0) return windowsListenError();
+    if (!setNonblock(sock)) return error.SocketUnavailable;
     var name_len: i32 = @sizeOf(RioSockAddr);
     if (getsockname(sock, &addr, &name_len) != 0) return error.SocketUnavailable;
     return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
