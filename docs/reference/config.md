@@ -182,7 +182,7 @@ Live Undertow route-table and server-registry capacities. These keys are parsed 
 
 Live S2S peer-driver tuning. `[mesh.link]` per-link `gossip_fanout` and view-capacity overrides are applied after `[mesh.gossip]` defaults.
 
-**Ripple keys** (witnessed failure detection) live under **`[mesh.ripple]`**. The older table name **`[mesh.sazanami]`** is a **legacy config path only** (same field names; not a command or IRC verb). Dual-read remains for operator migration: `mesh.sazanami.*` still loads, but prefer `mesh.ripple.*`. When both tables set the same field, **`mesh.ripple` wins**. Do not drop the dual-read without a migration note — live configs may still use `sazanami`.
+**Ripple keys** configure the witness-quorum library under **`[mesh.ripple]`**; the daemon timer does not drive that machine. The `witness_quorum` minimum of 2 means a pair cannot declare witnessed death. Live pair liveness is the ping timeout, and live roster repair is the full local-roster re-burst about every 30 seconds. The older table name **`[mesh.sazanami]`** is a **legacy config path only** (same field names; not a command or IRC verb). Dual-read remains for operator migration: `mesh.sazanami.*` still loads, but prefer `mesh.ripple.*`. When both tables set the same field, **`mesh.ripple` wins**. Do not drop the dual-read without a migration note — live configs may still use `sazanami`.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|

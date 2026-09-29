@@ -40,7 +40,7 @@ The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `
 ## NETHEALTH
 
 - Syntax: `NETHEALTH`
-- Description: Renders Ripple-style liveness for this node and each established peer, including link RTT and idle time when known.
+- Description: Lists this node and each established peer as alive with RTT and idle time; this is not a witness-quorum death decision. A pair loses the link on ping timeout.
 - Privileges: Oper (`.access = .oper`).
 - Parameters: None.
 - Replies: Server notices containing health report lines.

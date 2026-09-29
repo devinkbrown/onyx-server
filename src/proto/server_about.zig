@@ -60,7 +60,7 @@ pub fn renderInfo(info: AboutInfo, writer: anytype) !void {
 
     try writer.writeAll("100% Zig, zero C interop - substrate, crypto, and daemon are all native.\n");
     try writer.writeAll("\n");
-    try writer.writeAll("Mesh:     Undertow CRDT world state | Ripple gossip | Concord membership\n");
+    try writer.writeAll("Mesh:     Undertow CRDT world state | 30s roster re-burst | ping-timeout links\n");
     try writer.writeAll("Security: Mooring PQ-hybrid handshake | MeshPass admission | zeroize-on-free key hygiene\n");
     try writer.writeAll("Crypto:   Armor - a from-scratch pure-Zig TLS and primitive library\n");
     try writer.writeAll("Media:    Causeway SFU | CadenceVox/CadenceVis codecs | QUIC/WebTransport transport\n");

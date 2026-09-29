@@ -133,7 +133,7 @@ The operator security module exposes the current mesh inspection commands (`src/
 |---|---|
 | `MESH` or `NETSTAT` | Direct S2S peer/link health, multi-hop reachability, partition summary, `MESH LOG`, `MESH ADMISSION`, and `MESH GRANTS` (`src/daemon/server.zig:28746`, `src/daemon/server.zig:28748`, `src/daemon/server.zig:28761`, `src/daemon/server.zig:28780`, `src/daemon/server.zig:28835`). |
 | `ROUTE` | Current routing view: local node plus established one-hop peers; multi-hop routing is noted as future substrate work (`src/daemon/server.zig:28909`, `src/daemon/server.zig:28918`). |
-| `NETHEALTH` | [Ripple](../reference/glossary.md)-style liveness view using local node, established peers, RTT, idle time, and the live quorum/component summary (`src/daemon/server.zig:28931`, `src/daemon/server.zig:28943`, `src/daemon/server.zig:28961`). |
+| `NETHEALTH` | Lists this node and each established peer as alive with RTT and idle time; this is not a witness-quorum death decision. A pair loses the link on ping timeout (`src/daemon/server.zig:28931`, `src/daemon/server.zig:28943`, `src/daemon/server.zig:28961`). |
 | `CONNECT` | Opens outbound S2S to a peer (`src/daemon/server.zig:17161`, `src/daemon/server.zig:17180`). |
 | `SQUIT` | Tears down an S2S link by server name (`src/daemon/server.zig:17312`, `src/daemon/server.zig:17322`). |
 

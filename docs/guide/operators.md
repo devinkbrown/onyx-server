@@ -225,7 +225,7 @@ Operators with `mesh_admin` privilege can inspect and manage the mesh:
 |---|---|
 | `MESH` or `NETSTAT` | Direct S2S peer/link health, reachability, partition summary (`src/daemon/server.zig:10218`, `src/daemon/server.zig:10308`). |
 | `ROUTE` | Current routing table: this node plus established one-hop peers (`src/daemon/server.zig:10452`). |
-| `NETHEALTH` | Ripple-style liveness view using peer RTT and idle time (`src/daemon/server.zig:10474`). |
+| `NETHEALTH` | Lists this node and each established peer as alive with RTT and idle time; this is not a witness-quorum death decision. A pair loses the link on ping timeout (`src/daemon/server.zig:10474`). |
 | `CONNECT <host> <port>` | Open outbound S2S to a peer (`src/daemon/server.zig:6304`). |
 | `SQUIT <server>` | Tear down an S2S link by server name (`src/daemon/server.zig:6371`). |
 

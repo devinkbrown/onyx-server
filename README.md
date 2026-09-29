@@ -98,9 +98,10 @@ documentation commit may be newer.
 - **Zig top to bottom, no C interop.** Substrate, crypto, daemon, and tooling are all
   Zig; `comptime` powers the module machinery and generates wire codecs and
   dispatch tables.
-- **Mesh, not tree.** **Undertow** (水脈) — a CRDT state mesh with Ripple gossip and
-  Merkle anti-entropy — over **Mooring** — a post-quantum-hybrid (X25519 + ML-KEM-768)
-  forward-secret ratchet. No TS6. Operator surfaces are network-wide: the Event Spine
+- **Mesh, not tree.** **Undertow** (水脈) — a CRDT state mesh — over **Mooring** —
+  a post-quantum-hybrid (X25519 + ML-KEM-768) forward-secret ratchet. Live membership
+  repair re-bursts the local roster about every 30 seconds, and a direct link dies on
+  ping timeout. No TS6. Operator surfaces are network-wide: the Event Spine
   (connect/quit/oper alerts and the targeted `EVENT OBSERVE` feed) fans every event to
   all nodes rendered with the origin server, and a cross-node `MODE` shows the setter's
   nick, not the server. Message delivery across the mesh is **durable exact-once** —

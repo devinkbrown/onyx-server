@@ -42,8 +42,8 @@ codename in the guides and architecture docs links here.
 
 | Codename | What it is | Source |
 | --- | --- | --- |
-| **Undertow** (水脈) | The S2S CRDT mesh **state model**: logical/hybrid-logical clocks, delta-state CRDTs, and Merkle anti-entropy — the building blocks of the replicated mesh world state. (Membership and liveness are handled by Ripple + Concord below, not Undertow itself.) | `src/substrate/undertow/root.zig:4`, `src/substrate/undertow/` |
-| **Ripple** (漣) | The witnessed failure-detection membership state machine: a pure, deterministic liveness detector driven by gossip probes and a witness quorum, deciding which nodes are alive/suspect/dead. | `src/substrate/undertow/ripple.zig:4`, `src/substrate/undertow/gossip_round.zig:4` |
+| **Undertow** (水脈) | The S2S CRDT mesh **state model**: logical/hybrid-logical clocks, delta-state CRDTs, and Merkle anti-entropy — the building blocks of the replicated mesh world state. (The running daemon repairs membership with the reactor-0 full local-roster re-burst.) | `src/substrate/undertow/root.zig:4`, `src/substrate/undertow/` |
+| **Ripple** (漣) | A pure witness-quorum failure-detection library, not the daemon's live failure detector; `witness_quorum` floors at 2, so a pair cannot form a witnessed quorum. | `src/substrate/undertow/ripple.zig:4`, `src/substrate/undertow/gossip_round.zig:4` |
 | **Concord** | The delta-state CRDT library (OR-Set, LWW register, dots/causal context) that models mesh membership and other replicated state carried over Undertow. | `src/substrate/undertow/concord.zig:4` |
 | **Mooring** (紡ぎ) | The S2S secure-channel AKE and session ratchet: a Noise-IK-shaped, post-quantum-hybrid handshake (Ed25519 static node identity + X-Wing hybrid KEM) that establishes and re-keys the encrypted server-to-server link. | `src/crypto/mooring_handshake.zig:4`, `src/crypto/mooring_session.zig` |
 | **MeshPass** | Ed25519-signed capability admission tokens that gate which nodes may join the mesh; verified inside the encrypted handshake, fail-closed on tampered/untrusted material. | `src/proto/meshpass_props.zig:6`, `src/proto/server_about.zig:64` |

@@ -49960,9 +49960,10 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// NETHEALTH — oper view of mesh node liveness (Ripple-style): this node plus
-    /// each established peer, with link RTT and idle time from the health table.
-    /// Rendered by the pure ripple_report renderer.
+    /// NETHEALTH — this node plus each established peer, marked alive, with link
+    /// RTT and idle time. The lines go through the Ripple report renderer. This
+    /// command does not run the witness machine. A direct link still dies on
+    /// ping timeout, and `witness_quorum` cannot bury a pair.
     pub fn handleNethealth(self: *LinuxServer, conn: *ConnState) !void {
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         var names: [63][]const u8 = undefined;
@@ -53300,6 +53301,157 @@ test "stats_peak_clients counts registered clients across shards" {
     // from `rx().clients` (which here is shard 1 only).
     server.maybeWriteStats();
     try std.testing.expectEqual(@as(u64, 2), server.stats_peak_clients);
+}
+
+fn gapA11HoldOtherCadences(server: *Server) void {
+    const held = server.nowMs() + 3_600_000;
+    server.last_oper_grant_refresh_ms = held;
+    server.last_session_replica_refresh_ms = held;
+    server.last_session_attachment_lease_refresh_ms = held;
+    server.last_peer_rtt_probe_ms = held;
+}
+
+fn gapA11QueuedWire(allocator: std.mem.Allocator, conn: *const ConnState) ![]u8 {
+    const inline_bytes = conn.send_buf[conn.send_offset..conn.send_len];
+    const out = try allocator.alloc(u8, inline_bytes.len + conn.send_overflow.items.len);
+    @memcpy(out[0..inline_bytes.len], inline_bytes);
+    @memcpy(out[inline_bytes.len..], conn.send_overflow.items);
+    return out;
+}
+
+fn gapA11ClearQueued(conn: *ConnState) void {
+    conn.send_len = 0;
+    conn.send_offset = 0;
+    conn.send_overflow.clearRetainingCapacity();
+}
+
+fn gapA11RosterHas(members: []const s2s_peer_mod.MemberInfo, nick: []const u8) bool {
+    for (members) |member| {
+        if (std.mem.eql(u8, member.nick, nick)) return true;
+    }
+    return false;
+}
+
+test "DST GAP-A11 maintenance reactor re-bursts the local roster on the membership interval" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var left = try SessionReplayTestPair.initWithSeeds(allocator, 0xA1, 0xA2);
+    defer left.deinit();
+    var right = try SessionReplayTestPair.initWithSeeds(allocator, 0xA3, 0xA4);
+    defer right.deinit();
+    left.a.clearOutbound();
+    left.b.clearOutbound();
+    right.a.clearOutbound();
+    right.b.clearOutbound();
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .node_id = left.ida.shortId(),
+        .server_name = "reburs-home.test",
+        .node_identity = &left.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "session-replay-secret",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+    current_reactor = &server.reactors[0];
+
+    const alice = try addTestLocalClient(&server, "ReburstA", null);
+    const bob = try addTestLocalClient(&server, "ReburstB", null);
+    _ = try server.world.join("#reburs", worldIdFromClient(alice));
+    _ = try server.world.join("#reburs", worldIdFromClient(bob));
+    server.connFor(alice).?.session.registration.registered = true;
+    server.connFor(bob).?.session.registration.registered = true;
+    const fresh_activity = server.nowMs();
+    server.connFor(alice).?.last_activity_ms = fresh_activity;
+    server.connFor(bob).?.last_activity_ms = fresh_activity;
+
+    const left_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const left_peer = server.rx().clients.get(left_id).?;
+    left_peer.overflow_allocator = allocator;
+    left_peer.token = try tokenFromId(left_id);
+    left_peer.send_armed = true;
+    left_peer.sendq_cap = default_sendq_cap;
+    left_peer.s2s_secured = &left.a;
+    left_peer.s2s_burst_done = true;
+    const right_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const right_peer = server.rx().clients.get(right_id).?;
+    right_peer.overflow_allocator = allocator;
+    right_peer.token = try tokenFromId(right_id);
+    right_peer.send_armed = true;
+    right_peer.sendq_cap = default_sendq_cap;
+    right_peer.s2s_secured = &right.a;
+    right_peer.s2s_burst_done = true;
+    defer {
+        left_peer.s2s_secured = null;
+        right_peer.s2s_secured = null;
+        _ = server.rx().clients.free(left_id);
+        _ = server.rx().clients.free(right_id);
+    }
+
+    // Inside the interval, reactor 0 does not copy the world.
+    gapA11HoldOtherCadences(&server);
+    server.last_membership_resync_ms = server.nowMs();
+    const quiet = server.last_membership_resync_ms;
+    gapA11ClearQueued(left_peer);
+    gapA11ClearQueued(right_peer);
+    server.onTimerTick();
+    try std.testing.expectEqual(quiet, server.last_membership_resync_ms);
+    try std.testing.expectEqual(@as(usize, 0), left_peer.send_len);
+    try std.testing.expectEqual(@as(usize, 0), right_peer.send_len);
+
+    // A sibling reactor must not consume the shared interval or emit the copy.
+    server.last_membership_resync_ms = server.nowMs() - membership_resync_interval_ms;
+    const planted = server.last_membership_resync_ms;
+    current_reactor = &server.reactors[1];
+    server.onTimerTick();
+    try std.testing.expectEqual(planted, server.last_membership_resync_ms);
+    try std.testing.expectEqual(@as(usize, 0), left_peer.send_len);
+    try std.testing.expectEqual(@as(usize, 0), right_peer.send_len);
+
+    // Reactor 0 copies the whole local roster to every established peer.
+    current_reactor = &server.reactors[0];
+    gapA11HoldOtherCadences(&server);
+    server.onTimerTick();
+    try std.testing.expect(server.last_membership_resync_ms != planted);
+    const left_wire = try gapA11QueuedWire(allocator, left_peer);
+    defer allocator.free(left_wire);
+    const right_wire = try gapA11QueuedWire(allocator, right_peer);
+    defer allocator.free(right_wire);
+    try std.testing.expect(left_wire.len > 0);
+    try std.testing.expect(right_wire.len > 0);
+    const fed_at: u64 = @intCast(@max(@as(i64, 0), server.nowMs()));
+    try left.b.feed(left_wire, fed_at);
+    left.b.processDeferredResidenceFrames(fed_at);
+    server.discardIdentityTransitions(&left.b);
+    try right.b.feed(right_wire, fed_at);
+    right.b.processDeferredResidenceFrames(fed_at);
+    server.discardIdentityTransitions(&right.b);
+    const left_members = left.b.channelMembers("#reburs");
+    const right_members = right.b.channelMembers("#reburs");
+    try std.testing.expectEqual(@as(usize, 2), left_members.len);
+    try std.testing.expectEqual(@as(usize, 2), right_members.len);
+    try std.testing.expect(gapA11RosterHas(left_members, "ReburstA"));
+    try std.testing.expect(gapA11RosterHas(left_members, "ReburstB"));
+    try std.testing.expect(gapA11RosterHas(right_members, "ReburstA"));
+    try std.testing.expect(gapA11RosterHas(right_members, "ReburstB"));
+
+    // A later tick inside the same interval does not copy the world again.
+    const stamped = server.last_membership_resync_ms;
+    gapA11HoldOtherCadences(&server);
+    gapA11ClearQueued(left_peer);
+    gapA11ClearQueued(right_peer);
+    server.onTimerTick();
+    try std.testing.expectEqual(stamped, server.last_membership_resync_ms);
+    try std.testing.expectEqual(@as(usize, 0), left_peer.send_len);
+    try std.testing.expectEqual(@as(usize, 0), right_peer.send_len);
 }
 
 test "isMaintenanceReactor is false off reactor 0 and onTimerTick leaves shared last_*_ms still" {
