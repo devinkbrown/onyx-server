@@ -62332,6 +62332,135 @@ test "DST GAP-D4 oper ABUSE explains live throttle and abuse rows survive the dr
     try std.testing.expectEqual(@as(u32, 0), second.account_abuse.score("d4oper"));
 }
 
+test "GAP-D4 same-image USR2 keeps shun spamtrap Koshi reputation and the account score" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d4-usr2.wal");
+    var services = services_mod.Services.init(&store, null);
+    const listed_addr: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 44 } };
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .reputation_refuse_threshold = 40,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+            store.deinit();
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    const oper_id = try addTestLocalClient(first, "d4oper", "d4oper");
+    const oper = first.connFor(oper_id) orelse return error.TestUnexpectedResult;
+    oper.session.is_oper = true;
+    oper.session.oper_priv = oper_mod.OperPrivileges.full;
+    oper.session.registration.registered = true;
+
+    const victim_id = try addTestLocalClient(first, "d4user", "d4acct");
+    const victim = first.connFor(victim_id) orelse return error.TestUnexpectedResult;
+    victim.session.registration.registered = true;
+    victim.peer_addr = listed_addr;
+    const fg = flood_guard.GuardConfig{
+        .enabled = true,
+        .messages = .{ .capacity = 1, .refill_tokens = 0, .refill_period_ms = 1000 },
+        .commands = .{ .capacity = 1, .refill_tokens = 0, .refill_period_ms = 1000 },
+        .excess = .{ .threshold = 0, .decay_points = 0, .decay_period_ms = 1000 },
+        .throttle_penalty = 1,
+        .target_change_penalty = 1,
+        .privmsg_weight = 1,
+        .join_weight = 1,
+        .default_weight = 1,
+    };
+    try fg.validate();
+    victim.flood_guard = flood_guard.FloodGuard.init(fg, first.nowMs());
+    try first.processLiveLine(victim_id, victim, "NOTICE d4oper :one\r\n");
+    try first.processLiveLine(victim_id, victim, "NOTICE d4oper :two\r\n");
+    try std.testing.expectEqual(flood_guard.Decision.throttle, victim.last_flood);
+    const account_score = first.account_abuse.score("d4acct");
+    try std.testing.expect(account_score >= 1);
+
+    var shun_add = irc_line.LineView{ .raw = "", .command = "SHUN" };
+    shun_add.params[0] = "d4user";
+    shun_add.params[1] = "mute";
+    shun_add.param_count = 2;
+    try first.handleShun(oper, &shun_add, true);
+    var trap = irc_line.LineView{ .raw = "", .command = "SPAMTRAP" };
+    trap.params[0] = "ADD";
+    trap.params[1] = "NICK";
+    trap.params[2] = "Honeypot";
+    trap.param_count = 3;
+    try first.handleSpamtrap(oper, &trap);
+    var filter = irc_line.LineView{ .raw = "", .command = "FILTER" };
+    filter.params[0] = "ADD";
+    filter.params[1] = "buy coins";
+    filter.param_count = 2;
+    try first.handleFilter(oper, &filter);
+    first.penalizePeer(victim, 40);
+
+    oper.send_len = 0;
+    var why = irc_line.LineView{ .raw = "", .command = "ABUSE" };
+    why.params[0] = "d4user";
+    why.param_count = 1;
+    try first.handleAbuse(oper, &why);
+    const why_old = oper.send_buf[0..oper.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, why_old, "ABUSE d4user: flood throttle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, why_old, "ABUSE d4user: shun yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, why_old, "ABUSE d4user: reputation ") != null);
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(first, &pieces, &blobs);
+
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d4-usr2.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    try std.testing.expect(second.shuns.isShunned("d4user", second.nowMs()));
+    try std.testing.expect(try second.spamtrap.isTrapNick("Honeypot"));
+    try std.testing.expect(second.content_filter.matches("please buy coins now"));
+    try std.testing.expect(second.reputation.score(listed_addr, second.nowU64()) > 20.0);
+    try std.testing.expectEqual(account_score, second.account_abuse.score("d4acct"));
+
+    _ = try adoptUpgradePiecesForTest(second, pieces.items, "onyx-test-gap-d4-usr2");
+    current_reactor = null;
+    try std.testing.expect(second.shuns.isShunned("d4user", second.nowMs()));
+    try std.testing.expect(try second.spamtrap.isTrapNick("Honeypot"));
+    try std.testing.expect(second.content_filter.matches("please buy coins now"));
+    try std.testing.expect(!second.content_filter.matches("hello"));
+    try std.testing.expect(second.reputation.score(listed_addr, second.nowU64()) > 20.0);
+    try std.testing.expectEqual(account_score, second.account_abuse.score("d4acct"));
+
+    const back_id = try addTestLocalClient(second, "d4back", "d4acct");
+    const back = second.connFor(back_id) orelse return error.TestUnexpectedResult;
+    back.session.registration.registered = true;
+    back.flood_guard = flood_guard.FloodGuard.init(fg, second.nowMs());
+    const fresh = back.flood_guard.?.snapshot();
+    try std.testing.expectEqual(fg.messages.capacity, fresh.message_tokens);
+    try std.testing.expectEqual(@as(u64, 0), fresh.excess_points);
+    try second.processLiveLine(back_id, back, "NOTICE d4oper :fresh\r\n");
+    try std.testing.expectEqual(flood_guard.Decision.allow, back.last_flood);
+    try std.testing.expectEqual(account_score, second.account_abuse.score("d4acct"));
+    std.debug.print("GAP-D4 branch=same-image USR2 kept shun spamtrap Koshi reputation and account score; the new connection guard started full\n", .{});
+}
+
 test "UPGRADE GAP-D5 restart keeps SCRAM and CertFP and invalidates recovery tokens" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
