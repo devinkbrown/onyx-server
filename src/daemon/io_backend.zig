@@ -6,12 +6,13 @@
 //! Linux keeps today's Ringlane ring (`ringlane.zig`). FreeBSD implements the
 //! same operations on a kqueue fd via `kevent`. Windows implements them on an
 //! I/O completion port: AFD receive and send, AFD wait-for-listen and
-//! AFD poll, `NtCancelIoFileEx`, and an NT timer. `Iocp.open` also loads the
+//! AFD poll, `NtCancelIoFileEx`, and an NT timer. `Iocp.open` loads the
 //! Winsock Registered I/O function table and returns `error.MissingOp` when
-//! that table is missing; the pointers are not called. A missing op, a closed
-//! port or queue, or a kernel status other than success or pending returns
-//! `error.MissingOp` and is not reported as a finished transfer. No reactor
-//! drains the port. Helix USR2 adoption stays on `LinuxServer`.
+//! that table is missing. `dequeueRegistered` is what calls those pointers.
+//! A missing op, a closed port or queue, or a kernel status other than
+//! success or pending returns `error.MissingOp` and is not reported as a
+//! finished transfer. No reactor drains the port. Helix USR2 adoption stays
+//! on `LinuxServer`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,6 +27,19 @@ pub const Family = enum { ringlane, iocp, kqueue };
 pub const Op = enum { accept, recv, send, poll, cancel, timeout };
 
 pub const required_ops = [_]Op{ .accept, .recv, .send, .poll, .cancel, .timeout };
+
+/// One `RIODequeueCompletion` against the table `Iocp.open` stored.
+/// `ok` is true only when that call returned a 4-byte success and the peer
+/// socket read those same bytes. A closed port, a non-Windows host, or a
+/// kernel error leaves `ok` false and names the failing `stage`.
+pub const RioWitness = struct {
+    ok: bool = false,
+    stage: []const u8 = "",
+    count: u32 = 0,
+    status: i32 = 0,
+    bytes: u32 = 0,
+    errno: i32 = 0,
+};
 
 pub fn familyFor(tag: std.Target.Os.Tag) Family {
     return switch (tag) {
@@ -284,6 +298,17 @@ pub const IoBackend = struct {
                 return ring.submit();
             },
         }
+    }
+
+    /// Send four bytes through the Registered I/O table stored on this port
+    /// and dequeue that send. This does not issue a second `WSAIoctl`. Off
+    /// Windows, and on a port whose table was not loaded, it returns before
+    /// any function pointer is called.
+    pub fn dequeueRegistered(self: *IoBackend) RioWitness {
+        if (comptime builtin.os.tag != .windows) return .{ .stage = "off-windows" };
+        const iocp = self.iocp orelse return .{ .stage = "closed" };
+        if (iocp.port == 0 or !rioTableUsable(&iocp.rio)) return .{ .stage = "closed" };
+        return dequeueLoadedRio(&iocp.rio);
     }
 
     /// Look at a capsule and refuse it. This function does not adopt sessions.
@@ -737,8 +762,8 @@ const Kqueue = struct {
 /// reported as bytes already transferred.
 ///
 /// Open also loads `RIO_EXTENSION_FUNCTION_TABLE` through `WSAIoctl`. A failed
-/// or partial table closes the new port and returns `error.MissingOp`. The
-/// stored pointers are not called.
+/// or partial table closes the new port and returns `error.MissingOp`.
+/// `dequeueRegistered` calls that stored table; nothing else does.
 ///
 /// `ntdll` and `ws2_32` calls sit in functions that are not analyzed unless
 /// `builtin.os.tag == .windows`. This Linux host does not execute them.
@@ -1337,8 +1362,8 @@ pub const wsa_af_inet: i32 = 2;
 pub const wsa_sock_stream: i32 = 1;
 pub const wsa_ipproto_tcp: i32 = 6;
 
-/// One pointer from `RIO_EXTENSION_FUNCTION_TABLE`. Opaque because this daemon
-/// does not call `RIOReceive` or `RIOSend`. Windows recv and send are
+/// One pointer from `RIO_EXTENSION_FUNCTION_TABLE`. The daemon calls these
+/// only from `dequeueRegistered`. Ordinary accept, recv, and send stay on
 /// `IOCTL_AFD_RECEIVE` and `IOCTL_AFD_SEND`.
 pub const RioFn = ?*anyopaque;
 
@@ -1361,6 +1386,38 @@ pub const RioTable = extern struct {
     resize_request_queue: RioFn = null,
 };
 
+/// `RIO_BUF`. `buffer_id` is the value `RIORegisterBuffer` returned.
+const RioBuf = extern struct {
+    buffer_id: usize,
+    offset: u32,
+    length: u32,
+};
+
+/// `RIORESULT`. `status` is 0 on success. `request_context` is the pointer
+/// value passed to `RIOSend`, not a length the caller invents after the fact.
+const RioResult = extern struct {
+    status: i32 = -1,
+    bytes: u32 = 0,
+    socket_context: u64 = 0,
+    request_context: u64 = 0,
+};
+
+/// `sockaddr_in` for the loopback pair the dequeue uses. 16 bytes.
+const RioSockAddr = extern struct {
+    family: u16,
+    port: u16,
+    addr: u32,
+    zero: [8]u8,
+};
+
+/// `(RIO_BUFFERID)(ULONG_PTR)0xFFFFFFFF` from the Windows SDK.
+const rio_invalid_buffer_id: usize = 0xFFFFFFFF;
+/// `RIO_CORRUPT_CQ`. A dequeue count of this value is a failed queue, not a transfer.
+pub const rio_corrupt_cq: u32 = 0xFFFFFFFF;
+/// Opaque `RIOSend` request context. The kernel must copy it into `RIORESULT`.
+const rio_request_context: u64 = 0x33554144;
+const rio_payload = "RIO!";
+
 comptime {
     if (@sizeOf(RioGuid) != 16) @compileError("WSAID_MULTIPLE_RIO is 16 bytes");
     if (@sizeOf(usize) == 8 and @sizeOf(RioTable) != 112) {
@@ -1369,6 +1426,9 @@ comptime {
             .{@sizeOf(RioTable)},
         ));
     }
+    if (@sizeOf(usize) == 8 and @sizeOf(RioBuf) != 16) @compileError("RIO_BUF is 16 bytes");
+    if (@sizeOf(usize) == 8 and @sizeOf(RioResult) != 24) @compileError("RIORESULT is 24 bytes");
+    if (@sizeOf(RioSockAddr) != 16) @compileError("sockaddr_in is 16 bytes");
 }
 
 const rio_fields = [_][]const u8{
@@ -1490,6 +1550,244 @@ extern "ws2_32" fn WSAIoctl(
 ) callconv(.winapi) i32;
 
 extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+
+extern "ws2_32" fn bind(socket: usize, addr: *const RioSockAddr, namelen: i32) callconv(.winapi) i32;
+
+extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
+
+extern "ws2_32" fn getsockname(socket: usize, addr: *RioSockAddr, namelen: *i32) callconv(.winapi) i32;
+
+extern "ws2_32" fn connect(socket: usize, addr: *const RioSockAddr, namelen: i32) callconv(.winapi) i32;
+
+extern "ws2_32" fn accept(socket: usize, addr: ?*anyopaque, namelen: ?*i32) callconv(.winapi) usize;
+
+extern "ws2_32" fn recv(socket: usize, buf: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
+
+extern "ws2_32" fn setsockopt(socket: usize, level: i32, name: i32, value: *const anyopaque, len: i32) callconv(.winapi) i32;
+
+extern "ws2_32" fn select(nfds: i32, readfds: ?*RioFdSet, writefds: ?*RioFdSet, exceptfds: ?*RioFdSet, timeout: ?*RioTimeval) callconv(.winapi) i32;
+
+extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+
+extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
+
+fn rioPtr(comptime T: type, ptr: RioFn) ?T {
+    const raw = ptr orelse return null;
+    return @as(T, @ptrFromInt(@intFromPtr(raw)));
+}
+
+fn socketLive(socket: usize) bool {
+    return socket != 0 and socket != std.math.maxInt(usize);
+}
+
+fn rioCloseCq(table: *const RioTable, cq: *anyopaque) void {
+    const Func = *const fn (*anyopaque) callconv(.winapi) void;
+    const func = rioPtr(Func, table.close_completion_queue) orelse return;
+    func(cq);
+}
+
+fn rioDeregister(table: *const RioTable, buffer_id: usize) void {
+    const Func = *const fn (usize) callconv(.winapi) void;
+    const func = rioPtr(Func, table.deregister_buffer) orelse return;
+    func(buffer_id);
+}
+
+/// `SOL_SOCKET` and `SO_RCVTIMEO`. Winsock takes milliseconds in a `DWORD`.
+const sol_socket: i32 = 0xFFFF;
+const so_rcvtimeo: i32 = 0x1006;
+
+/// Windows `fd_set` is a count plus sockets, not a POSIX bitmask.
+/// `long` in `timeval` is 32 bits on x64 Windows.
+const RioFdSet = extern struct {
+    count: u32,
+    pad: u32 = 0,
+    array: [64]usize = @splat(0),
+};
+
+const RioTimeval = extern struct {
+    sec: i32,
+    usec: i32,
+};
+
+comptime {
+    if (@sizeOf(usize) == 8 and @sizeOf(RioFdSet) != 520) @compileError("WINSOCK fd_set is 520 bytes");
+    if (@sizeOf(RioTimeval) != 8) @compileError("WINSOCK timeval is 8 bytes");
+}
+
+const RioConnect = struct {
+    socket: usize,
+    addr: RioSockAddr,
+    len: i32,
+    rc: i32 = 1,
+    err: i32 = 0,
+};
+
+fn rioConnect(job: *RioConnect) void {
+    job.rc = connect(job.socket, &job.addr, job.len);
+    if (job.rc != 0) job.err = WSAGetLastError();
+}
+
+/// Calls the table `Iocp.open` already loaded. The listening socket is a
+/// normal overlapped socket. The client is `WSA_FLAG_REGISTERED_IO`. A
+/// registered socket rejects `FIONBIO` (`WSAEOPNOTSUPP`), so `connect` runs
+/// on a second thread and `select` waits on the listener. One `RIOSend` of
+/// `RIO!` is dequeued, then the accepted socket must read those four bytes.
+/// A null pointer, a refused call, an empty queue, or a peer mismatch
+/// returns a witness with `ok` false and does not invent a count.
+fn dequeueLoadedRio(table: *const RioTable) RioWitness {
+    const invalid = std.math.maxInt(usize);
+    var listener: usize = invalid;
+    var client: usize = invalid;
+    var accepted: usize = invalid;
+    var cq: ?*anyopaque = null;
+    var buffer_id: usize = 0;
+    const payload = std.heap.page_allocator.alloc(u8, rio_payload.len) catch {
+        return .{ .stage = "memory" };
+    };
+    defer std.heap.page_allocator.free(payload);
+    defer {
+        if (socketLive(client)) _ = closesocket(client);
+        if (cq) |queue| rioCloseCq(table, queue);
+        if (buffer_id != 0 and buffer_id != rio_invalid_buffer_id) rioDeregister(table, buffer_id);
+        if (socketLive(accepted)) _ = closesocket(accepted);
+        if (socketLive(listener)) _ = closesocket(listener);
+    }
+    @memcpy(payload, rio_payload);
+
+    listener = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    if (!socketLive(listener)) return .{ .stage = "socket", .errno = WSAGetLastError() };
+    var addr = RioSockAddr{
+        .family = @intCast(wsa_af_inet),
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        .zero = @splat(0),
+    };
+    if (bind(listener, &addr, @sizeOf(RioSockAddr)) != 0) return .{ .stage = "bind", .errno = WSAGetLastError() };
+    if (listen(listener, 1) != 0) return .{ .stage = "listen", .errno = WSAGetLastError() };
+    var name_len: i32 = @sizeOf(RioSockAddr);
+    if (getsockname(listener, &addr, &name_len) != 0) return .{ .stage = "name", .errno = WSAGetLastError() };
+
+    client = WSASocketW(
+        wsa_af_inet,
+        wsa_sock_stream,
+        wsa_ipproto_tcp,
+        null,
+        0,
+        wsa_flag_overlapped | wsa_flag_registered_io,
+    );
+    if (!socketLive(client)) return .{ .stage = "client", .errno = WSAGetLastError() };
+    var job = RioConnect{ .socket = client, .addr = addr, .len = name_len };
+    var connector: ?std.Thread = null;
+    defer if (connector) |thread| thread.join();
+    connector = std.Thread.spawn(.{}, rioConnect, .{&job}) catch return .{ .stage = "thread" };
+
+    var ready = RioFdSet{ .count = 1 };
+    ready.array[0] = listener;
+    var wait = RioTimeval{ .sec = 2, .usec = 0 };
+    const selected = select(0, &ready, null, null, &wait);
+    if (selected <= 0) {
+        const err = if (selected < 0) WSAGetLastError() else job.err;
+        if (socketLive(client)) {
+            _ = closesocket(client);
+            client = std.math.maxInt(usize);
+        }
+        return .{ .stage = "select", .errno = err };
+    }
+    accepted = accept(listener, null, null);
+    if (!socketLive(accepted)) return .{ .stage = "accept", .errno = WSAGetLastError() };
+    var timeout_ms: i32 = 2000;
+    _ = setsockopt(accepted, sol_socket, so_rcvtimeo, &timeout_ms, @sizeOf(i32));
+
+    const CreateCq = *const fn (u32, ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    const create_cq = rioPtr(CreateCq, table.create_completion_queue) orelse return .{ .stage = "table" };
+    cq = create_cq(32, null);
+    const queue = cq orelse return .{ .stage = "cq", .errno = WSAGetLastError() };
+
+    const CreateRq = *const fn (usize, u32, u32, u32, u32, *anyopaque, *anyopaque, ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    const create_rq = rioPtr(CreateRq, table.create_request_queue) orelse return .{ .stage = "table" };
+    const rq = create_rq(client, 1, 1, 1, 1, queue, queue, @ptrFromInt(0x22115249)) orelse {
+        return .{ .stage = "rq", .errno = WSAGetLastError() };
+    };
+
+    const Register = *const fn ([*]u8, u32) callconv(.winapi) usize;
+    const register = rioPtr(Register, table.register_buffer) orelse return .{ .stage = "table" };
+    buffer_id = register(payload.ptr, @intCast(payload.len));
+    if (buffer_id == 0 or buffer_id == rio_invalid_buffer_id) {
+        return .{ .stage = "register", .errno = WSAGetLastError() };
+    }
+
+    var rio_buf = RioBuf{
+        .buffer_id = buffer_id,
+        .offset = 0,
+        .length = @intCast(payload.len),
+    };
+    const Send = *const fn (*anyopaque, *RioBuf, u32, u32, ?*anyopaque) callconv(.winapi) i32;
+    const send = rioPtr(Send, table.send) orelse return .{ .stage = "table" };
+    if (send(rq, &rio_buf, 1, 0, @ptrFromInt(@as(usize, rio_request_context))) == 0) {
+        return .{ .stage = "send", .errno = WSAGetLastError() };
+    }
+
+    const Dequeue = *const fn (*anyopaque, [*]RioResult, u32) callconv(.winapi) u32;
+    const dequeue = rioPtr(Dequeue, table.dequeue_completion) orelse return .{ .stage = "table" };
+    var results: [4]RioResult = @splat(.{});
+    var count: u32 = 0;
+    var polls: u32 = 0;
+    while (polls < 200) : (polls += 1) {
+        count = dequeue(queue, &results, results.len);
+        if (count == rio_corrupt_cq) return .{ .stage = "corrupt", .errno = WSAGetLastError() };
+        if (count != 0) break;
+        Sleep(10);
+    }
+    if (count == 0 or count > results.len) {
+        return .{ .stage = "empty", .count = count, .errno = 0 };
+    }
+
+    var found = false;
+    var got = RioResult{};
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        if (results[index].request_context == rio_request_context) {
+            got = results[index];
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return .{
+            .stage = "context",
+            .count = count,
+            .status = results[0].status,
+            .bytes = results[0].bytes,
+            .errno = 0,
+        };
+    }
+    if (got.status != 0) {
+        return .{ .stage = "status", .count = count, .status = got.status, .bytes = got.bytes, .errno = 0 };
+    }
+    if (got.bytes != rio_payload.len) {
+        return .{ .stage = "short", .count = count, .status = got.status, .bytes = got.bytes, .errno = 0 };
+    }
+
+    var peer: [4]u8 = @splat(0);
+    const n = recv(accepted, &peer, @intCast(peer.len), 0);
+    if (n != @as(i32, rio_payload.len) or !std.mem.eql(u8, peer[0..rio_payload.len], rio_payload)) {
+        return .{
+            .stage = "peer",
+            .count = count,
+            .status = got.status,
+            .bytes = if (n > 0) @intCast(n) else 0,
+            .errno = WSAGetLastError(),
+        };
+    }
+    return .{
+        .ok = true,
+        .stage = "dequeued",
+        .count = count,
+        .status = got.status,
+        .bytes = got.bytes,
+        .errno = 0,
+    };
+}
 
 fn posixSocket() !linux.fd_t {
     const rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
@@ -1679,6 +1977,16 @@ test "GAP-X3 Windows RIO fails closed off Windows" {
     try std.testing.expectEqual(@as(i32, 6), wsa_ipproto_tcp);
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(RioGuid));
     try std.testing.expectEqual(@as(usize, 112), @sizeOf(RioTable));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(RioBuf));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(RioResult));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), rio_corrupt_cq);
+    var closed_rio = IoBackend.closed(.iocp, 32);
+    defer closed_rio.deinit();
+    const witness = closed_rio.dequeueRegistered();
+    try std.testing.expect(!witness.ok);
+    try std.testing.expectEqualStrings("off-windows", witness.stage);
+    try std.testing.expectEqual(@as(u32, 0), witness.count);
+    try std.testing.expectEqual(@as(u32, 0), witness.bytes);
     const guid_bytes = std.mem.asBytes(&rio_guid);
     try std.testing.expectEqualSlices(u8, &[_]u8{
         0x81, 0xe0, 0x09, 0x85, 0xdd, 0x96, 0x05, 0x40,
@@ -1712,5 +2020,5 @@ test "GAP-X3 Windows RIO fails closed off Windows" {
     try std.testing.expectError(error.MissingOp, loadRioForDaemon());
     try std.testing.expectError(error.Unsupported, refusePortableReactor(.windows, 32));
 
-    std.debug.print("GAP-X3 branch=windows RIO loads the function table with WSAIoctl SIO 0xC8000024 and GUID 8509e081-96dd-4005-b165-9e2ee8c79e3f on a WSA_FLAG_REGISTERED_IO socket during Iocp.open; a null or short table is MissingOp and the port is closed; off Windows this returns MissingOp before any WSA call; recv and send are IOCTL_AFD_RECEIVE and IOCTL_AFD_SEND; this host did not execute WSAIoctl; heading stays unmarked; whole-accept not claimed\n", .{});
+    std.debug.print("GAP-X3 branch=windows RIO loads the function table with WSAIoctl SIO 0xC8000024 and GUID 8509e081-96dd-4005-b165-9e2ee8c79e3f on a WSA_FLAG_REGISTERED_IO socket during Iocp.open; dequeueRegistered calls that stored table; off Windows it returns stage off-windows before any pointer call; a null or short table is MissingOp and the port is closed; recv and send on the IOCP path are IOCTL_AFD_RECEIVE and IOCTL_AFD_SEND; this host did not execute WSAIoctl or RIODequeueCompletion; heading stays unmarked; whole-accept not claimed\n", .{});
 }

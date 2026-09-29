@@ -3,7 +3,8 @@
 
 //! Guest execution of the shipped FreeBSD kqueue submit path, FreeBSD
 //! `enableKernelTls`, OpenBSD `pledgeDaemonPaths`, and the Windows IOCP
-//! submit path (whose open also loads the RIO table). Each test returns
+//! submit path. Windows open loads the RIO table; the guest then calls
+//! `dequeueRegistered` on that same table. Each test returns
 //! `error.SkipZigTest` unless it is compiled for that kernel, so a Linux
 //! suite does not pretend the syscall ran. `main` is the guest entry point
 //! and calls those same functions.
@@ -240,6 +241,17 @@ pub fn executeWindowsIocp() !void {
         return err;
     };
     com.write("GAP-X3 windows rio result=ok");
+    const witness = backend.dequeueRegistered();
+    var dequeue_ok = false;
+    var line_buf: [96]u8 = undefined;
+    if (witness.ok) {
+        dequeue_ok = true;
+        if (std.fmt.bufPrint(&line_buf, "GAP-X3 windows rio dequeue={d} bytes={d} status={d}", .{ witness.count, witness.bytes, witness.status })) |text| {
+            com.write(text);
+        } else |_| com.write("GAP-X3 windows rio dequeue=fmt");
+    } else if (std.fmt.bufPrint(&line_buf, "GAP-X3 windows rio dequeue=fail stage={s} errno={d} bytes={d}", .{ witness.stage, witness.errno, witness.bytes })) |text| {
+        com.write(text);
+    } else |_| com.write("GAP-X3 windows rio dequeue=fmt");
     const pair = windowsPair() catch |err| {
         com.write("GAP-X1 windows iocp submitted=missing stage=socket");
         com.write("GUEST_EXIT:1");
@@ -294,19 +306,18 @@ pub fn executeWindowsIocp() !void {
         com.write("GUEST_EXIT:1");
         return err;
     };
-    var line_buf: [80]u8 = undefined;
     if (std.fmt.bufPrint(&line_buf, "GAP-X1 windows iocp submitted={d}", .{submitted})) |text| {
         com.write(text);
     } else |_| {
         com.write("GAP-X1 windows iocp submitted=fmt");
     }
-    if (submitted == 0) {
-        com.write("GUEST_EXIT:1");
-        return error.MissingOp;
-    }
     _ = WinSock.closesocket(pair.listener);
     _ = WinSock.closesocket(pair.client);
     _ = WinSock.closesocket(pair.accepted);
+    if (submitted == 0 or !dequeue_ok) {
+        com.write("GUEST_EXIT:1");
+        return error.MissingOp;
+    }
     com.write("GUEST_EXIT:0");
     // `backend` and `buf` are deliberately not freed. A pending AFD request
     // can still write them, and process exit reclaims the pages.
@@ -323,7 +334,9 @@ pub fn main() !void {
         return;
     }
     if (comptime builtin.os.tag == .windows) {
-        try executeWindowsIocp();
+        // The witness lines are the result. Returning the error also prints
+        // a stack, which hides those lines on the WinPE console.
+        executeWindowsIocp() catch {};
         return;
     }
     std.debug.print("foreign kernel exec refused on {s}\n", .{@tagName(builtin.os.tag)});
