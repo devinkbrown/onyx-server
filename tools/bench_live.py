@@ -477,12 +477,25 @@ def render(
             "whether the kernel attached ULP. `[io] sqpoll` is set without",
             "`defer_taskrun`.",
             "",
-            "Non-Linux rows are not in this table. This host is Linux, and the",
-            "portable reactor cannot execute the same recipe.",
+            "This command writes the Linux rows only. A later run keeps an",
+            "existing `## FreeBSD` section in the output file. SQPOLL is Linux",
+            "io_uring, and the portable reactor does not serve a TLS listener.",
             "",
         ]
     )
     return "\n".join(lines)
+
+
+def keep_freebsd_section(path: Path, text: str) -> str:
+    """Keep a hand-measured FreeBSD section when this Linux command rewrites the file."""
+    if not path.is_file():
+        return text
+    old = path.read_text(encoding="utf-8")
+    marker = "\n## FreeBSD"
+    at = old.find(marker)
+    if at < 0:
+        return text
+    return text.rstrip() + "\n" + old[at + 1 :]
 
 
 def parse_args() -> argparse.Namespace:
@@ -576,6 +589,7 @@ def main() -> int:
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
+        text = keep_freebsd_section(out, text)
         out.write_text(text, encoding="utf-8")
         print(f"bench_live: wrote {out}", file=sys.stderr)
 
