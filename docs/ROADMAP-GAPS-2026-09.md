@@ -1085,6 +1085,7 @@ because each one fights an invariant above.
 | Cut | Reason |
 | --- | --- |
 | `armor enc` openssl-compatible format | AEAD substrate only. Exit 3 stays. |
+| TURN relay allocation | No sockets and no auth secret. `MEDIA TURN` fails `TURN_CUT`. `substrate/turn.zig` stays framing-only. |
 | Full DTLS listener for IRC | Media-plane DTLS-SRTP is the DTLS this daemon has. |
 | PQ hybrid certificates of our own design | Wait for a ratified profile (GAP-K5). |
 | Adopting `substrate/io/ring.zig` as the server | Unfinished, and it is not the live ring. |

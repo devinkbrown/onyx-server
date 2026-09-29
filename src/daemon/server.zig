@@ -48372,6 +48372,12 @@ pub const LinuxServer = struct {
     /// over the transport substrate, not this control socket. Caller must be a
     /// channel member.
     pub fn handleMedia(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        // TURN has no allocation API and no auth secret. Refuse it before any
+        // channel lookup so a secret or a channel name is not treated as a relay.
+        if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "TURN")) {
+            try self.failReply(conn, "MEDIA", "TURN_CUT", "TURN relay is not offered");
+            return;
+        }
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER> <#chan> [kind]");
             return;
@@ -93995,6 +94001,33 @@ test "GAP-V2 a rejected browser media frame returns numeric 404" {
     try std.testing.expectEqual(websocket.Opcode.binary, delivered.frame.opcode);
     try std.testing.expectEqualSlices(u8, good, delivered.frame.payload);
     std.debug.print("GAP-V2 branch=a rejected browser frame returns numeric 404 and is not relayed\n", .{});
+}
+
+test "GAP-V2 TURN is cut and allocates no relay" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "alice", null);
+    const conn = server.connFor(id).?;
+    var line = irc_line.LineView{ .raw = "", .command = "MEDIA" };
+    line.params[0] = "TURN";
+    line.params[1] = "#media";
+    line.params[2] = "secret-must-not-echo";
+    line.param_count = 3;
+    conn.send_len = 0;
+    try server.handleMedia(id, conn, &line);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL MEDIA TURN_CUT");
+    try expectContains(conn.send_buf[0..conn.send_len], "TURN relay is not offered");
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], "secret-must-not-echo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], "allocated") == null);
+    line.param_count = 1;
+    conn.send_len = 0;
+    try server.handleMedia(id, conn, &line);
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL MEDIA TURN_CUT");
+    std.debug.print("GAP-V2 branch=TURN is cut and MEDIA TURN allocates nothing\n", .{});
 }
 
 test "MEDIA WS OFFER suppresses unroutable NATIVE/TRANSPORT; non-WS still gets UDP candidates" {
