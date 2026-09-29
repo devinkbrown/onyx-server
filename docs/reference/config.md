@@ -464,6 +464,14 @@ Source: struct at `src/daemon/config_format.zig`, parsing in `parseToml`, mappin
 | `dir` | string | `""` | any string | Directory for timestamped local backup sets. Empty disables backup publication. |
 | `interval` | duration string | `"24h"` | positive `ms/s/m/h` duration | Minimum interval between backup sets. Reactor 0 compacts the account store under the services lock, copies the account snapshot and chanstats snapshot when present, and writes `latest.json`. |
 
+Restore drill:
+
+```
+onyx-server --restore-drill <backup-dir> --into <scratch-dir>
+```
+
+The command reads `<backup-dir>/latest.json` and checks the family lists. `included` names the OroStore families in the account snapshot: `accounts`, `nicks`, `chanregs`, `bans`, `memos`, `vhosts`, `props`, and `history`. `excluded` names `search`, `webhooks`, `event_history`, and `mail`. `chanstats` is included when that snapshot file was copied, and excluded when `[stats] channel_dir` was empty. A successful drill reopens the account snapshot as `<scratch-dir>/restored.wal` and exits. It does not boot, bind, or send mail.
+
 ## `[metrics]`
 
 Source: struct at `src/daemon/config_format.zig:263`, parsing at `src/daemon/config_format.zig:562`, mapping at `src/daemon/config_boot.zig:67`, live HTTP endpoint at `src/daemon/metrics_http.zig:1`.

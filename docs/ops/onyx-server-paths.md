@@ -46,6 +46,11 @@ sudo systemctl reload onyx-server   # SIGUSR2 via ExecReload
 # Config check without restart
 /home/kain/onyx-server-run/onyx-server --check-config /home/kain/onyx-server-run/onyx-server.local.toml
 
+# Restore drill. Reads latest.json, checks included and excluded families,
+# reopens the account snapshot as <scratch-dir>/restored.wal, then exits.
+# It does not boot, bind, or send mail. <backup-dir> is a [backup] dir.
+onyx-server --restore-drill <backup-dir> --into <scratch-dir>
+
 # Peer config check (run over SSH)
 ssh trev@ircx.us /home/trev/onyx-server-run/onyx-server --check-config /home/trev/onyx-server-run/onyx-server.local.toml
 

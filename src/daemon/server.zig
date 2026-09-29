@@ -62643,6 +62643,87 @@ test "GAP-D5 same-image USR2 invalidates recovery tokens and keeps SCRAM and Cer
     std.debug.print("GAP-D5 branch=same-image USR2 invalidated the pre-crash verify and reset tokens, then SCRAM and CertFP still resolved and a new token confirmed\n", .{});
 }
 
+test "GAP-D6 daemon backup set verifies and restores into a scratch directory" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const wal_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/gap-d6.wal", .{tmp.sub_path});
+    defer alloc.free(wal_rel);
+    const backup_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup", .{tmp.sub_path});
+    defer alloc.free(backup_rel);
+    const scratch_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/scratch", .{tmp.sub_path});
+    defer alloc.free(scratch_rel);
+    try std.Io.Dir.cwd().createDir(io, backup_rel, .default_dir);
+
+    var store = try services_mod.OroStore.open(alloc, io, std.Io.Dir.cwd(), wal_rel);
+    defer store.deinit();
+    try store.put(.accounts, "d6acct", "plain-row");
+    try store.put(.nicks, "d6nick", "nick-row");
+    try store.put(.chanregs, "d6chan", "chan-row");
+    try store.put(.bans, "shun:d6", "mute");
+    try store.put(.memos, "d6memo", "memo-row");
+    try store.put(.vhosts, "d6vh", "vhost-row");
+    try store.put(.props, "d6prop", "prop-row");
+    try store.put(.history, "d6hist", "history-row");
+    var services = services_mod.Services.init(&store, null);
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = io,
+        .backup_dir = backup_rel,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    try std.testing.expect(server.writeBackupSet(io));
+
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/latest.json", .{backup_rel});
+    defer alloc.free(manifest_path);
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, alloc, .limited(1 << 20));
+    defer alloc.free(text);
+    for (backup_set.included_families) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, text, name) != null);
+    }
+    for (backup_set.excluded_families) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, text, name) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"kind\":\"chanstats\"") == null);
+    const verified = try backup_set.verify(alloc, text);
+    defer verified.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, verified.accounts_name, "accounts-"));
+    try std.testing.expect(std.mem.endsWith(u8, verified.accounts_name, ".db.snap"));
+
+    try backup_set.restoreDrill(alloc, io, backup_rel, scratch_rel);
+    const restored_wal = try std.fmt.allocPrint(alloc, "{s}/restored.wal", .{scratch_rel});
+    defer alloc.free(restored_wal);
+    var restored = try services_mod.OroStore.open(alloc, io, std.Io.Dir.cwd(), restored_wal);
+    defer restored.deinit();
+    const accounts = restored.get(.accounts, "d6acct") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("plain-row", accounts);
+    const nicks = restored.get(.nicks, "d6nick") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("nick-row", nicks);
+    const chanregs = restored.get(.chanregs, "d6chan") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("chan-row", chanregs);
+    const bans = restored.get(.bans, "shun:d6") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("mute", bans);
+    const memos = restored.get(.memos, "d6memo") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("memo-row", memos);
+    const vhosts = restored.get(.vhosts, "d6vh") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("vhost-row", vhosts);
+    const props = restored.get(.props, "d6prop") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("prop-row", props);
+    const history = restored.get(.history, "d6hist") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("history-row", history);
+    std.debug.print("GAP-D6 branch=daemon writeBackupSet listed the included and excluded families and restoreDrill reopened every family in a scratch directory\n", .{});
+}
+
 test "UPGRADE GAP-D1 cold restart restores history msgids and skips ciphertext search" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
