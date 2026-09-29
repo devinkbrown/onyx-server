@@ -2617,6 +2617,9 @@ pub const ConnState = struct {
     /// Zero means none yet. One numeric per second keeps a bad encoder from
     /// filling the IRC send queue. Not sealed across USR2.
     media_drop_notice_ms: i64 = 0,
+    /// When set, a missing key-transparency log is a hard failure. Clients
+    /// that leave this clear keep the observational replies.
+    keytrans_require: bool = false,
     /// Per-connection pending WebAuthn (passkey) ceremony challenge. Single-use
     /// and time-bounded: set by `WEBAUTHN REGISTER`/`AUTH`, consumed (and cleared)
     /// by the matching `*-FINISH`. Inline (no heap); an in-flight challenge simply
@@ -41101,12 +41104,27 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleKeyTrans(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        const svc = self.account_services orelse return self.failReply(conn, "KEYTRANS", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         const p = parsed.paramSlice();
         const sub = if (p.len == 0) "STATUS" else p[0];
+        if (std.ascii.eqlIgnoreCase(sub, "REQUIRE")) {
+            if (p.len < 2) return self.failReply(conn, "KEYTRANS", "NEED_MORE_PARAMS", "Usage: KEYTRANS REQUIRE <on|off>");
+            if (std.ascii.eqlIgnoreCase(p[1], "on")) {
+                conn.keytrans_require = true;
+            } else if (std.ascii.eqlIgnoreCase(p[1], "off")) {
+                conn.keytrans_require = false;
+            } else return self.failReply(conn, "KEYTRANS", "BAD_VALUE", "REQUIRE must be on or off");
+            return self.keyTransReply(conn, if (conn.keytrans_require) "REQUIRE on" else "REQUIRE off");
+        }
+        const svc = self.account_services orelse {
+            if (conn.keytrans_require) return self.failReply(conn, "KEYTRANS", "MISSING_LOG", "Key transparency log is missing");
+            return self.failReply(conn, "KEYTRANS", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        };
 
         if (std.ascii.eqlIgnoreCase(sub, "STATUS") or std.ascii.eqlIgnoreCase(sub, "ROOT")) {
             const status = svc.keyTransparencyStatus();
+            if (conn.keytrans_require and (!status.enabled or !status.available)) {
+                return self.failReply(conn, "KEYTRANS", "MISSING_LOG", "Key transparency log is missing");
+            }
             if (!status.enabled) return self.keyTransReply(conn, "STATUS disabled semantics=observational scope=node-local");
             if (!status.available) return self.keyTransReply(conn, "STATUS unavailable semantics=observational scope=node-local");
             const root_hex = std.fmt.bytesToHex(status.root, .lower);
@@ -41292,7 +41310,80 @@ pub const LinuxServer = struct {
             return self.keyTransReply(conn, body);
         }
 
-        return self.failReply(conn, "KEYTRANS", "INVALID_SUBCOMMAND", "Usage: KEYTRANS [STATUS|ROOT|PROOF <position>|EVENT <position>|DEVICE <account> <device-id>|CONSISTENCY <old-size>]");
+        if (std.ascii.eqlIgnoreCase(sub, "STORE")) {
+            if (p.len < 7) return self.failReply(conn, "KEYTRANS", "NEED_MORE_PARAMS", "Usage: KEYTRANS STORE <node> <entries> <root-hex> <sig-hex> <pubkey-hex> <action> [key-id]");
+            const node_id = std.fmt.parseInt(u64, p[1], 10) catch
+                return self.failReply(conn, "KEYTRANS", "BAD_NODE", "Node id must be a decimal integer");
+            const entries = std.fmt.parseInt(u64, p[2], 10) catch
+                return self.failReply(conn, "KEYTRANS", "BAD_SIZE", "Entry count must be a decimal integer");
+            const key_id = if (p.len >= 8) p[7] else "";
+            const head = key_transparency.parseSignedHead(node_id, entries, p[3], p[4], p[5], p[6], key_id) catch
+                return self.failReply(conn, "KEYTRANS", "BAD_HEAD", "Signed head fields are not canonical");
+            svc.storeKeyTransparencyHead(head) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.Disabled => "DISABLED",
+                    error.Unavailable => "TEMPORARILY_UNAVAILABLE",
+                    error.BadSignature => "BAD_SIGNATURE",
+                    error.KeyMismatch => "KEY_MISMATCH",
+                    error.BadHead => "BAD_HEAD",
+                    error.OutOfMemory => "INTERNAL_ERROR",
+                };
+                const reason: []const u8 = switch (err) {
+                    error.Disabled => "Key transparency log is not enabled",
+                    error.Unavailable => "Key transparency log is unavailable",
+                    error.BadSignature => "Signed head did not verify",
+                    error.KeyMismatch => "That node id is already pinned to a different key",
+                    error.BadHead => "Signed head fields are not canonical",
+                    error.OutOfMemory => "Could not store the signed head",
+                };
+                return self.failReply(conn, "KEYTRANS", code, reason);
+            };
+            var b: [160]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "STORE node={d} entries={d} action={s}", .{
+                head.node_id,
+                head.entries,
+                head.action.wireName(),
+            }) catch return;
+            return self.keyTransReply(conn, body);
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "PEER")) {
+            if (p.len < 2) return self.failReply(conn, "KEYTRANS", "NEED_MORE_PARAMS", "Usage: KEYTRANS PEER <node>");
+            const node_id = std.fmt.parseInt(u64, p[1], 10) catch
+                return self.failReply(conn, "KEYTRANS", "BAD_NODE", "Node id must be a decimal integer");
+            const stored = svc.keyTransparencyPeerHead(node_id) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.Disabled => "DISABLED",
+                    error.Unavailable => "TEMPORARILY_UNAVAILABLE",
+                };
+                const reason: []const u8 = switch (err) {
+                    error.Disabled => "Key transparency log is not enabled",
+                    error.Unavailable => "Key transparency log is unavailable",
+                };
+                if (conn.keytrans_require and err == error.Disabled) {
+                    return self.failReply(conn, "KEYTRANS", "MISSING_LOG", "Key transparency log is missing");
+                }
+                return self.failReply(conn, "KEYTRANS", code, reason);
+            };
+            if (stored) |head| {
+                const root_hex = std.fmt.bytesToHex(head.root, .lower);
+                var b: [320]u8 = undefined;
+                const body = std.fmt.bufPrint(
+                    &b,
+                    "PEER node={d} entries={d} root={s} action={s} key_id={s} scheme=signed-head",
+                    .{ head.node_id, head.entries, &root_hex, head.action.wireName(), head.keyId() },
+                ) catch return;
+                return self.keyTransReply(conn, body);
+            }
+            if (conn.keytrans_require) {
+                return self.failReply(conn, "KEYTRANS", "MISSING_LOG", "No signed head is stored for that node");
+            }
+            var absent: [64]u8 = undefined;
+            const body = std.fmt.bufPrint(&absent, "PEER node={d} present=no", .{node_id}) catch return;
+            return self.keyTransReply(conn, body);
+        }
+
+        return self.failReply(conn, "KEYTRANS", "INVALID_SUBCOMMAND", "Usage: KEYTRANS [STATUS|ROOT|PROOF <position>|EVENT <position>|DEVICE <account> <device-id>|CONSISTENCY <old-size>|STORE <node> <entries> <root-hex> <sig-hex> <pubkey-hex> <action> [key-id]|PEER <node>|REQUIRE <on|off>]");
     }
 
     // ── WEBAUTHN: passkey (FIDO2) registration + passwordless login ──────────
@@ -69409,6 +69500,163 @@ test "KEYTRANS exposes credential transparency root and inclusion proof" {
     conn.send_len = 0;
     try server.handleKeyTrans(conn, &need);
     try expectContains(conn.send_buf[0..conn.send_len], "FAIL KEYTRANS NEED_MORE_PARAMS");
+}
+
+test "GAP-K2 a stored signed head shows a revocation and a missing log fails closed only when required" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-keytrans-peer.wal");
+    defer store.deinit();
+    var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer kt.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachKeyTransparencyLog(&kt);
+
+    var source = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
+    defer source.deinit();
+    var kp = try crypto_sign.KeyPair.fromSeed(@as(crypto_sign.Seed, @splat(0x42)));
+    defer kp.deinit();
+
+    const bind_pos = try source.append(.{
+        .account = "alice",
+        .kind = .e2ee_device,
+        .action = .bind,
+        .key_id = "phone",
+        .key_hash = key_transparency.materialHash("mls-phone"),
+        .timestamp_ms = 10,
+    });
+    var bind_head = try key_transparency.headFromParts(7, 1, bind_pos.root, .bind, "phone");
+    try key_transparency.signHead(&kp, &bind_head);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(&server, "kain", null);
+    const conn = server.connFor(id).?;
+
+    const store_ok = try gapK2Store(&server, conn, bind_head);
+    try expectContains(store_ok, "KEYTRANS STORE node=7 entries=1 action=bind");
+
+    const absent = try gapK2Peer(&server, conn, "99");
+    try expectContains(absent, "KEYTRANS PEER node=99 present=no");
+    try std.testing.expect(std.mem.indexOf(u8, absent, "FAIL") == null);
+
+    conn.send_len = 0;
+    var require = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    require.params[0] = "REQUIRE";
+    require.params[1] = "on";
+    require.param_count = 2;
+    try server.handleKeyTrans(conn, &require);
+    const missing = try gapK2Peer(&server, conn, "99");
+    try expectContains(missing, "FAIL KEYTRANS MISSING_LOG");
+
+    require.params[1] = "off";
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &require);
+
+    const bound = try gapK2Peer(&server, conn, "7");
+    const bind_root = std.fmt.bytesToHex(bind_head.root, .lower);
+    try expectContains(bound, "action=bind key_id=phone scheme=signed-head");
+    try expectContains(bound, &bind_root);
+
+    const delete_pos = try source.append(.{
+        .account = "alice",
+        .kind = .e2ee_device,
+        .action = .delete,
+        .key_id = "phone",
+        .key_hash = key_transparency.materialHash("mls-phone"),
+        .timestamp_ms = 11,
+    });
+    var delete_head = try key_transparency.headFromParts(7, 2, delete_pos.root, .delete, "phone");
+    try key_transparency.signHead(&kp, &delete_head);
+    _ = try gapK2Store(&server, conn, delete_head);
+    const revoked = try gapK2Peer(&server, conn, "7");
+    const delete_root = std.fmt.bytesToHex(delete_head.root, .lower);
+    try expectContains(revoked, "entries=2");
+    try expectContains(revoked, "action=delete key_id=phone");
+    try expectContains(revoked, &delete_root);
+    try std.testing.expect(std.mem.indexOf(u8, revoked, &bind_root) == null);
+
+    var forged = delete_head;
+    forged.signature[0] ^= 0x01;
+    const forged_reply = try gapK2Store(&server, conn, forged);
+    try expectContains(forged_reply, "FAIL KEYTRANS BAD_SIGNATURE");
+    const still = try gapK2Peer(&server, conn, "7");
+    try expectContains(still, &delete_root);
+
+    var other = try crypto_sign.KeyPair.fromSeed(@as(crypto_sign.Seed, @splat(0x99)));
+    defer other.deinit();
+    var swapped = delete_head;
+    try key_transparency.signHead(&other, &swapped);
+    const mismatch = try gapK2Store(&server, conn, swapped);
+    try expectContains(mismatch, "FAIL KEYTRANS KEY_MISMATCH");
+    const pinned = try gapK2Peer(&server, conn, "7");
+    try expectContains(pinned, &delete_root);
+
+    var bare_store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-keytrans-missing.wal");
+    defer bare_store.deinit();
+    var bare_services = services_mod.Services.init(&bare_store, null);
+    var bare = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &bare_services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer bare.deinit();
+    const bare_id = try addTestLocalClient(&bare, "rita", null);
+    const bare_conn = bare.connFor(bare_id).?;
+    var status = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    status.params[0] = "STATUS";
+    status.param_count = 1;
+    bare_conn.send_len = 0;
+    try bare.handleKeyTrans(bare_conn, &status);
+    try expectContains(bare_conn.send_buf[0..bare_conn.send_len], "STATUS disabled");
+    try std.testing.expect(std.mem.indexOf(u8, bare_conn.send_buf[0..bare_conn.send_len], "MISSING_LOG") == null);
+    var req = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    req.params[0] = "REQUIRE";
+    req.params[1] = "on";
+    req.param_count = 2;
+    bare_conn.send_len = 0;
+    try bare.handleKeyTrans(bare_conn, &req);
+    bare_conn.send_len = 0;
+    try bare.handleKeyTrans(bare_conn, &status);
+    try expectContains(bare_conn.send_buf[0..bare_conn.send_len], "FAIL KEYTRANS MISSING_LOG");
+
+    std.debug.print("GAP-K2 branch=each node stores the other signed head and a missing log fails closed only when required\n", .{});
+}
+
+fn gapK2Store(server: *Server, conn: *ConnState, head: key_transparency.SignedHead) ![]const u8 {
+    const root_hex = std.fmt.bytesToHex(head.root, .lower);
+    const sig_hex = std.fmt.bytesToHex(head.signature, .lower);
+    const pub_hex = std.fmt.bytesToHex(head.public_key, .lower);
+    var node_buf: [32]u8 = undefined;
+    var entries_buf: [32]u8 = undefined;
+    const node_s = std.fmt.bufPrint(&node_buf, "{d}", .{head.node_id}) catch return error.SkipZigTest;
+    const entries_s = std.fmt.bufPrint(&entries_buf, "{d}", .{head.entries}) catch return error.SkipZigTest;
+    var lv = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    lv.params[0] = "STORE";
+    lv.params[1] = node_s;
+    lv.params[2] = entries_s;
+    lv.params[3] = &root_hex;
+    lv.params[4] = &sig_hex;
+    lv.params[5] = &pub_hex;
+    lv.params[6] = head.action.wireName();
+    lv.params[7] = head.keyId();
+    lv.param_count = 8;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &lv);
+    return conn.send_buf[0..conn.send_len];
+}
+
+fn gapK2Peer(server: *Server, conn: *ConnState, node: []const u8) ![]const u8 {
+    var lv = irc_line.LineView{ .raw = "", .command = "KEYTRANS" };
+    lv.params[0] = "PEER";
+    lv.params[1] = node;
+    lv.param_count = 2;
+    conn.send_len = 0;
+    try server.handleKeyTrans(conn, &lv);
+    return conn.send_buf[0..conn.send_len];
 }
 
 test "KEYTRANS DEVICE and EVENT survive store restart" {

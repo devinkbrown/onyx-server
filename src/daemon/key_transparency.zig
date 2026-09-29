@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const mmr = @import("../substrate/merkle_mountain_range.zig");
+const crypto_sign = @import("../crypto/sign.zig");
 
 const Blake3 = std.crypto.hash.Blake3;
 
@@ -69,6 +70,154 @@ pub const Action = enum(u8) {
         return std.enums.fromInt(Action, value);
     }
 };
+
+/// Latest-action summary carried in a signed peer head. Not a leaf.
+pub const HeadAction = enum(u8) {
+    none = 0,
+    bind = 1,
+    delete = 2,
+
+    pub fn wireName(self: HeadAction) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .bind => "bind",
+            .delete => "delete",
+        };
+    }
+
+    pub fn fromName(name: []const u8) ?HeadAction {
+        if (std.mem.eql(u8, name, "none")) return .none;
+        if (std.mem.eql(u8, name, "bind")) return .bind;
+        if (std.mem.eql(u8, name, "delete")) return .delete;
+        return null;
+    }
+};
+
+/// The key id echoed in a signed head. The log itself still accepts longer ids.
+pub const head_key_max: usize = 64;
+
+/// A node's signed statement of its log size, root, and latest action.
+/// Storing one does not copy that node's leaves.
+pub const SignedHead = struct {
+    node_id: u64,
+    entries: u64,
+    root: Hash,
+    action: HeadAction,
+    key_id_buf: [head_key_max]u8 = @splat(0),
+    key_id_len: u8 = 0,
+    public_key: crypto_sign.PublicKey = @splat(0),
+    signature: crypto_sign.Signature = @splat(0),
+
+    pub fn keyId(self: *const SignedHead) []const u8 {
+        return self.key_id_buf[0..self.key_id_len];
+    }
+};
+
+const head_domain = "onyx-keytrans-head-v1";
+
+fn headKeyOk(key_id: []const u8) bool {
+    if (key_id.len > head_key_max) return false;
+    for (key_id) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
+pub fn headFromParts(node_id: u64, entries: u64, root: Hash, action: HeadAction, key_id: []const u8) error{BadHead}!SignedHead {
+    if (action == .none) {
+        if (entries != 0 or key_id.len != 0) return error.BadHead;
+    } else if (entries == 0 or key_id.len == 0 or !headKeyOk(key_id)) return error.BadHead;
+    var head = SignedHead{
+        .node_id = node_id,
+        .entries = entries,
+        .root = root,
+        .action = action,
+    };
+    if (key_id.len != 0) {
+        @memcpy(head.key_id_buf[0..key_id.len], key_id);
+        head.key_id_len = @intCast(key_id.len);
+    }
+    return head;
+}
+
+pub fn encodeHeadBody(head: SignedHead, out: []u8) error{BufferTooSmall}![]const u8 {
+    const need = head_domain.len + 1 + 8 + 8 + 32 + 1 + 1 + @as(usize, head.key_id_len);
+    if (out.len < need) return error.BufferTooSmall;
+    var i: usize = 0;
+    @memcpy(out[i..][0..head_domain.len], head_domain);
+    i += head_domain.len;
+    out[i] = 0;
+    i += 1;
+    std.mem.writeInt(u64, out[i..][0..8], head.node_id, .little);
+    i += 8;
+    std.mem.writeInt(u64, out[i..][0..8], head.entries, .little);
+    i += 8;
+    @memcpy(out[i..][0..32], &head.root);
+    i += 32;
+    out[i] = @intFromEnum(head.action);
+    i += 1;
+    out[i] = head.key_id_len;
+    i += 1;
+    if (head.key_id_len != 0) {
+        @memcpy(out[i..][0..head.key_id_len], head.keyId());
+        i += head.key_id_len;
+    }
+    return out[0..i];
+}
+
+pub fn signHead(kp: *const crypto_sign.KeyPair, head: *SignedHead) !void {
+    var buf: [160]u8 = undefined;
+    const msg = try encodeHeadBody(head.*, &buf);
+    head.public_key = kp.public_key;
+    head.signature = try kp.sign(msg);
+}
+
+pub fn verifyHead(head: SignedHead) bool {
+    var buf: [160]u8 = undefined;
+    const msg = encodeHeadBody(head, &buf) catch return false;
+    return crypto_sign.verify(msg, head.signature, head.public_key) catch false;
+}
+
+fn decodeHex(dst: []u8, hex: []const u8) bool {
+    if (hex.len != dst.len * 2) return false;
+    for (dst, 0..) |*out, i| {
+        const hi = hexNibble(hex[i * 2]) orelse return false;
+        const lo = hexNibble(hex[i * 2 + 1]) orelse return false;
+        out.* = (hi << 4) | lo;
+    }
+    return true;
+}
+
+fn hexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+pub fn parseSignedHead(
+    node_id: u64,
+    entries: u64,
+    root_hex: []const u8,
+    sig_hex: []const u8,
+    pub_hex: []const u8,
+    action_name: []const u8,
+    key_id: []const u8,
+) error{BadHead}!SignedHead {
+    const action = HeadAction.fromName(action_name) orelse return error.BadHead;
+    var root: Hash = undefined;
+    var signature: crypto_sign.Signature = undefined;
+    var public_key: crypto_sign.PublicKey = undefined;
+    if (!decodeHex(&root, root_hex)) return error.BadHead;
+    if (!decodeHex(&signature, sig_hex)) return error.BadHead;
+    if (!decodeHex(&public_key, pub_hex)) return error.BadHead;
+    var head = try headFromParts(node_id, entries, root, action, key_id);
+    head.public_key = public_key;
+    head.signature = signature;
+    return head;
+}
 
 pub const Event = struct {
     account: []const u8,
@@ -262,6 +411,8 @@ pub const KeyTransparencyLog = struct {
     digests: std.AutoHashMap(Hash, usize),
     /// Set when durable restore failed. Append and query stay fail-closed.
     unusable: bool = false,
+    /// Signed summaries of other nodes' logs. This is not a copy of their leaves.
+    peer_heads: std.ArrayList(SignedHead) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) KeyTransparencyLog {
         return .{
@@ -272,12 +423,34 @@ pub const KeyTransparencyLog = struct {
     }
 
     pub fn deinit(self: *KeyTransparencyLog) void {
+        self.peer_heads.deinit(self.mem());
         self.clearLatest();
         self.latest.deinit();
         self.digests.deinit();
         self.events.deinit(self.mem());
         self.tree.deinit();
         self.* = undefined;
+    }
+
+    /// Remember one peer's signed head. The first key for a node id sticks;
+    /// a later head must verify under that same key.
+    pub fn storePeerHead(self: *KeyTransparencyLog, head: SignedHead) (error{ BadSignature, KeyMismatch, BadHead } || std.mem.Allocator.Error)!void {
+        if (self.unusable) return error.BadHead;
+        if (!verifyHead(head)) return error.BadSignature;
+        for (self.peer_heads.items) |*slot| {
+            if (slot.node_id != head.node_id) continue;
+            if (!std.mem.eql(u8, &slot.public_key, &head.public_key)) return error.KeyMismatch;
+            slot.* = head;
+            return;
+        }
+        try self.peer_heads.append(self.mem(), head);
+    }
+
+    pub fn peerHead(self: *const KeyTransparencyLog, node_id: u64) ?SignedHead {
+        for (self.peer_heads.items) |slot| {
+            if (slot.node_id == node_id) return slot;
+        }
+        return null;
     }
 
     fn mem(self: *const KeyTransparencyLog) std.mem.Allocator {

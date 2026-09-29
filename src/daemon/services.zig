@@ -1770,6 +1770,22 @@ pub const Services = struct {
         };
     }
 
+    pub fn storeKeyTransparencyHead(self: *Services, head: key_transparency.SignedHead) (error{ Disabled, Unavailable, BadSignature, KeyMismatch, BadHead } || std.mem.Allocator.Error)!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const log = self.key_transparency orelse return error.Disabled;
+        if (log.unusable) return error.Unavailable;
+        try log.storePeerHead(head);
+    }
+
+    pub fn keyTransparencyPeerHead(self: *Services, node_id: u64) error{ Disabled, Unavailable }!?key_transparency.SignedHead {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const log = self.key_transparency orelse return error.Disabled;
+        if (log.unusable) return error.Unavailable;
+        return log.peerHead(node_id);
+    }
+
     /// Copy an inclusion proof for `position` into caller-owned memory. The
     /// returned snapshot is stable after the services lock releases.
     pub fn keyTransparencyProof(self: *Services, allocator: std.mem.Allocator, position: usize) (std.mem.Allocator.Error || error{ Disabled, Unavailable, IndexOutOfRange })!KeyTransparencyProofSnapshot {
