@@ -910,6 +910,15 @@ abuse, Helix) and what it must not (the member list in the clear), plus a
 fail-closed prototype that does not weaken ordinary channels. Do not start
 this before GAP-K1 is boring.
 
+The prototype is the channel PROP `membership-visibility`. Absent and
+`ordinary` keep today's `NAMES`, `WHO`, and `WHOX` lists, including a bare
+`NAMES`. `sealed` answers `MEMBERSHIP_SEALED` and does not emit the member
+list or an empty end-of-list. Any other value is rejected. A stored value the
+server does not understand refuses the roster. Delivery still uses the channel
+name, a `KICK` still names its one target, and the world membership used to
+route stays. Helix does not publish that membership as a clear roster. No new
+`CapsuleKind`. The GAP-K1 client journey stays open. The heading stays unmarked.
+
 ### GAP-K5 — Post-quantum signatures
 
 **Size L when a profile exists.** `ml_dsa.zig` and `slh_dsa.zig` verify. They

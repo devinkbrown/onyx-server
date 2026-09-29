@@ -112,8 +112,23 @@ does not add a server history-rekey mode.
 Metadata-min mode, which would hide nicks, sizes, and timing from the server,
 is not a daemon mode. `NAMES` still lists members. Authorized search still
 returns plaintext the caller can see, and it still drops ciphertext bodies.
-Abuse handling still sees the connection. Sealed rooms stay unstarted while
-the client group journey is open. Neither feature follows from this boundary.
+Abuse handling still sees the connection. A sealed room is a separate opt-in
+that refuses only that room's clear roster. Neither history rekey nor
+metadata-min follows from this boundary.
+
+### Sealed room prototype
+
+The server still sees three things for a sealed room. Routing uses the channel
+name, and the world membership that delivers a message stays in place. Abuse
+handling still names the one nick an operator supplies to `KICK`. Helix keeps
+that delivery membership and does not publish it as a clear roster. No new
+capsule kind is added.
+
+The server does not emit the member list in the clear. `NAMES`, `WHO`, and
+`WHOX` on `membership-visibility=sealed` fail with `MEMBERSHIP_SEALED` and do
+not send a roster or an empty end-of-list. Absent and `ordinary` keep today's
+lists, so an ordinary channel is unchanged. A value other than those two is
+rejected, and a stored value the server does not understand refuses the roster.
 
 ## Portable account identity
 

@@ -161,6 +161,7 @@ const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
 const account_identity = @import("../proto/account_identity.zig");
 const e2ee_policy = @import("../proto/e2ee_policy.zig");
+const sealed_room = @import("../proto/sealed_room.zig");
 
 comptime {
     if (e2ee_policy.max_room_envelope_wire_len != message_relay.max_text_len)
@@ -20217,6 +20218,7 @@ pub const LinuxServer = struct {
                         if (!is_member) continue;
                     }
                 }
+                if (self.rosterRefused(ch.name)) continue;
                 try self.sendNames(conn, ch.name);
             }
             return;
@@ -20229,6 +20231,12 @@ pub const LinuxServer = struct {
             } else {
                 try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             }
+            return;
+        }
+        // A sealed room has no clear member list, including for members and opers.
+        // An empty 366 would look like an empty channel, so the command fails.
+        if (self.rosterRefused(channel)) {
+            try self.failReply(conn, "NAMES", "MEMBERSHIP_SEALED", "Channel roster is sealed");
             return;
         }
         // A secret (+s), private (+p), or hidden (+h) channel's roster is
@@ -21170,6 +21178,10 @@ pub const LinuxServer = struct {
     pub fn handleWhox(self: *LinuxServer, conn: *ConnState, target: []const u8, req: whox.Request) !void {
         const requester = conn.session.displayName();
         if (world_model.isChannelName(target) and self.world.channelExists(target)) {
+            if (self.rosterRefused(target)) {
+                try self.failReply(conn, "WHO", "MEMBERSHIP_SEALED", "Channel roster is sealed");
+                return;
+            }
             // Same ShowChannel gate as plain WHO: a secret(+s), private(+p),
             // or hidden(+h) roster is visible only to members and opers.
             // Non-member non-oper gets a bare RPL_ENDOFWHO. Fail-closed.
@@ -21319,6 +21331,10 @@ pub const LinuxServer = struct {
         }
 
         if (world_model.isChannelName(target) and self.world.channelExists(target)) {
+            if (self.rosterRefused(target)) {
+                try self.failReply(conn, "WHO", "MEMBERSHIP_SEALED", "Channel roster is sealed");
+                return;
+            }
             // A secret (+s), private (+p), or hidden (+h) roster is visible
             // only to members and opers. A non-member non-oper gets a bare
             // RPL_ENDOFWHO. Fail-closed: an unknown viewer is a non-member.
@@ -34615,6 +34631,13 @@ pub const LinuxServer = struct {
             if (!e2ee_policy.validPolicyValue(value)) return .bad_value;
             return .not_handled;
         }
+        if (std.ascii.eqlIgnoreCase(key, sealed_room.prop_key)) {
+            // Sealed rooms refuse a clear roster. Absent stays ordinary.
+            // Delete clears the prop. Any other value is rejected.
+            if (deleting) return .not_handled;
+            if (sealed_room.visibilityValue(value) == null) return .bad_value;
+            return .not_handled;
+        }
         if (std.ascii.eqlIgnoreCase(key, "history-policy")) {
             // Aegis-lite room policy for history visibility. Persist as a normal
             // signed channel PROP; CHATHISTORY reads the value at request time.
@@ -34668,6 +34691,18 @@ pub const LinuxServer = struct {
         const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
         const ev = self.props.getProp(entity, e2ee_policy.policy_prop) catch return .off;
         return e2ee_policy.policyValue(ev.value) orelse .off;
+    }
+
+    pub fn channelMembershipVisibility(self: *LinuxServer, channel: []const u8) sealed_room.Visibility {
+        if (channel.len == 0 or (channel[0] != '#' and channel[0] != '&')) return .ordinary;
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const ev = self.props.getProp(entity, sealed_room.prop_key) catch return .ordinary;
+        // A stored value this server does not understand refuses the roster.
+        return sealed_room.visibilityValue(ev.value) orelse .sealed;
+    }
+
+    fn rosterRefused(self: *LinuxServer, channel: []const u8) bool {
+        return sealed_room.rosterDisclosure(self.channelMembershipVisibility(channel)) == .refuse;
     }
 
     fn messageSatisfiesEncryptionPolicy(
@@ -111347,6 +111382,132 @@ test "GAP-P12 a loopback history read matches CHATHISTORY visibility" {
 
     current_reactor = null;
     std.debug.print("GAP-P12 branch=loopback HTTPS GET /history returns the lines CHATHISTORY would and a public bind is refused\n", .{});
+}
+
+test "GAP-K4 a sealed room refuses the clear roster and an ordinary room still lists it" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const founder_id = try addTestLocalClient(server, "Founder", "founder");
+    const member_id = try addTestLocalClient(server, "Member", "member");
+    const founder = server.connFor(founder_id).?;
+    const member = server.connFor(member_id).?;
+    founder.ircx = true;
+    member.ircx = true;
+
+    _ = try server.world.join("#open", worldIdFromClient(founder_id));
+    _ = try server.world.join("#sealed", worldIdFromClient(founder_id));
+    _ = try server.world.join("#open", worldIdFromClient(member_id));
+    _ = try server.world.join("#sealed", worldIdFromClient(member_id));
+
+    resetTestSendQ(founder);
+    var names_open = try irc_line.parseLine("NAMES #open");
+    try server.handleNames(founder, &names_open);
+    const open_roster = founder.send_buf[0..founder.send_len];
+    try expectContains(open_roster, " 353 ");
+    try expectContains(open_roster, "Member");
+
+    resetTestSendQ(founder);
+    var bad_vis = try irc_line.parseLine("PROP #sealed membership-visibility :hidden");
+    try server.handleProp(founder_id, founder, &bad_vis);
+    try expectContains(founder.send_buf[0..founder.send_len], "Invalid property value");
+    const sealed_entity = ircx_prop_store.Entity{ .kind = .channel, .id = "#sealed" };
+    try std.testing.expectError(error.PropMissing, server.props.getProp(sealed_entity, sealed_room.prop_key));
+
+    resetTestSendQ(founder);
+    var set_vis = try irc_line.parseLine("PROP #sealed membership-visibility :sealed");
+    try server.handleProp(founder_id, founder, &set_vis);
+    try std.testing.expectEqualStrings("sealed", (try server.props.getProp(sealed_entity, sealed_room.prop_key)).value);
+    try std.testing.expectEqual(sealed_room.Visibility.sealed, server.channelMembershipVisibility("#sealed"));
+    try std.testing.expectEqual(sealed_room.Visibility.ordinary, server.channelMembershipVisibility("#open"));
+    try std.testing.expect(!sealed_room.helixPublishesClearRoster(server.channelMembershipVisibility("#sealed")));
+    try std.testing.expect(sealed_room.helixPublishesClearRoster(server.channelMembershipVisibility("#open")));
+    try std.testing.expect(server.world.memberCount("#sealed") >= 2);
+
+    resetTestSendQ(founder);
+    var names_open_again = try irc_line.parseLine("NAMES #open");
+    try server.handleNames(founder, &names_open_again);
+    try expectContains(founder.send_buf[0..founder.send_len], " 353 ");
+    try expectContains(founder.send_buf[0..founder.send_len], "Member");
+
+    resetTestSendQ(founder);
+    var names_sealed = try irc_line.parseLine("NAMES #sealed");
+    try server.handleNames(founder, &names_sealed);
+    const sealed_names = founder.send_buf[0..founder.send_len];
+    try expectContains(sealed_names, "MEMBERSHIP_SEALED");
+    try std.testing.expect(std.mem.indexOf(u8, sealed_names, " 353 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sealed_names, "Member") == null);
+
+    resetTestSendQ(founder);
+    var names_bare = try irc_line.parseLine("NAMES");
+    try server.handleNames(founder, &names_bare);
+    const bare_names = founder.send_buf[0..founder.send_len];
+    try expectContains(bare_names, " 353 ");
+    try expectContains(bare_names, "#open");
+    try expectContains(bare_names, "Member");
+    try std.testing.expect(std.mem.indexOf(u8, bare_names, "#sealed") == null);
+
+    resetTestSendQ(founder);
+    var who_sealed = try irc_line.parseLine("WHO #sealed");
+    try server.handleWho(founder, &who_sealed);
+    const sealed_who = founder.send_buf[0..founder.send_len];
+    try expectContains(sealed_who, "MEMBERSHIP_SEALED");
+    try std.testing.expect(std.mem.indexOf(u8, sealed_who, " 352 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sealed_who, "Member") == null);
+
+    resetTestSendQ(founder);
+    var who_open = try irc_line.parseLine("WHO #open");
+    try server.handleWho(founder, &who_open);
+    try expectContains(founder.send_buf[0..founder.send_len], "Member");
+
+    resetTestSendQ(founder);
+    var whox_sealed = try irc_line.parseLine("WHO #sealed %n");
+    try server.handleWho(founder, &whox_sealed);
+    const sealed_whox = founder.send_buf[0..founder.send_len];
+    try expectContains(sealed_whox, "MEMBERSHIP_SEALED");
+    try std.testing.expect(std.mem.indexOf(u8, sealed_whox, " 354 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sealed_whox, "Member") == null);
+
+    resetTestSendQ(founder);
+    resetTestSendQ(member);
+    try gapP4Send(server, founder_id, founder, "PRIVMSG #sealed :k4routeword");
+    try expectContains(member.send_buf[0..member.send_len], "k4routeword");
+
+    resetTestSendQ(founder);
+    resetTestSendQ(member);
+    var kick_line = try irc_line.parseLine("KICK #sealed Member :sealed-room abuse");
+    try server.handleKick(founder_id, founder, &kick_line);
+    const kicked = member.send_buf[0..member.send_len];
+    try expectContains(kicked, "KICK #sealed Member");
+    try std.testing.expect(std.mem.indexOf(u8, kicked, " 353 ") == null);
+
+    resetTestSendQ(founder);
+    var set_ordinary = try irc_line.parseLine("PROP #sealed membership-visibility :ordinary");
+    try server.handleProp(founder_id, founder, &set_ordinary);
+    try std.testing.expectEqual(sealed_room.Visibility.ordinary, server.channelMembershipVisibility("#sealed"));
+    resetTestSendQ(founder);
+    var names_restored = try irc_line.parseLine("NAMES #sealed");
+    try server.handleNames(founder, &names_restored);
+    const restored = founder.send_buf[0..founder.send_len];
+    try expectContains(restored, " 353 ");
+    try expectContains(restored, "Founder");
+    try std.testing.expect(std.mem.indexOf(u8, restored, "MEMBERSHIP_SEALED") == null);
+
+    std.debug.print("GAP-K4 branch=sealed room refuses NAMES WHO and WHOX; ordinary room still lists members; routing and KICK keep their targets\n", .{});
 }
 
 test {
