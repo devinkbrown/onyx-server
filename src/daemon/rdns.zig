@@ -13,6 +13,7 @@
 //! the established `geo_services` background-fetcher pattern.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const dns = @import("../proto/dns.zig");
 const platform = @import("../substrate/platform.zig");
 
@@ -207,10 +208,34 @@ fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.Thread.yield() catch {};
 }
 
+/// Idle wait for the resolver worker. Linux `nanosleep` is syscall 35, which
+/// is a different call on FreeBSD, so the BSD thread uses libc.
 fn sleepMs(ms: u32) void {
-    const linux = std.os.linux;
-    var req = linux.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
-    _ = linux.nanosleep(&req, null);
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            var req = linux.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
+            _ = linux.nanosleep(&req, null);
+        },
+        .windows => {
+            const ntdll = struct {
+                extern "ntdll" fn NtDelayExecution(alertable: u8, interval: *const i64) callconv(.winapi) i32;
+            };
+            var ticks: i64 = -@as(i64, ms) * 10_000;
+            _ = ntdll.NtDelayExecution(0, &ticks);
+        },
+        else => {
+            var req = std.c.timespec{
+                .sec = @intCast(ms / 1000),
+                .nsec = @intCast((ms % 1000) * 1_000_000),
+            };
+            _ = std.c.nanosleep(&req, null);
+        },
+    }
+}
+
+test "resolver idle wait returns" {
+    sleepMs(1);
 }
 
 test "request enqueues; lookup misses until a confirmed result is stored" {

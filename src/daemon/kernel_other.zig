@@ -95,6 +95,10 @@ pub const cap_peeloff = capRight(0, 0x0000001000000000);
 pub const cap_setsockopt = capRight(0, 0x0000002000000000);
 pub const cap_shutdown = capRight(0, 0x0000004000000000);
 pub const cap_event = capRight(1, 0x0000000000000020);
+/// FreeBSD `CAP_KQUEUE_EVENT` / `CAP_KQUEUE_CHANGE`. `kevent` on a kqueue
+/// descriptor needs both. `CAP_EVENT` only covers poll on an ordinary fd.
+pub const cap_kqueue_event = capRight(1, 0x0000000000000040);
+pub const cap_kqueue_change = capRight(1, 0x0000000000100000);
 
 pub const Rights = extern struct {
     words: [2]u64,
@@ -120,6 +124,17 @@ pub fn listenerRights() Rights {
 
 pub fn stdioRights() Rights {
     return rightsFrom(cap_read | cap_write | cap_seek | cap_fcntl | cap_fstat, cap_event);
+}
+
+/// Listener rights plus the two kqueue bits `kevent` checks.
+pub fn kqueueRights() Rights {
+    const base = listenerRights();
+    return .{
+        .words = .{
+            base.words[0],
+            base.words[1] | cap_kqueue_event | cap_kqueue_change,
+        },
+    };
 }
 
 const SockaddrIn6 = extern struct {
@@ -230,10 +245,24 @@ pub fn enterDaemonCapsicum(fds: []const i32) Error!void {
         freebsdTypecheck(fds.len);
         return error.MissingOp;
     }
-    const rights = listenerRights();
+    const rights = kqueueRights();
     for (fds) |fd| {
         if (fd < 0) return error.MissingOp;
         if (cap_rights_limit(fd, &rights) != 0) return error.MissingOp;
+    }
+    // stdout/stderr stay writable after cap_enter so the listen banner and
+    // libc logging do not die with ENOTCAPABLE. Skip an fd already limited
+    // above, and skip one that is not open.
+    const stdio = stdioRights();
+    var stdio_fd: i32 = 0;
+    while (stdio_fd < 3) : (stdio_fd += 1) {
+        var listed = false;
+        for (fds) |fd| {
+            if (fd == stdio_fd) listed = true;
+        }
+        if (listed) continue;
+        if (fcntl(stdio_fd, 1) < 0) continue;
+        if (cap_rights_limit(stdio_fd, &stdio) != 0) return error.MissingOp;
     }
     if (cap_enter() != 0) return error.MissingOp;
     var mode: u32 = 0;
@@ -296,6 +325,7 @@ extern "c" fn close(fd: i32) i32;
 extern "c" fn cap_enter() i32;
 extern "c" fn cap_getmode(modep: *u32) i32;
 extern "c" fn cap_rights_limit(fd: i32, rights: *const Rights) i32;
+extern "c" fn fcntl(fd: i32, cmd: i32) i32;
 extern "c" fn pledge(promises: ?[*:0]const u8, execpromises: ?[*:0]const u8) i32;
 extern "c" fn unveil(path: ?[*:0]const u8, permissions: ?[*:0]const u8) i32;
 
@@ -339,6 +369,11 @@ test "GAP-X3 FreeBSD Capsicum and SO_REUSEPORT_LB, OpenBSD pledge, and a Windows
     try std.testing.expectEqual(cap_event, listener.words[1] & cap_event);
     try std.testing.expectEqual(@as(u64, 0), listener.words[0] >> 62);
     const stdio = stdioRights();
+    const kq = kqueueRights();
+    try std.testing.expectEqual(cap_kqueue_event, kq.words[1] & cap_kqueue_event);
+    try std.testing.expectEqual(cap_kqueue_change, kq.words[1] & cap_kqueue_change);
+    try std.testing.expectEqual(cap_event, kq.words[1] & cap_event);
+    try std.testing.expectEqual(cap_accept, kq.words[0] & cap_accept);
     try std.testing.expectEqual(cap_read, stdio.words[0] & cap_read);
     try std.testing.expectEqual(cap_write, stdio.words[0] & cap_write);
     const cap_low: u64 = 0x01ffffffffffffff;

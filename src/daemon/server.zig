@@ -54248,7 +54248,10 @@ const PortableServer = struct {
         if (conn.send_armed) self.backend.cancel(.send, conn.token) catch {};
         conn.recv_armed = false;
         conn.send_armed = false;
-        self.pending = true;
+        // Flush the EV_DELETE while the fd is still open. Closing first makes
+        // kqueue report EBADF, and that receipt aborts the listen loop.
+        _ = self.backend.submit() catch {};
+        self.pending = false;
         io_backend.closeSocket(conn.fd);
         conn.fd = -1;
     }
@@ -54304,6 +54307,36 @@ test "GAP-X1 PortableServer answers PING through processLine" {
     const text = got[0..read_rc];
     try std.testing.expect(std.mem.indexOf(u8, text, "PONG") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "lane") != null);
+    _ = linux.shutdown(client, linux.SHUT.RDWR);
+    var drain: u8 = 0;
+    while (drain < 12) : (drain += 1) try server.runOnce();
+    const raw2 = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    if (posix.errno(raw2) != .SUCCESS) return error.Unexpected;
+    const client2: linux.fd_t = @intCast(raw2);
+    defer _ = linux.close(client2);
+    if (posix.errno(linux.connect(client2, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.Unexpected;
+    _ = linux.setsockopt(client2, posix.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+    const msg2 = "PING two\r\n";
+    var off2: usize = 0;
+    while (off2 < msg2.len) {
+        const wrote2 = linux.write(client2, msg2[off2..].ptr, msg2.len - off2);
+        switch (posix.errno(wrote2)) {
+            .SUCCESS => {
+                if (wrote2 == 0) return error.Unexpected;
+                off2 += wrote2;
+            },
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+    var spins2: u8 = 0;
+    while (spins2 < 12) : (spins2 += 1) try server.runOnce();
+    var got2: [128]u8 = @splat(0);
+    const read2 = linux.read(client2, &got2, got2.len);
+    if (posix.errno(read2) != .SUCCESS or read2 == 0) return error.Unexpected;
+    const text2 = got2[0..read2];
+    try std.testing.expect(std.mem.indexOf(u8, text2, "PONG") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text2, "two") != null);
     try std.testing.expectError(error.Unsupported, io_backend.refuseForeignCapsule());
     std.debug.print("GAP-X1 branch=PortableServer answered PING lane with PONG through processLine on {s}\n", .{@tagName(server.backend.family)});
 }

@@ -868,27 +868,35 @@ pub fn systemResolverConfig() ResolverConfig {
     return cfg;
 }
 
-/// Read a small file into `buf` via raw syscalls (no allocator / Io dependency),
-/// returning the populated slice or null on any error.
+/// Read a small file into `buf` (no allocator / Io dependency), or null on error.
+/// Linux `open` is syscall 2. That number is `fork` on FreeBSD, so this uses
+/// the target POSIX open rather than `std.os.linux`.
 fn readFileZ(path: [*:0]const u8, buf: []u8) ?[]u8 {
-    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
-    if (posix.errno(rc) != .SUCCESS) return null;
-    const fd: linux.fd_t = @intCast(rc);
-    defer _ = linux.close(fd);
+    if (comptime builtin.os.tag == .windows) return null;
+    const fd = posix.openatZ(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return null;
+    defer _ = posix.system.close(fd);
     var total: usize = 0;
     while (total < buf.len) {
-        const r = linux.read(fd, buf[total..].ptr, buf.len - total);
-        switch (posix.errno(r)) {
-            .SUCCESS => {
-                const got: usize = @intCast(r);
-                if (got == 0) break;
-                total += got;
-            },
-            .INTR => continue,
-            else => return null,
-        }
+        const got = posix.read(fd, buf[total..]) catch return null;
+        if (got == 0) break;
+        total += got;
     }
     return buf[0..total];
+}
+
+fn randomIdHost() ResolveError!u16 {
+    switch (builtin.os.tag) {
+        .linux, .windows => return error.RandomSourceFailed,
+        else => {
+            var b: [2]u8 = undefined;
+            const c = struct {
+                extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
+            };
+            c.arc4random_buf(&b, b.len);
+            const id = std.mem.readInt(u16, &b, .little);
+            return if (id == 0) 1 else id;
+        },
+    }
 }
 
 fn addressEql(a: Address, b: Address) bool {
@@ -1038,6 +1046,8 @@ fn queryAll(
 }
 
 fn randomId() ResolveError!u16 {
+    // Linux getrandom is syscall 318. Off Linux that number is not getrandom.
+    if (comptime builtin.os.tag != .linux) return randomIdHost();
     var b: [2]u8 = undefined;
     var filled: usize = 0;
     while (filled < b.len) {
@@ -1291,6 +1301,12 @@ test "parses IPv4 and IPv6 nameserver literals" {
     try std.testing.expectEqual(@as(u8, 0x20), v6.ipv6[0]);
     try std.testing.expect(parseIpLiteral("not-an-ip") == null);
     try std.testing.expect(parseIpLiteral("999.1.1.1") == null);
+}
+
+test "systemResolverConfig returns nameservers from the host file or the public fallback" {
+    const cfg = systemResolverConfig();
+    try std.testing.expect(cfg.nameserver_count > 0);
+    try std.testing.expect(cfg.nameserver_count <= max_nameservers);
 }
 
 test "parseResolvConf extracts nameservers and ignores noise" {
