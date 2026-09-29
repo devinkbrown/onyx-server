@@ -358,6 +358,7 @@ const userip = @import("../proto/userip.zig");
 const server_stats = @import("server_stats.zig");
 const command_usage = @import("command_usage.zig");
 const metrics_http = @import("metrics_http.zig");
+const history_http = @import("history_http.zig");
 const webhook_mod = @import("webhook.zig");
 const webhook_http = @import("webhook_http.zig");
 const activity = @import("../proto/activity.zig");
@@ -23007,8 +23008,12 @@ pub const LinuxServer = struct {
         return dmHistoryKey(conn.session.displayName(), conn.session.account(), target, peer_account, out) orelse target;
     }
 
-    fn ensureChathistoryTargetVisible(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, target: []const u8) !bool {
-        if (!world_model.isChannelName(target)) return true;
+    const HistoryView = enum { allow, hidden, policy };
+
+    /// Same channel visibility CHATHISTORY uses. A non-channel target is a
+    /// direct-message key built from the caller, not a network-wide read.
+    fn historyView(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, target: []const u8) HistoryView {
+        if (!world_model.isChannelName(target)) return .allow;
         const wid = worldIdFromClient(id);
         const channel_exists = self.world.channelExists(target);
         const is_member = self.world.isMember(target, wid);
@@ -23016,14 +23021,48 @@ pub const LinuxServer = struct {
             !self.world.channelHasFlag(target, .secret) and
             !self.world.isPrivate(target) and
             !self.world.isHidden(target);
-        if (!chathistory_cmd.channelHistoryTargetAllowed(channel_exists, is_member, is_visible)) {
-            try self.failReply(conn, "CHATHISTORY", "ACCESS_DENIED", "Cannot access channel history");
-            return false;
+        if (!chathistory_cmd.channelHistoryTargetAllowed(channel_exists, is_member, is_visible)) return .hidden;
+        if (!self.historyPolicyAllows(target, is_member, conn.session.isOper())) return .policy;
+        return .allow;
+    }
+
+    fn ensureChathistoryTargetVisible(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, target: []const u8) !bool {
+        switch (self.historyView(id, conn, target)) {
+            .allow => return true,
+            .policy => {
+                self.publishHistoryPolicyDeny(target, conn);
+                try self.failReply(conn, "CHATHISTORY", "ACCESS_DENIED", "Cannot access channel history");
+                return false;
+            },
+            .hidden => {
+                try self.failReply(conn, "CHATHISTORY", "ACCESS_DENIED", "Cannot access channel history");
+                return false;
+            },
         }
-        if (self.historyPolicyAllows(target, is_member, conn.session.isOper())) return true;
-        self.publishHistoryPolicyDeny(target, conn);
-        try self.failReply(conn, "CHATHISTORY", "ACCESS_DENIED", "Cannot access channel history");
-        return false;
+    }
+
+    /// Bodies the live account can already read with CHATHISTORY. A missing
+    /// session or a failed visibility check is a denial, not an empty room.
+    pub fn readAccountHistory(self: *LinuxServer, account: []const u8, target: []const u8, out: []lotus.Message) error{Denied}![]const lotus.Message {
+        const live = self.connForAccount(account) orelse return error.Denied;
+        if (self.historyView(live.id, live.conn, target) != .allow) return error.Denied;
+        if (world_model.isChannelName(target)) {
+            if (self.accountIsGatedBot(account) and !self.bot_grants.allows(account, .history, target, self.grantNowU64())) return error.Denied;
+        }
+        var key_buf: [320]u8 = undefined;
+        const store_target = self.historyKeyForTarget(live.conn, target, &key_buf);
+        return self.history.latest(store_target, out.len, out) catch return error.Denied;
+    }
+
+    fn connForAccount(self: *LinuxServer, account: []const u8) ?struct { id: client_model.ClientId, conn: *ConnState } {
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const acct = entry.value.session.account() orelse continue;
+                if (std.ascii.eqlIgnoreCase(acct, account)) return .{ .id = entry.id, .conn = entry.value };
+            }
+        }
+        return null;
     }
 
     fn historyRealtimeMs() u64 {
@@ -111358,6 +111397,58 @@ test "GAP-P11 IRCX screens name a handler or a divergence" {
     std.debug.print("GAP-P11 divergence=remote LISTX creation time stays 0 because creation is not replicated\n", .{});
     std.debug.print("GAP-P11 divergence=TACCESS BTPROP comic-chat avatar DATA and OPFORCE stay unwired\n", .{});
     std.debug.print("GAP-P11 branch=handlers at file:line or an explicit divergence and the client stays in the Onyx repo\n", .{});
+}
+
+fn gapP12Fill(ptr: *anyopaque, account: []const u8, target: []const u8, out: []u8) error{Denied}!usize {
+    const server: *Server = @ptrCast(@alignCast(ptr));
+    var msgs: [8]lotus.Message = undefined;
+    const rows = try server.readAccountHistory(account, target, &msgs);
+    var n: usize = 0;
+    for (rows) |row| {
+        if (n >= out.len) break;
+        const line = std.fmt.bufPrint(out[n..], "{s} {s}\n", .{ row.msgid, row.text }) catch break;
+        n += line.len;
+    }
+    return n;
+}
+
+test "GAP-P12 a loopback history read matches CHATHISTORY visibility" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "p12.test" };
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const member_id = try addTestLocalClient(server, "member", "member");
+    const outsider_id = try addTestLocalClient(server, "outsider", "outsider");
+    _ = try server.world.join("#room", worldIdFromClient(member_id));
+    _ = try server.world.setChannelFlag("#room", .secret, true);
+    server.recordHistoryRelayAt("#room", "member!member@localhost", "m1", "PRIVMSG", "visible line", null, server.meshWallMs());
+    try std.testing.expect(!server.connFor(member_id).?.session.isOper());
+    try std.testing.expect(!server.connFor(outsider_id).?.session.isOper());
+
+    const reader = history_http.Reader{ .ptr = server, .readFn = gapP12Fill };
+    var body: [512]u8 = undefined;
+    var outbuf: [1024]u8 = undefined;
+    const allowed = history_http.handleRequest("GET /history?target=%23room HTTP/1.1\r\nAuthorization: Bearer member\r\n\r\n", reader, &body, &outbuf);
+    try std.testing.expect(std.mem.indexOf(u8, allowed, " 200 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed, "visible line") != null);
+
+    const denied = history_http.handleRequest("GET /history?target=%23room HTTP/1.1\r\nAuthorization: Bearer outsider\r\n\r\n", reader, &body, &outbuf);
+    try std.testing.expect(std.mem.indexOf(u8, denied, " 403 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied, "visible line") == null);
+
+    const ghost = history_http.handleRequest("GET /history?target=%23room HTTP/1.1\r\nAuthorization: Bearer ghost\r\n\r\n", reader, &body, &outbuf);
+    try std.testing.expect(std.mem.indexOf(u8, ghost, " 403 ") != null);
+    try std.testing.expectError(error.PublicBind, history_http.listenAddr("0.0.0.0"));
+
+    current_reactor = null;
+    std.debug.print("GAP-P12 branch=loopback GET /history returns the lines CHATHISTORY would and a public bind is refused\n", .{});
 }
 
 test {

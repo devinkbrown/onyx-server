@@ -109,6 +109,7 @@ pub const appeal = @import("appeal.zig");
 pub const challenge = @import("challenge.zig");
 pub const first_hold = @import("first_hold.zig");
 pub const slash_cmd = @import("slash_cmd.zig");
+pub const history_http = @import("history_http.zig");
 pub const secured_s2s_link = @import("secured_s2s_link.zig");
 pub const server = @import("server.zig");
 pub const server_stats = @import("server_stats.zig");
@@ -463,6 +464,7 @@ test {
     _ = challenge;
     _ = first_hold;
     _ = slash_cmd;
+    _ = history_http;
     _ = secured_s2s_link;
     _ = server;
     _ = server_stats;
