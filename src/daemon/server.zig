@@ -5009,6 +5009,8 @@ pub const LinuxServer = struct {
         self.writeNodeHealthPrometheus(self.allocator, &out) catch return;
         self.peer_health.writePrometheus(self.allocator, &out) catch return;
         self.writeE2eeGroupPrometheus(self.allocator, &out) catch return;
+        const webpush_dropped: usize = if (self.webpush_worker) |worker| worker.dropped.load(.monotonic) else 0;
+        webpush_mod.appendDroppedSample(&out, self.allocator, webpush_dropped) catch return;
         self.metrics_snapshot.set(out.items) catch return;
     }
 
@@ -46374,7 +46376,14 @@ pub const LinuxServer = struct {
         }
         w.writeAll("}") catch return;
 
-        for (live[0..n]) |s_| worker.enqueue(s_.endpoint, s_.ua_public, s_.auth, w.buffered());
+        for (live[0..n]) |s_| {
+            const queued = worker.enqueue(s_.endpoint, s_.ua_public, s_.auth, w.buffered());
+            if (queued == .dropped) {
+                if (worker.takeOverflowOperEvent()) |msg| {
+                    self.publishOperEvent(.service, .warn, msg) catch {};
+                }
+            }
+        }
     }
 
     /// True when `hay` contains `needle` as a case-insensitive IRC nick token

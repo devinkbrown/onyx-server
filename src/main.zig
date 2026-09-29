@@ -1425,7 +1425,7 @@ pub fn main(init: std.process.Init) !void {
                 srv.webpush_worker = w;
                 std.debug.print("onyx-server: web push live ({d} trust anchors; VAPID {s})\n", .{ anchors.items.len, srv_cfg.webpush_vapid_pub });
             } else {
-                std.debug.print("onyx-server: [webpush] enabled but web push is Linux-only; disabled\n", .{});
+                std.debug.print("onyx-server: [webpush] enabled but {s}\n", .{onyx_server.daemon.webpush.portable_disable_reason});
             }
         }
     }

@@ -24,6 +24,7 @@ const ecdsa = @import("../crypto/ecdsa_p256.zig");
 const acme_runner = @import("acme_runner.zig");
 const http1 = @import("../proto/http1_client.zig");
 const platform = @import("../substrate/platform.zig");
+const services_mod = @import("services.zig");
 
 const Allocator = std.mem.Allocator;
 const net = std.Io.net;
@@ -37,8 +38,13 @@ pub const max_endpoint_len: usize = 512;
 pub const push_ttl_seconds: u32 = 12 * 60 * 60;
 /// VAPID JWT lifetime (must be ≤ 24h; short keeps a leaked token boring).
 pub const vapid_jwt_ttl_seconds: i64 = 12 * 60 * 60;
-/// Bound on queued jobs; beyond it new pushes drop (push is best-effort).
+/// Bound on queued jobs. A full queue drops the new push, counts it, and
+/// leaves an oper event. Jobs already queued stay queued. The cap stays 256.
 pub const max_queued_jobs: usize = 256;
+/// Oper text published when `enqueue` drops because the queue is full.
+pub const overflow_oper_message = "WEBPUSH queue full; dropped a push";
+/// Printed by the non-Linux boot path. Wave 6 keeps this explicit disable.
+pub const portable_disable_reason = "web push is Linux-only; disabled";
 
 pub const Config = struct {
     /// Master gate: off = command rejected, no worker, nothing advertised.
@@ -285,6 +291,11 @@ pub const Worker = struct {
     /// tolerable: monotonically increasing counters).
     sent: usize = 0,
     failed: usize = 0,
+    /// Jobs refused because the queue already held `max_queued_jobs`.
+    /// Incremented on the enqueue thread; metrics scrapes load it atomically.
+    dropped: std.atomic.Value(usize) = .init(0),
+    /// Unpublished overflow oper events. Drained by `takeOverflowOperEvent`.
+    overflow_events: usize = 0,
 
     pub fn spawn(self: *Worker) !void {
         self.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, run, .{self});
@@ -300,22 +311,31 @@ pub const Worker = struct {
         self.dead.deinit(self.allocator);
     }
 
-    /// Enqueue a push (copies everything). Full queue = dropped: push is a
-    /// best-effort nudge, never a delivery guarantee (memo holds the DM).
+    pub const EnqueueResult = enum { queued, dropped, stopped, nomem };
+
+    /// Enqueue a push (copies everything). A full queue drops this job, counts
+    /// it on `dropped`, and leaves an oper event for `takeOverflowOperEvent`.
+    /// Jobs already queued stay queued so delivery is still attempted. Stop
+    /// and allocation failure are not overflow. The memo remains the DM.
     pub fn enqueue(
         self: *Worker,
         endpoint: []const u8,
         ua_public: [wp_crypto.ua_public_length]u8,
         auth: [wp_crypto.auth_secret_length]u8,
         payload: []const u8,
-    ) void {
+    ) EnqueueResult {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        if (self.stop_flag.load(.acquire) or self.queue.items.len >= max_queued_jobs) return;
-        const ep = self.allocator.dupe(u8, endpoint) catch return;
+        if (self.stop_flag.load(.acquire)) return .stopped;
+        if (self.queue.items.len >= max_queued_jobs) {
+            _ = self.dropped.fetchAdd(1, .monotonic);
+            self.overflow_events +|= 1;
+            return .dropped;
+        }
+        const ep = self.allocator.dupe(u8, endpoint) catch return .nomem;
         const pl = self.allocator.dupe(u8, payload) catch {
             self.allocator.free(ep);
-            return;
+            return .nomem;
         };
         self.queue.append(self.allocator, .{
             .endpoint = ep,
@@ -325,8 +345,19 @@ pub const Worker = struct {
         }) catch {
             self.allocator.free(ep);
             self.allocator.free(pl);
-            return;
+            return .nomem;
         };
+        return .queued;
+    }
+
+    /// One pending overflow oper line, or null when none is waiting.
+    /// The slice is the static `overflow_oper_message`.
+    pub fn takeOverflowOperEvent(self: *Worker) ?[]const u8 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.overflow_events == 0) return null;
+        self.overflow_events -= 1;
+        return overflow_oper_message;
     }
 
     /// Take ownership of the dead-endpoint list (freed with this worker's
@@ -426,6 +457,13 @@ pub const Worker = struct {
         dlog.log("webpush: {s} answered {d}\n", .{ job.endpoint, resp.status });
     }
 };
+
+/// Prometheus sample for jobs dropped because the delivery queue was full.
+pub fn appendDroppedSample(out: *std.ArrayList(u8), allocator: Allocator, dropped: usize) Allocator.Error!void {
+    try out.print(allocator, "# HELP onyx_webpush_dropped Web Push jobs dropped because the delivery queue was full\n", .{});
+    try out.print(allocator, "# TYPE onyx_webpush_dropped counter\n", .{});
+    try out.print(allocator, "onyx_webpush_dropped {d}\n", .{dropped});
+}
 
 fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.Thread.yield() catch {};
@@ -583,10 +621,85 @@ test "worker enqueue/shutdown never blocks and bounds the queue" {
     };
     try w.spawn();
     const ua = try @import("../crypto/ecdh_p256.zig").generate();
-    w.enqueue("https://push.example.net/send/1", ua.public_sec1, @as([16]u8, @splat(1)), "{\"type\":\"dm\"}");
+    _ = w.enqueue("https://push.example.net/send/1", ua.public_sec1, @as([16]u8, @splat(1)), "{\"type\":\"dm\"}");
     sleepMs(50);
     w.shutdown();
     // The lone job either failed (dead resolver) or was still queued at
     // shutdown; both are fine — nothing hung, nothing leaked.
     try testing.expect(w.sent == 0);
+}
+
+test "DST GAP-D8 webpush queue overflow increments a metric and emits an oper event" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(testing.allocator, testing.io, tmp.dir, "d8-webpush.wal");
+    defer store.deinit();
+    var svc = services_mod.Services.init(&store, null);
+
+    const endpoint = "https://push.example.net/send/kept";
+    var subs = [_]Subscription{
+        .{
+            .endpoint = try testing.allocator.dupe(u8, endpoint),
+            .ua_public = [_]u8{4} ++ @as([64]u8, @splat(1)),
+            .auth = @as([16]u8, @splat(7)),
+        },
+    };
+    defer subs[0].deinit(testing.allocator);
+    const blob = try encodeList(testing.allocator, &subs);
+    defer testing.allocator.free(blob);
+    try svc.webpushPut("alice", blob);
+
+    var ctx_byte: u8 = 0;
+    const FailResolver = struct {
+        fn resolve(_: *anyopaque, _: []const u8, _: u16) anyerror!net.IpAddress {
+            return error.TemporaryNameServerFailure;
+        }
+    };
+    var w = Worker{
+        .allocator = testing.allocator,
+        .vapid = ecdsa.KeyPair.generate(testing.io),
+        .subject = "mailto:t@example.net",
+        .resolver = .{ .ctx = @ptrCast(&ctx_byte), .resolveFn = FailResolver.resolve },
+        .trust_anchors = &.{},
+    };
+    // No worker thread: a live drain would hide the full-queue drop.
+    defer w.shutdown();
+
+    var i: usize = 0;
+    while (i < max_queued_jobs) : (i += 1) {
+        try testing.expectEqual(Worker.EnqueueResult.queued, w.enqueue(endpoint, subs[0].ua_public, subs[0].auth, "{\"type\":\"dm\"}"));
+    }
+    try testing.expectEqual(@as(usize, 0), w.dropped.load(.monotonic));
+    try testing.expect(w.takeOverflowOperEvent() == null);
+    try testing.expectEqual(max_queued_jobs, w.queue.items.len);
+
+    try testing.expectEqual(Worker.EnqueueResult.dropped, w.enqueue(endpoint, subs[0].ua_public, subs[0].auth, "{\"type\":\"dm\"}"));
+    try testing.expectEqual(@as(usize, 1), w.dropped.load(.monotonic));
+    try testing.expectEqual(max_queued_jobs, w.queue.items.len);
+    try testing.expectEqualStrings(endpoint, w.queue.items[0].endpoint);
+    try testing.expectEqualStrings(endpoint, w.queue.items[max_queued_jobs - 1].endpoint);
+    try testing.expectEqualStrings(overflow_oper_message, w.takeOverflowOperEvent() orelse "");
+    try testing.expect(w.takeOverflowOperEvent() == null);
+
+    try testing.expectEqual(Worker.EnqueueResult.dropped, w.enqueue(endpoint, subs[0].ua_public, subs[0].auth, "{\"type\":\"dm\"}"));
+    try testing.expectEqual(@as(usize, 2), w.dropped.load(.monotonic));
+    try testing.expectEqual(max_queued_jobs, w.queue.items.len);
+    try testing.expectEqualStrings(overflow_oper_message, w.takeOverflowOperEvent() orelse "");
+
+    var metric: std.ArrayList(u8) = .empty;
+    defer metric.deinit(testing.allocator);
+    try appendDroppedSample(&metric, testing.allocator, w.dropped.load(.monotonic));
+    try testing.expect(std.mem.indexOf(u8, metric.items, "# TYPE onyx_webpush_dropped counter\n") != null);
+    try testing.expect(std.mem.indexOf(u8, metric.items, "onyx_webpush_dropped 2\n") != null);
+    var zero: std.ArrayList(u8) = .empty;
+    defer zero.deinit(testing.allocator);
+    try appendDroppedSample(&zero, testing.allocator, 0);
+    try testing.expect(std.mem.indexOf(u8, zero.items, "onyx_webpush_dropped 0\n") != null);
+
+    const kept = svc.webpushGetAlloc(testing.allocator, "alice") orelse return error.MissingSubscription;
+    defer testing.allocator.free(kept);
+    try testing.expectEqualSlices(u8, blob, kept);
+    try testing.expectEqualStrings(portable_disable_reason, "web push is Linux-only; disabled");
+
+    std.debug.print("GAP-D8 branch=full webpush queue increments onyx_webpush_dropped and emits an oper event; subscription rows in props stay; live mail stays off; non-Linux keeps the explicit disable\n", .{});
 }
