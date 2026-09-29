@@ -1213,6 +1213,7 @@ pub fn mintEd25519Leaf(
 const oid_basic_constraints_bytes = [_]u8{ 0x55, 0x1D, 0x13 };
 const oid_subject_alt_name_bytes = [_]u8{ 0x55, 0x1D, 0x11 };
 const oid_name_constraints_bytes = [_]u8{ 0x55, 0x1D, 0x1E };
+const oid_key_usage_bytes = [_]u8{ 0x55, 0x1D, 0x0F };
 
 /// Extension inputs for `mintEd25519CertExt`. All fields default to "omit this
 /// extension" so a plain leaf needs only `dns_names`.
@@ -1227,6 +1228,9 @@ const CertExtOpts = struct {
     permitted_dns: []const []const u8 = &.{},
     /// NameConstraints excludedSubtrees (dNSName). Empty omits the field.
     excluded_dns: []const []const u8 = &.{},
+    /// Null omits KeyUsage. False emits the extension with digitalSignature
+    /// clear. True emits digitalSignature.
+    key_usage_digital_signature: ?bool = null,
 };
 
 fn writeExtTlv(w: *W, oid: []const u8, ext_value: []const u8) void {
@@ -1235,6 +1239,16 @@ fn writeExtTlv(w: *W, oid: []const u8, ext_value: []const u8) void {
     b.tlv(0x06, oid); // extnID
     b.tlv(0x04, ext_value); // extnValue OCTET STRING
     w.tlv(0x30, b.bytes()); // Extension SEQUENCE
+}
+
+/// KeyUsage BIT STRING. digitalSignature is bit 0. A clear bit still emits
+/// the extension so a verifier can tell "absent" from "present and forbidden".
+fn writeKeyUsageExt(w: *W, digital_signature: bool) void {
+    const bits = if (digital_signature) [_]u8{ 0x07, 0x80 } else [_]u8{ 0x07, 0x00 };
+    var val: [8]u8 = undefined;
+    var v = W.init(&val);
+    v.tlv(0x03, &bits);
+    writeExtTlv(w, &oid_key_usage_bytes, v.bytes());
 }
 
 fn writeBasicConstraintsExt(w: *W, path_len: ?u8) void {
@@ -1325,6 +1339,7 @@ pub fn mintEd25519CertExt(
     var esb = W.init(&ext_seq_body);
     if (opts.is_ca) writeBasicConstraintsExt(&esb, opts.path_len);
     if (opts.dns_names.len != 0) writeSanExt(&esb, opts.dns_names);
+    if (opts.key_usage_digital_signature) |bit| writeKeyUsageExt(&esb, bit);
     if (opts.permitted_dns.len != 0 or opts.excluded_dns.len != 0) {
         writeNameConstraintsExt(&esb, opts.permitted_dns, opts.excluded_dns);
     }

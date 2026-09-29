@@ -3528,6 +3528,9 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
     // ExtendedKeyUsage extension is present it has to list serverAuth (or
     // anyExtendedKeyUsage). Absent EKU is permitted (unrestricted).
     if (leaf.eku_present and !leaf.eku_server_auth) return error.BadCertificate;
+    // KeyUsage, when present, must allow digitalSignature. This runs while the
+    // Certificate message is checked, before CertificateVerify.
+    if (leaf.key_usage_present and !leaf.key_usage_digital_signature) return error.BadCertificate;
 
     var i: usize = 0;
     while (i + 1 < chain.len) : (i += 1) {
@@ -6794,6 +6797,42 @@ test "GAP-K11 a trust anchor's name constraints and path length bind a chain tha
     try verifyChainToTrustAnchors(&ok_chain, &name_anchors, "host.example.com", null);
 
     std.debug.print("GAP-K11 branch=a trust anchor's name constraints and path length bind a chain that omits it\n", .{});
+}
+
+test "GAP-K12 a leaf keyUsage without digitalSignature is rejected before CertificateVerify" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const nb: i64 = 1_704_067_200;
+    const na: i64 = 1_924_991_999;
+    const ca_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x41)));
+    const leaf_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x42)));
+    var ca_buf: [1024]u8 = undefined;
+    const ca = try x509_verify.mintEd25519CertExt(&ca_buf, "KU CA", "KU CA", ca_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .is_ca = true,
+    });
+    var leaf_buf: [1024]u8 = undefined;
+
+    const forbidden = try x509_verify.mintEd25519CertExt(&leaf_buf, "KU CA", "leaf.ku.test", leaf_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .dns_names = &.{"leaf.ku.test"},
+        .key_usage_digital_signature = false,
+    });
+    const forbidden_chain = [_][]const u8{ forbidden, ca };
+    const anchors = [_][]const u8{ca};
+    try std.testing.expectError(error.BadCertificate, verifyChainToTrustAnchors(&forbidden_chain, &anchors, "leaf.ku.test", null));
+
+    const absent = try x509_verify.mintEd25519CertExt(&leaf_buf, "KU CA", "leaf.ku.test", leaf_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .dns_names = &.{"leaf.ku.test"},
+    });
+    const absent_chain = [_][]const u8{ absent, ca };
+    try verifyChainToTrustAnchors(&absent_chain, &anchors, "leaf.ku.test", null);
+
+    const allowed = try x509_verify.mintEd25519CertExt(&leaf_buf, "KU CA", "leaf.ku.test", leaf_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .dns_names = &.{"leaf.ku.test"},
+        .key_usage_digital_signature = true,
+    });
+    const allowed_chain = [_][]const u8{ allowed, ca };
+    try verifyChainToTrustAnchors(&allowed_chain, &anchors, "leaf.ku.test", null);
+
+    std.debug.print("GAP-K12 branch=a leaf keyUsage without digitalSignature is rejected before CertificateVerify\n", .{});
 }
 
 // ---------------------------------------------------------------------------
