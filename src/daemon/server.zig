@@ -46351,6 +46351,65 @@ pub const LinuxServer = struct {
             try self.mediaStats(conn, channel);
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "CONSENT")) {
+            if (parsed.param_count < 3) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA CONSENT <#chan> <on|off>");
+                return;
+            }
+            if (!self.media_rooms.isParticipant(channel, nick)) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before setting consent");
+                return;
+            }
+            const token = parsed.paramSlice()[2];
+            const on = std.ascii.eqlIgnoreCase(token, "on") or std.mem.eql(u8, token, "1");
+            const off = std.ascii.eqlIgnoreCase(token, "off") or std.mem.eql(u8, token, "0");
+            if (!on and !off) {
+                try self.failReply(conn, "MEDIA", "BAD_CONSENT", "Consent must be on or off");
+                return;
+            }
+            if (!try self.media_rooms.setConsent(channel, nick, on)) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before setting consent");
+                return;
+            }
+            if (!on and self.media_rooms.stopRecording(channel)) {
+                try self.broadcastMediaEvent(channel, "RECORD", nick, "stopped");
+            }
+            try self.broadcastMediaEvent(channel, "CONSENT", nick, if (on) "on" else "off");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "RECORD")) {
+            if (!self.media_rooms.isParticipant(channel, nick)) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before recording");
+                return;
+            }
+            if (parsed.param_count >= 3 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[2], "stop")) {
+                if (self.media_rooms.stopRecording(channel)) {
+                    try self.broadcastMediaEvent(channel, "RECORD", nick, "stopped");
+                } else {
+                    try self.sendMediaEventReply(conn, "RECORD", channel, "active=0");
+                }
+                return;
+            }
+            if (!self.media_rooms.allConsented(channel)) {
+                try self.failReply(conn, "MEDIA", "CONSENT_REQUIRED", "Every current member must consent before recording");
+                return;
+            }
+            if (self.media_rooms.recordingOf(channel)) |rec| {
+                if (rec.active) {
+                    var buf: [96]u8 = undefined;
+                    const detail = std.fmt.bufPrint(&buf, "active=1 by={s}", .{rec.by()}) catch return;
+                    try self.sendMediaEventReply(conn, "RECORD", channel, detail);
+                    return;
+                }
+            }
+            if (!try self.media_rooms.startRecording(channel, nick)) {
+                try self.failReply(conn, "MEDIA", "CONSENT_REQUIRED", "Every current member must consent before recording");
+                return;
+            }
+            try self.broadcastMediaEvent(channel, "RECORD", nick, "started");
+            try self.sendMediaEventReply(conn, "RECORD", channel, "started");
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "LAYER")) {
             // `MEDIA LAYER <#chan> <max_spatial> <max_temporal>` — receiver-driven
             // simulcast: ask the native SFU to forward this receiver only up to
@@ -46681,6 +46740,15 @@ pub const LinuxServer = struct {
             };
             if (self.media_physical_attachments.items.len == 1 or physical.first_kind) conn.clearMediaE2eeAttachment();
             if (physical.first_kind) try self.broadcastMediaEvent(channel, "JOIN", nick, kname);
+            if (physical.first_kind) {
+                if (self.media_rooms.recordingOf(channel)) |rec| {
+                    if (rec.active and !self.media_rooms.hasConsent(channel, nick)) {
+                        _ = self.media_rooms.stopRecording(channel);
+                        try self.broadcastMediaEvent(channel, "RECORD", nick, "stopped");
+                        try self.sendMediaEventReply(conn, "RECORD", channel, "stopped");
+                    }
+                }
+            }
             // Era 3 C3: closed-tab call invite for co-channel members not yet in media.
             if (physical.first_kind) self.webpushNotifyCallInvite(channel, nick);
             // WS media plane: bind this connection to the call and hand it the
@@ -46715,7 +46783,7 @@ pub const LinuxServer = struct {
             else
                 try self.failReply(conn, "MEDIA", "NOT_PUBLISHING", "You are not publishing that kind");
         } else {
-            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, BREAKOUT, POS, HAND, REACT, CAPTION, TRANSCRIPT, E2EE-HANDSHAKE, E2EE-GROUPKEY, or ROSTER");
+            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, BREAKOUT, POS, HAND, REACT, CAPTION, TRANSCRIPT, CONSENT, RECORD, E2EE-HANDSHAKE, E2EE-GROUPKEY, or ROSTER");
         }
     }
 
@@ -47568,11 +47636,12 @@ pub const LinuxServer = struct {
             const pos = self.media_rooms.positionOf(channel, p.id.slice());
             const hand: []const u8 = if (self.media_rooms.handRaised(channel, p.id.slice())) "hand" else "-";
             var buf: [default_reply_bytes]u8 = undefined;
+            const consent: u8 = if (self.media_rooms.hasConsent(channel, p.id.slice())) 1 else 0;
             const detail = if (self.media_rooms.participantProfileOf(channel, p.id.slice())) |prof| blk: {
                 var caps_buf: [256]u8 = undefined;
-                const caps = formatMediaCodecDetail(&caps_buf, prof.slice(), prof.fec) orelse break :blk std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand }) catch continue;
-                break :blk std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s} {s}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand, caps }) catch continue;
-            } else std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand }) catch continue;
+                const caps = formatMediaCodecDetail(&caps_buf, prof.slice(), prof.fec) orelse break :blk std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s} consent={d}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand, consent }) catch continue;
+                break :blk std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s} {s} consent={d}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand, caps, consent }) catch continue;
+            } else std.fmt.bufPrint(&buf, "{s} {s} {s} {d} {d} {s} consent={d}", .{ p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand, consent }) catch continue;
             try self.sendMediaEventReply(conn, "ROSTER", channel, detail);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;
@@ -53931,6 +54000,69 @@ test "GAP-V3 MEDIA ABR stores independent spatial ceilings from the hint" {
     try std.testing.expect(std.mem.indexOf(u8, high_reply, "action=increase") != null);
 
     std.debug.print("GAP-V3 branch=MEDIA ABR applies each receiver's abrHint to its own spatial ceiling\n", .{});
+}
+
+test "GAP-V4 recording waits for every member and stops when one joins" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const carol_id = try addTestLocalClient(&server, "carol", null);
+    _ = try server.world.join("#rec", worldIdFromClient(alice_id));
+    _ = try server.world.join("#rec", worldIdFromClient(bob_id));
+    _ = try server.world.join("#rec", worldIdFromClient(carol_id));
+    const alice = server.rx().clients.get(alice_id).?;
+    const bob = server.rx().clients.get(bob_id).?;
+    const carol = server.rx().clients.get(carol_id).?;
+    alice.send_armed = true;
+    bob.send_armed = true;
+    carol.send_armed = true;
+
+    const join_a = try irc_line.parseLine("MEDIA JOIN #rec voice");
+    const join_b = try irc_line.parseLine("MEDIA JOIN #rec voice");
+    try server.handleMedia(alice_id, alice, &join_a);
+    try server.handleMedia(bob_id, bob, &join_b);
+
+    alice.send_len = 0;
+    const too_soon = try irc_line.parseLine("MEDIA RECORD #rec");
+    try server.handleMedia(alice_id, alice, &too_soon);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "CONSENT_REQUIRED") != null);
+
+    const consent_a = try irc_line.parseLine("MEDIA CONSENT #rec on");
+    const consent_b = try irc_line.parseLine("MEDIA CONSENT #rec on");
+    try server.handleMedia(alice_id, alice, &consent_a);
+    try server.handleMedia(bob_id, bob, &consent_b);
+    alice.send_len = 0;
+    const record = try irc_line.parseLine("MEDIA RECORD #rec");
+    try server.handleMedia(alice_id, alice, &record);
+    const note = server.media_rooms.recordingOf("#rec") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(note.active);
+    try std.testing.expectEqualStrings("alice", note.by());
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "RECORD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "started") != null);
+
+    const roster = try irc_line.parseLine("MEDIA ROSTER #rec");
+    alice.send_len = 0;
+    try server.handleMedia(alice_id, alice, &roster);
+    const roster_text = alice.send_buf[0..alice.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, roster_text, "alice voice main 0 0 - consent=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, roster_text, "bob voice main 0 0 - consent=1") != null);
+
+    const join_c = try irc_line.parseLine("MEDIA JOIN #rec voice");
+    try server.handleMedia(carol_id, carol, &join_c);
+    const stopped = server.media_rooms.recordingOf("#rec") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!stopped.active);
+    try std.testing.expect(std.mem.indexOf(u8, carol.send_buf[0..carol.send_len], "stopped") != null);
+
+    std.debug.print("GAP-V4 branch=recording starts only after every member consents, is announced, and stops when a member joins without consent\n", .{});
 }
 
 /// Real encrypted link pair for daemon-level retained-replay tests. Keeping the

@@ -1066,6 +1066,7 @@ pub const Config = struct {
 
 pub const TomlError = error{
     ParseError,
+    HiddenRecorderRefused,
     UnknownOcg2Field,
     MissingOcg2AuthorityNodeId,
     MissingOcg2AuthorityPublicKey,
@@ -1398,6 +1399,12 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.history.search_max_token_bytes = try uintField(doc, "history.search.max_token_bytes", cfg.history.search_max_token_bytes, 8, 256);
 
     // [media]
+    // A recorder that bypasses the in-call consent bit cannot be configured.
+    if (doc.getBool("media.hidden_recorder") != null or
+        doc.getString("media.hidden_recorder") != null or
+        doc.getBool("media.record_without_consent") != null or
+        doc.getString("media.record_without_consent") != null)
+        return error.HiddenRecorderRefused;
     if (doc.getBool("media.enabled")) |b| cfg.media.enabled = b;
     cfg.media.max_upload_bytes = try uintField(doc, "media.max_upload_bytes", cfg.media.max_upload_bytes, 0, 1024 * 1024 * 1024);
     cfg.media.max_frame_bytes = try uintField(doc, "media.max_frame_bytes", cfg.media.max_frame_bytes, 0, 16 * 1024 * 1024);
@@ -3806,6 +3813,12 @@ test "parseToml: media.dtls13 defaults off and lifts independently of dtls_srtp"
     defer cfg.deinit(allocator);
     try testing.expect(cfg.media.dtls_srtp);
     try testing.expect(cfg.media.dtls13);
+}
+
+test "GAP-V4 config refuses a hidden recorder" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.HiddenRecorderRefused, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[media]\nhidden_recorder = true\n", .{}));
+    try testing.expectError(error.HiddenRecorderRefused, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[media]\nrecord_without_consent = true\n", .{}));
 }
 
 test "parseToml: media sizing keys default, lift, and validate ranges" {

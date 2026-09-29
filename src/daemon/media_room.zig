@@ -64,6 +64,17 @@ pub const max_breakout_bytes: usize = 32;
 /// scale/normalize). Default is the origin (centered / non-spatial).
 pub const Position = struct { x: i32 = 0, y: i32 = 0 };
 
+/// The stored record of a call recording. `by` is the member who started it.
+pub const Recording = struct {
+    by_buf: [64]u8 = undefined,
+    by_len: usize = 0,
+    active: bool = false,
+
+    pub fn by(self: *const Recording) []const u8 {
+        return self.by_buf[0..self.by_len];
+    }
+};
+
 /// Max distinct codecs a negotiated call profile retains.
 pub const max_profile_codecs: usize = 4;
 
@@ -102,6 +113,13 @@ pub const MediaRooms = struct {
     /// distinct from the channel profile: it records what each participant can
     /// receive so Causeway can keep the call transcode-free.
     participant_profiles: std.StringHashMap(CallProfile),
+    /// Visible consent bits, keyed by "channel\x00participant". Absent means
+    /// the member has not consented. There is no hidden-recorder flag.
+    consents: std.StringHashMap(void),
+    /// One oper-visible recording note per channel. The room announcement is
+    /// the existence signal; this row is the stored artifact. It is not a
+    /// media capture and it is cleared when the call ends.
+    recordings: std.StringHashMap(Recording),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
         return initConfig(allocator, .{});
@@ -117,6 +135,8 @@ pub const MediaRooms = struct {
             .hands = std.StringHashMap(void).init(allocator),
             .profiles = std.StringHashMap(CallProfile).init(allocator),
             .participant_profiles = std.StringHashMap(CallProfile).init(allocator),
+            .consents = std.StringHashMap(void).init(allocator),
+            .recordings = std.StringHashMap(Recording).init(allocator),
         };
     }
 
@@ -145,6 +165,12 @@ pub const MediaRooms = struct {
         var cit = self.participant_profiles.keyIterator();
         while (cit.next()) |key| self.allocator.free(key.*);
         self.participant_profiles.deinit();
+        var consent_it = self.consents.keyIterator();
+        while (consent_it.next()) |key| self.allocator.free(key.*);
+        self.consents.deinit();
+        var rec_it = self.recordings.keyIterator();
+        while (rec_it.next()) |key| self.allocator.free(key.*);
+        self.recordings.deinit();
         self.* = undefined;
     }
 
@@ -162,7 +188,9 @@ pub const MediaRooms = struct {
             self.positions.count() == 0 and
             self.hands.count() == 0 and
             self.profiles.count() == 0 and
-            self.participant_profiles.count() == 0;
+            self.participant_profiles.count() == 0 and
+            self.consents.count() == 0 and
+            self.recordings.count() == 0;
     }
 
     /// Build the "channel\x00participant" composite key into `buf`.
@@ -368,6 +396,7 @@ pub const MediaRooms = struct {
         self.clearPosition(channel, pid);
         self.clearHand(channel, pid);
         self.clearParticipantProfile(channel, pid);
+        self.clearConsent(channel, pid);
         if (entry.value_ptr.*.count() == 0) self.dropRoom(entry);
         return true;
     }
@@ -399,6 +428,84 @@ pub const MediaRooms = struct {
         return r.participant(id) != null;
     }
 
+    /// Set the visible consent bit. False when `pid` is not in the call.
+    pub fn setConsent(self: *MediaRooms, channel: []const u8, pid: []const u8, on: bool) Error!bool {
+        if (!self.isParticipant(channel, pid)) return false;
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return false;
+        if (on) {
+            const gop = try self.consents.getOrPut(k);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = self.allocator.dupe(u8, k) catch |e| {
+                    _ = self.consents.remove(k);
+                    return e;
+                };
+            }
+        } else self.clearConsent(channel, pid);
+        return true;
+    }
+
+    pub fn hasConsent(self: *const MediaRooms, channel: []const u8, pid: []const u8) bool {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return false;
+        return self.consents.contains(k);
+    }
+
+    fn clearConsent(self: *MediaRooms, channel: []const u8, pid: []const u8) void {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return;
+        if (self.consents.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+    }
+
+    /// True only when the call has at least one member and every member has
+    /// the consent bit set.
+    pub fn allConsented(self: *MediaRooms, channel: []const u8) bool {
+        const rows = self.roster(channel);
+        if (rows.len == 0) return false;
+        for (rows) |p| {
+            if (!self.hasConsent(channel, p.id.slice())) return false;
+        }
+        return true;
+    }
+
+    pub fn recordingOf(self: *const MediaRooms, channel: []const u8) ?Recording {
+        return self.recordings.get(channel);
+    }
+
+    /// Start the room recording. False when consent is not unanimous or a
+    /// recording is already active. The note is the stored artifact.
+    pub fn startRecording(self: *MediaRooms, channel: []const u8, by_nick: []const u8) Error!bool {
+        if (!self.allConsented(channel)) return false;
+        if (self.recordings.get(channel)) |existing| {
+            if (existing.active) return false;
+        }
+        var note = Recording{ .active = true };
+        const n = @min(by_nick.len, note.by_buf.len);
+        @memcpy(note.by_buf[0..n], by_nick[0..n]);
+        note.by_len = n;
+        const gop = try self.recordings.getOrPut(channel);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, channel) catch |e| {
+                _ = self.recordings.remove(channel);
+                return e;
+            };
+        }
+        gop.value_ptr.* = note;
+        return true;
+    }
+
+    /// Stop an active recording. False when none is active.
+    pub fn stopRecording(self: *MediaRooms, channel: []const u8) bool {
+        const note = self.recordings.getPtr(channel) orelse return false;
+        if (!note.active) return false;
+        note.active = false;
+        return true;
+    }
+
+    fn clearRecording(self: *MediaRooms, channel: []const u8) void {
+        if (self.recordings.fetchRemove(channel)) |kv| self.allocator.free(kv.key);
+    }
+
     fn ensure(self: *MediaRooms, channel: []const u8) Error!*Room {
         if (self.rooms.get(channel)) |r| return r;
         const r = try self.allocator.create(Room);
@@ -414,6 +521,7 @@ pub const MediaRooms = struct {
         const key = entry.key_ptr.*;
         const r = entry.value_ptr.*;
         self.clearProfile(key);
+        self.clearRecording(key);
         self.rooms.removeByPtr(entry.key_ptr);
         self.allocator.free(key);
         self.allocator.destroy(r);
@@ -519,6 +627,39 @@ test "breakout assignment defaults to main and clears on leave" {
     try testing.expectEqualStrings("ops", m.breakoutOf("#c", "alice"));
     try testing.expect(m.leaveAll("#c", "alice"));
     try testing.expectEqualStrings("main", m.breakoutOf("#c", "alice")); // cleared
+}
+
+test "GAP-V4 recording starts only when every member consented" {
+    var m = MediaRooms.init(testing.allocator);
+    defer m.deinit();
+    try m.join("#c", "alice", .voice);
+    try m.join("#c", "bob", .voice);
+    try testing.expect(!m.allConsented("#c"));
+    try testing.expect(!try m.startRecording("#c", "alice"));
+    try testing.expect(try m.setConsent("#c", "alice", true));
+    try testing.expect(!m.allConsented("#c"));
+    try testing.expect(try m.setConsent("#c", "bob", true));
+    try testing.expect(m.allConsented("#c"));
+    try testing.expect(try m.startRecording("#c", "alice"));
+    const started = m.recordingOf("#c").?;
+    try testing.expect(started.active);
+    try testing.expectEqualStrings("alice", started.by());
+
+    try m.join("#c", "carol", .voice);
+    try testing.expect(!m.hasConsent("#c", "carol"));
+    try testing.expect(m.stopRecording("#c"));
+    try testing.expect(!m.recordingOf("#c").?.active);
+
+    try testing.expect(try m.setConsent("#c", "carol", true));
+    try testing.expect(try m.startRecording("#c", "carol"));
+    try testing.expect(try m.setConsent("#c", "bob", false));
+    try testing.expect(!m.allConsented("#c"));
+    try testing.expect(m.stopRecording("#c"));
+    try testing.expect(m.leaveAll("#c", "alice"));
+    try testing.expect(m.leaveAll("#c", "bob"));
+    try testing.expect(m.leaveAll("#c", "carol"));
+    try testing.expect(m.recordingOf("#c") == null);
+    try testing.expect(m.upgradeContinuityReady());
 }
 
 test "spatial position defaults to origin and clears on leave" {
