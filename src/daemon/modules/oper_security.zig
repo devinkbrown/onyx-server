@@ -13,7 +13,7 @@ fn oper(c: *anyopaque, _: I) anyerror!void {
 }
 fn rehash(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
-    try x.server.handleRehash(x.conn);
+    try x.server.handleRehashParsed(x.conn, x.parsed);
 }
 fn grant(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);

@@ -153,6 +153,7 @@ const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const chathistory_targets = @import("../proto/chathistory_targets.zig");
 const msgedit = @import("../proto/msgedit.zig");
 const warden = @import("warden.zig");
+const rehash_dry = @import("rehash_dry.zig");
 const whox = @import("../proto/whox.zig");
 const metadata_proto = @import("../proto/metadata.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
@@ -48981,11 +48982,104 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    fn liveListenerSet(self: *const LinuxServer) config_format.ListenerSet {
+        return .{
+            .irc = self.config.port,
+            .tls = self.config.tls_port,
+            .ws = if (self.config.ws_enabled) self.config.ws_port else 0,
+            .webtransport = self.config.webtransport_port,
+            .s2s = self.config.s2s_port,
+            .media = self.config.media_port,
+            .native_media = self.config.native_media_port,
+        };
+    }
+
+    fn rehashLimitLive(self: *const LinuxServer) rehash_dry.LimitSnap {
+        return .{
+            .max_clones_per_ip = self.config.max_clones_per_ip,
+            .max_clones_per_net = self.config.max_clones_per_net,
+            .max_clones_per_ip_net = self.config.max_clones_per_ip_net,
+            .nick_delay_ms = self.config.nick_delay_ms,
+            .throttle_connects = self.config.throttle_connects,
+            .throttle_window_ms = self.config.throttle_window_ms,
+            .raid_joins = self.config.raid_joins,
+            .raid_secs = self.config.raid_secs,
+        };
+    }
+
+    fn rehashLimitProposed(lim: config_format.Config.Limits) rehash_dry.LimitSnap {
+        return .{
+            .max_clones_per_ip = lim.max_clones_per_ip,
+            .max_clones_per_net = lim.max_clones_per_net,
+            .max_clones_per_ip_net = lim.max_clones_per_ip_net,
+            .nick_delay_ms = lim.nick_delay_ms,
+            .throttle_connects = lim.throttle_connects,
+            .throttle_window_ms = lim.throttle_window_ms,
+            .raid_joins = lim.raid_joins,
+            .raid_secs = @max(@as(u64, 1), lim.raid_window_ms / 1000),
+        };
+    }
+
+    /// Build the class registry a real REHASH would install. The caller frees it.
+    /// A failure leaves the live registry alone.
+    fn proposedClassRegistry(self: *LinuxServer, parsed: *const config_format.Config) ?conn_class.Registry {
+        var cb = conn_class.Builder.init(self.allocator);
+        for (parsed.classes) |c| {
+            cb.add(.{
+                .name = c.name,
+                .policy = c.policy,
+                .cidr_texts = c.match_texts,
+                .tls_only = c.match_tls,
+                .account_only = c.match_account,
+                .oper_only = c.match_oper,
+                .ident_glob = c.ident_glob,
+                .host_glob = c.host_glob,
+            }) catch {
+                cb.deinit();
+                return null;
+            };
+        }
+        return cb.finish() catch {
+            cb.deinit();
+            return null;
+        };
+    }
+
+    fn emitRehashDry(self: *LinuxServer, conn: *ConnState, path: []const u8, parsed: *const config_format.Config) !void {
+        var proposed_reg = self.proposedClassRegistry(parsed);
+        defer if (proposed_reg) |*reg| reg.deinit();
+        const lines = try rehash_dry.report(self.allocator, .{
+            .live_limits = self.rehashLimitLive(),
+            .proposed_limits = rehashLimitProposed(parsed.limits),
+            .live_classes = if (self.config.class_registry) |*reg| reg.classes else &.{},
+            .proposed_classes = if (proposed_reg) |*reg| reg.classes else &.{},
+            .class_rejected = proposed_reg == null,
+            .live_dnsbl_ward = self.config.dnsbl_ward,
+            .proposed_dnsbl_ward = parsed.dnsbl.ward,
+            .running_wards = self.warden.wards.items,
+            .live_listeners = self.liveListenerSet(),
+            .proposed_listeners = config_format.listenerSetFromConfig(parsed.*),
+        });
+        defer rehash_dry.freeReport(self.allocator, lines);
+        for (lines) |line| try self.noticeTo(conn, line);
+        try queueNumeric(conn, .RPL_REHASHING, &.{path}, "dry-run; applied none");
+    }
+
     /// REHASH — oper-only configuration reload. Re-reads and re-parses the
     /// configured file and swaps in a freshly-built oper registry (account→class
     /// bindings). Existing sessions keep their current oper state; new SASL logins
     /// observe the reloaded bindings. Without a config path it acknowledges only.
+    /// `REHASH DRY` prints the diff and returns before any of those commits.
     pub fn handleRehash(self: *LinuxServer, conn: *ConnState) !void {
+        try self.rehashFromConn(conn, false);
+    }
+
+    pub fn handleRehashParsed(self: *LinuxServer, conn: *ConnState, parsed_line: *const irc_line.LineView) !void {
+        const dry = parsed_line.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed_line.paramSlice()[0], "DRY");
+        try self.rehashFromConn(conn, dry);
+    }
+
+    fn rehashFromConn(self: *LinuxServer, conn: *ConnState, dry: bool) !void {
         if (!self.requirePriv(conn, .server_rehash)) return;
         // Operator gate enforced by the registry (access=.oper).
         const path = self.config.config_path orelse {
@@ -49009,6 +49103,11 @@ pub const LinuxServer = struct {
         if (ocg2RehashHasUnsupportedRuntimeMode(parsed.oper_ocg2)) {
             parsed.deinit(self.allocator);
             try self.noticeTo(conn, "REHASH: OCG2 project/mint mode is unsupported by this release; keeping current config");
+            return;
+        }
+        if (dry) {
+            defer parsed.deinit(self.allocator);
+            try self.emitRehashDry(conn, path, &parsed);
             return;
         }
         // Build the new oper bindings (strings borrow `parsed`, kept alive below).
@@ -53657,6 +53756,128 @@ test "GAP-X5 enqueuePlainFanout queues one line on the connection SendQ" {
         "GAP-X5 branch=plaintext fan-out line queued on the inline SendQ; ConnState bytes={d}\n",
         .{@sizeOf(ConnState)},
     );
+}
+
+test "GAP-O5 REHASH DRY prints diffs and applies none" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text =
+        \\[node]
+        \\id = 1
+        \\
+        \\[listen]
+        \\host = "127.0.0.1"
+        \\irc = 18981
+        \\ws = 18982
+        \\
+        \\[limits]
+        \\max_clones_per_ip = 9
+        \\nick_delay = "3s"
+        \\
+        \\[class.trusted]
+        \\sendq = "2M"
+        \\
+        \\[dnsbl]
+        \\action = "ward"
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rehash.toml", .data = text });
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/rehash.toml", .{tmp.sub_path[0..]}) catch return error.TestUnexpectedResult;
+
+    server.config.config_path = path;
+    server.config.crypto_io = std.testing.io;
+    server.config.port = 18981;
+    server.config.ws_enabled = false;
+    server.config.ws_port = 0;
+    server.config.tls_port = 0;
+    server.config.s2s_port = 0;
+    server.config.webtransport_port = 0;
+    server.config.media_port = 0;
+    server.config.native_media_port = 0;
+    server.config.max_clones_per_ip = 2;
+    server.config.nick_delay_ms = 0;
+    server.config.raid_joins = 0;
+    server.config.raid_secs = 10;
+    server.config.dnsbl_ward = false;
+    server.config.tls_enable_resumption = true;
+    server.tls_ticket_key = @splat(0x5a);
+    const ticket_before = server.tls_ticket_key;
+    try server.warden.add(.{
+        .match = .address,
+        .pattern = "203.0.113.9",
+        .reason = "gap-o5",
+        .set_by = "test",
+    });
+
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.send_armed = true;
+    defer {
+        if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(allocator);
+        if (server.rx().clients.get(id)) |live| {
+            live.send_armed = false;
+            _ = server.rx().clients.free(id);
+        }
+    }
+    conn.session.is_oper = true;
+    conn.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_rehash});
+    try conn.session.setNick("oper");
+
+    const invocation = try irc_line.parseLine("REHASH DRY");
+    try server.handleRehashParsed(conn, &invocation);
+
+    const reply = conn.send_buf[0..conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "REHASH DRY: applied none") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "REHASH DRY ward dnsbl.action: refuse -> ward") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "REHASH DRY ward running address 203.0.113.9 kept") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "REHASH DRY class +trusted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "REHASH DRY limit max_clones_per_ip: 2 -> 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "REHASH DRY limit nick_delay_ms: 0 -> 3000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "REHASH DRY listener ws: 0 -> 18982") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, config_format.cold_restart_required_reason) != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "dry-run; applied none") != null);
+
+    try std.testing.expectEqual(@as(u32, 2), server.config.max_clones_per_ip);
+    try std.testing.expectEqual(@as(u64, 0), server.config.nick_delay_ms);
+    try std.testing.expect(!server.config.dnsbl_ward);
+    try std.testing.expect(!server.config.ws_enabled);
+    try std.testing.expectEqual(@as(u16, 0), server.config.ws_port);
+    try std.testing.expectEqual(@as(u16, 18981), server.config.port);
+    try std.testing.expect(server.config.class_registry == null);
+    try std.testing.expect(server.reload_parsed == null);
+    try std.testing.expect(server.oper_registry == null);
+    try std.testing.expectEqual(@as(usize, 0), server.reload_bindings.len);
+    try std.testing.expectEqual(ticket_before, server.tls_ticket_key);
+    try std.testing.expect(server.tls_previous_ticket_key == null);
+    try std.testing.expect(server.warden.check(.{ .address = "203.0.113.9" }, 0) != null);
+
+    try server.handleRehash(conn);
+    try std.testing.expectEqual(@as(u32, 9), server.config.max_clones_per_ip);
+    try std.testing.expectEqual(@as(u64, 3000), server.config.nick_delay_ms);
+    try std.testing.expect(!server.config.ws_enabled);
+    try std.testing.expectEqual(@as(u16, 0), server.config.ws_port);
+    try std.testing.expect(!server.config.dnsbl_ward);
+    try std.testing.expect(server.reload_parsed != null);
+    try std.testing.expect(server.config.class_registry.?.byName("trusted") != null);
+    try std.testing.expect(server.tls_previous_ticket_key != null);
+    try std.testing.expectEqual(ticket_before, server.tls_previous_ticket_key.?);
+    try std.testing.expect(server.warden.check(.{ .address = "203.0.113.9" }, 0) != null);
+
+    std.debug.print("GAP-O5 branch=REHASH DRY named ward class limit and listener diffs, applied none, then a real REHASH applied the limit without moving the listener\n", .{});
 }
 
 /// Real encrypted link pair for daemon-level retained-replay tests. Keeping the
