@@ -589,6 +589,21 @@ pub fn unsecuredMeshPeerError(connect_count: usize, require_secured: bool) ?[]co
     return null;
 }
 
+/// Listener snapshot `--check-config` compares. Same value `UPGRADE` builds
+/// from the running `Server.Config` plus `listenerSetFromConfig` on the file.
+pub fn listenerSetFromParsed(parsed: config_format.Config) config_format.ListenerSet {
+    return config_format.listenerSetFromConfig(parsed);
+}
+
+/// Null when the configured listener ports are unchanged. A difference is an
+/// add, a removal, or a port move, which Helix cannot adopt.
+pub fn listenerChangeError(
+    live: config_format.ListenerSet,
+    proposed: config_format.ListenerSet,
+) ?[]const u8 {
+    return config_format.listenerChangeError(live, proposed);
+}
+
 pub fn mapAcmeBootConfig(cfg: config_format.Config) AcmeBootConfig {
     return .{
         .enabled = cfg.acme.enabled,
@@ -1065,6 +1080,103 @@ test "config check GAP-A2 refuses a mesh peer without require_secured and keeps 
         empty.parsed.mesh.require_secured,
     ) == null);
     std.debug.print("GAP-A2 branch=check-config refuse unsecured mesh.connect; compat default\n", .{});
+}
+
+test "config check GAP-A7 refuses a listener add or remove with cold restart required" {
+    const allocator = testing.allocator;
+    const live_text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6667
+        \\webtransport = 0
+        \\s2s = 6900
+        \\
+    ;
+    var live = try loadFromText(allocator, live_text, .{ .port = 6667 }, .{});
+    defer live.deinit(allocator);
+    const live_set = listenerSetFromParsed(live.parsed);
+    try testing.expect(listenerChangeError(live_set, live_set) == null);
+    try testing.expect(configCheckError(live.io, live.tls.ktls) == null);
+
+    const added_text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6667
+        \\webtransport = 4433
+        \\s2s = 6900
+        \\
+    ;
+    var added = try loadFromText(allocator, added_text, .{ .port = 6667 }, .{});
+    defer added.deinit(allocator);
+    // A file that merely enables WebTransport is a valid cold boot. The
+    // refusal is the delta against the running listener set.
+    try testing.expect(configCheckError(added.io, added.tls.ktls) == null);
+    const added_why = listenerChangeError(live_set, listenerSetFromParsed(added.parsed)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(config_format.cold_restart_required_reason, added_why);
+    try testing.expect(std.mem.indexOf(u8, added_why, "cold restart required") != null);
+
+    const removed_text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6667
+        \\webtransport = 0
+        \\s2s = 0
+        \\
+    ;
+    var removed = try loadFromText(allocator, removed_text, .{ .port = 6667 }, .{});
+    defer removed.deinit(allocator);
+    const removed_why = listenerChangeError(live_set, listenerSetFromParsed(removed.parsed)) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, removed_why, "cold restart required") != null);
+
+    const moved_text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6668
+        \\s2s = 6900
+        \\
+    ;
+    var moved = try loadFromText(allocator, moved_text, .{ .port = 6667 }, .{});
+    defer moved.deinit(allocator);
+    try testing.expect(listenerChangeError(live_set, listenerSetFromParsed(moved.parsed)) != null);
+
+    const tls_off =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6667
+        \\s2s = 6900
+        \\[tls]
+        \\enabled = false
+        \\
+    ;
+    var tls_disabled = try loadFromText(allocator, tls_off, .{ .port = 6667 }, .{});
+    defer tls_disabled.deinit(allocator);
+    // The default TLS port is not a listener while TLS is off.
+    try testing.expect(listenerChangeError(live_set, listenerSetFromParsed(tls_disabled.parsed)) == null);
+
+    const tls_on =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6667
+        \\s2s = 6900
+        \\[tls]
+        \\enabled = true
+        \\port = 6697
+        \\
+    ;
+    var tls_enabled = try loadFromText(allocator, tls_on, .{ .port = 6667 }, .{});
+    defer tls_enabled.deinit(allocator);
+    const tls_why = listenerChangeError(live_set, listenerSetFromParsed(tls_enabled.parsed)) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, tls_why, "cold restart required") != null);
+
+    const with_tls = listenerSetFromParsed(tls_enabled.parsed);
+    try testing.expect(listenerChangeError(with_tls, with_tls) == null);
+    std.debug.print("GAP-A7 branch=check-config refuse listener add/remove; cold boot of webtransport stays valid\n", .{});
 }
 
 test "config GAP-V1 hold-off: media.dtls13 defaults off" {

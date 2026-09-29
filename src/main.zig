@@ -242,14 +242,27 @@ pub fn main(init: std.process.Init) !void {
             if (result.failed) std.process.exit(1);
             return;
         } else
-        // `onyx-server --check-config <path>` parses a config and reports OK/ERROR
-        // WITHOUT booting (no ports bound, no mesh dialed) — safe pre-deploy
-        // validation. Exits 0 on success, 1 on any read/parse error.
+        // `onyx-server --check-config <path> [--against <running.toml>]` parses a
+        // config and reports OK/ERROR WITHOUT booting (no ports bound, no mesh
+        // dialed) — safe pre-deploy validation. Exits 0 on success, 1 on any
+        // read/parse error. `--against` compares configured listeners with the
+        // file the running daemon booted, and refuses an add, removal, or port
+        // move before the operator sends SIGUSR2.
         if (std.mem.eql(u8, first, "--check-config")) {
             const path = args.next() orelse {
-                std.debug.print("usage: onyx-server --check-config <path>\n", .{});
+                std.debug.print("usage: onyx-server --check-config <path> [--against <running.toml>]\n", .{});
                 std.process.exit(2);
             };
+            const against_path: ?[]const u8 = if (args.next()) |extra| blk: {
+                if (!std.mem.eql(u8, extra, "--against")) {
+                    std.debug.print("usage: onyx-server --check-config <path> [--against <running.toml>]\n", .{});
+                    std.process.exit(2);
+                }
+                break :blk args.next() orelse {
+                    std.debug.print("usage: onyx-server --check-config <path> [--against <running.toml>]\n", .{});
+                    std.process.exit(2);
+                };
+            } else null;
             const resolver = onyx_server.daemon.config_format.Resolver{
                 .ctx = @ptrCast(&resolver_ctx),
                 .env = envLookup,
@@ -347,6 +360,25 @@ pub fn main(init: std.process.Init) !void {
                             std.process.exit(1);
                         };
                         std.debug.print("config OCG2: {s}\n", .{@tagName(role)});
+                    }
+                    if (against_path) |base_path| {
+                        const base_text = std.Io.Dir.cwd().readFileAlloc(init.io, base_path, allocator, .limited(1 << 20)) catch |err| {
+                            std.debug.print("config ERROR: cannot read {s}: {s}\n", .{ base_path, @errorName(err) });
+                            std.process.exit(1);
+                        };
+                        defer allocator.free(base_text);
+                        var base_loaded = onyx_server.daemon.config_boot.loadFromText(allocator, base_text, srv_cfg, resolver) catch |err| {
+                            std.debug.print("config ERROR in {s}: {s}\n", .{ base_path, @errorName(err) });
+                            std.process.exit(1);
+                        };
+                        defer base_loaded.deinit(allocator);
+                        if (onyx_server.daemon.config_boot.listenerChangeError(
+                            onyx_server.daemon.config_boot.listenerSetFromParsed(base_loaded.parsed),
+                            onyx_server.daemon.config_boot.listenerSetFromParsed(l.parsed),
+                        )) |why| {
+                            std.debug.print("config ERROR in {s}: {s}\n", .{ path, why });
+                            std.process.exit(1);
+                        }
                     }
                     std.debug.print("config OK: {s}\n", .{path});
                     return;

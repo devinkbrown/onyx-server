@@ -25021,7 +25021,54 @@ pub const LinuxServer = struct {
     /// mid-frame browser client survives with no lost bytes.
     pub fn handleUpgrade(self: *LinuxServer, conn: *ConnState) !void {
         if (!self.requirePriv(conn, .server_restart)) return;
+        // Compare the on-disk listener set before the upgrade is queued. SIGUSR2
+        // is the signal the operator sends after this command, or after
+        // `--check-config --against`, has already refused.
+        if (try self.upgradeRefusedForListenerChange(conn)) return;
         self.deferUpgrade(.{ .client = idFromToken(conn.token) });
+    }
+
+    /// Ports the process is actually serving. Zero means that listener is off.
+    /// This matches `config_format.listenerSetFromConfig` for the file that booted
+    /// the process: TLS is `tls_port` only when main armed it, and WebSocket is
+    /// the configured port only when `ws_enabled`.
+    fn configuredListenerSet(self: *const LinuxServer) config_format.ListenerSet {
+        return .{
+            .irc = self.config.port,
+            .tls = self.config.tls_port,
+            .ws = if (self.config.ws_enabled) self.config.ws_port else 0,
+            .webtransport = self.config.webtransport_port,
+            .s2s = self.config.s2s_port,
+            .media = self.config.media_port,
+            .native_media = self.config.native_media_port,
+        };
+    }
+
+    /// True when UPGRADE must stop before `deferUpgrade`. No config path means
+    /// there is no on-disk listener delta to apply (tests and a path-less boot).
+    /// A path that cannot be read or parsed also stops the upgrade: adopting
+    /// blindly is how an operator would learn about a listener change too late.
+    fn upgradeRefusedForListenerChange(self: *LinuxServer, conn: *ConnState) !bool {
+        const path = self.config.config_path orelse return false;
+        const io = self.config.crypto_io orelse {
+            try self.noticeTo(conn, "UPGRADE refused: cannot read config to compare listeners; cold restart required");
+            return true;
+        };
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(1 << 20)) catch {
+            try self.noticeTo(conn, "UPGRADE refused: cannot read config file");
+            return true;
+        };
+        defer self.allocator.free(text);
+        var parsed = config_format.parseToml(self.allocator, text, self.config.config_resolver) catch {
+            try self.noticeTo(conn, "UPGRADE refused: config parse error");
+            return true;
+        };
+        defer parsed.deinit(self.allocator);
+        if (config_format.listenerChangeError(self.configuredListenerSet(), config_format.listenerSetFromConfig(parsed))) |why| {
+            try self.noticeTo(conn, why);
+            return true;
+        }
+        return false;
     }
 
     /// Session replica dirty flags, pending Store staging, local channel
@@ -61905,6 +61952,97 @@ test "DST GAP-A4 event history reloads across USR2 and a signed id is not duplic
     try std.testing.expectEqualSlices(u8, restarted_before, restarted_after);
 
     std.debug.print("GAP-A4 branch=reference event history path; boot reload; USR2 keeps the signed id; heal does not duplicate\n", .{});
+}
+
+test "DST GAP-A7 listener add or remove refuses UPGRADE with cold restart required" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try rehashTmpPath(alloc, tmp, "listeners.toml");
+    defer alloc.free(path);
+
+    const same =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6667
+        \\webtransport = 0
+        \\
+    ;
+    const added =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6667
+        \\webtransport = 4433
+        \\
+    ;
+    const removed =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6667
+        \\webtransport = 0
+        \\s2s = 0
+        \\
+    ;
+
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    // The test binds an ephemeral port so it does not collide with a live
+    // daemon. The configured listener set is what UPGRADE compares.
+    server.config.port = 6667;
+    server.config.config_path = path;
+
+    const id = try addTestLocalClient(&server, "a7oper", "a7oper");
+    const conn = server.rx().clients.get(id).?;
+    conn.session.is_oper = true;
+    conn.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_restart});
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "listeners.toml", .data = same });
+    try server.handleUpgrade(conn);
+    try std.testing.expect(server.reactors[0].deferred_upgrade != null);
+    const queued = try copyTestSendQ(alloc, conn);
+    defer alloc.free(queued);
+    try std.testing.expect(std.mem.indexOf(u8, queued, "cold restart required") == null);
+    server.reactors[0].deferred_upgrade = null;
+    resetTestSendQ(conn);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "listeners.toml", .data = added });
+    try server.handleUpgrade(conn);
+    try std.testing.expect(server.reactors[0].deferred_upgrade == null);
+    const add_notice = try copyTestSendQ(alloc, conn);
+    defer alloc.free(add_notice);
+    try std.testing.expect(std.mem.indexOf(u8, add_notice, "cold restart required") != null);
+    resetTestSendQ(conn);
+
+    server.config.webtransport_port = 4433;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "listeners.toml", .data = removed });
+    try server.handleUpgrade(conn);
+    try std.testing.expect(server.reactors[0].deferred_upgrade == null);
+    const remove_notice = try copyTestSendQ(alloc, conn);
+    defer alloc.free(remove_notice);
+    try std.testing.expect(std.mem.indexOf(u8, remove_notice, "cold restart required") != null);
+    resetTestSendQ(conn);
+
+    // An unchanged non-zero WebTransport port is not an add or a removal.
+    // This command must still queue; the later continuity inventory is separate.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "listeners.toml", .data = added });
+    try server.handleUpgrade(conn);
+    try std.testing.expect(server.reactors[0].deferred_upgrade != null);
+    server.reactors[0].deferred_upgrade = null;
+    std.debug.print("GAP-A7 branch=refuse cold restart required before UPGRADE; unchanged listeners still queue\n", .{});
 }
 test "UPGRADE mandatory restored EventHistory and webhook store skip stale disk reload at start" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
