@@ -67,6 +67,10 @@ fn shun(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleShun(x.conn, x.parsed, true);
 }
+fn abuse(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleAbuse(x.conn, x.parsed);
+}
 fn unshun(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleShun(x.conn, x.parsed, false);
@@ -162,6 +166,7 @@ pub const module = registry.Module{
         .{ .name = "XLINE", .access = .oper, .handler = xline },
         .{ .name = "SHUN", .access = .oper, .handler = shun },
         .{ .name = "UNSHUN", .access = .oper, .handler = unshun },
+        .{ .name = "ABUSE", .access = .oper, .handler = abuse, .summary = "why a live connection was throttled, shunned, DNSBL-marked, or reputation-decayed" },
         .{ .name = "GLOBAL", .access = .oper, .handler = global },
         .{ .name = "OPERMOTD", .access = .oper, .handler = operMotd },
         .{ .name = "DIE", .access = .oper, .handler = die },

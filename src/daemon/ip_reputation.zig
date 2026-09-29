@@ -59,7 +59,17 @@ pub const Config = struct {
 pub const Error = error{
     /// half_life_ms was zero, which would make the decay rate undefined.
     InvalidHalfLife,
+    /// A stored row was not an IPv4 or IPv6 key.
+    BadRow,
 } || std.mem.Allocator.Error;
+
+/// One reputation row as stored, before decay. `tag` is 4 or 6.
+pub const StoredRow = struct {
+    tag: u8,
+    bytes: [16]u8,
+    score: f64,
+    updated_ms: u64,
+};
 
 /// A fixed-width hashable key derived from an `Address`. Tag byte distinguishes
 /// the IPv4 / IPv6 families so that, e.g., an IPv4-mapped pattern cannot alias.
@@ -130,6 +140,38 @@ pub const IpReputation = struct {
     /// if an entry was present and removed.
     pub fn clear(self: *IpReputation, addr: Address) bool {
         return self.entries.remove(Key.fromAddress(addr));
+    }
+
+    /// Drop every row. Used when a durable generation replaces the table.
+    pub fn clearAll(self: *IpReputation) void {
+        self.entries.deinit(self.allocator);
+        self.entries = .empty;
+    }
+
+    /// Copy live rows. The caller frees the slice; it is not a view.
+    pub fn dupeRows(self: *const IpReputation, allocator: std.mem.Allocator) Error![]StoredRow {
+        const rows = try allocator.alloc(StoredRow, self.entries.count());
+        var n: usize = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            rows[n] = .{
+                .tag = kv.key_ptr.tag,
+                .bytes = kv.key_ptr.bytes,
+                .score = kv.value_ptr.score,
+                .updated_ms = kv.value_ptr.updated_ms,
+            };
+            n += 1;
+        }
+        return rows;
+    }
+
+    /// Insert or replace one stored row without applying decay.
+    pub fn importRow(self: *IpReputation, row: StoredRow) Error!void {
+        if (row.tag != 4 and row.tag != 6) return error.BadRow;
+        try self.entries.put(self.allocator, .{ .tag = row.tag, .bytes = row.bytes }, .{
+            .score = row.score,
+            .updated_ms = row.updated_ms,
+        });
     }
 
     /// Current time-decayed score for `addr`. Unknown addresses score 0.

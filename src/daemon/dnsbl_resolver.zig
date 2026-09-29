@@ -120,6 +120,18 @@ pub const Resolver = struct {
         self.enqueueLocked(ip);
     }
 
+    /// Record a resolved verdict in the cache without a probe. The worker
+    /// writes the same slot after DNS; this is the synchronous form so a
+    /// caller that already holds a verdict can make `lookup` answer.
+    pub fn remember(self: *Resolver, ip: dns.Address, verdict: Verdict) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const e = self.reserve(ip);
+        e.verdict = verdict;
+        e.state = .ready;
+        e.resolved_ms = platform.monotonicMillis();
+    }
+
     /// Cached verdict for `ip`, or null when not yet resolved (pending/absent).
     /// A resolved not-listed result is a real answer (`.listed == false`), not a
     /// miss. Never blocks.

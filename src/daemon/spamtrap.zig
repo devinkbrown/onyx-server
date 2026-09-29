@@ -227,6 +227,32 @@ pub fn Spamtrap(comptime params: Params) type {
             return self.trap_channels.count();
         }
 
+        /// Duplicate configured trap names into caller-owned lists. Recent
+        /// trips and offender counts stay process-local.
+        pub fn dupeTrapNames(
+            self: *const Self,
+            alloc: std.mem.Allocator,
+            nicks: *std.ArrayListUnmanaged([]u8),
+            channels: *std.ArrayListUnmanaged([]u8),
+        ) !void {
+            var nit = self.trap_nicks.iterator();
+            while (nit.next()) |kv| {
+                const owned = try alloc.dupe(u8, kv.key_ptr.*);
+                nicks.append(alloc, owned) catch |err| {
+                    alloc.free(owned);
+                    return err;
+                };
+            }
+            var cit = self.trap_channels.iterator();
+            while (cit.next()) |kv| {
+                const owned = try alloc.dupe(u8, kv.key_ptr.*);
+                channels.append(alloc, owned) catch |err| {
+                    alloc.free(owned);
+                    return err;
+                };
+            }
+        }
+
         /// Return the number of retained recent trips.
         pub fn recentTripCount(self: *const Self) usize {
             return self.recent.items.len;

@@ -144,6 +144,8 @@ const history_durable = @import("history_durable.zig");
 const memo_durable = @import("memo_durable.zig");
 const marker_durable = @import("marker_durable.zig");
 const gag_durable = @import("gag_durable.zig");
+const abuse_durable = @import("abuse_durable.zig");
+const account_abuse_mod = @import("account_abuse.zig");
 const vhost_durable = @import("vhost_durable.zig");
 const chanstats_mod = @import("chanstats.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
@@ -2547,6 +2549,10 @@ pub const ConnState = struct {
     /// flood-exempt, or for S2S links. Retuned in place when the class is
     /// re-assigned (oper-up, USR2 adoption).
     flood_guard: ?flood_guard.FloodGuard = null,
+    /// Last verdict from this connection's flood guard. Throttle does not
+    /// change token balances, so the oper explanation reads this alongside
+    /// the snapshot. It dies with the connection.
+    last_flood: flood_guard.Decision = .allow,
     /// Allocator backing `send_overflow` (the owning reactor's). `undefined` on a
     /// test-only `ConnState.init(-1)`; only touched once overflow is non-empty,
     /// which such conns never reach.
@@ -3957,6 +3963,8 @@ pub const LinuxServer = struct {
     /// Decaying per-IP penalty table. Only consulted/updated when Config's
     /// reputation_refuse_threshold is non-zero (otherwise reputation is off).
     reputation: ip_reputation_mod.IpReputation,
+    /// Per-account abuse score. Separate from `flood_guard` token buckets.
+    account_abuse: account_abuse_mod.AccountAbuse,
     /// Optional reactor seam (time/IO). Null = system monotonic clock.
     reactor: ?reactor_mod.Reactor = null,
     /// Run flag from runThreaded, so DIE/RESTART can stop the reactor.
@@ -4808,6 +4816,7 @@ pub const LinuxServer = struct {
                 .half_life_ms = @intCast(@max(1, config.reputation_half_life_ms)),
                 .refuse_threshold = @floatFromInt(config.reputation_refuse_threshold),
             }) catch unreachable,
+            .account_abuse = account_abuse_mod.AccountAbuse.init(allocator),
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .snowflake = snowflake_id.Generator.init(.{ .node_id = @intCast(config.node_id & snowflake_id.NODE_MASK) }) catch unreachable,
             // Seed the msgid minter once from boot entropy (OS CSPRNG via
@@ -4863,6 +4872,7 @@ pub const LinuxServer = struct {
         self.restoreDurableMemos();
         self.restoreDurableMarkers();
         self.restoreDurableGags();
+        self.restoreDurableAbuse();
         self.restoreDurableVhosts();
     }
 
@@ -5853,6 +5863,7 @@ pub const LinuxServer = struct {
         self.mesh_clones.deinit();
         self.nick_delay.deinit();
         self.reputation.deinit();
+        self.account_abuse.deinit();
         self.accepts.deinit();
         self.silence.deinit();
         self.observe.deinit();
@@ -8893,7 +8904,8 @@ pub const LinuxServer = struct {
     fn penalizePeer(self: *LinuxServer, conn: *const ConnState, points: f64) void {
         if (!self.reputationOn()) return;
         if (conn.peer_addr) |addr| {
-            _ = self.reputation.penalize(addr, points, self.nowU64()) catch {};
+            _ = self.reputation.penalize(addr, points, self.nowU64()) catch return;
+            self.snapshotReputation();
         }
     }
 
@@ -14180,7 +14192,10 @@ pub const LinuxServer = struct {
         // climbs; only `.disconnect` tears the client down.
         if (was_registered and conn.s2s == null and conn.s2s_secured == null) {
             if (conn.flood_guard) |*guard| {
-                if (guard.classifyRaw(self.nowMs(), line) == .disconnect) {
+                const decision = guard.classifyRaw(self.nowMs(), line);
+                conn.last_flood = decision;
+                if (decision != .allow) self.noteAccountAbuse(conn);
+                if (decision == .disconnect) {
                     emitServerLine(conn, "ERROR :Excess Flood");
                     conn.close_reason = "Excess Flood";
                     conn.closing = true;
@@ -21395,6 +21410,7 @@ pub const LinuxServer = struct {
             return;
         };
         const cleared = self.reputation.clear(addr);
+        if (cleared) self.snapshotReputation();
         var buf: [default_reply_bytes]u8 = undefined;
         const state = if (cleared) "cleared" else "had no penalty";
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :UNREJECT {s}: {s}\r\n", .{ self.serverName(), conn.session.displayName(), ip_text, state }) catch return;
@@ -22572,6 +22588,197 @@ pub const LinuxServer = struct {
         gag_durable.restoreInto(svc.store, &self.gags) catch |err| {
             srvLog("onyx-server: gag durable restore failed closed ({s})\n", .{@errorName(err)});
         };
+    }
+
+    fn snapshotShuns(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        abuse_durable.replaceShuns(svc.store, &self.shuns) catch |err| {
+            srvLog("onyx-server: shun durable snapshot failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn snapshotSpamtraps(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        var nicks: std.ArrayListUnmanaged([]u8) = .empty;
+        var chans: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (nicks.items) |name| self.allocator.free(name);
+            for (chans.items) |name| self.allocator.free(name);
+            nicks.deinit(self.allocator);
+            chans.deinit(self.allocator);
+        }
+        lockSpin(&self.spamtrap_mu);
+        const copied = self.spamtrap.dupeTrapNames(self.allocator, &nicks, &chans);
+        self.spamtrap_mu.unlock();
+        copied catch |err| {
+            srvLog("onyx-server: spamtrap durable copy failed ({s})\n", .{@errorName(err)});
+            return;
+        };
+        abuse_durable.replaceSpam(svc.store, nicks.items, chans.items) catch |err| {
+            srvLog("onyx-server: spamtrap durable snapshot failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn snapshotKoshi(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        abuse_durable.replaceKoshi(svc.store, &self.content_filter) catch |err| {
+            srvLog("onyx-server: koshi durable snapshot failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn snapshotReputation(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        const rows = self.reputation.dupeRows(self.allocator) catch |err| {
+            srvLog("onyx-server: reputation durable copy failed ({s})\n", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(rows);
+        abuse_durable.replaceReputation(svc.store, rows) catch |err| {
+            srvLog("onyx-server: reputation durable snapshot failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn snapshotAccountAbuse(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        abuse_durable.replaceAccounts(svc.store, &self.account_abuse) catch |err| {
+            srvLog("onyx-server: account abuse snapshot failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn restoreDurableAbuse(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        abuse_durable.restoreShuns(svc.store, &self.shuns) catch |err| {
+            srvLog("onyx-server: shun durable restore failed closed ({s})\n", .{@errorName(err)});
+        };
+        if (abuse_durable.restoreSpam(svc.store, &self.spamtrap)) {
+            self.spamtrap_active.store(self.spamtrap.trapNickCount() + self.spamtrap.trapChannelCount() > 0, .release);
+        } else |err| {
+            srvLog("onyx-server: spamtrap durable restore failed closed ({s})\n", .{@errorName(err)});
+        }
+        abuse_durable.restoreKoshi(svc.store, &self.content_filter) catch |err| {
+            srvLog("onyx-server: koshi durable restore failed closed ({s})\n", .{@errorName(err)});
+        };
+        abuse_durable.restoreReputation(svc.store, &self.reputation) catch |err| {
+            srvLog("onyx-server: reputation durable restore failed closed ({s})\n", .{@errorName(err)});
+        };
+        abuse_durable.restoreAccounts(svc.store, &self.account_abuse) catch |err| {
+            srvLog("onyx-server: account abuse restore failed closed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    /// Bump the account axis when the connection guard throttles or disconnects.
+    /// A missing account leaves the score untouched. The connection guard itself
+    /// is not written.
+    fn noteAccountAbuse(self: *LinuxServer, conn: *ConnState) void {
+        const account = conn.session.account() orelse return;
+        _ = self.account_abuse.note(account) catch |err| {
+            srvLog("onyx-server: account abuse note failed ({s})\n", .{@errorName(err)});
+            return;
+        };
+        self.snapshotAccountAbuse();
+    }
+
+    fn liveConnByNick(self: *LinuxServer, nick: []const u8) ?*ConnState {
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.value.session.displayName(), nick)) return entry.value;
+            }
+        }
+        return null;
+    }
+
+    fn shunMatchesConn(self: *LinuxServer, conn: *ConnState) bool {
+        const now = self.nowMs();
+        const nick = conn.session.displayName();
+        if (nick.len > 0 and self.shuns.isShunned(nick, now)) return true;
+        const ip = conn.session.realHost();
+        if (ip.len > 0 and self.shuns.isShunned(ip, now)) return true;
+        var hm_buf: [320]u8 = undefined;
+        if (clientPrefix(conn, &hm_buf)) |hm| {
+            if (self.shuns.isShunned(hm, now)) return true;
+        } else |_| {}
+        return false;
+    }
+
+    /// `ABUSE <nick>` — oper explanation, from current RAM, of why a live
+    /// connection was throttled, shunned, DNSBL-marked, or reputation-decayed.
+    /// The account score is reported beside the connection guard, not instead of it.
+    pub fn handleAbuse(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.requirePriv(conn, .client_moderate)) return;
+        const p = parsed.paramSlice();
+        if (p.len == 0 or p[0].len == 0) {
+            try self.noticeTo(conn, "Usage: ABUSE <nick>");
+            return;
+        }
+        const target = self.liveConnByNick(p[0]) orelse {
+            try self.noticeTo(conn, "ABUSE: no such nick");
+            return;
+        };
+        const nick = target.session.displayName();
+        if (target.flood_guard) |*guard| {
+            const snap = guard.snapshot();
+            var b: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "ABUSE {s}: flood {s} excess={d} message_tokens={d}", .{
+                nick,
+                @tagName(target.last_flood),
+                snap.excess_points,
+                snap.message_tokens,
+            }) catch return;
+            try self.noticeTo(conn, line);
+        } else {
+            var b: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "ABUSE {s}: flood none", .{nick}) catch return;
+            try self.noticeTo(conn, line);
+        }
+        {
+            var b: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "ABUSE {s}: shun {s}", .{ nick, if (self.shunMatchesConn(target)) "yes" else "no" }) catch return;
+            try self.noticeTo(conn, line);
+        }
+        if (self.config.dnsbl) |bl| {
+            if (target.peer_addr) |addr| {
+                if (bl.lookup(addr)) |verdict| {
+                    var b: [160]u8 = undefined;
+                    const line = if (verdict.listed)
+                        std.fmt.bufPrint(&b, "ABUSE {s}: dnsbl listed {d}", .{ nick, verdict.code }) catch return
+                    else
+                        std.fmt.bufPrint(&b, "ABUSE {s}: dnsbl clear", .{nick}) catch return;
+                    try self.noticeTo(conn, line);
+                } else {
+                    var b: [160]u8 = undefined;
+                    const line = std.fmt.bufPrint(&b, "ABUSE {s}: dnsbl unknown", .{nick}) catch return;
+                    try self.noticeTo(conn, line);
+                }
+            } else {
+                var b: [160]u8 = undefined;
+                const line = std.fmt.bufPrint(&b, "ABUSE {s}: dnsbl unknown", .{nick}) catch return;
+                try self.noticeTo(conn, line);
+            }
+        } else {
+            var b: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "ABUSE {s}: dnsbl unknown", .{nick}) catch return;
+            try self.noticeTo(conn, line);
+        }
+        if (target.peer_addr) |addr| {
+            const shown: u64 = @intFromFloat(@round(@max(@as(f64, 0), self.reputation.score(addr, self.nowU64()))));
+            var b: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "ABUSE {s}: reputation {d}", .{ nick, shown }) catch return;
+            try self.noticeTo(conn, line);
+        } else {
+            var b: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "ABUSE {s}: reputation none", .{nick}) catch return;
+            try self.noticeTo(conn, line);
+        }
+        if (target.session.account()) |account| {
+            var b: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "ABUSE {s}: account {s} score={d}", .{ nick, account, self.account_abuse.score(account) }) catch return;
+            try self.noticeTo(conn, line);
+        } else {
+            var b: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "ABUSE {s}: account none score=0", .{nick}) catch return;
+            try self.noticeTo(conn, line);
+        }
     }
 
     fn grantDurablePersona(self: *LinuxServer, account: []const u8, name: []const u8, host: []const u8, source: guise_mod.Source) !void {
@@ -24805,6 +25012,7 @@ pub const LinuxServer = struct {
         const mask = p[0];
         if (!adding) {
             const removed = self.shuns.remove(mask);
+            if (removed) self.snapshotShuns();
             const status = if (removed) "removed" else "not found";
             const proof_id = self.recordOperAudit(conn.session.displayName(), .unshun, mask, status);
             var b: [default_reply_bytes]u8 = undefined;
@@ -24837,6 +25045,7 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "SHUN: could not add (limit or invalid mask)");
             return;
         };
+        self.snapshotShuns();
         const proof_id = self.recordOperAudit(conn.session.displayName(), .shun, mask, reason);
         var b: [default_reply_bytes]u8 = undefined;
         const note = if (proof_id) |pid|
@@ -47778,6 +47987,7 @@ pub const LinuxServer = struct {
                 try self.failReply(conn, "FILTER", "INVALID_PATTERN", "Pattern empty, too long, full, or duplicate");
                 return;
             }
+            self.snapshotKoshi();
             try self.noticeTo(conn, "FILTER: pattern added");
         } else if (std.ascii.eqlIgnoreCase(sub, "DEL")) {
             const removed = self.content_filter.remove(pattern) catch false;
@@ -47785,6 +47995,7 @@ pub const LinuxServer = struct {
                 try self.failReply(conn, "FILTER", "NO_SUCH_PATTERN", "No such filter pattern");
                 return;
             }
+            self.snapshotKoshi();
             try self.noticeTo(conn, "FILTER: pattern removed");
         } else {
             try self.failReply(conn, "FILTER", "INVALID_SUBCOMMAND", "Use ADD, DEL, or LIST");
@@ -48641,6 +48852,7 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, emsg);
             return;
         };
+        self.snapshotSpamtraps();
         var b: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&b, "SPAMTRAP {s} {s} {s}", .{ if (adding) "ADD" else "DEL", if (is_nick) "NICK" else "CHAN", target }) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
@@ -59270,6 +59482,162 @@ test "UPGRADE GAP-D3 gag and granted vhost survive the dropped process image" {
     try std.testing.expectEqualStrings("staff", personas[0].name);
     try std.testing.expectEqualStrings("carol.staff.example", personas[0].host);
     try std.testing.expectEqual(guise_mod.Source.granted, personas[0].source);
+}
+
+test "DST GAP-D4 oper ABUSE explains live throttle and abuse rows survive the dropped image" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var resolver = try dnsbl_resolver.Resolver.init(alloc, &.{"dnsbl.example.test"});
+    defer resolver.deinit();
+    const listed_addr: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 10 } };
+    resolver.remember(listed_addr, .{ .listed = true, .code = 4 });
+
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d4.wal");
+    var services = services_mod.Services.init(&store, null);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .reputation_refuse_threshold = 40,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+            store.deinit();
+            return error.SkipZigTest;
+        },
+        else => {
+            store.deinit();
+            return err;
+        },
+    };
+    first.config.dnsbl = &resolver;
+
+    const oper_id = try addTestLocalClient(first, "d4oper", "d4oper");
+    const oper = first.connFor(oper_id) orelse return error.TestUnexpectedResult;
+    oper.session.is_oper = true;
+    oper.session.oper_priv = oper_mod.OperPrivileges.full;
+    oper.session.registration.registered = true;
+
+    const victim_id = try addTestLocalClient(first, "d4user", "d4acct");
+    const victim = first.connFor(victim_id) orelse return error.TestUnexpectedResult;
+    victim.session.registration.registered = true;
+    victim.peer_addr = listed_addr;
+    const fg = flood_guard.GuardConfig{
+        .enabled = true,
+        .messages = .{ .capacity = 1, .refill_tokens = 0, .refill_period_ms = 1000 },
+        .commands = .{ .capacity = 1, .refill_tokens = 0, .refill_period_ms = 1000 },
+        .excess = .{ .threshold = 0, .decay_points = 0, .decay_period_ms = 1000 },
+        .throttle_penalty = 1,
+        .target_change_penalty = 1,
+        .privmsg_weight = 1,
+        .join_weight = 1,
+        .default_weight = 1,
+    };
+    try fg.validate();
+    victim.flood_guard = flood_guard.FloodGuard.init(fg, first.nowMs());
+    try first.processLiveLine(victim_id, victim, "NOTICE d4oper :one\r\n");
+    try first.processLiveLine(victim_id, victim, "NOTICE d4oper :two\r\n");
+    try std.testing.expectEqual(flood_guard.Decision.throttle, victim.last_flood);
+    try std.testing.expect(victim.flood_guard.?.snapshot().excess_points > 0);
+    try std.testing.expectEqual(@as(u64, 0), victim.flood_guard.?.snapshot().message_tokens);
+    const account_score = first.account_abuse.score("d4acct");
+    try std.testing.expect(account_score >= 1);
+
+    var shun_add = irc_line.LineView{ .raw = "", .command = "SHUN" };
+    shun_add.params[0] = "d4user";
+    shun_add.params[1] = "mute";
+    shun_add.param_count = 2;
+    try first.handleShun(oper, &shun_add, true);
+    shun_add.params[0] = "d4gone";
+    try first.handleShun(oper, &shun_add, true);
+    var shun_del = irc_line.LineView{ .raw = "", .command = "UNSHUN" };
+    shun_del.params[0] = "d4gone";
+    shun_del.param_count = 1;
+    try first.handleShun(oper, &shun_del, false);
+
+    var trap = irc_line.LineView{ .raw = "", .command = "SPAMTRAP" };
+    trap.params[0] = "ADD";
+    trap.params[1] = "NICK";
+    trap.params[2] = "Honeypot";
+    trap.param_count = 3;
+    try first.handleSpamtrap(oper, &trap);
+
+    var filter = irc_line.LineView{ .raw = "", .command = "FILTER" };
+    filter.params[0] = "ADD";
+    filter.params[1] = "buy coins";
+    filter.param_count = 2;
+    try first.handleFilter(oper, &filter);
+
+    first.penalizePeer(victim, 40);
+    try std.testing.expect(first.enforceDnsbl(victim));
+    try std.testing.expectEqualStrings("DNSBL listed", victim.close_reason);
+
+    oper.send_len = 0;
+    var why = irc_line.LineView{ .raw = "", .command = "ABUSE" };
+    why.params[0] = "d4user";
+    why.param_count = 1;
+    try first.handleAbuse(oper, &why);
+    const why_old = oper.send_buf[0..oper.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, why_old, "ABUSE d4user: flood throttle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, why_old, "ABUSE d4user: shun yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, why_old, "ABUSE d4user: dnsbl listed 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, why_old, "ABUSE d4user: reputation ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, why_old, "ABUSE d4user: reputation 0") == null);
+    var score_buf: [64]u8 = undefined;
+    const score_note = std.fmt.bufPrint(&score_buf, "ABUSE d4user: account d4acct score={d}", .{account_score}) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, why_old, score_note) != null);
+
+    const next_id = try addTestLocalClient(first, "d4next", "d4acct");
+    const next = first.connFor(next_id) orelse return error.TestUnexpectedResult;
+    next.session.registration.registered = true;
+    next.peer_addr = listed_addr;
+    next.flood_guard = flood_guard.FloodGuard.init(fg, first.nowMs());
+    const fresh = next.flood_guard.?.snapshot();
+    try std.testing.expectEqual(fg.messages.capacity, fresh.message_tokens);
+    try std.testing.expectEqual(@as(u64, 0), fresh.excess_points);
+    try std.testing.expectEqual(account_score, first.account_abuse.score("d4acct"));
+    try first.processLiveLine(next_id, next, "NOTICE d4oper :fresh\r\n");
+    try std.testing.expectEqual(flood_guard.Decision.allow, next.last_flood);
+    try std.testing.expectEqual(@as(u64, 0), next.flood_guard.?.snapshot().excess_points);
+    try std.testing.expectEqual(account_score, first.account_abuse.score("d4acct"));
+
+    oper.send_len = 0;
+    why.params[0] = "d4next";
+    try first.handleAbuse(oper, &why);
+    const why_new = oper.send_buf[0..oper.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, why_new, "ABUSE d4next: flood allow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, why_new, "ABUSE d4next: shun no") != null);
+    try std.testing.expect(std.mem.indexOf(u8, why_new, "excess=0") != null);
+    var next_score: [64]u8 = undefined;
+    const next_note = std.fmt.bufPrint(&next_score, "account d4acct score={d}", .{account_score}) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, why_new, next_note) != null);
+
+    std.debug.print("GAP-D4 branch=oper ABUSE explains throttle shun dnsbl reputation from RAM; shun spamtrap koshi reputation and account score reload after the process image is dropped; account score survives reconnect and the new connection guard starts full\n", .{});
+
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d4.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    cfg2.dnsbl = null;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    try std.testing.expect(second.shuns.isShunned("d4user", second.nowMs()));
+    try std.testing.expect(!second.shuns.isShunned("d4gone", second.nowMs()));
+    try std.testing.expect(try second.spamtrap.isTrapNick("Honeypot"));
+    try std.testing.expect(second.content_filter.matches("please buy coins now"));
+    try std.testing.expect(!second.content_filter.matches("hello"));
+    try std.testing.expect(second.reputation.score(listed_addr, second.nowU64()) > 20.0);
+    try std.testing.expectEqual(account_score, second.account_abuse.score("d4acct"));
+    try std.testing.expectEqual(@as(u32, 0), second.account_abuse.score("d4oper"));
 }
 
 test "UPGRADE GAP-D5 restart keeps SCRAM and CertFP and invalidates recovery tokens" {
