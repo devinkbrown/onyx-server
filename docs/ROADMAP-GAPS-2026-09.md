@@ -985,8 +985,10 @@ refuse a USR2 capsule instead of adopting it wrong. A `zig build` of the daemon
 succeeds for `x86_64-linux` and at least one non-Linux triple.
 
 FreeBSD 14.5-RELEASE-p1 executed the shipped kqueue submit
-(`GAP-X1 freebsd kqueue submitted=6 errno=0`). Windows IOCP remains unmet.
-The heading stays unmarked and the whole Accept stays unclaimed.
+(`GAP-X1 freebsd kqueue submitted=6 errno=0`). Windows 11 22H2 WinPE, build
+22621.525, executed the shipped IOCP submit twice
+(`GAP-X1 windows iocp submitted=6`, `GUEST_EXIT:0`). The heading stays
+unmarked and the whole Accept stays unclaimed.
 
 ### GAP-X2 — `server.zig` strangler, only as a seam is touched
 
@@ -1011,9 +1013,9 @@ kernel that has them. Do not fake them with a compile-time zero.
 | OS | Missing | Notes |
 | --- | --- | --- |
 | Linux | Landlock, seccomp, `TCP_FASTOPEN`, `TCP_USER_TIMEOUT`, `SO_INCOMING_CPU`, `IORING_OP_MSG_RING`, `openat2` `RESOLVE_*`, `pidfd`, `close_range`, `MADV_DONTDUMP` / `MADV_WIPEONFORK` on secrets | `eventfd` already wakes shards. kTLS TX is live. Multishot accept/recv, provided buffer rings, `send_zc`, and fixed files are `RingFeatures` defaulting false and are not projected from config. |
-| FreeBSD | `TCP_TXTLS_ENABLE` ran on FreeBSD 14.5-RELEASE-p1: `GAP-X3 freebsd ktls result=ok errno=0` after `kern.ipc.tls.enable=1`. With that sysctl at 0 the same setsockopt returned errno 45. `SO_REUSEPORT_LB` and Capsicum are in that module | AES-GCM is `CRYPTO_AES_NIST_GCM_16` (25). ChaCha20-Poly1305 is 41. Linux `SO_REUSEPORT` is not the FreeBSD load-balancing option. Windows RIO is the `loadRegisteredIo` loader and remains unmet. The heading stays unmarked. |
+| FreeBSD | `TCP_TXTLS_ENABLE` ran on FreeBSD 14.5-RELEASE-p1: `GAP-X3 freebsd ktls result=ok errno=0` after `kern.ipc.tls.enable=1`. With that sysctl at 0 the same setsockopt returned errno 45. `SO_REUSEPORT_LB` and Capsicum are in that module | AES-GCM is `CRYPTO_AES_NIST_GCM_16` (25). ChaCha20-Poly1305 is 41. Linux `SO_REUSEPORT` is not the FreeBSD load-balancing option. The heading stays unmarked. |
 | OpenBSD | `pledge` / `unveil` ran on OpenBSD 7.9 (`kern.osrelease=7.9`): `GAP-X3 openbsd pledge result=ok errno=0`, with `/etc`, `/usr`, `/var`, and `/tmp` present | The armor CLI applies none (section 12). The daemon unveils `/etc` r, `/usr` r, `/var` rwc, `/tmp` rwc, then pledges `stdio rpath wpath cpath inet dns`. Off OpenBSD this is `MissingOp` before either call. The heading stays unmarked. |
-| Windows | an executed RIO dequeue (the loader is `loadRegisteredIo` on `Iocp.open`; this host did not run `WSAIoctl`). IOCP and the job object are already in the tree | GUID `8509e081-96dd-4005-b165-9e2ee8c79e3f`, SIO `0xC8000024`, flags `WSA_FLAG_OVERLAPPED` \| `WSA_FLAG_REGISTERED_IO`. A short or null table is `MissingOp` and the completion port is closed. Recv and send stay `NtReadFile` / `NtWriteFile`. No kTLS claim. The heading stays unmarked. |
+| Windows | `Iocp.open` ran `WSAIoctl` on Windows 11 22H2 WinPE build 22621.525 twice (`GAP-X3 windows rio result=ok`). The thirteen pointers were not called, so this is not a RIO dequeue. IOCP submit on that kernel returned `GAP-X1 windows iocp submitted=6` twice | GUID `8509e081-96dd-4005-b165-9e2ee8c79e3f`, SIO `0xC8000024`, flags `WSA_FLAG_OVERLAPPED` \| `WSA_FLAG_REGISTERED_IO`. A short or null table is `MissingOp` and the completion port is closed. Recv and send are `IOCTL_AFD_RECEIVE` (`0x12017`) and `IOCTL_AFD_SEND` (`0x1201F`); a raw `NtReadFile` on that socket is `STATUS_INVALID_PARAMETER`. No kTLS claim. The heading stays unmarked. |
 
 **Explicitly out,** even if a benchmark post suggests them: XDP / AF_XDP, BPF
 as a firewall, `IP_TRANSPARENT` / `TPROXY`, `SCHED_FIFO`, `TCP_CORK`, and
@@ -1154,12 +1156,15 @@ FreeBSD 14.5-RELEASE-p1 executed the shipped kqueue submit
 (`GAP-X1 freebsd kqueue submitted=6 errno=0`) and kernel TLS
 (`GAP-X3 freebsd ktls result=ok errno=0` with `kern.ipc.tls.enable=1`).
 OpenBSD 7.9 executed the shipped pledge
-(`GAP-X3 openbsd pledge result=ok errno=0`). Windows IOCP, Windows RIO, the
-live `IDENTIFY` sentence (eshmaki.me / ircx.us), and the live
-`relay_v2_authoring=active` flip stay unmet. No Windows host is installed, and
-Wine is not a Windows kernel. Commit `838ee337` does not close GAP-X3.
-Headings stay unmarked. This waiver does not mark those Accepts done, and the
-roadmap stays open.
+(`GAP-X3 openbsd pledge result=ok errno=0`). Windows 11 22H2 WinPE, build
+22621.525, executed the shipped IOCP submit twice
+(`GAP-X1 windows iocp submitted=6`, `GUEST_EXIT:0`) and loaded the RIO table
+twice (`GAP-X3 windows rio result=ok`). Those pointers were not called, so
+this is not a RIO dequeue. The live `IDENTIFY` sentence (eshmaki.me / ircx.us)
+and the live `relay_v2_authoring=active` flip stay unmet. Wine is not a
+Windows kernel, and commit `838ee337` does not close GAP-X3. Headings stay
+unmarked. This waiver does not mark those Accepts done, and the roadmap stays
+open.
 
 ### First three slices a worker can pick up
 

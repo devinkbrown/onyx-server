@@ -5,7 +5,7 @@
 //!
 //! Linux keeps today's Ringlane ring (`ringlane.zig`). FreeBSD implements the
 //! same operations on a kqueue fd via `kevent`. Windows implements them on an
-//! I/O completion port: `NtReadFile` / `NtWriteFile`, AFD wait-for-listen and
+//! I/O completion port: AFD receive and send, AFD wait-for-listen and
 //! AFD poll, `NtCancelIoFileEx`, and an NT timer. `Iocp.open` also loads the
 //! Winsock Registered I/O function table and returns `error.MissingOp` when
 //! that table is missing; the pointers are not called. A missing op, a closed
@@ -729,8 +729,9 @@ const Kqueue = struct {
 ///
 /// Accept is AFD wait-for-listen (`0x1200C`) and poll is AFD select
 /// (`0x12024`), the ReactOS/libuv packing `(FILE_DEVICE_NETWORK << 12) |
-/// (operation << 2) | method`. Recv and send are `NtReadFile` / `NtWriteFile`
-/// after the handle is associated with the port. Timeout arms an NT timer and
+/// (operation << 2) | method`. Recv and send are `IOCTL_AFD_RECEIVE` /
+/// `IOCTL_AFD_SEND` (`0x12017` / `0x1201F`). A raw `NtReadFile` on an AFD
+/// socket returns `STATUS_INVALID_PARAMETER`. Timeout arms an NT timer and
 /// does not synthesize a completion packet. Nothing calls
 /// `NtRemoveIoCompletion` on the success path, so a posted request is not
 /// reported as bytes already transferred.
@@ -741,6 +742,42 @@ const Kqueue = struct {
 ///
 /// `ntdll` and `ws2_32` calls sit in functions that are not analyzed unless
 /// `builtin.os.tag == .windows`. This Linux host does not execute them.
+///
+/// `AFD_POLL_INFO` for one handle. `exclusive` is the `BOOLEAN Unique` byte
+/// plus the three padding bytes AFD.sys expects before the handle (mio layout).
+const AfdPollHandle = extern struct {
+    handle: usize,
+    events: u32,
+    status: i32,
+};
+
+const AfdPollInfo = extern struct {
+    timeout: i64,
+    handle_count: u32,
+    exclusive: u32,
+    handles: AfdPollHandle,
+};
+
+/// `WSABUF` and `AFD_RECV_INFO` / `AFD_SEND_INFO`. The pointer inside the
+/// info struct must stay valid until the request completes.
+const AfdWsaBuf = extern struct {
+    len: u32,
+    buf: [*]u8,
+};
+
+const AfdDataInfo = extern struct {
+    buffers: *AfdWsaBuf,
+    count: u32,
+    afd_flags: u32,
+    tdi_flags: u32,
+};
+
+comptime {
+    if (@sizeOf(usize) == 8 and @sizeOf(AfdPollInfo) != 32) @compileError("AFD_POLL_INFO is 32 bytes");
+    if (@sizeOf(usize) == 8 and @sizeOf(AfdWsaBuf) != 16) @compileError("WSABUF is 16 bytes");
+    if (@sizeOf(usize) == 8 and @sizeOf(AfdDataInfo) != 24) @compileError("AFD_RECV_INFO is 24 bytes");
+}
+
 const Iocp = struct {
     port: usize = 0,
     cap: u16 = 0,
@@ -750,6 +787,16 @@ const Iocp = struct {
     packets: [submit_batch]Packet = @splat(.{}),
     regs: []Reg = &.{},
     armed: []usize = &.{},
+    /// Handles already associated with `port`. A second association fails.
+    bound: []usize = &.{},
+    /// Live for the life of the port. A pending NT request writes these after
+    /// `postOne` returns; a stack copy would dangle.
+    iosbs: [submit_batch]std.os.windows.IO_STATUS_BLOCK = undefined,
+    poll_infos: [submit_batch]AfdPollInfo = undefined,
+    wsa_bufs: [submit_batch]AfdWsaBuf = undefined,
+    data_infos: [submit_batch]AfdDataInfo = undefined,
+    /// `AFD_LISTEN_RESPONSE_INFO_TL` is a sequence plus a `SOCKADDR`.
+    accept_outs: [submit_batch][128]u8 = undefined,
 
     pub const submit_batch = 256;
 
@@ -761,8 +808,11 @@ const Iocp = struct {
     pub const op_cancel: u8 = 7;
 
     /// FILE_DEVICE_NETWORK is 0x12. AFD wait-for-listen is operation 3,
-    /// METHOD_BUFFERED. AFD select (poll) is operation 9, METHOD_BUFFERED.
+    /// METHOD_BUFFERED. AFD receive is operation 5 and AFD send is operation
+    /// 7, both METHOD_NEITHER. AFD select (poll) is operation 9, METHOD_BUFFERED.
     pub const ioctl_afd_wait_for_listen: u32 = (0x12 << 12) | (3 << 2) | 0;
+    pub const ioctl_afd_receive: u32 = (0x12 << 12) | (5 << 2) | 3;
+    pub const ioctl_afd_send: u32 = (0x12 << 12) | (7 << 2) | 3;
     pub const ioctl_afd_poll: u32 = (0x12 << 12) | (9 << 2) | 0;
 
     pub const Packet = struct {
@@ -819,6 +869,10 @@ const Iocp = struct {
             std.heap.page_allocator.free(self.armed);
             self.armed = &.{};
         }
+        if (self.bound.len != 0) {
+            std.heap.page_allocator.free(self.bound);
+            self.bound = &.{};
+        }
     }
 
     pub fn enqueueAccept(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t) !void {
@@ -842,6 +896,7 @@ const Iocp = struct {
             .length = @intCast(buffer.len),
             .token = packToken(token),
             .buf = @intFromPtr(buffer.ptr),
+            .ioctl = ioctl_afd_receive,
         });
     }
 
@@ -855,6 +910,7 @@ const Iocp = struct {
             .length = @intCast(buffer.len),
             .token = packToken(token),
             .buf = @intFromPtr(buffer.ptr),
+            .ioctl = ioctl_afd_send,
         });
     }
 
@@ -1019,51 +1075,56 @@ const Iocp = struct {
         self.n = 0;
         var i: u16 = 0;
         while (i < n_packets) : (i += 1) {
-            try self.postOne(queued[i]);
+            try self.postOne(i, queued[i]);
         }
         return n_packets;
     }
 
-    fn postOne(self: *Iocp, packet: Packet) !void {
+    fn postOne(self: *Iocp, index: u16, packet: Packet) !void {
         const w = std.os.windows;
+        const iosb = &self.iosbs[index];
+        iosb.* = std.mem.zeroes(w.IO_STATUS_BLOCK);
         switch (packet.op) {
             op_accept => {
-                var out: [8]u8 = @splat(0);
-                try self.device(packet, &out);
+                const out = &self.accept_outs[index];
+                @memset(out, 0);
+                try self.device(packet, iosb, "", out);
             },
             op_recv, op_send => {
-                if (packet.buf == 0 or packet.length == 0) return error.MissingOp;
-                try self.associate(packet.handle);
-                var iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
-                const status = if (packet.op == op_recv)
-                    w.ntdll.NtReadFile(
-                        @ptrFromInt(packet.handle),
-                        null,
-                        null,
-                        null,
-                        &iosb,
-                        @ptrFromInt(packet.buf),
-                        packet.length,
-                        null,
-                        null,
-                    )
-                else
-                    w.ntdll.NtWriteFile(
-                        @ptrFromInt(packet.handle),
-                        null,
-                        null,
-                        null,
-                        &iosb,
-                        @ptrFromInt(packet.buf),
-                        packet.length,
-                        null,
-                        null,
-                    );
-                if (status != .SUCCESS and status != .PENDING) return error.MissingOp;
+                if (packet.buf == 0 or packet.length == 0 or packet.ioctl == 0) return error.MissingOp;
+                const wsa = &self.wsa_bufs[index];
+                wsa.* = .{
+                    .len = packet.length,
+                    .buf = @ptrFromInt(packet.buf),
+                };
+                const info = &self.data_infos[index];
+                // AFD_OVERLAPPED is 0x2. TDI_RECEIVE_NORMAL is 0x20. Send uses
+                // no TDI flag; the kernel rejects a raw NtReadFile / NtWriteFile.
+                info.* = .{
+                    .buffers = wsa,
+                    .count = 1,
+                    .afd_flags = 0x2,
+                    .tdi_flags = if (packet.op == op_recv) @as(u32, 0x20) else 0,
+                };
+                var none: [0]u8 = .{};
+                try self.device(packet, iosb, std.mem.asBytes(info), &none);
             },
             op_poll => {
-                var out: [64]u8 = @splat(0);
-                try self.device(packet, &out);
+                // AFD poll is METHOD_BUFFERED and reads the handle list from
+                // the input. A null input is rejected by the kernel.
+                const info = &self.poll_infos[index];
+                info.* = .{
+                    .timeout = -10_000_000,
+                    .handle_count = 1,
+                    .exclusive = 0,
+                    .handles = .{
+                        .handle = packet.handle,
+                        .events = packet.length,
+                        .status = 0,
+                    },
+                };
+                const bytes = std.mem.asBytes(info);
+                try self.device(packet, iosb, bytes, bytes);
             },
             op_cancel => try self.cancelOne(packet),
             op_timeout => try self.armTimer(packet),
@@ -1072,6 +1133,9 @@ const Iocp = struct {
     }
 
     fn associate(self: *Iocp, handle: usize) !void {
+        for (self.bound) |known| {
+            if (known == handle) return;
+        }
         const w = std.os.windows;
         var info = extern struct {
             port: w.HANDLE,
@@ -1088,37 +1152,57 @@ const Iocp = struct {
             @sizeOf(@TypeOf(info)),
             .Completion,
         );
-        if (status != .SUCCESS) return error.MissingOp;
+        if (status != .SUCCESS) {
+            std.debug.print("GAP-X1 windows iocp status=0x{x} op=associate\n", .{@intFromEnum(status)});
+            return error.MissingOp;
+        }
+        const old = self.bound;
+        const grown = std.heap.page_allocator.alloc(usize, old.len + 1) catch return error.OutOfMemory;
+        if (old.len != 0) {
+            @memcpy(grown[0..old.len], old);
+            std.heap.page_allocator.free(old);
+        }
+        grown[old.len] = handle;
+        self.bound = grown;
     }
 
-    fn device(self: *Iocp, packet: Packet, out: []u8) !void {
+    fn device(self: *Iocp, packet: Packet, iosb: *std.os.windows.IO_STATUS_BLOCK, in_buf: []const u8, out: []u8) !void {
         const w = std.os.windows;
         try self.associate(packet.handle);
-        var iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
+        iosb.* = std.mem.zeroes(w.IO_STATUS_BLOCK);
         const code: w.CTL_CODE = @bitCast(packet.ioctl);
         const status = w.ntdll.NtDeviceIoControlFile(
             @ptrFromInt(packet.handle),
             null,
             null,
             null,
-            &iosb,
+            iosb,
             code,
-            null,
-            0,
+            if (in_buf.len == 0) null else @ptrCast(in_buf.ptr),
+            @intCast(in_buf.len),
             if (out.len == 0) null else @ptrCast(out.ptr),
             @intCast(out.len),
         );
-        if (status != .SUCCESS and status != .PENDING) return error.MissingOp;
+        if (status != .SUCCESS and status != .PENDING) {
+            std.debug.print("GAP-X1 windows iocp status=0x{x} op={d}\n", .{ @intFromEnum(status), packet.op });
+            return error.MissingOp;
+        }
     }
 
     fn cancelOne(self: *Iocp, packet: Packet) !void {
         const w = std.os.windows;
         if (packet.length == op_timeout) {
-            const timer = self.lookup(packet.token, op_timeout) orelse return error.MissingOp;
+            // The timer object exists only after armTimer, which runs earlier
+            // in this submit. The enqueue-time registration stores no handle.
+            if (self.armed.len == 0) return error.MissingOp;
+            const timer = self.armed[self.armed.len - 1];
             if (timer == 0) return error.MissingOp;
             var state: w.BOOLEAN = .FALSE;
             const status = NtCancelTimer(@ptrFromInt(timer), &state);
-            if (status != .SUCCESS) return error.MissingOp;
+            if (status != .SUCCESS) {
+                std.debug.print("GAP-X1 windows iocp status=0x{x} op={d}\n", .{ @intFromEnum(status), packet.op });
+                return error.MissingOp;
+            }
             return;
         }
         var request = std.mem.zeroes(w.IO_STATUS_BLOCK);
@@ -1254,8 +1338,8 @@ pub const wsa_sock_stream: i32 = 1;
 pub const wsa_ipproto_tcp: i32 = 6;
 
 /// One pointer from `RIO_EXTENSION_FUNCTION_TABLE`. Opaque because this daemon
-/// does not call `RIOReceive` or `RIOSend`; Windows recv and send stay on
-/// `NtReadFile` / `NtWriteFile`.
+/// does not call `RIOReceive` or `RIOSend`. Windows recv and send are
+/// `IOCTL_AFD_RECEIVE` and `IOCTL_AFD_SEND`.
 pub const RioFn = ?*anyopaque;
 
 /// Userspace image of `RIO_EXTENSION_FUNCTION_TABLE`. On 64-bit Windows the
@@ -1522,6 +1606,8 @@ test "GAP-X1 IoBackend queues accept recv send poll cancel and timeout on the li
     try std.testing.expectError(error.MissingOp, closed_iocp.requireAll());
     for (required_ops) |op| try std.testing.expect(!closed_iocp.opImplemented(op));
     try std.testing.expectEqual(Iocp.ioctl_afd_wait_for_listen, @as(u32, 0x1200c));
+    try std.testing.expectEqual(Iocp.ioctl_afd_receive, @as(u32, 0x12017));
+    try std.testing.expectEqual(Iocp.ioctl_afd_send, @as(u32, 0x1201f));
     try std.testing.expectEqual(Iocp.ioctl_afd_poll, @as(u32, 0x12024));
     var send_bytes = [_]u8{'x'};
     try std.testing.expectError(error.MissingOp, closed_iocp.accept(token, fd));
@@ -1532,8 +1618,8 @@ test "GAP-X1 IoBackend queues accept recv send poll cancel and timeout on the li
     try std.testing.expectError(error.MissingOp, closed_iocp.timeout(token, &ts));
     const iocp_packets = [_]Iocp.Packet{
         .{ .op = Iocp.op_accept, .handle = fd_ident, .token = token_key, .ioctl = Iocp.ioctl_afd_wait_for_listen },
-        .{ .op = Iocp.op_recv, .handle = fd_ident, .length = buf.len, .token = token_key, .buf = @intFromPtr(&buf) },
-        .{ .op = Iocp.op_send, .handle = fd_ident, .length = 1, .token = token_key, .buf = @intFromPtr(&send_bytes) },
+        .{ .op = Iocp.op_recv, .handle = fd_ident, .length = buf.len, .token = token_key, .buf = @intFromPtr(&buf), .ioctl = Iocp.ioctl_afd_receive },
+        .{ .op = Iocp.op_send, .handle = fd_ident, .length = 1, .token = token_key, .buf = @intFromPtr(&send_bytes), .ioctl = Iocp.ioctl_afd_send },
         .{ .op = Iocp.op_poll, .handle = fd_ident, .length = linux.POLL.IN, .token = token_key, .ioctl = Iocp.ioctl_afd_poll },
         .{ .op = Iocp.op_cancel, .handle = fd_ident, .length = Iocp.op_recv, .token = token_key },
         .{ .op = Iocp.op_timeout, .length = 60_000, .token = token_key },
@@ -1626,5 +1712,5 @@ test "GAP-X3 Windows RIO fails closed off Windows" {
     try std.testing.expectError(error.MissingOp, loadRioForDaemon());
     try std.testing.expectError(error.Unsupported, refusePortableReactor(.windows, 32));
 
-    std.debug.print("GAP-X3 branch=windows RIO loads the function table with WSAIoctl SIO 0xC8000024 and GUID 8509e081-96dd-4005-b165-9e2ee8c79e3f on a WSA_FLAG_REGISTERED_IO socket during Iocp.open; a null or short table is MissingOp and the port is closed; off Windows this returns MissingOp before any WSA call; recv and send stay NtReadFile and NtWriteFile; this host did not execute WSAIoctl; heading stays unmarked; whole-accept not claimed\n", .{});
+    std.debug.print("GAP-X3 branch=windows RIO loads the function table with WSAIoctl SIO 0xC8000024 and GUID 8509e081-96dd-4005-b165-9e2ee8c79e3f on a WSA_FLAG_REGISTERED_IO socket during Iocp.open; a null or short table is MissingOp and the port is closed; off Windows this returns MissingOp before any WSA call; recv and send are IOCTL_AFD_RECEIVE and IOCTL_AFD_SEND; this host did not execute WSAIoctl; heading stays unmarked; whole-accept not claimed\n", .{});
 }

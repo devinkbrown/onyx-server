@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Guest execution of the shipped FreeBSD kqueue submit path, FreeBSD
-//! `enableKernelTls`, and OpenBSD `pledgeDaemonPaths`. Each test returns
+//! `enableKernelTls`, OpenBSD `pledgeDaemonPaths`, and the Windows IOCP
+//! submit path (whose open also loads the RIO table). Each test returns
 //! `error.SkipZigTest` unless it is compiled for that kernel, so a Linux
 //! suite does not pretend the syscall ran. `main` is the guest entry point
 //! and calls those same functions.
@@ -131,6 +132,186 @@ pub fn executeOpenBsdPledge() !void {
     std.debug.print("GAP-X3 openbsd pledge result=ok errno={d}\n", .{errnoNow()});
 }
 
+const WinSock = struct {
+    const SockAddrIn = extern struct {
+        family: u16,
+        port: u16,
+        addr: u32,
+        zero: [8]u8,
+    };
+
+    extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(address_family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn bind(s: usize, addr: *const SockAddrIn, namelen: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn listen(s: usize, backlog: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(s: usize, addr: *SockAddrIn, namelen: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(s: usize, addr: *const SockAddrIn, namelen: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn accept(s: usize, addr: ?*anyopaque, namelen: ?*i32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(s: usize) callconv(.winapi) i32;
+};
+
+const WinCom = struct {
+    handle: ?*anyopaque = null,
+
+    extern "kernel32" fn CreateFileA(name: [*:0]const u8, access: u32, share: u32, security: ?*anyopaque, disposition: u32, flags: u32, template: ?*anyopaque) callconv(.winapi) *anyopaque;
+    extern "kernel32" fn WriteFile(handle: *anyopaque, buffer: [*]const u8, len: u32, written: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) i32;
+
+    fn open() WinCom {
+        const invalid: *anyopaque = @ptrFromInt(std.math.maxInt(usize));
+        // WinPE's X: ramdisk is writable. COM1 produced no bytes on the
+        // first boot, so the witness file is the record the screen types back.
+        const handle = CreateFileA("X:\\onyx-out.txt", 4, 1, null, 4, 0x80, null);
+        if (handle == invalid) return .{};
+        return .{ .handle = handle };
+    }
+
+    fn write(self: WinCom, text: []const u8) void {
+        std.debug.print("{s}\n", .{text});
+        const handle = self.handle orelse return;
+        var scratch: [160]u8 = undefined;
+        if (text.len + 2 > scratch.len) return;
+        @memcpy(scratch[0..text.len], text);
+        scratch[text.len] = '\r';
+        scratch[text.len + 1] = '\n';
+        var wrote: u32 = 0;
+        _ = WriteFile(handle, scratch[0 .. text.len + 2].ptr, @intCast(text.len + 2), &wrote, null);
+    }
+
+    fn close(self: *WinCom) void {
+        if (self.handle) |handle| {
+            _ = CloseHandle(handle);
+            self.handle = null;
+        }
+    }
+};
+
+fn winSocket() !usize {
+    const sock = WinSock.WSASocketW(
+        io_backend.wsa_af_inet,
+        io_backend.wsa_sock_stream,
+        io_backend.wsa_ipproto_tcp,
+        null,
+        0,
+        io_backend.wsa_flag_overlapped,
+    );
+    if (sock == 0 or sock == std.math.maxInt(usize)) return error.MissingOp;
+    return sock;
+}
+
+fn socketFd(sock: usize) !std.os.linux.fd_t {
+    const limit: usize = @intCast(std.math.maxInt(std.os.linux.fd_t));
+    if (sock == 0 or sock > limit) return error.MissingOp;
+    return @intCast(sock);
+}
+
+fn windowsPair() !struct { listener: usize, client: usize, accepted: usize } {
+    var startup: [408]u8 = @splat(0);
+    if (WinSock.WSAStartup(0x0202, &startup) != 0) return error.MissingOp;
+    const listener = try winSocket();
+    errdefer _ = WinSock.closesocket(listener);
+    var addr = WinSock.SockAddrIn{
+        .family = 2,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        .zero = @splat(0),
+    };
+    if (WinSock.bind(listener, &addr, @sizeOf(WinSock.SockAddrIn)) != 0) return error.MissingOp;
+    if (WinSock.listen(listener, 1) != 0) return error.MissingOp;
+    var len: i32 = @sizeOf(WinSock.SockAddrIn);
+    if (WinSock.getsockname(listener, &addr, &len) != 0) return error.MissingOp;
+    const client = try winSocket();
+    errdefer _ = WinSock.closesocket(client);
+    if (WinSock.connect(client, &addr, len) != 0) return error.MissingOp;
+    const accepted = WinSock.accept(listener, null, null);
+    if (accepted == 0 or accepted == std.math.maxInt(usize)) return error.MissingOp;
+    return .{ .listener = listener, .client = client, .accepted = accepted };
+}
+
+pub fn executeWindowsIocp() !void {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var com = WinCom.open();
+    defer com.close();
+    // The completion port and the receive buffer stay mapped until process
+    // exit. A pending AFD request writes them after submit returns.
+    var backend = io_backend.IoBackend.openOwned(.iocp, 32, .{}) catch |err| {
+        com.write("GAP-X3 windows rio result=missing stage=open");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    com.write("GAP-X3 windows rio result=ok");
+    const pair = windowsPair() catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=socket");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    const listen_fd = socketFd(pair.listener) catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=fd");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    const peer_fd = socketFd(pair.accepted) catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=fd");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    const token = ringlane.FdToken{ .slot = 1, .gen = 1 };
+    const buf = std.heap.page_allocator.alloc(u8, 4) catch return error.OutOfMemory;
+    @memset(buf, 0);
+    backend.accept(token, listen_fd) catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=accept");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    backend.recv(token, peer_fd, buf) catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=recv");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    backend.send(token, peer_fd, "x") catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=send");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    backend.poll(token, peer_fd, std.os.linux.POLL.IN) catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=poll");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    var ts = std.os.linux.kernel_timespec{ .sec = 1, .nsec = 0 };
+    backend.timeout(token, &ts) catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=timeout");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    backend.cancel(.timeout, token) catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=cancel");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    const submitted = backend.submit() catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=submit");
+        com.write("GUEST_EXIT:1");
+        return err;
+    };
+    var line_buf: [80]u8 = undefined;
+    if (std.fmt.bufPrint(&line_buf, "GAP-X1 windows iocp submitted={d}", .{submitted})) |text| {
+        com.write(text);
+    } else |_| {
+        com.write("GAP-X1 windows iocp submitted=fmt");
+    }
+    if (submitted == 0) {
+        com.write("GUEST_EXIT:1");
+        return error.MissingOp;
+    }
+    _ = WinSock.closesocket(pair.listener);
+    _ = WinSock.closesocket(pair.client);
+    _ = WinSock.closesocket(pair.accepted);
+    com.write("GUEST_EXIT:0");
+    // `backend` and `buf` are deliberately not freed. A pending AFD request
+    // can still write them, and process exit reclaims the pages.
+}
+
 pub fn main() !void {
     if (comptime builtin.os.tag == .freebsd) {
         try executeFreeBsdKqueue();
@@ -139,6 +320,10 @@ pub fn main() !void {
     }
     if (comptime builtin.os.tag == .openbsd) {
         try executeOpenBsdPledge();
+        return;
+    }
+    if (comptime builtin.os.tag == .windows) {
+        try executeWindowsIocp();
         return;
     }
     std.debug.print("foreign kernel exec refused on {s}\n", .{@tagName(builtin.os.tag)});
@@ -158,4 +343,9 @@ test "GAP-X3 FreeBSD kernel TLS executes on this kernel" {
 test "GAP-X3 OpenBSD pledge executes on this kernel" {
     if (comptime builtin.os.tag != .openbsd) return error.SkipZigTest;
     try executeOpenBsdPledge();
+}
+
+test "GAP-X1 Windows IOCP and RIO executes on this kernel" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    try executeWindowsIocp();
 }
