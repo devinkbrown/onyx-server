@@ -120,13 +120,14 @@ image still round-trips.
 
 **Size M.** `src/daemon/memo.zig` says "in-memory + bounded; a WAL/snapshot
 backing can be layered later." `CapsuleKind` has no memo kind.
-`helix/memo_capsule.zig` is exported from `helix/root.zig` and is not a capsule
-kind. OroStore's `memos` family is unused by `services.zig`.
+`helix/memo_capsule.zig` is not maintained. Memos ride `memo_durable.zig` and
+the OroStore `memos` family. `CapsuleKind` still has no memo kind.
 
 The same pattern covers other codecs that describe themselves as the upgrade
 payload and are not sealed and not `CapsuleKind`s: `read_marker_capsule.zig`,
 `whowas_capsule.zig`, `chathistory_cursor_capsule.zig`,
-`bouncer_buffer_capsule.zig`, `account_capsule.zig`, `ratelimit_capsule.zig`.
+`bouncer_buffer_capsule.zig`, `account_capsule.zig`. `ratelimit_capsule.zig`
+is not maintained.
 Read markers are a process-local store. Bouncer rewind on `JOIN` uses that
 marker. After USR2, offline memos are gone, `MARKREAD` positions reset, WHOWAS
 is empty, and connect throttles are zero. Channel text in Lotus still crosses
@@ -156,7 +157,7 @@ after cold start. Reconnect behavior stays as it is.
 (`flood_guard.zig`: "a per-account abuse score that survived reconnects would
 be a separate axis; this module does not model it"). Reputation, clone tables,
 gags, shuns, spamtraps, and Koshi patterns are RAM. `ratelimit_capsule.zig`
-is not a `CapsuleKind`, so a USR2 also clears the in-process tables.
+is not maintained, and it was not a `CapsuleKind`.
 `SPAMTRAP LIST` reports counts, not the recent trips. There is no oper dump of
 reputation rows, flood buckets, or the gag set.
 
@@ -1051,7 +1052,7 @@ mode.
 | `sparse_merkle.zig` | only if anti-entropy outgrows the Merkle already in Undertow |
 | `rendezvous_hash.zig` | GAP-N6 homing |
 | `audit_trail.zig`, `oper_override.zig` | GAP-O10 / GAP-O9, or delete them if the live audit ring is the one that stays |
-| Helix codecs with no kind: `memo_capsule`, `away_capsule`, `whowas_capsule`, `ratelimit_capsule`; `ban_capsule` used by DST while live bans ride the world checkpoint | GAP-D2, GAP-D3, GAP-D4. Either give them a `CapsuleKind` and a version or stop maintaining a second codec |
+| Helix codecs with no kind: `memo_capsule`, `away_capsule`, `whowas_capsule`, and `ratelimit_capsule` are not maintained. `ban_capsule` stays for DST while live bans ride the world checkpoint. `CapsuleKind` is still 1 through 17 | GAP-D2, GAP-D3, GAP-D4. The second codec was removed. No new `CapsuleKind` was added |
 
 `wal.zig` is not the missing store. OroStore already is a checksummed WAL plus
 snapshot (default 16 MiB/record, 256 MiB WAL). The gap is which families are

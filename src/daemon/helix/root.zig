@@ -49,11 +49,8 @@ pub const metadata_capsule = @import("metadata_capsule.zig");
 pub const bouncer_buffer_capsule = @import("bouncer_buffer_capsule.zig");
 pub const read_marker_capsule = @import("read_marker_capsule.zig");
 pub const chathistory_cursor_capsule = @import("chathistory_cursor_capsule.zig");
-pub const away_capsule = @import("away_capsule.zig");
 pub const ban_capsule = @import("ban_capsule.zig");
 pub const silence_capsule = @import("silence_capsule.zig");
-pub const ratelimit_capsule = @import("ratelimit_capsule.zig");
-pub const memo_capsule = @import("memo_capsule.zig");
 pub const upgrade_manifest = @import("upgrade_manifest.zig");
 
 // Successor-side planners + deterministic self-tests.
@@ -70,4 +67,23 @@ test {
     std.testing.refAllDecls(@This());
     _ = thread_snapshot;
     _ = schedule_snapshot;
+}
+
+test "section 10 drops unused memo away and ratelimit codecs" {
+    try std.testing.expect(!@hasDecl(@This(), "memo_capsule"));
+    try std.testing.expect(!@hasDecl(@This(), "away_capsule"));
+    try std.testing.expect(!@hasDecl(@This(), "ratelimit_capsule"));
+    try std.testing.expect(@hasDecl(@This(), "ban_capsule"));
+    try std.testing.expect(@hasDecl(@This(), "silence_capsule"));
+
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(capsule.CapsuleKind.clients));
+    try std.testing.expectEqual(@as(u8, 17), @intFromEnum(capsule.CapsuleKind.handoff_manifest));
+    try std.testing.expectEqual(capsule.CapsuleKind.handoff_manifest, try capsule.CapsuleKind.fromByte(17));
+    try std.testing.expectError(error.UnknownKind, capsule.CapsuleKind.fromByte(18));
+    try std.testing.expectEqual(@as(usize, 17), @typeInfo(capsule.CapsuleKind).@"enum".field_names.len);
+
+    std.debug.print(
+        "section 10 branch=stop maintaining memo_capsule away_capsule and ratelimit_capsule; CapsuleKind stays 1 through 17; ban_capsule stays\n",
+        .{},
+    );
 }
