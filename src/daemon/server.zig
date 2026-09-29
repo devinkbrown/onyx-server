@@ -58157,6 +58157,121 @@ test "DST GAP-A10 late lease refresh does not emit QUIT while the session is liv
     ));
 }
 
+const GapA3Roster = struct {
+    peer: s2s_peer_mod.S2sPeer,
+    state: *s2s_peer_mod.ChannelCrdt,
+
+    fn deinit(self: *@This()) void {
+        self.peer.deinit();
+        self.state.deinit();
+        std.testing.allocator.destroy(self.state);
+    }
+};
+
+/// Handshake a secured SESSION_REPLICA_V2 link and apply one MEMBERSHIP through
+/// `server.residenceVerifier`. `prime_node == 0` starts from an empty roster.
+/// A non-zero prime is the Helix-restored holder already on this link: the
+/// new frame still arrives through `sendMembership`, and trust is the verifier's.
+fn gapA3Exchange(
+    server: *LinuxServer,
+    now_ms: *u64,
+    sender_seed: [sign_mod.seed_len]u8,
+    observer_seed: [sign_mod.seed_len]u8,
+    channel: []const u8,
+    nick: []const u8,
+    account: []const u8,
+    hlc: u64,
+    prime_node: u64,
+    prime_hlc: u64,
+    prime_account: []const u8,
+    prime_trusted: bool,
+) !GapA3Roster {
+    const allocator = std.testing.allocator;
+    var sender_kp = try sign_mod.KeyPair.fromSeed(sender_seed);
+    var observer_kp = try sign_mod.KeyPair.fromSeed(observer_seed);
+    const sender_node = message_relay.originShortId(sender_kp.public_key);
+    const observer_node = message_relay.originShortId(observer_kp.public_key);
+    if (sender_node == 0 or observer_node == 0 or sender_node == observer_node) {
+        sender_kp.deinit();
+        observer_kp.deinit();
+        return error.TestUnexpectedResult;
+    }
+
+    const sender_state = try allocator.create(s2s_peer_mod.ChannelCrdt);
+    sender_state.* = s2s_peer_mod.ChannelCrdt.init(allocator, sender_node);
+    const receiver_state = try allocator.create(s2s_peer_mod.ChannelCrdt);
+    receiver_state.* = s2s_peer_mod.ChannelCrdt.init(allocator, observer_node);
+
+    var sender = initServerTestPeer(sender_state, now_ms, sender_kp, observer_node, 1000, "a3-origin.test", true) catch |err| {
+        sender_kp.deinit();
+        observer_kp.deinit();
+        sender_state.deinit();
+        receiver_state.deinit();
+        allocator.destroy(sender_state);
+        allocator.destroy(receiver_state);
+        return err;
+    };
+    var receiver = initServerTestPeer(receiver_state, now_ms, observer_kp, sender_node, 2000, "a3-obs.test", true) catch |err| {
+        observer_kp.deinit();
+        sender.deinit();
+        sender_state.deinit();
+        receiver_state.deinit();
+        allocator.destroy(sender_state);
+        allocator.destroy(receiver_state);
+        return err;
+    };
+
+    var failed = true;
+    defer {
+        if (failed) {
+            sender.deinit();
+            receiver.deinit();
+            sender_state.deinit();
+            receiver_state.deinit();
+            allocator.destroy(sender_state);
+            allocator.destroy(receiver_state);
+        }
+    }
+
+    receiver.setResidenceVerifier(server.residenceVerifier());
+    var to_receiver = ServerPeerTestBuffer{};
+    defer to_receiver.deinit();
+    var to_sender = ServerPeerTestBuffer{};
+    defer to_sender.deinit();
+    try sender.startHandshake(to_receiver.sink());
+    try receiver.startHandshake(to_sender.sink());
+    try pumpServerTestPeers(&sender, &receiver, &to_receiver, &to_sender, now_ms.*, 0xA310);
+    try std.testing.expect(receiver.supportsSessionReplicaV2());
+
+    if (prime_node != 0) {
+        const primed_at: i64 = @intCast(@min(now_ms.*, @as(u64, std.math.maxInt(i64))));
+        _ = try receiver.routes.applyMembership(channel, nick, prime_node, 0, prime_hlc, true, .{
+            .username = "u",
+            .realname = "r",
+            .host = "held.test",
+            .account = prime_account,
+            .account_trusted = prime_trusted,
+        }, primed_at);
+    }
+
+    try sender.sendMembership(to_receiver.sink(), channel, nick, 0, hlc, true, .{
+        .username = "u",
+        .realname = "r",
+        .host = "origin.test",
+        .account = account,
+    }, "");
+    try pumpServerTestPeers(&sender, &receiver, &to_receiver, &to_sender, now_ms.*, 0xA311);
+    // v2 links hold MEMBERSHIP until the daemon has committed this feed's
+    // authority. The offers were already applied; this is that commit point.
+    receiver.processDeferredResidenceFrames(now_ms.*);
+
+    sender.deinit();
+    sender_state.deinit();
+    allocator.destroy(sender_state);
+    failed = false;
+    return .{ .peer = receiver, .state = receiver_state };
+}
+
 test "DST GAP-A3 replica residence keeps two honest nicks and UID-renames a forged account" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -58218,43 +58333,45 @@ test "DST GAP-A3 replica residence keeps two honest nicks and UID-renames a forg
         LinuxServer.residenceTrusted(&server, "alice", "alice", node_a, false),
     );
 
-    var table = try route_table_mod.RouteTable.init(allocator, .{});
-    defer table.deinit();
-    _ = try table.applyMembership("#a3", "alice", node_a, 0, 100, true, .{
-        .account = "alice",
-        .account_trusted = true,
-    }, 0);
-    try std.testing.expectEqual(
-        route_table_mod.NickDecision.remote_same_account,
-        table.resolveIncomingNick("alice", node_b, 50, "alice", true),
-    );
-    _ = try table.applyMembership("#a3", "alice", node_b, 0, 50, true, .{
-        .account = "alice",
-        .account_trusted = true,
-    }, 0);
-    const forged = table.resolveIncomingNick("alice", node_c, 9_000, "alice", false);
-    const forged_uid = switch (forged) {
-        .rename_to_uid => |uid| uid,
-        else => return error.TestUnexpectedResult,
-    };
-    _ = try table.applyMembership("#a3", &forged_uid, node_c, 0, 9_000, true, .{
-        .account = "alice",
-        .account_trusted = false,
-    }, 0);
-    const members = table.channelMembers("#a3");
-    var saw_alice = false;
+    // The secured link applies MEMBERSHIP itself. Trust comes from the signed
+    // replica offers above via residenceVerifier, then resolveIncomingNick.
+    var now_ms: u64 = 50_000;
+    var roster_a = try gapA3Exchange(&server, &now_ms, @as([sign_mod.seed_len]u8, @splat(0xA4)), @as([sign_mod.seed_len]u8, @splat(0xB3)), "#a3", "alice", "alice", 100, 0, 0, "", false);
+    defer roster_a.deinit();
+    const admitted_a = roster_a.peer.channelMembers("#a3");
+    try std.testing.expectEqual(@as(usize, 1), admitted_a.len);
+    try std.testing.expectEqualStrings("alice", admitted_a[0].nick);
+    try std.testing.expectEqualStrings("alice", admitted_a[0].account);
+    try std.testing.expect(admitted_a[0].account_trusted);
+    try std.testing.expectEqual(node_a, admitted_a[0].node);
+    const held_trusted = admitted_a[0].account_trusted;
+
+    var roster_b = try gapA3Exchange(&server, &now_ms, @as([sign_mod.seed_len]u8, @splat(0xA5)), @as([sign_mod.seed_len]u8, @splat(0xB4)), "#a3", "alice", "alice", 200, node_a, 100, "alice", held_trusted);
+    defer roster_b.deinit();
+    const admitted_b = roster_b.peer.channelMembers("#a3");
+    try std.testing.expectEqual(@as(usize, 1), admitted_b.len);
+    try std.testing.expectEqualStrings("alice", admitted_b[0].nick);
+    try std.testing.expect(admitted_b[0].account_trusted);
+    try std.testing.expectEqual(node_b, admitted_b[0].node);
+
+    var roster_c = try gapA3Exchange(&server, &now_ms, @as([sign_mod.seed_len]u8, @splat(0xA6)), @as([sign_mod.seed_len]u8, @splat(0xB5)), "#a3", "alice", "alice", 9_000, node_a, 100, "alice", held_trusted);
+    defer roster_c.deinit();
+    const admitted_c = roster_c.peer.channelMembers("#a3");
+    var saw_honest = false;
     var saw_forged = false;
-    for (members) |member| {
-        if (std.mem.eql(u8, member.nick, "alice")) {
-            saw_alice = true;
-            try std.testing.expect(member.node == node_a or member.node == node_b);
+    for (admitted_c) |member| {
+        if (member.node == node_a) {
+            saw_honest = true;
+            try std.testing.expectEqualStrings("alice", member.nick);
+            try std.testing.expect(member.account_trusted);
         }
         if (member.node == node_c) {
             saw_forged = true;
             try std.testing.expect(!std.ascii.eqlIgnoreCase(member.nick, "alice"));
+            try std.testing.expect(!member.account_trusted);
         }
     }
-    try std.testing.expect(saw_alice);
+    try std.testing.expect(saw_honest);
     try std.testing.expect(saw_forged);
 
     const token_ambiguous: session_migrate.Token = @splat(0xA7);
