@@ -6,8 +6,10 @@
 //! Linux keeps today's Ringlane ring (`ringlane.zig`). FreeBSD implements the
 //! same operations on a kqueue fd via `kevent`. Windows implements them on an
 //! I/O completion port: `NtReadFile` / `NtWriteFile`, AFD wait-for-listen and
-//! AFD poll, `NtCancelIoFileEx`, and an NT timer. A missing op, a closed port
-//! or queue, or a kernel status other than success or pending returns
+//! AFD poll, `NtCancelIoFileEx`, and an NT timer. `Iocp.open` also loads the
+//! Winsock Registered I/O function table and returns `error.MissingOp` when
+//! that table is missing; the pointers are not called. A missing op, a closed
+//! port or queue, or a kernel status other than success or pending returns
 //! `error.MissingOp` and is not reported as a finished transfer. No reactor
 //! drains the port. Helix USR2 adoption stays on `LinuxServer`.
 
@@ -733,12 +735,18 @@ const Kqueue = struct {
 /// `NtRemoveIoCompletion` on the success path, so a posted request is not
 /// reported as bytes already transferred.
 ///
-/// `ntdll` calls sit in functions that are not analyzed unless
+/// Open also loads `RIO_EXTENSION_FUNCTION_TABLE` through `WSAIoctl`. A failed
+/// or partial table closes the new port and returns `error.MissingOp`. The
+/// stored pointers are not called.
+///
+/// `ntdll` and `ws2_32` calls sit in functions that are not analyzed unless
 /// `builtin.os.tag == .windows`. This Linux host does not execute them.
 const Iocp = struct {
     port: usize = 0,
     cap: u16 = 0,
     n: u16 = 0,
+    /// Empty unless `open` stored a table `rioTableUsable` accepted.
+    rio: RioTable = .{},
     packets: [submit_batch]Packet = @splat(.{}),
     regs: []Reg = &.{},
     armed: []usize = &.{},
@@ -780,13 +788,29 @@ const Iocp = struct {
     pub fn open(entries: u16) !Iocp {
         if (entries == 0) return error.MissingOp;
         if (comptime builtin.os.tag != .windows) return error.MissingOp;
-        return .{ .port = try openHandle(), .cap = batchCap(entries) };
+        const port = try openHandle();
+        var opened = Iocp{
+            .port = port,
+            .cap = batchCap(entries),
+        };
+        // The Registered I/O table is part of opening the Windows backend.
+        // A missing table is not an open port with ordinary sockets underneath.
+        opened.rio = loadRioForDaemon() catch |err| {
+            opened.deinit();
+            return err;
+        };
+        if (!rioTableUsable(&opened.rio)) {
+            opened.deinit();
+            return error.MissingOp;
+        }
+        return opened;
     }
 
     pub fn deinit(self: *Iocp) void {
         if (comptime builtin.os.tag == .windows) self.closeWindows();
         self.port = 0;
         self.n = 0;
+        self.rio = .{};
         if (self.regs.len != 0) {
             std.heap.page_allocator.free(self.regs);
             self.regs = &.{};
@@ -1206,6 +1230,183 @@ extern "ntdll" fn NtCancelTimer(
     CurrentState: ?*std.os.windows.BOOLEAN,
 ) callconv(.winapi) std.os.windows.NTSTATUS;
 
+/// `WSAID_MULTIPLE_RIO` from `mswsock.h`: `8509e081-96dd-4005-b165-9e2ee8c79e3f`.
+pub const RioGuid = extern struct {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [8]u8,
+};
+
+pub const rio_guid: RioGuid = .{
+    .data1 = 0x8509e081,
+    .data2 = 0x96dd,
+    .data3 = 0x4005,
+    .data4 = .{ 0xb1, 0x65, 0x9e, 0x2e, 0xe8, 0xc7, 0x9e, 0x3f },
+};
+
+/// `_WSAIORW(IOC_WS2, 36)` = `IOC_INOUT | IOC_WS2 | 36`.
+pub const sio_get_multiple_rio: u32 = 0xC8000024;
+pub const wsa_flag_overlapped: u32 = 0x01;
+pub const wsa_flag_registered_io: u32 = 0x100;
+pub const wsa_af_inet: i32 = 2;
+pub const wsa_sock_stream: i32 = 1;
+pub const wsa_ipproto_tcp: i32 = 6;
+
+/// One pointer from `RIO_EXTENSION_FUNCTION_TABLE`. Opaque because this daemon
+/// does not call `RIOReceive` or `RIOSend`; Windows recv and send stay on
+/// `NtReadFile` / `NtWriteFile`.
+pub const RioFn = ?*anyopaque;
+
+/// Userspace image of `RIO_EXTENSION_FUNCTION_TABLE`. On 64-bit Windows the
+/// `u32` size is padded to the first pointer, then thirteen pointers: 112 bytes.
+pub const RioTable = extern struct {
+    cb_size: u32 = 0,
+    receive: RioFn = null,
+    receive_ex: RioFn = null,
+    send: RioFn = null,
+    send_ex: RioFn = null,
+    close_completion_queue: RioFn = null,
+    create_completion_queue: RioFn = null,
+    create_request_queue: RioFn = null,
+    dequeue_completion: RioFn = null,
+    deregister_buffer: RioFn = null,
+    notify: RioFn = null,
+    register_buffer: RioFn = null,
+    resize_completion_queue: RioFn = null,
+    resize_request_queue: RioFn = null,
+};
+
+comptime {
+    if (@sizeOf(RioGuid) != 16) @compileError("WSAID_MULTIPLE_RIO is 16 bytes");
+    if (@sizeOf(usize) == 8 and @sizeOf(RioTable) != 112) {
+        @compileError(std.fmt.comptimePrint(
+            "RIO_EXTENSION_FUNCTION_TABLE is {d} bytes, want 112",
+            .{@sizeOf(RioTable)},
+        ));
+    }
+}
+
+const rio_fields = [_][]const u8{
+    "receive",
+    "receive_ex",
+    "send",
+    "send_ex",
+    "close_completion_queue",
+    "create_completion_queue",
+    "create_request_queue",
+    "dequeue_completion",
+    "deregister_buffer",
+    "notify",
+    "register_buffer",
+    "resize_completion_queue",
+    "resize_request_queue",
+};
+
+/// True only when `cbSize` is the struct size and every required pointer is set.
+/// A zero table, a short `cbSize`, or any null function is unusable.
+pub fn rioTableUsable(table: *const RioTable) bool {
+    if (table.cb_size != @sizeOf(RioTable)) return false;
+    inline for (rio_fields) |name| {
+        if (@field(table, name) == null) return false;
+    }
+    return true;
+}
+
+/// Loads the RIO table for an existing socket. Socket `0` and `INVALID_SOCKET`
+/// fail before `WSAIoctl`. Every non-Windows host fails before `WSAIoctl`.
+pub fn loadRegisteredIo(socket: usize) !RioTable {
+    if (socket == 0 or socket == std.math.maxInt(usize)) return error.MissingOp;
+    if (comptime builtin.os.tag != .windows) return error.MissingOp;
+    return ioctlRegisteredIo(socket);
+}
+
+/// Socket plus table load used by `Iocp.open`. Off Windows this is `MissingOp`
+/// and does not call Winsock. The probe socket is closed; the function
+/// pointers are what open keeps. `WSACleanup` is not called.
+fn loadRioForDaemon() !RioTable {
+    if (comptime builtin.os.tag != .windows) return error.MissingOp;
+    std.mem.doNotOptimizeAway(&loadRegisteredIo);
+    const sock = try openRegisteredSocket();
+    defer closeRegisteredSocket(sock);
+    const table = try loadRegisteredIo(sock);
+    if (!rioTableUsable(&table)) return error.MissingOp;
+    return table;
+}
+
+fn openRegisteredSocket() !usize {
+    if (comptime builtin.os.tag != .windows) return error.MissingOp;
+    if (comptime @sizeOf(usize) != 8) return error.MissingOp;
+    // `WSADATA` on Win64 is 408 bytes. The bytes are not interpreted.
+    var startup: [408]u8 = @splat(0);
+    const started = WSAStartup(0x0202, &startup);
+    if (started != 0) return error.MissingOp;
+    const sock = WSASocketW(
+        wsa_af_inet,
+        wsa_sock_stream,
+        wsa_ipproto_tcp,
+        null,
+        0,
+        wsa_flag_overlapped | wsa_flag_registered_io,
+    );
+    if (sock == 0 or sock == std.math.maxInt(usize)) return error.MissingOp;
+    return sock;
+}
+
+fn closeRegisteredSocket(socket: usize) void {
+    if (comptime builtin.os.tag != .windows) return;
+    if (socket == 0 or socket == std.math.maxInt(usize)) return;
+    _ = closesocket(socket);
+}
+
+fn ioctlRegisteredIo(socket: usize) !RioTable {
+    var table = RioTable{ .cb_size = @intCast(@sizeOf(RioTable)) };
+    var bytes: u32 = 0;
+    const rc = WSAIoctl(
+        socket,
+        sio_get_multiple_rio,
+        &rio_guid,
+        @sizeOf(RioGuid),
+        &table,
+        @intCast(@sizeOf(RioTable)),
+        &bytes,
+        null,
+        null,
+    );
+    if (rc != 0) return error.MissingOp;
+    if (bytes < @sizeOf(RioTable)) return error.MissingOp;
+    if (!rioTableUsable(&table)) return error.MissingOp;
+    return table;
+}
+
+extern "ws2_32" fn WSAStartup(
+    version_requested: u16,
+    data: *anyopaque,
+) callconv(.winapi) i32;
+
+extern "ws2_32" fn WSASocketW(
+    address_family: i32,
+    socket_type: i32,
+    protocol: i32,
+    protocol_info: ?*anyopaque,
+    group: u32,
+    flags: u32,
+) callconv(.winapi) usize;
+
+extern "ws2_32" fn WSAIoctl(
+    socket: usize,
+    control_code: u32,
+    in_buffer: ?*const anyopaque,
+    in_bytes: u32,
+    out_buffer: ?*anyopaque,
+    out_bytes: u32,
+    bytes_returned: *u32,
+    overlapped: ?*anyopaque,
+    completion: ?*anyopaque,
+) callconv(.winapi) i32;
+
+extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+
 fn posixSocket() !linux.fd_t {
     const rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
     switch (std.posix.errno(rc)) {
@@ -1377,4 +1578,53 @@ test "GAP-X1 IoBackend queues accept recv send poll cancel and timeout on the li
     if (comptime builtin.os.tag == .windows) try Iocp.exerciseLive();
 
     std.debug.print("GAP-X1 branch=linux ring queued six ops; this host did not execute kqueue or IOCP; closed kqueue describes FreeBSD filters; closed IOCP describes AFD wait-for-listen and AFD poll and returns MissingOp; portable init refuses; USR2 capsule refused\n", .{});
+}
+
+test "GAP-X3 Windows RIO fails closed off Windows" {
+    const ioc_inout: u32 = 0x80000000 | 0x40000000;
+    const ioc_ws2: u32 = 0x08000000;
+    try std.testing.expectEqual(ioc_inout | ioc_ws2 | 36, sio_get_multiple_rio);
+    try std.testing.expectEqual(@as(u32, 0xC8000024), sio_get_multiple_rio);
+    try std.testing.expectEqual(@as(u32, 0x01), wsa_flag_overlapped);
+    try std.testing.expectEqual(@as(u32, 0x100), wsa_flag_registered_io);
+    try std.testing.expectEqual(@as(u32, 0x101), wsa_flag_overlapped | wsa_flag_registered_io);
+    try std.testing.expectEqual(@as(i32, 2), wsa_af_inet);
+    try std.testing.expectEqual(@as(i32, 1), wsa_sock_stream);
+    try std.testing.expectEqual(@as(i32, 6), wsa_ipproto_tcp);
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(RioGuid));
+    try std.testing.expectEqual(@as(usize, 112), @sizeOf(RioTable));
+    const guid_bytes = std.mem.asBytes(&rio_guid);
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x81, 0xe0, 0x09, 0x85, 0xdd, 0x96, 0x05, 0x40,
+        0xb1, 0x65, 0x9e, 0x2e, 0xe8, 0xc7, 0x9e, 0x3f,
+    }, guid_bytes);
+
+    const zero = RioTable{};
+    try std.testing.expect(!rioTableUsable(&zero));
+    const ptr: RioFn = @as(*anyopaque, @ptrFromInt(1));
+    var full = RioTable{ .cb_size = @intCast(@sizeOf(RioTable)) };
+    inline for (rio_fields) |name| @field(full, name) = ptr;
+    try std.testing.expect(rioTableUsable(&full));
+    inline for (rio_fields) |name| {
+        const saved = @field(full, name);
+        @field(full, name) = null;
+        try std.testing.expect(!rioTableUsable(&full));
+        @field(full, name) = saved;
+    }
+    try std.testing.expect(rioTableUsable(&full));
+    full.cb_size = @intCast(@sizeOf(RioTable) - 1);
+    try std.testing.expect(!rioTableUsable(&full));
+
+    const unopened = Iocp.unopened(32);
+    try std.testing.expectEqual(@as(usize, 0), unopened.port);
+    try std.testing.expect(!rioTableUsable(&unopened.rio));
+    try std.testing.expectError(error.MissingOp, Iocp.open(0));
+    try std.testing.expectError(error.MissingOp, IoBackend.openOwned(.iocp, 32, .{}));
+    try std.testing.expectError(error.MissingOp, loadRegisteredIo(0));
+    try std.testing.expectError(error.MissingOp, loadRegisteredIo(std.math.maxInt(usize)));
+    try std.testing.expectError(error.MissingOp, loadRegisteredIo(1));
+    try std.testing.expectError(error.MissingOp, loadRioForDaemon());
+    try std.testing.expectError(error.Unsupported, refusePortableReactor(.windows, 32));
+
+    std.debug.print("GAP-X3 branch=windows RIO loads the function table with WSAIoctl SIO 0xC8000024 and GUID 8509e081-96dd-4005-b165-9e2ee8c79e3f on a WSA_FLAG_REGISTERED_IO socket during Iocp.open; a null or short table is MissingOp and the port is closed; off Windows this returns MissingOp before any WSA call; recv and send stay NtReadFile and NtWriteFile; this host did not execute WSAIoctl; heading stays unmarked; whole-accept not claimed\n", .{});
 }

@@ -1007,9 +1007,9 @@ kernel that has them. Do not fake them with a compile-time zero.
 | OS | Missing | Notes |
 | --- | --- | --- |
 | Linux | Landlock, seccomp, `TCP_FASTOPEN`, `TCP_USER_TIMEOUT`, `SO_INCOMING_CPU`, `IORING_OP_MSG_RING`, `openat2` `RESOLVE_*`, `pidfd`, `close_range`, `MADV_DONTDUMP` / `MADV_WIPEONFORK` on secrets | `eventfd` already wakes shards. kTLS TX is live. Multishot accept/recv, provided buffer rings, `send_zc`, and fixed files are `RingFeatures` defaulting false and are not projected from config. |
-| FreeBSD | an executed `TCP_TXTLS_ENABLE` (the `tls_enable` sockopt is `kernel_other.enableKernelTls`; this host did not run it). `SO_REUSEPORT_LB` and Capsicum are in that module | AES-GCM is `CRYPTO_AES_NIST_GCM_16` (25). ChaCha20-Poly1305 is 41. Linux `SO_REUSEPORT` is not the FreeBSD load-balancing option. Windows RIO stays unmet. The heading stays unmarked. |
+| FreeBSD | an executed `TCP_TXTLS_ENABLE` (the `tls_enable` sockopt is `kernel_other.enableKernelTls`; this host did not run it). `SO_REUSEPORT_LB` and Capsicum are in that module | AES-GCM is `CRYPTO_AES_NIST_GCM_16` (25). ChaCha20-Poly1305 is 41. Linux `SO_REUSEPORT` is not the FreeBSD load-balancing option. Windows RIO is the `loadRegisteredIo` loader and was not executed. The heading stays unmarked. |
 | OpenBSD | `pledge`, `unveil` | Apply to `armor` and to the daemon if it ever runs there. |
-| Windows | IOCP, RIO, Job objects | Comes with GAP-X1. No kTLS claim. |
+| Windows | an executed RIO dequeue (the loader is `loadRegisteredIo` on `Iocp.open`; this host did not run `WSAIoctl`). IOCP and the job object are already in the tree | GUID `8509e081-96dd-4005-b165-9e2ee8c79e3f`, SIO `0xC8000024`, flags `WSA_FLAG_OVERLAPPED` \| `WSA_FLAG_REGISTERED_IO`. A short or null table is `MissingOp` and the completion port is closed. Recv and send stay `NtReadFile` / `NtWriteFile`. No kTLS claim. The heading stays unmarked. |
 
 **Explicitly out,** even if a benchmark post suggests them: XDP / AF_XDP, BPF
 as a firewall, `IP_TRANSPARENT` / `TPROXY`, `SCHED_FIFO`, `TCP_CORK`, and

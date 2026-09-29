@@ -350,6 +350,7 @@ comptime {
 
 test {
     _ = kernel_other;
+    _ = @import("io_backend.zig");
     _ = module_manifest;
     _ = key_transparency;
     _ = durable_credential_props;
