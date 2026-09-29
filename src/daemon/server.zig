@@ -242,6 +242,7 @@ const tls12_server = @import("../crypto/tls12_server.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 const http_fetch = @import("http_fetch.zig");
 const unfurl = @import("unfurl.zig");
+const appeal = @import("appeal.zig");
 
 /// Per-channel cross-leg media bridge (native ↔ opt-in WebRTC roster).
 const Bridge = media_bridge_mod.ChannelBridge(native_media_mod.max_call_participants);
@@ -4260,6 +4261,8 @@ pub const LinuxServer = struct {
     /// Other nodes whose history SEARCH may ask. Each hit is authorized on
     /// this node. The list is live process state, not a checkpoint.
     mesh_search_peers: std.ArrayList(*LinuxServer) = .empty,
+    /// Ban appeals. One open filing per host per window. Not a mesh checkpoint.
+    appeals: appeal.Table = .{},
     /// Test stand-ins for the unfurl resolver and fetch. Null uses DNS and HTTPS.
     unfurl_resolve_for_test: ?unfurl.ResolveFn = null,
     unfurl_fetch_for_test: ?unfurl.FetchFn = null,
@@ -4778,6 +4781,7 @@ pub const LinuxServer = struct {
             .bot_registry = bot_registry_mod.BotRegistry.init(allocator),
             .threads = thread_snapshot.Table.init(allocator) catch unreachable,
             .schedules = schedule_snapshot.Table.init(allocator) catch unreachable,
+            .appeals = appeal.Table.init(allocator) catch unreachable,
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
@@ -6155,6 +6159,7 @@ pub const LinuxServer = struct {
         self.bot_registry.deinit();
         self.threads.deinit();
         self.schedules.deinit();
+        self.appeals.deinit();
         self.mesh_search_peers.deinit(self.allocator);
         self.warden.deinit();
         self.spamtrap.deinit();
@@ -24276,6 +24281,85 @@ pub const LinuxServer = struct {
         const end = std.mem.indexOf(u8, rest, "\r\n") orelse return null;
         if (end == 0) return null;
         return rest[0..end];
+    }
+
+    /// `APPEAL <text>` files one structured appeal per host per window. The
+    /// connection does not need to be registered or joined. `APPEAL LIST` and
+    /// `APPEAL ANSWER <id> :<text>` are oper-only. The answer is audited. Nothing
+    /// on this path is sent to a channel.
+    pub fn handleAppeal(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const p = parsed.paramSlice();
+        if (p.len < 1 or p[0].len == 0) {
+            try self.noticeTo(conn, "Usage: APPEAL <text> | APPEAL LIST | APPEAL ANSWER <id> :<text>");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "LIST")) {
+            if (!conn.session.isOper()) {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied");
+                return;
+            }
+            var views: [appeal.max_appeals]appeal.View = undefined;
+            const n = self.appeals.list(&views);
+            if (n == 0) {
+                try self.noticeTo(conn, "APPEAL none");
+                return;
+            }
+            for (views[0..n]) |view| {
+                var buf: [512]u8 = undefined;
+                const line = std.fmt.bufPrint(&buf, "APPEAL {d} {s} {s} {s} :{s}", .{
+                    view.id,
+                    view.nick,
+                    view.host,
+                    if (view.answered) "answered" else "open",
+                    view.text,
+                }) catch continue;
+                try self.noticeTo(conn, line);
+            }
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "ANSWER")) {
+            if (!conn.session.isOper()) {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied");
+                return;
+            }
+            if (p.len < 3) {
+                try self.noticeTo(conn, "Usage: APPEAL ANSWER <id> :<text>");
+                return;
+            }
+            const id = std.fmt.parseInt(u64, p[1], 10) catch {
+                try self.noticeTo(conn, "APPEAL no such id");
+                return;
+            };
+            self.appeals.answer(id, p[2]) catch {
+                try self.noticeTo(conn, "APPEAL no such id");
+                return;
+            };
+            var id_buf: [32]u8 = undefined;
+            const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch "0";
+            var reason_buf: [180]u8 = undefined;
+            const reason = std.fmt.bufPrint(&reason_buf, "appeal answer: {s}", .{p[2]}) catch "appeal answer";
+            _ = self.recordOperAudit(conn.session.displayName(), .other, id_text, reason);
+            try self.noticeTo(conn, "APPEAL answered");
+            return;
+        }
+        const host = conn.session.realHost();
+        const key = if (host.len != 0) host else conn.session.displayName();
+        const nick = conn.session.displayName();
+        const wall = self.meshWallMs();
+        const now: i64 = if (wall > @as(u64, std.math.maxInt(i64))) std.math.maxInt(i64) else @intCast(wall);
+        const id = self.appeals.file(nick, key, p[0], now) catch |err| switch (err) {
+            error.Window => {
+                try self.noticeTo(conn, "APPEAL already filed");
+                return;
+            },
+            else => {
+                try self.noticeTo(conn, "APPEAL could not file");
+                return;
+            },
+        };
+        var buf: [64]u8 = undefined;
+        const notice = std.fmt.bufPrint(&buf, "APPEAL filed {d}", .{id}) catch "APPEAL filed";
+        try self.noticeTo(conn, notice);
     }
 
     /// `OPERMOTD` — show the operator MOTD (RPL_OMOTDSTART/OMOTD/ENDOFOMOTD, or
@@ -110488,6 +110572,82 @@ test "GAP-P6 unfurl is opt-in, bounded, and refuses private addresses" {
     try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "client refused") != null);
     current_reactor = null;
     std.debug.print("GAP-P6 branch=unfurl defaults off, the client can refuse, and private addresses are not fetched\n", .{});
+}
+
+test "GAP-P7 a banned connection files one appeal and the oper answer is audited" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "appeal.test" };
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const bob_id = try addTestLocalClient(server, "bob", "bob");
+    const bob = server.connFor(bob_id).?;
+    _ = try server.world.join("#room", worldIdFromClient(bob_id));
+    try std.testing.expect(try server.world.addBan("#room", "*!*@banned.example", "bob", 1));
+
+    const alice_id = try addTestLocalClient(server, "alice", "alice");
+    const alice = server.connFor(alice_id).?;
+    alice.session.setRealHost("banned.example");
+    const mask = "alice!alice@banned.example";
+    try std.testing.expect(server.world.isBanned("#room", mask));
+    try std.testing.expect(!server.world.isMember("#room", worldIdFromClient(alice_id)));
+
+    bob.send_len = 0;
+    var filed = try irc_line.parseLine("APPEAL :please review the ban");
+    try server.handleAppeal(alice, &filed);
+    const filed_note = alice.send_buf[0..alice.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, filed_note, "APPEAL filed 1") != null);
+    try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+
+    alice.send_len = 0;
+    var again = try irc_line.parseLine("APPEAL :please review again");
+    try server.handleAppeal(alice, &again);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "already filed") != null);
+    try std.testing.expectEqual(@as(usize, 1), server.appeals.count());
+
+    const carol_id = try addTestLocalClient(server, "carol", "carol");
+    const carol = server.connFor(carol_id).?;
+    carol.session.is_oper = true;
+    carol.send_len = 0;
+    var list_line = try irc_line.parseLine("APPEAL LIST");
+    try server.handleAppeal(carol, &list_line);
+    const listed = carol.send_buf[0..carol.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, listed, "please review the ban") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "open") != null);
+
+    carol.send_len = 0;
+    var answer = try irc_line.parseLine("APPEAL ANSWER 1 :reviewed tomorrow");
+    try server.handleAppeal(carol, &answer);
+    try std.testing.expect(std.mem.indexOf(u8, carol.send_buf[0..carol.send_len], "APPEAL answered") != null);
+    try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+
+    var audited = false;
+    var i: usize = 0;
+    while (i < server.oper_audit.len()) : (i += 1) {
+        const entry = server.oper_audit.at(i) orelse continue;
+        if (std.mem.indexOf(u8, entry.reason, "appeal answer") != null and
+            std.mem.indexOf(u8, entry.reason, "reviewed tomorrow") != null)
+        {
+            audited = true;
+        }
+    }
+    try std.testing.expect(audited);
+
+    var hist: [16]lotus.Message = undefined;
+    if (server.history.latest("#room", hist.len, &hist)) |rows| {
+        for (rows) |row| {
+            try std.testing.expect(std.mem.indexOf(u8, row.text, "please review") == null);
+            try std.testing.expect(std.mem.indexOf(u8, row.text, "reviewed tomorrow") == null);
+        }
+    } else |_| {}
+    current_reactor = null;
+    std.debug.print("GAP-P7 branch=a banned connection files one appeal without joining and the oper answer is audited\n", .{});
 }
 
 test {
