@@ -61903,6 +61903,109 @@ test "UPGRADE GAP-D2 restored memo is delivered when the account attaches" {
     try std.testing.expectEqual(@as(usize, 0), second.memo.pending("carol").len);
 }
 
+test "GAP-D2 kill-restart and same-image USR2 deliver the memo and fire MEMO_PUSH" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d2-usr2.wal");
+    var services = services_mod.Services.init(&store, null);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+            store.deinit();
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(usize, 1), try first.storeOfflineMemo("carol", "alice", "usr2 offline", 88));
+    try std.testing.expectEqual(memo_mod.default_max_per_account, first.memo.cfg.max_per_account);
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(first, &pieces, &blobs);
+
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d2-usr2.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    const restored = second.memo.pending("carol");
+    try std.testing.expectEqual(@as(usize, 1), restored.len);
+    try std.testing.expectEqualStrings("alice", restored[0].from);
+    try std.testing.expectEqualStrings("usr2 offline", restored[0].text);
+    try std.testing.expectEqual(@as(i64, 88), restored[0].sent_ms);
+
+    _ = try adoptUpgradePiecesForTest(second, pieces.items, "onyx-test-gap-d2-usr2");
+    current_reactor = null;
+    const after_adopt = second.memo.pending("carol");
+    try std.testing.expectEqual(@as(usize, 1), after_adopt.len);
+    try std.testing.expectEqualStrings("usr2 offline", after_adopt[0].text);
+    try std.testing.expectEqual(memo_mod.default_max_per_account, second.memo.cfg.max_per_account);
+
+    var pair = try SessionReplayTestPair.init(alloc);
+    defer {
+        pair.b.deinit();
+        pair.ida.deinit();
+        pair.idb.deinit();
+    }
+    const link = try alloc.create(secured_s2s_link.SecuredLink);
+    link.* = pair.a;
+    var link_owned_by_server = false;
+    errdefer {
+        if (!link_owned_by_server) {
+            link.deinit();
+            alloc.destroy(link);
+        }
+    }
+    const id = try second.rx().clients.alloc(ConnState.init(-1));
+    const peer = second.rx().clients.get(id).?;
+    peer.overflow_allocator = alloc;
+    peer.token = try tokenFromId(id);
+    peer.s2s_secured = link;
+    peer.closing = true;
+    link_owned_by_server = true;
+    try std.testing.expect(link.established());
+
+    var conn = ConnState{};
+    Server.loginSession(&conn, "carol");
+    try second.deliverMemo(&conn);
+    const delivered = conn.send_buf[0..conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, delivered, "usr2 offline") != null);
+    try std.testing.expectEqual(@as(usize, 0), second.memo.pending("carol").len);
+    try std.testing.expect(link.outbound().len != 0);
+    try pair.b.feed(link.outbound(), 90);
+    const pushes = try pair.b.takeMemoPushes();
+    defer {
+        for (pushes) |payload| alloc.free(payload);
+        alloc.free(pushes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), pushes.len);
+    const hint = try memo_push_relay.decode(pushes[0]);
+    try std.testing.expectEqualStrings("carol", hint.account);
+    try std.testing.expectEqualStrings("alice", hint.from);
+    try std.testing.expectEqualStrings("usr2 offline", hint.text);
+    std.debug.print("GAP-D2 branch=kill-restart plus same-image USR2 delivered usr2 offline and fired MEMO_PUSH\n", .{});
+}
+
 test "UPGRADE GAP-P16 MARKREAD survives the dropped process image and rewind stays bounded" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
