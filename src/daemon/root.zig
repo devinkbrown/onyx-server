@@ -104,6 +104,7 @@ pub const scoped_access = @import("scoped_access.zig");
 pub const scram_store = @import("scram_store.zig");
 pub const mesh_search = @import("mesh_search.zig");
 pub const search_index = @import("search_index.zig");
+pub const unfurl = @import("unfurl.zig");
 pub const secured_s2s_link = @import("secured_s2s_link.zig");
 pub const server = @import("server.zig");
 pub const server_stats = @import("server_stats.zig");
@@ -453,6 +454,7 @@ test {
     _ = scram_store;
     _ = mesh_search;
     _ = search_index;
+    _ = unfurl;
     _ = secured_s2s_link;
     _ = server;
     _ = server_stats;

@@ -241,6 +241,7 @@ const tls_server = @import("../crypto/tls_server.zig");
 const tls12_server = @import("../crypto/tls12_server.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 const http_fetch = @import("http_fetch.zig");
+const unfurl = @import("unfurl.zig");
 
 /// Per-channel cross-leg media bridge (native ↔ opt-in WebRTC roster).
 const Bridge = media_bridge_mod.ChannelBridge(native_media_mod.max_call_participants);
@@ -1380,6 +1381,8 @@ pub const Config = struct {
     /// base64url VAPID public key; when set, advertised as ISUPPORT `VAPID=`
     /// so clients can pushManager.subscribe without any round-trip.
     webpush_vapid_pub: []const u8 = "",
+    /// Link previews. Off until an operator opts in. A client still has to opt in.
+    unfurl_enabled: bool = false,
     /// WebAuthn (passkey) Relying Party ID — a registrable domain the passkeys
     /// are scoped to (`[webauthn] rp_id`). Null ⇒ the WEBAUTHN command fails
     /// closed (the feature is inert until both this and an origin are set). The
@@ -2429,6 +2432,8 @@ pub const ConnState = struct {
     /// if never. The handler rate-limits searches against it (anti-abuse): a
     /// second SEARCH within `search_rate_limit_ms` is rejected with a FAIL.
     last_search_ms: i64 = 0,
+    /// The client asked for link previews. Default refuse.
+    unfurl_opt_in: bool = false,
     /// True after the sweep sent an unsolicited server PING and is awaiting any
     /// inbound byte (PONG or otherwise) before the ping-timeout grace elapses.
     awaiting_pong: bool = false,
@@ -4255,6 +4260,9 @@ pub const LinuxServer = struct {
     /// Other nodes whose history SEARCH may ask. Each hit is authorized on
     /// this node. The list is live process state, not a checkpoint.
     mesh_search_peers: std.ArrayList(*LinuxServer) = .empty,
+    /// Test stand-ins for the unfurl resolver and fetch. Null uses DNS and HTTPS.
+    unfurl_resolve_for_test: ?unfurl.ResolveFn = null,
+    unfurl_fetch_for_test: ?unfurl.FetchFn = null,
     /// Strictly-increasing incarnation counter for minted oper grants, so a later
     /// GRANT/REVOKE always supersedes an earlier one (even within one ms).
     grant_incarnation: u64 = 0,
@@ -24168,6 +24176,106 @@ pub const LinuxServer = struct {
             if (existing == peer) return;
         }
         try self.mesh_search_peers.append(self.allocator, peer);
+    }
+
+    /// `UNFURL ON|OFF|<https-url>`. The daemon flag defaults off. A client that
+    /// has not sent ON is refusing previews. The fetch is one https GET with no
+    /// Cookie header and no cookie jar. Private, link-local, and loopback
+    /// addresses are refused before the connection.
+    pub fn handleUnfurl(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.registered()) {
+            try queueNumeric(conn, .ERR_NOTREGISTERED, &.{}, "You have not registered");
+            return;
+        }
+        if (!self.config.unfurl_enabled) {
+            try self.noticeTo(conn, "UNFURL: disabled");
+            return;
+        }
+        const p = parsed.paramSlice();
+        if (p.len < 1 or p[0].len == 0) {
+            try self.noticeTo(conn, "Usage: UNFURL <ON|OFF|https://host/path>");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "ON")) {
+            conn.unfurl_opt_in = true;
+            try self.noticeTo(conn, "UNFURL: previews on");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "OFF")) {
+            conn.unfurl_opt_in = false;
+            try self.noticeTo(conn, "UNFURL: client refused");
+            return;
+        }
+        if (!conn.unfurl_opt_in) {
+            try self.noticeTo(conn, "UNFURL: client refused");
+            return;
+        }
+        const target = unfurl.parseHttps(p[0]) catch {
+            try self.noticeTo(conn, "UNFURL: https URLs only");
+            return;
+        };
+        const addr = if (target.literal) |literal|
+            literal
+        else if (self.unfurl_resolve_for_test) |resolve|
+            resolve(target.host) catch {
+                try self.noticeTo(conn, "UNFURL: could not resolve");
+                return;
+            }
+        else
+            http_fetch.resolveHostA(target.host, target.port, 2000) catch {
+                try self.noticeTo(conn, "UNFURL: could not resolve");
+                return;
+            };
+        if (unfurl.deniedAddress(addr)) {
+            try self.noticeTo(conn, "UNFURL: address refused");
+            return;
+        }
+        var request_buf: [512]u8 = undefined;
+        const request = unfurl.buildRequest(&request_buf, target.host, target.path) catch {
+            try self.noticeTo(conn, "UNFURL: url is too long");
+            return;
+        };
+        var body_buf: [unfurl.max_body]u8 = undefined;
+        const body = self.unfurlBody(request, &body_buf) catch {
+            try self.noticeTo(conn, "UNFURL: could not fetch");
+            return;
+        };
+        var title_buf: [unfurl.max_field]u8 = undefined;
+        var desc_buf: [unfurl.max_field]u8 = undefined;
+        var image_buf: [unfurl.max_field]u8 = undefined;
+        const preview = unfurl.parse(body, &title_buf, &desc_buf, &image_buf);
+        var notice_buf: [640]u8 = undefined;
+        const notice = std.fmt.bufPrint(&notice_buf, "UNFURL title={s} description={s} image={s}", .{ preview.title, preview.description, preview.image }) catch {
+            try self.noticeTo(conn, "UNFURL: preview is too long");
+            return;
+        };
+        try self.noticeTo(conn, notice);
+    }
+
+    fn unfurlBody(self: *LinuxServer, request: []const u8, dest: []u8) ![]const u8 {
+        if (self.unfurl_fetch_for_test) |fetch| {
+            const n = try fetch(request, dest);
+            return dest[0..@min(n, dest.len)];
+        }
+        const host = requestHost(request) orelse return error.BadUrl;
+        const raw = try http_fetch.get(self.allocator, host, 443, true, request, .{
+            .max_response_bytes = unfurl.max_body,
+        });
+        defer self.allocator.free(raw);
+        const split = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return dest[0..0];
+        const body = raw[split + 4 ..];
+        const n = @min(body.len, dest.len);
+        @memcpy(dest[0..n], body[0..n]);
+        return dest[0..n];
+    }
+
+    fn requestHost(request: []const u8) ?[]const u8 {
+        const marker = "Host: ";
+        const at = std.mem.indexOf(u8, request, marker) orelse return null;
+        const rest = request[at + marker.len ..];
+        const end = std.mem.indexOf(u8, rest, "\r\n") orelse return null;
+        if (end == 0) return null;
+        return rest[0..end];
     }
 
     /// `OPERMOTD` — show the operator MOTD (RPL_OMOTDSTART/OMOTD/ENDOFOMOTD, or
@@ -110273,6 +110381,113 @@ test "GAP-P5 merged search stays inside the hard cap" {
     try std.testing.expectEqual(@as(usize, 10), countSliceForTest(got, "fromlocal"));
     current_reactor = null;
     std.debug.print("GAP-P5 branch=local and peer hits share one hard cap and each hit stays authorized\n", .{});
+}
+
+var gap_p6_fetches: usize = 0;
+var gap_p6_resolves: usize = 0;
+
+fn gapP6Fetch(request: []const u8, dest: []u8) anyerror!usize {
+    if (std.mem.indexOf(u8, request, "Cookie") != null) return error.Cookie;
+    if (std.mem.indexOf(u8, request, "cookie") != null) return error.Cookie;
+    gap_p6_fetches += 1;
+    const html = "<html><title>Hello Title</title><meta property=\"og:description\" content=\"A description\"><meta property=\"og:image\" content=\"https://cdn.example/a.png\"></html>";
+    if (html.len > dest.len) return error.TooBig;
+    @memcpy(dest[0..html.len], html);
+    return html.len;
+}
+
+fn gapP6Resolve(host: []const u8) anyerror!std.Io.net.IpAddress {
+    _ = host;
+    gap_p6_resolves += 1;
+    return .{ .ip4 = .{ .bytes = .{ 1, 1, 1, 1 }, .port = 443 } };
+}
+
+test "GAP-P6 unfurl is opt-in, bounded, and refuses private addresses" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    gap_p6_fetches = 0;
+    gap_p6_resolves = 0;
+
+    const off_config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "unfurl.test" };
+    const off = createTestServer(alloc, off_config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(off);
+    defer off.deinit();
+    off.unfurl_fetch_for_test = gapP6Fetch;
+    off.unfurl_resolve_for_test = gapP6Resolve;
+    const off_id = try addTestLocalClient(off, "alice", "alice");
+    const off_alice = off.connFor(off_id).?;
+    off_alice.session.registration.registered = true;
+    off_alice.send_len = 0;
+    var off_line = try irc_line.parseLine("UNFURL https://example.com/a");
+    try off.handleUnfurl(off_alice, &off_line);
+    try std.testing.expect(std.mem.indexOf(u8, off_alice.send_buf[0..off_alice.send_len], "disabled") != null);
+    try std.testing.expectEqual(@as(usize, 0), gap_p6_fetches);
+
+    var on_config = off_config;
+    on_config.unfurl_enabled = true;
+    const server = createTestServer(alloc, on_config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    server.unfurl_fetch_for_test = gapP6Fetch;
+    server.unfurl_resolve_for_test = gapP6Resolve;
+    const alice_id = try addTestLocalClient(server, "alice", "alice");
+    const alice = server.connFor(alice_id).?;
+    alice.session.registration.registered = true;
+
+    alice.send_len = 0;
+    var refused = try irc_line.parseLine("UNFURL https://example.com/a");
+    try server.handleUnfurl(alice, &refused);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "client refused") != null);
+    try std.testing.expectEqual(@as(usize, 0), gap_p6_fetches);
+
+    var on_line = try irc_line.parseLine("UNFURL ON");
+    try server.handleUnfurl(alice, &on_line);
+
+    const denied = [_][]const u8{
+        "UNFURL https://127.0.0.1/secret",
+        "UNFURL https://10.1.2.3/a",
+        "UNFURL https://192.168.0.2/a",
+        "UNFURL https://169.254.169.254/latest",
+        "UNFURL https://[::1]/a",
+        "UNFURL https://[fe80::1]/a",
+        "UNFURL http://1.1.1.1/a",
+    };
+    for (denied) |raw| {
+        alice.send_len = 0;
+        var line = try irc_line.parseLine(raw);
+        try server.handleUnfurl(alice, &line);
+        const got = alice.send_buf[0..alice.send_len];
+        try std.testing.expect(std.mem.indexOf(u8, got, "Hello Title") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), gap_p6_fetches);
+    try std.testing.expectEqual(@as(usize, 0), gap_p6_resolves);
+
+    alice.send_len = 0;
+    var ok_line = try irc_line.parseLine("UNFURL https://example.com/a");
+    try server.handleUnfurl(alice, &ok_line);
+    const preview = alice.send_buf[0..alice.send_len];
+    try std.testing.expectEqual(@as(usize, 1), gap_p6_fetches);
+    try std.testing.expectEqual(@as(usize, 1), gap_p6_resolves);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "Hello Title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "A description") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "https://cdn.example/a.png") != null);
+
+    var off_again = try irc_line.parseLine("UNFURL OFF");
+    try server.handleUnfurl(alice, &off_again);
+    alice.send_len = 0;
+    var after = try irc_line.parseLine("UNFURL https://example.com/b");
+    try server.handleUnfurl(alice, &after);
+    try std.testing.expectEqual(@as(usize, 1), gap_p6_fetches);
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "client refused") != null);
+    current_reactor = null;
+    std.debug.print("GAP-P6 branch=unfurl defaults off, the client can refuse, and private addresses are not fetched\n", .{});
 }
 
 test {
