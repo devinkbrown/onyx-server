@@ -1018,20 +1018,22 @@ const Kqueue = struct {
 
 /// Windows completion port. One submit posts at most `submit_batch` kernel
 /// requests; that bound is the batch, not a connection ceiling. A closed
-/// port, a full batch, an unknown cancel, or a status other than success or
-/// pending returns `error.MissingOp`.
+/// port, a full batch, an unknown cancel, or a status other than success,
+/// pending, or a closed connection returns `error.MissingOp`. A closed
+/// connection is that operation's result and does not stop the listener.
 ///
-/// Accept is AFD wait-for-listen (`0x1200C`) and poll is AFD select
-/// (`0x12024`), the ReactOS/libuv packing `(FILE_DEVICE_NETWORK << 12) |
-/// (operation << 2) | method`. Recv and send are `IOCTL_AFD_RECEIVE` /
-/// `IOCTL_AFD_SEND` (`0x12017` / `0x1201F`). A raw `NtReadFile` on an AFD
-/// socket returns `STATUS_INVALID_PARAMETER`. Timeout arms an NT timer and
-/// does not synthesize a completion packet. `STATUS_SUCCESS` is a finished
-/// AFD operation and `reap` returns it before waiting. `STATUS_PENDING` is
-/// reported only from `NtRemoveIoCompletion`. A duplicate port packet for
-/// that slot is discarded. The listening socket stays blocking: a nonblocking
-/// `accept` after wait-for-listen returns WSAEWOULDBLOCK and the connection
-/// is never read.
+/// Accept is AFD wait-for-listen (`0x1200C`) completed by `IOCTL_AFD_ACCEPT`
+/// (`0x12010`) onto a new socket. Poll is AFD select (`0x12024`). The packing
+/// is `(FILE_DEVICE_NETWORK << 12) | (operation << 2) | method`. Recv and
+/// send are `IOCTL_AFD_RECEIVE` / `IOCTL_AFD_SEND` (`0x12017` / `0x1201F`).
+/// A raw `NtReadFile` on an AFD socket returns `STATUS_INVALID_PARAMETER`.
+/// Timeout arms an NT timer and does not synthesize a completion packet.
+/// `STATUS_SUCCESS` is a finished AFD operation and `reap` returns it before
+/// waiting. `STATUS_PENDING` is reported only from `NtRemoveIoCompletion`.
+/// A duplicate port packet for that slot is discarded. Winsock `accept`
+/// after wait-for-listen returns `WSAEWOULDBLOCK` or a socket whose first
+/// receive is `STATUS_CONNECTION_RESET`, so the sequence from the wait is
+/// what adopts the connection.
 ///
 /// Open also loads `RIO_EXTENSION_FUNCTION_TABLE` through `WSAIoctl`. A failed
 /// or partial table closes the new port and returns `error.MissingOp`.
@@ -1069,10 +1071,22 @@ const AfdDataInfo = extern struct {
     tdi_flags: u32,
 };
 
+/// `AFD_ACCEPT_INFO`. `SanActive` is a `BOOLEAN` followed by padding so
+/// `Sequence` is at offset 4 and `AcceptHandle` is at offset 8. A zero flag
+/// has the same first four bytes as a `ULONG` flag.
+const AfdAcceptInfo = extern struct {
+    san_active: u8,
+    sequence: i32,
+    accept_handle: usize,
+};
+
 comptime {
     if (@sizeOf(usize) == 8 and @sizeOf(AfdPollInfo) != 32) @compileError("AFD_POLL_INFO is 32 bytes");
     if (@sizeOf(usize) == 8 and @sizeOf(AfdWsaBuf) != 16) @compileError("WSABUF is 16 bytes");
     if (@sizeOf(usize) == 8 and @sizeOf(AfdDataInfo) != 24) @compileError("AFD_RECV_INFO is 24 bytes");
+    if (@sizeOf(usize) == 8 and @sizeOf(AfdAcceptInfo) != 16) @compileError("AFD_ACCEPT_INFO is 16 bytes");
+    if (@offsetOf(AfdAcceptInfo, "sequence") != 4) @compileError("AFD_ACCEPT_INFO sequence");
+    if (@offsetOf(AfdAcceptInfo, "accept_handle") != 8) @compileError("AFD_ACCEPT_INFO handle");
 }
 
 const Iocp = struct {
@@ -1117,6 +1131,7 @@ const Iocp = struct {
     /// METHOD_BUFFERED. AFD receive is operation 5 and AFD send is operation
     /// 7, both METHOD_NEITHER. AFD select (poll) is operation 9, METHOD_BUFFERED.
     pub const ioctl_afd_wait_for_listen: u32 = (0x12 << 12) | (3 << 2) | 0;
+    pub const ioctl_afd_accept: u32 = (0x12 << 12) | (4 << 2) | 0;
     pub const ioctl_afd_receive: u32 = (0x12 << 12) | (5 << 2) | 3;
     pub const ioctl_afd_send: u32 = (0x12 << 12) | (7 << 2) | 3;
     pub const ioctl_afd_poll: u32 = (0x12 << 12) | (9 << 2) | 0;
@@ -1488,7 +1503,7 @@ const Iocp = struct {
     fn finishInline(self: *Iocp, index: u16) !void {
         const packet = self.slot_pkt[index];
         const iosb = self.iosbs[index];
-        const ev = finishPosted(packet, iosb);
+        const ev = finishPosted(packet, iosb, &self.accept_outs[index]);
         self.slot_live[index] = false;
         self.pushReady(ev) catch |err| {
             if (ev.op == .accept and ev.result >= 0) _ = closesocket(@intCast(ev.result));
@@ -1567,6 +1582,13 @@ const Iocp = struct {
         );
         if (status == .SUCCESS) return true;
         if (status == .PENDING) return false;
+        // One peer reset is that operation's result. MissingOp here ends the
+        // listen loop, which is what a reset of the accepted socket did.
+        if (closedConnection(status)) {
+            iosb.u.Status = status;
+            std.debug.print("GAP-X1 windows iocp closed status=0x{x} op={d}\n", .{ @intFromEnum(status), packet.op });
+            return true;
+        }
         std.debug.print("GAP-X1 windows iocp status=0x{x} op={d}\n", .{ @intFromEnum(status), packet.op });
         return error.MissingOp;
     }
@@ -1656,14 +1678,14 @@ const Iocp = struct {
             if (@intFromPtr(&self.iosbs[i]) != apc_addr) continue;
             const packet = self.slot_pkt[i];
             self.slot_live[i] = false;
-            return finishPosted(packet, iosb);
+            return finishPosted(packet, iosb, &self.accept_outs[i]);
         }
         // The port packet was removed. A synchronous success already cleared
         // its slot, so this copy must not stop the rest of the drain.
         return error.Unmatched;
     }
 
-    fn finishPosted(packet: Packet, iosb: std.os.windows.IO_STATUS_BLOCK) Reaped {
+    fn finishPosted(packet: Packet, iosb: std.os.windows.IO_STATUS_BLOCK, accept_out: []const u8) Reaped {
         const token = ringlane.FdToken{
             .slot = @truncate(packet.token),
             .gen = @truncate(packet.token >> 32),
@@ -1677,12 +1699,8 @@ const Iocp = struct {
         };
         if (iosb.u.Status != .SUCCESS) return .{ .op = op, .token = token, .result = -1 };
         if (packet.op == op_accept) {
-            const sock = acceptOne(packet.handle) catch |err| switch (err) {
-                // WSAEWOULDBLOCK. The listener stays blocking, so this is not
-                // the path that adopts a PING. A nonblocking listener hits
-                // it after wait-for-listen and drops the connection.
-                error.WouldBlock => return .{ .op = .accept, .token = token, .result = -11 },
-                error.SocketFailed => return .{ .op = .accept, .token = token, .result = -1 },
+            const sock = acceptSequence(packet.handle, accept_out) catch {
+                return .{ .op = .accept, .token = token, .result = -1 };
             };
             return .{ .op = .accept, .token = token, .result = sock };
         }
@@ -2015,6 +2033,53 @@ fn acceptOne(handle: usize) error{ WouldBlock, SocketFailed }!i32 {
     if (bad) {
         if (sock != 0 and sock != std.math.maxInt(usize)) _ = closesocket(sock);
         if (WSAGetLastError() == 10035) return error.WouldBlock;
+        return error.SocketFailed;
+    }
+    return @intCast(sock);
+}
+
+fn closedConnection(status: std.os.windows.NTSTATUS) bool {
+    return switch (@intFromEnum(status)) {
+        // DISCONNECTED, RESET, LOCAL_DISCONNECT, REMOTE_DISCONNECT,
+        // REFUSED, INVALID, ABORTED.
+        0xC000020C, 0xC000020D, 0xC000013B, 0xC000013C, 0xC0000236, 0xC000023A, 0xC0000241 => true,
+        else => false,
+    };
+}
+
+/// Move the connection named by the wait-for-listen sequence onto a new
+/// overlapped socket. The first four bytes of `out` are that sequence.
+fn acceptSequence(listener: usize, out: []const u8) error{SocketFailed}!i32 {
+    if (out.len < 4) return error.SocketFailed;
+    const sequence = std.mem.readInt(i32, out[0..4], .little);
+    const sock = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    if (sock == 0 or sock == std.math.maxInt(usize)) return error.SocketFailed;
+    const info = AfdAcceptInfo{
+        .san_active = 0,
+        .sequence = sequence,
+        .accept_handle = sock,
+    };
+    var iosb = std.mem.zeroes(std.os.windows.IO_STATUS_BLOCK);
+    const code: std.os.windows.CTL_CODE = @bitCast(Iocp.ioctl_afd_accept);
+    const status = std.os.windows.ntdll.NtDeviceIoControlFile(
+        @ptrFromInt(listener),
+        null,
+        null,
+        null,
+        &iosb,
+        code,
+        &info,
+        @sizeOf(AfdAcceptInfo),
+        null,
+        0,
+    );
+    if (status != .SUCCESS) {
+        _ = closesocket(sock);
+        std.debug.print("GAP-X1 windows afd accept status=0x{x} seq={d}\n", .{ @intFromEnum(status), sequence });
+        return error.SocketFailed;
+    }
+    if (sock > std.math.maxInt(i32)) {
+        _ = closesocket(sock);
         return error.SocketFailed;
     }
     return @intCast(sock);
@@ -2487,6 +2552,7 @@ test "GAP-X1 IoBackend queues accept recv send poll cancel and timeout on the li
     try std.testing.expectError(error.MissingOp, closed_iocp.requireAll());
     for (required_ops) |op| try std.testing.expect(!closed_iocp.opImplemented(op));
     try std.testing.expectEqual(Iocp.ioctl_afd_wait_for_listen, @as(u32, 0x1200c));
+    try std.testing.expectEqual(Iocp.ioctl_afd_accept, @as(u32, 0x12010));
     try std.testing.expectEqual(Iocp.ioctl_afd_receive, @as(u32, 0x12017));
     try std.testing.expectEqual(Iocp.ioctl_afd_send, @as(u32, 0x1201f));
     try std.testing.expectEqual(Iocp.ioctl_afd_poll, @as(u32, 0x12024));
