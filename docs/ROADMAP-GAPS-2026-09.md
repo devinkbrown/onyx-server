@@ -984,6 +984,10 @@ trait and fail closed on a missing op. Helix `USR2` stays Linux. Other kernels
 refuse a USR2 capsule instead of adopting it wrong. A `zig build` of the daemon
 succeeds for `x86_64-linux` and at least one non-Linux triple.
 
+FreeBSD 14.5-RELEASE-p1 executed the shipped kqueue submit
+(`GAP-X1 freebsd kqueue submitted=6 errno=0`). Windows IOCP remains unmet.
+The heading stays unmarked and the whole Accept stays unclaimed.
+
 ### GAP-X2 — `server.zig` strangler, only as a seam is touched
 
 **Size XL, sliced.** 102,407 lines in one file. A mechanical split is how
@@ -1007,8 +1011,8 @@ kernel that has them. Do not fake them with a compile-time zero.
 | OS | Missing | Notes |
 | --- | --- | --- |
 | Linux | Landlock, seccomp, `TCP_FASTOPEN`, `TCP_USER_TIMEOUT`, `SO_INCOMING_CPU`, `IORING_OP_MSG_RING`, `openat2` `RESOLVE_*`, `pidfd`, `close_range`, `MADV_DONTDUMP` / `MADV_WIPEONFORK` on secrets | `eventfd` already wakes shards. kTLS TX is live. Multishot accept/recv, provided buffer rings, `send_zc`, and fixed files are `RingFeatures` defaulting false and are not projected from config. |
-| FreeBSD | an executed `TCP_TXTLS_ENABLE` (the `tls_enable` sockopt is `kernel_other.enableKernelTls`; this host did not run it). `SO_REUSEPORT_LB` and Capsicum are in that module | AES-GCM is `CRYPTO_AES_NIST_GCM_16` (25). ChaCha20-Poly1305 is 41. Linux `SO_REUSEPORT` is not the FreeBSD load-balancing option. Windows RIO is the `loadRegisteredIo` loader and was not executed. The heading stays unmarked. |
-| OpenBSD | an executed `pledge` / `unveil` (the call is `kernel_other.pledgeDaemonPaths`; this host did not run it) | The armor CLI applies none (section 12). The daemon unveils `/etc` r, `/usr` r, `/var` rwc, `/tmp` rwc, then pledges `stdio rpath wpath cpath inet dns`. Off OpenBSD this is `MissingOp` before either call. The heading stays unmarked. |
+| FreeBSD | `TCP_TXTLS_ENABLE` ran on FreeBSD 14.5-RELEASE-p1: `GAP-X3 freebsd ktls result=ok errno=0` after `kern.ipc.tls.enable=1`. With that sysctl at 0 the same setsockopt returned errno 45. `SO_REUSEPORT_LB` and Capsicum are in that module | AES-GCM is `CRYPTO_AES_NIST_GCM_16` (25). ChaCha20-Poly1305 is 41. Linux `SO_REUSEPORT` is not the FreeBSD load-balancing option. Windows RIO is the `loadRegisteredIo` loader and remains unmet. The heading stays unmarked. |
+| OpenBSD | `pledge` / `unveil` ran on OpenBSD 7.9 (`kern.osrelease=7.9`): `GAP-X3 openbsd pledge result=ok errno=0`, with `/etc`, `/usr`, `/var`, and `/tmp` present | The armor CLI applies none (section 12). The daemon unveils `/etc` r, `/usr` r, `/var` rwc, `/tmp` rwc, then pledges `stdio rpath wpath cpath inet dns`. Off OpenBSD this is `MissingOp` before either call. The heading stays unmarked. |
 | Windows | an executed RIO dequeue (the loader is `loadRegisteredIo` on `Iocp.open`; this host did not run `WSAIoctl`). IOCP and the job object are already in the tree | GUID `8509e081-96dd-4005-b165-9e2ee8c79e3f`, SIO `0xC8000024`, flags `WSA_FLAG_OVERLAPPED` \| `WSA_FLAG_REGISTERED_IO`. A short or null table is `MissingOp` and the completion port is closed. Recv and send stay `NtReadFile` / `NtWriteFile`. No kTLS claim. The heading stays unmarked. |
 
 **Explicitly out,** even if a benchmark post suggests them: XDP / AF_XDP, BPF
@@ -1146,13 +1150,16 @@ Human-only, whenever a slice is actually deployed: Helix `USR2` when the image
 token allows, cold restart one node at a time otherwise, GitHub push last.
 This roadmap does not authorize a deploy.
 
-Execution of the remaining observations is waived for this tree. No FreeBSD,
-OpenBSD, or Windows host is installed. QEMU has no guest image, and Wine is
-not a Windows kernel. The live `IDENTIFY` sentence (eshmaki.me / ircx.us) and
-the live `relay_v2_authoring=active` flip stay unmet. Executed kqueue, IOCP,
-FreeBSD kernel TLS, OpenBSD pledge, and Windows RIO stay unmet. Commit
-`838ee337` does not close GAP-X3. Headings stay unmarked. This waiver does not
-mark those Accepts done.
+FreeBSD 14.5-RELEASE-p1 executed the shipped kqueue submit
+(`GAP-X1 freebsd kqueue submitted=6 errno=0`) and kernel TLS
+(`GAP-X3 freebsd ktls result=ok errno=0` with `kern.ipc.tls.enable=1`).
+OpenBSD 7.9 executed the shipped pledge
+(`GAP-X3 openbsd pledge result=ok errno=0`). Windows IOCP, Windows RIO, the
+live `IDENTIFY` sentence (eshmaki.me / ircx.us), and the live
+`relay_v2_authoring=active` flip stay unmet. No Windows host is installed, and
+Wine is not a Windows kernel. Commit `838ee337` does not close GAP-X3.
+Headings stay unmarked. This waiver does not mark those Accepts done, and the
+roadmap stays open.
 
 ### First three slices a worker can pick up
 
