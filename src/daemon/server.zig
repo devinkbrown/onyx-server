@@ -873,6 +873,7 @@ pub const ParsedLine = irc_line.LineView;
 pub const ReplyCode = Numeric;
 
 const ringlane = @import("ringlane.zig");
+const io_backend = @import("io_backend.zig");
 
 const RingFdToken = ringlane.FdToken;
 const RingCore = ringlane.Ring;
@@ -4195,7 +4196,7 @@ pub const LinuxServer = struct {
             -1;
         errdefer if (ws_listener_fd >= 0) closeFd(ws_listener_fd);
 
-        var ring = RingCore.init(config.ring_entries, config.features) catch |err| {
+        var ring = io_backend.openLinuxRing(config.ring_entries, config.features) catch |err| {
             if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
             return err;
         };
@@ -5734,19 +5735,19 @@ pub const LinuxServer = struct {
     pub fn armAccept(self: *LinuxServer) !void {
         if (self.rx().socket_io_quiescing) return;
         if (!self.rx().accept_armed) {
-            try self.rx().ring.submitAccept(listener_token, self.rx().listener_fd);
+            try io_backend.submitAccept(&self.rx().ring, listener_token, self.rx().listener_fd);
             self.rx().accept_armed = true;
         }
         if (self.rx() == &self.reactors[0] and self.rx().s2s_listener_fd >= 0 and !self.rx().s2s_accept_armed) {
-            try self.rx().ring.submitAccept(s2s_listener_token, self.rx().s2s_listener_fd);
+            try io_backend.submitAccept(&self.rx().ring, s2s_listener_token, self.rx().s2s_listener_fd);
             self.rx().s2s_accept_armed = true;
         }
         if (self.rx().tls_listener_fd >= 0 and !self.rx().tls_accept_armed) {
-            try self.rx().ring.submitAccept(tls_listener_token, self.rx().tls_listener_fd);
+            try io_backend.submitAccept(&self.rx().ring, tls_listener_token, self.rx().tls_listener_fd);
             self.rx().tls_accept_armed = true;
         }
         if (self.rx().ws_listener_fd >= 0 and !self.rx().ws_accept_armed) {
-            try self.rx().ring.submitAccept(ws_listener_token, self.rx().ws_listener_fd);
+            try io_backend.submitAccept(&self.rx().ring, ws_listener_token, self.rx().ws_listener_fd);
             self.rx().ws_accept_armed = true;
         }
     }
@@ -5756,7 +5757,7 @@ pub const LinuxServer = struct {
     fn armWake(self: *LinuxServer) !void {
         if (self.rx().wake) |w| {
             if (!self.rx().wake_armed) {
-                try self.rx().ring.submitPollAdd(wake_token, w.fd(), linux.POLL.IN);
+                try io_backend.submitPoll(&self.rx().ring, wake_token, w.fd(), linux.POLL.IN);
                 self.rx().wake_armed = true;
             }
         }
@@ -5954,7 +5955,7 @@ pub const LinuxServer = struct {
         if (self.rx().timer_armed) return;
         const ns = self.config.sweep_interval_ms * std.time.ns_per_ms;
         self.rx().timer_spec = .{ .sec = @intCast(@divFloor(ns, std.time.ns_per_s)), .nsec = @intCast(@mod(ns, std.time.ns_per_s)) };
-        try self.rx().ring.submitTimeout(timer_token, &self.rx().timer_spec);
+        try io_backend.submitTimeout(&self.rx().ring, timer_token, &self.rx().timer_spec);
         self.rx().timer_armed = true;
     }
 
@@ -7494,7 +7495,7 @@ pub const LinuxServer = struct {
             };
             for (accept_ops) |op| {
                 if (!op.armed.* or op.pending.*) continue;
-                r.ring.submitExactCancel(.accept, op.token) catch |err| switch (err) {
+                io_backend.submitCancel(&r.ring, .accept, op.token) catch |err| switch (err) {
                     error.SubmissionQueueFull => {
                         sq_full = true;
                         break;
@@ -7510,7 +7511,7 @@ pub const LinuxServer = struct {
                 if (!slot.occupied) continue;
                 const conn = &slot.value;
                 if (conn.recv_armed and !conn.recv_cancel_pending) {
-                    r.ring.submitExactCancel(.recv, conn.token) catch |err| switch (err) {
+                    io_backend.submitCancel(&r.ring, .recv, conn.token) catch |err| switch (err) {
                         error.SubmissionQueueFull => {
                             sq_full = true;
                             break;
@@ -7523,7 +7524,7 @@ pub const LinuxServer = struct {
                     conn.recv_cancel_pending = true;
                 }
                 if (conn.send_armed and !conn.send_cancel_pending) {
-                    r.ring.submitExactCancel(.send, conn.token) catch |err| switch (err) {
+                    io_backend.submitCancel(&r.ring, .send, conn.token) catch |err| switch (err) {
                         error.SubmissionQueueFull => {
                             sq_full = true;
                             break;
@@ -7536,7 +7537,7 @@ pub const LinuxServer = struct {
                     conn.send_cancel_pending = true;
                 }
                 if (conn.connect_armed and !conn.connect_cancel_pending) {
-                    r.ring.submitExactCancel(.connect, conn.token) catch |err| switch (err) {
+                    io_backend.submitCancel(&r.ring, .connect, conn.token) catch |err| switch (err) {
                         error.SubmissionQueueFull => {
                             sq_full = true;
                             break;
@@ -13112,7 +13113,7 @@ pub const LinuxServer = struct {
     /// latch to consult.
     fn armRecv(self: *LinuxServer, conn: *ConnState) !void {
         if (self.rx().socket_io_quiescing or conn.recv_armed or conn.closing) return;
-        self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch |err| {
+        io_backend.submitRecv(&self.rx().ring, conn.token, conn.fd, &conn.recv_buf) catch |err| {
             if (err == error.SubmissionQueueFull) {
                 conn.io_activation_pending = true;
                 conn.activation_recv_required = true;
@@ -13145,7 +13146,7 @@ pub const LinuxServer = struct {
         // first. This keeps inherited secured-link replay/burst helpers inert
         // even though they normally arm output as they append it.
         if (!conn.closing and conn.io_activation_pending and conn.activation_recv_required and !conn.recv_armed) return;
-        self.rx().ring.submitSend(conn.token, conn.fd, conn.send_buf[conn.send_offset..conn.send_len]) catch |err| {
+        io_backend.submitSend(&self.rx().ring, conn.token, conn.fd, conn.send_buf[conn.send_offset..conn.send_len]) catch |err| {
             if (err == error.SubmissionQueueFull) {
                 conn.io_activation_pending = true;
                 conn.activation_recv_required = conn.activation_recv_required or (!conn.recv_armed and !conn.closing);
@@ -27090,7 +27091,10 @@ pub const LinuxServer = struct {
     }
 
     pub fn adoptInheritedSessions(self: *LinuxServer) error{ InvalidInheritedHandoff, DurableDeviceActivationFailed }!void {
-        if (comptime builtin.os.tag != .linux) return;
+        if (comptime builtin.os.tag != .linux) {
+            io_backend.refuseForeignCapsule() catch return error.InvalidInheritedHandoff;
+            return error.InvalidInheritedHandoff;
+        }
         const arena_fd = self.config.resume_arena_fd orelse {
             // A state-fd manifest without its arena is an incomplete handoff. A
             // malformed/colliding list is startup-fatal because guessing at
@@ -52777,16 +52781,15 @@ pub const LinuxServer = struct {
     }
 };
 
-/// Public entry point. `LinuxServer` is the io_uring fast path; other targets
-/// get a stub whose `init` fails closed until a portable poll/kqueue backend
-/// lands (CROSS-PLATFORM MANDATE). main() already falls back to the DST boot
-/// banner when `init` returns error.Unsupported, so the daemon still links and
-/// runs its non-socket paths on macOS/BSD/Windows.
+/// Public entry point. `LinuxServer` is the io_uring fast path. Other targets
+/// construct `PortableServer`, whose `init` asks `IoBackend` and fails closed
+/// when accept, recv, send, poll, cancel, or timeout is missing.
 pub const Server = if (builtin.os.tag == .linux) LinuxServer else PortableServer;
 
 const PortableServer = struct {
-    pub fn init(_: std.mem.Allocator, _: Config) ServerError!PortableServer {
-        return error.Unsupported;
+    pub fn init(_: std.mem.Allocator, config: Config) ServerError!PortableServer {
+        io_backend.refusePortableReactor(builtin.os.tag, config.ring_entries) catch |err| return err;
+        unreachable;
     }
     pub fn deinit(_: *PortableServer) void {}
     pub fn start(_: *PortableServer) void {}
@@ -52810,6 +52813,11 @@ const PortableServer = struct {
     pub fn replayServicesLiveState(_: *PortableServer, _: *services_mod.Services) void {}
     pub fn loadWasmPlugins(_: *PortableServer) void {}
 };
+
+test "GAP-X1 PortableServer init fails closed through the IoBackend" {
+    try std.testing.expectError(error.Unsupported, PortableServer.init(std.testing.allocator, .{ .port = 0 }));
+    std.debug.print("GAP-X1 branch=PortableServer init refuses through the IoBackend\n", .{});
+}
 
 const CompletionHandler = struct {
     server: *LinuxServer,
