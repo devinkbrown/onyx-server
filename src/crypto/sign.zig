@@ -163,6 +163,19 @@ pub const KeyPair = struct {
         self.secret_key.wipe();
     }
 
+    /// A second sealed page holding the same secret. Each `KeyPair` unmaps
+    /// only the page it still points at, so a copy that shares `page` is not
+    /// a second owner.
+    pub fn clone(self: *const KeyPair) error{SecretPageUnavailable}!KeyPair {
+        if (self.secret_key.page == null) return error.SecretPageUnavailable;
+        var material = self.secret_key.declassify();
+        defer secureZero(&material);
+        return .{
+            .public_key = self.public_key,
+            .secret_key = try SealedSecretKey.seal(&material),
+        };
+    }
+
     /// Sign `msg` with plain RFC 8032 Ed25519.
     pub fn sign(self: *const KeyPair, msg: []const u8) SignError!Signature {
         return self.signPrefixed("", "", msg);

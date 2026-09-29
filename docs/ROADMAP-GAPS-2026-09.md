@@ -793,6 +793,13 @@ sets `dtls13 = true`, with 1.2 as the fallback when a peer does not offer 1.3.
 daemon and media flows, or the live flag goes back to off and the code comment
 stays. Same-library tests do not close this item.
 
+Source `[media].dtls13` defaults off, and `dtls13_server.zig` keeps the
+transcript caveat (`browser_interop_caveat_held`). With that flag off, a
+DTLS 1.2 ClientHello still gets `HelloVerifyRequest`. Unmodified Chromium
+150.0.7871.128 launches and has no DTLS client mode, so no handshake is
+claimed and no media flowed. The live fleet TOML was not changed. The
+heading stays unmarked.
+
 ### GAP-V2 — An unmodified browser can join
 
 **Size XL.** Signaling is IRC `MEDIA`, not SDP. The SFU terminates DTLS-SRTP.

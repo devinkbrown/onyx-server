@@ -282,7 +282,10 @@ pub const SecuredLink = struct {
 
         const link = try self.allocator.create(s2s_link.S2sLink);
         errdefer self.allocator.destroy(link);
-        try link.resumeEstablished(.{
+        // The peer wipes whatever page it stores. Seal a new one so the
+        // borrowed identity key stays mapped for its owner.
+        var owned_key = try self.identity.sign_kp.clone();
+        link.resumeEstablished(.{
             .allocator = self.allocator,
             .local_node_id = node_short_id.shortId(self.identity.node_id),
             .remote_node_id = rs.inner.remote_node_id,
@@ -292,12 +295,17 @@ pub const SecuredLink = struct {
             .channel_name = self.channel_name,
             .config = self.inner_config,
             .now_ms = rs.now_ms,
-            .signing_key = self.identity.sign_kp,
+            .signing_key = owned_key,
             .admitted_frame_families = rs.established.admitted_frame_families,
             .session_replica_transport_enabled = true,
             .secure_relay_transport_enabled = true,
             .event_spine_v2_transport_enabled = true,
-        }, rs.inner, rs.remote_name, rs.rng_seed);
+        }, rs.inner, rs.remote_name, rs.rng_seed) catch |err| {
+            owned_key.deinit();
+            return err;
+        };
+        // The peer stored this page. Drop the stack handle without unmapping.
+        owned_key.secret_key.page = null;
         self.inner = link;
         return self;
     }
@@ -1372,7 +1380,14 @@ pub const SecuredLink = struct {
         const peer_short = self.session.?.peerShortId().?;
         const link = try self.allocator.create(s2s_link.S2sLink);
         errdefer self.allocator.destroy(link);
-        try link.init(.{
+        // End-to-end frame signing: hand the inner peer this node's signing
+        // key so direct-owned state frames carry a self-certifying origin
+        // proof. `local_node_id` above is derived from the SAME identity, so
+        // the receiver's `originShortId(pubkey) == origin_node` invariant
+        // holds. The page sealed here is the peer's: its deinit wipes that
+        // page only, and `self.identity.sign_kp` stays mapped.
+        var owned_key = try self.identity.sign_kp.clone();
+        link.init(.{
             .allocator = self.allocator,
             .local_node_id = node_short_id.shortId(self.identity.node_id),
             .remote_node_id = peer_short,
@@ -1382,18 +1397,16 @@ pub const SecuredLink = struct {
             .channel_name = self.channel_name,
             .config = self.inner_config,
             .now_ms = now_ms,
-            // End-to-end frame signing: hand the inner peer this node's signing
-            // key so direct-owned state frames carry a self-certifying origin
-            // proof. `local_node_id` above is derived from the SAME identity, so
-            // the receiver's `originShortId(pubkey) == origin_node` invariant
-            // holds. The inner peer takes an independent copy and wipes it on
-            // deinit; `self.identity.sign_kp` is unaffected.
-            .signing_key = self.identity.sign_kp,
+            .signing_key = owned_key,
             .admitted_frame_families = self.establishedKeys().admitted_frame_families,
             .session_replica_transport_enabled = true,
             .secure_relay_transport_enabled = true,
             .event_spine_v2_transport_enabled = true,
-        });
+        }) catch |err| {
+            owned_key.deinit();
+            return err;
+        };
+        owned_key.secret_key.page = null;
         if (self.local_nicks) |resolver| link.setLocalNickResolver(resolver);
         if (self.residence_verifier) |v| link.setResidenceVerifier(v);
         if (self.session_token_resolver) |resolver| link.setSessionTokenResolver(resolver);
