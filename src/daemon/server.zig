@@ -233,6 +233,8 @@ const s2s_snapshot = @import("helix/s2s_snapshot.zig");
 const oper_grant_snapshot = @import("helix/oper_grant_snapshot.zig");
 const bot_grant_snapshot = @import("helix/bot_grant_snapshot.zig");
 const thread_snapshot = @import("helix/thread_snapshot.zig");
+const schedule_snapshot = @import("helix/schedule_snapshot.zig");
+const cron = @import("../substrate/cron.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
 const mesh_clock_snapshot = @import("helix/mesh_clock_snapshot.zig");
 const tls_server = @import("../crypto/tls_server.zig");
@@ -4246,6 +4248,10 @@ pub const LinuxServer = struct {
     /// and rebuilt from durable history on a cold start. The `+draft/reply` tag
     /// stays on the wire for clients that negotiated it.
     threads: thread_snapshot.Table = .{},
+    /// Deferred channel messages and oper modes. The body lives in the memo
+    /// store and, after reactor 0 fires, in history. The due-record rides a
+    /// SCHD mesh checkpoint so a USR2 replay does not send it twice.
+    schedules: schedule_snapshot.Table = .{},
     /// Strictly-increasing incarnation counter for minted oper grants, so a later
     /// GRANT/REVOKE always supersedes an earlier one (even within one ms).
     grant_incarnation: u64 = 0,
@@ -4760,6 +4766,7 @@ pub const LinuxServer = struct {
             .oper_motd = oper_motd_mod.OperMotd.init(allocator),
             .bot_registry = bot_registry_mod.BotRegistry.init(allocator),
             .threads = thread_snapshot.Table.init(allocator) catch unreachable,
+            .schedules = schedule_snapshot.Table.init(allocator) catch unreachable,
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
@@ -6136,6 +6143,7 @@ pub const LinuxServer = struct {
         self.destroyOutboundWebhooks();
         self.bot_registry.deinit();
         self.threads.deinit();
+        self.schedules.deinit();
         self.warden.deinit();
         self.spamtrap.deinit();
         self.raid_shield.deinit();
@@ -6697,6 +6705,7 @@ pub const LinuxServer = struct {
             self.retryRelayV2Outbox();
             self.retryE2eeGroupCustody();
         }
+        if (self.isMaintenanceReactor()) self.sweepDeferredDeliveries();
         self.sweepTempModes();
         // Keep the IRCX ACCESS store clock current on every reactor (a JOIN
         // gate may match on any shard) so timed ACCESS entries expire; reclaim
@@ -7557,6 +7566,57 @@ pub const LinuxServer = struct {
             _ = self.temp_modes.sweep(now);
             if (n < actions.len) break; // batch drained
         }
+    }
+
+    /// Reactor 0 delivers each due deferred job once. `claimDue` marks the job
+    /// fired before this sends, so a later tick or a USR2 replay cannot send it
+    /// again. The body is the memo stored at schedule time; history records the
+    /// same body when the send happens.
+    fn sweepDeferredDeliveries(self: *LinuxServer) void {
+        if (!self.isMaintenanceReactor()) return;
+        const wall = self.meshWallMs();
+        const now: i64 = if (wall > @as(u64, std.math.maxInt(i64))) std.math.maxInt(i64) else @intCast(wall);
+        var due: [schedule_snapshot.max_jobs]schedule_snapshot.Fired = undefined;
+        const n = self.schedules.claimDue(now, &due);
+        for (due[0..n]) |job| self.deliverScheduled(job);
+    }
+
+    fn deliverScheduled(self: *LinuxServer, job: schedule_snapshot.Fired) void {
+        const pending = self.memo.pending(job.keySlice());
+        if (pending.len == 0) return;
+        const src = pending[0].text;
+        if (src.len == 0 or src.len > 512) return;
+        var body_buf: [512]u8 = undefined;
+        @memcpy(body_buf[0..src.len], src);
+        const body = body_buf[0..src.len];
+        const target = job.targetSlice();
+        if (!self.world.channelExists(target)) return;
+        const sender = job.senderSlice();
+        var msgid_buf: [17]u8 = undefined;
+        msgid_buf[0] = 's';
+        const hex = "0123456789abcdef";
+        var shift: u6 = 60;
+        var hi: usize = 0;
+        while (hi < 16) : (hi += 1) {
+            msgid_buf[1 + hi] = hex[@as(usize, @intCast((job.id >> shift) & 0xf))];
+            if (shift >= 4) shift -= 4;
+        }
+        var pfx_buf: [80]u8 = undefined;
+        const pfx = std.fmt.bufPrint(&pfx_buf, "{s}!{s}@deferred", .{ sender, sender }) catch return;
+        const stamp = self.meshWallMs();
+        if (job.kind == schedule_snapshot.kind_channel) {
+            var line_buf: [800]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, ":{s} PRIVMSG {s} :{s}\r\n", .{ pfx, target, body }) catch return;
+            self.broadcastChannel(target, line, null) catch {};
+            self.recordHistoryRelayAt(target, pfx, &msgid_buf, "PRIVMSG", body, null, stamp);
+            return;
+        }
+        const mode = channelFlagFromLetter(job.mode) orelse return;
+        _ = self.world.setChannelFlag(target, mode, true) catch return;
+        var line_buf: [160]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, ":{s} MODE {s} +{c}\r\n", .{ self.serverName(), target, job.mode }) catch return;
+        self.broadcastChannel(target, line, null) catch {};
+        self.recordHistoryRelayAt(target, pfx, &msgid_buf, "MODE", body, null, stamp);
     }
 
     /// Map a channel flag-mode letter to its `ChannelMode`, or null if the letter
@@ -26610,6 +26670,27 @@ pub const LinuxServer = struct {
             return null;
         };
 
+        // Deferred deliveries ride the same family. Absence stays legal. An
+        // empty image is still sealed. Fired jobs stay fired so the successor
+        // does not send them again.
+        const schedule_wire = schedule_snapshot.encodeFrom(self.allocator, &self.schedules) catch |err| {
+            srvLog("onyx-server: UPGRADE schedule checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        blobs.append(self.allocator, schedule_wire) catch {
+            srvLog("onyx-server: UPGRADE schedule blob ownership append failed\n", .{});
+            self.allocator.free(schedule_wire);
+            return null;
+        };
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = schedule_wire,
+            .min_supported = 2,
+        }) catch {
+            srvLog("onyx-server: UPGRADE schedule piece append failed\n", .{});
+            return null;
+        };
+
         return .{
             .world_bytes = world_wire.len,
             .history_bytes = history_wire.len,
@@ -28321,6 +28402,36 @@ pub const LinuxServer = struct {
             };
         }
 
+        // Same at-most-once rule: a pre-schedule arena lacks SCHD and adopts
+        // with an empty table. A malformed or duplicate image rejects the handoff.
+        var schedule_checkpoint: ?schedule_snapshot.Snapshot = null;
+        for (caps) |c| {
+            if (c.header.kind != .mesh_checkpoint) continue;
+            var recognized = false;
+            for (c.fields) |field| {
+                if (schedule_snapshot.isCheckpoint(field.bytes)) {
+                    recognized = true;
+                    break;
+                }
+            }
+            if (!recognized) continue;
+            const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+            if (schedule_checkpoint != null or
+                c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != 2 or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate schedule checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            schedule_checkpoint = schedule_snapshot.decodeCurrent(c.fields[0].bytes) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed schedule checkpoint");
+                return error.InvalidInheritedHandoff;
+            };
+        }
+
         // Select the process-global TLS ticket-key authority without publishing
         // it. Resumption-enabled predecessors in the current Helix contract emit
         // exactly one canonical v1 singleton. Missing, duplicate, malformed, or
@@ -29472,6 +29583,18 @@ pub const LinuxServer = struct {
                 srvLog("onyx-server: UPGRADE resume — primed {d} carried thread(s)\n", .{restored});
             if (dropped != 0)
                 srvLog("onyx-server: UPGRADE resume — WARNING: dropped {d} carried thread(s)\n", .{dropped});
+        }
+
+        // Prime deferred deliveries at the same no-fail edge. The table is
+        // already allocated, so the copy does not allocate. A missing piece
+        // leaves the table empty. Fired jobs stay fired.
+        if (schedule_checkpoint) |snap| {
+            const dropped = self.schedules.replace(snap);
+            const restored = self.schedules.count();
+            if (restored != 0)
+                srvLog("onyx-server: UPGRADE resume — primed {d} carried schedule(s)\n", .{restored});
+            if (dropped != 0)
+                srvLog("onyx-server: UPGRADE resume — WARNING: dropped {d} carried schedule(s)\n", .{dropped});
         }
 
         // Transfer descriptor ownership immediately at the commit edge. Every
@@ -32952,6 +33075,176 @@ pub const LinuxServer = struct {
         var nb: [128]u8 = undefined;
         const note = std.fmt.bufPrint(&nb, "CLEAR {s}: removed {d} user(s)", .{ req.channel, kicked }) catch return;
         try self.noticeTo(conn, note);
+    }
+
+    /// DEFER AT <unix-ms> <#channel> :<text>
+    /// DEFER CRON <min> <hour> <dom> <mon> <dow> <#channel> :<text>
+    /// DEFER AT <unix-ms> OPER <#channel> <flag>
+    /// DEFER CRON <min> <hour> <dom> <mon> <dow> OPER <#channel> <flag>
+    ///
+    /// A registered user defers one channel message. An oper defers one boolean
+    /// channel mode. Reactor 0 fires each job once. The body is stored through
+    /// the offline memo path and, when fired, through history.
+    pub fn handleDefer(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.registered()) {
+            try queueNumeric(conn, .ERR_NOTREGISTERED, &.{}, "You have not registered");
+            return;
+        }
+        const p = parsed.paramSlice();
+        if (p.len < 4) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"DEFER"}, "Usage: DEFER AT <unix-ms> <#channel> :<text> | DEFER CRON <min> <hour> <dom> <mon> <dow> <#channel> :<text> | DEFER <when> OPER <#channel> <flag>");
+            return;
+        }
+        const cron_form = std.ascii.eqlIgnoreCase(p[0], "CRON");
+        const at_form = std.ascii.eqlIgnoreCase(p[0], "AT");
+        if (!cron_form and !at_form) {
+            try self.noticeTo(conn, "DEFER: invalid schedule");
+            return;
+        }
+
+        var due_ms: i64 = 0;
+        var cron_buf: [schedule_snapshot.max_cron]u8 = undefined;
+        var cron_len: usize = 0;
+        const rest: []const []const u8 = if (at_form) blk: {
+            due_ms = std.fmt.parseInt(i64, p[1], 10) catch {
+                try self.noticeTo(conn, "DEFER: invalid schedule");
+                return;
+            };
+            if (due_ms < 0) {
+                try self.noticeTo(conn, "DEFER: invalid schedule");
+                return;
+            }
+            break :blk p[2..];
+        } else blk: {
+            if (p.len < 8) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"DEFER"}, "Usage: DEFER CRON <min> <hour> <dom> <mon> <dow> <#channel> :<text>");
+                return;
+            }
+            var n: usize = 0;
+            for (p[1..6], 0..) |field, i| {
+                if (field.len == 0) {
+                    try self.noticeTo(conn, "DEFER: invalid schedule");
+                    return;
+                }
+                if (i != 0) {
+                    if (n >= cron_buf.len) {
+                        try self.noticeTo(conn, "DEFER: invalid schedule");
+                        return;
+                    }
+                    cron_buf[n] = ' ';
+                    n += 1;
+                }
+                if (n + field.len > cron_buf.len) {
+                    try self.noticeTo(conn, "DEFER: invalid schedule");
+                    return;
+                }
+                @memcpy(cron_buf[n..][0..field.len], field);
+                n += field.len;
+            }
+            const parsed_cron = cron.parse(cron_buf[0..n]) catch {
+                try self.noticeTo(conn, "DEFER: invalid schedule");
+                return;
+            };
+            const wall = self.meshWallMs();
+            const unix_secs: i64 = if (wall / 1000 > @as(u64, std.math.maxInt(i64))) std.math.maxInt(i64) else @intCast(wall / 1000);
+            const next = cron.nextAfter(parsed_cron, unix_secs) orelse {
+                try self.noticeTo(conn, "DEFER: invalid schedule");
+                return;
+            };
+            due_ms = std.math.mul(i64, next, 1000) catch {
+                try self.noticeTo(conn, "DEFER: invalid schedule");
+                return;
+            };
+            cron_len = n;
+            break :blk p[6..];
+        };
+
+        const oper_form = rest.len >= 1 and std.ascii.eqlIgnoreCase(rest[0], "OPER");
+        var target: []const u8 = undefined;
+        var body: []const u8 = undefined;
+        var mode: u8 = 0;
+        var kind: u8 = schedule_snapshot.kind_channel;
+        var mode_body: [2]u8 = undefined;
+        if (oper_form) {
+            if (!conn.session.isOper()) {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied");
+                return;
+            }
+            if (rest.len < 3 or rest[2].len != 1) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"DEFER"}, "Usage: DEFER AT <unix-ms> OPER <#channel> <flag>");
+                return;
+            }
+            target = rest[1];
+            mode = rest[2][0];
+            if (channelFlagFromLetter(mode) == null) {
+                try queueNumeric(conn, .ERR_UNKNOWNMODE, &.{target}, "DEFER supports boolean channel flags only");
+                return;
+            }
+            kind = schedule_snapshot.kind_oper;
+            mode_body[0] = '+';
+            mode_body[1] = mode;
+            body = &mode_body;
+        } else {
+            if (rest.len < 2 or rest[1].len == 0) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"DEFER"}, "Usage: DEFER AT <unix-ms> <#channel> :<text>");
+                return;
+            }
+            target = rest[0];
+            body = rest[1];
+            if (body.len > 400) {
+                try self.noticeTo(conn, "DEFER: message is too long");
+                return;
+            }
+            for (body) |ch| {
+                if (ch == '\r' or ch == '\n' or ch == 0) {
+                    try self.noticeTo(conn, "DEFER: invalid schedule");
+                    return;
+                }
+            }
+        }
+        if (!world_model.isChannelName(target) or !self.world.channelExists(target)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
+            return;
+        }
+        if (kind == schedule_snapshot.kind_channel and !self.world.isMember(target, worldIdFromClient(id))) {
+            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{target}, "You're not on that channel");
+            return;
+        }
+        const sender = conn.session.displayName();
+        if (sender.len == 0 or sender.len > schedule_snapshot.max_sender or target.len > schedule_snapshot.max_target) {
+            try self.noticeTo(conn, "DEFER: invalid schedule");
+            return;
+        }
+        if (self.schedules.find(kind, target) != null) {
+            try self.noticeTo(conn, "DEFER: already scheduled");
+            return;
+        }
+
+        const job_id = self.schedules.takeId() catch {
+            try self.noticeTo(conn, "DEFER: could not schedule (limit)");
+            return;
+        };
+        var key_buf: [schedule_snapshot.max_key]u8 = undefined;
+        const key = schedule_snapshot.keyFromId(job_id, &key_buf);
+        _ = self.storeOfflineMemo(key, sender, body, self.nowMs()) catch {
+            try self.noticeTo(conn, "DEFER: could not store the message");
+            return;
+        };
+        self.schedules.insert(.{
+            .id = job_id,
+            .kind = kind,
+            .when_kind = if (cron_form) schedule_snapshot.when_cron else schedule_snapshot.when_timestamp,
+            .mode = mode,
+            .due_ms = due_ms,
+            .target = target,
+            .sender = sender,
+            .key = key,
+            .cron = cron_buf[0..cron_len],
+        }) catch {
+            try self.noticeTo(conn, "DEFER: could not schedule (limit)");
+            return;
+        };
+        try self.noticeTo(conn, "DEFER: scheduled");
     }
 
     /// TEMPMODE ADD <#chan> <flag> [param] <duration> | CANCEL <#chan> <flag>
@@ -61236,6 +61529,24 @@ fn upgradeThreadBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u8 
             thread_snapshot.isCheckpoint(piece.bytes)) return piece.bytes;
     }
     return null;
+}
+
+fn upgradeScheduleBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u8 {
+    for (pieces) |piece| {
+        if (piece.kind == .mesh_checkpoint and
+            schedule_snapshot.isCheckpoint(piece.bytes)) return piece.bytes;
+    }
+    return null;
+}
+
+fn countSliceForTest(hay: []const u8, needle: []const u8) usize {
+    if (needle.len == 0 or hay.len < needle.len) return 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        if (std.mem.eql(u8, hay[i..][0..needle.len], needle)) n += 1;
+    }
+    return n;
 }
 
 fn copyTaggedValueForTest(buf: []const u8, key: []const u8, out: []u8) ?[]const u8 {
@@ -109553,6 +109864,301 @@ test "GAP-P1 malformed thread checkpoint rejects the handoff" {
     _ = try rejectUpgradePiecesForTest(successor, pieces.items, "onyx-test-threads-bad");
     try std.testing.expectEqual(@as(usize, 0), successor.threads.count());
     std.debug.print("GAP-P1 branch=a malformed THRD image rejects the whole handoff\n", .{});
+}
+
+test "GAP-P3 reactor 0 fires a deferred channel message and oper mode once" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-p3.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    const config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "sched.test",
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const alice_id = try addTestLocalClient(server, "alice", "alice");
+    const bob_id = try addTestLocalClient(server, "bob", "bob");
+    const carol_id = try addTestLocalClient(server, "carol", "carol");
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    const carol = server.connFor(carol_id).?;
+    alice.session.registration.registered = true;
+    bob.session.registration.registered = true;
+    carol.session.registration.registered = true;
+    carol.session.is_oper = true;
+    _ = try server.world.join("#room", worldIdFromClient(alice_id));
+    _ = try server.world.join("#room", worldIdFromClient(bob_id));
+
+    const due: i64 = @as(i64, @intCast(server.meshWallMs())) - 1;
+    var msg_buf: [160]u8 = undefined;
+    const msg_wire = std.fmt.bufPrint(&msg_buf, "DEFER AT {d} #room :deferred-body", .{due}) catch
+        return error.TestUnexpectedResult;
+    var msg_line = try irc_line.parseLine(msg_wire);
+    try server.handleDefer(alice_id, alice, &msg_line);
+    try std.testing.expectEqual(@as(usize, 1), server.schedules.pendingCount());
+    const msg_slot = server.schedules.find(schedule_snapshot.kind_channel, "#room") orelse
+        return error.TestUnexpectedResult;
+    const msg_key = server.schedules.memoKeyAt(msg_slot);
+    var key_keep: [schedule_snapshot.max_key]u8 = undefined;
+    const key_len = msg_key.len;
+    @memcpy(key_keep[0..key_len], msg_key);
+    const staged = server.memo.pending(msg_key);
+    try std.testing.expectEqual(@as(usize, 1), staged.len);
+    try std.testing.expectEqualStrings("deferred-body", staged[0].text);
+
+    var mode_buf: [160]u8 = undefined;
+    const mode_wire = std.fmt.bufPrint(&mode_buf, "DEFER AT {d} OPER #room m", .{due}) catch
+        return error.TestUnexpectedResult;
+    var mode_line = try irc_line.parseLine(mode_wire);
+    try server.handleDefer(carol_id, carol, &mode_line);
+    try std.testing.expectEqual(@as(usize, 2), server.schedules.pendingCount());
+    const mode_slot = server.schedules.find(schedule_snapshot.kind_oper, "#room") orelse
+        return error.TestUnexpectedResult;
+    const staged_mode = server.memo.pending(server.schedules.memoKeyAt(mode_slot));
+    try std.testing.expectEqual(@as(usize, 1), staged_mode.len);
+    try std.testing.expectEqualStrings("+m", staged_mode[0].text);
+
+    bob.send_len = 0;
+    current_reactor = null;
+    server.onTimerTick();
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(bob.send_buf[0..bob.send_len], "deferred-body"));
+    try std.testing.expectEqual(@as(usize, 2), server.schedules.pendingCount());
+
+    current_reactor = &server.reactors[0];
+    server.onTimerTick();
+    try std.testing.expectEqual(@as(usize, 1), countSliceForTest(bob.send_buf[0..bob.send_len], "deferred-body"));
+    try std.testing.expectEqual(@as(usize, 1), countSliceForTest(bob.send_buf[0..bob.send_len], "MODE #room +m"));
+    try std.testing.expect(server.world.channelHasFlag("#room", .moderated));
+    try std.testing.expectEqual(@as(usize, 0), server.schedules.pendingCount());
+    server.onTimerTick();
+    try std.testing.expectEqual(@as(usize, 1), countSliceForTest(bob.send_buf[0..bob.send_len], "deferred-body"));
+    try std.testing.expectEqual(@as(usize, 1), countSliceForTest(bob.send_buf[0..bob.send_len], "MODE #room +m"));
+
+    var hist: [8]lotus.Message = undefined;
+    const rows = try server.history.latest("#room", 8, &hist);
+    var saw_body = false;
+    var saw_mode = false;
+    for (rows) |row| {
+        if (std.mem.eql(u8, row.text, "deferred-body")) saw_body = true;
+        if (std.mem.eql(u8, row.text, "+m")) saw_mode = true;
+    }
+    try std.testing.expect(saw_body);
+    try std.testing.expect(saw_mode);
+
+    try server.world.part("#room", worldIdFromClient(alice_id));
+    try server.world.part("#room", worldIdFromClient(bob_id));
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(server, &pieces, &blobs);
+    try std.testing.expect(upgradeScheduleBytesForTest(pieces.items) != null);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-schedules");
+    current_reactor = &successor.reactors[0];
+    const kept = successor.schedules.find(schedule_snapshot.kind_channel, "#room") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(successor.schedules.firedAt(kept));
+    try std.testing.expectEqual(@as(usize, 0), successor.schedules.pendingCount());
+    const restored_memo = successor.memo.pending(key_keep[0..key_len]);
+    try std.testing.expectEqual(@as(usize, 1), restored_memo.len);
+    try std.testing.expectEqualStrings("deferred-body", restored_memo[0].text);
+    var hist2: [8]lotus.Message = undefined;
+    const rows2 = try successor.history.latest("#room", 8, &hist2);
+    var saw_again = false;
+    for (rows2) |row| {
+        if (std.mem.eql(u8, row.text, "deferred-body")) saw_again = true;
+    }
+    try std.testing.expect(saw_again);
+
+    const bob2_id = try addTestLocalClient(successor, "bob", "bob");
+    const bob2 = successor.connFor(bob2_id).?;
+    bob2.session.registration.registered = true;
+    _ = try successor.world.join("#room", worldIdFromClient(bob2_id));
+    bob2.send_len = 0;
+    successor.onTimerTick();
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(bob2.send_buf[0..bob2.send_len], "deferred-body"));
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(bob2.send_buf[0..bob2.send_len], "MODE #room +m"));
+    try std.testing.expectEqual(@as(usize, 0), successor.schedules.pendingCount());
+    current_reactor = null;
+    std.debug.print("GAP-P3 branch=reactor 0 fires a deferred channel message and oper mode once; USR2 does not send either again\n", .{});
+}
+
+test "GAP-P3 a cron fire is delivered once by reactor 0" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var sim_time = reactor_mod.SimReactor.init(1_700_000_000_000);
+    const config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "sched.test",
+        .reactor = sim_time.reactor(),
+        .ping_interval_ms = 3_600_000,
+        .ping_timeout_ms = 3_600_000,
+        .registration_timeout_ms = 3_600_000,
+        .nick_grace_ms = 3_600_000,
+    };
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const alice_id = try addTestLocalClient(server, "alice", "alice");
+    const bob_id = try addTestLocalClient(server, "bob", "bob");
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    alice.session.registration.registered = true;
+    bob.session.registration.registered = true;
+    _ = try server.world.join("#room", worldIdFromClient(alice_id));
+    _ = try server.world.join("#room", worldIdFromClient(bob_id));
+
+    var line = try irc_line.parseLine("DEFER CRON * * * * * #room :cron-body");
+    try server.handleDefer(alice_id, alice, &line);
+    const slot = server.schedules.find(schedule_snapshot.kind_channel, "#room") orelse
+        return error.TestUnexpectedResult;
+    const unix_secs: i64 = @divFloor(sim_time.clock_ms, 1000);
+    const parsed = try cron.parse("* * * * *");
+    const next = cron.nextAfter(parsed, unix_secs) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(try std.math.mul(i64, next, 1000), server.schedules.dueMsAt(slot));
+    const staged = server.memo.pending(server.schedules.memoKeyAt(slot));
+    try std.testing.expectEqual(@as(usize, 1), staged.len);
+    try std.testing.expectEqualStrings("cron-body", staged[0].text);
+
+    bob.send_len = 0;
+    server.onTimerTick();
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(bob.send_buf[0..bob.send_len], "cron-body"));
+    try std.testing.expectEqual(@as(usize, 1), server.schedules.pendingCount());
+
+    sim_time.clock_ms = try std.math.mul(i64, next, 1000);
+    server.onTimerTick();
+    try std.testing.expectEqual(@as(usize, 1), countSliceForTest(bob.send_buf[0..bob.send_len], "cron-body"));
+    var hist: [4]lotus.Message = undefined;
+    const rows = try server.history.latest("#room", 4, &hist);
+    try std.testing.expect(rows.len >= 1);
+    try std.testing.expectEqualStrings("cron-body", rows[0].text);
+
+    sim_time.clock_ms += 120_000;
+    server.onTimerTick();
+    try std.testing.expectEqual(@as(usize, 1), countSliceForTest(bob.send_buf[0..bob.send_len], "cron-body"));
+    try std.testing.expectEqual(@as(usize, 0), server.schedules.pendingCount());
+    current_reactor = null;
+    std.debug.print("GAP-P3 branch=a cron expression fires once on reactor 0\n", .{});
+}
+
+test "GAP-P3 missing schedule checkpoint still adopts" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "sched.test" };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    current_reactor = &predecessor.reactors[0];
+    const alice_id = try addTestLocalClient(predecessor, "alice", "alice");
+    const alice = predecessor.connFor(alice_id).?;
+    alice.session.registration.registered = true;
+    _ = try predecessor.world.join("#room", worldIdFromClient(alice_id));
+    var line = try irc_line.parseLine("DEFER AT 1 #room :kept-off-the-wire");
+    try predecessor.handleDefer(alice_id, alice, &line);
+    try std.testing.expectEqual(@as(usize, 1), predecessor.schedules.pendingCount());
+    try predecessor.world.part("#room", worldIdFromClient(alice_id));
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    var legacy: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer legacy.deinit(alloc);
+    for (pieces.items) |piece| {
+        if (piece.kind == .mesh_checkpoint and schedule_snapshot.isCheckpoint(piece.bytes)) continue;
+        try legacy.append(alloc, piece);
+    }
+    try std.testing.expectEqual(pieces.items.len - 1, legacy.items.len);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, legacy.items, "onyx-test-schedules-legacy");
+    try std.testing.expectEqual(@as(usize, 0), successor.schedules.count());
+    current_reactor = null;
+    std.debug.print("GAP-P3 branch=a predecessor arena without SCHD adopts an empty schedule table\n", .{});
+}
+
+test "GAP-P3 malformed schedule checkpoint rejects the handoff" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    var corrupted = false;
+    for (blobs.items) |blob| {
+        if (!schedule_snapshot.isCheckpoint(blob) or blob.len <= schedule_snapshot.magic.len) continue;
+        blob[schedule_snapshot.magic.len] = 0xff;
+        corrupted = true;
+    }
+    try std.testing.expect(corrupted);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try rejectUpgradePiecesForTest(successor, pieces.items, "onyx-test-schedules-bad");
+    try std.testing.expectEqual(@as(usize, 0), successor.schedules.count());
+    current_reactor = null;
+    std.debug.print("GAP-P3 branch=a malformed SCHD image rejects the whole handoff\n", .{});
 }
 
 test {

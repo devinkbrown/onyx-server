@@ -23,6 +23,7 @@ const mesh_redial = @import("mesh_redial.zig");
 const oper_grant_snapshot = @import("oper_grant_snapshot.zig");
 const bot_grant_snapshot = @import("bot_grant_snapshot.zig");
 const thread_snapshot = @import("thread_snapshot.zig");
+const schedule_snapshot = @import("schedule_snapshot.zig");
 const monitor_capsule = @import("monitor_capsule.zig");
 const prop_checkpoint = @import("prop_checkpoint.zig");
 const s2s_snapshot = @import("s2s_snapshot.zig");
@@ -95,6 +96,8 @@ pub const Error = error{
     InvalidBotGrants,
     DuplicateThreads,
     InvalidThreads,
+    DuplicateSchedules,
+    InvalidSchedules,
     UnknownMeshCheckpoint,
 };
 
@@ -116,6 +119,7 @@ pub const Summary = struct {
     oper_grants: usize = 0,
     bot_grants: usize = 0,
     threads: usize = 0,
+    schedules: usize = 0,
 };
 
 /// Validate decoded capsules after `live.verifyHandoffManifest` and before any
@@ -360,6 +364,15 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             thread_snapshot.validateCheckpoint(bytes) catch return error.InvalidThreads;
             if (summary.threads != 0) return error.DuplicateThreads;
             summary.threads = 1;
+            continue;
+        }
+        // SCHD is at-most-once, like threads. A pre-schedule arena has no
+        // piece and must still adopt. Absence is not a missing-singleton error.
+        if (schedule_snapshot.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidSchedules;
+            schedule_snapshot.validateCheckpoint(bytes) catch return error.InvalidSchedules;
+            if (summary.schedules != 0) return error.DuplicateSchedules;
+            summary.schedules = 1;
             continue;
         }
         if (item.header.min_supported != descriptor.min_supported)

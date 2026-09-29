@@ -32,6 +32,7 @@ pub const mesh_redial = @import("mesh_redial.zig");
 pub const mesh_clock_snapshot = @import("mesh_clock_snapshot.zig");
 pub const oper_grant_snapshot = @import("oper_grant_snapshot.zig");
 pub const thread_snapshot = @import("thread_snapshot.zig");
+pub const schedule_snapshot = @import("schedule_snapshot.zig");
 pub const session_migrate = @import("session_migrate.zig");
 pub const session_replica = @import("session_replica.zig");
 pub const session_replica_attachment = @import("session_replica_attachment.zig");
@@ -68,4 +69,5 @@ pub const multishard_upgrade_dst = @import("multishard_upgrade_dst.zig");
 test {
     std.testing.refAllDecls(@This());
     _ = thread_snapshot;
+    _ = schedule_snapshot;
 }
