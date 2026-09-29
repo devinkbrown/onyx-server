@@ -141,6 +141,9 @@ const lotus = @import("../proto/lotus.zig");
 const search_index_mod = @import("search_index.zig");
 const history_durable = @import("history_durable.zig");
 const memo_durable = @import("memo_durable.zig");
+const marker_durable = @import("marker_durable.zig");
+const gag_durable = @import("gag_durable.zig");
+const vhost_durable = @import("vhost_durable.zig");
 const chanstats_mod = @import("chanstats.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const chathistory_targets = @import("../proto/chathistory_targets.zig");
@@ -4700,6 +4703,9 @@ pub const LinuxServer = struct {
             .autojoins = autojoin_mod.AutoJoin.init(allocator),
             .nick_groups = memo_group_mod.NickGroup.init(allocator),
             .welcome = welcome_pack_mod.WelcomePack.init(allocator),
+            // Verify and reset tokens are process-local. A dropped image does not
+            // restore them: the old code is invalid, and the request commands
+            // issue a new one. Pending TOTP enrollments stay in RAM the same way.
             .account_verifies = account_verify_mod.VerifyStore.init(allocator, .{ .token_bytes = 16 }),
             .reset_store = password_reset.ResetStore.init(allocator, .{ .token_bytes = reset_token_hex_len }),
             .totp = totp_auth.TotpStore.init(allocator, .{}),
@@ -4786,6 +4792,9 @@ pub const LinuxServer = struct {
         }
         self.restoreDurableHistory();
         self.restoreDurableMemos();
+        self.restoreDurableMarkers();
+        self.restoreDurableGags();
+        self.restoreDurableVhosts();
     }
 
     /// By-value construction, kept for callers that own the result directly.
@@ -19391,9 +19400,9 @@ pub const LinuxServer = struct {
 
         const ip = tconn.session.realHost();
         if (turn_on) {
-            if (ip.len > 0) self.gags.add(ip) catch {};
+            if (ip.len > 0) self.recordGag(ip);
         } else {
-            if (ip.len > 0) _ = self.gags.remove(ip);
+            if (ip.len > 0) self.forgetGag(ip);
         }
         // Mirror the display flag onto every live connection from this IP (and
         // the target itself, covering the IP-unknown edge case).
@@ -21906,7 +21915,7 @@ pub const LinuxServer = struct {
                     .timestamp => |t| t,
                     .unset => break :blk (read_marker_store.buildResponse(sr.target, .unset, &out_buf) catch return),
                 };
-                const res = self.read_markers.set(owner, sr.target, ts) catch return;
+                const res = self.rememberReadMarker(owner, sr.target, ts) catch return;
                 break :blk (read_marker_store.buildTimestampResponse(sr.target, res.timestamp, &out_buf) catch return);
             },
         };
@@ -22272,6 +22281,85 @@ pub const LinuxServer = struct {
             };
         }
         return n;
+    }
+
+    fn rememberReadMarker(
+        self: *LinuxServer,
+        owner: []const u8,
+        target: []const u8,
+        timestamp: read_marker_store.Timestamp,
+    ) !read_marker_store.SetResult {
+        const res = try self.read_markers.set(owner, target, timestamp);
+        if (res.changed) self.snapshotReadMarkers();
+        return res;
+    }
+
+    fn snapshotReadMarkers(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        marker_durable.replaceAll(svc.store, &self.read_markers) catch |err| {
+            srvLog("onyx-server: read-marker durable snapshot failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn restoreDurableMarkers(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        marker_durable.restoreInto(svc.store, &self.read_markers) catch |err| {
+            srvLog("onyx-server: read-marker durable restore failed closed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn recordGag(self: *LinuxServer, ip: []const u8) void {
+        self.gags.add(ip) catch return;
+        self.snapshotGags();
+    }
+
+    fn forgetGag(self: *LinuxServer, ip: []const u8) void {
+        if (!self.gags.remove(ip)) return;
+        self.snapshotGags();
+    }
+
+    fn snapshotGags(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        gag_durable.replaceAll(svc.store, &self.gags) catch |err| {
+            srvLog("onyx-server: gag durable snapshot failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn restoreDurableGags(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        gag_durable.restoreInto(svc.store, &self.gags) catch |err| {
+            srvLog("onyx-server: gag durable restore failed closed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn grantDurablePersona(self: *LinuxServer, account: []const u8, name: []const u8, host: []const u8, source: guise_mod.Source) !void {
+        try self.guises.grant(account, name, host, source, self.nowMs());
+        self.snapshotVhosts();
+    }
+
+    fn claimDurablePersona(self: *LinuxServer, account: []const u8, host: []const u8) !guise_mod.Offer {
+        const offer = try self.guises.claim(account, host, self.nowMs());
+        self.snapshotVhosts();
+        return offer;
+    }
+
+    fn addDurableOffer(self: *LinuxServer, template: []const u8, label: []const u8) !void {
+        try self.guises.addOffer(template, label);
+        self.snapshotVhosts();
+    }
+
+    fn snapshotVhosts(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        vhost_durable.replaceAll(svc.store, &self.guises) catch |err| {
+            srvLog("onyx-server: vhost durable snapshot failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn restoreDurableVhosts(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        vhost_durable.restoreInto(svc.store, &self.guises) catch |err| {
+            srvLog("onyx-server: vhost durable restore failed closed ({s})\n", .{@errorName(err)});
+        };
     }
 
     fn restoreDurableMemos(self: *LinuxServer) void {
@@ -45691,6 +45779,7 @@ pub const LinuxServer = struct {
             var buf: [default_reply_bytes]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, "MEMO from {s} :{s}", .{ m.from, m.text }) catch continue;
             try self.noticeTo(conn, line);
+            self.meshBroadcastMemoPush(account, m.from, m.text);
         }
         _ = self.clearOfflineMemo(account);
     }
@@ -47318,7 +47407,7 @@ pub const LinuxServer = struct {
         var hbuf: [128]u8 = undefined;
         const host = std.fmt.bufPrint(&hbuf, "{s}", .{req.vhost}) catch return;
         // Record the approved host as a switchable "granted" persona.
-        self.guises.grant(account, "granted", host, .granted, self.nowMs()) catch {};
+        self.grantDurablePersona(account, "granted", host, .granted) catch {};
         _ = self.applyVhostToAccount(account, host);
         try self.noticeTo(conn, "VHOST approved and applied");
     }
@@ -47365,7 +47454,7 @@ pub const LinuxServer = struct {
         if (p.len < 2 or p[1].len == 0) return self.noticeTo(conn, "Usage: VHOST CLAIM <host>");
         const host = p[1];
         chghost.validateHost(host) catch return self.failReply(conn, "VHOST", "INVALID_HOST", "Invalid host");
-        _ = self.guises.claim(account, host, self.nowMs()) catch |err| switch (err) {
+        _ = self.claimDurablePersona(account, host) catch |err| switch (err) {
             // Self-service CLAIM is account-bound: a user may only claim a host
             // that spells their own account, and not one another account wears.
             error.NotYours => return self.failReply(conn, "VHOST", "HOST_NOT_YOURS", "You may only claim a vhost whose leading label is your account name"),
@@ -47390,7 +47479,7 @@ pub const LinuxServer = struct {
         if (!conn.session.isOper()) return queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
         if (p.len < 2 or p[1].len == 0) return self.noticeTo(conn, "Usage: VHOST OFFER <template> [:label]");
         const label = if (p.len >= 3) p[2] else "vhost offer";
-        self.guises.addOffer(p[1], label) catch return self.noticeTo(conn, "VHOST: could not add offer (duplicate or limit)");
+        self.addDurableOffer(p[1], label) catch return self.noticeTo(conn, "VHOST: could not add offer (duplicate or limit)");
         var b: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&b, "VHOST OFFER {s}", .{p[1]}) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
@@ -47406,7 +47495,7 @@ pub const LinuxServer = struct {
         const host = p[2];
         const name = if (p.len >= 4) p[3] else "oper";
         chghost.validateHost(host) catch return self.failReply(conn, "VHOST", "INVALID_HOST", "Invalid host");
-        self.guises.grant(account, name, host, .granted, self.nowMs()) catch return self.noticeTo(conn, "VHOST: could not set (limit or invalid)");
+        self.grantDurablePersona(account, name, host, .granted) catch return self.noticeTo(conn, "VHOST: could not set (limit or invalid)");
         _ = self.applyVhostToAccount(account, host);
         var b: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&b, "VHOST SET {s} -> {s}", .{ account, host }) catch return;
@@ -57946,6 +58035,230 @@ test "UPGRADE GAP-D2 offline memo survives the dropped process image" {
     try std.testing.expectEqualStrings("alice", pending[0].from);
     try std.testing.expectEqualStrings("waiting offline", pending[0].text);
     try std.testing.expectEqual(@as(i64, 77), pending[0].sent_ms);
+}
+
+test "UPGRADE GAP-D2 restored memo is delivered when the account attaches" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d2-deliver.wal");
+    var services = services_mod.Services.init(&store, null);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+            store.deinit();
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(usize, 1), try first.storeOfflineMemo("carol", "alice", "waiting offline", 77));
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d2-deliver.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    var conn = ConnState{};
+    Server.loginSession(&conn, "carol");
+    try second.deliverMemo(&conn);
+    const delivered = conn.send_buf[0..conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, delivered, "waiting offline") != null);
+    try std.testing.expectEqual(@as(usize, 0), second.memo.pending("carol").len);
+}
+
+test "UPGRADE GAP-P16 MARKREAD survives the dropped process image and rewind stays bounded" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-p16.wal");
+    var services = services_mod.Services.init(&store, null);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+            store.deinit();
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    first.recordHistoryRelayAt("#room", "alice!a@h", "old-1", "PRIVMSG", "already-read", null, 1000);
+    first.recordHistoryRelayAt("#room", "alice!a@h", "new-1", "PRIVMSG", "after-marker", null, 2000);
+    first.recordHistoryRelayAt("#room", "alice!a@h", "new-2", "PRIVMSG", "also-after", null, 3000);
+    const ts = try read_marker_store.Timestamp.parseWire("1970-01-01T00:00:01.500Z");
+    _ = try first.rememberReadMarker("carol", "#room", ts);
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-p16.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    const marker = (try second.read_markers.get("carol", "#room")).?;
+    const other_attachment = (try second.read_markers.get("carol", "#room")).?;
+    try std.testing.expectEqualStrings(ts.slice(), marker.slice());
+    try std.testing.expectEqualStrings(marker.slice(), other_attachment.slice());
+    var all_buf: [8]lotus.Message = undefined;
+    const all = try second.history.latest("#room", 8, &all_buf);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+    const marker_ms = Server.markerToMillis(marker.slice()).?;
+    var after_buf: [8]lotus.Message = undefined;
+    const tail = try second.history.after("#room", marker_ms, 8, &after_buf);
+    try std.testing.expectEqual(@as(usize, 2), tail.len);
+    try std.testing.expect(tail.len < all.len);
+    var conn = ConnState{};
+    conn.session.addCap(.onyx_bouncer);
+    Server.loginSession(&conn, "carol");
+    try second.replayRewindOnJoin(&conn, "#room");
+    const replay = conn.send_buf[0..conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, replay, "already-read") == null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "after-marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "also-after") != null);
+}
+
+test "UPGRADE GAP-D3 gag and granted vhost survive the dropped process image" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d3.wal");
+    var services = services_mod.Services.init(&store, null);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+            store.deinit();
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    first.recordGag("192.0.2.10");
+    first.recordGag("192.0.2.11");
+    first.forgetGag("192.0.2.10");
+    try first.grantDurablePersona("carol", "staff", "carol.staff.example", .granted);
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d3.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    try std.testing.expect(second.gags.contains("192.0.2.11"));
+    try std.testing.expect(second.gags.contains("192.0.2.11"));
+    try std.testing.expect(!second.gags.contains("192.0.2.10"));
+    const personas = second.guises.personas("Carol");
+    try std.testing.expectEqual(@as(usize, 1), personas.len);
+    try std.testing.expectEqualStrings("staff", personas[0].name);
+    try std.testing.expectEqualStrings("carol.staff.example", personas[0].host);
+    try std.testing.expectEqual(guise_mod.Source.granted, personas[0].source);
+}
+
+test "UPGRADE GAP-D5 restart keeps SCRAM and CertFP and invalidates recovery tokens" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const scram_store_mod = @import("scram_store.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d5.wal");
+    var scram = scram_store_mod.ScramStore.init(alloc);
+    var binds = certfp_bind_mod.CertfpBindStore.init(alloc);
+    var services = services_mod.Services.init(&store, null);
+    services.attachScramStore(&scram);
+    services.attachCertfpBinds(&binds);
+    var scratch: [2048]u8 = undefined;
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    const fp = "abababababababababababababababababababababababababababababababab";
+    try services.bindCertfp("alice", fp);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+            scram.deinit();
+            binds.deinit();
+            store.deinit();
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    var verify_bytes: [16]u8 = @splat(0x11);
+    const issued = try first.account_verifies.issue("alice", "alice@example.test", &verify_bytes, 10);
+    var issued_copy: [64]u8 = undefined;
+    try std.testing.expect(issued.len <= issued_copy.len);
+    @memcpy(issued_copy[0..issued.len], issued);
+    const issued_len = issued.len;
+    var reset_token: [32]u8 = "0123456789abcdef0123456789abcdef".*;
+    try first.reset_store.issue("alice", &reset_token, 10);
+    try std.testing.expect(first.account_verifies.isPending("alice"));
+    try std.testing.expect(first.reset_store.isPending("alice"));
+    first.deinit();
+    alloc.destroy(first);
+    scram.deinit();
+    binds.deinit();
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d5.wal");
+    defer store2.deinit();
+    var scram2 = scram_store_mod.ScramStore.init(alloc);
+    defer scram2.deinit();
+    var binds2 = certfp_bind_mod.CertfpBindStore.init(alloc);
+    defer binds2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    services2.attachScramStore(&scram2);
+    services2.attachCertfpBinds(&binds2);
+    scram2.setLoader(services2.scramLoader());
+    try std.testing.expect(scram2.lookup("alice") == null);
+    try std.testing.expect(scram2.resolve("alice") != null);
+    try std.testing.expect(scram2.resolve512("alice") != null);
+    try std.testing.expectEqualStrings("alice", services2.accountForCertfp(fp).?);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    try std.testing.expectEqual(account_verify_mod.Result.no_pending, second.account_verifies.confirm("alice", issued_copy[0..issued_len], 11));
+    try std.testing.expectEqual(password_reset.Result.no_request, second.reset_store.confirm("alice", &reset_token, 11));
+    var again_bytes: [16]u8 = @splat(0x22);
+    const again = try second.account_verifies.issue("alice", "alice@example.test", &again_bytes, 12);
+    try std.testing.expect(again.len != 0);
+    try std.testing.expect(!std.mem.eql(u8, again, issued_copy[0..issued_len]));
+    var reset_again: [32]u8 = "fedcba9876543210fedcba9876543210".*;
+    try second.reset_store.issue("alice", &reset_again, 12);
+    try std.testing.expect(second.reset_store.isPending("alice"));
+    try std.testing.expectEqual(password_reset.Result.ok, second.reset_store.confirm("alice", &reset_again, 13));
 }
 
 test "UPGRADE GAP-D1 cold restart restores history msgids and skips ciphertext search" {

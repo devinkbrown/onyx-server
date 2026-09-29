@@ -136,6 +136,17 @@ pub fn ReadMarkerStore(comptime params: Params) type {
             return self.entries.get(key);
         }
 
+        /// Visit every stored marker. `owner` and `target` borrow the map key for
+        /// the callback only; `target` is the normalized form `set` stored.
+        pub fn forEach(self: *const Self, context: anytype, comptime callback: anytype) !void {
+            var it = self.entries.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
+                try callback(context, key[0..sep], key[sep + 1 ..], entry.value_ptr.*);
+            }
+        }
+
         fn makeKey(
             owner: []const u8,
             target: []const u8,

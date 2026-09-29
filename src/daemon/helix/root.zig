@@ -51,7 +51,6 @@ pub const away_capsule = @import("away_capsule.zig");
 pub const ban_capsule = @import("ban_capsule.zig");
 pub const silence_capsule = @import("silence_capsule.zig");
 pub const ratelimit_capsule = @import("ratelimit_capsule.zig");
-pub const whowas_capsule = @import("whowas_capsule.zig");
 pub const memo_capsule = @import("memo_capsule.zig");
 pub const upgrade_manifest = @import("upgrade_manifest.zig");
 
