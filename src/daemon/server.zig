@@ -62539,6 +62539,110 @@ test "UPGRADE GAP-D5 restart keeps SCRAM and CertFP and invalidates recovery tok
     try std.testing.expectEqual(password_reset.Result.ok, second.reset_store.confirm("alice", &reset_again, 13));
 }
 
+test "GAP-D5 same-image USR2 invalidates recovery tokens and keeps SCRAM and CertFP" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const scram_store_mod = @import("scram_store.zig");
+    const bridge = @import("sasl_bridge.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d5-usr2.wal");
+    var scram = scram_store_mod.ScramStore.init(alloc);
+    var binds = certfp_bind_mod.CertfpBindStore.init(alloc);
+    var services = services_mod.Services.init(&store, null);
+    services.attachScramStore(&scram);
+    services.attachCertfpBinds(&binds);
+    var scratch: [2048]u8 = undefined;
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    const fp = "abababababababababababababababababababababababababababababababab";
+    try services.bindCertfp("alice", fp);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+            scram.deinit();
+            binds.deinit();
+            store.deinit();
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    var verify_bytes: [16]u8 = @splat(0x31);
+    const issued = try first.account_verifies.issue("alice", "alice@example.test", &verify_bytes, 10);
+    var issued_copy: [64]u8 = undefined;
+    try std.testing.expect(issued.len <= issued_copy.len);
+    @memcpy(issued_copy[0..issued.len], issued);
+    const issued_len = issued.len;
+    var reset_token: [32]u8 = "0123456789abcdef0123456789abcdef".*;
+    try first.reset_store.issue("alice", &reset_token, 10);
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(first, &pieces, &blobs);
+
+    first.deinit();
+    alloc.destroy(first);
+    scram.deinit();
+    binds.deinit();
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d5-usr2.wal");
+    defer store2.deinit();
+    var scram2 = scram_store_mod.ScramStore.init(alloc);
+    defer scram2.deinit();
+    var binds2 = certfp_bind_mod.CertfpBindStore.init(alloc);
+    defer binds2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    services2.attachScramStore(&scram2);
+    services2.attachCertfpBinds(&binds2);
+    scram2.setLoader(services2.scramLoader());
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    try std.testing.expectEqual(account_verify_mod.Result.no_pending, second.account_verifies.confirm("alice", issued_copy[0..issued_len], 11));
+    try std.testing.expectEqual(password_reset.Result.no_request, second.reset_store.confirm("alice", &reset_token, 11));
+
+    _ = try adoptUpgradePiecesForTest(second, pieces.items, "onyx-test-gap-d5-usr2");
+    current_reactor = null;
+    try std.testing.expectEqual(account_verify_mod.Result.no_pending, second.account_verifies.confirm("alice", issued_copy[0..issued_len], 12));
+    try std.testing.expectEqual(password_reset.Result.no_request, second.reset_store.confirm("alice", &reset_token, 12));
+
+    second.config.sasl_scram256 = scram2.scram256Lookup();
+    second.config.sasl_scram512 = scram2.scram512Lookup();
+    try std.testing.expect(second.config.sasl_scram256.?.lookup("alice") != null);
+    try std.testing.expect(second.config.sasl_scram512.?.lookup("alice") != null);
+    var external = bridge.ServicesExternalLookup{ .services = &services2 };
+    second.config.sasl_external = external.lookup();
+    try std.testing.expectEqualStrings("alice", (second.config.sasl_external.?.verify(fp, "")).?);
+
+    var conn = ConnState{};
+    Server.loginSession(&conn, "alice");
+    conn.session.tls_certfp = fp;
+    try std.testing.expect(second.sessionCertVerifiedFor(&conn, "alice"));
+
+    var again_bytes: [16]u8 = @splat(0x32);
+    const again = try second.account_verifies.issue("alice", "alice@example.test", &again_bytes, 13);
+    try std.testing.expect(again.len != 0);
+    try std.testing.expect(!std.mem.eql(u8, again, issued_copy[0..issued_len]));
+    try std.testing.expectEqual(account_verify_mod.Result.verified, second.account_verifies.confirm("alice", again, 14));
+    var reset_again: [32]u8 = "fedcba9876543210fedcba9876543210".*;
+    try second.reset_store.issue("alice", &reset_again, 13);
+    try std.testing.expectEqual(password_reset.Result.ok, second.reset_store.confirm("alice", &reset_again, 14));
+    std.debug.print("GAP-D5 branch=same-image USR2 invalidated the pre-crash verify and reset tokens, then SCRAM and CertFP still resolved and a new token confirmed\n", .{});
+}
+
 test "UPGRADE GAP-D1 cold restart restores history msgids and skips ciphertext search" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
