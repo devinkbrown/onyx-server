@@ -107,6 +107,7 @@ pub const search_index = @import("search_index.zig");
 pub const unfurl = @import("unfurl.zig");
 pub const appeal = @import("appeal.zig");
 pub const challenge = @import("challenge.zig");
+pub const first_hold = @import("first_hold.zig");
 pub const secured_s2s_link = @import("secured_s2s_link.zig");
 pub const server = @import("server.zig");
 pub const server_stats = @import("server_stats.zig");
@@ -459,6 +460,7 @@ test {
     _ = unfurl;
     _ = appeal;
     _ = challenge;
+    _ = first_hold;
     _ = secured_s2s_link;
     _ = server;
     _ = server_stats;

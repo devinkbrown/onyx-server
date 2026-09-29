@@ -244,6 +244,7 @@ const http_fetch = @import("http_fetch.zig");
 const unfurl = @import("unfurl.zig");
 const appeal = @import("appeal.zig");
 const challenge_mod = @import("challenge.zig");
+const first_hold = @import("first_hold.zig");
 
 /// Per-channel cross-leg media bridge (native ↔ opt-in WebRTC roster).
 const Bridge = media_bridge_mod.ChannelBridge(native_media_mod.max_call_participants);
@@ -4282,6 +4283,8 @@ pub const LinuxServer = struct {
     mesh_search_peers: std.ArrayList(*LinuxServer) = .empty,
     /// Ban appeals. One open filing per host per window. Not a mesh checkpoint.
     appeals: appeal.Table = .{},
+    /// First channel messages waiting for an oper to release or drop them.
+    first_holds: first_hold.Table = .{},
     /// Test stand-ins for the unfurl resolver and fetch. Null uses DNS and HTTPS.
     unfurl_resolve_for_test: ?unfurl.ResolveFn = null,
     unfurl_fetch_for_test: ?unfurl.FetchFn = null,
@@ -4801,6 +4804,7 @@ pub const LinuxServer = struct {
             .threads = thread_snapshot.Table.init(allocator) catch unreachable,
             .schedules = schedule_snapshot.Table.init(allocator) catch unreachable,
             .appeals = appeal.Table.init(allocator) catch unreachable,
+            .first_holds = first_hold.Table.init(allocator) catch unreachable,
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
@@ -6179,6 +6183,7 @@ pub const LinuxServer = struct {
         self.threads.deinit();
         self.schedules.deinit();
         self.appeals.deinit();
+        self.first_holds.deinit();
         self.mesh_search_peers.deinit(self.allocator);
         self.warden.deinit();
         self.spamtrap.deinit();
@@ -38015,6 +38020,110 @@ pub const LinuxServer = struct {
     /// daemon, so Onyx Server repurposes it as an operator force-join (the registry
     /// gates it `.access = .oper`). Reuses the same target resolution + join path
     /// as `FORCEJOIN`, then replies `RPL_SUMMONING` (342) to the requester.
+    fn channelHoldLimit(self: *LinuxServer, channel: []const u8) u16 {
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const ev = self.props.getProp(entity, "HOLD") catch return 0;
+        const n = std.fmt.parseInt(u16, ev.value, 10) catch return 0;
+        if (n == 0) return 0;
+        return @min(n, first_hold.max_per_member);
+    }
+
+    /// True when this PRIVMSG is stored for review instead of delivered.
+    /// A missing or zero HOLD prop leaves delivery unchanged.
+    fn captureFirstHold(self: *LinuxServer, conn: *ConnState, channel: []const u8, text: []const u8) bool {
+        if (conn.session.isOper()) return false;
+        const limit = self.channelHoldLimit(channel);
+        if (limit == 0) return false;
+        const nick = conn.session.displayName();
+        if (self.first_holds.seen(channel, nick) >= limit) return false;
+        self.first_holds.hold(channel, nick, text, limit) catch {
+            self.noticeTo(conn, "HOLD could not store") catch {};
+            return true;
+        };
+        self.noticeTo(conn, "HOLD stored") catch {};
+        return true;
+    }
+
+    pub fn handleHold(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied");
+            return;
+        }
+        const p = parsed.paramSlice();
+        if (p.len < 3) {
+            try self.noticeTo(conn, "Usage: HOLD RELEASE|DROP <#chan> <nick>");
+            return;
+        }
+        const channel = p[1];
+        const nick = p[2];
+        if (std.ascii.eqlIgnoreCase(p[0], "DROP")) {
+            const n = self.first_holds.drop(channel, nick);
+            var buf: [64]u8 = undefined;
+            const note = std.fmt.bufPrint(&buf, "HOLD dropped {d}", .{n}) catch "HOLD dropped";
+            try self.noticeTo(conn, note);
+            return;
+        }
+        if (!std.ascii.eqlIgnoreCase(p[0], "RELEASE")) {
+            try self.noticeTo(conn, "Usage: HOLD RELEASE|DROP <#chan> <nick>");
+            return;
+        }
+        var bodies: [first_hold.max_per_member][first_hold.max_body]u8 = undefined;
+        var lens: [first_hold.max_per_member]usize = undefined;
+        const n = self.first_holds.copyOut(channel, nick, &bodies, &lens);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const text = bodies[i][0..lens[i]];
+            var prefix_buf: [96]u8 = undefined;
+            const prefix = std.fmt.bufPrint(&prefix_buf, "{s}!{s}@held", .{ nick, nick }) catch nick;
+            var msg_buf: [first_hold.max_body + 160]u8 = undefined;
+            const msg = formatMessage(&msg_buf, prefix, "PRIVMSG", &.{channel}, text) catch continue;
+            self.broadcastChannel(channel, msg, null) catch {};
+            var id_buf: [16]u8 = undefined;
+            const msgid = std.fmt.bufPrint(&id_buf, "hold{d}", .{i}) catch "hold";
+            self.recordHistoryRelayAt(channel, prefix, msgid, "PRIVMSG", text, null, self.meshWallMs());
+        }
+        var buf: [64]u8 = undefined;
+        const note = std.fmt.bufPrint(&buf, "HOLD released {d}", .{n}) catch "HOLD released";
+        try self.noticeTo(conn, note);
+    }
+
+    pub fn handleQuarantine(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied");
+            return;
+        }
+        const p = parsed.paramSlice();
+        if (p.len < 3 or !world_model.isChannelName(p[1]) or p[2].len == 0) {
+            try self.noticeTo(conn, "Usage: QUARANTINE <nick> <#chan> :<reason>");
+            return;
+        }
+        const nick = p[0];
+        const channel = p[1];
+        const reason = p[2];
+        const target = self.resolveTargetConn(conn, nick) orelse return;
+        const wid = worldIdFromClient(target.id);
+        const listed = self.world.channelCount();
+        const names = try self.allocator.alloc([]const u8, listed);
+        defer self.allocator.free(names);
+        const n = self.world.channelsOf(wid, names);
+        var copies: std.ArrayList([]u8) = .empty;
+        defer {
+            for (copies.items) |item| self.allocator.free(item);
+            copies.deinit(self.allocator);
+        }
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(names[i], channel)) continue;
+            try copies.append(self.allocator, try self.allocator.dupe(u8, names[i]));
+        }
+        for (copies.items) |name| self.partOne(target.id, target.conn, name, reason) catch {};
+        try self.joinOne(target.id, target.conn, channel, null, 0);
+        var reason_buf: [180]u8 = undefined;
+        const audit = std.fmt.bufPrint(&reason_buf, "quarantine {s}: {s}", .{ channel, reason }) catch "quarantine";
+        _ = self.recordOperAudit(conn.session.displayName(), .other, nick, audit);
+        try self.noticeTo(conn, "QUARANTINE moved");
+    }
+
     pub fn handleSummon(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SUMMON"}, "Not enough parameters (SUMMON <nick> <channel>)");
@@ -53686,6 +53795,7 @@ pub const LinuxServer = struct {
         if (world_model.isChannelName(chan)) {
             const speech = try self.channelSpeechGate(id, conn, target, chan, text, is_notice, min_rank, true);
             if (speech == .deny) return;
+            if (!is_notice and min_rank == 0 and self.captureFirstHold(conn, chan, text)) return;
             const opmod_route = speech == .opmoderate;
             // Fantasy bot: a speaker's PRIVMSG beginning with '!' may invoke the
             // weather/news bot. The message is still delivered to the channel
@@ -110914,6 +111024,98 @@ test "GAP-P8 a tripped connection answers a challenge before 001" {
     try std.testing.expect(raid.session.account() == null);
     current_reactor = null;
     std.debug.print("GAP-P8 branch=reputation or raid shield holds 001 until a pluggable challenge admits and success is not an account\n", .{});
+}
+
+fn gapP9HistoryHas(server: *Server, channel: []const u8, needle: []const u8) bool {
+    var hist: [16]lotus.Message = undefined;
+    const rows = server.history.latest(channel, hist.len, &hist) catch return false;
+    for (rows) |row| if (std.mem.indexOf(u8, row.text, needle) != null) return true;
+    return false;
+}
+
+test "GAP-P9 a channel prop holds first messages and quarantine is audited" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "p9.test" };
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const alice_id = try addTestLocalClient(server, "alice", null);
+    const bob_id = try addTestLocalClient(server, "bob", null);
+    const eve_id = try addTestLocalClient(server, "eve", null);
+    const dave_id = try addTestLocalClient(server, "dave", null);
+    const oper_id = try addTestLocalClient(server, "p9oper", null);
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    const eve = server.connFor(eve_id).?;
+    const dave = server.connFor(dave_id).?;
+    const oper = server.connFor(oper_id).?;
+    alice.session.registration.registered = true;
+    bob.session.registration.registered = true;
+    eve.session.registration.registered = true;
+    dave.session.registration.registered = true;
+    oper.session.registration.registered = true;
+    oper.session.is_oper = true;
+    _ = try server.world.join("#room", worldIdFromClient(alice_id));
+    _ = try server.world.join("#room", worldIdFromClient(bob_id));
+    _ = try server.world.join("#room", worldIdFromClient(eve_id));
+    _ = try server.world.join("#room", worldIdFromClient(dave_id));
+    _ = try server.world.join("#other", worldIdFromClient(dave_id));
+    const entity = ircx_prop_store.Entity{ .kind = .channel, .id = "#room" };
+    _ = try server.props.setProp(entity, "HOLD", "1", .{ .id = "p9oper", .access = .host });
+
+    bob.send_len = 0;
+    var held = try irc_line.parseLine("PRIVMSG #room :hello held");
+    try server.handleMessage(alice_id, alice, &held, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "HOLD stored") != null);
+    try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+    try std.testing.expect(!gapP9HistoryHas(server, "#room", "hello held"));
+
+    bob.send_len = 0;
+    var second = try irc_line.parseLine("PRIVMSG #room :second flows");
+    try server.handleMessage(alice_id, alice, &second, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "second flows") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "hello held") == null);
+
+    bob.send_len = 0;
+    var release = try irc_line.parseLine("HOLD RELEASE #room alice");
+    try server.handleHold(oper, &release);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "HOLD released 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "hello held") != null);
+    try std.testing.expect(gapP9HistoryHas(server, "#room", "hello held"));
+
+    bob.send_len = 0;
+    var secret = try irc_line.parseLine("PRIVMSG #room :secret drop");
+    try server.handleMessage(eve_id, eve, &secret, "PRIVMSG");
+    try std.testing.expectEqual(@as(usize, 0), bob.send_len);
+    var drop = try irc_line.parseLine("HOLD DROP #room eve");
+    try server.handleHold(oper, &drop);
+    try std.testing.expect(!gapP9HistoryHas(server, "#room", "secret drop"));
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "secret drop") == null);
+
+    var move = try irc_line.parseLine("QUARANTINE dave #pen :review the join");
+    try server.handleQuarantine(oper, &move);
+    try std.testing.expect(!server.world.isMember("#room", worldIdFromClient(dave_id)));
+    try std.testing.expect(!server.world.isMember("#other", worldIdFromClient(dave_id)));
+    try std.testing.expect(server.world.isMember("#pen", worldIdFromClient(dave_id)));
+    var audited = false;
+    var ai: usize = 0;
+    while (ai < server.oper_audit.len()) : (ai += 1) {
+        const entry = server.oper_audit.at(ai) orelse continue;
+        if (std.mem.indexOf(u8, entry.reason, "quarantine") != null and
+            std.mem.indexOf(u8, entry.reason, "review the join") != null)
+        {
+            audited = true;
+        }
+    }
+    try std.testing.expect(audited);
+    current_reactor = null;
+    std.debug.print("GAP-P9 branch=a channel HOLD prop keeps the first messages for release or drop and quarantine audits the reason\n", .{});
 }
 
 test {

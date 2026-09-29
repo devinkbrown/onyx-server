@@ -48,6 +48,14 @@ fn challengeCmd(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleChallenge(x.id, x.conn, x.parsed);
 }
+fn holdCmd(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleHold(x.conn, x.parsed);
+}
+fn quarantineCmd(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleQuarantine(x.conn, x.parsed);
+}
 fn media(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMedia(x.id, x.conn, x.parsed);
@@ -92,6 +100,8 @@ pub const module = registry.Module{
         .{ .name = "UNFURL", .min_params = 1, .access = .registered, .handler = unfurlCmd, .summary = "Opt-in https link preview. Default off. UNFURL OFF refuses previews" },
         .{ .name = "APPEAL", .min_params = 1, .access = .any, .handler = appealCmd, .summary = "File one ban appeal per window without joining. Oper LIST and ANSWER are audited" },
         .{ .name = "CHALLENGE", .min_params = 1, .access = .oper, .handler = challengeCmd, .summary = "Set the pre-001 challenge method or question. An unregistered client answers with CHALLENGE" },
+        .{ .name = "HOLD", .min_params = 3, .access = .oper, .handler = holdCmd, .summary = "Release or drop a channel's held first messages" },
+        .{ .name = "QUARANTINE", .min_params = 3, .access = .oper, .handler = quarantineCmd, .summary = "Move a joiner into a quarantine channel and audit the reason" },
         .{ .name = "MEDIA", .feature = "media", .handler = media },
         .{ .name = "MEMO", .handler = memoCmd },
         .{ .name = "WEBPUSH", .handler = webpushCmd, .summary = "Browser push subscriptions (VAPID/SUBSCRIBE/UNSUBSCRIBE/LIST)" },
