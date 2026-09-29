@@ -393,6 +393,16 @@ const ResumeOffer = struct {
     }
 };
 
+/// RFC 8446 §4.6.1: tickets older than seven days are not offered, and neither
+/// is a ticket older than the lifetime the server advertised.
+const max_ticket_offer_age_ms: u64 = 604_800 * 1000;
+
+fn ticketOfferAllowed(lifetime_seconds: u32, age_ms: u64) bool {
+    if (lifetime_seconds == 0) return false;
+    const advertised_ms: u64 = @as(u64, lifetime_seconds) * 1000;
+    return age_ms <= @min(advertised_ms, max_ticket_offer_age_ms);
+}
+
 pub const Client = struct {
     allocator: Allocator,
     server_name: []u8,
@@ -860,6 +870,9 @@ pub const Client = struct {
     /// Load a serialized TLS 1.3 session ticket previously returned by
     /// `takeSessionTicket`. `ticket_age_ms` is the caller's elapsed wall-clock
     /// age for the ticket and is folded into `obfuscated_ticket_age`.
+    ///
+    /// A ticket older than its advertised lifetime, or older than the RFC 8446
+    /// 7-day cap, is not offered and cannot carry early data.
     pub fn setSessionTicket(self: *Client, serialized: []const u8, ticket_age_ms: u64) Error!void {
         const decoded = try tls_resumption.decodeStoredSession(serialized);
         const suite = try CipherSuite.fromWire(decoded.suite);
@@ -867,6 +880,13 @@ pub const Client = struct {
         if (self.resume_offer) |*old| {
             old.wipe(self.allocator);
             self.resume_offer = null;
+        }
+        if (!ticketOfferAllowed(decoded.ticket_lifetime, ticket_age_ms)) {
+            if (self.early_data) |old| {
+                self.allocator.free(old);
+                self.early_data = null;
+            }
+            return;
         }
         const ticket = try self.allocator.dupe(u8, decoded.ticket);
         errdefer self.allocator.free(ticket);
@@ -6909,6 +6929,155 @@ test "GAP-K15 an IP literal matches an iPAddress SAN only" {
     try std.testing.expectError(error.CertificateNameMismatch, verifyChainToTrustAnchors(&v6_chain, &anchors, "www.example.com", null));
 
     std.debug.print("GAP-K15 branch=an IP literal matches an iPAddress SAN only\n", .{});
+}
+
+fn clientHelloHasExt(flight: []const u8, typ: tls_extension.ExtensionType) bool {
+    if (flight.len < tls_record.record_header_len + 4) return false;
+    const rec_len = std.mem.readInt(u16, flight[3..5], .big);
+    const rec_end = tls_record.record_header_len + @as(usize, rec_len);
+    if (rec_end > flight.len) return false;
+    const hs = flight[tls_record.record_header_len..rec_end];
+    if (hs[0] != @intFromEnum(HandshakeType.client_hello)) return false;
+    var pos: usize = 4 + 2 + 32;
+    if (hs.len < pos + 1) return false;
+    const sid_len: usize = hs[pos];
+    pos += 1 + sid_len;
+    if (hs.len < pos + 2) return false;
+    const cs_len = std.mem.readInt(u16, hs[pos..][0..2], .big);
+    pos += 2 + @as(usize, cs_len);
+    if (hs.len < pos + 1) return false;
+    const comp_len: usize = hs[pos];
+    pos += 1 + comp_len;
+    if (hs.len < pos + 2) return false;
+    const ext_len = std.mem.readInt(u16, hs[pos..][0..2], .big);
+    pos += 2;
+    const ext_end = pos + @as(usize, ext_len);
+    if (ext_end > hs.len) return false;
+    var e: usize = pos;
+    while (e + tls_extension.header_len <= ext_end) {
+        const wire = std.mem.readInt(u16, hs[e..][0..2], .big);
+        const len = std.mem.readInt(u16, hs[e + 2 ..][0..2], .big);
+        const data_at = e + tls_extension.header_len;
+        if (data_at + @as(usize, len) > ext_end) return false;
+        if (wire == @intFromEnum(typ)) return true;
+        e = data_at + len;
+    }
+    return false;
+}
+
+test "GAP-K16 a ticket older than its lifetime or seven days is not offered" {
+    const tls_server = @import("tls_server.zig");
+    const alloc = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x16)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "k16.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x16},
+        .key_pair = kp,
+        .dns_names = &.{"k16.test"},
+        .is_ca = true,
+    });
+    var server = try tls_server.Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .ticket_lifetime_seconds = 100,
+        .max_early_data_size = 32,
+    });
+    defer server.deinit();
+    var client = try Client.init(alloc, .{ .server_name = "k16.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+    const decoded = try tls_resumption.decodeStoredSession(stored);
+    try std.testing.expectEqual(@as(u32, 100), decoded.ticket_lifetime);
+    try std.testing.expectEqual(@as(u32, 32), decoded.max_early_data_size);
+
+    var fresh = try Client.init(alloc, .{ .server_name = "k16.test", .trust_anchors = &.{der} });
+    defer fresh.deinit();
+    try fresh.setSessionTicket(stored, 100 * 1000);
+    try fresh.setEarlyData("hi");
+    const offered = try fresh.start();
+    defer alloc.free(offered);
+    try std.testing.expect(clientHelloHasExt(offered, .pre_shared_key));
+    try std.testing.expect(clientHelloHasExt(offered, .early_data));
+    const offered_hello = tls_record.record_header_len + std.mem.readInt(u16, offered[3..5], .big);
+    try std.testing.expect(offered.len > offered_hello);
+
+    var stale = try Client.init(alloc, .{ .server_name = "k16.test", .trust_anchors = &.{der} });
+    defer stale.deinit();
+    try stale.setSessionTicket(stored, 100 * 1000 + 1);
+    try std.testing.expect(stale.resume_offer == null);
+    try std.testing.expectError(error.BadState, stale.setEarlyData("hi"));
+    const plain = try stale.start();
+    defer alloc.free(plain);
+    try std.testing.expect(!clientHelloHasExt(plain, .pre_shared_key));
+    try std.testing.expect(!clientHelloHasExt(plain, .early_data));
+    try std.testing.expectEqual(plain.len, tls_record.record_header_len + std.mem.readInt(u16, plain[3..5], .big));
+
+    var swapped = try Client.init(alloc, .{ .server_name = "k16.test", .trust_anchors = &.{der} });
+    defer swapped.deinit();
+    try swapped.setSessionTicket(stored, 0);
+    try swapped.setEarlyData("hi");
+    try swapped.setSessionTicket(stored, 100 * 1000 + 1);
+    const dropped = try swapped.start();
+    defer alloc.free(dropped);
+    try std.testing.expect(swapped.resume_offer == null);
+    try std.testing.expect(swapped.early_data == null);
+    try std.testing.expect(!clientHelloHasExt(dropped, .pre_shared_key));
+    try std.testing.expect(!clientHelloHasExt(dropped, .early_data));
+
+    const psk = @as([32]u8, @splat(0x16));
+    const long = try tls_resumption.encodeStoredSession(alloc, .{
+        .suite = 0x1301,
+        .ticket_lifetime = 1_000_000,
+        .ticket_age_add = 7,
+        .ticket = "k16-long",
+        .psk = &psk,
+        .max_early_data_size = 16,
+    });
+    defer alloc.free(long);
+    const seven_ms: u64 = 604_800 * 1000;
+    var week = try Client.init(alloc, .{ .server_name = "k16.test", .trust_anchors = &.{} });
+    defer week.deinit();
+    try week.setSessionTicket(long, seven_ms);
+    try week.setEarlyData("x");
+    const week_hello = try week.start();
+    defer alloc.free(week_hello);
+    try std.testing.expect(clientHelloHasExt(week_hello, .pre_shared_key));
+    try std.testing.expect(clientHelloHasExt(week_hello, .early_data));
+
+    var over = try Client.init(alloc, .{ .server_name = "k16.test", .trust_anchors = &.{} });
+    defer over.deinit();
+    try over.setSessionTicket(long, seven_ms + 1);
+    try std.testing.expect(over.resume_offer == null);
+    try std.testing.expectError(error.BadState, over.setEarlyData("x"));
+    const over_hello = try over.start();
+    defer alloc.free(over_hello);
+    try std.testing.expect(!clientHelloHasExt(over_hello, .pre_shared_key));
+    try std.testing.expect(!clientHelloHasExt(over_hello, .early_data));
+
+    std.debug.print("GAP-K16 branch=a ticket older than its lifetime or seven days is not offered\n", .{});
 }
 
 // ---------------------------------------------------------------------------
