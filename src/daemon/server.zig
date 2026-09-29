@@ -132,6 +132,7 @@ const wildcard_limit = @import("../proto/wildcard_limit.zig");
 const color_strip = @import("../proto/color_strip.zig");
 const snowflake_id = @import("../proto/snowflake_id.zig");
 const msgid_mod = @import("../proto/msgid.zig");
+const draft_reply_relay = @import("../proto/draft_reply_relay.zig");
 const multiline = @import("../proto/multiline.zig");
 const meshpass = @import("../proto/meshpass.zig");
 const labeled_response = @import("../proto/labeled_response.zig");
@@ -231,6 +232,7 @@ const silence_capsule = @import("helix/silence_capsule.zig");
 const s2s_snapshot = @import("helix/s2s_snapshot.zig");
 const oper_grant_snapshot = @import("helix/oper_grant_snapshot.zig");
 const bot_grant_snapshot = @import("helix/bot_grant_snapshot.zig");
+const thread_snapshot = @import("helix/thread_snapshot.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
 const mesh_clock_snapshot = @import("helix/mesh_clock_snapshot.zig");
 const tls_server = @import("../crypto/tls_server.zig");
@@ -4239,6 +4241,11 @@ pub const LinuxServer = struct {
     /// Announcement registry. BOTGRANT also registers the account here so
     /// `isBot` matches the grant table. The grant itself carries no oper bit.
     bot_registry: bot_registry_mod.BotRegistry = .{ .allocator = undefined, .map = .{} },
+    /// Reply threads keyed by a stable id derived from the root msgid.
+    /// The reply list is bounded. Carried across USR2 as a THRD mesh checkpoint
+    /// and rebuilt from durable history on a cold start. The `+draft/reply` tag
+    /// stays on the wire for clients that negotiated it.
+    threads: thread_snapshot.Table = .{},
     /// Strictly-increasing incarnation counter for minted oper grants, so a later
     /// GRANT/REVOKE always supersedes an earlier one (even within one ms).
     grant_incarnation: u64 = 0,
@@ -4752,6 +4759,7 @@ pub const LinuxServer = struct {
             .observe = observe_mod.Registry.init(allocator, .{}),
             .oper_motd = oper_motd_mod.OperMotd.init(allocator),
             .bot_registry = bot_registry_mod.BotRegistry.init(allocator),
+            .threads = thread_snapshot.Table.init(allocator) catch unreachable,
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
@@ -6127,6 +6135,7 @@ pub const LinuxServer = struct {
         self.policy_undo = null;
         self.destroyOutboundWebhooks();
         self.bot_registry.deinit();
+        self.threads.deinit();
         self.warden.deinit();
         self.spamtrap.deinit();
         self.raid_shield.deinit();
@@ -12067,6 +12076,11 @@ pub const LinuxServer = struct {
             &candidate,
         );
         if (event_log_plan) |*plan| _ = plan.commit();
+        if (history) |row| {
+            var thread_msgid_buf: [msgid_mod.id_len]u8 = undefined;
+            const thread_msgid = msgid_mod.fromStableId(relay_id, &thread_msgid_buf);
+            self.noteThreadFromTags(thread_msgid, row.client_tags);
+        }
         return .{ .accepted = relay_id };
     }
 
@@ -23127,7 +23141,9 @@ pub const LinuxServer = struct {
         const svc = self.account_services orelse return;
         history_durable.restoreInto(HistoryStore, svc.store, &self.history, &self.search_index) catch |err| {
             srvLog("onyx-server: history durable restore failed closed ({s})\n", .{@errorName(err)});
+            return;
         };
+        self.rebuildThreadsFromHistory();
     }
 
     fn snapshotDurableHistory(self: *LinuxServer) void {
@@ -23162,6 +23178,7 @@ pub const LinuxServer = struct {
             .client_tags = client_tags,
         }) catch {};
         self.persistHistoryRecord(store_target, msgid, sender, text, timestamp_ms, command, client_tags);
+        self.noteThreadFromTags(msgid, client_tags);
         // Forward-index the message body for draft/search (word -> msgid). Bounded
         // by the index Config (max words/ids/token bytes); oversize indexes are a
         // best-effort drop, never an error to the sender. msgid uniquely keys the
@@ -23204,6 +23221,7 @@ pub const LinuxServer = struct {
             .client_tags = client_tags,
         }) catch {};
         self.persistHistoryRecord(store_target, msgid, sender_prefix, text, timestamp_ms, command, client_tags);
+        self.noteThreadFromTags(msgid, client_tags);
         self.indexHistoryBody(msgid, text, client_tags);
         self.chanstatsMessage(store_target, sender_prefix, command, text);
     }
@@ -23233,6 +23251,29 @@ pub const LinuxServer = struct {
             .client_tags = tags,
         }) catch {};
         self.persistHistoryRecord(store_target, msgid, sender, "", timestamp_ms, "TAGMSG", tags);
+        self.noteThreadFromTags(msgid, tags);
+    }
+
+    /// A delivered message whose `+draft/reply` value passes the shipped msgid
+    /// check joins that thread. Invalid values stay on the wire and do not
+    /// create a thread. The tag itself is not removed here.
+    fn noteThreadFromTags(self: *LinuxServer, msgid: []const u8, client_tags: ?[]const u8) void {
+        const tags = client_tags orelse return;
+        const raw = findTagValue(tags, draft_reply_relay.TAG_KEY) orelse return;
+        const parent = draft_reply_relay.parse(raw) catch return;
+        const reply = draft_reply_relay.parse(msgid) catch return;
+        self.threads.noteReply(parent, reply) catch {};
+    }
+
+    /// Cold start has no Helix arena. Durable history already stored the reply
+    /// tag, so the thread table is rebuilt from those rows, oldest first.
+    fn rebuildThreadsFromHistory(self: *LinuxServer) void {
+        self.threads.clear();
+        var it = self.history.deterministicIterator();
+        while (it.next()) |entry| {
+            if (entry.message.tombstone) continue;
+            self.noteThreadFromTags(entry.message.msgid, entry.message.client_tags);
+        }
     }
 
     /// Record a draft/event-playback EVENT (a non-message channel action such as
@@ -26549,6 +26590,26 @@ pub const LinuxServer = struct {
             return null;
         };
 
+        // Reply threads ride the same mesh_checkpoint family under a different
+        // magic. Absence stays legal. An empty image is still sealed.
+        const thread_wire = thread_snapshot.encodeFrom(self.allocator, &self.threads) catch |err| {
+            srvLog("onyx-server: UPGRADE thread checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        blobs.append(self.allocator, thread_wire) catch {
+            srvLog("onyx-server: UPGRADE thread blob ownership append failed\n", .{});
+            self.allocator.free(thread_wire);
+            return null;
+        };
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = thread_wire,
+            .min_supported = 2,
+        }) catch {
+            srvLog("onyx-server: UPGRADE thread piece append failed\n", .{});
+            return null;
+        };
+
         return .{
             .world_bytes = world_wire.len,
             .history_bytes = history_wire.len,
@@ -28230,6 +28291,36 @@ pub const LinuxServer = struct {
             };
         }
 
+        // Same at-most-once rule: a pre-thread arena lacks THRD and adopts with
+        // an empty thread table. A malformed or duplicate image rejects the handoff.
+        var thread_checkpoint: ?thread_snapshot.Snapshot = null;
+        for (caps) |c| {
+            if (c.header.kind != .mesh_checkpoint) continue;
+            var recognized = false;
+            for (c.fields) |field| {
+                if (thread_snapshot.isCheckpoint(field.bytes)) {
+                    recognized = true;
+                    break;
+                }
+            }
+            if (!recognized) continue;
+            const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+            if (thread_checkpoint != null or
+                c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != 2 or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate thread checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            thread_checkpoint = thread_snapshot.decodeCurrent(c.fields[0].bytes) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed thread checkpoint");
+                return error.InvalidInheritedHandoff;
+            };
+        }
+
         // Select the process-global TLS ticket-key authority without publishing
         // it. Resumption-enabled predecessors in the current Helix contract emit
         // exactly one canonical v1 singleton. Missing, duplicate, malformed, or
@@ -29370,6 +29461,18 @@ pub const LinuxServer = struct {
             srvLog("onyx-server: UPGRADE resume — primed {d} carried bot grant record(s)\n", .{bot_grants_restored});
         if (bot_grants_dropped != 0)
             srvLog("onyx-server: UPGRADE resume — WARNING: dropped {d} carried bot grant record(s)\n", .{bot_grants_dropped});
+
+        // Prime reply threads at the same no-fail edge. The table is already
+        // allocated, so the copy does not allocate. A missing piece leaves the
+        // cold-start rebuild (if any) untouched.
+        if (thread_checkpoint) |snap| {
+            const dropped = self.threads.replace(snap);
+            const restored = self.threads.count();
+            if (restored != 0)
+                srvLog("onyx-server: UPGRADE resume — primed {d} carried thread(s)\n", .{restored});
+            if (dropped != 0)
+                srvLog("onyx-server: UPGRADE resume — WARNING: dropped {d} carried thread(s)\n", .{dropped});
+        }
 
         // Transfer descriptor ownership immediately at the commit edge. Every
         // later action is retryable/best-effort derived work and must never
@@ -61125,6 +61228,29 @@ fn upgradeBotGrantBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u
             bot_grant_snapshot.isCheckpoint(piece.bytes)) return piece.bytes;
     }
     return null;
+}
+
+fn upgradeThreadBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u8 {
+    for (pieces) |piece| {
+        if (piece.kind == .mesh_checkpoint and
+            thread_snapshot.isCheckpoint(piece.bytes)) return piece.bytes;
+    }
+    return null;
+}
+
+fn copyTaggedValueForTest(buf: []const u8, key: []const u8, out: []u8) ?[]const u8 {
+    const at = std.mem.indexOf(u8, buf, key) orelse return null;
+    const rest = buf[at + key.len ..];
+    var end: usize = 0;
+    while (end < rest.len) : (end += 1) {
+        switch (rest[end]) {
+            ';', ' ', '\r', '\n' => break,
+            else => {},
+        }
+    }
+    if (end == 0 or end > out.len) return null;
+    @memcpy(out[0..end], rest[0..end]);
+    return out[0..end];
 }
 
 fn eventHistoryBytesForTest(
@@ -109109,6 +109235,324 @@ test "GAP-O12 malformed bot-grant checkpoint rejects the handoff" {
     current_reactor = null;
     try std.testing.expect(!successor.bot_grants.isBot("newsbot"));
     std.debug.print("GAP-O12 branch=a malformed BGNT image rejects the whole handoff\n", .{});
+}
+
+test "GAP-P1 threads keep a stable id, a bounded reply list, and the reply tag across USR2" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "thread.test" };
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const alice_id = try addTestLocalClient(server, "alice", "alice");
+    const bob_id = try addTestLocalClient(server, "bob", "bob");
+    const carol_id = try addTestLocalClient(server, "carol", "carol");
+    const dave_id = try addTestLocalClient(server, "dave", "dave");
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    const carol = server.connFor(carol_id).?;
+    const dave = server.connFor(dave_id).?;
+    bob.session.addCap(.message_tags);
+    carol.session.addCap(.reply);
+    _ = try server.world.join("#room", worldIdFromClient(alice_id));
+    _ = try server.world.join("#room", worldIdFromClient(bob_id));
+    _ = try server.world.join("#room", worldIdFromClient(carol_id));
+    _ = try server.world.join("#room", worldIdFromClient(dave_id));
+
+    bob.send_len = 0;
+    var root_line = try irc_line.parseLine("PRIVMSG #room :root-body");
+    try server.handleMessage(alice_id, alice, &root_line, "PRIVMSG");
+    var root_buf: [thread_snapshot.max_msgid]u8 = undefined;
+    const root = copyTaggedValueForTest(bob.send_buf[0..bob.send_len], "msgid=", &root_buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(server.threads.count() == 0);
+
+    var reply_a_buf: [160]u8 = undefined;
+    const reply_a_wire = std.fmt.bufPrint(&reply_a_buf, "@+draft/reply={s} PRIVMSG #room :reply-a", .{root}) catch
+        return error.TestUnexpectedResult;
+    var reply_a = try irc_line.parseLine(reply_a_wire);
+    bob.send_len = 0;
+    carol.send_len = 0;
+    dave.send_len = 0;
+    try server.handleMessage(alice_id, alice, &reply_a, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, carol.send_buf[0..carol.send_len], "reply-a") != null);
+    var carol_tag: [96]u8 = undefined;
+    const carol_expect = std.fmt.bufPrint(&carol_tag, "+draft/reply={s}", .{root}) catch return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, carol.send_buf[0..carol.send_len], carol_expect) != null);
+    try std.testing.expect(std.mem.indexOf(u8, dave.send_buf[0..dave.send_len], "+draft/reply=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dave.send_buf[0..dave.send_len], "reply-a") != null);
+    var reply_a_id_buf: [thread_snapshot.max_msgid]u8 = undefined;
+    const reply_a_id = copyTaggedValueForTest(bob.send_buf[0..bob.send_len], "msgid=", &reply_a_id_buf) orelse
+        return error.TestUnexpectedResult;
+
+    var bad_buf: [160]u8 = undefined;
+    const bad_wire = std.fmt.bufPrint(&bad_buf, "@+draft/reply={s}\\x PRIVMSG #room :not-a-thread", .{root}) catch
+        return error.TestUnexpectedResult;
+    var bad_line = try irc_line.parseLine(bad_wire);
+    carol.send_len = 0;
+    try server.handleMessage(alice_id, alice, &bad_line, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, carol.send_buf[0..carol.send_len], "+draft/reply=") != null);
+    try std.testing.expectEqual(@as(usize, 1), server.threads.count());
+
+    var reply_b_buf: [180]u8 = undefined;
+    const reply_b_wire = std.fmt.bufPrint(&reply_b_buf, "@+draft/reply={s} PRIVMSG #room :reply-b", .{reply_a_id}) catch
+        return error.TestUnexpectedResult;
+    var reply_b = try irc_line.parseLine(reply_b_wire);
+    bob.send_len = 0;
+    try server.handleMessage(alice_id, alice, &reply_b, "PRIVMSG");
+
+    const slot = server.threads.findByRoot(root) orelse return error.TestUnexpectedResult;
+    var expect_id: [thread_snapshot.id_len]u8 = undefined;
+    const stable_id = thread_snapshot.idFromRoot(root, &expect_id);
+    try std.testing.expectEqualStrings(stable_id, server.threads.idAt(slot));
+    try std.testing.expect(!std.mem.eql(u8, stable_id, root));
+    try std.testing.expectEqual(@as(usize, 2), server.threads.replyCountAt(slot));
+    try std.testing.expect(server.threads.containsReply(slot, reply_a_id));
+
+    var first_flood: [thread_snapshot.max_msgid]u8 = undefined;
+    var first_flood_len: usize = 0;
+    var last_flood: [thread_snapshot.max_msgid]u8 = undefined;
+    var last_flood_len: usize = 0;
+    var n: usize = 0;
+    while (n < thread_snapshot.max_replies) : (n += 1) {
+        var line_buf: [180]u8 = undefined;
+        const wire = std.fmt.bufPrint(&line_buf, "@+draft/reply={s} PRIVMSG #room :reply-{d}", .{ root, n }) catch
+            return error.TestUnexpectedResult;
+        var line = try irc_line.parseLine(wire);
+        bob.send_len = 0;
+        try server.handleMessage(alice_id, alice, &line, "PRIVMSG");
+        const copied = copyTaggedValueForTest(bob.send_buf[0..bob.send_len], "msgid=", &last_flood) orelse
+            return error.TestUnexpectedResult;
+        last_flood_len = copied.len;
+        if (n == 0) {
+            @memcpy(first_flood[0..copied.len], copied);
+            first_flood_len = copied.len;
+        }
+    }
+    try std.testing.expectEqual(thread_snapshot.max_replies, server.threads.replyCountAt(slot));
+    try std.testing.expectEqualStrings(stable_id, server.threads.idAt(slot));
+    try std.testing.expect(!server.threads.containsReply(slot, reply_a_id));
+    try std.testing.expect(server.threads.containsReply(slot, first_flood[0..first_flood_len]));
+    try std.testing.expect(server.threads.containsReply(slot, last_flood[0..last_flood_len]));
+    try std.testing.expectEqual(@as(usize, 1), server.threads.count());
+
+    try server.world.part("#room", worldIdFromClient(alice_id));
+    try server.world.part("#room", worldIdFromClient(bob_id));
+    try server.world.part("#room", worldIdFromClient(carol_id));
+    try server.world.part("#room", worldIdFromClient(dave_id));
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(server, &pieces, &blobs);
+    try std.testing.expect(upgradeThreadBytesForTest(pieces.items) != null);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-threads");
+    current_reactor = &successor.reactors[0];
+
+    const kept = successor.threads.findByRoot(root) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(stable_id, successor.threads.idAt(kept));
+    try std.testing.expectEqualStrings(root, successor.threads.rootAt(kept));
+    try std.testing.expectEqual(thread_snapshot.max_replies, successor.threads.replyCountAt(kept));
+    try std.testing.expect(successor.threads.containsReply(kept, last_flood[0..last_flood_len]));
+    try std.testing.expect(!successor.threads.containsReply(kept, reply_a_id));
+
+    const alice2_id = try addTestLocalClient(successor, "alice", "alice");
+    const carol2_id = try addTestLocalClient(successor, "carol", "carol");
+    const alice2 = successor.connFor(alice2_id).?;
+    const carol2 = successor.connFor(carol2_id).?;
+    carol2.session.addCap(.reply);
+    _ = try successor.world.join("#room", worldIdFromClient(alice2_id));
+    _ = try successor.world.join("#room", worldIdFromClient(carol2_id));
+    var again_buf: [160]u8 = undefined;
+    const again_wire = std.fmt.bufPrint(&again_buf, "@+draft/reply={s} PRIVMSG #room :after-usr2", .{root}) catch
+        return error.TestUnexpectedResult;
+    var again = try irc_line.parseLine(again_wire);
+    carol2.send_len = 0;
+    try successor.handleMessage(alice2_id, alice2, &again, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, carol2.send_buf[0..carol2.send_len], "+draft/reply=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, carol2.send_buf[0..carol2.send_len], root) != null);
+    try std.testing.expect(std.mem.indexOf(u8, carol2.send_buf[0..carol2.send_len], "after-usr2") != null);
+    try std.testing.expectEqualStrings(stable_id, successor.threads.idAt(kept));
+    try std.testing.expectEqual(thread_snapshot.max_replies, successor.threads.replyCountAt(kept));
+
+    current_reactor = null;
+    std.debug.print("GAP-P1 branch=stable thread id, bounded replies, and the reply tag survive USR2\n", .{});
+}
+
+test "GAP-P1 cold start rebuilds the thread from durable history" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-p1.wal");
+    var services = services_mod.Services.init(&store, null);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "thread.test",
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    current_reactor = &first.reactors[0];
+    const alice_id = try addTestLocalClient(first, "alice", "alice");
+    const bob_id = try addTestLocalClient(first, "bob", "bob");
+    const alice = first.connFor(alice_id).?;
+    const bob = first.connFor(bob_id).?;
+    bob.session.addCap(.message_tags);
+    bob.session.addCap(.reply);
+    _ = try first.world.join("#room", worldIdFromClient(alice_id));
+    _ = try first.world.join("#room", worldIdFromClient(bob_id));
+
+    bob.send_len = 0;
+    var root_line = try irc_line.parseLine("PRIVMSG #room :cold-root");
+    try first.handleMessage(alice_id, alice, &root_line, "PRIVMSG");
+    var root_buf: [thread_snapshot.max_msgid]u8 = undefined;
+    const root_view = copyTaggedValueForTest(bob.send_buf[0..bob.send_len], "msgid=", &root_buf) orelse
+        return error.TestUnexpectedResult;
+    var root_keep: [thread_snapshot.max_msgid]u8 = undefined;
+    @memcpy(root_keep[0..root_view.len], root_view);
+    const root = root_keep[0..root_view.len];
+
+    var reply_buf: [160]u8 = undefined;
+    const reply_wire = std.fmt.bufPrint(&reply_buf, "@+draft/reply={s} PRIVMSG #room :cold-reply", .{root}) catch
+        return error.TestUnexpectedResult;
+    var reply_line = try irc_line.parseLine(reply_wire);
+    bob.send_len = 0;
+    try first.handleMessage(alice_id, alice, &reply_line, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "+draft/reply=") != null);
+    const slot = first.threads.findByRoot(root) orelse return error.TestUnexpectedResult;
+    var id_buf: [thread_snapshot.id_len]u8 = undefined;
+    const stable_id = thread_snapshot.idFromRoot(root, &id_buf);
+    try std.testing.expectEqualStrings(stable_id, first.threads.idAt(slot));
+    var id_keep: [thread_snapshot.id_len]u8 = undefined;
+    @memcpy(&id_keep, stable_id);
+
+    current_reactor = null;
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-p1.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    const kept = second.threads.findByRoot(root) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(&id_keep, second.threads.idAt(kept));
+    try std.testing.expectEqualStrings(root, second.threads.rootAt(kept));
+    try std.testing.expectEqual(@as(usize, 1), second.threads.replyCountAt(kept));
+    var hist: [4]lotus.Message = undefined;
+    const rows = try second.history.latest("#room", 4, &hist);
+    try std.testing.expect(rows.len >= 1);
+    const tags = rows[0].client_tags orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, tags, "+draft/reply=") != null);
+    std.debug.print("GAP-P1 branch=cold start rebuilds the thread from durable history\n", .{});
+}
+
+test "GAP-P1 missing thread checkpoint still adopts" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    try predecessor.threads.noteReply("rootmsgid1", "replymsgid1");
+    try std.testing.expectEqual(@as(usize, 1), predecessor.threads.count());
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    var legacy: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer legacy.deinit(alloc);
+    for (pieces.items) |piece| {
+        if (piece.kind == .mesh_checkpoint and thread_snapshot.isCheckpoint(piece.bytes)) continue;
+        try legacy.append(alloc, piece);
+    }
+    try std.testing.expectEqual(pieces.items.len - 1, legacy.items.len);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, legacy.items, "onyx-test-threads-legacy");
+    try std.testing.expectEqual(@as(usize, 0), successor.threads.count());
+    std.debug.print("GAP-P1 branch=a predecessor arena without THRD adopts an empty thread table\n", .{});
+}
+
+test "GAP-P1 malformed thread checkpoint rejects the handoff" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    var corrupted = false;
+    for (blobs.items) |blob| {
+        if (!thread_snapshot.isCheckpoint(blob) or blob.len <= thread_snapshot.magic.len) continue;
+        blob[thread_snapshot.magic.len] = 0xff;
+        corrupted = true;
+    }
+    try std.testing.expect(corrupted);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try rejectUpgradePiecesForTest(successor, pieces.items, "onyx-test-threads-bad");
+    try std.testing.expectEqual(@as(usize, 0), successor.threads.count());
+    std.debug.print("GAP-P1 branch=a malformed THRD image rejects the whole handoff\n", .{});
 }
 
 test {

@@ -22,6 +22,7 @@ const mesh_clock_snapshot = @import("mesh_clock_snapshot.zig");
 const mesh_redial = @import("mesh_redial.zig");
 const oper_grant_snapshot = @import("oper_grant_snapshot.zig");
 const bot_grant_snapshot = @import("bot_grant_snapshot.zig");
+const thread_snapshot = @import("thread_snapshot.zig");
 const monitor_capsule = @import("monitor_capsule.zig");
 const prop_checkpoint = @import("prop_checkpoint.zig");
 const s2s_snapshot = @import("s2s_snapshot.zig");
@@ -92,6 +93,8 @@ pub const Error = error{
     InvalidOperGrants,
     DuplicateBotGrants,
     InvalidBotGrants,
+    DuplicateThreads,
+    InvalidThreads,
     UnknownMeshCheckpoint,
 };
 
@@ -112,6 +115,7 @@ pub const Summary = struct {
     mesh_clock: usize = 0,
     oper_grants: usize = 0,
     bot_grants: usize = 0,
+    threads: usize = 0,
 };
 
 /// Validate decoded capsules after `live.verifyHandoffManifest` and before any
@@ -347,6 +351,15 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             bot_grant_snapshot.validateCheckpoint(bytes) catch return error.InvalidBotGrants;
             if (summary.bot_grants != 0) return error.DuplicateBotGrants;
             summary.bot_grants = 1;
+            continue;
+        }
+        // THRD is at-most-once, like bot grants. A pre-thread arena has no
+        // piece and must still adopt. Absence is not a missing-singleton error.
+        if (thread_snapshot.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidThreads;
+            thread_snapshot.validateCheckpoint(bytes) catch return error.InvalidThreads;
+            if (summary.threads != 0) return error.DuplicateThreads;
+            summary.threads = 1;
             continue;
         }
         if (item.header.min_supported != descriptor.min_supported)
