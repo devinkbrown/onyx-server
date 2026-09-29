@@ -2042,7 +2042,10 @@ pub const Server = struct {
 
         @memcpy(self.accepted_psk[0..opened.opened.psk.len], opened.opened.psk);
         self.accepted_psk_len = opened.opened.psk.len;
-        self.accepted_early_data_limit = opened.opened.max_early_data_size;
+        // Zero config refuses early data for every ticket. A non-zero config
+        // accepts only up to the smaller of this node's limit and the limit
+        // sealed when the ticket was minted.
+        self.accepted_early_data_limit = @min(opened.opened.max_early_data_size, self.config.max_early_data_size);
         @memcpy(self.accepted_binder[0..binder.len], binder);
         self.accepted_binder_len = binder.len;
         return suite;
@@ -6030,6 +6033,119 @@ test "loopback: TLS 1.3 PSK-DHE resumption rejects 0-RTT when sealed ticket limi
     try std.testing.expect(resumed_client.handshakeDone());
     _ = try resumed_server.feed(rcfin);
     try std.testing.expect(resumed_server.handshakeDone());
+}
+
+fn gapK18Early(ticket_key: tls_resumption.TicketKey, der: []const u8, kp: Ed25519.KeyPair, stored: []const u8, accept_limit: u32, early: []const u8) !struct { resumed: bool, accepted: bool, bytes: ?[]u8 } {
+    const tls_client = @import("tls_client.zig");
+    const alloc = std.testing.allocator;
+    var guard = tls_resumption.ReplayGuard{};
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = accept_limit,
+        .replay_guard = &guard,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "k18.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    try client.setSessionTicket(stored, 0);
+    try client.setEarlyData(early);
+    const flight = try client.start();
+    defer alloc.free(flight);
+    const reply = switch (try server.feed(flight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(reply);
+    return .{
+        .resumed = server.acceptedSessionTicket(),
+        .accepted = server.earlyDataAccepted(),
+        .bytes = try server.takeEarlyData(),
+    };
+}
+
+test "GAP-K18 turning 0-RTT off binds tickets already sealed with a limit" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x18)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "k18.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x18},
+        .key_pair = kp,
+        .dns_names = &.{"k18.test"},
+        .is_ca = true,
+    });
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 64,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "k18.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(tls_client.AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+    try std.testing.expectEqual(@as(u32, 64), (try tls_resumption.decodeStoredSession(stored)).max_early_data_size);
+
+    const off = try gapK18Early(ticket_key, der, kp, stored, 0, "0123456789");
+    defer if (off.bytes) |b| alloc.free(b);
+    try std.testing.expect(off.resumed);
+    try std.testing.expect(!off.accepted);
+    try std.testing.expect(off.bytes == null);
+
+    const capped = try gapK18Early(ticket_key, der, kp, stored, 16, "0123456789");
+    defer if (capped.bytes) |b| alloc.free(b);
+    try std.testing.expect(capped.resumed);
+    try std.testing.expect(capped.accepted);
+    try std.testing.expectEqualStrings("0123456789", capped.bytes.?);
+
+    const wide = try gapK18Early(ticket_key, der, kp, stored, 1000, "0123456789");
+    defer if (wide.bytes) |b| alloc.free(b);
+    try std.testing.expect(wide.resumed);
+    try std.testing.expect(wide.accepted);
+    try std.testing.expectEqualStrings("0123456789", wide.bytes.?);
+
+    var over_guard = tls_resumption.ReplayGuard{};
+    var over_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = 16,
+        .replay_guard = &over_guard,
+    });
+    defer over_server.deinit();
+    var over_client = try tls_client.Client.init(alloc, .{ .server_name = "k18.test", .trust_anchors = &.{der} });
+    defer over_client.deinit();
+    try over_client.setSessionTicket(stored, 0);
+    try over_client.setEarlyData("0123456789abcdefghij");
+    const over_flight = try over_client.start();
+    defer alloc.free(over_flight);
+    try std.testing.expectError(error.BadRecord, over_server.feed(over_flight));
+
+    std.debug.print("GAP-K18 branch=turning 0-RTT off binds tickets already sealed with a limit\n", .{});
 }
 
 test "buildTicketExtensions omits early_data when 0-RTT disabled (BoringSSL regression)" {
