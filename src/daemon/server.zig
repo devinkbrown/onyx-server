@@ -54074,35 +54074,13 @@ const PortableServer = struct {
             _ = self.backend.submit() catch return error.Unsupported;
             self.pending = false;
         }
-        // Wait-for-listen misses a socket that arrived before the ioctl was
-        // posted. Pull the backlog before blocking, then again after dispatch.
-        try self.drainWindowsBacklog();
-        if (self.pending) {
-            _ = self.backend.submit() catch return error.Unsupported;
-            self.pending = false;
-        }
         var evs: [16]io_backend.Reaped = undefined;
         const n = self.backend.reap(&evs, 200) catch return error.Unsupported;
         var i: usize = 0;
         while (i < n) : (i += 1) try self.dispatch(evs[i]);
-        try self.drainWindowsBacklog();
         if (self.pending) {
             _ = self.backend.submit() catch return error.Unsupported;
             self.pending = false;
-        }
-    }
-
-    /// At most one wake's worth of `accept` calls. Further sockets stay in
-    /// the kernel backlog until the next wake. Not a connection ceiling.
-    fn drainWindowsBacklog(self: *PortableServer) ServerError!void {
-        if (comptime builtin.os.tag != .windows) return;
-        var pulled: u16 = 0;
-        while (pulled < 256) : (pulled += 1) {
-            const fd = io_backend.pullAccept(self.listener) catch |err| switch (err) {
-                error.WouldBlock => return,
-                error.SocketFailed => return error.Unsupported,
-            };
-            try self.adopt(fd);
         }
     }
     /// Serve loop `main` runs after `init` returns a listener.

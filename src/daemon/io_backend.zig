@@ -1029,8 +1029,9 @@ const Kqueue = struct {
 /// does not synthesize a completion packet. `STATUS_SUCCESS` is a finished
 /// AFD operation and `reap` returns it before waiting. `STATUS_PENDING` is
 /// reported only from `NtRemoveIoCompletion`. A duplicate port packet for
-/// that slot is discarded. The listening socket is nonblocking, so `accept`
-/// on a finished wait cannot stall the thread.
+/// that slot is discarded. The listening socket stays blocking: a nonblocking
+/// `accept` after wait-for-listen returns WSAEWOULDBLOCK and the connection
+/// is never read.
 ///
 /// Open also loads `RIO_EXTENSION_FUNCTION_TABLE` through `WSAIoctl`. A failed
 /// or partial table closes the new port and returns `error.MissingOp`.
@@ -1677,9 +1678,9 @@ const Iocp = struct {
         if (iosb.u.Status != .SUCCESS) return .{ .op = op, .token = token, .result = -1 };
         if (packet.op == op_accept) {
             const sock = acceptOne(packet.handle) catch |err| switch (err) {
-                // WSAEWOULDBLOCK. The wait fired after the backlog drain
-                // already took the socket. Same code portableAgain treats
-                // as a retry, not a dead listener.
+                // WSAEWOULDBLOCK. The listener stays blocking, so this is not
+                // the path that adopts a PING. A nonblocking listener hits
+                // it after wait-for-listen and drops the connection.
                 error.WouldBlock => return .{ .op = .accept, .token = token, .result = -11 },
                 error.SocketFailed => return .{ .op = .accept, .token = token, .result = -1 },
             };
@@ -2008,14 +2009,6 @@ extern "ws2_32" fn select(nfds: i32, readfds: ?*RioFdSet, writefds: ?*RioFdSet, 
 
 extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
 
-extern "ws2_32" fn ioctlsocket(s: usize, cmd: i32, argp: *u32) callconv(.winapi) i32;
-
-fn setNonblock(sock: usize) bool {
-    var on: u32 = 1;
-    const fionbio: i32 = @bitCast(@as(u32, 0x8004667E));
-    return ioctlsocket(sock, fionbio, &on) == 0;
-}
-
 fn acceptOne(handle: usize) error{ WouldBlock, SocketFailed }!i32 {
     const sock = accept(handle, null, null);
     const bad = sock == 0 or sock == std.math.maxInt(usize) or sock > std.math.maxInt(i32);
@@ -2024,14 +2017,11 @@ fn acceptOne(handle: usize) error{ WouldBlock, SocketFailed }!i32 {
         if (WSAGetLastError() == 10035) return error.WouldBlock;
         return error.SocketFailed;
     }
-    // Leave the accepted socket blocking. Nonblocking AFD receive completes
-    // with zero bytes before the PING is queued, and the listen loop treats
-    // that as EOF. FIONBIO stays on the listener only.
     return @intCast(sock);
 }
 
-/// One nonblocking `accept`. `WouldBlock` means the backlog is empty.
-/// Off Windows this is `SocketFailed` and does not call the host `accept`.
+/// One `accept` on a blocking listener. Off Windows this is `SocketFailed`
+/// and does not call the host `accept`.
 pub fn pullAccept(fd: linux.fd_t) error{ WouldBlock, SocketFailed }!linux.fd_t {
     if (comptime builtin.os.tag != .windows) return error.SocketFailed;
     if (fd < 0) return error.SocketFailed;
@@ -2370,7 +2360,6 @@ fn listenWindows(host: []const u8, port: u16) ListenError!Listener {
     };
     if (bind(sock, &addr, @sizeOf(RioSockAddr)) != 0) return windowsListenError();
     if (listen(sock, 128) != 0) return windowsListenError();
-    if (!setNonblock(sock)) return error.SocketUnavailable;
     var name_len: i32 = @sizeOf(RioSockAddr);
     if (getsockname(sock, &addr, &name_len) != 0) return error.SocketUnavailable;
     return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
