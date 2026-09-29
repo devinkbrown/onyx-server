@@ -327,6 +327,7 @@ fn bridgeOnRtcpFeedback(ctx: *anyopaque, channel: []const u8, rtcp: []const u8) 
     return br.fanoutRtcpFeedbackToNative(rtcp, &sctx, bridgeSendFeedbackToNative);
 }
 const memo_mod = @import("memo.zig");
+const raid_shield = @import("raid_shield.zig");
 const webpush_mod = @import("webpush.zig");
 const memo_push_relay = @import("../proto/memo_push_relay.zig");
 const media_ws_relay = @import("../proto/media_ws_relay.zig");
@@ -3903,6 +3904,10 @@ pub const LinuxServer = struct {
     spamtrap: spamtrap_mod.DefaultSpamtrap,
     spamtrap_mu: std.atomic.Mutex = .unlocked,
     spamtrap_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Join-shape correlation across Mooring peers. Notes are taken on a
+    /// successful local JOIN and on a remote membership announcement. Reactor 0
+    /// evaluates them and may engage the channel slowmode prop.
+    raid_shield: raid_shield.Shield,
     metadata: metadata_store.DefaultStore,
     /// Background weather/news cache backing `!weather`/`!news` (lazy-started on
     /// first fantasy use; heap-owned so its address is stable for the thread).
@@ -4704,6 +4709,8 @@ pub const LinuxServer = struct {
 
         var latency_stats = try server_stats.LatencyStats.init(allocator, reactors.len);
         errdefer latency_stats.deinit();
+        var raid_state = try raid_shield.Shield.init(allocator);
+        errdefer raid_state.deinit();
 
         self.* = .{
             .allocator = allocator,
@@ -4771,6 +4778,7 @@ pub const LinuxServer = struct {
             .chanstats = chanstats_mod.ChanStats.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .spamtrap = spamtrap_mod.DefaultSpamtrap.init(allocator),
+            .raid_shield = raid_state,
             .metadata = metadata_store.DefaultStore.init(allocator),
             .geo = geo_ptr,
             .props = if (durable_property_candidate) |candidate|
@@ -5809,6 +5817,7 @@ pub const LinuxServer = struct {
         self.chanstats.deinit();
         self.warden.deinit();
         self.spamtrap.deinit();
+        self.raid_shield.deinit();
         self.metadata.deinit();
         self.props.deinit();
         {
@@ -6344,6 +6353,7 @@ pub const LinuxServer = struct {
         // Prune the throttle's expired/empty per-IP state on the same cadence.
         if (self.isMaintenanceReactor()) {
             self.expireRetainedHistory();
+            self.evaluateRaidShield();
             _ = self.tickOcg2Runtime();
             self.projectOcg2LiveSessions();
             if (self.conn_throttle) |*t| t.prune(self.nowMs());
@@ -17060,6 +17070,7 @@ pub const LinuxServer = struct {
                     if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, ch.prev_status, ch.status, ch.setter);
                     return;
                 }
+                self.noteRaidJoin(ch.channel, server_host);
                 const line = std.fmt.bufPrint(&buf, ":{s}!{s}@{s} JOIN :{s}\r\n", .{ ch.nick, user, host, ch.channel }) catch return;
                 self.broadcastChannel(ch.channel, line, null) catch return;
                 if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, 0, ch.status, ch.setter);
@@ -17562,6 +17573,7 @@ pub const LinuxServer = struct {
                 // Skip membership echoes of locally-homed users — they never
                 // split, so local clients never lost their JOIN. (#64)
                 if (self.nickIsLiveLocal(ch.nick)) continue;
+                self.noteRaidJoin(channel, server_host);
                 const user = if (ch.username.len != 0) ch.username else world_projection.remote_user_placeholder;
                 const host = if (ch.host.len != 0) ch.host else server_host;
                 const prefix = std.fmt.bufPrint(&prefixes[n], "{s}!{s}@{s}", .{ ch.nick, user, host }) catch continue;
@@ -19231,6 +19243,7 @@ pub const LinuxServer = struct {
                 return;
             };
         const logical_joined = newly_joined or prejoined_create or clone_parent != null;
+        if (logical_joined) self.noteRaidJoin(join_target, self.serverName());
         if (creating) {
             // The World commit is the acceptance boundary. Purge orphaned
             // external metadata only after it succeeds so a failed JOIN cannot
@@ -23064,6 +23077,41 @@ pub const LinuxServer = struct {
         const text = std.fmt.bufPrint(&buf, "{d}", .{secs}) catch return error.InvalidGap;
         const ev = try self.props.setProp(entity, "SLOWMODE", text, .{ .id = "raid-shield", .access = .host });
         self.publishSlowmodeProp(channel, ev.key, ev.value, ev.owner, true);
+    }
+
+    /// Record one accepted join for the raid shield. `origin` is this server for
+    /// a local JOIN and the Mooring peer name for a remote announcement.
+    /// Allocation failure leaves the join in place.
+    fn noteRaidJoin(self: *LinuxServer, channel: []const u8, origin: []const u8) void {
+        self.raid_shield.note(channel, origin, self.nowU64()) catch |err| {
+            srvLog("onyx-server: raid shield note failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    /// Reactor 0 turns a correlated burst into one slowmode engagement, and
+    /// clears that slowmode after the channel has been quiet. A second pass
+    /// while the shield is still engaged does not raise another verdict.
+    fn evaluateRaidShield(self: *LinuxServer) void {
+        if (!self.isMaintenanceReactor()) return;
+        const actions = self.raid_shield.evaluate(self.nowU64()) catch |err| {
+            srvLog("onyx-server: raid shield evaluate failed ({s})\n", .{@errorName(err)});
+            return;
+        };
+        defer if (actions.len != 0) self.allocator.free(actions);
+        for (actions) |action| {
+            switch (action.kind) {
+                .engage => {
+                    self.setChannelSlowmode(action.channel, raid_shield.engaged_gap_secs) catch |err| {
+                        srvLog("onyx-server: raid shield slowmode failed ({s})\n", .{@errorName(err)});
+                        continue;
+                    };
+                    var buf: [320]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "FLOOD raid shield engaged slowmode on {s}", .{action.channel}) catch continue;
+                    self.publishOperEvent(.flood, .warn, msg) catch {};
+                },
+                .relax => self.setChannelSlowmode(action.channel, null) catch {},
+            }
+        }
     }
 
     /// The oldest message timestamp (epoch ms) still visible in `channel`, or 0
@@ -62764,6 +62812,154 @@ test "DST GAP-P4 channel retention TTL deletes history search ids and memo copie
     try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#retain"));
 
     std.debug.print("GAP-P4 branch=PROP RETAIN ttl; expiry deletes the lotus row, search id, and memo copies; ciphertext expires without plaintext\n", .{});
+}
+
+const O6Remote = struct {
+    kind: s2s_peer_mod.S2sPeer.MembershipDelta.Kind,
+    nick: []const u8,
+    username: []const u8 = "u",
+    realname: []const u8 = "",
+    host: []const u8 = "remote.test",
+    channel: []const u8,
+    status: u4 = 0,
+    prev_status: u4 = 0,
+    setter: []const u8 = "",
+    account: []const u8 = "",
+};
+
+fn gapO6Remote(server: *Server, channel: []const u8, remote: []const u8, nick: []const u8) void {
+    server.emitRemoteMembership(O6Remote{
+        .kind = .joined,
+        .nick = nick,
+        .host = remote,
+        .channel = channel,
+    }, remote);
+}
+
+fn gapO6Join(server: *Server, id: client_model.ClientId, conn: *ConnState, channel: []const u8) !void {
+    var buf: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "JOIN {s}", .{channel});
+    var parsed = try irc_line.parseLine(line);
+    try server.handleJoin(id, conn, &parsed);
+}
+
+fn gapO6FloodVerdicts(server: *Server, needle: []const u8) usize {
+    var buf: [8]event_history_mod.StoredEvent = undefined;
+    const n = server.event_history.collect(
+        @intFromEnum(event_spine.EventCategory.flood),
+        @intFromEnum(event_spine.EventSeverity.warn),
+        &buf,
+    );
+    var count: usize = 0;
+    for (buf[0..n]) |ev| {
+        if (!ev.has_event_id) continue;
+        if (std.mem.indexOf(u8, ev.message(), needle) == null) continue;
+        count += 1;
+    }
+    return count;
+}
+
+test "DST GAP-O6 raid shield correlates peers and relaxes slowmode" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x06)), "o6.test");
+    defer ident.deinit();
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+        .server_name = "o6.test",
+        .node_identity = &ident,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    var sim = reactor_mod.SimReactor.init(5_000_000);
+    server.reactor = sim.reactor();
+
+    const popular_nicks = [_][]const u8{ "o6p0", "o6p1", "o6p2", "o6p3", "o6p4", "o6p5" };
+    const noted_before = server.raid_shield.noted;
+    var popular_ids: [popular_nicks.len]client_model.ClientId = undefined;
+    for (popular_nicks, 0..) |nick, index| {
+        popular_ids[index] = try addTestLocalClient(server, nick, null);
+    }
+    for (popular_ids) |id| {
+        try gapO6Join(server, id, server.connFor(id).?, "#popular");
+    }
+    try std.testing.expect(server.raid_shield.noted >= noted_before + popular_nicks.len);
+    try std.testing.expect(server.raid_shield.joins.estimate("#popular") >= popular_nicks.len);
+    server.onTimerTick();
+    const popular = ircx_prop_store.Entity{ .kind = .channel, .id = "#popular" };
+    try std.testing.expectError(error.PropMissing, server.props.getProp(popular, "SLOWMODE"));
+    try std.testing.expectEqual(@as(usize, 0), gapO6FloodVerdicts(server, "raid shield"));
+
+    gapO6Remote(server, "#trickle", "peer-a.test", "ta");
+    gapO6Remote(server, "#trickle", "peer-b.test", "tb");
+    gapO6Remote(server, "#trickle", "peer-c.test", "tc");
+    server.onTimerTick();
+    const trickle = ircx_prop_store.Entity{ .kind = .channel, .id = "#trickle" };
+    try std.testing.expectError(error.PropMissing, server.props.getProp(trickle, "SLOWMODE"));
+
+    const founder = try addTestLocalClient(server, "o6found", null);
+    try gapO6Join(server, founder, server.connFor(founder).?, "#raid");
+
+    var batch = [_]O6Remote{
+        .{ .kind = .joined, .nick = "batch1", .channel = "#raid", .host = "peer-a.test" },
+        .{ .kind = .joined, .nick = "batch2", .channel = "#raid", .host = "peer-a.test" },
+    };
+    server.emitNetjoinRun("#raid", "peer-a.test", &batch);
+    const raid_peers = [_][]const u8{ "peer-a.test", "peer-b.test", "peer-c.test" };
+    const raid_nicks = [_][]const u8{ "ra1", "ra2", "rb1", "rb2", "rc1", "rc2" };
+    for (raid_nicks, 0..) |nick, index| {
+        gapO6Remote(server, "#raid", raid_peers[index / 2], nick);
+    }
+    server.onTimerTick();
+    const raid = ircx_prop_store.Entity{ .kind = .channel, .id = "#raid" };
+    const engaged = try server.props.getProp(raid, "SLOWMODE");
+    try std.testing.expectEqualStrings("10", engaged.value);
+    try std.testing.expectEqualStrings("raid-shield", engaged.owner);
+    try std.testing.expectEqual(@as(usize, 1), gapO6FloodVerdicts(server, "#raid"));
+
+    const late = try addTestLocalClient(server, "o6late", null);
+    try gapO6Join(server, late, server.connFor(late).?, "#raid");
+    try std.testing.expect(server.world.isMember("#raid", worldIdFromClient(late)));
+    server.onTimerTick();
+    try std.testing.expectEqual(@as(usize, 1), gapO6FloodVerdicts(server, "#raid"));
+    try std.testing.expectEqualStrings("10", (try server.props.getProp(raid, "SLOWMODE")).value);
+
+    sim.advance(raid_shield.relax_after_ms);
+    server.onTimerTick();
+    try std.testing.expectError(error.PropMissing, server.props.getProp(raid, "SLOWMODE"));
+    try std.testing.expectEqual(@as(usize, 1), gapO6FloodVerdicts(server, "#raid"));
+    try std.testing.expectError(error.PropMissing, server.props.getProp(popular, "SLOWMODE"));
+
+    var extra: usize = 0;
+    while (extra < raid_shield.max_channels + 40) : (extra += 1) {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "#s{d}", .{extra});
+        server.noteRaidJoin(name, "peer-a.test");
+    }
+    var origin_i: usize = 0;
+    while (origin_i < 80) : (origin_i += 1) {
+        var origin_buf: [32]u8 = undefined;
+        const origin = try std.fmt.bufPrint(&origin_buf, "scale-peer-{d}", .{origin_i});
+        server.noteRaidJoin("#scale", origin);
+    }
+    try std.testing.expect(server.raid_shield.channelCount() <= raid_shield.max_channels);
+    try std.testing.expectEqual(raid_shield.sketch_width * raid_shield.sketch_depth, server.raid_shield.sketchCells());
+    try std.testing.expectEqual(raid_shield.hottest_capacity, server.raid_shield.hottest.capacity());
+
+    const tail = try addTestLocalClient(server, "o6tail", null);
+    try gapO6Join(server, tail, server.connFor(tail).?, "#tail");
+    try std.testing.expect(server.world.isMember("#tail", worldIdFromClient(tail)));
+
+    std.debug.print("GAP-O6 branch=reactor 0 correlates peer joins; one signed flood verdict; slowmode engages and relaxes; one origin does not trip\n", .{});
 }
 
 test "UPGRADE mandatory restored EventHistory and webhook store skip stale disk reload at start" {
