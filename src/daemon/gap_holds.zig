@@ -100,11 +100,7 @@ test "GAP-C5 FEC stays unwired and section 12 symbols stay absent" {
     std.debug.print("GAP-C5 branch=FEC modules stay unwired until a measured GAP-V3 signal; section 12 symbols stay absent\n", .{});
 }
 
-test "section 13 remainder stays unwitnessed on this host" {
-    // These refusals are the Linux host's view. A FreeBSD or Windows run would
-    // take the real syscall path and must not be reported as "not executed".
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
+fn assertThisHostRefusesForeignKernels() !void {
     var defaults = try config_format.parseToml(
         testing.allocator,
         "[node]\nid = 1\n[listen]\nirc = 6680\n",
@@ -137,6 +133,13 @@ test "section 13 remainder stays unwitnessed on this host" {
     try testing.expectError(error.Unsupported, io_backend.refusePortableReactor(.windows, 32));
     try testing.expectError(error.Unsupported, io_backend.refusePortableReactor(.freebsd, 32));
     try testing.expectError(error.Unsupported, io_backend.refusePortableReactor(.openbsd, 32));
+}
+
+test "section 13 remainder stays unwitnessed on this host" {
+    // These refusals are the Linux host's view. A FreeBSD or Windows run would
+    // take the real syscall path and must not be reported as "not executed".
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try assertThisHostRefusesForeignKernels();
 
     var daemon = try std.Io.Dir.cwd().openDir(testing.io, "src/daemon", .{ .iterate = true });
     defer daemon.close(testing.io);
@@ -145,4 +148,10 @@ test "section 13 remainder stays unwitnessed on this host" {
     try testing.expectEqual(@as(usize, 0), hits);
 
     std.debug.print("section 13 remainder branch=no further in-repo witnessable Accept; live IDENTIFY and live relay_v2_authoring=active stay unmet; FreeBSD kqueue, Windows IOCP, FreeBSD kernel TLS, OpenBSD pledge, and Windows RIO were not executed; commit 838ee337 does not close GAP-X3; GAP-K1 stays in the client repo; GAP-V7 stays a hold; section 12 and GAP-N stay unbuilt; headings stay unmarked; roadmap not closed\n", .{});
+}
+
+test "section 13 execution waiver keeps the live and foreign kernel Accepts unmet" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try assertThisHostRefusesForeignKernels();
+    std.debug.print("section 13 waiver branch=live IDENTIFY, live relay_v2_authoring=active, executed FreeBSD kqueue, Windows IOCP, FreeBSD kernel TLS, OpenBSD pledge, and Windows RIO are waived as unverifiable on this host; the shipped paths still return MissingOp or Unsupported; commit 838ee337 does not close GAP-X3; headings stay unmarked; Accepts stay unmet; roadmap not closed\n", .{});
 }

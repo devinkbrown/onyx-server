@@ -1146,6 +1146,14 @@ Human-only, whenever a slice is actually deployed: Helix `USR2` when the image
 token allows, cold restart one node at a time otherwise, GitHub push last.
 This roadmap does not authorize a deploy.
 
+Execution of the remaining observations is waived for this tree. No FreeBSD,
+OpenBSD, or Windows host is installed. QEMU has no guest image, and Wine is
+not a Windows kernel. The live `IDENTIFY` sentence (eshmaki.me / ircx.us) and
+the live `relay_v2_authoring=active` flip stay unmet. Executed kqueue, IOCP,
+FreeBSD kernel TLS, OpenBSD pledge, and Windows RIO stay unmet. Commit
+`838ee337` does not close GAP-X3. Headings stay unmarked. This waiver does not
+mark those Accepts done.
+
 ### First three slices a worker can pick up
 
 1. **GAP-V1 decision record and, if the browser test fails, the config hold.**
