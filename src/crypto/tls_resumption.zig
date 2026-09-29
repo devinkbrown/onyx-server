@@ -389,7 +389,7 @@ test "sealed server ticket opens with the same key" {
 
 /// Seal a legacy v2 ticket blob (magic 2, no ticket_age_add) so the graceful
 /// backward-compat decode arm can be exercised without a v2 build.
-fn sealLegacyV2(
+pub fn sealLegacyV2(
     allocator: Allocator,
     key: TicketKey,
     aead_nonce: [ChaCha20Poly1305.nonce_length]u8,

@@ -173,6 +173,12 @@ pub const Error = error{
     tls_signature_scheme.Error || tls_psk.Error || tls_session_ticket.EncodeError ||
     tls_resumption.Error || cert_compression.Error;
 
+/// Process-wide 0-RTT binder ring used when `Config.replay_guard` is null.
+/// A second copy of an accepted early-data flight is refused in this process
+/// even if the caller installed no guard, the ticket has no age, and no clock
+/// is set. 1-RTT resumption does not consult it.
+var builtin_0rtt_replay: tls_resumption.ReplayGuard = .{};
+
 pub const Config = struct {
     /// DER certificates, leaf first. The leaf SPKI must match the configured
     /// signing key used for CertificateVerify.
@@ -248,10 +254,9 @@ pub const Config = struct {
     /// rejected, falling back to a full handshake). When null, lifetime is not
     /// enforced (back-compatible).
     now_unix_seconds: ?i64 = null,
-    /// Shared 0-RTT anti-replay guard. When set, accepted-early-data is gated on
-    /// the guard (a replayed PSK binder still resumes via 1-RTT but its early
-    /// data is not accepted). The caller owns it and must serialize access if it
-    /// is shared across threads. Null keeps the prior no-anti-replay behavior.
+    /// Shared 0-RTT anti-replay guard. When set, accepted early data is gated on
+    /// this guard (a replayed PSK binder still resumes via 1-RTT). The caller
+    /// owns it. When null, the process-wide binder ring records the same way.
     replay_guard: ?*tls_resumption.ReplayGuard = null,
     /// RFC 8446 §8.2–8.3 0-RTT freshness-window tolerance, in milliseconds. On a
     /// 0-RTT attempt the server un-obfuscates the client's `obfuscated_ticket_age`
@@ -1914,10 +1919,8 @@ pub const Server = struct {
                         self.accepted_early_data_limit > 0 and
                         self.accepted_age_within_window)
                     {
-                        const replay_ok = if (self.config.replay_guard) |g|
-                            g.checkAndRecord(self.accepted_binder[0..self.accepted_binder_len])
-                        else
-                            true;
+                        const guard = self.config.replay_guard orelse &builtin_0rtt_replay;
+                        const replay_ok = guard.checkAndRecord(self.accepted_binder[0..self.accepted_binder_len]);
                         if (replay_ok) {
                             self.early_data_accepted = true;
                             self.early_data_done = false;
@@ -8253,4 +8256,188 @@ test "exploit: a plaintext handshake record where an encrypted one is required i
     const rec = exploitPlainRecord(&rec_buf, 22, &forged);
     try std.testing.expectError(error.BadRecord, server.feed(rec));
     try std.testing.expect(!server.handshakeDone());
+}
+
+fn gapK10ExpectSecondFlightRefused(
+    alloc: std.mem.Allocator,
+    der: []const u8,
+    kp: Ed25519.KeyPair,
+    ticket_key: tls_resumption.TicketKey,
+    stored: []const u8,
+    early: []const u8,
+) !void {
+    const tls_client = @import("tls_client.zig");
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    try client.setSessionTicket(stored, 0);
+    try client.setEarlyData(early);
+    const flight = try client.start();
+    defer alloc.free(flight);
+
+    var first = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = 4096,
+    });
+    defer first.deinit();
+    const first_out = switch (try first.feed(flight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(first_out);
+    try std.testing.expect(first.acceptedSessionTicket());
+    try std.testing.expect(first.earlyDataAccepted());
+
+    var second = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = 4096,
+    });
+    defer second.deinit();
+    const second_out = switch (try second.feed(flight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(second_out);
+    try std.testing.expect(second.acceptedSessionTicket());
+    try std.testing.expect(!second.earlyDataAccepted());
+
+    const fin = switch (try client.feed(second_out)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(fin);
+    try std.testing.expectEqual(@as(?bool, false), client.earlyDataAccepted());
+    try std.testing.expect(client.handshakeDone());
+    _ = try second.feed(fin);
+    try std.testing.expect(second.handshakeDone());
+}
+
+test "GAP-K10 a second 0-RTT flight is rejected without a ReplayGuard" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x7a)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x7a, 0x10 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    // No clock and no ReplayGuard. The minted ticket's issue time is 0.
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 4096,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(tls_client.AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    try gapK10ExpectSecondFlightRefused(alloc, der, kp, ticket_key, stored, "GET /early");
+
+    // Legacy ticket: no ticket_age_add. The age window stays open; the binder ring still refuses the copy.
+    const decoded = try tls_resumption.decodeStoredSession(stored);
+    const nonce: [ChaCha20Poly1305.nonce_length]u8 = @splat(0x7a);
+    const v2 = try tls_resumption.sealLegacyV2(alloc, ticket_key, nonce, decoded.suite, decoded.psk, "n", 0, 4096);
+    defer alloc.free(v2);
+    const legacy = try tls_resumption.encodeStoredSession(alloc, .{
+        .suite = decoded.suite,
+        .ticket_lifetime = decoded.ticket_lifetime,
+        .ticket_age_add = 0,
+        .ticket = v2,
+        .psk = decoded.psk,
+        .max_early_data_size = 4096,
+    });
+    defer alloc.free(legacy);
+    try gapK10ExpectSecondFlightRefused(alloc, der, kp, ticket_key, legacy, "GET /legacy");
+
+    // An unexpired ticket still completes a 1-RTT resumption.
+    const now: i64 = 1_700_000_000;
+    var timed = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 4096,
+        .now_unix_seconds = now,
+    });
+    defer timed.deinit();
+    var timed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer timed_client.deinit();
+    const tch = try timed_client.start();
+    defer alloc.free(tch);
+    const tflight = switch (try timed.feed(tch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(tflight);
+    const tfin = switch (try timed_client.feed(tflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(tfin);
+    _ = try timed.feed(tfin);
+    const timed_key = timed.ticketKey();
+    const timed_record = (try timed.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(timed_record);
+    try std.testing.expectEqual(tls_client.AppRead.control, try timed_client.decryptApp(timed_record));
+    const timed_stored = timed_client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(timed_stored);
+
+    var resume_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = timed_key,
+        .now_unix_seconds = now + 30,
+    });
+    defer resume_server.deinit();
+    var resume_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resume_client.deinit();
+    try resume_client.setSessionTicket(timed_stored, 30_000);
+    const rch = try resume_client.start();
+    defer alloc.free(rch);
+    const rflight = switch (try resume_server.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rflight);
+    try std.testing.expect(resume_server.acceptedSessionTicket());
+    try std.testing.expect(!resume_server.earlyDataAccepted());
+    const rfin = switch (try resume_client.feed(rflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rfin);
+    _ = try resume_server.feed(rfin);
+    try std.testing.expect(resume_server.handshakeDone());
+    try std.testing.expect(resume_client.handshakeDone());
+
+    std.debug.print("GAP-K10 branch=a second 0-RTT flight is rejected without a ReplayGuard\n", .{});
 }
