@@ -19,6 +19,7 @@
 //! no syscalls — it is a pure byte transform over the `Server` it wraps.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const tls_server = @import("../crypto/tls_server.zig");
@@ -26,6 +27,7 @@ const tls12_server = @import("../crypto/tls12_server.zig");
 const tls_record = @import("../crypto/tls_record.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 const ktls = @import("ktls.zig");
+const kernel_other = @import("kernel_other.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 
@@ -170,6 +172,22 @@ pub const TlsConn = struct {
     /// from the socket first and the socket must be ESTABLISHED, or the kernel
     /// would encrypt the already-ciphertext tail. Only TLS 1.3 is supported.
     pub fn enableKtlsTx(self: *TlsConn, fd: linux.fd_t) KtlsError!void {
+        if (comptime builtin.os.tag == .freebsd) {
+            const params = switch (self.engine) {
+                .tls13 => |*s| s.ktlsTxParams() orelse return error.KtlsUnsupportedEngine,
+                .undecided, .tls12 => return error.KtlsUnsupportedEngine,
+            };
+            kernel_other.enableKernelTls(
+                @intCast(fd),
+                .tx,
+                freebsdKtlsCipher(params.cipher),
+                params.key,
+                &params.iv,
+                ktls.seqToBytes(params.seq),
+            ) catch return error.KtlsTxUnsupported;
+            self.ktls_tx_offloaded = true;
+            return;
+        }
         var buf: [ktls.max_crypto_info_len]u8 = undefined;
         const encoded = try self.buildKtlsTxCryptoInfo(&buf);
         try ktls.attachUlp(fd);
@@ -184,6 +202,21 @@ pub const TlsConn = struct {
     /// userspace. Only TLS 1.3 is supported.
     pub fn enableKtlsRx(self: *const TlsConn, fd: linux.fd_t) KtlsError!void {
         if (self.hasBufferedInbound()) return error.KtlsDirtyInbound;
+        if (comptime builtin.os.tag == .freebsd) {
+            const params = switch (self.engine) {
+                .tls13 => |*s| s.ktlsRxParams() orelse return error.KtlsUnsupportedEngine,
+                .undecided, .tls12 => return error.KtlsUnsupportedEngine,
+            };
+            kernel_other.enableKernelTls(
+                @intCast(fd),
+                .rx,
+                freebsdKtlsCipher(params.cipher),
+                params.key,
+                &params.iv,
+                ktls.seqToBytes(params.seq),
+            ) catch return error.KtlsRxUnsupported;
+            return;
+        }
         var buf: [ktls.max_crypto_info_len]u8 = undefined;
         const encoded = try self.buildKtlsRxCryptoInfo(&buf);
         try ktls.attachUlp(fd);
@@ -210,10 +243,28 @@ pub const TlsConn = struct {
             .tls13 => |*s| try s.advanceRxKeyForKtls(),
             .undecided, .tls12 => return error.KtlsUnsupportedEngine,
         };
+        if (comptime builtin.os.tag == .freebsd) {
+            kernel_other.enableKernelTls(
+                @intCast(fd),
+                .rx,
+                freebsdKtlsCipher(params.cipher),
+                params.key,
+                &params.iv,
+                ktls.seqToBytes(params.seq),
+            ) catch return error.KtlsRxUnsupported;
+            return;
+        }
         var buf: [ktls.max_crypto_info_len]u8 = undefined;
         const encoded = try encodeKtlsCryptoInfo(params, &buf);
         // The ULP is already attached (RX offload is live); re-install the RX key.
         try ktls.attachRx(fd, encoded);
+    }
+
+    fn freebsdKtlsCipher(cipher: tls_server.Server.KtlsCipher) i32 {
+        return switch (cipher) {
+            .aes_128_gcm, .aes_256_gcm => kernel_other.crypto_aes_nist_gcm_16,
+            .chacha20_poly1305 => kernel_other.crypto_chacha20_poly1305,
+        };
     }
 
     /// True when a partial inbound TLS record is buffered (an incomplete record

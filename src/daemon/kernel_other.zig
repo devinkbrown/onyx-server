@@ -7,8 +7,9 @@
 //! pledges the daemon. Windows assigns the process to a job that dies on an
 //! unhandled exception and is killed when the job handle closes. Any other
 //! OS, a closed fd, or a kernel status other than success returns MissingOp.
-//! This host does not execute those calls. FreeBSD kernel TLS and Windows
-//! RIO are not this module.
+//! This host does not execute those calls. FreeBSD kernel TLS is
+//! `setsockopt(IPPROTO_TCP, TCP_TXTLS_ENABLE)` with `struct tls_enable`.
+//! Windows RIO is not this module.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,6 +19,47 @@ pub const Error = error{MissingOp};
 /// FreeBSD load-balancing reuse. Linux SO_REUSEPORT is a different option.
 pub const so_reuseport_lb: u32 = 0x00010000;
 pub const sol_socket: i32 = 0xffff;
+
+/// FreeBSD 14 `netinet/tcp.h`. Linux `SOL_TLS` / `TLS_TX` is a different option.
+pub const ipproto_tcp: i32 = 6;
+pub const tcp_txtls_enable: i32 = 39;
+pub const tcp_txtls_mode: i32 = 40;
+pub const tcp_rxtls_enable: i32 = 41;
+pub const tcp_rxtls_mode: i32 = 42;
+pub const tcp_tls_mode_sw: i32 = 1;
+
+/// FreeBSD 14 `opencrypto/cryptodev.h` and `sys/ktls.h`.
+pub const crypto_aes_nist_gcm_16: i32 = 25;
+pub const crypto_chacha20_poly1305: i32 = 41;
+pub const tls_major_ver_one: u8 = 3;
+pub const tls_minor_ver_three: u8 = 4;
+pub const tls_1_3_iv_len: i32 = 12;
+
+pub const TlsDirection = enum { tx, rx };
+
+/// Userspace `struct tls_enable` from FreeBSD 14 `sys/ktls.h`.
+pub const TlsEnable = extern struct {
+    cipher_key: ?[*]const u8,
+    iv: ?[*]const u8,
+    auth_key: ?[*]const u8,
+    cipher_algorithm: i32,
+    cipher_key_len: i32,
+    iv_len: i32,
+    auth_algorithm: i32,
+    auth_key_len: i32,
+    flags: i32,
+    tls_vmajor: u8,
+    tls_vminor: u8,
+    rec_seq: [8]u8,
+};
+
+comptime {
+    if (@sizeOf(usize) == 8 and @sizeOf(TlsEnable) != 64) {
+        @compileError("FreeBSD struct tls_enable is 64 bytes on 64-bit");
+    }
+}
+
+pub const kernel_tls_anchor: *const @TypeOf(enableKernelTls) = &enableKernelTls;
 pub const sys_cap_enter: u32 = 516;
 pub const sys_cap_getmode: u32 = 517;
 pub const sys_cap_rights_limit: u32 = 533;
@@ -109,6 +151,49 @@ comptime {
     if (@sizeOf(usize) == 8 and @sizeOf(JobBasicLimit) != 64) {
         @compileError("JOBOBJECT_BASIC_LIMIT_INFORMATION is 64 bytes on 64-bit");
     }
+}
+
+/// Install FreeBSD kernel TLS on one direction. AES-GCM (16-byte tag, 16 or
+/// 32 byte key) and ChaCha20-Poly1305 (32 byte key) are the TLS 1.3 suites
+/// this daemon already offloads. The 12-byte IV is the TLS 1.3 static write
+/// IV. Any other cipher, a short IV, a closed fd, or any OS other than
+/// FreeBSD returns MissingOp before `setsockopt`.
+pub fn enableKernelTls(
+    fd: i32,
+    direction: TlsDirection,
+    cipher_algorithm: i32,
+    key: []const u8,
+    iv: []const u8,
+    rec_seq: [8]u8,
+) Error!void {
+    if (fd < 0) return error.MissingOp;
+    if (iv.len != tls_1_3_iv_len) return error.MissingOp;
+    const key_ok = switch (cipher_algorithm) {
+        crypto_aes_nist_gcm_16 => key.len == 16 or key.len == 32,
+        crypto_chacha20_poly1305 => key.len == 32,
+        else => false,
+    };
+    if (!key_ok) return error.MissingOp;
+    if (comptime builtin.os.tag != .freebsd) return error.MissingOp;
+    var enable = TlsEnable{
+        .cipher_key = key.ptr,
+        .iv = iv.ptr,
+        .auth_key = null,
+        .cipher_algorithm = cipher_algorithm,
+        .cipher_key_len = @intCast(key.len),
+        .iv_len = tls_1_3_iv_len,
+        .auth_algorithm = 0,
+        .auth_key_len = 0,
+        .flags = 0,
+        .tls_vmajor = tls_major_ver_one,
+        .tls_vminor = tls_minor_ver_three,
+        .rec_seq = rec_seq,
+    };
+    const opt: i32 = switch (direction) {
+        .tx => tcp_txtls_enable,
+        .rx => tcp_rxtls_enable,
+    };
+    if (setsockopt(fd, ipproto_tcp, opt, &enable, @sizeOf(TlsEnable)) != 0) return error.MissingOp;
 }
 
 pub fn applyReusePortLb(fd: i32) Error!void {
@@ -278,5 +363,31 @@ test "GAP-X3 FreeBSD Capsicum and SO_REUSEPORT_LB, OpenBSD pledge, and a Windows
         try std.testing.expectEqual(@as(u32, 0), val);
     }
 
-    std.debug.print("GAP-X3 branch=freebsd capsicum and SO_REUSEPORT_LB, openbsd pledge and unveil, windows job kill-on-close; this host did not execute them; freebsd kernel tls and windows RIO stay unmet\n", .{});
+    std.debug.print("GAP-X3 branch=freebsd capsicum and SO_REUSEPORT_LB, openbsd pledge and unveil, windows job kill-on-close; this host did not execute them; windows RIO stays unmet\n", .{});
+}
+
+test "GAP-X3 FreeBSD kernel TLS fails closed off FreeBSD" {
+    try std.testing.expectEqual(@as(i32, 39), tcp_txtls_enable);
+    try std.testing.expectEqual(@as(i32, 41), tcp_rxtls_enable);
+    try std.testing.expectEqual(@as(i32, 25), crypto_aes_nist_gcm_16);
+    try std.testing.expectEqual(@as(i32, 41), crypto_chacha20_poly1305);
+    try std.testing.expectEqual(@as(u8, 3), tls_major_ver_one);
+    try std.testing.expectEqual(@as(u8, 4), tls_minor_ver_three);
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(TlsEnable));
+
+    const key16: [16]u8 = @splat(0x11);
+    const key32: [32]u8 = @splat(0x22);
+    const iv: [12]u8 = @splat(0x33);
+    const seq = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
+
+    try std.testing.expectError(error.MissingOp, enableKernelTls(0, .tx, crypto_aes_nist_gcm_16, &key16, &iv, seq));
+    try std.testing.expectError(error.MissingOp, enableKernelTls(0, .rx, crypto_aes_nist_gcm_16, &key32, &iv, seq));
+    try std.testing.expectError(error.MissingOp, enableKernelTls(0, .tx, crypto_chacha20_poly1305, &key32, &iv, seq));
+    try std.testing.expectError(error.MissingOp, enableKernelTls(-1, .tx, crypto_aes_nist_gcm_16, &key16, &iv, seq));
+    try std.testing.expectError(error.MissingOp, enableKernelTls(0, .tx, crypto_aes_nist_gcm_16, &key16, iv[0..4], seq));
+    try std.testing.expectError(error.MissingOp, enableKernelTls(0, .tx, 0, &key16, &iv, seq));
+    try std.testing.expectError(error.MissingOp, enableKernelTls(0, .tx, crypto_chacha20_poly1305, &key16, &iv, seq));
+    std.mem.doNotOptimizeAway(kernel_tls_anchor);
+
+    std.debug.print("GAP-X3 branch=freebsd kernel TLS uses TCP_TXTLS_ENABLE and struct tls_enable; this host did not execute setsockopt; windows RIO stays unmet\n", .{});
 }

@@ -54020,7 +54020,12 @@ test "GAP-X3 live listener sets TCP_FASTOPEN, TCP_USER_TIMEOUT, and SO_INCOMING_
 pub fn installDaemonKernelSandbox(config_path: ?[]const u8) !void {
     switch (comptime builtin.os.tag) {
         .linux => return kernel_linux.installDaemonSandbox(config_path),
-        .freebsd => return kernel_other.enterDaemonCapsicum(&.{}),
+        .freebsd => {
+            // Keep the setsockopt in the image. Boot has no traffic key, so
+            // this does not enable kernel TLS and does not swallow MissingOp.
+            std.mem.doNotOptimizeAway(kernel_other.kernel_tls_anchor);
+            return kernel_other.enterDaemonCapsicum(&.{});
+        },
         .openbsd => return kernel_other.pledgeDaemonPaths(),
         .windows => return kernel_other.assignDaemonJob(),
         else => return error.MissingOp,
