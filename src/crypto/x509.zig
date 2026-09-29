@@ -113,7 +113,111 @@ pub const IpAddress = struct {
     pub fn slice(self: *const IpAddress) []const u8 {
         return self.bytes[0..self.len];
     }
+
+    /// Octet form of an IPv4 or IPv6 literal. Brackets and zone identifiers are
+    /// not part of the address. A DNS name returns null.
+    pub fn parseLiteral(text: []const u8) ?IpAddress {
+        if (parseIpv4Literal(text)) |octets| {
+            var ip = IpAddress{ .bytes = @as([16]u8, @splat(0)), .len = 4 };
+            @memcpy(ip.bytes[0..4], &octets);
+            return ip;
+        }
+        if (std.mem.indexOfScalar(u8, text, ':') == null) return null;
+        const octets = parseIpv6Literal(text) orelse return null;
+        return .{ .bytes = octets, .len = 16 };
+    }
 };
+
+fn parseIpv4Literal(text: []const u8) ?[4]u8 {
+    var out: [4]u8 = undefined;
+    var i: usize = 0;
+    var oct: usize = 0;
+    while (oct < 4) : (oct += 1) {
+        if (i >= text.len or !std.ascii.isDigit(text[i])) return null;
+        const start = i;
+        var val: u16 = 0;
+        while (i < text.len and std.ascii.isDigit(text[i])) {
+            if (i - start == 3) return null;
+            val = val * 10 + (text[i] - '0');
+            if (val > 255) return null;
+            i += 1;
+        }
+        if (i - start > 1 and text[start] == '0') return null;
+        out[oct] = @intCast(val);
+        if (oct < 3) {
+            if (i >= text.len or text[i] != '.') return null;
+            i += 1;
+        }
+    }
+    if (i != text.len) return null;
+    return out;
+}
+
+fn hexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+fn parseIpv6Groups(side: []const u8, out: *[8]u16) ?usize {
+    if (side.len == 0) return 0;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, side, ':');
+    while (it.next()) |part| {
+        if (n >= 8) return null;
+        if (std.mem.indexOfScalar(u8, part, '.') != null) {
+            if (it.next() != null) return null;
+            const v4 = parseIpv4Literal(part) orelse return null;
+            if (n + 2 > 8) return null;
+            out[n] = (@as(u16, v4[0]) << 8) | v4[1];
+            out[n + 1] = (@as(u16, v4[2]) << 8) | v4[3];
+            return n + 2;
+        }
+        if (part.len == 0 or part.len > 4) return null;
+        var val: u16 = 0;
+        for (part) |c| {
+            const d = hexNibble(c) orelse return null;
+            val = (val << 4) | d;
+        }
+        out[n] = val;
+        n += 1;
+    }
+    return n;
+}
+
+fn parseIpv6Literal(text: []const u8) ?[16]u8 {
+    if (text.len == 0 or text.len > 45) return null;
+    if (std.mem.indexOfScalar(u8, text, '%') != null) return null;
+    const compress = std.mem.indexOf(u8, text, "::");
+    if (compress != null and std.mem.indexOf(u8, text[compress.? + 2 ..], "::") != null) return null;
+
+    var head: [8]u16 = undefined;
+    var tail: [8]u16 = undefined;
+    const head_n: usize = if (compress) |at|
+        parseIpv6Groups(text[0..at], &head) orelse return null
+    else
+        parseIpv6Groups(text, &head) orelse return null;
+    const tail_n: usize = if (compress) |at|
+        parseIpv6Groups(text[at + 2 ..], &tail) orelse return null
+    else
+        0;
+    if (compress == null) {
+        if (head_n != 8) return null;
+    } else if (head_n + tail_n >= 8) return null;
+
+    var groups: [8]u16 = @splat(0);
+    @memcpy(groups[0..head_n], head[0..head_n]);
+    if (tail_n != 0) @memcpy(groups[8 - tail_n ..][0..tail_n], tail[0..tail_n]);
+    var raw: [16]u8 = undefined;
+    for (groups, 0..) |group, i| {
+        raw[i * 2] = @intCast(group >> 8);
+        raw[i * 2 + 1] = @intCast(group & 0xff);
+    }
+    return raw;
+}
 
 pub const Tlv = struct {
     tag: u8,

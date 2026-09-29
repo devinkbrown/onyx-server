@@ -1224,6 +1224,8 @@ const CertExtOpts = struct {
     path_len: ?u8 = null,
     /// SubjectAltName dNSName entries.
     dns_names: []const []const u8 = &.{},
+    /// SubjectAltName iPAddress entries: raw 4-byte IPv4 or 16-byte IPv6.
+    ip_addresses: []const []const u8 = &.{},
     /// NameConstraints permittedSubtrees (dNSName). Empty omits the field.
     permitted_dns: []const []const u8 = &.{},
     /// NameConstraints excludedSubtrees (dNSName). Empty omits the field.
@@ -1273,10 +1275,11 @@ fn writeBasicConstraintsExt(w: *W, path_len: ?u8) void {
     writeExtTlv(w, &oid_basic_constraints_bytes, v.bytes());
 }
 
-fn writeSanExt(w: *W, dns_names: []const []const u8) void {
+fn writeSanExt(w: *W, dns_names: []const []const u8, ip_addresses: []const []const u8) void {
     var body: [160]u8 = undefined;
     var b = W.init(&body);
     for (dns_names) |name| b.tlv(0x82, name); // dNSName [2]
+    for (ip_addresses) |ip| b.tlv(0x87, ip); // iPAddress [7]
     var val: [176]u8 = undefined;
     var v = W.init(&val);
     v.tlv(0x30, b.bytes());
@@ -1349,7 +1352,7 @@ pub fn mintEd25519CertExt(
     var ext_seq_body: [512]u8 = undefined;
     var esb = W.init(&ext_seq_body);
     if (opts.is_ca) writeBasicConstraintsExt(&esb, opts.path_len);
-    if (opts.dns_names.len != 0) writeSanExt(&esb, opts.dns_names);
+    if (opts.dns_names.len != 0 or opts.ip_addresses.len != 0) writeSanExt(&esb, opts.dns_names, opts.ip_addresses);
     if (opts.key_usage_digital_signature) |bit| writeKeyUsageExt(&esb, bit);
     if (opts.extra_oid.len != 0) writeMarkedExt(&esb, opts.extra_oid, opts.extra_critical, opts.extra_value);
     if (opts.permitted_dns.len != 0 or opts.excluded_dns.len != 0) {

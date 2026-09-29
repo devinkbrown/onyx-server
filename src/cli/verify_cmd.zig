@@ -90,6 +90,22 @@ pub fn decodeChain(gpa: Allocator, text: []const u8, chain: *[max_chain][]u8, co
     if (count.* == 0) return error.BeginNotFound;
 }
 
+/// RFC 9525, same rule as the TLS clients: an IP literal matches an
+/// iPAddress SAN only. A DNS name matches dNSName only.
+fn presentedNameMatches(name: []const u8, cert: x509.Certificate) bool {
+    if (x509.IpAddress.parseLiteral(name)) |ip| {
+        for (cert.san_ips[0..cert.san_ip_count]) |*san| {
+            if (std.mem.eql(u8, san.slice(), ip.slice())) return true;
+        }
+        return false;
+    }
+    if (std.mem.indexOfScalar(u8, name, ':') != null) return false;
+    for (cert.san_dns[0..cert.san_dns_count]) |san| {
+        if (dnsPatternMatches(san, name)) return true;
+    }
+    return false;
+}
+
 /// Single-label DNS wildcard match (`*.example.com` matches `a.example.com`,
 /// never `a.b.example.com`) — mirrors tls_client.zig's private matcher.
 pub fn dnsPatternMatches(pattern: []const u8, name: []const u8) bool {
@@ -122,14 +138,7 @@ pub fn verifyChain(
 ) !void {
     if (expected_name) |name| {
         const leaf = try x509.parse(chain[0]);
-        var matched = false;
-        for (leaf.san_dns[0..leaf.san_dns_count]) |san| {
-            if (dnsPatternMatches(san, name)) {
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) return error.NameMismatch;
+        if (!presentedNameMatches(name, leaf)) return error.NameMismatch;
     }
 
     var full = try gpa.alloc([]const u8, chain.len + 1);
@@ -241,6 +250,48 @@ test "armorcli verify accepts a root-issued leaf and rejects a stranger" {
     try verifyChain(gpa, &.{leaf_der}, &.{ca_der}, now, "a.wild.test");
     try testing.expectError(error.NameMismatch, verifyChain(gpa, &.{leaf_der}, &.{ca_der}, now, "a.b.wild.test"));
     try testing.expectError(error.NameMismatch, verifyChain(gpa, &.{leaf_der}, &.{ca_der}, now, "evil.test"));
+}
+
+test "GAP-K15 armorcli verify matches an IP literal against iPAddress only" {
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+    const now: i64 = 1_800_000_000;
+    const ca_kp = ecdsa_p256.KeyPair.generate(io);
+    var ca_buf: [2048]u8 = undefined;
+    const ca_der = try x509_selfsign.buildSelfSignedEcdsaP256(&ca_buf, .{
+        .common_name = "k15 root",
+        .not_before = now - 1000,
+        .not_after = now + 100_000,
+        .serial = &.{0x15},
+        .key_pair = ca_kp,
+        .dns_names = &.{"k15.test"},
+        .is_ca = true,
+    });
+    const leaf_kp = ecdsa_p256.KeyPair.generate(io);
+    var leaf_buf: [2048]u8 = undefined;
+    const v4 = [_]u8{ 1, 2, 3, 4 };
+    const dns_only = try x509_selfsign.buildEcdsaP256IssuedBy(&leaf_buf, .{
+        .common_name = "k15 root",
+        .not_before = now - 1000,
+        .not_after = now + 100_000,
+        .serial = &.{0x16},
+        .key_pair = leaf_kp,
+        .dns_names = &.{ "1.2.3.4", "*.2.3.4", "www.example.com", "*.example.com" },
+    }, ca_kp);
+    try testing.expectError(error.NameMismatch, verifyChain(gpa, &.{dns_only}, &.{ca_der}, now, "1.2.3.4"));
+    try verifyChain(gpa, &.{dns_only}, &.{ca_der}, now, "www.example.com");
+    try verifyChain(gpa, &.{dns_only}, &.{ca_der}, now, "a.example.com");
+
+    const ip_leaf = try x509_selfsign.buildEcdsaP256IssuedBy(&leaf_buf, .{
+        .common_name = "k15 root",
+        .not_before = now - 1000,
+        .not_after = now + 100_000,
+        .serial = &.{0x17},
+        .key_pair = leaf_kp,
+        .ip_addresses = &.{&v4},
+    }, ca_kp);
+    try verifyChain(gpa, &.{ip_leaf}, &.{ca_der}, now, "1.2.3.4");
+    try testing.expectError(error.NameMismatch, verifyChain(gpa, &.{ip_leaf}, &.{ca_der}, now, "www.example.com"));
 }
 
 test "armorcli verify dnsPatternMatches is single-label only" {

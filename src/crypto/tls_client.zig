@@ -3596,9 +3596,21 @@ fn verifyIssuedBy(child_der: []const u8, issuer_der: []const u8) Error!void {
 }
 
 fn dnsNameMatchesCert(server_name: []const u8, cert: x509.Certificate) bool {
+    // RFC 9525: an IP reference matches an iPAddress SAN only. A dNSName of
+    // the same text, including a single-label wildcard, is not that address.
+    if (x509.IpAddress.parseLiteral(server_name)) |ip| return ipSanMatches(cert, ip);
+    if (std.mem.indexOfScalar(u8, server_name, ':') != null) return false;
     var i: usize = 0;
     while (i < cert.san_dns_count) : (i += 1) {
         if (dnsPatternMatches(cert.san_dns[i], server_name)) return true;
+    }
+    return false;
+}
+
+fn ipSanMatches(cert: x509.Certificate, ip: x509.IpAddress) bool {
+    var i: usize = 0;
+    while (i < cert.san_ip_count) : (i += 1) {
+        if (std.mem.eql(u8, cert.san_ips[i].slice(), ip.slice())) return true;
     }
     return false;
 }
@@ -6838,6 +6850,65 @@ test "GAP-K12 a leaf keyUsage without digitalSignature is rejected before Certif
     try verifyChainToTrustAnchors(&allowed_chain, &anchors, "leaf.ku.test", null);
 
     std.debug.print("GAP-K12 branch=a leaf keyUsage without digitalSignature is rejected before CertificateVerify\n", .{});
+}
+
+test "GAP-K15 an IP literal matches an iPAddress SAN only" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const nb: i64 = 1_704_067_200;
+    const na: i64 = 1_924_991_999;
+    const ca_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x15)));
+    const leaf_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x16)));
+    var ca_buf: [1024]u8 = undefined;
+    const ca = try x509_verify.mintEd25519CertExt(&ca_buf, "K15 CA", "K15 CA", ca_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .is_ca = true,
+    });
+    const anchors = [_][]const u8{ca};
+    var leaf_buf: [1024]u8 = undefined;
+    const v4 = [_]u8{ 1, 2, 3, 4 };
+    const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 };
+
+    const dns_text = try x509_verify.mintEd25519CertExt(&leaf_buf, "K15 CA", "leaf", leaf_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .dns_names = &.{"1.2.3.4"},
+    });
+    const dns_text_chain = [_][]const u8{ dns_text, ca };
+    try std.testing.expectError(error.CertificateNameMismatch, verifyChainToTrustAnchors(&dns_text_chain, &anchors, "1.2.3.4", null));
+
+    const dns_wild = try x509_verify.mintEd25519CertExt(&leaf_buf, "K15 CA", "leaf", leaf_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .dns_names = &.{"*.2.3.4"},
+    });
+    const dns_wild_chain = [_][]const u8{ dns_wild, ca };
+    try std.testing.expectError(error.CertificateNameMismatch, verifyChainToTrustAnchors(&dns_wild_chain, &anchors, "1.2.3.4", null));
+
+    const ip_leaf = try x509_verify.mintEd25519CertExt(&leaf_buf, "K15 CA", "leaf", leaf_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .ip_addresses = &.{&v4},
+    });
+    const ip_chain = [_][]const u8{ ip_leaf, ca };
+    try verifyChainToTrustAnchors(&ip_chain, &anchors, "1.2.3.4", null);
+    try std.testing.expectError(error.CertificateNameMismatch, verifyChainToTrustAnchors(&ip_chain, &anchors, "www.example.com", null));
+
+    const dns_leaf = try x509_verify.mintEd25519CertExt(&leaf_buf, "K15 CA", "leaf", leaf_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .dns_names = &.{ "www.example.com", "*.example.com" },
+    });
+    const dns_chain = [_][]const u8{ dns_leaf, ca };
+    try verifyChainToTrustAnchors(&dns_chain, &anchors, "www.example.com", null);
+    try verifyChainToTrustAnchors(&dns_chain, &anchors, "a.example.com", null);
+    try std.testing.expectError(error.CertificateNameMismatch, verifyChainToTrustAnchors(&dns_chain, &anchors, "1.2.3.4", null));
+
+    const v6_dns = try x509_verify.mintEd25519CertExt(&leaf_buf, "K15 CA", "leaf", leaf_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .dns_names = &.{"2001:db8::1"},
+    });
+    const v6_dns_chain = [_][]const u8{ v6_dns, ca };
+    try std.testing.expectError(error.CertificateNameMismatch, verifyChainToTrustAnchors(&v6_dns_chain, &anchors, "2001:db8::1", null));
+
+    const v6_leaf = try x509_verify.mintEd25519CertExt(&leaf_buf, "K15 CA", "leaf", leaf_kp.public_key.toBytes(), ca_kp, nb, na, .{
+        .ip_addresses = &.{&v6},
+    });
+    const v6_chain = [_][]const u8{ v6_leaf, ca };
+    try verifyChainToTrustAnchors(&v6_chain, &anchors, "2001:db8::1", null);
+    try verifyChainToTrustAnchors(&v6_chain, &anchors, "2001:DB8::1", null);
+    try std.testing.expectError(error.CertificateNameMismatch, verifyChainToTrustAnchors(&v6_chain, &anchors, "www.example.com", null));
+
+    std.debug.print("GAP-K15 branch=an IP literal matches an iPAddress SAN only\n", .{});
 }
 
 // ---------------------------------------------------------------------------
