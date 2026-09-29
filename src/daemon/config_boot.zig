@@ -38,10 +38,11 @@ pub const Ocg2RuntimeMode = enum {
 };
 
 /// Runtime stages implemented by this binary. Keep CLI preflight and normal
-/// boot on this single predicate; reserved privilege-changing modes must never
-/// pass validation only to fail during service restart.
+/// boot on this single predicate. `project` and `mint` boot only because live
+/// sessions take the durable image, a failed pass restores the previous
+/// session image, and minting still requires the configured authority node.
 pub fn ocg2RuntimeModeSupported(mode: Ocg2RuntimeMode) bool {
-    return mode == .disabled or mode == .observe;
+    return mode == .disabled or mode == .observe or mode == .project or mode == .mint;
 }
 
 pub const Ocg2BootConfig = struct {
@@ -1736,11 +1737,43 @@ test "OCG2 config boot mapping exposes disabled observe project and mint modes" 
     try testing.expectEqual(Ocg2RuntimeMode.mint, mint.mode);
 }
 
-test "OCG2 runtime support predicate admits only disabled and observe" {
+test "OCG2 runtime support predicate admits disabled observe project and mint" {
     try testing.expect(ocg2RuntimeModeSupported(.disabled));
     try testing.expect(ocg2RuntimeModeSupported(.observe));
-    try testing.expect(!ocg2RuntimeModeSupported(.project));
-    try testing.expect(!ocg2RuntimeModeSupported(.mint));
+    try testing.expect(ocg2RuntimeModeSupported(.project));
+    try testing.expect(ocg2RuntimeModeSupported(.mint));
+}
+
+test "DST GAP-A1 mint stays on the authority node and a private key in TOML is refused" {
+    const allocator = testing.allocator;
+    const mint = try testOcg2BootConfig(0xC5, .mint);
+    var authority_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC5)), "ocg2-test");
+    defer authority_identity.deinit();
+    var receiver_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC6)), "ocg2-test");
+    defer receiver_identity.deinit();
+    try testing.expectEqual(Ocg2LocalRole.authority, try validateOcg2LocalIdentity(mint, &authority_identity));
+    try testing.expectError(error.Ocg2MintingRequiresAuthority, validateOcg2LocalIdentity(mint, &receiver_identity));
+
+    const public_hex = std.fmt.bytesToHex(authority_identity.sign_kp.public_key, .lower);
+    const text = try std.fmt.allocPrint(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sasl]
+        \\account_db = "accounts.oro"
+        \\[oper.ocg2]
+        \\enabled = true
+        \\projection_enabled = true
+        \\minting_enabled = true
+        \\authority_node_id = "{x:0>16}"
+        \\authority_public_key = "{s}"
+        \\private_key = "must-never-be-accepted"
+        \\
+    , .{ authority_identity.shortId(), &public_hex });
+    defer allocator.free(text);
+    try testing.expectError(error.UnknownOcg2Field, config_format.parseToml(allocator, text, .{}));
+    std.debug.print("GAP-A1 branch=mint authority only and toml private key refused\n", .{});
 }
 
 test "OCG2 boot identity classification keeps receivers public-only and exact authority full-key bound" {

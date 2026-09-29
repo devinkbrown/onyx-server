@@ -10,8 +10,8 @@ operator behavior.
 | --- | --- | --- |
 | `enabled = false` | `disabled` | No OCG2 store activation, allocation, timer work, projection, or minting. |
 | `enabled = true` | `observe` | Strictly restore the durable image, establish its security clock, and continuously validate bounded reconciliation work. No live privilege changes. |
-| `projection_enabled = true` | `project` | Reserved. This build fails boot because projection is not yet exposed. |
-| `minting_enabled = true` | `mint` | Reserved. This build fails boot because minting is not yet exposed. |
+| `projection_enabled = true` | `project` | Boots. Projects the durable image onto logged-in sessions, restores the previous session image if that pass fails, and audits every privilege change. |
+| `minting_enabled = true` | `mint` | Boots only on the configured authority node. Uses the same projection. A private key in TOML is rejected. |
 
 Projection requires `enabled = true`. Minting requires both `enabled = true` and
 `projection_enabled = true`, and is valid only on the exact configured authority
@@ -49,8 +49,20 @@ operator paths remain unchanged.
    each node, keeping projection and minting false.
 4. Enable observe mode one node at a time and confirm the primed boot log plus
    stable housekeeping.
-5. Do not enable projection or minting until a later build implements and tests
-   their complete fail-closed lifecycle.
+5. Leave projection and minting false on the live pair until an explicit deploy.
+   This build can boot both modes. REHASH does not hot-apply either one.
+
+Project mode primes the durable horizon before listeners open. Reactor 0 then
+projects that image onto every logged-in session. A configured local operator
+binding keeps precedence. A failed pass restores the session image from the
+start of the pass and audits `rollback`. Grant and revoke lines are audited
+before the generation is acknowledged.
+
+A dropped process keeps the durable snapshot. The next boot fast-forwards
+security time to the reserved horizon and projects that image again. Mint mode
+uses the same projection and is refused unless this node is the configured
+authority. Mesh-wide revoke commits one signed tombstone on each peer and
+projects it. OCG1 `GRANT` / `REVOKE` stays display-only.
 
 Never place an authority private key in the TOML file. The configured tuple is
 public-only; authority identity is bound to the already-provisioned node key.

@@ -624,15 +624,20 @@ pub fn main(init: std.process.Init) !void {
     // identity are both available; once selected, every load error is fatal.
     var durable_device_state: ?onyx_server.daemon.durable_credential_props.State = null;
     defer if (durable_device_state) |*state| state.deinit();
-    // Process-owned inactive OCG2 image. Services borrows it only after exact
-    // marker/snapshot activation. The bounded observer below may borrow Services,
-    // but it exposes no session, mesh, minting, or projection capability.
+    // Process-owned OCG2 image. Services borrows it only after exact
+    // marker/snapshot activation. Observe borrows Services and changes no
+    // privileges. Project and mint borrow the projection runtime, which the
+    // server applies to live sessions.
     var durable_oper_state: ?onyx_server.daemon.durable_oper_authority.State = null;
     defer if (durable_oper_state) |*state| state.deinit();
     // Runtime carries bounded 256-entry scratch inventories, so allocate it only
-    // for explicit observe mode. Disabled deployments pay neither heap nor stack.
+    // for an enabled OCG2 mode. Disabled deployments pay neither heap nor stack.
     var ocg2_observer: ?*onyx_server.daemon.ocg2_runtime.Runtime = null;
     defer if (ocg2_observer) |observer| onyx_server.daemon.ocg2_runtime.destroy(observer);
+    var ocg2_projection: ?*onyx_server.daemon.ocg2_projection_runtime.Runtime = null;
+    defer if (ocg2_projection) |runtime| runtime.deinit();
+    var ocg2_audit_storage: ?onyx_server.daemon.audit_trail.AuditTrail = null;
+    defer if (ocg2_audit_storage) |*audit| audit.deinit();
     var account_services: onyx_server.daemon.services.Services = undefined;
     var account_checker: onyx_server.daemon.sasl_bridge.ServicesPlainChecker = undefined;
     var external_bridge: onyx_server.daemon.sasl_bridge.ServicesExternalLookup = undefined;
@@ -742,7 +747,48 @@ pub fn main(init: std.process.Init) !void {
                             srv_cfg.ocg2_runtime = observer;
                             srv_cfg.ocg2_runtime_monotonic_origin_ms = origin_ms;
                         },
-                        .project, .mint => unreachable,
+                        .project, .mint => {
+                            if (h.ocg2.mode == .mint and ocg2_role.? != .authority) {
+                                std.debug.print("onyx-server: fatal — OCG2 mint is only available on the configured authority node\n", .{});
+                                return error.Ocg2MintingRequiresAuthority;
+                            }
+                            const projection = try onyx_server.daemon.ocg2_projection_runtime.Runtime.initDefault(
+                                allocator,
+                                &account_services,
+                            );
+                            ocg2_projection = projection;
+                            ocg2_audit_storage = onyx_server.daemon.audit_trail.AuditTrail.init(allocator);
+                            const audit = &ocg2_audit_storage.?;
+                            const initial_realtime_ms: u64 = @intCast(@max(
+                                @as(i64, 0),
+                                onyx_server.substrate.platform.realtimeMillis(),
+                            ));
+                            const origin_ms: u64 = @intCast(@max(
+                                @as(i64, 0),
+                                onyx_server.substrate.platform.monotonicMillis(),
+                            ));
+                            const primed = try onyx_server.daemon.ocg2_live_projection.projectOnce(
+                                allocator,
+                                projection,
+                                &.{},
+                                audit,
+                                initial_realtime_ms,
+                                0,
+                            );
+                            switch (primed) {
+                                .committed, .unchanged => std.debug.print(
+                                    "onyx-server: OCG2 {s} runtime primed ({s}; {s}; projects durable authority onto live sessions)\n",
+                                    .{ @tagName(h.ocg2.mode), @tagName(activation.source), @tagName(ocg2_role.?) },
+                                ),
+                                else => {
+                                    std.debug.print("onyx-server: fatal — OCG2 {s} runtime could not prime its durable image\n", .{@tagName(h.ocg2.mode)});
+                                    return error.Ocg2RuntimeActivationFailed;
+                                },
+                            }
+                            srv_cfg.ocg2_projection = projection;
+                            srv_cfg.ocg2_projection_origin_ms = origin_ms;
+                            srv_cfg.ocg2_audit = audit;
+                        },
                     }
                 }
                 // Seed config-declared oper certfp bindings so SASL EXTERNAL works

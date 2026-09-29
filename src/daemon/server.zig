@@ -366,6 +366,9 @@ const tls_certs = @import("tls_certs.zig");
 const x509_verify = @import("../crypto/x509_verify.zig");
 const services_mod = @import("services.zig");
 const ocg2_runtime_mod = @import("ocg2_runtime.zig");
+const ocg2_projection_mod = @import("ocg2_projection_runtime.zig");
+const ocg2_live_projection = @import("ocg2_live_projection.zig");
+const audit_trail_mod = @import("audit_trail.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const webauthn = @import("../crypto/webauthn.zig");
 const webauthn_creds_mod = @import("webauthn_creds.zig");
@@ -2188,6 +2191,14 @@ pub const Config = struct {
     /// Exact monotonic millisecond sample paired with the process owner's
     /// elapsed=0 prime. Required iff `ocg2_runtime` is present.
     ocg2_runtime_monotonic_origin_ms: ?u64 = null,
+    /// OCG2 projection runtime. Null keeps live sessions on the observer or
+    /// on configured-local oper bindings. Borrowed; owner must outlive the server.
+    ocg2_projection: ?*ocg2_projection_mod.Runtime = null,
+    /// Monotonic sample paired with the projection runtime's elapsed=0 prime.
+    /// Required iff `ocg2_projection` is present.
+    ocg2_projection_origin_ms: ?u64 = null,
+    /// Audit trail for OCG2 privilege transitions. Required iff projection is set.
+    ocg2_audit: ?*audit_trail_mod.AuditTrail = null,
     /// Boot-only DPROP1 authority. Production leaves this inactive unless main
     /// has opened the configured account OroStore, loaded the reserved snapshot
     /// strictly, and attached the exact same State to Services.
@@ -4258,8 +4269,11 @@ pub const LinuxServer = struct {
     ocg2_runtime: ?*ocg2_runtime_mod.Runtime = null,
     /// Exact monotonic origin paired with the observer's elapsed=0 prime.
     ocg2_runtime_monotonic_origin_ms: ?u64 = null,
-    /// A terminal observer failure is reported once; later timer turns remain
-    /// silent while the fail-closed Runtime stays terminal.
+    ocg2_projection: ?*ocg2_projection_mod.Runtime = null,
+    ocg2_projection_origin_ms: ?u64 = null,
+    ocg2_audit: ?*audit_trail_mod.AuditTrail = null,
+    /// A terminal observer or projection failure is reported once; later timer
+    /// turns remain silent while that runtime stays terminal.
     ocg2_runtime_terminal_logged: bool = false,
     /// Web Push delivery worker (borrowed; owned by main; null = disabled).
     webpush_worker: ?*webpush_mod.Worker = null,
@@ -4462,6 +4476,10 @@ pub const LinuxServer = struct {
         errdefer if (runtime_features.owned_disabled_features) |owned| allocator.free(owned);
         var config = runtime_features.config;
         if ((config.ocg2_runtime == null) != (config.ocg2_runtime_monotonic_origin_ms == null))
+            return error.InvalidOcg2RuntimeClock;
+        if ((config.ocg2_projection == null) != (config.ocg2_projection_origin_ms == null))
+            return error.InvalidOcg2RuntimeClock;
+        if (config.ocg2_projection != null and config.ocg2_audit == null)
             return error.InvalidOcg2RuntimeClock;
         // A secured mesh identifies nodes by the self-certified short id of the
         // configured key.  `[node].id` predates that identity and is still useful
@@ -4816,6 +4834,9 @@ pub const LinuxServer = struct {
             .account_services = config.account_services,
             .ocg2_runtime = config.ocg2_runtime,
             .ocg2_runtime_monotonic_origin_ms = config.ocg2_runtime_monotonic_origin_ms,
+            .ocg2_projection = config.ocg2_projection,
+            .ocg2_projection_origin_ms = config.ocg2_projection_origin_ms,
+            .ocg2_audit = config.ocg2_audit,
             .mesh_clock = initial_mesh_clock,
             .reactor = config.reactor,
             .start_ms = if (config.reactor) |r| r.nowMillis() else platform.monotonicMillis(),
@@ -6232,6 +6253,51 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// Reactor 0 projects the durable OCG2 image onto every logged-in session.
+    /// A retryable or failed generation leaves the previous privilege image in
+    /// place; the next timer turn tries again.
+    fn projectOcg2LiveSessions(self: *LinuxServer) void {
+        if (!self.isMaintenanceReactor()) return;
+        if (self.ocg2_runtime_terminal_logged) return;
+        const runtime = self.ocg2_projection orelse return;
+        const origin_ms = self.ocg2_projection_origin_ms orelse return;
+        const audit = self.ocg2_audit orelse return;
+        const now_ms = self.nowU64();
+        if (now_ms < origin_ms) return;
+        var sessions: std.ArrayList(ocg2_live_projection.SessionRef) = .empty;
+        defer sessions.deinit(self.allocator);
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const client = entry.value;
+                if (client.s2s != null or client.s2s_secured != null) continue;
+                const account = client.session.account() orelse continue;
+                const binding = if (self.oper_registry) |*registry|
+                    oper_session_provenance.configuredLocalBinding(registry, account)
+                else
+                    null;
+                sessions.append(self.allocator, .{
+                    .session = &client.session,
+                    .configured_binding = binding,
+                }) catch return;
+            }
+        }
+        switch (ocg2_live_projection.projectOnce(
+            self.allocator,
+            runtime,
+            sessions.items,
+            audit,
+            self.meshWallMs(),
+            now_ms - origin_ms,
+        ) catch return) {
+            .committed, .unchanged, .aborted, .busy, .retryable => {},
+            .terminal => {
+                self.ocg2_runtime_terminal_logged = true;
+                srvLog("onyx-server: OCG2 projection stopped\n", .{});
+            },
+        }
+    }
+
     /// Fired when the periodic timer elapses: run the timeout sweep and re-arm.
     fn onTimerTick(self: *LinuxServer) void {
         self.rx().timer_armed = false;
@@ -6269,6 +6335,7 @@ pub const LinuxServer = struct {
         // Prune the throttle's expired/empty per-IP state on the same cadence.
         if (self.isMaintenanceReactor()) {
             _ = self.tickOcg2Runtime();
+            self.projectOcg2LiveSessions();
             if (self.conn_throttle) |*t| t.prune(self.nowMs());
             // Evict unlocked, decayed-to-floor login-throttle records too.
             _ = self.login_throttle.sweep(self.nowMs());
@@ -48735,8 +48802,8 @@ pub const LinuxServer = struct {
             config.authority_public_key != null;
     }
 
-    fn ocg2RehashHasUnsupportedRuntimeMode(config: config_format.Config.OperOcg2) bool {
-        return config.projection_enabled or config.minting_enabled;
+    fn ocg2RehashHasUnsupportedRuntimeMode(_: config_format.Config.OperOcg2) bool {
+        return false;
     }
 
     /// REHASH — oper-only configuration reload. Re-reads and re-parses the
@@ -103939,8 +104006,8 @@ test "OCG2 REHASH reports every restart-only authority intent" {
     }));
     try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{}));
     try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .enabled = true }));
-    try std.testing.expect(LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .projection_enabled = true }));
-    try std.testing.expect(LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .minting_enabled = true }));
+    try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .projection_enabled = true }));
+    try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .minting_enabled = true }));
 }
 
 test "OCG2 server runtime is inert by default and reactor zero owns terminal cadence" {

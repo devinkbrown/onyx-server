@@ -173,6 +173,9 @@ pub const ocg2_runtime = @import("ocg2_runtime.zig");
 /// exported for the integrator but owns no session, mesh, issuer, or minting
 /// capability.
 pub const ocg2_projection_runtime = @import("ocg2_projection_runtime.zig");
+/// Projects one acknowledged OCG2 generation onto live sessions, rolls the
+/// session image back when that pass fails, and audits every transition.
+pub const ocg2_live_projection = @import("ocg2_live_projection.zig");
 comptime {
     _ = @import("isupport_advertise.zig");
 }
