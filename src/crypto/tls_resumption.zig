@@ -22,12 +22,12 @@ pub const max_hash_len: usize = 48;
 
 const sealed_magic_v1: u8 = 1;
 const sealed_magic_v2: u8 = 2;
-/// Current sealed-ticket version: v3 adds `ticket_age_add` so a server (any
-/// node holding the ticket key) can un-obfuscate the client's reported
-/// `obfuscated_ticket_age` and enforce the RFC 8446 §8.2–8.3 freshness window
-/// on 0-RTT. v2/v1 tickets still open (legacy arms) but carry no age_add, so
-/// they simply do not get the window check.
-const sealed_magic: u8 = 3;
+const sealed_magic_v3: u8 = 3;
+/// Current sealed-ticket version. v3 added `ticket_age_add`. v4 seals the
+/// lifetime advertised at mint so a later config cannot extend it. Older
+/// tickets still open; they carry a null lifetime and are not resumed once
+/// the acceptor has a clock.
+const sealed_magic: u8 = 4;
 const stored_magic = [_]u8{ 'O', 'T', 'S', '1' };
 const sealed_aad = "onyx tls13 session ticket v1";
 
@@ -50,6 +50,9 @@ pub const OpenedTicket = struct {
     /// §8.2–8.3 freshness window. Null for legacy v1/v2 tickets — those degrade
     /// to no window check, never to a failure.
     ticket_age_add: ?u32,
+    /// Lifetime in seconds advertised when the ticket was minted (v4+). Null
+    /// when the ticket cannot prove that window.
+    ticket_lifetime: ?u32 = null,
 };
 
 pub const StoredSession = struct {
@@ -141,11 +144,12 @@ pub fn sealTicket(
     issued_unix_ms: i64,
     max_early_data_size: u32,
     ticket_age_add: u32,
+    ticket_lifetime: u32,
 ) Error![]u8 {
     if (psk.len > max_hash_len) return error.PskTooLarge;
     if (ticket_nonce.len > std.math.maxInt(u8)) return error.NonceTooLarge;
 
-    var plain = try allocator.alloc(u8, 1 + 2 + 8 + 4 + 1 + ticket_nonce.len + 4 + 1 + psk.len);
+    var plain = try allocator.alloc(u8, 1 + 2 + 8 + 4 + 4 + 1 + ticket_nonce.len + 4 + 1 + psk.len);
     defer allocator.free(plain);
 
     var off: usize = 0;
@@ -156,6 +160,8 @@ pub fn sealTicket(
     std.mem.writeInt(i64, plain[off..][0..8], issued_unix_ms, .big);
     off += 8;
     std.mem.writeInt(u32, plain[off..][0..4], ticket_age_add, .big);
+    off += 4;
+    std.mem.writeInt(u32, plain[off..][0..4], ticket_lifetime, .big);
     off += 4;
     plain[off] = @intCast(ticket_nonce.len);
     off += 1;
@@ -214,7 +220,7 @@ pub fn openTicket(
     ticket: []const u8,
 ) Error!OpenedTicketResult {
     if (ticket.len < 1 + ChaCha20Poly1305.nonce_length + ChaCha20Poly1305.tag_length) return error.BadTicket;
-    if (ticket[0] != sealed_magic and ticket[0] != sealed_magic_v2 and ticket[0] != sealed_magic_v1) return error.BadTicket;
+    if (ticket[0] != sealed_magic and ticket[0] != sealed_magic_v3 and ticket[0] != sealed_magic_v2 and ticket[0] != sealed_magic_v1) return error.BadTicket;
     const nonce = ticket[1..][0..ChaCha20Poly1305.nonce_length].*;
     const sealed = ticket[1 + ChaCha20Poly1305.nonce_length ..];
     const clen = sealed.len - ChaCha20Poly1305.tag_length;
@@ -226,16 +232,23 @@ pub fn openTicket(
     var off: usize = 0;
     if (plain.len - off < 1) return error.BadTicket;
     const version = plain[off];
-    if (version != sealed_magic and version != sealed_magic_v2 and version != sealed_magic_v1) return error.BadTicket;
+    if (version != sealed_magic and version != sealed_magic_v3 and version != sealed_magic_v2 and version != sealed_magic_v1) return error.BadTicket;
     off += 1;
     if (plain.len - off < 2 + 8 + 1) return error.BadTicket;
     const suite = std.mem.readInt(u16, plain[off..][0..2], .big);
     off += 2;
     const issued = std.mem.readInt(i64, plain[off..][0..8], .big);
     off += 8;
-    // v3 only: ticket_age_add sits between the issue time and the nonce. Legacy
+    // v3+ : ticket_age_add sits between the issue time and the nonce. Legacy
     // v1/v2 tickets carry none — they decode as before, with a null age_add.
-    const ticket_age_add: ?u32 = if (version == sealed_magic) blk: {
+    const ticket_age_add: ?u32 = if (version >= sealed_magic_v3) blk: {
+        if (plain.len - off < 4) return error.BadTicket;
+        const v = std.mem.readInt(u32, plain[off..][0..4], .big);
+        off += 4;
+        break :blk v;
+    } else null;
+    // v4 seals the lifetime advertised at mint. Older tickets have no such field.
+    const ticket_lifetime: ?u32 = if (version >= sealed_magic) blk: {
         if (plain.len - off < 4) return error.BadTicket;
         const v = std.mem.readInt(u32, plain[off..][0..4], .big);
         off += 4;
@@ -271,6 +284,7 @@ pub fn openTicket(
             .psk = psk,
             .max_early_data_size = max_early_data_size,
             .ticket_age_add = ticket_age_add,
+            .ticket_lifetime = ticket_lifetime,
         },
     };
 }
@@ -373,7 +387,7 @@ test "sealed server ticket opens with the same key" {
     const key = @as([ChaCha20Poly1305.key_length]u8, @splat(0x11));
     const nonce = @as([ChaCha20Poly1305.nonce_length]u8, @splat(0x22));
     const psk = @as([32]u8, @splat(0x33));
-    const ticket = try sealTicket(allocator, key, nonce, 0x1301, &psk, "nonce", 1234, 8192, 0xC0FFEE);
+    const ticket = try sealTicket(allocator, key, nonce, 0x1301, &psk, "nonce", 1234, 8192, 0xC0FFEE, 86_400);
     defer allocator.free(ticket);
 
     const opened = try openTicket(allocator, key, ticket);
@@ -385,6 +399,7 @@ test "sealed server ticket opens with the same key" {
     try std.testing.expectEqual(@as(u32, 8192), opened.opened.max_early_data_size);
     // v3 tickets carry the ticket_age_add for the 0-RTT freshness window.
     try std.testing.expectEqual(@as(?u32, 0xC0FFEE), opened.opened.ticket_age_add);
+    try std.testing.expectEqual(@as(?u32, 86_400), opened.opened.ticket_lifetime);
 }
 
 /// Seal a legacy v2 ticket blob (magic 2, no ticket_age_add) so the graceful
@@ -447,6 +462,7 @@ test "legacy v2 ticket opens with a null ticket_age_add (graceful degrade)" {
     // The decisive assertion: a legacy ticket carries no age_add, so the server
     // skips the freshness window rather than crashing on a missing field.
     try std.testing.expectEqual(@as(?u32, null), opened.opened.ticket_age_add);
+    try std.testing.expectEqual(@as(?u32, null), opened.opened.ticket_lifetime);
 }
 
 test "openTicketWithRotation accepts current and previous keys, rejects retired" {
@@ -457,7 +473,7 @@ test "openTicketWithRotation accepts current and previous keys, rejects retired"
     const psk = @as([32]u8, @splat(0x33));
 
     // A ticket sealed under the OLD key A.
-    const ticket_a = try sealTicket(allocator, key_a, nonce, 0x1301, &psk, "n", 1, 0, 0);
+    const ticket_a = try sealTicket(allocator, key_a, nonce, 0x1301, &psk, "n", 1, 0, 0, 100);
     defer allocator.free(ticket_a);
 
     // After rotation: current = B, previous = A. The A-ticket still opens.
@@ -468,7 +484,7 @@ test "openTicketWithRotation accepts current and previous keys, rejects retired"
     }
     // A ticket sealed under the new current key B also opens.
     {
-        const ticket_b = try sealTicket(allocator, key_b, nonce, 0x1301, &psk, "n", 1, 0, 0);
+        const ticket_b = try sealTicket(allocator, key_b, nonce, 0x1301, &psk, "n", 1, 0, 0, 100);
         defer allocator.free(ticket_b);
         const opened = try openTicketWithRotation(allocator, key_b, key_a, ticket_b);
         defer allocator.free(opened.plain);

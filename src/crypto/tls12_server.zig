@@ -984,6 +984,7 @@ pub const Server = struct {
             self.config.now_unix_seconds * 1000,
             0, // no 0-RTT in TLS 1.2
             0, // ticket_age_add: unused (no 0-RTT freshness window in TLS 1.2)
+            self.config.ticket_lifetime_seconds,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // sealTicket only rejects oversized inputs, which cannot occur with
@@ -1053,10 +1054,12 @@ pub const Server = struct {
         // connection, only the resumption fast path.
         if (self.config.now_unix_seconds == 0) return false;
         const issued_s = @divTrunc(opened.opened.issued_unix_ms, 1000);
-        if (issued_s != 0) {
-            if (self.config.now_unix_seconds < issued_s) return false;
-            if (self.config.now_unix_seconds - issued_s > @as(i64, self.config.ticket_lifetime_seconds)) return false;
-        }
+        // No issue time, or a ticket that does not carry the lifetime it was
+        // minted with, cannot be shown to be inside that window.
+        const sealed_lifetime = opened.opened.ticket_lifetime orelse return false;
+        if (issued_s == 0) return false;
+        if (self.config.now_unix_seconds < issued_s) return false;
+        if (self.config.now_unix_seconds - issued_s > @as(i64, sealed_lifetime)) return false;
 
         // Replay defence: a ticket presented twice must NOT take the abbreviated
         // path again. The replay guard caps binders at SHA-384 size (48 bytes),

@@ -2005,15 +2005,17 @@ pub const Server = struct {
         if (opened.opened.psk.len != suite.hashLen()) return null;
         if (binder.len != suite.hashLen()) return null;
 
-        // Ticket-lifetime enforcement (when the caller supplies a clock and the
-        // ticket carries a real issue time): reject expired or future tickets,
-        // falling back to a full handshake.
+        // Ticket-lifetime enforcement once a clock is configured. A missing
+        // issue time, or a ticket that does not carry the lifetime advertised
+        // at mint, cannot be shown to be inside that window, so it does not
+        // resume. Lengthening this node's config does not extend a ticket.
         if (self.config.now_unix_seconds) |now_s| {
             const issued_s = @divTrunc(opened.opened.issued_unix_ms, 1000);
-            if (issued_s != 0) {
-                if (now_s < issued_s) return null;
-                if (now_s - issued_s > @as(i64, effectiveTicketLifetimeSeconds(self.config.ticket_lifetime_seconds))) return null;
-            }
+            const sealed_lifetime = opened.opened.ticket_lifetime orelse return null;
+            if (issued_s == 0) return null;
+            if (now_s < issued_s) return null;
+            const window = @min(sealed_lifetime, max_ticket_lifetime_seconds);
+            if (now_s - issued_s > @as(i64, window)) return null;
             // RFC 8446 §8.2–8.3 0-RTT freshness window. Un-obfuscate the client's
             // reported age with the ticket's sealed age_add and compare it to the
             // server's own measured elapsed time. Runs only for a v3 ticket
@@ -2757,6 +2759,7 @@ pub const Server = struct {
         };
         defer secureZero(psk[0..psk_len]);
 
+        const lifetime = effectiveTicketLifetimeSeconds(self.config.ticket_lifetime_seconds);
         const sealed = try tls_resumption.sealTicket(
             self.allocator,
             self.ticket_key,
@@ -2770,6 +2773,7 @@ pub const Server = struct {
             // node holding the ticket key can later un-obfuscate the client's
             // reported obfuscated_ticket_age for the §8.2–8.3 freshness window.
             ticket_age_add,
+            lifetime,
         );
         defer self.allocator.free(sealed);
 
@@ -2778,7 +2782,7 @@ pub const Server = struct {
 
         var ticket_body_buf: [512]u8 = undefined;
         const ticket_body = try tls_session_ticket.encode(&ticket_body_buf, .{
-            .ticket_lifetime = effectiveTicketLifetimeSeconds(self.config.ticket_lifetime_seconds),
+            .ticket_lifetime = lifetime,
             .ticket_age_add = ticket_age_add,
             .ticket_nonce = &ticket_nonce,
             .ticket = sealed,
@@ -5471,6 +5475,89 @@ test "exploit: an over-long ticket_lifetime cannot breach the RFC 8446 4.6.1 cei
     const early = try ticketLifetimePolicyProbe(thirty_days, seven_days - 1000);
     try std.testing.expectEqual(@as(u32, 604_800), early.advertised);
     try std.testing.expect(early.resumed);
+}
+
+fn gapK17Resumed(mint_lifetime: u32, mint_now: ?i64, accept_lifetime: u32, accept_now: i64) !bool {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x17)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "k17.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x17},
+        .key_pair = kp,
+        .dns_names = &.{"k17.test"},
+        .is_ca = true,
+    });
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .ticket_lifetime_seconds = mint_lifetime,
+        .now_unix_seconds = mint_now,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "k17.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(tls_client.AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    var resumed_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .ticket_lifetime_seconds = accept_lifetime,
+        .now_unix_seconds = accept_now,
+    });
+    defer resumed_server.deinit();
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "k17.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    // Age 0 keeps the client offer inside the advertised lifetime. The server
+    // judges expiry from the sealed issue time, not from this hint.
+    try resumed_client.setSessionTicket(stored, 0);
+    const rch = try resumed_client.start();
+    defer alloc.free(rch);
+    const flight = switch (try resumed_server.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(flight);
+    return resumed_server.acceptedSessionTicket();
+}
+
+test "GAP-K17 a ticket dies with the lifetime sealed at mint" {
+    const t0: i64 = 1_700_000_000;
+    // A shorter config must not expire a ticket still inside the sealed window.
+    try std.testing.expect(try gapK17Resumed(100, t0, 50, t0 + 60));
+    // The advertised lifetime itself is still inside.
+    try std.testing.expect(try gapK17Resumed(100, t0, 100, t0 + 100));
+    // A longer config, on this node or a peer with the same ticket key, does
+    // not keep the PSK alive past the lifetime sealed at mint.
+    try std.testing.expect(try gapK17Resumed(100, t0, 100_000, t0 + 50));
+    try std.testing.expect(!try gapK17Resumed(100, t0, 100_000, t0 + 101));
+    // No issue time was sealed. A clock at accept rejects the ticket.
+    try std.testing.expect(!try gapK17Resumed(100, null, 100_000, t0 + 1));
+    std.debug.print("GAP-K17 branch=a ticket dies with the lifetime sealed at mint\n", .{});
 }
 
 /// Shared harness for the RFC 8446 §8.2–8.3 freshness-window tests: issue a
