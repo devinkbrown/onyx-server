@@ -4925,6 +4925,7 @@ pub const LinuxServer = struct {
         self.restoreDurableGags();
         self.restoreDurableAbuse();
         self.restoreDurableVhosts();
+        self.restoreProofChain();
     }
 
     /// By-value construction, kept for callers that own the result directly.
@@ -23394,6 +23395,35 @@ pub const LinuxServer = struct {
         vhost_durable.restoreInto(svc.store, &self.guises) catch |err| {
             srvLog("onyx-server: vhost durable restore failed closed ({s})\n", .{@errorName(err)});
         };
+    }
+
+    fn persistProofChain(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        const blob = self.oper_audit.writeChain(self.allocator) catch |err| {
+            srvLog("onyx-server: proof chain snapshot failed ({s})\n", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(blob);
+        svc.store.put(.props, svc_operaudit.chain_store_key, blob) catch |err| {
+            srvLog("onyx-server: proof chain snapshot failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn restoreProofChain(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        const blob = svc.store.get(.props, svc_operaudit.chain_store_key) orelse return;
+        self.oper_audit.readChain(blob) catch |err| {
+            srvLog("onyx-server: proof chain restore failed closed ({s})\n", .{@errorName(err)});
+            self.oper_audit.markChainBroken();
+        };
+    }
+
+    fn sealProofChain(self: *LinuxServer) void {
+        const head = self.oper_audit.chainHead() orelse return;
+        const kp = self.meshSignKey() orelse return;
+        const msg = svc_operaudit.chainHeadMessage(head);
+        const sig = kp.sign(&msg, null) catch return;
+        self.oper_audit.seal(head, sig.toBytes(), kp.public_key.toBytes());
     }
 
     fn restoreDurableMemos(self: *LinuxServer) void {
@@ -50545,6 +50575,8 @@ pub const LinuxServer = struct {
         var proof_pub_buf: [@sizeOf(proofmark.PublicKey) * 2]u8 = undefined;
         const proof = self.operProofEvidence(ts, oper, action, target, reason, &proof_id_buf, &proof_sig_buf, &proof_pub_buf);
         _ = self.oper_audit.recordWithProofEvidence(ts, oper, action, target, reason, proof) catch return null;
+        self.sealProofChain();
+        self.persistProofChain();
         if (proof) |p| {
             if (p.id.len != proofmark.proof_id_hex_len) return null;
             var out: [proofmark.proof_id_hex_len]u8 = undefined;
@@ -69657,6 +69689,118 @@ fn gapK2Peer(server: *Server, conn: *ConnState, node: []const u8) ![]const u8 {
     conn.send_len = 0;
     try server.handleKeyTrans(conn, &lv);
     return conn.send_buf[0..conn.send_len];
+}
+
+fn expectNodeProof(ident: *const node_identity.NodeIdentity, entry: *const svc_operaudit.Entry) !void {
+    try std.testing.expect(entry.proof_signature.len == @sizeOf(proofmark.Signature) * 2);
+    try std.testing.expect(entry.proof_public_key.len == @sizeOf(proofmark.PublicKey) * 2);
+    var sig: proofmark.Signature = undefined;
+    var stored_pk: proofmark.PublicKey = undefined;
+    _ = std.fmt.hexToBytes(&sig, entry.proof_signature) catch return error.TestExpectedEqual;
+    _ = std.fmt.hexToBytes(&stored_pk, entry.proof_public_key) catch return error.TestExpectedEqual;
+    try std.testing.expectEqualSlices(u8, &ident.sign_kp.public_key, &stored_pk);
+    const proof = proofmark.Proof{
+        .actor = entry.oper,
+        .target = entry.target,
+        .action = entry.proof_action,
+        .reason_hash = entry.proof_reason_hash,
+        .policy_version = entry.proof_policy_version,
+        .issued_ms = entry.proof_issued_ms,
+        .expiry_ms = entry.proof_expiry_ms,
+    };
+    try std.testing.expect(proofmark.verify(proof, sig, ident.sign_kp.public_key));
+    var id_buf: [proofmark.proof_id_hex_len]u8 = undefined;
+    const id = try proofmark.proofIdHex(proof, sig, &id_buf);
+    try std.testing.expectEqualStrings(id, entry.proof_id);
+}
+
+test "GAP-K3 a node public key verifies a ban or kick after restart and a removed entry breaks the chain" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wal_name = "server-proof-chain.wal";
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x3a)), "proof-chain");
+    defer ident.deinit();
+    var kline_id: [proofmark.proof_id_hex_len]u8 = undefined;
+    var kick_id: [proofmark.proof_id_hex_len]u8 = undefined;
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        const server = createTestServer(std.testing.allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .account_services = &services,
+            .node_identity = &ident,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer std.testing.allocator.destroy(server);
+        defer server.deinit();
+        const ban = server.recordOperAudit("op", .kline, "*@spam", "flood") orelse return error.TestExpectedEqual;
+        const kick_proof = server.recordOperAudit("op", .kick, "#room nick", "flood") orelse return error.TestExpectedEqual;
+        _ = server.recordOperAudit("op", .shun, "bad!*@*", "flood") orelse return error.TestExpectedEqual;
+        kline_id = ban;
+        kick_id = kick_proof;
+        try std.testing.expect(server.oper_audit.chainStatus(ident.sign_kp.public_key) == .intact);
+        try expectNodeProof(&ident, server.oper_audit.findByProofId(&kline_id).?);
+        try expectNodeProof(&ident, server.oper_audit.findByProofId(&kick_id).?);
+        try std.testing.expectEqual(svc_operaudit.Action.kline, server.oper_audit.findByProofId(&kline_id).?.action);
+        try std.testing.expectEqual(svc_operaudit.Action.kick, server.oper_audit.findByProofId(&kick_id).?.action);
+    }
+
+    var tampered_holder: []u8 = &.{};
+    defer if (tampered_holder.len != 0) std.testing.allocator.free(tampered_holder);
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        const server = createTestServer(std.testing.allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .account_services = &services,
+            .node_identity = &ident,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer std.testing.allocator.destroy(server);
+        defer server.deinit();
+        try std.testing.expectEqual(@as(usize, 3), server.oper_audit.len());
+        try std.testing.expect(server.oper_audit.chainStatus(ident.sign_kp.public_key) == .intact);
+        const ban = server.oper_audit.findByProofId(&kline_id).?;
+        const kick_proof = server.oper_audit.findByProofId(&kick_id).?;
+        try expectNodeProof(&ident, ban);
+        try expectNodeProof(&ident, kick_proof);
+        try std.testing.expect(LinuxServer.auditProofVerified(ban));
+        try std.testing.expect(LinuxServer.auditProofVerified(kick_proof));
+        const blob = store.get(.props, svc_operaudit.chain_store_key) orelse return error.TestExpectedEqual;
+        tampered_holder = try svc_operaudit.omitEncodedEntry(std.testing.allocator, blob, 1);
+        try store.put(.props, svc_operaudit.chain_store_key, tampered_holder);
+    }
+
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        const server = createTestServer(std.testing.allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .account_services = &services,
+            .node_identity = &ident,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer std.testing.allocator.destroy(server);
+        defer server.deinit();
+        try std.testing.expectEqual(@as(usize, 2), server.oper_audit.len());
+        try std.testing.expect(server.oper_audit.chainStatus(ident.sign_kp.public_key) == .broken);
+        try std.testing.expect(server.oper_audit.findByProofId(&kick_id) == null);
+        try expectNodeProof(&ident, server.oper_audit.findByProofId(&kline_id).?);
+    }
+    std.debug.print("GAP-K3 branch=a node public key verifies a ban or kick after restart and a removed entry breaks the chain\n", .{});
 }
 
 test "KEYTRANS DEVICE and EVENT survive store restart" {

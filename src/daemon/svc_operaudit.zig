@@ -124,6 +124,41 @@ pub const Action = enum {
             .other => 255,
         };
     }
+
+    pub fn fromProofCode(code: u8) ?Action {
+        return switch (code) {
+            1 => .kill,
+            2 => .kline,
+            3 => .shun,
+            4 => .jupe,
+            5 => .mode,
+            6 => .akill,
+            7 => .unkline,
+            8 => .gline,
+            9 => .kick,
+            10 => .oper_up,
+            11 => .rehash,
+            12 => .die,
+            13 => .restart,
+            14 => .ward_add,
+            15 => .unshun,
+            16 => .ward_del,
+            17 => .connect,
+            18 => .squit,
+            19 => .redact,
+            20 => .access_add,
+            21 => .access_delete,
+            22 => .access_clear,
+            23 => .forcejoin,
+            24 => .forcepart,
+            25 => .forceop,
+            26 => .forcedeop,
+            27 => .forcetopic,
+            28 => .access_copy,
+            255 => .other,
+            else => null,
+        };
+    }
 };
 
 /// A single recorded oper action. Strings are owned by the ring.
@@ -152,6 +187,10 @@ pub const Entry = struct {
     proof_action: u8 = 0,
     proof_issued_ms: i64 = 0,
     proof_expiry_ms: i64 = 0,
+    /// Link of the previous retained entry. Zeros only when this entry was the
+    /// first record ever. Oldest-eviction leaves a non-zero prefix here; that
+    /// prefix is not a break.
+    chain_prev: proofmark.Digest = @splat(0),
 };
 
 pub const ProofEvidence = struct {
@@ -178,6 +217,14 @@ pub const OperAudit = struct {
     count: usize,
     /// Next sequence number to assign.
     next_seq: u64,
+    /// BLAKE3 link of the newest entry, signed when `chain_sealed` is set.
+    chain_head: proofmark.Digest = @splat(0),
+    chain_sig: proofmark.Signature = @splat(0),
+    chain_pubkey: proofmark.PublicKey = @splat(0),
+    chain_sealed: bool = false,
+    /// A blob that failed to decode. Later intact records stay untrusted
+    /// until a successful `readChain` replaces this ring.
+    chain_broken: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) OperAudit {
         return .{
@@ -277,6 +324,11 @@ pub const OperAudit = struct {
         const owned_public_key = try self.allocator.dupe(u8, proof_public_key);
         errdefer self.allocator.free(owned_public_key);
 
+        const chain_prev: proofmark.Digest = if (self.count == 0)
+            @splat(0)
+        else
+            linkOf(self.at(self.count - 1).?);
+
         const seq = self.next_seq;
         // Saturate rather than overflow on an absurdly long-lived process.
         self.next_seq = std.math.add(u64, self.next_seq, 1) catch std.math.maxInt(u64);
@@ -307,6 +359,7 @@ pub const OperAudit = struct {
             .proof_action = if (proof) |p| p.action else action.proofCode(),
             .proof_issued_ms = if (proof) |p| p.issued_ms else ts,
             .proof_expiry_ms = if (proof) |p| p.expiry_ms else 0,
+            .chain_prev = chain_prev,
         };
         return seq;
     }
@@ -416,7 +469,309 @@ pub const OperAudit = struct {
         }
         return buf.toOwnedSlice(allocator);
     }
+
+    pub fn chainHead(self: *const OperAudit) ?proofmark.Digest {
+        if (self.count == 0) return null;
+        return linkOf(self.at(self.count - 1).?);
+    }
+
+    pub fn seal(self: *OperAudit, head: proofmark.Digest, signature: proofmark.Signature, public_key: proofmark.PublicKey) void {
+        self.chain_head = head;
+        self.chain_sig = signature;
+        self.chain_pubkey = public_key;
+        self.chain_sealed = true;
+    }
+
+    pub fn markChainBroken(self: *OperAudit) void {
+        self.chain_broken = true;
+    }
+
+    /// Intact only when every retained link matches and `node_public_key`
+    /// signed the head. A missing seal, a different key, or a removed entry
+    /// is broken. An empty unsealed ring is empty.
+    pub fn chainStatus(self: *const OperAudit, node_public_key: proofmark.PublicKey) ChainStatus {
+        if (self.chain_broken) return .broken;
+        if (self.count == 0) return if (self.chain_sealed) .broken else .empty;
+        var i: usize = 1;
+        while (i < self.count) : (i += 1) {
+            const prev = self.at(i - 1).?;
+            const cur = self.at(i).?;
+            const expect = linkOf(prev);
+            if (!std.mem.eql(u8, &cur.chain_prev, &expect)) return .broken;
+        }
+        if (!self.chain_sealed) return .broken;
+        const head = linkOf(self.at(self.count - 1).?);
+        if (!std.mem.eql(u8, &head, &self.chain_head)) return .broken;
+        if (!std.mem.eql(u8, &self.chain_pubkey, &node_public_key)) return .broken;
+        if (!verifyChainSeal(self.chain_head, self.chain_sig, self.chain_pubkey)) return .broken;
+        return .intact;
+    }
+
+    pub fn writeChain(self: *const OperAudit, allocator: std.mem.Allocator) ChainError![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        try buf.appendSlice(allocator, chain_magic);
+        try buf.append(allocator, chain_version);
+        try buf.append(allocator, if (self.chain_sealed) 1 else 0);
+        try appendInt(&buf, allocator, u16, @intCast(self.count));
+        try appendInt(&buf, allocator, u64, self.next_seq);
+        try buf.appendSlice(allocator, &self.chain_head);
+        try buf.appendSlice(allocator, &self.chain_sig);
+        try buf.appendSlice(allocator, &self.chain_pubkey);
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            try appendEntry(&buf, allocator, self.at(i).?);
+        }
+        return buf.toOwnedSlice(allocator);
+    }
+
+    pub fn readChain(self: *OperAudit, blob: []const u8) ChainError!void {
+        const loaded = try self.allocator.create(OperAudit);
+        errdefer self.allocator.destroy(loaded);
+        loaded.* = OperAudit.init(self.allocator);
+        errdefer loaded.deinit();
+        try decodeInto(loaded, blob);
+        self.deinit();
+        const moved = loaded.*;
+        self.allocator.destroy(loaded);
+        self.* = moved;
+    }
 };
+
+pub const chain_store_key = "pm1:chain";
+pub const chain_head_domain = "onyx-proof-chain-head-v1";
+pub const chain_head_message_len: usize = chain_head_domain.len + 32;
+
+pub const ChainStatus = enum { empty, intact, broken };
+
+pub const ChainError = error{
+    Truncated,
+    Corrupt,
+    StringTooLong,
+    OutOfRange,
+} || std.mem.Allocator.Error;
+
+const chain_magic = "PM1CHAIN";
+const chain_version: u8 = 1;
+
+pub fn chainHeadMessage(head: proofmark.Digest) [chain_head_message_len]u8 {
+    var out: [chain_head_message_len]u8 = undefined;
+    @memcpy(out[0..chain_head_domain.len], chain_head_domain);
+    @memcpy(out[chain_head_domain.len..], &head);
+    return out;
+}
+
+pub fn verifyChainSeal(head: proofmark.Digest, signature: proofmark.Signature, public_key: proofmark.PublicKey) bool {
+    const msg = chainHeadMessage(head);
+    const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(public_key) catch return false;
+    const sig = std.crypto.sign.Ed25519.Signature.fromBytes(signature);
+    sig.verifyStrict(&msg, pk) catch return false;
+    return true;
+}
+
+/// Rebuild `blob` without the entry at `index`. Links and the signed head
+/// stay as they were, so a later read reports a broken chain.
+pub fn omitEncodedEntry(allocator: std.mem.Allocator, blob: []const u8, index: usize) ChainError![]u8 {
+    var src = OperAudit.init(allocator);
+    defer src.deinit();
+    try src.readChain(blob);
+    if (index >= src.count) return error.OutOfRange;
+    var dst = OperAudit.init(allocator);
+    defer dst.deinit();
+    var i: usize = 0;
+    while (i < src.count) : (i += 1) {
+        if (i == index) continue;
+        try copyEntry(&dst, src.at(i).?);
+    }
+    dst.next_seq = src.next_seq;
+    dst.chain_head = src.chain_head;
+    dst.chain_sig = src.chain_sig;
+    dst.chain_pubkey = src.chain_pubkey;
+    dst.chain_sealed = src.chain_sealed;
+    return dst.writeChain(allocator);
+}
+
+fn linkOf(entry: *const Entry) proofmark.Digest {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update("onyx-proof-chain-v1");
+    var seq_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seq_buf, entry.seq, .little);
+    hasher.update(&seq_buf);
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, @as(u64, entry.proof_id.len), .little);
+    hasher.update(&len_buf);
+    hasher.update(entry.proof_id);
+    hasher.update(&entry.chain_prev);
+    var out: proofmark.Digest = undefined;
+    hasher.final(&out);
+    return out;
+}
+
+fn copyEntry(self: *OperAudit, src: *const Entry) ChainError!void {
+    const oper = try self.allocator.dupe(u8, src.oper);
+    errdefer self.allocator.free(oper);
+    const target = try self.allocator.dupe(u8, src.target);
+    errdefer self.allocator.free(target);
+    const reason = try self.allocator.dupe(u8, src.reason);
+    errdefer self.allocator.free(reason);
+    const proof_id = try self.allocator.dupe(u8, src.proof_id);
+    errdefer self.allocator.free(proof_id);
+    const proof_signature = try self.allocator.dupe(u8, src.proof_signature);
+    errdefer self.allocator.free(proof_signature);
+    const proof_public_key = try self.allocator.dupe(u8, src.proof_public_key);
+    errdefer self.allocator.free(proof_public_key);
+    if (self.count >= OperAudit.cap) return error.Corrupt;
+    const idx = (self.start + self.count) % OperAudit.cap;
+    self.slots[idx] = .{
+        .seq = src.seq,
+        .ts = src.ts,
+        .oper = oper,
+        .action = src.action,
+        .target = target,
+        .reason = reason,
+        .proof_id = proof_id,
+        .proof_signature = proof_signature,
+        .proof_public_key = proof_public_key,
+        .proof_reason_hash = src.proof_reason_hash,
+        .proof_policy_version = src.proof_policy_version,
+        .proof_action = src.proof_action,
+        .proof_issued_ms = src.proof_issued_ms,
+        .proof_expiry_ms = src.proof_expiry_ms,
+        .chain_prev = src.chain_prev,
+    };
+    self.count += 1;
+}
+
+fn appendInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime T: type, value: T) !void {
+    var tmp: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &tmp, value, .little);
+    try buf.appendSlice(allocator, &tmp);
+}
+
+fn appendStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, bytes: []const u8) !void {
+    if (bytes.len > std.math.maxInt(u16)) return error.StringTooLong;
+    try appendInt(buf, allocator, u16, @intCast(bytes.len));
+    try buf.appendSlice(allocator, bytes);
+}
+
+fn appendEntry(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, entry: *const Entry) !void {
+    try appendInt(buf, allocator, u64, entry.seq);
+    try appendInt(buf, allocator, u64, @bitCast(entry.ts));
+    try buf.append(allocator, entry.action.proofCode());
+    try buf.appendSlice(allocator, &entry.proof_reason_hash);
+    try appendInt(buf, allocator, u32, entry.proof_policy_version);
+    try buf.append(allocator, entry.proof_action);
+    try appendInt(buf, allocator, u64, @bitCast(entry.proof_issued_ms));
+    try appendInt(buf, allocator, u64, @bitCast(entry.proof_expiry_ms));
+    try buf.appendSlice(allocator, &entry.chain_prev);
+    try appendStr(buf, allocator, entry.oper);
+    try appendStr(buf, allocator, entry.target);
+    try appendStr(buf, allocator, entry.reason);
+    try appendStr(buf, allocator, entry.proof_id);
+    try appendStr(buf, allocator, entry.proof_signature);
+    try appendStr(buf, allocator, entry.proof_public_key);
+}
+
+fn decodeInto(self: *OperAudit, blob: []const u8) ChainError!void {
+    var pos: usize = 0;
+    if (blob.len < chain_magic.len + 1 + 1 + 2 + 8 + 32 + 64 + 32) return error.Truncated;
+    if (!std.mem.eql(u8, blob[0..chain_magic.len], chain_magic)) return error.Corrupt;
+    pos = chain_magic.len;
+    if (blob[pos] != chain_version) return error.Corrupt;
+    pos += 1;
+    const flags = blob[pos];
+    pos += 1;
+    if (flags > 1) return error.Corrupt;
+    const count = try readInt(u16, blob, &pos);
+    if (count > OperAudit.cap) return error.Corrupt;
+    const next_seq = try readInt(u64, blob, &pos);
+    self.chain_head = try readArray(32, blob, &pos);
+    self.chain_sig = try readArray(64, blob, &pos);
+    self.chain_pubkey = try readArray(32, blob, &pos);
+    self.chain_sealed = flags == 1;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        try decodeEntry(self, blob, &pos);
+    }
+    if (pos != blob.len) return error.Corrupt;
+    if (count > 0) {
+        const newest = self.at(count - 1).?;
+        if (newest.seq != std.math.maxInt(u64) and next_seq <= newest.seq) return error.Corrupt;
+    }
+    self.next_seq = next_seq;
+}
+
+fn decodeEntry(self: *OperAudit, blob: []const u8, pos: *usize) ChainError!void {
+    const seq = try readInt(u64, blob, pos);
+    const ts: i64 = @bitCast(try readInt(u64, blob, pos));
+    if (pos.* >= blob.len) return error.Truncated;
+    const action_code = blob[pos.*];
+    pos.* += 1;
+    const action = Action.fromProofCode(action_code) orelse return error.Corrupt;
+    const reason_hash = try readArray(32, blob, pos);
+    const policy = try readInt(u32, blob, pos);
+    if (pos.* >= blob.len) return error.Truncated;
+    const proof_action = blob[pos.*];
+    pos.* += 1;
+    const issued: i64 = @bitCast(try readInt(u64, blob, pos));
+    const expiry: i64 = @bitCast(try readInt(u64, blob, pos));
+    const chain_prev = try readArray(32, blob, pos);
+    const oper = try readStr(self.allocator, blob, pos);
+    errdefer self.allocator.free(oper);
+    const target = try readStr(self.allocator, blob, pos);
+    errdefer self.allocator.free(target);
+    const reason = try readStr(self.allocator, blob, pos);
+    errdefer self.allocator.free(reason);
+    const proof_id = try readStr(self.allocator, blob, pos);
+    errdefer self.allocator.free(proof_id);
+    const proof_signature = try readStr(self.allocator, blob, pos);
+    errdefer self.allocator.free(proof_signature);
+    const proof_public_key = try readStr(self.allocator, blob, pos);
+    errdefer self.allocator.free(proof_public_key);
+    if (self.count >= OperAudit.cap) return error.Corrupt;
+    const idx = (self.start + self.count) % OperAudit.cap;
+    self.slots[idx] = .{
+        .seq = seq,
+        .ts = ts,
+        .oper = oper,
+        .action = action,
+        .target = target,
+        .reason = reason,
+        .proof_id = proof_id,
+        .proof_signature = proof_signature,
+        .proof_public_key = proof_public_key,
+        .proof_reason_hash = reason_hash,
+        .proof_policy_version = policy,
+        .proof_action = proof_action,
+        .proof_issued_ms = issued,
+        .proof_expiry_ms = expiry,
+        .chain_prev = chain_prev,
+    };
+    self.count += 1;
+}
+
+fn readInt(comptime T: type, blob: []const u8, pos: *usize) ChainError!T {
+    if (pos.* + @sizeOf(T) > blob.len) return error.Truncated;
+    const value = std.mem.readInt(T, blob[pos.*..][0..@sizeOf(T)], .little);
+    pos.* += @sizeOf(T);
+    return value;
+}
+
+fn readArray(comptime n: usize, blob: []const u8, pos: *usize) ChainError![n]u8 {
+    if (pos.* + n > blob.len) return error.Truncated;
+    var out: [n]u8 = undefined;
+    @memcpy(&out, blob[pos.*..][0..n]);
+    pos.* += n;
+    return out;
+}
+
+fn readStr(allocator: std.mem.Allocator, blob: []const u8, pos: *usize) ChainError![]u8 {
+    const n = try readInt(u16, blob, pos);
+    if (pos.* + n > blob.len) return error.Truncated;
+    const out = try allocator.dupe(u8, blob[pos.*..][0..n]);
+    pos.* += n;
+    return out;
+}
 
 // ----------------------------------------------------------------------------
 // Tests
@@ -651,4 +1006,62 @@ test "action labels round-trip" {
     try testing.expectEqualStrings("kill", Action.kill.label());
     try testing.expectEqualStrings("akill", Action.akill.label());
     try testing.expectEqualStrings("other", Action.other.label());
+}
+
+test "GAP-K3 a removed entry breaks the signed proof chain" {
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x51)));
+    const pk = kp.public_key.toBytes();
+    var empty = OperAudit.init(testing.allocator);
+    defer empty.deinit();
+    try testing.expect(empty.chainStatus(pk) == .empty);
+
+    var audit = OperAudit.init(testing.allocator);
+    defer audit.deinit();
+    _ = try audit.record(1, "op", .kline, "*@spam", "flood");
+    _ = try audit.record(2, "op", .kick, "nick", "flood");
+    _ = try audit.record(3, "op", .shun, "bad", "flood");
+    const head = audit.chainHead().?;
+    const msg = chainHeadMessage(head);
+    const sig = try kp.sign(&msg, null);
+    audit.seal(head, sig.toBytes(), pk);
+    try testing.expect(audit.chainStatus(pk) == .intact);
+
+    const blob = try audit.writeChain(testing.allocator);
+    defer testing.allocator.free(blob);
+    var restored = OperAudit.init(testing.allocator);
+    defer restored.deinit();
+    try restored.readChain(blob);
+    try testing.expectEqual(@as(usize, 3), restored.len());
+    try testing.expect(restored.chainStatus(pk) == .intact);
+    const other = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x52)));
+    try testing.expect(restored.chainStatus(other.public_key.toBytes()) == .broken);
+
+    const middle = try omitEncodedEntry(testing.allocator, blob, 1);
+    defer testing.allocator.free(middle);
+    var broken = OperAudit.init(testing.allocator);
+    defer broken.deinit();
+    try broken.readChain(middle);
+    try testing.expectEqual(@as(usize, 2), broken.len());
+    try testing.expect(broken.chainStatus(pk) == .broken);
+
+    const tail = try omitEncodedEntry(testing.allocator, blob, 2);
+    defer testing.allocator.free(tail);
+    var tailless = OperAudit.init(testing.allocator);
+    defer tailless.deinit();
+    try tailless.readChain(tail);
+    try testing.expectEqual(@as(usize, 2), tailless.len());
+    try testing.expect(tailless.chainStatus(pk) == .broken);
+
+    var full = OperAudit.init(testing.allocator);
+    defer full.deinit();
+    var i: usize = 0;
+    while (i < OperAudit.cap + 3) : (i += 1) {
+        _ = try full.record(@intCast(i), "op", .kline, "t", "r");
+    }
+    const full_head = full.chainHead().?;
+    const full_msg = chainHeadMessage(full_head);
+    const full_sig = try kp.sign(&full_msg, null);
+    full.seal(full_head, full_sig.toBytes(), pk);
+    try testing.expect(full.chainStatus(pk) == .intact);
+    try testing.expect(full.at(0).?.seq != 1);
 }
