@@ -1180,3 +1180,186 @@ Server ships first for each of these. The client repo is `/home/kain/onyx`.
 
 Capability and token additions stay server-first. A client-only reinterpretation
 of an existing tag can ship client-first.
+
+---
+
+## 16. Audit findings (2026-09-29)
+
+Recorded from the Armor TLS audit and the mesh scale audit. These ids are not
+in the section 13 order. The AEAD stream counter wrap is already fixed and is
+not restated here. None of the Armor rows below are fixed in the tree this
+section was written against.
+
+### GAP-K8 — HelloRetryRequest PSK binder covers the wrong transcript
+
+**Size M.** `tls_server.zig` `verifyPskBinderT` hashes only the truncated
+ClientHello. After HelloRetryRequest the client binder
+(`tls_client.zig`, the PSK binder transcript) is
+`message_hash(ClientHello1) || HRR || truncated ClientHello2`. A valid binder
+fails, `tryAcceptPsk` returns null, and the server continues a certificate
+handshake instead of aborting (RFC 8446 §4.2.11.2) or resuming. A binder that
+omits the retry transcript is the one the server accepts.
+
+**Accept:** an HRR resumption with a correct binder resumes, and a binder that
+omits ClientHello1 or the HelloRetryRequest is rejected. A regression drives
+the shipped server and client functions.
+
+### GAP-K9 — EndOfEarlyData is not in the handshake transcript
+
+**Size M.** `processAcceptedEarlyRecords` requires `EndOfEarlyData` and then
+sets `early_data_done` without appending it. The client emits the message in
+`start` and also never appends it before `writeClientFinishedRecord` or the
+resumption master secret. RFC 8446 §4.4.1 places that message after the server
+Finished and before the client Finished.
+
+**Accept:** accepted 0-RTT puts `EndOfEarlyData` on both transcripts. The
+client Finished and the resumption PSK cover it. A transcript that differs
+only by that message fails Finished verification.
+
+### GAP-K10 — 0-RTT is accepted again when nothing records the binder
+
+**Size M.** When `replay_guard` is null, the 0-RTT check sets `replay_ok` to
+true (`tls_server.zig`, the early-data branch in ClientHello). `ticketAgeWithinWindow`
+returns fresh when `ticket_age_add` is missing or `issued_unix_ms` is 0, and
+the age check does not run when `now_unix_seconds` is null. `max_early_data_size`
+defaults to 0; once a ticket advertises early data, this branch still accepts.
+
+**Accept:** with early data enabled, a second copy of the same 0-RTT flight is
+rejected when no `ReplayGuard` is installed, when the ticket has no age add or
+no issue time, and when no clock is set. 1-RTT resumption of an unexpired
+ticket still completes.
+
+### GAP-K11 — Trust-anchor constraints never bind the path
+
+**Size M.** `verifyChainToTrustAnchors` (`tls_client.zig`) enforces CA,
+`keyCertSign`, name constraints, and path length only for certificates inside
+the presented chain. On a DN and signature match it returns without reading
+the anchor's name constraints or `pathLenConstraint`. RFC 5280 initializes
+both from the trust anchor, which a normal TLS chain omits. In-chain
+`enforceNameConstraints` is called with the leaf only, so an intermediate's
+own dNSName is not checked against the CA that constrained it.
+
+**Accept:** a name-constrained or pathLen-0 anchor rejects a leaf outside the
+constraint and a non-self-issued intermediate the path length forbids, even
+when the anchor is not resent in the chain. An intermediate whose own dNSName
+falls outside its issuer's permitted subtree, or inside an excluded subtree,
+is rejected. The same chain still verifies when every certificate is inside
+the constraints.
+
+### GAP-K12 — A leaf that forbids digitalSignature still verifies
+
+**Size S.** The leaf check in `verifyChainToTrustAnchors` stops at EKU
+`serverAuth`. When `keyUsage` is present and `digitalSignature` is clear,
+verification continues. An issuer in the chain is already rejected when
+`keyCertSign` is clear.
+
+**Accept:** a leaf whose `keyUsage` omits `digitalSignature` fails before
+CertificateVerify. A leaf with no `keyUsage` extension, and a leaf that sets
+the bit, still verifies.
+
+### GAP-K13 — Application traffic sequence numbers wrap
+
+**Size M.** Server `app_write_seq` / `app_read_seq` and the client counterparts
+are bare `u64` increments. `Seq64.next` in `tls.zig` refuses to emit the
+maximum so a nonce cannot wrap, and these seal/open paths do not call it. The
+shipping daemon is built ReleaseFast, which does not trap the overflow.
+
+**Accept:** the record after `2^64 - 1` under one application traffic key
+fails closed on both the client and the server. Nonce 0 is not reused. A
+regression calls the shipped seal or open path, not a copied counter.
+
+### GAP-K14 — Critical CRL and SCT extensions are treated as understood
+
+**Size S.** `extensionOidIsSupported` in `x509.zig` returns true for
+`cRLDistributionPoints` (2.5.29.31) and the CT SCT list
+(1.3.6.1.4.1.11129.2.4.2). `parseExtensions` does not interpret either OID and
+does not mark it handled, so `rejectUnsupportedCriticalExtension` does not
+fire. RFC 5280 §4.2 requires a verifier that does not process a critical
+extension to reject the certificate.
+
+**Accept:** a critical CRL distribution point or a critical embedded SCT list
+fails closed. A non-critical copy of either extension may still be ignored.
+This does not turn on live CRL or CT fetch (GAP-K6).
+
+### GAP-K15 — An IP literal matches a DNS name
+
+**Size M.** `dnsNameMatchesCert` compares `server_name` only to `san_dns`.
+`dnsPatternMatches` treats a left-most `*.` label as one DNS label and does
+not reject an address. `san_ips` is parsed in `x509.zig` and then ignored.
+RFC 9525: an IP verify name matches an `iPAddress` SAN only.
+
+**Accept:** `1.2.3.4` does not match a dNSName of that text or `*.2.3.4`. It
+matches an `iPAddress` SAN of that address. A DNS name still matches `san_dns`,
+including a single-label wildcard, and still does not match an `iPAddress`.
+
+### GAP-K16 — The client offers a ticket past its lifetime
+
+**Size S.** A stored ticket is offered, and may carry 0-RTT, with no check
+that `ticket_age_ms` is within `ticket_lifetime` (seconds) or the 7-day cap.
+`ResumeOffer.ticket_lifetime` is stored and not read on the offer path
+(`tls_client.zig`).
+
+**Accept:** a ticket older than its advertised lifetime, or older than seven
+days, is not offered and is not used for early data. A ticket inside both
+bounds is still offered.
+
+### GAP-K17 — Ticket lifetime is the current config, and missing issue times never expire
+
+**Size S.** `tryAcceptPsk` enforces lifetime only when a clock is set and
+`issued_unix_ms` truncates to a non-zero second count. The window is
+`effectiveTicketLifetimeSeconds` of the accepting node's current
+`ticket_lifetime_seconds`. The lifetime advertised when the ticket was minted
+is not sealed in the ticket.
+
+**Accept:** a ticket minted with no issue time is rejected once a clock is
+configured. Lengthening `ticket_lifetime_seconds`, or opening the ticket on a
+peer with a longer config and the same ticket key, does not keep the PSK
+alive past the lifetime that was advertised at mint. A ticket inside that
+sealed lifetime still resumes.
+
+### GAP-K18 — Turning 0-RTT off does not bind tickets already sealed with a limit
+
+**Size S.** The 0-RTT gate reads the sealed ticket's `max_early_data_size`
+(`accepted_early_data_limit`), not `config.max_early_data_size`. The config
+comment says zero disables acceptance. The accept path does not read that
+field. New tickets are sealed from the config; old tickets are not.
+
+**Accept:** `max_early_data_size = 0` refuses early data for every ticket,
+including one sealed earlier with a positive limit and one sealed by another
+node that shares the ticket key. A non-zero config still accepts early data
+only up to the smaller of the config and the sealed limit.
+
+### GAP-M1 — A version vector refuses the 65th replica
+
+**Size M.** `VersionVector.max_entries` is 64. `increment` returns
+`error.CapacityExceeded` at the 65th replica (`clock.zig`). `member_compact.max_context`
+is the same 64 and rejects a larger context as `Oversize`. The vector is a
+value type: callers copy it and read `entries` directly, and several size
+wire buffers from `max_entries`. Growing the two files alone leaves those
+callers wrong. The mesh scale audit did not own this pair; the Codex lane
+confirmed the ceiling and made no edit.
+
+**Accept:** 65 replicas merge and round-trip through `member_compact` without
+`CapacityExceeded` or `Oversize`. Callers that copy a vector or size a buffer
+from the entry count still build. A gossip sample size of 64 that still stores
+every member is not this item.
+
+### GAP-M2 — Mesh ceilings the scale audit did not confirm
+
+**Size S.** Three candidates were reported and the confirm pass rejected all
+three as a hard lock at 64.
+
+| Candidate | What the code does | Why confirm rejected it |
+| --- | --- | --- |
+| `route_table.zig` `addMember` | The 65th distinct node returns `error.ChannelFanoutFull` when `len == nodes.len`. `nodes.len` is `Config.max_nodes_per_channel` (default 64). | TOML admits `4..4096`. A config above 64 inserts the 65th node. |
+| `membership_view.zig` `add passiveEntry` | At `passive_capacity` the next distinct node overwrites `passive[rng.index]` and the previous node leaves the view. Default capacity 64. | `mesh.gossip.view_passive_capacity` admits `active+1..4096`. |
+| `gossip_views.zig` `add passive` | Same overwrite at `passive_max` (default 64). | `passive_view_max=128` is accepted. |
+
+Gossip rounds, the server registry, mesh topology, and the partition detector
+produced no finding in that pass. `server_registry` already defaults to 512.
+
+**Accept:** leave these three alone unless a test shows a path that still
+refuses or overwrites at 64 after the operator ceiling is raised above 64.
+Do not replace the partition detector's adjacency matrix under this id. The
+drop-on-full behavior of a full passive view, at whatever capacity is
+configured, stays the view's eviction rule.
