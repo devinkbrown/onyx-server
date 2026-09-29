@@ -44,6 +44,10 @@ fn appealCmd(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleAppeal(x.conn, x.parsed);
 }
+fn challengeCmd(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleChallenge(x.id, x.conn, x.parsed);
+}
 fn media(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMedia(x.id, x.conn, x.parsed);
@@ -87,6 +91,7 @@ pub const module = registry.Module{
         .{ .name = "DEFER", .min_params = 4, .access = .registered, .handler = deferCmd, .summary = "Defer a channel message or an oper mode until a timestamp or a cron fire" },
         .{ .name = "UNFURL", .min_params = 1, .access = .registered, .handler = unfurlCmd, .summary = "Opt-in https link preview. Default off. UNFURL OFF refuses previews" },
         .{ .name = "APPEAL", .min_params = 1, .access = .any, .handler = appealCmd, .summary = "File one ban appeal per window without joining. Oper LIST and ANSWER are audited" },
+        .{ .name = "CHALLENGE", .min_params = 1, .access = .oper, .handler = challengeCmd, .summary = "Set the pre-001 challenge method or question. An unregistered client answers with CHALLENGE" },
         .{ .name = "MEDIA", .feature = "media", .handler = media },
         .{ .name = "MEMO", .handler = memoCmd },
         .{ .name = "WEBPUSH", .handler = webpushCmd, .summary = "Browser push subscriptions (VAPID/SUBSCRIBE/UNSUBSCRIBE/LIST)" },

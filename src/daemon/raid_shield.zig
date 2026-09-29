@@ -80,6 +80,13 @@ pub const Shield = struct {
         return self.channels.count();
     }
 
+    /// True when a correlated burst has engaged at least one channel.
+    pub fn engaged(self: *Shield) bool {
+        var it = self.channels.iterator();
+        while (it.next()) |entry| if (entry.value_ptr.engaged) return true;
+        return false;
+    }
+
     pub fn sketchCells(self: *const Shield) usize {
         return self.joins.width * self.joins.depth;
     }

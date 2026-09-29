@@ -243,6 +243,7 @@ const tls_resumption = @import("../crypto/tls_resumption.zig");
 const http_fetch = @import("http_fetch.zig");
 const unfurl = @import("unfurl.zig");
 const appeal = @import("appeal.zig");
+const challenge_mod = @import("challenge.zig");
 
 /// Per-channel cross-leg media bridge (native ↔ opt-in WebRTC roster).
 const Bridge = media_bridge_mod.ChannelBridge(native_media_mod.max_call_participants);
@@ -1384,6 +1385,10 @@ pub const Config = struct {
     webpush_vapid_pub: []const u8 = "",
     /// Link previews. Off until an operator opts in. A client still has to opt in.
     unfurl_enabled: bool = false,
+    /// Pre-001 challenge ladder. Off keeps a reputation trip as a hard refuse.
+    /// On, a reputation trip or an engaged raid shield asks for a challenge
+    /// before 001. Passing the challenge is not an account.
+    challenge_enabled: bool = false,
     /// WebAuthn (passkey) Relying Party ID — a registrable domain the passkeys
     /// are scoped to (`[webauthn] rp_id`). Null ⇒ the WEBAUTHN command fails
     /// closed (the feature is inert until both this and an origin are set). The
@@ -2435,6 +2440,13 @@ pub const ConnState = struct {
     last_search_ms: i64 = 0,
     /// The client asked for link previews. Default refuse.
     unfurl_opt_in: bool = false,
+    /// Set after the challenge ladder admits this connection. Not an account.
+    challenge_passed: bool = false,
+    /// Daemon-issued proof-of-work seed. Empty until a hold is armed.
+    challenge_seed: [16]u8 = @splat(0),
+    challenge_seed_len: usize = 0,
+    /// Monotonic ms before another answer may be checked. Failure delays.
+    challenge_not_before_ms: i64 = 0,
     /// True after the sweep sent an unsolicited server PING and is awaiting any
     /// inbound byte (PONG or otherwise) before the ping-timeout grace elapses.
     awaiting_pong: bool = false,
@@ -3872,6 +3884,13 @@ pub const LinuxServer = struct {
     /// successful local JOIN and on a remote membership announcement. Reactor 0
     /// evaluates them and may engage the channel slowmode prop.
     raid_shield: raid_shield.Shield,
+    /// Ladder method. `admit` is the only check. The wire stays CHALLENGE.
+    challenge_method: challenge_mod.Method = .pow,
+    challenge_question: [challenge_mod.max_text]u8 = @splat(0),
+    challenge_question_len: usize = 0,
+    challenge_answer: [challenge_mod.max_answer]u8 = @splat(0),
+    challenge_answer_len: usize = 0,
+    challenge_issued: u64 = 0,
     metadata: metadata_store.DefaultStore,
     /// Background weather/news cache backing `!weather`/`!news` (lazy-started on
     /// first fantasy use; heap-owned so its address is stable for the thread).
@@ -9045,7 +9064,7 @@ pub const LinuxServer = struct {
         var refuse = self.draining;
         if (!refuse and self.reputationOn()) {
             if (conn.peer_addr) |addr| {
-                if (self.reputation.shouldRefuse(addr, self.nowU64())) {
+                if (self.reputation.shouldRefuse(addr, self.nowU64()) and !self.config.challenge_enabled) {
                     self.publishSecurityAdmissionRefusal(conn, "REPUTATION", "threshold exceeded");
                     refuse = true;
                 }
@@ -9207,7 +9226,7 @@ pub const LinuxServer = struct {
         }
         if (self.reputationOn()) {
             if (conn.peer_addr) |addr| {
-                if (self.reputation.shouldRefuse(addr, self.nowU64())) {
+                if (self.reputation.shouldRefuse(addr, self.nowU64()) and !self.config.challenge_enabled) {
                     self.publishSecurityAdmissionRefusal(conn, "REPUTATION", "threshold exceeded");
                     emitServerLine(conn, "ERROR :Connection refused (reputation)");
                     conn.close_reason = "Reputation";
@@ -14533,6 +14552,205 @@ pub const LinuxServer = struct {
         }
     }
 
+    fn challengeRequired(self: *LinuxServer, conn: *ConnState) bool {
+        if (!self.config.challenge_enabled) return false;
+        if (conn.s2s != null or conn.s2s_secured != null) return false;
+        if (self.reputationOn()) {
+            if (conn.peer_addr) |addr| {
+                if (self.reputation.shouldRefuse(addr, self.nowU64())) return true;
+            }
+        }
+        return self.raid_shield.engaged();
+    }
+
+    fn armChallengeHold(self: *LinuxServer, conn: *ConnState) void {
+        if (conn.challenge_passed or !self.challengeRequired(conn)) {
+            conn.session.challenge_hold = false;
+            return;
+        }
+        conn.session.challenge_hold = true;
+        if (conn.challenge_seed_len != 0) return;
+        var text: [48]u8 = undefined;
+        const rendered = std.fmt.bufPrint(&text, "challenge:{d}:{d}", .{ self.challenge_issued, self.nowU64() }) catch "challenge";
+        self.challenge_issued += 1;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(rendered, &digest, .{});
+        @memcpy(conn.challenge_seed[0..16], digest[0..16]);
+        conn.challenge_seed_len = 16;
+    }
+
+    fn noticeChallenge(self: *LinuxServer, conn: *ConnState) !void {
+        var buf: [240]u8 = undefined;
+        const text = switch (self.challenge_method) {
+            .pow => blk: {
+                var hex_buf: [32]u8 = undefined;
+                const hex = challenge_mod.hexEncode(conn.challenge_seed[0..conn.challenge_seed_len], &hex_buf);
+                break :blk std.fmt.bufPrint(&buf, "CHALLENGE pow {s}", .{hex}) catch "CHALLENGE pow";
+            },
+            .question => std.fmt.bufPrint(&buf, "CHALLENGE question {s}", .{self.challenge_question[0..self.challenge_question_len]}) catch "CHALLENGE question",
+        };
+        try self.noticeTo(conn, text);
+    }
+
+    /// Oper METHOD/QUESTION selects the ladder arm. An unregistered answer is
+    /// checked by `challenge_mod.admit`. A pass clears the hold and may emit 001.
+    /// It does not log the client into an account.
+    pub fn handleChallenge(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        _ = id;
+        const p = parsed.paramSlice();
+        if (conn.session.registered()) {
+            if (!conn.session.isOper()) {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied");
+                return;
+            }
+            if (!self.config.challenge_enabled) {
+                try self.noticeTo(conn, "CHALLENGE disabled");
+                return;
+            }
+            if (p.len >= 2 and std.ascii.eqlIgnoreCase(p[0], "METHOD")) {
+                if (std.ascii.eqlIgnoreCase(p[1], "pow")) self.challenge_method = .pow else if (std.ascii.eqlIgnoreCase(p[1], "question")) self.challenge_method = .question else {
+                    try self.noticeTo(conn, "CHALLENGE method is pow or question");
+                    return;
+                }
+                try self.noticeTo(conn, "CHALLENGE method set");
+                return;
+            }
+            if (p.len >= 1 and std.ascii.eqlIgnoreCase(p[0], "QUESTION")) {
+                if (p.len < 3 or p[1].len == 0 or p[1].len > challenge_mod.max_text or p[2].len == 0 or p[2].len > challenge_mod.max_answer or dispatch.hasControlByte(p[1]) or dispatch.hasControlByte(p[2])) {
+                    try self.noticeTo(conn, "Usage: CHALLENGE QUESTION <question> :<answer>");
+                    return;
+                }
+                @memcpy(self.challenge_question[0..p[1].len], p[1]);
+                self.challenge_question_len = p[1].len;
+                @memcpy(self.challenge_answer[0..p[2].len], p[2]);
+                self.challenge_answer_len = p[2].len;
+                self.challenge_method = .question;
+                try self.noticeTo(conn, "CHALLENGE question set");
+                return;
+            }
+            try self.noticeTo(conn, "Usage: CHALLENGE METHOD <pow|question>");
+            return;
+        }
+        if (p.len < 1) {
+            try self.noticeTo(conn, "Usage: CHALLENGE <answer>");
+            return;
+        }
+        if (!conn.session.challenge_hold and !self.challengeRequired(conn)) {
+            try self.noticeTo(conn, "CHALLENGE not required");
+            return;
+        }
+        if (self.nowMs() < conn.challenge_not_before_ms) {
+            try self.noticeTo(conn, "CHALLENGE wait");
+            return;
+        }
+        const material = challenge_mod.Material{
+            .seed = conn.challenge_seed[0..conn.challenge_seed_len],
+            .expected = self.challenge_answer[0..self.challenge_answer_len],
+        };
+        if (!challenge_mod.admit(self.challenge_method, material, p[0])) {
+            const now = self.nowMs();
+            conn.challenge_not_before_ms = now + challenge_mod.fail_delay_ms;
+            try self.noticeTo(conn, "CHALLENGE failed");
+            return;
+        }
+        conn.challenge_passed = true;
+        var storage: [default_reply_bytes]u8 = undefined;
+        var replies = dispatch.ReplyCtx.init(&storage);
+        try dispatch.releaseChallengeHold(&conn.session, &replies);
+        if (replies.written().len != 0) try appendToConn(conn, replies.written());
+    }
+
+    /// Post-001 registration tail shared by NICK/USER and a passed challenge.
+    fn completeLiveRegistration(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
+        // Re-apply the visible host now that the background resolver (kicked
+        // off at connect) has had the handshake window to finish. With a
+        // cloak key this re-cloaks the IP (rDNS never feeds the public cloak
+        // — that would leak the ISP domain); without one it picks up the
+        // forward-confirmed reverse-DNS name if the operator enabled rDNS.
+        self.applyVisibleHost(conn);
+        try self.registerConnNick(id, conn);
+        if (conn.closing) return;
+        // Complete the registration burst after the 001-005 numerics
+        // (emitted by the dispatch welcome): LUSERS (251-255) then the
+        // MOTD (375/372/376 or 422), as every ircd does on connect.
+        self.handleLusers(conn) catch {};
+        self.handleMotd(conn) catch {};
+        // Warden: a network/node ban (Match × Scope × Action) is
+        // enforced against the freshly registered client's facets,
+        // before oper elevation/welcome.
+        if (self.enforceWard(conn)) return;
+        // Connect-time DNS blocklist: refuse (or network-ban) a client
+        // whose IP is listed by a configured zone. Best-effort — a lookup
+        // not yet resolved by now lets the client through (fail-open).
+        if (self.enforceDnsbl(conn)) return;
+        if (try self.enforceServerAccess(conn)) return;
+        // Persistent +z GAG: a client reconnecting from a gagged IP is
+        // re-flagged so its messages stay silenced and +z displays.
+        {
+            const rip = conn.session.realHost();
+            if (rip.len > 0 and self.gags.contains(rip)) conn.gagged = true;
+        }
+        // SEEN: record this account's login for the LASTSEEN history.
+        if (conn.session.account()) |acct| {
+            var mb: [256]u8 = undefined;
+            const mask = clientPrefix(conn, &mb) catch "";
+            self.recordSeen(acct, mask, .login);
+        }
+        const external_candidate = if (conn.sasl_external_authenticated) blk: {
+            const account = conn.session.account() orelse break :blk ExternalResumeCandidate.none;
+            break :blk self.externalResumeCandidate(
+                monitorIdFromClient(id),
+                account,
+                conn.session.displayName(),
+            );
+        } else ExternalResumeCandidate.none;
+        // SASL-only oper: elevate now if the (SASL-set) account is bound to
+        // an operator class. Emits 381 + MODE +o after the welcome burst.
+        // Gated on the mechanism allowing elevation: federated (OAUTHBEARER)
+        // and guest (ANONYMOUS) logins never auto-oper, matching the gated
+        // SASL-success/REGISTER elevation sites.
+        if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccountWithPrefix(
+            conn,
+            external_candidate == .none,
+        );
+        // Match the now-fully-identified client (IP/TLS/account/oper) to its
+        // connection class, apply the per-class SendQ ceiling, then enforce
+        // the class admission policy (require_tls / require_sasl).
+        self.assignConnClass(conn);
+        if (self.enforceClassAdmission(conn)) return;
+        self.meshCloneAdd(conn); // count toward the network-wide IP aggregate + gossip
+        // EXTERNAL authority is selected before inserting the claimant:
+        // a cap-bound insertion may evict the detached row we are about
+        // to restore. Only a genuinely fresh login gets a new token.
+        if (!conn.sasl_external_authenticated) self.trackSession(id, conn);
+        const external_outcome = if (conn.sasl_external_authenticated)
+            try self.autoResumeExternalSession(id, conn, external_candidate)
+        else
+            ExternalResumeOutcome.fresh;
+        if (external_outcome == .blocked) {
+            conn.closing = true;
+            return;
+        }
+        self.armBoundedExactResumeHoldIfNeeded(id, conn);
+        if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
+        try self.deliverMemo(conn); // hand over any offline messages
+        // OBSERVE: push a connect record to watching operators.
+        self.notifyObservers(.connect, observeSubject(conn, ""));
+        self.publishUserConnectEvent(conn) catch {};
+        // Apply any operator-approved vhost waiting for this account.
+        self.maybeApplyApprovedVhost(id, conn);
+        if (external_outcome == .fresh) self.applyLoginJoinState(id, conn);
+        // Set the client's `location`/`country` metadata from GeoIP (or
+        // the configured default) so `!weather` has a per-user location.
+        self.setGeoLocation(conn);
+        // Welcome-burst origin line: the client's OWN GeoIP location + ASN,
+        // shown only to them (privacy-safe — never another user's geo/ASN).
+        self.emitGeoOriginNotice(conn);
+        self.deliverWelcome(conn);
+        self.emitClientRegistered(id, conn);
+        self.evaluateNickProtection(conn);
+    }
+
     fn feedBytes(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, bytes: []const u8) !void {
         for (bytes) |byte| {
             const line = (recvqPush(conn, byte) catch |err| switch (err) {
@@ -14595,6 +14813,12 @@ pub const LinuxServer = struct {
         }
 
         if (!was_registered) {
+            self.armChallengeHold(conn);
+            if (std.ascii.eqlIgnoreCase(parsed.command, "CHALLENGE")) {
+                try self.handleChallenge(id, conn, &parsed);
+                if (conn.session.registered()) try self.completeLiveRegistration(id, conn);
+                return;
+            }
             // IRCX discovery must work BEFORE registration (draft-pfenning): an
             // unregistered client probes support via IRCX/ISIRCX/MODE ISIRCX.
             if (std.ascii.eqlIgnoreCase(parsed.command, "IRCX")) {
@@ -14686,95 +14910,10 @@ pub const LinuxServer = struct {
                 conn.session.sasl_issue_session_token = false;
                 self.issueSessionTokenNotice(conn, "SASL") catch {};
             }
-            if (conn.session.registered()) {
-                // Re-apply the visible host now that the background resolver (kicked
-                // off at connect) has had the handshake window to finish. With a
-                // cloak key this re-cloaks the IP (rDNS never feeds the public cloak
-                // — that would leak the ISP domain); without one it picks up the
-                // forward-confirmed reverse-DNS name if the operator enabled rDNS.
-                self.applyVisibleHost(conn);
-                try self.registerConnNick(id, conn);
-                if (conn.closing) return;
-                // Complete the registration burst after the 001-005 numerics
-                // (emitted by the dispatch welcome): LUSERS (251-255) then the
-                // MOTD (375/372/376 or 422), as every ircd does on connect.
-                self.handleLusers(conn) catch {};
-                self.handleMotd(conn) catch {};
-                // Warden: a network/node ban (Match × Scope × Action) is
-                // enforced against the freshly registered client's facets,
-                // before oper elevation/welcome.
-                if (self.enforceWard(conn)) return;
-                // Connect-time DNS blocklist: refuse (or network-ban) a client
-                // whose IP is listed by a configured zone. Best-effort — a lookup
-                // not yet resolved by now lets the client through (fail-open).
-                if (self.enforceDnsbl(conn)) return;
-                if (try self.enforceServerAccess(conn)) return;
-                // Persistent +z GAG: a client reconnecting from a gagged IP is
-                // re-flagged so its messages stay silenced and +z displays.
-                {
-                    const rip = conn.session.realHost();
-                    if (rip.len > 0 and self.gags.contains(rip)) conn.gagged = true;
-                }
-                // SEEN: record this account's login for the LASTSEEN history.
-                if (conn.session.account()) |acct| {
-                    var mb: [256]u8 = undefined;
-                    const mask = clientPrefix(conn, &mb) catch "";
-                    self.recordSeen(acct, mask, .login);
-                }
-                const external_candidate = if (conn.sasl_external_authenticated) blk: {
-                    const account = conn.session.account() orelse break :blk ExternalResumeCandidate.none;
-                    break :blk self.externalResumeCandidate(
-                        monitorIdFromClient(id),
-                        account,
-                        conn.session.displayName(),
-                    );
-                } else ExternalResumeCandidate.none;
-                // SASL-only oper: elevate now if the (SASL-set) account is bound to
-                // an operator class. Emits 381 + MODE +o after the welcome burst.
-                // Gated on the mechanism allowing elevation: federated (OAUTHBEARER)
-                // and guest (ANONYMOUS) logins never auto-oper, matching the gated
-                // SASL-success/REGISTER elevation sites.
-                if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccountWithPrefix(
-                    conn,
-                    external_candidate == .none,
-                );
-                // Match the now-fully-identified client (IP/TLS/account/oper) to its
-                // connection class, apply the per-class SendQ ceiling, then enforce
-                // the class admission policy (require_tls / require_sasl).
-                self.assignConnClass(conn);
-                if (self.enforceClassAdmission(conn)) return;
-                self.meshCloneAdd(conn); // count toward the network-wide IP aggregate + gossip
-                // EXTERNAL authority is selected before inserting the claimant:
-                // a cap-bound insertion may evict the detached row we are about
-                // to restore. Only a genuinely fresh login gets a new token.
-                if (!conn.sasl_external_authenticated) self.trackSession(id, conn);
-                const external_outcome = if (conn.sasl_external_authenticated)
-                    try self.autoResumeExternalSession(id, conn, external_candidate)
-                else
-                    ExternalResumeOutcome.fresh;
-                if (external_outcome == .blocked) {
-                    conn.closing = true;
-                    return;
-                }
-                self.armBoundedExactResumeHoldIfNeeded(id, conn);
-                if (!try self.enforceE2eeSessionEligibility(id, conn)) return;
-                try self.deliverMemo(conn); // hand over any offline messages
-                // OBSERVE: push a connect record to watching operators.
-                self.notifyObservers(.connect, observeSubject(conn, ""));
-                self.publishUserConnectEvent(conn) catch {};
-                // Apply any operator-approved vhost waiting for this account.
-                self.maybeApplyApprovedVhost(id, conn);
-                if (external_outcome == .fresh) self.applyLoginJoinState(id, conn);
-                // Set the client's `location`/`country` metadata from GeoIP (or
-                // the configured default) so `!weather` has a per-user location.
-                self.setGeoLocation(conn);
-                // Welcome-burst origin line: the client's OWN GeoIP location + ASN,
-                // shown only to them (privacy-safe — never another user's geo/ASN).
-                self.emitGeoOriginNotice(conn);
-                self.deliverWelcome(conn);
-                self.emitClientRegistered(id, conn);
-                self.evaluateNickProtection(conn);
+            if (!conn.session.registered() and conn.session.challenge_hold and conn.session.registration.nick_seen and conn.session.registration.user_seen and (std.ascii.eqlIgnoreCase(parsed.command, "NICK") or std.ascii.eqlIgnoreCase(parsed.command, "USER"))) {
+                try self.noticeChallenge(conn);
             }
+            if (conn.session.registered()) try self.completeLiveRegistration(id, conn);
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
                 conn.closing = true;
             }
@@ -110648,6 +110787,133 @@ test "GAP-P7 a banned connection files one appeal and the oper answer is audited
     } else |_| {}
     current_reactor = null;
     std.debug.print("GAP-P7 branch=a banned connection files one appeal without joining and the oper answer is audited\n", .{});
+}
+
+fn gapP8Open(server: *Server) !client_model.ClientId {
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.token = try tokenFromId(id);
+    conn.overflow_allocator = server.allocator;
+    conn.connected_at_ms = server.nowMs();
+    return id;
+}
+
+fn gapP8Feed(server: *Server, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
+    conn.send_len = 0;
+    conn.send_offset = 0;
+    try server.feedBytes(id, conn, line);
+}
+
+fn gapP8Pow(seed: []const u8, out: []u8) ?[]const u8 {
+    var i: u32 = 0;
+    while (i < 4096) : (i += 1) {
+        const text = std.fmt.bufPrint(out, "{d}", .{i}) catch return null;
+        if (challenge_mod.admit(.pow, .{ .seed = seed }, text)) return text;
+    }
+    return null;
+}
+
+test "GAP-P8 a tripped connection answers a challenge before 001" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "p8.test",
+        .challenge_enabled = true,
+        .reputation_refuse_threshold = 1,
+    };
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    var sim = reactor_mod.SimReactor.init(1_000_000);
+    server.reactor = sim.reactor();
+
+    const clean_id = try gapP8Open(server);
+    const clean = server.connFor(clean_id).?;
+    try gapP8Feed(server, clean_id, clean, "NICK p8clean\r\nUSER p8clean 0 * :Clean\r\n");
+    const clean_sent = clean.send_buf[0..clean.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, clean_sent, " 001 ") != null);
+    try std.testing.expect(clean.session.registered());
+    try std.testing.expect(!clean.session.logged_in);
+    try std.testing.expect(clean.session.account() == null);
+
+    const bad_addr: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 9 } };
+    _ = try server.reputation.penalize(bad_addr, 5, server.nowU64());
+    const bad_id = try gapP8Open(server);
+    const bad = server.connFor(bad_id).?;
+    bad.peer_addr = bad_addr;
+    try gapP8Feed(server, bad_id, bad, "NICK p8bad\r\nUSER p8bad 0 * :Bad\r\n");
+    const held = bad.send_buf[0..bad.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, held, " 001 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, held, "CHALLENGE pow ") != null);
+    try std.testing.expect(!bad.session.registered());
+    try std.testing.expect(!bad.session.logged_in);
+    try std.testing.expect(bad.session.account() == null);
+    var hex_buf: [32]u8 = undefined;
+    const hex = challenge_mod.hexEncode(bad.challenge_seed[0..bad.challenge_seed_len], &hex_buf);
+    try std.testing.expect(std.mem.indexOf(u8, held, hex) != null);
+
+    try gapP8Feed(server, bad_id, bad, "CHALLENGE nope\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, bad.send_buf[0..bad.send_len], "CHALLENGE failed") != null);
+    try std.testing.expect(!bad.session.registered());
+
+    var nonce_buf: [8]u8 = undefined;
+    const nonce = gapP8Pow(bad.challenge_seed[0..bad.challenge_seed_len], &nonce_buf) orelse return error.TestUnexpectedResult;
+    var answer_buf: [64]u8 = undefined;
+    const too_soon = std.fmt.bufPrint(&answer_buf, "CHALLENGE {s}\r\n", .{nonce}) catch return error.TestUnexpectedResult;
+    try gapP8Feed(server, bad_id, bad, too_soon);
+    try std.testing.expect(std.mem.indexOf(u8, bad.send_buf[0..bad.send_len], "CHALLENGE wait") != null);
+    try std.testing.expect(!bad.session.registered());
+
+    sim.advance(challenge_mod.fail_delay_ms);
+    try gapP8Feed(server, bad_id, bad, too_soon);
+    try std.testing.expect(std.mem.indexOf(u8, bad.send_buf[0..bad.send_len], " 001 ") != null);
+    try std.testing.expect(bad.session.registered());
+    try std.testing.expect(!bad.session.logged_in);
+    try std.testing.expect(bad.session.account() == null);
+    try std.testing.expect(!bad.closing);
+
+    const oper_id = try addTestLocalClient(server, "p8oper", null);
+    const oper = server.connFor(oper_id).?;
+    oper.session.registration.registered = true;
+    oper.session.is_oper = true;
+    oper.send_len = 0;
+    var question = try irc_line.parseLine("CHALLENGE QUESTION mascot :onyx");
+    try server.handleChallenge(oper_id, oper, &question);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "question set") != null);
+    try std.testing.expectEqual(challenge_mod.Method.question, server.challenge_method);
+
+    var n: usize = 0;
+    while (n < 6) : (n += 1) server.noteRaidJoin("#p8raid", "peer-a.test");
+    server.noteRaidJoin("#p8raid", "peer-b.test");
+    server.noteRaidJoin("#p8raid", "peer-c.test");
+    current_reactor = &server.reactors[0];
+    server.evaluateRaidShield();
+    current_reactor = null;
+    try std.testing.expect(server.raid_shield.engaged());
+
+    const raid_id = try gapP8Open(server);
+    const raid = server.connFor(raid_id).?;
+    try gapP8Feed(server, raid_id, raid, "NICK p8raid\r\nUSER p8raid 0 * :Raid\r\n");
+    const asked = raid.send_buf[0..raid.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, asked, " 001 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, asked, "CHALLENGE question mascot") != null);
+    try std.testing.expect(!raid.session.registered());
+    try gapP8Feed(server, raid_id, raid, "CHALLENGE nope\r\n");
+    try std.testing.expect(!raid.session.registered());
+    sim.advance(challenge_mod.fail_delay_ms);
+    try gapP8Feed(server, raid_id, raid, "CHALLENGE onyx\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, raid.send_buf[0..raid.send_len], " 001 ") != null);
+    try std.testing.expect(raid.session.registered());
+    try std.testing.expect(!raid.session.logged_in);
+    try std.testing.expect(raid.session.account() == null);
+    current_reactor = null;
+    std.debug.print("GAP-P8 branch=reputation or raid shield holds 001 until a pluggable challenge admits and success is not an account\n", .{});
 }
 
 test {

@@ -812,6 +812,9 @@ pub const RegistrationState = struct {
 pub const ClientSession = struct {
     client: Client = .{},
     registration: RegistrationState = .{},
+    /// When set, NICK+USER must not emit 001. The live server clears it after
+    /// the challenge ladder admits the connection. Admission is not an account.
+    challenge_hold: bool = false,
     cap: CapSession = .{},
 
     /// SASL mechanism awaiting its credentials line (null = none selected).
@@ -2160,10 +2163,18 @@ fn maybeCompleteRegistration(session: *ClientSession, replies: *ReplyCtx) Dispat
     if (session.registration.registered) return;
     if (!session.registration.nick_seen or !session.registration.user_seen) return;
     if (session.cap.registrationHeld()) return;
+    if (session.challenge_hold) return;
 
     session.registration.registered = true;
     session.client.registration.prereg = .registered;
     try emitWelcome(session, replies);
+}
+
+/// Clear the pre-001 hold and emit 001 when NICK and USER have already been
+/// seen. Clearing the hold does not log the client into an account.
+pub fn releaseChallengeHold(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
+    session.challenge_hold = false;
+    try maybeCompleteRegistration(session, replies);
 }
 
 fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
