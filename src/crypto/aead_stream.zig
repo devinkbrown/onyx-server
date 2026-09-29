@@ -200,6 +200,8 @@ pub const Decryptor = struct {
         Aead.decrypt(plaintext, ciphertext, tag, sealed[0..header_len], nonce, self.key) catch {
             return Error.AuthFailed;
         };
+        // A non-final chunk at u32::MAX would wrap expected_counter back to 0.
+        if (!header.isFinal() and self.expected_counter == std.math.maxInt(u32)) return Error.CounterExhausted;
 
         if (!self.have_base_nonce) {
             self.base_nonce = header.base_nonce;
@@ -370,4 +372,20 @@ test "empty final chunk round-trips and closes stream" {
     try dec.finish();
     try testing.expectError(Error.StreamAlreadyEnded, dec.pull(testing.allocator, sealed));
     try testing.expectError(Error.StreamAlreadyEnded, enc.push(testing.allocator, "", true));
+}
+
+test "decryptor refuses an authenticated nonfinal chunk at exhausted counter" {
+    var dec = Decryptor.init(fixed_key);
+    dec.expected_counter = std.math.maxInt(u32);
+
+    const header = Header.init(fixed_nonce, std.math.maxInt(u32), false).encode();
+    var sealed: [header_len + 1 + tag_len]u8 = undefined;
+    @memcpy(sealed[0..header_len], &header);
+    var tag: Tag = undefined;
+    Aead.encrypt(sealed[header_len .. header_len + 1], &tag, "x", sealed[0..header_len], deriveNonce(fixed_nonce, std.math.maxInt(u32), false), fixed_key);
+    @memcpy(sealed[header_len + 1 ..], &tag);
+
+    try testing.expectError(Error.CounterExhausted, dec.pull(testing.allocator, &sealed));
+    try testing.expectEqual(std.math.maxInt(u32), dec.expected_counter);
+    try testing.expectError(Error.MissingFinalBlock, dec.finish());
 }

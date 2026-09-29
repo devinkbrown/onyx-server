@@ -21484,8 +21484,9 @@ pub const LinuxServer = struct {
     }
 
     /// KNOCK <channel> [:reason] — ask for an invite to a +i channel. Channel
-    /// ops get RPL_KNOCK (710); the knocker gets RPL_KNOCKDLVR (711). Refused if
-    /// the channel is open (713) or the knocker is already a member (714).
+    /// ops get RPL_KNOCK (710); the knocker gets RPL_KNOCKDLVR (711) only after
+    /// a local operator is notified. Refused if the channel is open (713) or
+    /// the knocker is already a member (714).
     pub fn handleKnock(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"KNOCK"}, "Not enough parameters");
@@ -21512,17 +21513,24 @@ pub const LinuxServer = struct {
             return;
         }
 
-        // Notify every operator-or-higher member.
+        // Notify every local operator-or-higher member.
         var mask_buf: [256]u8 = undefined;
         const mask = try clientPrefix(conn, &mask_buf);
         var members = self.world.memberIterator(channel) orelse return;
+        var notified_ops: usize = 0;
         while (members.next()) |member| {
             const mm = self.world.memberModes(channel, member.*) orelse continue;
             if (!mm.isOperator()) continue;
             const op_id = clientIdFromWorld(member.*);
-            try self.deliverNumeric(op_id, .RPL_KNOCK, &.{ channel, mask }, reason);
+            const op_conn = self.connFor(op_id) orelse continue;
+            if (op_conn.closing) continue;
+            var line_buf: [default_reply_bytes]u8 = undefined;
+            const line = try formatNumericLine(&line_buf, op_conn.session.displayName(), .RPL_KNOCK, &.{ channel, mask }, reason);
+            if (self.enqueueDeliveryMaybeClose(op_id, line, false, "Client quit") == .delivered) notified_ops += 1;
         }
-        try queueNumeric(conn, .RPL_KNOCKDLVR, &.{channel}, "Your KNOCK has been delivered");
+        if (notified_ops > 0) {
+            try queueNumeric(conn, .RPL_KNOCKDLVR, &.{channel}, "Your KNOCK has been delivered");
+        }
 
         // MEMBER KNOCK event: a non-member asked to enter a gated channel. Lets
         // MEMBER subscribers (and legacy oper-action opers) see knocks network-wide.
@@ -102037,6 +102045,38 @@ test "REHASH cert hot-reload: not configured when TLS is absent" {
         try std.testing.expect(server.reload_tls == null);
         try std.testing.expectEqual(@as(usize, 0), server.config.tls_cert_chain.len);
     } else return error.SkipZigTest;
+}
+
+test "GAP-P0c KNOCK sends 711 only after local operator notification" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const op_id = try addTestLocalClient(&server, "Operator", null);
+    const op_conn = server.connFor(op_id).?;
+    const member_id = try addTestLocalClient(&server, "Member", null);
+    const caller_id = try addTestLocalClient(&server, "Knocker", null);
+    const caller_conn = server.connFor(caller_id).?;
+
+    _ = try server.world.join("#with-op", worldIdFromClient(op_id));
+    _ = try server.world.setMemberMode("#with-op", worldIdFromClient(op_id), .op, true);
+    _ = try server.world.setChannelFlag("#with-op", .invite_only, true);
+    var with_op = try irc_line.parseLine("KNOCK #with-op :please invite me");
+    try server.handleKnock(caller_id, caller_conn, &with_op);
+    try expectContains(op_conn.send_buf[0..op_conn.send_len], " 710 Operator #with-op ");
+    try expectContains(caller_conn.send_buf[0..caller_conn.send_len], " 711 Knocker #with-op ");
+
+    _ = try server.world.join("#without-op", worldIdFromClient(member_id));
+    _ = try server.world.setMemberMode("#without-op", worldIdFromClient(member_id), .founder, false);
+    _ = try server.world.setChannelFlag("#without-op", .invite_only, true);
+    caller_conn.send_len = 0;
+    var without_op = try irc_line.parseLine("KNOCK #without-op :please invite me");
+    try server.handleKnock(caller_id, caller_conn, &without_op);
+    try std.testing.expect(std.mem.indexOf(u8, caller_conn.send_buf[0..caller_conn.send_len], " 711 ") == null);
+    std.debug.print("GAP-P0c branch=knock 711 only after a local op is notified\n", .{});
 }
 
 test "rotateTicketKey moves current to previous and generates a fresh key" {

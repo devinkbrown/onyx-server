@@ -100,6 +100,7 @@ The channel command module registers the base membership and moderation commands
 - Privileges: Registered client.
 - Parameters: Channel and optional reason.
 - Replies: `RPL_KNOCK 710` to operators and `RPL_KNOCKDLVR 711` to caller.
+- `711` is sent only when a local operator was notified.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_KNOCKONCHAN 714`, `ERR_CHANOPEN 713`.
 - Example: `KNOCK #private :please`
 - Sources: `src/daemon/modules/channel_ops.zig:66`, `src/daemon/server.zig:13821`
