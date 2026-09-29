@@ -671,7 +671,7 @@ allow_anonymous = false
 # Path for persisting the Event Spine history ring so `EVENT REPLAY` survives a
 # USR2 hot-upgrade and a cold restart. Rewritten on the stats cadence, loaded at
 # boot. Leave unset to keep event history in-memory (per-process lifetime).
-# event_history_path = "/var/lib/onyx-server/event_history.bin"
+event_history_path = "/var/lib/onyx-server/event_history.bin"
 
 
 # --- [oper.ocg2] — staged durable operator authority ------------------------

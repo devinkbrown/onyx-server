@@ -61748,6 +61748,164 @@ test "UPGRADE continuity gate accepts idle state and refuses every media or comp
     try std.testing.expect(blocker(&server) == null);
 }
 
+fn gapA4ReplayShowsPeer(server: *Server, alloc: std.mem.Allocator) !void {
+    current_reactor = &server.reactors[0];
+    const id = try addTestLocalClient(server, "a4oper", "a4oper");
+    const conn = server.rx().clients.get(id).?;
+    conn.session.is_oper = true;
+    conn.send_armed = true;
+    try server.handleEventReplay(conn, true, &.{ "REPLAY", "JSON", "5" });
+    const queued = try copyTestSendQ(alloc, conn);
+    defer alloc.free(queued);
+    try std.testing.expect(std.mem.indexOf(u8, queued, "relay-origin.test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, queued, "peer flood verdict") != null);
+}
+
+fn gapA4HistoryId(server: *Server, message: []const u8) ?oper_event.EventId {
+    var buf: [512]event_history_mod.StoredEvent = undefined;
+    const n = server.event_history.collect(null, 0, &buf);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (std.mem.eql(u8, buf[i].message(), message)) return buf[i].eventId();
+    }
+    return null;
+}
+
+test "DST GAP-A4 event history reloads across USR2 and a signed id is not duplicated" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const reference = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "etc/onyx-server.reference.toml", alloc, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.free(reference);
+    try std.testing.expect(std.mem.indexOf(u8, reference, "\nevent_history_path = \"/var/lib/onyx-server/event_history.bin\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reference, "# event_history_path =") == null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const event_path = try rehashTmpPath(alloc, tmp, "event_history.bin");
+    defer alloc.free(event_path);
+
+    var local_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xB4)), "gap-a4");
+    defer local_identity.deinit();
+    var remote_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xB5)), "gap-a4");
+    defer remote_identity.deinit();
+    const remote_id = remote_identity.shortId();
+    const config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .node_id = local_identity.shortId(),
+        .server_name = "a4-local.test",
+        .node_identity = &local_identity,
+        .crypto_io = std.testing.io,
+        .event_history_path = event_path,
+    };
+
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+
+    var peer_ready = false;
+    var peer: s2s_link.S2sLink = undefined;
+    defer if (peer_ready) peer.deinit();
+    try addTestRelayHomes(predecessor, &peer, remote_id, &.{"a4peer"});
+    peer_ready = true;
+
+    var pubkey: [oper_event.pubkey_len]u8 = undefined;
+    var signature: [oper_event.sig_len]u8 = undefined;
+    var event = oper_event.SignedOperEventV2{
+        .category = @intFromEnum(event_spine.EventCategory.security),
+        .severity = @intFromEnum(event_spine.EventSeverity.warn),
+        .origin_node = remote_id,
+        .hlc = predecessor.nextMeshHlc(),
+        .origin_server = "relay-origin.test",
+        .subject = "#a4",
+        .message = "peer flood verdict",
+    };
+    try oper_event.stampOrigin(&event, &remote_identity.sign_kp, &pubkey, &signature);
+    const event_id = (try predecessor.admitEventSpineV2(event)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &event_id, &(gapA4HistoryId(predecessor, event.message) orelse return error.TestUnexpectedResult));
+
+    const before_heal = try eventHistoryBytesForTest(alloc, &predecessor.event_history);
+    defer alloc.free(before_heal);
+    try std.testing.expect((try predecessor.admitEventSpineV2(event)) == null);
+    const after_heal = try eventHistoryBytesForTest(alloc, &predecessor.event_history);
+    defer alloc.free(after_heal);
+    try std.testing.expectEqualSlices(u8, before_heal, after_heal);
+    predecessor.saveEventHistory();
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-gap-a4");
+    try std.testing.expect(successor.inherited_event_history_restored);
+    try std.testing.expectEqualSlices(u8, &event_id, &(gapA4HistoryId(successor, event.message) orelse return error.TestUnexpectedResult));
+    try gapA4ReplayShowsPeer(successor, alloc);
+
+    var successor_peer_ready = false;
+    var successor_peer: s2s_link.S2sLink = undefined;
+    defer if (successor_peer_ready) successor_peer.deinit();
+    try addTestRelayHomes(successor, &successor_peer, remote_id, &.{"a4peer"});
+    successor_peer_ready = true;
+    const successor_before = try eventHistoryBytesForTest(alloc, &successor.event_history);
+    defer alloc.free(successor_before);
+    try std.testing.expect((try successor.admitEventSpineV2(event)) == null);
+    const successor_after = try eventHistoryBytesForTest(alloc, &successor.event_history);
+    defer alloc.free(successor_after);
+    try std.testing.expectEqualSlices(u8, successor_before, successor_after);
+
+    var extra_pk: [oper_event.pubkey_len]u8 = undefined;
+    var extra_sig: [oper_event.sig_len]u8 = undefined;
+    var extra = event;
+    extra.hlc = successor.nextMeshHlc();
+    extra.message = "second peer event";
+    try oper_event.stampOrigin(&extra, &remote_identity.sign_kp, &extra_pk, &extra_sig);
+    try std.testing.expect((try successor.admitEventSpineV2(extra)) != null);
+
+    const restarted = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(restarted);
+    defer restarted.deinit();
+    try std.testing.expect(!restarted.inherited_event_history_restored);
+    restarted.start();
+    try std.testing.expectEqualSlices(u8, &event_id, &(gapA4HistoryId(restarted, event.message) orelse return error.TestUnexpectedResult));
+    try gapA4ReplayShowsPeer(restarted, alloc);
+
+    var restarted_peer_ready = false;
+    var restarted_peer: s2s_link.S2sLink = undefined;
+    defer if (restarted_peer_ready) restarted_peer.deinit();
+    try addTestRelayHomes(restarted, &restarted_peer, remote_id, &.{"a4peer"});
+    restarted_peer_ready = true;
+    const restarted_before = try eventHistoryBytesForTest(alloc, &restarted.event_history);
+    defer alloc.free(restarted_before);
+    try std.testing.expect((try restarted.admitEventSpineV2(event)) == null);
+    const restarted_after = try eventHistoryBytesForTest(alloc, &restarted.event_history);
+    defer alloc.free(restarted_after);
+    try std.testing.expectEqualSlices(u8, restarted_before, restarted_after);
+
+    std.debug.print("GAP-A4 branch=reference event history path; boot reload; USR2 keeps the signed id; heal does not duplicate\n", .{});
+}
 test "UPGRADE mandatory restored EventHistory and webhook store skip stale disk reload at start" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
