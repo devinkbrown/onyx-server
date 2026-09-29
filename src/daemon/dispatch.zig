@@ -2388,6 +2388,20 @@ fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) == null);
 }
 
+/// True when `name` appears as a CAP token (optionally `name=value`), bounded
+/// by a space or the start of an LS/LIST body.
+fn expectCapNameAbsent(haystack: []const u8, name: []const u8) !void {
+    var cursor: usize = 0;
+    while (cursor < haystack.len) {
+        const found = std.mem.indexOfPos(u8, haystack, cursor, name) orelse return;
+        const before_ok = found == 0 or haystack[found - 1] == ' ' or haystack[found - 1] == ':';
+        const after = found + name.len;
+        const after_ok = after == haystack.len or haystack[after] == ' ' or haystack[after] == '=' or haystack[after] == '\r';
+        if (before_ok and after_ok) return error.TestExpectedEqual;
+        cursor = found + 1;
+    }
+}
+
 fn expectCodesInOrder(haystack: []const u8, codes: []const []const u8) !void {
     var pos: usize = 0;
     for (codes) |code| {
@@ -2658,6 +2672,39 @@ test "GAP-P0b advertises IDENTIFY for 2FA before AUTHENTICATE" {
     try expectNotContains(replies.written(), "sasl=IDENTIFY");
 
     std.debug.print("GAP-P0b branch=cap onyx/2fa=IDENTIFY before AUTHENTICATE\n", .{});
+}
+
+test "GAP-P0c cap-notify is static and whoami file-upload and oper stay off the live list" {
+    var session = ClientSession.init();
+    var storage: [8192]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP LS 302");
+    const listed = replies.written();
+    try expectContains(listed, "cap-notify");
+    try expectContains(listed, "draft/multiline=max-bytes=40000,max-lines=64");
+    try expectNotContains(listed, "draft/whoami");
+    try expectNotContains(listed, "file-upload");
+    try expectNotContains(listed, " CAP * NEW ");
+    try expectNotContains(listed, " CAP * DEL ");
+    try expectCapNameAbsent(listed, "oper");
+
+    const stale = @import("../proto/cap.zig");
+    try std.testing.expect(stale.CapRegistry.default().find("file-upload") != null);
+    try std.testing.expect(stale.CapRegistry.default().find("draft/whoami") == null);
+    try std.testing.expect(stale.capForTag("oper") == null);
+
+    replies.clear();
+    try dispatchText(&session, &replies, "CAP NEW cap-notify");
+    try expectContains(replies.written(), " 410 ");
+    try expectNotContains(replies.written(), " CAP * NEW ");
+    replies.clear();
+    try dispatchText(&session, &replies, "CAP DEL cap-notify");
+    try expectContains(replies.written(), " 410 ");
+    try expectNotContains(replies.written(), " CAP * DEL ");
+    try std.testing.expect(!session.hasCap(.cap_notify));
+
+    std.debug.print("GAP-P0c branch=cap-notify is advertised from a static set and CAP NEW DEL whoami file-upload and oper stay off\n", .{});
 }
 
 test "CAP LS advertises configured draft/multiline limits" {

@@ -2,6 +2,8 @@
 
 *Server-answered in-channel `!` commands for weather and news, with no pseudo-clients.*
 
+Mode +B and WHOIS 335 mark a bot. `bot_registry` and `announce_board` stay loaded beside the daemon and stay off the WHOIS and fantasy paths. The in-channel commands are `!weather` and `!news`.
+
 Onyx Server answers a small set of in-channel `!` fantasy commands directly from the
 server, with no pseudo-clients (`src/daemon/server.zig:11150`, `handleFantasy`).
 The triggering message reaches the channel normally; the server posts the answer

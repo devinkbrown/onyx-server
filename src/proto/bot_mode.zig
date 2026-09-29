@@ -267,6 +267,25 @@ test "isupport bot value and token build" {
     try std.testing.expectEqualStrings("BOT=b", token);
 }
 
+test "GAP-P0c WHOIS 335 follows bot mode while the registry and board stay uncalled" {
+    try std.testing.expect(shouldEmitWhoisBot(true));
+    try std.testing.expect(!shouldEmitWhoisBot(false));
+    var buf: [128]u8 = undefined;
+    const line = try buildWhoisBotNumeric(&buf, "irc.example", "alice", "robodan");
+    try std.testing.expectEqualStrings(":irc.example 335 alice robodan :is a bot", line);
+
+    const io = std.testing.io;
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, "src/daemon/server.zig", std.testing.allocator, .limited(20 << 20));
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "const bot_registry_mod = @import(\"bot_registry.zig\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "const announce_board_mod = @import(\"announce_board.zig\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bot_registry_mod.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "announce_board_mod.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "!weather") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "!news") != null);
+    std.debug.print("GAP-P0c branch=WHOIS 335 and +B are the bot surface and the in-channel commands stay weather and news\n", .{});
+}
+
 test "rpl whoisbot numeric build" {
     var buf: [128]u8 = undefined;
     const line = try buildWhoisBotNumeric(&buf, "irc.example", "alice", "robodan");

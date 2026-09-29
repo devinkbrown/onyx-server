@@ -70,6 +70,23 @@ pub const Package = enum {
     }
 };
 
+/// SASL mechanism name for an IRCX AUTH package, or null when the package
+/// parses and still has no authenticator. `handleIrcxAuth` answers null with
+/// numeric 912.
+pub fn saslMechanism(package: Package) ?[]const u8 {
+    return switch (package) {
+        .plain => "PLAIN",
+        .external => "EXTERNAL",
+        .scram_sha_256 => "SCRAM-SHA-256",
+        .scram_sha_512 => "SCRAM-SHA-512",
+        .scram_sha_512_plus => "SCRAM-SHA-512-PLUS",
+        .session_token => "SESSION-TOKEN",
+        .oauthbearer => "OAUTHBEARER",
+        .anonymous => "ANONYMOUS",
+        .anon, .gatekeeper, .gatekeeper_passport => null,
+    };
+}
+
 /// Direction/sequence token on an AUTH line.
 pub const Sequence = enum {
     initial,
@@ -290,6 +307,25 @@ test "parse AUTH package forms" {
     try std.testing.expectEqual(.gatekeeper_passport, gkp.package);
     try std.testing.expectEqual(.initial, gkp.sequence);
     try std.testing.expectEqualStrings("ticket profile", gkp.data.?);
+}
+
+test "GAP-P0c classic IRCX AUTH packages stay an unknown package" {
+    const classic = [_][]const u8{ "ANON", "GateKeeper", "GateKeeperPassport" };
+    for (classic) |name| {
+        const req = try parseParams(&.{ name, "I" });
+        try std.testing.expect(saslMechanism(req.package) == null);
+        var buf: [160]u8 = undefined;
+        const line = try buildUnknownPackageReply(&buf, .{
+            .server_name = "irc.example",
+            .recipient_nick = "alice",
+        }, req.package_raw);
+        try std.testing.expect(std.mem.indexOf(u8, line, " 912 ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "Unsupported authentication package") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, name) != null);
+    }
+    try std.testing.expectEqualStrings("PLAIN", saslMechanism(.plain).?);
+    try std.testing.expectEqualStrings("ANONYMOUS", saslMechanism(.anonymous).?);
+    std.debug.print("GAP-P0c branch=ANON GateKeeper and GateKeeperPassport reply 912 and stay off the SASL list\n", .{});
 }
 
 test "parse AUTH rejects unknown package" {

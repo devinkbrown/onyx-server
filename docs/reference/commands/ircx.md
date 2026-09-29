@@ -29,7 +29,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## AUTH
 
 - Syntax: `AUTH <package> [mechanism/payload]` (repeat with the package-specific SASL exchange)
-- Description: IRCX's SASL-backed authentication transport. The package name selects the same configured mechanisms exposed by IRCv3 SASL (`PLAIN`, `SCRAM-SHA-256`, and `EXTERNAL` in the IRCX discovery list); payloads are handled by the shared SASL router and account success gate. Use IRCv3 `AUTHENTICATE` when the client does not need IRCX framing.
+- Description: IRCX's SASL-backed authentication transport. The package name selects the same configured mechanisms exposed by IRCv3 SASL (`PLAIN`, `SCRAM-SHA-256`, and `EXTERNAL` in the IRCX discovery list); payloads are handled by the shared SASL router and account success gate. Use IRCv3 `AUTHENTICATE` when the client does not need IRCX framing. ANON, GateKeeper, and GateKeeperPassport answer with numeric 912 and stay outside the SASL mechanism list.
 - Privileges: IRCX-enabled client; registration/account effects follow the selected SASL mechanism.
 - Replies: `RPL_IRCXAUTH` challenge/success/failure lines and the normal account numerics on completion.
 - Errors: Package parsing, SASL, TLS, and account lockout errors from the shared router; malformed exchanges fail closed.
@@ -39,7 +39,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## DATA
 
 - Syntax: `DATA <target> <tag> :<message>`
-- Description: Sends an IRCX typed message to a nick or channel. Tags must match `[A-Za-z][A-Za-z0-9.]{0,14}`. `SYS`/`ADM` prefixes require oper; `OWN`/`HST` require channel operator/host authority or oper.
+- Description: Sends an IRCX typed message to a nick or channel. Tags must match `[A-Za-z][A-Za-z0-9.]{0,14}`. `SYS`/`ADM` prefixes require oper; `OWN`/`HST` require channel operator/host authority or oper. A remote SYS or ADM tag stays closed for every sender, including an operator account.
 - Privileges: Registered client, with reserved tag restrictions.
 - Parameters: Target nick/channel, tag, message.
 - Replies: Relayed `DATA` line to target(s).

@@ -40,7 +40,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 ## WHOIS
 
 - Syntax: `WHOIS [server] <nick>`
-- Description: Emits a WHOIS sequence covering account, away state, visible channels, oper and admin visibility, bot mode, certificate fingerprint, TLS status, actual host (for opers and self), and optional GeoIP/rDNS text (for opers and self). `RPL_WHOISSPECIAL 320` also carries public +R/+g private-message restriction hints for every requester.
+- Description: Emits a WHOIS sequence covering account, away state, visible channels, oper and admin visibility, bot mode, certificate fingerprint, TLS status, actual host (for opers and self), and optional GeoIP/rDNS text (for opers and self). `RPL_WHOISSPECIAL 320` also carries public +R/+g private-message restriction hints for every requester. A remote mesh WHOIS copies the roster identity and leaves idle, away, and TLS-secure on the user's home node.
 - Privileges: Registered client.
 - Parameters: Target nick is the last parameter.
 - Replies: `RPL_WHOISUSER 311`, `RPL_WHOISSERVER 312`, `RPL_WHOISOPERATOR 313`, `RPL_WHOISIDLE 317`, `RPL_ENDOFWHOIS 318`, `RPL_WHOISCHANNELS 319`, `RPL_WHOISSPECIAL 320`, `RPL_WHOISLOGGEDIN 330`, `RPL_WHOISBOT 335`, `RPL_WHOISCERTFP 276`, `RPL_WHOISSECURE 671`, `RPL_WHOISACTUALLY 338`, and `RPL_AWAY 301` when applicable.

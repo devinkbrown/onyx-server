@@ -301,6 +301,30 @@ fn checkedAdd(a: usize, b: usize) ?usize {
     return if (overflow != 0) null else sum;
 }
 
+test "GAP-P0c draft/multiline reassembles inbound and leaves the value as one message" {
+    var out: [128]u8 = undefined;
+    const body = [_][]const u8{
+        "@batch=ref PRIVMSG #chan :alpha",
+        "@batch=ref PRIVMSG #chan :beta",
+    };
+    const msg = try assemble(
+        .{ .max_bytes = default_max_bytes, .max_lines = default_max_lines },
+        "BATCH +ref draft/multiline #chan",
+        &body,
+        "BATCH -ref",
+        &out,
+    );
+    try std.testing.expectEqual(.privmsg, msg.command);
+    try std.testing.expectEqualStrings("#chan", msg.target);
+    try std.testing.expectEqual(@as(usize, 2), msg.line_count);
+    try std.testing.expectEqualStrings("alpha\nbeta", msg.value);
+    try std.testing.expect(std.mem.indexOf(u8, msg.value, "BATCH") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.value, "draft/multiline") == null);
+    try std.testing.expectEqual(@as(usize, 40_000), default_max_bytes);
+    try std.testing.expectEqual(@as(usize, 64), default_max_lines);
+    std.debug.print("GAP-P0c branch=inbound multiline reassembles to one value and a server reply stays one line\n", .{});
+}
+
 test "assembles newline joins and concat joins" {
     var out: [128]u8 = undefined;
     const body = [_][]const u8{

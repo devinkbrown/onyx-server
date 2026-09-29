@@ -44,7 +44,7 @@ There is no `STARTTLS` command; TLS is listener-level implicit TLS (`src/daemon/
 ## CAP
 
 - Syntax: `CAP LS [302]`, `CAP REQ :<cap>[ <cap>...]`, `CAP LIST`, `CAP END`
-- Description: Dispatches capability negotiation to the session capability handler. `LS` enters negotiation and emits the advertised list, `REQ` enters negotiation and emits `ACK` or `NAK`, `LIST` emits negotiated caps, and `END` completes negotiation.
+- Description: Dispatches capability negotiation to the session capability handler. `LS` enters negotiation and emits the advertised list, `REQ` enters negotiation and emits `ACK` or `NAK`, `LIST` emits negotiated caps, and `END` completes negotiation. cap-notify is advertised from a static set, so CAP NEW and CAP DEL stay unused. draft/whoami and file-upload stay off this list; file-upload remains only on the unused proto/cap.zig table.
 - Privileges: Any client, before or after registration.
 - Parameters: A subcommand is required. `REQ` requires a capability list. Capability values are accepted only when they match the advertised value or one comma-separated offered item.
 - Replies: Raw `CAP` replies; no numeric on normal success.

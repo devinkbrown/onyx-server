@@ -34133,17 +34133,7 @@ pub const LinuxServer = struct {
     }
 
     fn ircxAuthMechName(package: ircx_auth.Package) ?[]const u8 {
-        return switch (package) {
-            .plain => "PLAIN",
-            .external => "EXTERNAL",
-            .scram_sha_256 => "SCRAM-SHA-256",
-            .scram_sha_512 => "SCRAM-SHA-512",
-            .scram_sha_512_plus => "SCRAM-SHA-512-PLUS",
-            .session_token => "SESSION-TOKEN",
-            .oauthbearer => "OAUTHBEARER",
-            .anonymous => "ANONYMOUS",
-            .anon, .gatekeeper, .gatekeeper_passport => null,
-        };
+        return ircx_auth.saslMechanism(package);
     }
 
     fn ircxAuthAllowsOperElevation(package: ircx_auth.Package) bool {
@@ -95205,6 +95195,110 @@ test "remote WHOIS projects a live mesh grant as display-only oper status" {
     try expectContains(reply, " 311 Watcher RemoteLegacy remote remote.users.test ");
     try expectContains(reply, " 318 Watcher RemoteLegacy ");
     try expectContains(reply, " 313 Watcher RemoteLegacy :is Legacy Network Administrator");
+}
+
+test "GAP-P0c remote WHOIS copies roster identity and leaves idle away and secure unreplicated" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const watcher_id = try addTestLocalClient(&server, "Watcher", null);
+    const watcher = server.connFor(watcher_id) orelse return error.TestUnexpectedResult;
+    watcher.session.registration.registered = true;
+    try reconcileTestOper(&watcher.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "ircop", "Watcher");
+    try std.testing.expect(watcher.session.isOper());
+
+    var storage: [default_reply_bytes * 2]u8 = undefined;
+    var lines_buf: [40]whois.WhoisLine = undefined;
+    var sink = whois.WhoisLineSink{ .lines = &lines_buf, .storage = &storage };
+    try server.sendRemoteWhois(watcher, &sink, .{
+        .nick = "FarUser",
+        .username = "far",
+        .realname = "Far Person",
+        .host = "far.example",
+        .server = "peer.example",
+        .server_info = "Peer",
+        .account = "faracct",
+        .real_host = "198.51.100.8",
+        .certfp = "abcdef",
+    });
+
+    const reply = watcher.send_buf[0..watcher.send_len];
+    try expectContains(reply, " 311 Watcher FarUser far far.example ");
+    try expectContains(reply, " :Far Person");
+    try expectContains(reply, " 330 Watcher FarUser faracct ");
+    try expectContains(reply, " 312 Watcher FarUser peer.example ");
+    try expectContains(reply, " 338 ");
+    try expectContains(reply, " 276 ");
+    try std.testing.expect(std.mem.indexOf(u8, reply, " 317 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, " 301 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, " 671 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "draft/multiline") == null);
+    std.debug.print("GAP-P0c branch=remote WHOIS copies roster identity and leaves idle away and TLS-secure unreplicated\n", .{});
+}
+
+test "GAP-P0c remote SYS and ADM DATA tags stay closed for an operator account" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const now = server.grantNowU64();
+    _ = server.oper_grants.upsert(.{
+        .account = "trusted-oper",
+        .privilege_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits(),
+        .class = "oper",
+        .title = "",
+        .issuer_node = "authority.test",
+        .incarnation = 1,
+        .issued_ms = now,
+        .expiry_ms = now + 60_000,
+    });
+    const member = world_model.MemberModes.empty();
+    const channel_op = world_model.MemberModes.fromModes(&.{.op});
+
+    try std.testing.expect(!server.remoteDataTagAuthorized("SYS.notice", false, null, "trusted-oper"));
+    try std.testing.expect(!server.remoteDataTagAuthorized("ADM.alert", true, channel_op, "trusted-oper"));
+    try std.testing.expect(!server.remoteDataTagAuthorized("sys.notice", true, channel_op, "trusted-oper"));
+    try std.testing.expect(server.remoteDataTagAuthorized("OWN.state", true, channel_op, "trusted-oper"));
+    try std.testing.expect(!server.remoteDataTagAuthorized("OWN.state", true, member, "trusted-oper"));
+    try std.testing.expect(server.remoteDataTagAuthorized("app.status", true, member, "trusted-oper"));
+    std.debug.print("GAP-P0c branch=remote SYS and ADM DATA tags stay closed even for an operator account\n", .{});
+}
+
+test "GAP-P0c an operator session still gets no oper message-tag" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var session = dispatch.ClientSession.init();
+    try reconcileTestOper(&session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "ircop", "Watcher");
+    try std.testing.expect(session.isOper());
+    session.addCap(.message_tags);
+    session.addCap(.server_time);
+    session.addCap(.account_tag);
+    const tags = Server.MsgTags{
+        .time_value = "2026-09-29T00:00:00.000Z",
+        .account = "watcher",
+        .msgid = "m1",
+        .is_bot = false,
+    };
+    var out: [256]u8 = undefined;
+    const prefix = buildTagPrefix(&session, tags, &out);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "@time=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "account=watcher") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "msgid=m1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "@oper") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, ";oper") == null);
+    std.debug.print("GAP-P0c branch=the live tag prefix leaves the oper message-tag off\n", .{});
 }
 
 test "threaded server: IRCX EVENT subscription numerics" {
