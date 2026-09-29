@@ -56,6 +56,10 @@ fn quarantineCmd(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleQuarantine(x.conn, x.parsed);
 }
+fn botcmdCmd(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleBotCmd(x.conn, x.parsed);
+}
 fn media(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMedia(x.id, x.conn, x.parsed);
@@ -102,6 +106,7 @@ pub const module = registry.Module{
         .{ .name = "CHALLENGE", .min_params = 1, .access = .oper, .handler = challengeCmd, .summary = "Set the pre-001 challenge method or question. An unregistered client answers with CHALLENGE" },
         .{ .name = "HOLD", .min_params = 3, .access = .oper, .handler = holdCmd, .summary = "Release or drop a channel's held first messages" },
         .{ .name = "QUARANTINE", .min_params = 3, .access = .oper, .handler = quarantineCmd, .summary = "Move a joiner into a quarantine channel and audit the reason" },
+        .{ .name = "BOTCMD", .min_params = 1, .access = .registered, .handler = botcmdCmd, .summary = "Register or run a bot command. A speak grant allows it. Buttons are not part of this command" },
         .{ .name = "MEDIA", .feature = "media", .handler = media },
         .{ .name = "MEMO", .handler = memoCmd },
         .{ .name = "WEBPUSH", .handler = webpushCmd, .summary = "Browser push subscriptions (VAPID/SUBSCRIBE/UNSUBSCRIBE/LIST)" },

@@ -245,6 +245,7 @@ const unfurl = @import("unfurl.zig");
 const appeal = @import("appeal.zig");
 const challenge_mod = @import("challenge.zig");
 const first_hold = @import("first_hold.zig");
+const slash_cmd = @import("slash_cmd.zig");
 
 /// Per-channel cross-leg media bridge (native ↔ opt-in WebRTC roster).
 const Bridge = media_bridge_mod.ChannelBridge(native_media_mod.max_call_participants);
@@ -4285,6 +4286,8 @@ pub const LinuxServer = struct {
     appeals: appeal.Table = .{},
     /// First channel messages waiting for an oper to release or drop them.
     first_holds: first_hold.Table = .{},
+    /// Bot command names. A speak grant is what allows registration and a run.
+    slash_cmds: slash_cmd.Table = .{},
     /// Test stand-ins for the unfurl resolver and fetch. Null uses DNS and HTTPS.
     unfurl_resolve_for_test: ?unfurl.ResolveFn = null,
     unfurl_fetch_for_test: ?unfurl.FetchFn = null,
@@ -4805,6 +4808,7 @@ pub const LinuxServer = struct {
             .schedules = schedule_snapshot.Table.init(allocator) catch unreachable,
             .appeals = appeal.Table.init(allocator) catch unreachable,
             .first_holds = first_hold.Table.init(allocator) catch unreachable,
+            .slash_cmds = slash_cmd.Table.init(allocator) catch unreachable,
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
@@ -6184,6 +6188,7 @@ pub const LinuxServer = struct {
         self.schedules.deinit();
         self.appeals.deinit();
         self.first_holds.deinit();
+        self.slash_cmds.deinit();
         self.mesh_search_peers.deinit(self.allocator);
         self.warden.deinit();
         self.spamtrap.deinit();
@@ -38084,6 +38089,92 @@ pub const LinuxServer = struct {
         }
         var buf: [64]u8 = undefined;
         const note = std.fmt.bufPrint(&buf, "HOLD released {d}", .{n}) catch "HOLD released";
+        try self.noticeTo(conn, note);
+    }
+
+    fn botHasSpeakGrant(self: *LinuxServer, account: []const u8) bool {
+        if (!self.accountIsGatedBot(account)) return false;
+        const now = self.grantNowU64();
+        var live: [bot_grant_snapshot.max_grants]bot_grant_snapshot.GrantView = undefined;
+        const n = self.bot_grants.copyLive(now, &live);
+        for (live[0..n]) |slot| {
+            if (slot.kind == .speak and std.ascii.eqlIgnoreCase(slot.account, account)) return true;
+        }
+        return false;
+    }
+
+    /// `BOTCMD ADD <name> <argc> :<help>` registers one command for the caller's
+    /// account. `BOTCMD RUN <name> [args...]` accepts it only when that account
+    /// still holds a speak grant. The grant is not an oper bit, and this
+    /// command does not create buttons.
+    pub fn handleBotCmd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const account = conn.session.account() orelse {
+            try self.noticeTo(conn, "BOTCMD denied");
+            return;
+        };
+        if (!self.botHasSpeakGrant(account)) {
+            try self.noticeTo(conn, "BOTCMD denied");
+            return;
+        }
+        const p = parsed.paramSlice();
+        if (p.len < 1) {
+            try self.noticeTo(conn, "Usage: BOTCMD ADD <name> <argc> :<help> | RUN <name> [args] | LIST");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "LIST")) {
+            var views: [slash_cmd.max_cmds]slash_cmd.View = undefined;
+            const n = self.slash_cmds.list(account, &views);
+            if (n == 0) {
+                try self.noticeTo(conn, "BOTCMD none");
+                return;
+            }
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                var buf: [160]u8 = undefined;
+                const note = std.fmt.bufPrint(&buf, "BOTCMD {s} args={d} {s}", .{ views[i].name, views[i].argc, views[i].help }) catch "BOTCMD";
+                try self.noticeTo(conn, note);
+            }
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "ADD")) {
+            if (p.len < 4) {
+                try self.noticeTo(conn, "Usage: BOTCMD ADD <name> <argc> :<help>");
+                return;
+            }
+            const argc = std.fmt.parseInt(u8, p[2], 10) catch {
+                try self.noticeTo(conn, "BOTCMD rejected");
+                return;
+            };
+            self.slash_cmds.add(account, p[1], p[3], argc) catch {
+                try self.noticeTo(conn, "BOTCMD rejected");
+                return;
+            };
+            try self.noticeTo(conn, "BOTCMD added");
+            return;
+        }
+        if (!std.ascii.eqlIgnoreCase(p[0], "RUN")) {
+            try self.noticeTo(conn, "Usage: BOTCMD ADD <name> <argc> :<help> | RUN <name> [args] | LIST");
+            return;
+        }
+        if (p.len < 2) {
+            try self.noticeTo(conn, "Usage: BOTCMD RUN <name> [args]");
+            return;
+        }
+        const cmd = self.slash_cmds.find(account, p[1]) orelse {
+            try self.noticeTo(conn, "BOTCMD unknown");
+            return;
+        };
+        if (p.len - 2 != @as(usize, cmd.argc)) {
+            try self.noticeTo(conn, "BOTCMD args");
+            return;
+        }
+        var buf: [240]u8 = undefined;
+        var note: []const u8 = undefined;
+        if (cmd.argc == 0) {
+            note = std.fmt.bufPrint(&buf, "BOTCMD ok {s}", .{cmd.name}) catch "BOTCMD ok";
+        } else {
+            note = std.fmt.bufPrint(&buf, "BOTCMD ok {s} {s}", .{ cmd.name, p[2] }) catch "BOTCMD ok";
+        }
         try self.noticeTo(conn, note);
     }
 
@@ -111116,6 +111207,60 @@ test "GAP-P9 a channel prop holds first messages and quarantine is audited" {
     try std.testing.expect(audited);
     current_reactor = null;
     std.debug.print("GAP-P9 branch=a channel HOLD prop keeps the first messages for release or drop and quarantine audits the reason\n", .{});
+}
+
+test "GAP-P10 a speak grant registers a command and a run is not an oper bit" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "p10.test" };
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    try server.bot_registry.register("helper", .{});
+    const now = server.grantNowU64();
+    try server.bot_grants.upsert("helper", .speak, "#room", now + 60_000, now);
+    const bot_id = try addTestLocalClient(server, "helper", "helper");
+    const bot = server.connFor(bot_id).?;
+    bot.session.registration.registered = true;
+    try std.testing.expect(!bot.session.isOper());
+
+    bot.send_len = 0;
+    var add = try irc_line.parseLine("BOTCMD ADD ping 2 :say hello");
+    try server.handleBotCmd(bot, &add);
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "BOTCMD added") != null);
+    const stored = server.slash_cmds.find("helper", "ping").?;
+    try std.testing.expectEqualStrings("say hello", stored.help);
+    try std.testing.expectEqual(@as(u8, 2), stored.argc);
+
+    bot.send_len = 0;
+    var short = try irc_line.parseLine("BOTCMD RUN ping only");
+    try server.handleBotCmd(bot, &short);
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "BOTCMD args") != null);
+
+    bot.send_len = 0;
+    var run = try irc_line.parseLine("BOTCMD RUN ping one two");
+    try server.handleBotCmd(bot, &run);
+    const ran = bot.send_buf[0..bot.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, ran, "BOTCMD ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ran, "one") != null);
+    try std.testing.expect(!bot.session.isOper());
+
+    const plain_id = try addTestLocalClient(server, "alice", "alice");
+    const plain = server.connFor(plain_id).?;
+    plain.session.registration.registered = true;
+    plain.send_len = 0;
+    var denied = try irc_line.parseLine("BOTCMD ADD ping 0 :nope");
+    try server.handleBotCmd(plain, &denied);
+    try std.testing.expect(std.mem.indexOf(u8, plain.send_buf[0..plain.send_len], "BOTCMD denied") != null);
+    try std.testing.expect(server.slash_cmds.find("alice", "ping") == null);
+    try std.testing.expect(!plain.session.isOper());
+    current_reactor = null;
+    std.debug.print("GAP-P10 branch=a speak grant registers a bounded command and running it is not an oper bit\n", .{});
 }
 
 test {
