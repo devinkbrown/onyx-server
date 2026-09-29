@@ -62111,6 +62111,71 @@ test "UPGRADE GAP-D3 gag and granted vhost survive the dropped process image" {
     try std.testing.expectEqual(guise_mod.Source.granted, personas[0].source);
 }
 
+test "GAP-D3 same-image USR2 keeps the gag and the granted vhost" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d3-usr2.wal");
+    var services = services_mod.Services.init(&store, null);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+            store.deinit();
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    first.recordGag("192.0.2.10");
+    first.recordGag("192.0.2.11");
+    first.forgetGag("192.0.2.10");
+    try first.grantDurablePersona("carol", "staff", "carol.staff.example", .granted);
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(first, &pieces, &blobs);
+
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d3-usr2.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    try std.testing.expect(second.gags.contains("192.0.2.11"));
+    try std.testing.expect(!second.gags.contains("192.0.2.10"));
+    const before = second.guises.personas("Carol");
+    try std.testing.expectEqual(@as(usize, 1), before.len);
+    try std.testing.expectEqualStrings("carol.staff.example", before[0].host);
+
+    _ = try adoptUpgradePiecesForTest(second, pieces.items, "onyx-test-gap-d3-usr2");
+    current_reactor = null;
+    try std.testing.expect(second.gags.contains("192.0.2.11"));
+    try std.testing.expect(!second.gags.contains("192.0.2.10"));
+    const personas = second.guises.personas("Carol");
+    try std.testing.expectEqual(@as(usize, 1), personas.len);
+    try std.testing.expectEqualStrings("staff", personas[0].name);
+    try std.testing.expectEqualStrings("carol.staff.example", personas[0].host);
+    try std.testing.expectEqual(guise_mod.Source.granted, personas[0].source);
+    std.debug.print("GAP-D3 branch=same-image USR2 kept gag 192.0.2.11 and granted vhost staff\n", .{});
+}
+
 test "DST GAP-D4 oper ABUSE explains live throttle and abuse rows survive the dropped image" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
