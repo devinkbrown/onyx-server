@@ -159,6 +159,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.oper.event_history_path) |v| out.event_history_path = v;
     if (cfg.trace.file) |v| out.flight_recorder_path = v;
     out.oper_auto_override = cfg.oper.auto_override;
+    out.two_person_rule = cfg.oper.two_person_rule;
     if (cfg.wasm.plugin_dir) |v| out.wasm_plugin_dir = v;
     out.wasm_max_plugin_bytes = cfg.wasm.max_plugin_bytes;
     out.wasm_max_memory_bytes = cfg.wasm.max_memory_bytes;

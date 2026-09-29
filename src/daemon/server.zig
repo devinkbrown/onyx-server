@@ -1465,6 +1465,9 @@ pub const Config = struct {
     /// oper_override privilege (full channel authority without `/mode +j`).
     /// `[oper] auto_override`.
     oper_auto_override: bool = false,
+    /// When set, DIE, RESTART, and mesh-scope bans wait for a second distinct
+    /// operator. Default off leaves a single-oper network unchanged.
+    two_person_rule: bool = false,
     /// Directory scanned at boot/REHASH for `*.wasm` OroWasm control-plane
     /// plugins. Empty = the plugin system stays dormant. `[wasm] plugin_dir`.
     wasm_plugin_dir: []const u8 = "",
@@ -3421,6 +3424,62 @@ const MeshPeerSeen = struct {
     public_key_present: bool = false,
 };
 
+/// How long a first approval stays open. A later distinct oper must answer
+/// inside this window; the clock is `nowMs` (the SimReactor in tests).
+const two_person_window_ms: i64 = 60_000;
+const two_person_identity_max = 64;
+const two_person_target_max = 256;
+
+const TwoPersonKind = enum { die, restart, ward_add, ward_del };
+
+const TwoPersonPending = struct {
+    kind: TwoPersonKind,
+    target: [two_person_target_max]u8 = @splat(0),
+    target_len: u16 = 0,
+    identity: [two_person_identity_max]u8 = @splat(0),
+    identity_len: u16 = 0,
+    at_ms: i64 = 0,
+
+    fn targetSlice(self: *const TwoPersonPending) []const u8 {
+        return self.target[0..self.target_len];
+    }
+
+    fn identitySlice(self: *const TwoPersonPending) []const u8 {
+        return self.identity[0..self.identity_len];
+    }
+};
+
+const TwoPersonAdmit = enum { proceed, waiting, confirmed };
+
+fn twoPersonCopy(dst: []u8, src: []const u8) ?u16 {
+    if (src.len > dst.len or src.len > std.math.maxInt(u16)) return null;
+    @memcpy(dst[0..src.len], src);
+    return @intCast(src.len);
+}
+
+fn twoPersonStillOpen(now_ms: i64, at_ms: i64) bool {
+    if (now_ms < at_ms) return true;
+    return now_ms - at_ms <= two_person_window_ms;
+}
+
+fn twoPersonAuditAction(kind: TwoPersonKind) svc_operaudit.Action {
+    return switch (kind) {
+        .die => .die,
+        .restart => .restart,
+        .ward_add => .ward_add,
+        .ward_del => .ward_del,
+    };
+}
+
+/// Account when the oper is logged in, otherwise the nick. Two nicks on one
+/// account are one person.
+fn twoPersonIdentity(conn: *const ConnState) []const u8 {
+    if (conn.session.account()) |acct| {
+        if (acct.len != 0) return acct;
+    }
+    return conn.session.displayName();
+}
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -3723,6 +3782,9 @@ pub const LinuxServer = struct {
     mesh_ban_filter: ?warden.MeshBanFilter = null,
     /// Times a filter hit was re-checked against the registry and was not a ban.
     mesh_ban_filter_rechecks: u64 = 0,
+    /// First approval waiting for a second distinct oper. Empty unless
+    /// `config.two_person_rule` is on and a gated command is in its window.
+    two_person_pending: ?TwoPersonPending = null,
     /// Operator-designated spam-trap (honeypot) registry: nicks/channels a
     /// legitimate user has no reason to contact. A non-oper that touches one
     /// trips the trap (oper alert + offender flagging). Server-wide, so it is
@@ -24852,6 +24914,12 @@ pub const LinuxServer = struct {
         reason: []const u8,
         audit_action: svc_operaudit.Action,
     ) !void {
+        if (scope == .mesh) {
+            switch (try self.twoPersonAdmit(conn, .ward_add, pattern)) {
+                .waiting => return,
+                .proceed, .confirmed => {},
+            }
+        }
         const now = platform.realtimeMillis();
         const ward = warden.Ward{
             .match = match,
@@ -24889,6 +24957,12 @@ pub const LinuxServer = struct {
         // by a direct registry lookup so the scope read is correct regardless of how
         // many Wards share `match` (a bounded `list` copy could miss the entry).
         const was_mesh = if (self.warden.find(match, pattern)) |w| w.scope == .mesh else false;
+        if (was_mesh) {
+            switch (try self.twoPersonAdmit(conn, .ward_del, pattern)) {
+                .waiting => return,
+                .proceed, .confirmed => {},
+            }
+        }
         const removed = self.warden.remove(match, pattern);
         if (removed) {
             self.deleteWardMirror(match, pattern);
@@ -25129,6 +25203,42 @@ pub const LinuxServer = struct {
         if (!std.mem.endsWith(u8, line, "\n")) try appendToConn(conn, "\r\n");
     }
 
+    /// Flag off returns `.proceed` and the caller runs the existing body.
+    /// Flag on records the first oper and waits. A second distinct oper, for
+    /// the same kind and target, inside the window, confirms. The same identity
+    /// cannot confirm itself. A different kind or an expired window replaces
+    /// the pending approval instead of confirming it.
+    fn twoPersonAdmit(self: *LinuxServer, conn: *ConnState, kind: TwoPersonKind, target: []const u8) !TwoPersonAdmit {
+        if (!self.config.two_person_rule) return .proceed;
+        const identity = twoPersonIdentity(conn);
+        const now = self.nowMs();
+        if (self.two_person_pending) |pending| {
+            const same = pending.kind == kind and std.ascii.eqlIgnoreCase(pending.targetSlice(), target);
+            if (same and twoPersonStillOpen(now, pending.at_ms)) {
+                if (std.ascii.eqlIgnoreCase(pending.identitySlice(), identity)) {
+                    try self.noticeTo(conn, "waiting for a second operator");
+                    return .waiting;
+                }
+                _ = self.recordOperAudit(identity, twoPersonAuditAction(kind), target, "two-person approval");
+                self.two_person_pending = null;
+                return .confirmed;
+            }
+        }
+        var next = TwoPersonPending{ .kind = kind, .at_ms = now };
+        next.identity_len = twoPersonCopy(&next.identity, identity) orelse {
+            try self.noticeTo(conn, "waiting for a second operator");
+            return .waiting;
+        };
+        next.target_len = twoPersonCopy(&next.target, target) orelse {
+            try self.noticeTo(conn, "waiting for a second operator");
+            return .waiting;
+        };
+        self.two_person_pending = next;
+        _ = self.recordOperAudit(identity, twoPersonAuditAction(kind), target, "two-person approval");
+        try self.noticeTo(conn, "waiting for a second operator");
+        return .waiting;
+    }
+
     /// DIE / RESTART — oper-only server lifecycle.
     ///   * DIE     — shut the server down (clear the run flag; the process exits
     ///               and stays down — no re-exec, no service-manager restart).
@@ -25144,6 +25254,14 @@ pub const LinuxServer = struct {
         const restarting = std.ascii.eqlIgnoreCase(cmd, "RESTART");
         const needed: oper_mod.Privilege = if (restarting) .server_restart else .server_shutdown;
         if (!self.requirePriv(conn, needed)) return;
+        const kind: TwoPersonKind = if (restarting) .restart else .die;
+        switch (try self.twoPersonAdmit(conn, kind, cmd)) {
+            .waiting => return,
+            .proceed => {},
+            .confirmed => {
+                _ = self.recordOperAudit(twoPersonIdentity(conn), twoPersonAuditAction(kind), cmd, "two-person action");
+            },
+        }
         var nbuf: [128]u8 = undefined;
         const note = std.fmt.bufPrint(&nbuf, "{s} requested by {s}", .{ cmd, conn.session.displayName() }) catch cmd;
         try self.publishOperEvent(.oper_action, .critical, note);
@@ -107230,6 +107348,167 @@ test "GAP-P0c reaction tally is readable after a late subscribe" {
     const out = late_conn.send_buf[0..late_conn.send_len];
     try expectContains(out, "target=msg-stable-1 fire=1");
     std.debug.print("GAP-P0c branch=reaction tally a late subscriber can read\n", .{});
+}
+
+test "GAP-O9 DIE, RESTART, and mesh bans wait for a second operator" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var sim = reactor_mod.SimReactor.init(1_000_000);
+    var shutdown = std.atomic.Value(bool).init(true);
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "two-person.test",
+        .crypto_io = std.testing.io,
+        .reactor = sim.reactor(),
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        current_reactor = null;
+        server.deinit();
+    }
+    current_reactor = &server.reactors[0];
+    server.shutdown = &shutdown;
+
+    var op1 = ConnState.init(-1);
+    var op2 = ConnState.init(-1);
+    var op3 = ConnState.init(-1);
+    op1.overflow_allocator = allocator;
+    op2.overflow_allocator = allocator;
+    op3.overflow_allocator = allocator;
+    op1.send_armed = true;
+    op2.send_armed = true;
+    op3.send_armed = true;
+    defer if (op1.send_overflow.capacity > 0) op1.send_overflow.deinit(allocator);
+    defer if (op2.send_overflow.capacity > 0) op2.send_overflow.deinit(allocator);
+    defer if (op3.send_overflow.capacity > 0) op3.send_overflow.deinit(allocator);
+
+    const privs = oper_mod.OperPrivileges.initMany(&.{ .server_shutdown, .server_restart, .client_moderate });
+    try op1.session.setNick("op1");
+    try op2.session.setNick("op2");
+    try op3.session.setNick("op3");
+    op1.session.is_oper = true;
+    op2.session.is_oper = true;
+    op3.session.is_oper = true;
+    op1.session.oper_priv = privs;
+    op2.session.oper_priv = privs;
+    op3.session.oper_priv = privs;
+
+    const AuditScan = struct {
+        fn count(audit: *const svc_operaudit.OperAudit, action: svc_operaudit.Action, reason: []const u8) usize {
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i < audit.len()) : (i += 1) {
+                const row = audit.at(i).?;
+                if (row.action == action and std.mem.eql(u8, row.reason, reason)) n += 1;
+            }
+            return n;
+        }
+    };
+
+    // Flag off: DIE stops the process and writes no die audit.
+    const before_die = server.oper_audit.len();
+    try server.handleDie(&op1, "DIE");
+    try std.testing.expect(!shutdown.load(.acquire));
+    try std.testing.expectEqual(before_die, server.oper_audit.len());
+    try std.testing.expect(server.two_person_pending == null);
+    shutdown.store(true, .release);
+
+    // Flag off: a mesh ban installs on the first oper.
+    try server.addWardLive(&op1, .address, "203.0.113.9", .mesh, .refuse, 0, "net", .ward_add);
+    try std.testing.expect(server.warden.find(.address, "203.0.113.9") != null);
+    try std.testing.expectEqual(@as(usize, 0), AuditScan.count(&server.oper_audit, .ward_add, "two-person approval"));
+
+    server.config.two_person_rule = true;
+
+    // RESTART waits. The test must return before upgradeListenerOnly execs.
+    const before_restart = server.oper_audit.len();
+    try server.handleDie(&op1, "RESTART");
+    try std.testing.expect(shutdown.load(.acquire));
+    try std.testing.expect(server.two_person_pending != null);
+    try std.testing.expectEqual(TwoPersonKind.restart, server.two_person_pending.?.kind);
+    try std.testing.expectEqual(before_restart + 1, server.oper_audit.len());
+    const opened_at = server.two_person_pending.?.at_ms;
+
+    // The same oper does not confirm and does not extend the window.
+    sim.advance(1_000);
+    try server.handleDie(&op1, "RESTART");
+    try std.testing.expect(shutdown.load(.acquire));
+    try std.testing.expectEqual(opened_at, server.two_person_pending.?.at_ms);
+    try std.testing.expectEqual(before_restart + 1, server.oper_audit.len());
+
+    // DIE does not confirm a pending RESTART. It replaces that approval.
+    try server.handleDie(&op2, "DIE");
+    try std.testing.expect(shutdown.load(.acquire));
+    try std.testing.expectEqual(TwoPersonKind.die, server.two_person_pending.?.kind);
+    try std.testing.expectEqualStrings("op2", server.two_person_pending.?.identitySlice());
+
+    // A second distinct oper confirms DIE. The action is the extra audit row.
+    try server.handleDie(&op1, "DIE");
+    try std.testing.expect(!shutdown.load(.acquire));
+    try std.testing.expect(server.two_person_pending == null);
+    try std.testing.expectEqual(@as(usize, 2), AuditScan.count(&server.oper_audit, .die, "two-person approval"));
+    try std.testing.expectEqual(@as(usize, 1), AuditScan.count(&server.oper_audit, .die, "two-person action"));
+    try std.testing.expectEqual(@as(usize, 1), AuditScan.count(&server.oper_audit, .restart, "two-person approval"));
+    shutdown.store(true, .release);
+
+    // Mesh ban: logged-in account is the identity, so a second nick on the
+    // same account is not a second operator.
+    try op1.session.setNick("alpha-nick");
+    op1.session.loginAs("alpha");
+    op1.session.is_oper = true;
+    op1.session.oper_priv = privs;
+    try op2.session.setNick("alpha-other");
+    op2.session.loginAs("alpha");
+    op2.session.is_oper = true;
+    op2.session.oper_priv = privs;
+    try server.addWardLive(&op1, .host, "evil.example", .mesh, .expel, 0, "raid", .ward_add);
+    try std.testing.expect(server.warden.find(.host, "evil.example") == null);
+    try server.addWardLive(&op2, .host, "evil.example", .mesh, .expel, 0, "raid", .ward_add);
+    try std.testing.expect(server.warden.find(.host, "evil.example") == null);
+    try std.testing.expect(server.two_person_pending != null);
+
+    try op3.session.setNick("beta-nick");
+    op3.session.loginAs("beta");
+    op3.session.is_oper = true;
+    op3.session.oper_priv = privs;
+    try server.addWardLive(&op3, .host, "evil.example", .mesh, .expel, 0, "raid", .ward_add);
+    const installed = server.warden.find(.host, "evil.example") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(warden.Scope.mesh, installed.scope);
+    try std.testing.expect(server.two_person_pending == null);
+
+    // Node scope stays single-oper while the flag is on.
+    const approvals_before_node = AuditScan.count(&server.oper_audit, .ward_add, "two-person approval");
+    try server.addWardLive(&op1, .host, "local.example", .node, .expel, 0, "local", .ward_add);
+    const local = server.warden.find(.host, "local.example") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(warden.Scope.node, local.scope);
+    try std.testing.expectEqual(approvals_before_node, AuditScan.count(&server.oper_audit, .ward_add, "two-person approval"));
+
+    // Past the window, the other oper's repeat is a new proposal, not a confirm.
+    try server.addWardLive(&op1, .address, "198.51.100.7", .mesh, .refuse, 0, "later", .ward_add);
+    try std.testing.expect(server.warden.find(.address, "198.51.100.7") == null);
+    const expiry_at = server.two_person_pending.?.at_ms;
+    const approvals_at_proposal = AuditScan.count(&server.oper_audit, .ward_add, "two-person approval");
+    sim.advance(60_001);
+    try server.addWardLive(&op3, .address, "198.51.100.7", .mesh, .refuse, 0, "later", .ward_add);
+    try std.testing.expect(server.warden.find(.address, "198.51.100.7") == null);
+    try std.testing.expect(server.two_person_pending.?.at_ms != expiry_at);
+    try std.testing.expectEqual(approvals_at_proposal + 1, AuditScan.count(&server.oper_audit, .ward_add, "two-person approval"));
+    try server.addWardLive(&op1, .address, "198.51.100.7", .mesh, .refuse, 0, "later", .ward_add);
+    try std.testing.expect(server.warden.find(.address, "198.51.100.7") != null);
+
+    // Mesh delete waits, then the second oper removes it.
+    try server.deleteWardLive(&op1, .address, "198.51.100.7");
+    try std.testing.expect(server.warden.find(.address, "198.51.100.7") != null);
+    try server.deleteWardLive(&op3, .address, "198.51.100.7");
+    try std.testing.expect(server.warden.find(.address, "198.51.100.7") == null);
+    try std.testing.expectEqual(@as(usize, 2), AuditScan.count(&server.oper_audit, .ward_del, "two-person approval"));
+    try std.testing.expectEqual(@as(usize, 1), AuditScan.count(&server.oper_audit, .ward_del, "removed"));
+
+    std.debug.print("GAP-O9 branch=two-person rule waits for a second distinct operator; flag off is unchanged\n", .{});
 }
 
 test {

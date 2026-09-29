@@ -260,6 +260,9 @@ pub const Config = struct {
         /// (KICK/MODE/TOPIC/PROP/…) without a manual `/mode +j`. Default false
         /// keeps override an explicit, audited opt-in.
         auto_override: bool = false,
+        /// DIE, RESTART, and mesh-scope bans wait for a second distinct oper.
+        /// Default off: a single-oper network is unchanged.
+        two_person_rule: bool = false,
     };
 
     /// `[trace]` flight-recorder file. A fault overwrites this path with the
@@ -1206,6 +1209,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("oper.event_history_path"), &cfg.oper.event_history_path);
     try setOpt(allocator, resolver, doc.getString("trace.file"), &cfg.trace.file);
     if (doc.getBool("oper.auto_override")) |b| cfg.oper.auto_override = b;
+    if (doc.getBool("oper.two_person_rule")) |b| cfg.oper.two_person_rule = b;
     try setOpt(allocator, resolver, doc.getString("wasm.plugin_dir"), &cfg.wasm.plugin_dir);
     cfg.wasm.max_plugin_bytes = @intCast(try uintField(doc, "wasm.max_plugin_bytes", cfg.wasm.max_plugin_bytes, 1024, 64 * 1024 * 1024));
     cfg.wasm.max_memory_bytes = @intCast(try uintField(doc, "wasm.max_memory_bytes", cfg.wasm.max_memory_bytes, 64 * 1024, 16 * 1024 * 1024));
@@ -2588,6 +2592,17 @@ test "parseToml: listen proxy protocol and SASL enabled gate project" {
     try testing.expect(!omitted.sasl.allow_anonymous);
     try testing.expect(!omitted.sasl.oauth_auto_provision);
     try testing.expect(omitted.sasl.oauth_account_claim == null);
+}
+
+test "GAP-O9 two-person rule defaults off and parses on" {
+    const allocator = testing.allocator;
+    var omitted = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{});
+    defer omitted.deinit(allocator);
+    try testing.expect(!omitted.oper.two_person_rule);
+
+    var enabled = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[oper]\ntwo_person_rule=true\n", .{});
+    defer enabled.deinit(allocator);
+    try testing.expect(enabled.oper.two_person_rule);
 }
 
 test "GAP-P0b OAuth auto provision config defaults false and accepts true" {
