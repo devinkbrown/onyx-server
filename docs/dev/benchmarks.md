@@ -163,11 +163,15 @@ TLS / `num_shards` / `ring_entries`×`cqe_batch` matrix. kTLS is the configured 
 ```sh
 zig build bench-live -- --quick
 tools/bench.sh --live -o docs/audit/bench-live-<version>.md
+zig build bench-live -- --gap-x4 -o docs/audit/bench-gap-x4.md
 ```
 
 Default matrix: plaintext at shards 1 and 2, `ring_entries` 32 vs 128, `cqe_batch`
 256 vs 512, plus userspace TLS and kTLS-intent on the default io pair. `--quick`
-is one plaintext cell (smoke, not a baseline). A TLS cell that cannot handshake
+is one plaintext cell (smoke, not a baseline). `--gap-x4` is the eight-cell Linux
+matrix: `[io] sqpoll` on and off, TLS off and userspace (`ktls = "off"`), and
+`num_shards` 1 and 4, at `ring_entries` 32 and `cqe_batch` 256. It does not
+enable `defer_taskrun` or kTLS `txrx`. A TLS cell that cannot handshake
 (for example Python `ssl` vs an Ed25519 bootstrap leaf) is recorded as a failed
 cell — never silently skipped. Do not fold `bench-live` into `zig build test`.
 

@@ -14,6 +14,7 @@ before every boot so a bad cell cannot fall through to the daemon defaults.
 Usage:
   python3 tools/bench_live.py --bin zig-out/bin/onyx-server --quick
   python3 tools/bench_live.py --bin zig-out/bin/onyx-server -o docs/audit/bench-live-0.7.0-rc.1.md
+  zig build bench-live -- --gap-x4 -o docs/audit/bench-gap-x4.md
 """
 
 from __future__ import annotations
@@ -154,6 +155,7 @@ def write_config(
     shards: int,
     ring_entries: int,
     cqe_batch: int,
+    sqpoll: bool,
 ) -> None:
     tls_block = ""
     if tls_mode != "off":
@@ -176,7 +178,8 @@ def write_config(
         f"num_shards = {shards}\n"
         "[io]\n"
         f"ring_entries = {ring_entries}\n"
-        f"cqe_batch = {cqe_batch}\n",
+        f"cqe_batch = {cqe_batch}\n"
+        f"sqpoll = {'true' if sqpoll else 'false'}\n",
         encoding="utf-8",
     )
 
@@ -187,7 +190,9 @@ class CellResult:
     shards: int
     ring_entries: int
     cqe_batch: int
+    sqpoll: bool
     register_ms: float | None
+    join_ms: float | None
     privmsg_ms: float | None
     rss_idle_kib: int | None
     rss_loaded_kib: int | None
@@ -214,9 +219,12 @@ def run_cell(
     samples: int,
 ) -> CellResult:
     tls_mode = cell["tls"]
+    sqpoll = bool(cell.get("sqpoll", False))
     irc_port = free_port()
     tls_port = free_port() if tls_mode != "off" else 0
-    conf = work / f"cell-{tls_mode}-{cell['shards']}-{cell['ring']}-{cell['cqe']}.toml"
+    conf = work / (
+        f"cell-{tls_mode}-s{cell['shards']}-sq{int(sqpoll)}-{cell['ring']}-{cell['cqe']}.toml"
+    )
     log = conf.with_suffix(".log")
     write_config(
         conf,
@@ -226,6 +234,7 @@ def run_cell(
         shards=cell["shards"],
         ring_entries=cell["ring"],
         cqe_batch=cell["cqe"],
+        sqpoll=sqpoll,
     )
     check = subprocess.run(
         [str(bin_path), "--check-config", str(conf)],
@@ -239,6 +248,8 @@ def run_cell(
             cell["shards"],
             cell["ring"],
             cell["cqe"],
+            sqpoll,
+            None,
             None,
             None,
             None,
@@ -265,6 +276,8 @@ def run_cell(
                 cell["shards"],
                 cell["ring"],
                 cell["cqe"],
+                sqpoll,
+                None,
                 None,
                 None,
                 None,
@@ -277,14 +290,19 @@ def run_cell(
         rss_idle = rss_kib(proc.pid)
         socks: list[socket.socket] = []
         register_samples: list[float] = []
+        join_samples: list[float] = []
         try:
             for i in range(clients):
                 t0 = time.perf_counter()
                 s = connect(port, tls_mode, 3.0)
                 register(s, f"b{i}", 4.0)
                 register_samples.append((time.perf_counter() - t0) * 1000.0)
+                t_join = time.perf_counter()
                 s.sendall(f"JOIN {CHANNEL}\r\n".encode())
-                recv_until(s, b" 366 ", 4.0)
+                joined = recv_until(s, b" 366 ", 4.0)
+                if b" 366 " not in joined:
+                    raise RuntimeError(f"no 366 for {i}: {joined[:200]!r}")
+                join_samples.append((time.perf_counter() - t_join) * 1000.0)
                 socks.append(s)
             rss_loaded = rss_kib(proc.pid)
 
@@ -303,7 +321,9 @@ def run_cell(
                 cell["shards"],
                 cell["ring"],
                 cell["cqe"],
+                sqpoll,
                 statistics.median(register_samples),
+                statistics.median(join_samples),
                 statistics.median(privmsg_samples),
                 rss_idle,
                 rss_loaded,
@@ -323,6 +343,8 @@ def run_cell(
             cell["shards"],
             cell["ring"],
             cell["cqe"],
+            sqpoll,
+            None,
             None,
             None,
             None,
@@ -404,29 +426,44 @@ def render(
     clients: int,
     samples: int,
     bin_path: Path,
+    title: str,
+    command: str,
 ) -> str:
     lines = [
-        "# Live-daemon bench — P0-1 remaining axes",
+        f"# {title}",
+        "",
+        "Every number in the table below was produced by this command and no other:",
+        "",
+        "```sh",
+        command,
+        "```",
         "",
         "Throwaway `onyx-server` on 127.0.0.1, kernel-assigned ports, "
-        "`--check-config` before each boot. Not `orochi.service`.",
+        "`--check-config` before each boot. Not a production service unit.",
         "",
         f"clients={clients}  privmsg_samples={samples}",
+        "",
+        "JOIN p50 is the median time from `JOIN` to numeric 366. PRIVMSG p50 is",
+        "the median time from `PRIVMSG` on the first client until the last client",
+        "receives that token. RSS idle is before any client; RSS loaded is after",
+        "every client has joined.",
         "",
     ]
     lines.extend(provenance(bin_path))
     lines.extend(
         [
-        "| tls | shards | ring×cqe | register p50 ms | PRIVMSG p50 ms | RSS idle KiB | RSS/client KiB | note | error |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+            "| sqpoll | tls | shards | ring×cqe | register p50 ms | JOIN p50 ms | PRIVMSG p50 ms | RSS idle KiB | RSS loaded KiB | RSS/client KiB | note | error |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
         ]
     )
     for r in results:
         io = f"{r.ring_entries}×{r.cqe_batch}"
-        err = (r.error or "").replace("\n", " ")[:80]
+        err = (r.error or "").replace("\n", " ")[:120]
+        loaded = "—" if r.rss_loaded_kib is None else str(r.rss_loaded_kib)
+        idle = "—" if r.rss_idle_kib is None else str(r.rss_idle_kib)
         lines.append(
-            f"| {r.tls} | {r.shards} | {io} | {fmt_ms(r.register_ms)} | "
-            f"{fmt_ms(r.privmsg_ms)} | {r.rss_idle_kib or '—'} | "
+            f"| {str(r.sqpoll).lower()} | {r.tls} | {r.shards} | {io} | {fmt_ms(r.register_ms)} | "
+            f"{fmt_ms(r.join_ms)} | {fmt_ms(r.privmsg_ms)} | {idle} | {loaded} | "
             f"{fmt_rss(r.rss_per_client())} | {r.note} | {err} |"
         )
     lines.extend(
@@ -434,8 +471,14 @@ def render(
             "",
             "RSS/client is (loaded − idle) / N after JOIN. A small or negative",
             "delta means the idle image already dwarfs N clients — do not treat",
-            "it as a per-conn floor. kTLS is the configured intent (`txrx`);",
-            "the kernel may keep the path in userspace if ULP is absent.",
+            "it as a per-conn floor. A blank timing with an error is an unmeasured",
+            "cell, not a zero. TLS `userspace` sets `ktls = \"off\"`. The kTLS",
+            "`txrx` cell, when present, is configured intent only; the note says",
+            "whether the kernel attached ULP. `[io] sqpoll` is set without",
+            "`defer_taskrun`.",
+            "",
+            "Non-Linux rows are not in this table. This host is Linux, and the",
+            "portable reactor cannot execute the same recipe.",
             "",
         ]
     )
@@ -457,6 +500,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--clients", type=int, default=0)
     p.add_argument("--samples", type=int, default=0)
+    p.add_argument(
+        "--gap-x4",
+        action="store_true",
+        help="GAP-X4 matrix: SQPOLL on/off × TLS off/userspace × shards 1 and 4",
+    )
     return p.parse_args()
 
 
@@ -467,21 +515,46 @@ def main() -> int:
         print(f"bench_live: binary not found: {bin_path} (run zig build first)", file=sys.stderr)
         return 2
 
-    if args.quick:
-        cells = [{"tls": "off", "shards": 1, "ring": 32, "cqe": 256}]
+    if args.quick and args.gap_x4:
+        print("bench_live: --quick and --gap-x4 are different matrices", file=sys.stderr)
+        return 2
+    if args.gap_x4:
+        cells = []
+        for sqpoll in (False, True):
+            for tls_mode in ("off", "userspace"):
+                for shards in (1, 4):
+                    cells.append(
+                        {
+                            "tls": tls_mode,
+                            "shards": shards,
+                            "ring": 32,
+                            "cqe": 256,
+                            "sqpoll": sqpoll,
+                        }
+                    )
+        clients = args.clients or 4
+        samples = args.samples or 16
+        title = "GAP-X4 Linux live bench"
+        command = "zig build bench-live -- --gap-x4 -o docs/audit/bench-gap-x4.md"
+    elif args.quick:
+        cells = [{"tls": "off", "shards": 1, "ring": 32, "cqe": 256, "sqpoll": False}]
         clients = args.clients or 4
         samples = args.samples or 8
+        title = "Live-daemon bench — one plaintext cell"
+        command = "zig build bench-live -- --quick"
     else:
         cells = [
-            {"tls": "off", "shards": 1, "ring": 32, "cqe": 256},
-            {"tls": "off", "shards": 2, "ring": 32, "cqe": 256},
-            {"tls": "off", "shards": 1, "ring": 128, "cqe": 256},
-            {"tls": "off", "shards": 1, "ring": 32, "cqe": 512},
-            {"tls": "userspace", "shards": 1, "ring": 32, "cqe": 256},
-            {"tls": "ktls", "shards": 1, "ring": 32, "cqe": 256},
+            {"tls": "off", "shards": 1, "ring": 32, "cqe": 256, "sqpoll": False},
+            {"tls": "off", "shards": 2, "ring": 32, "cqe": 256, "sqpoll": False},
+            {"tls": "off", "shards": 1, "ring": 128, "cqe": 256, "sqpoll": False},
+            {"tls": "off", "shards": 1, "ring": 32, "cqe": 512, "sqpoll": False},
+            {"tls": "userspace", "shards": 1, "ring": 32, "cqe": 256, "sqpoll": False},
+            {"tls": "ktls", "shards": 1, "ring": 32, "cqe": 256, "sqpoll": False},
         ]
         clients = args.clients or 8
         samples = args.samples or 16
+        title = "Live-daemon bench — P0-1 remaining axes"
+        command = "zig build bench-live"
 
     results: list[CellResult] = []
     with tempfile.TemporaryDirectory(prefix="onyx-bench-live-") as tmp:
@@ -491,7 +564,14 @@ def main() -> int:
                 run_cell(bin_path, work, cell, clients=clients, samples=samples)
             )
 
-    text = render(results, clients=clients, samples=samples, bin_path=bin_path)
+    text = render(
+        results,
+        clients=clients,
+        samples=samples,
+        bin_path=bin_path,
+        title=title,
+        command=command,
+    )
     print(text)
     if args.out:
         out = Path(args.out)
@@ -499,6 +579,10 @@ def main() -> int:
         out.write_text(text, encoding="utf-8")
         print(f"bench_live: wrote {out}", file=sys.stderr)
 
+    if args.gap_x4:
+        if any(r.error for r in results):
+            return 1
+        return 0
     required = [r for r in results if r.tls == "off"]
     if any(r.error for r in required):
         return 1
