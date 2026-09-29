@@ -1290,7 +1290,14 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const Server = onyx_server.daemon.server.Server;
-    var srv = Server.init(allocator, srv_cfg) catch |err| {
+    // `init` copies LinuxServer onto the caller stack, which no longer fits
+    // the default 8MB main thread. `initInPlace` fills this heap slot.
+    const srv = allocator.create(Server) catch |err| {
+        std.debug.print("onyx-server: fatal — cannot allocate server: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer allocator.destroy(srv);
+    srv.initInPlace(allocator, srv_cfg) catch |err| {
         // The reactor requires io_uring on a 64-bit Linux kernel. If it is
         // unavailable (old kernel / restricted sandbox) the daemon cannot serve,
         // so fail loudly and exit non-zero rather than pretending to have started.
@@ -1327,7 +1334,7 @@ pub fn main(init: std.process.Init) !void {
             if (comptime builtin.os.tag == .linux) {
                 srv.setAcmeTlsReloadConfig(&h.parsed.tls);
                 const svc = try allocator.create(AcmeRenewalService);
-                svc.* = AcmeRenewalService.init(allocator, init.io, &srv, h.parsed.acme, &h.parsed.tls);
+                svc.* = AcmeRenewalService.init(allocator, init.io, srv, h.parsed.acme, &h.parsed.tls);
                 acme_renewal = svc;
                 svc.start();
             } else {
@@ -1371,7 +1378,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
                 const svc = try allocator.create(OcspStapleService);
-                svc.* = OcspStapleService.init(allocator, init.io, &srv, &h.parsed.tls, .{
+                svc.* = OcspStapleService.init(allocator, init.io, srv, &h.parsed.tls, .{
                     .check_interval_ms = h.parsed.ocsp.check_interval_ms,
                 });
                 svc.trust_anchors = trust_anchors;
@@ -1449,7 +1456,7 @@ pub fn main(init: std.process.Init) !void {
     // hook so channel REGISTER/DROP reflects into the world's +r REGISTERED flag.
     if (account_store != null) {
         account_services.state = .{
-            .ptr = &srv,
+            .ptr = srv,
             .create_channel = svcCreateChannel,
             .drop_channel = svcDropChannel,
         };
