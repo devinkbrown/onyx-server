@@ -230,6 +230,7 @@ const monitor_capsule = @import("helix/monitor_capsule.zig");
 const silence_capsule = @import("helix/silence_capsule.zig");
 const s2s_snapshot = @import("helix/s2s_snapshot.zig");
 const oper_grant_snapshot = @import("helix/oper_grant_snapshot.zig");
+const bot_grant_snapshot = @import("helix/bot_grant_snapshot.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
 const mesh_clock_snapshot = @import("helix/mesh_clock_snapshot.zig");
 const tls_server = @import("../crypto/tls_server.zig");
@@ -4232,6 +4233,12 @@ pub const LinuxServer = struct {
     /// an operator authenticated on a peer node be recognized here without the
     /// password ever crossing the mesh. See proto/oper_cred_share.zig.
     oper_grants: oper_cred_share.Registry = .{},
+    /// Scoped bot grants (speak, webhook, history). Not operator privilege bits.
+    /// Carried across USR2 as a BGNT `.mesh_checkpoint` image.
+    bot_grants: bot_grant_snapshot.Table = .{},
+    /// Announcement registry. BOTGRANT also registers the account here so
+    /// `isBot` matches the grant table. The grant itself carries no oper bit.
+    bot_registry: bot_registry_mod.BotRegistry = .{ .allocator = undefined, .map = .{} },
     /// Strictly-increasing incarnation counter for minted oper grants, so a later
     /// GRANT/REVOKE always supersedes an earlier one (even within one ms).
     grant_incarnation: u64 = 0,
@@ -4744,6 +4751,7 @@ pub const LinuxServer = struct {
             .silence = silence.Store.initWithParams(allocator, .{ .max_masks_per_owner = config.silencelimit }),
             .observe = observe_mod.Registry.init(allocator, .{}),
             .oper_motd = oper_motd_mod.OperMotd.init(allocator),
+            .bot_registry = bot_registry_mod.BotRegistry.init(allocator),
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
@@ -5495,7 +5503,14 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "WEBHOOK: that is not a channel name");
             return;
         }
-        if (!self.webhookChannelOpGate(id, conn, channel)) return;
+        if (conn.session.account()) |account| {
+            if (self.accountIsGatedBot(account)) {
+                if (!self.bot_grants.allows(account, .webhook, channel, self.grantNowU64())) {
+                    try self.noticeTo(conn, "BOTGRANT: webhook refused");
+                    return;
+                }
+            } else if (!self.webhookChannelOpGate(id, conn, channel)) return;
+        } else if (!self.webhookChannelOpGate(id, conn, channel)) return;
         const name = if (params.len >= 3) params[2] else channel;
 
         var idm: [webhook_mod.id_bytes]u8 = undefined;
@@ -5704,6 +5719,122 @@ pub const LinuxServer = struct {
         }
         _ = self.recordOperAudit(conn.session.displayName(), .other, url, "outbound webhook");
         try self.noticeTo(conn, if (replaced) "OUTHOOK: updated" else "OUTHOOK: registered");
+    }
+
+    fn accountIsGatedBot(self: *const LinuxServer, account: []const u8) bool {
+        return self.bot_grants.isBot(account) or self.bot_registry.isBot(account);
+    }
+
+    fn botChannelSpeakDenied(self: *LinuxServer, conn: *ConnState, target: []const u8) bool {
+        if (!world_model.isChannelName(target)) return false;
+        const account = conn.session.account() orelse return false;
+        if (!self.accountIsGatedBot(account)) return false;
+        return !self.bot_grants.allows(account, .speak, target, self.grantNowU64());
+    }
+
+    /// `BOTGRANT ADD <account> <speak|webhook|history> <channel> <ttl-seconds>`
+    /// grants one scoped action. `DEL` revokes it. `LIST` shows live grants.
+    /// The account becomes a bot. The grant is not an oper bit.
+    pub fn handleBotGrant(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (!self.requirePriv(conn, .server_admin)) return;
+        const p = parsed.paramSlice();
+        if (p.len < 1) {
+            try self.noticeTo(conn, "Usage: BOTGRANT ADD <account> <speak|webhook|history> <channel> <ttl-seconds> | DEL <account> <kind> <channel> | LIST [account]");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "LIST")) {
+            const filter = if (p.len >= 2) p[1] else null;
+            var shown: usize = 0;
+            const now = self.grantNowU64();
+            var live: [bot_grant_snapshot.max_grants]bot_grant_snapshot.GrantView = undefined;
+            const n = self.bot_grants.copyLive(now, &live);
+            for (live[0..n]) |slot| {
+                if (filter) |name| {
+                    if (!std.ascii.eqlIgnoreCase(slot.account, name)) continue;
+                }
+                var buf: [default_reply_bytes]u8 = undefined;
+                const note = std.fmt.bufPrint(&buf, "BOTGRANT: {s} {s} {s} expires={d}", .{
+                    slot.account,
+                    @tagName(slot.kind),
+                    slot.scope,
+                    slot.expiry_ms,
+                }) catch continue;
+                try self.noticeTo(conn, note);
+                shown += 1;
+            }
+            if (shown == 0) try self.noticeTo(conn, "BOTGRANT: none");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "DEL") or std.ascii.eqlIgnoreCase(p[0], "DELETE")) {
+            if (p.len < 4) {
+                try self.noticeTo(conn, "Usage: BOTGRANT DEL <account> <speak|webhook|history> <channel>");
+                return;
+            }
+            const kind = bot_grant_snapshot.Kind.parse(p[2]) orelse {
+                try self.noticeTo(conn, "BOTGRANT: kind must be speak, webhook, or history");
+                return;
+            };
+            if (!self.bot_grants.remove(p[1], kind, p[3])) {
+                try self.noticeTo(conn, "BOTGRANT: no such grant");
+                return;
+            }
+            _ = self.recordOperAudit(conn.session.displayName(), .other, p[1], "bot grant del");
+            try self.noticeTo(conn, "BOTGRANT: revoked");
+            return;
+        }
+        if (!std.ascii.eqlIgnoreCase(p[0], "ADD")) {
+            try self.noticeTo(conn, "Usage: BOTGRANT ADD <account> <speak|webhook|history> <channel> <ttl-seconds> | DEL <account> <kind> <channel> | LIST [account]");
+            return;
+        }
+        if (p.len < 5) {
+            try self.noticeTo(conn, "Usage: BOTGRANT ADD <account> <speak|webhook|history> <channel> <ttl-seconds>");
+            return;
+        }
+        const account = p[1];
+        const kind = bot_grant_snapshot.Kind.parse(p[2]) orelse {
+            try self.noticeTo(conn, "BOTGRANT: kind must be speak, webhook, or history");
+            return;
+        };
+        const scope = p[3];
+        if (account.len == 0 or account.len > bot_grant_snapshot.max_account) {
+            try self.noticeTo(conn, "BOTGRANT: account name is empty or too long");
+            return;
+        }
+        if (!world_model.isChannelName(scope) or scope.len > bot_grant_snapshot.max_scope) {
+            try self.noticeTo(conn, "BOTGRANT: scope must be a channel name");
+            return;
+        }
+        const ttl = std.fmt.parseInt(u64, p[4], 10) catch {
+            try self.noticeTo(conn, "BOTGRANT: ttl must be a positive number of seconds");
+            return;
+        };
+        if (ttl == 0 or ttl > std.math.maxInt(u64) / 1000) {
+            try self.noticeTo(conn, "BOTGRANT: ttl must be a positive number of seconds");
+            return;
+        }
+        const now = self.grantNowU64();
+        const expiry = std.math.add(u64, now, ttl * 1000) catch {
+            try self.noticeTo(conn, "BOTGRANT: ttl is too large");
+            return;
+        };
+        self.bot_registry.register(account, .{}) catch {
+            try self.noticeTo(conn, "BOTGRANT: could not register the bot account");
+            return;
+        };
+        self.bot_grants.upsert(account, kind, scope, expiry, now) catch |err| {
+            const msg: []const u8 = switch (err) {
+                error.TooMany => "BOTGRANT: grant table is full",
+                else => "BOTGRANT: rejected",
+            };
+            try self.noticeTo(conn, msg);
+            return;
+        };
+        _ = self.recordOperAudit(conn.session.displayName(), .other, account, "bot grant");
+        try self.noticeTo(conn, "BOTGRANT: added");
     }
 
     /// Push one admitted oper event to every subscription whose mask includes
@@ -5995,6 +6126,7 @@ pub const LinuxServer = struct {
         if (self.policy_undo) |*undo| self.destroyPolicyUndo(undo);
         self.policy_undo = null;
         self.destroyOutboundWebhooks();
+        self.bot_registry.deinit();
         self.warden.deinit();
         self.spamtrap.deinit();
         self.raid_shield.deinit();
@@ -23785,7 +23917,16 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "CHATHISTORY", code, reason);
             return;
         };
-        if (!try self.ensureChathistoryTargetVisible(id, conn, chathistory_cmd.requestTarget(req))) return;
+        const hist_target = chathistory_cmd.requestTarget(req);
+        if (!try self.ensureChathistoryTargetVisible(id, conn, hist_target)) return;
+        if (world_model.isChannelName(hist_target)) {
+            if (conn.session.account()) |account| {
+                if (self.accountIsGatedBot(account) and !self.bot_grants.allows(account, .history, hist_target, self.grantNowU64())) {
+                    try self.failReply(conn, "CHATHISTORY", "ACCESS_DENIED", "BOTGRANT: history refused");
+                    return;
+                }
+            }
+        }
         var buf: [64]lotus.Message = undefined;
         var target: []const u8 = "";
         var found: []const lotus.Message = buf[0..0];
@@ -26382,6 +26523,32 @@ pub const LinuxServer = struct {
             return null;
         };
 
+        // Scoped bot grants ride the same mesh_checkpoint family under a
+        // different magic. Absence stays legal (a pre-O12 arena has no piece).
+        // An empty image is still sealed so the successor keeps "no grants"
+        // distinct from a missing predecessor piece only by adopting empty.
+        const bot_grant_wire = bot_grant_snapshot.encodeFrom(
+            self.allocator,
+            &self.bot_grants,
+            self.grantNowU64(),
+        ) catch |err| {
+            srvLog("onyx-server: UPGRADE bot-grant checkpoint seal failed ({s})\n", .{@errorName(err)});
+            return null;
+        };
+        blobs.append(self.allocator, bot_grant_wire) catch {
+            srvLog("onyx-server: UPGRADE bot-grant blob ownership append failed\n", .{});
+            self.allocator.free(bot_grant_wire);
+            return null;
+        };
+        pieces.append(self.allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = bot_grant_wire,
+            .min_supported = 2,
+        }) catch {
+            srvLog("onyx-server: UPGRADE bot-grant piece append failed\n", .{});
+            return null;
+        };
+
         return .{
             .world_bytes = world_wire.len,
             .history_bytes = history_wire.len,
@@ -28031,6 +28198,38 @@ pub const LinuxServer = struct {
             };
         }
 
+        // Same at-most-once rule as oper grants: a pre-checkpoint arena lacks
+        // BGNT and adopts with an empty bot-grant table. A malformed or
+        // duplicate image rejects the handoff. Restoring the table does not
+        // set operator privilege bits.
+        var bot_grant_checkpoint: ?bot_grant_snapshot.Snapshot = null;
+        for (caps) |c| {
+            if (c.header.kind != .mesh_checkpoint) continue;
+            var recognized = false;
+            for (c.fields) |field| {
+                if (bot_grant_snapshot.isCheckpoint(field.bytes)) {
+                    recognized = true;
+                    break;
+                }
+            }
+            if (!recognized) continue;
+            const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+            if (bot_grant_checkpoint != null or
+                c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != 2 or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate bot-grant checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            bot_grant_checkpoint = bot_grant_snapshot.decodeCurrent(c.fields[0].bytes) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed bot-grant checkpoint");
+                return error.InvalidInheritedHandoff;
+            };
+        }
+
         // Select the process-global TLS ticket-key authority without publishing
         // it. Resumption-enabled predecessors in the current Helix contract emit
         // exactly one canonical v1 singleton. Missing, duplicate, malformed, or
@@ -29138,6 +29337,39 @@ pub const LinuxServer = struct {
             srvLog("onyx-server: UPGRADE resume — primed {d} carried oper grant(s)\n", .{oper_grants_restored});
         if (oper_grants_dropped != 0)
             srvLog("onyx-server: UPGRADE resume — WARNING: dropped {d} carried oper grant(s) (registry capacity exhausted or superseded); a cross-mesh grant/revocation may be lost\n", .{oper_grants_dropped});
+
+        // Prime scoped bot grants at the same no-fail edge. Slot inserts do not
+        // allocate. Mirroring the account into the announcement registry can
+        // allocate; a failure there still leaves the fixed table in place, so
+        // the account stays gated. Nothing in this restore sets `is_oper`.
+        var bot_grants_restored: usize = 0;
+        var bot_grants_dropped: usize = 0;
+        if (bot_grant_checkpoint) |snap| {
+            var bot_it = snap.botIterator();
+            while (bot_it.next()) |account| {
+                self.bot_grants.insertBot(account) catch {
+                    bot_grants_dropped += 1;
+                    continue;
+                };
+                self.bot_registry.register(account, .{}) catch {
+                    bot_grants_dropped += 1;
+                    continue;
+                };
+                bot_grants_restored += 1;
+            }
+            var grant_it = snap.grantIterator();
+            while (grant_it.next()) |g| {
+                self.bot_grants.upsert(g.account, g.kind, g.scope, g.expiry_ms, self.grantNowU64()) catch {
+                    bot_grants_dropped += 1;
+                    continue;
+                };
+                bot_grants_restored += 1;
+            }
+        }
+        if (bot_grants_restored != 0)
+            srvLog("onyx-server: UPGRADE resume — primed {d} carried bot grant record(s)\n", .{bot_grants_restored});
+        if (bot_grants_dropped != 0)
+            srvLog("onyx-server: UPGRADE resume — WARNING: dropped {d} carried bot grant record(s)\n", .{bot_grants_dropped});
 
         // Transfer descriptor ownership immediately at the commit edge. Every
         // later action is retryable/best-effort derived work and must never
@@ -52413,6 +52645,10 @@ pub const LinuxServer = struct {
                 unique_targets[unique_count] = target;
                 unique_count += 1;
             }
+            if (self.botChannelSpeakDenied(conn, target)) {
+                if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (bot grant)");
+                continue;
+            }
             try self.messageOne(id, conn, command, target, text, parsed.tags_raw);
         }
     }
@@ -60879,6 +61115,14 @@ fn upgradeOperGrantBytesForTest(pieces: []const helix_live.StatePiece) ?[]const 
     for (pieces) |piece| {
         if (piece.kind == .mesh_checkpoint and
             oper_grant_snapshot.isCheckpoint(piece.bytes)) return piece.bytes;
+    }
+    return null;
+}
+
+fn upgradeBotGrantBytesForTest(pieces: []const helix_live.StatePiece) ?[]const u8 {
+    for (pieces) |piece| {
+        if (piece.kind == .mesh_checkpoint and
+            bot_grant_snapshot.isCheckpoint(piece.bytes)) return piece.bytes;
     }
     return null;
 }
@@ -108534,6 +108778,337 @@ test "GAP-O11 outbound webhooks sign retries and refuse loopback" {
     try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "not enabled") != null);
 
     std.debug.print("GAP-O11 branch=outbound webhooks sign and retry with a cap; link-local and loopback stay refused unless config allows them\n", .{});
+}
+
+test "GAP-O12 scoped expiring bot grants survive USR2 and are not an oper bit" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "grant.test" };
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    server.config.webhook_enabled = true;
+
+    const human_id = try addTestLocalClient(server, "human", "human");
+    const human = server.connFor(human_id).?;
+    const oper_id = try addTestLocalClient(server, "oper", "operacct");
+    const oper = server.connFor(oper_id).?;
+    oper.session.is_oper = true;
+    oper.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_admin});
+    const bot_id = try addTestLocalClient(server, "newsbot", "newsbot");
+    const bot = server.connFor(bot_id).?;
+    const peer_id = try addTestLocalClient(server, "peer", "peer");
+    const peer = server.connFor(peer_id).?;
+
+    try std.testing.expect(!bot.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), bot.session.oper_priv.count());
+    try std.testing.expect(!server.accountIsGatedBot("newsbot"));
+
+    _ = try server.world.join("#room", worldIdFromClient(human_id));
+    _ = try server.world.join("#room", worldIdFromClient(bot_id));
+    _ = try server.world.join("#room", worldIdFromClient(peer_id));
+    _ = try server.world.join("#hooks", worldIdFromClient(human_id));
+    _ = try server.world.join("#hooks", worldIdFromClient(bot_id));
+    _ = try server.history.append("#room", .{ .msgid = "m1", .sender = "a!u@h", .text = "planted-history-line", .timestamp = 5 });
+
+    var denied = try irc_line.parseLine("BOTGRANT ADD newsbot speak #room 3600");
+    try server.handleBotGrant(human, &denied);
+    try std.testing.expect(std.mem.indexOf(u8, human.send_buf[0..human.send_len], "not an IRC operator") != null);
+    try std.testing.expectEqual(@as(usize, 0), server.bot_grants.grantCount());
+
+    var bad_kind = try irc_line.parseLine("BOTGRANT ADD newsbot dance #room 3600");
+    oper.send_len = 0;
+    try server.handleBotGrant(oper, &bad_kind);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "kind must be speak") != null);
+    try std.testing.expectEqual(@as(usize, 0), server.bot_grants.grantCount());
+    try std.testing.expect(!server.bot_registry.isBot("newsbot"));
+
+    var bad_ttl = try irc_line.parseLine("BOTGRANT ADD newsbot speak #room 0");
+    oper.send_len = 0;
+    try server.handleBotGrant(oper, &bad_ttl);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "positive number") != null);
+    try std.testing.expect(!server.accountIsGatedBot("newsbot"));
+
+    // An ordinary logged-in user still speaks with no grant.
+    var human_msg = try irc_line.parseLine("PRIVMSG #room :human-still-speaks");
+    peer.send_len = 0;
+    try server.handleMessage(human_id, human, &human_msg, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, peer.send_buf[0..peer.send_len], "human-still-speaks") != null);
+
+    var add_speak = try irc_line.parseLine("BOTGRANT ADD newsbot speak #room 3600");
+    oper.send_len = 0;
+    try server.handleBotGrant(oper, &add_speak);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "BOTGRANT: added") != null);
+    try std.testing.expect(server.bot_registry.isBot("newsbot"));
+    try std.testing.expect(server.bot_grants.isBot("newsbot"));
+    try std.testing.expect(!bot.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), bot.session.oper_priv.count());
+
+    var list_cmd = try irc_line.parseLine("BOTGRANT LIST newsbot");
+    oper.send_len = 0;
+    try server.handleBotGrant(oper, &list_cmd);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "newsbot speak #room") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "privilege") == null);
+
+    // The speak grant is for #room only. #hooks is a different scope.
+    var wrong_chan = try irc_line.parseLine("PRIVMSG #hooks :should-not-land");
+    human.send_len = 0;
+    bot.send_len = 0;
+    try server.handleMessage(bot_id, bot, &wrong_chan, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "bot grant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, human.send_buf[0..human.send_len], "should-not-land") == null);
+
+    var ok_msg = try irc_line.parseLine("PRIVMSG #room :hello-from-bot");
+    peer.send_len = 0;
+    bot.send_len = 0;
+    try server.handleMessage(bot_id, bot, &ok_msg, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, peer.send_buf[0..peer.send_len], "hello-from-bot") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "bot grant") == null);
+    try std.testing.expect(!bot.session.isOper());
+
+    var quiet = try irc_line.parseLine("NOTICE #hooks :notice-dropped");
+    bot.send_len = 0;
+    human.send_len = 0;
+    try server.handleMessage(bot_id, bot, &quiet, "NOTICE");
+    try std.testing.expectEqual(@as(usize, 0), bot.send_len);
+    try std.testing.expect(std.mem.indexOf(u8, human.send_buf[0..human.send_len], "notice-dropped") == null);
+
+    bot.session.addCap(.chathistory);
+    var hist_denied = try irc_line.parseLine("CHATHISTORY LATEST #room * 10");
+    bot.send_len = 0;
+    try server.handleChathistory(bot_id, bot, &hist_denied, hist_denied.raw);
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "history refused") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "planted-history-line") == null);
+
+    var add_hist = try irc_line.parseLine("BOTGRANT ADD newsbot history #room 3600");
+    oper.send_len = 0;
+    try server.handleBotGrant(oper, &add_hist);
+    bot.send_len = 0;
+    try server.handleChathistory(bot_id, bot, &hist_denied, hist_denied.raw);
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "planted-history-line") != null);
+    try std.testing.expect(!bot.session.isOper());
+
+    var del_hist = try irc_line.parseLine("BOTGRANT DEL newsbot history #room");
+    oper.send_len = 0;
+    try server.handleBotGrant(oper, &del_hist);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "BOTGRANT: revoked") != null);
+    bot.send_len = 0;
+    try server.handleChathistory(bot_id, bot, &hist_denied, hist_denied.raw);
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "history refused") != null);
+    try std.testing.expect(server.bot_registry.isBot("newsbot"));
+
+    // A channel founder who is not a bot still creates a webhook with no grant.
+    var human_hook = try irc_line.parseLine("WEBHOOK CREATE #hooks humanhook");
+    human.send_len = 0;
+    try server.handleWebhook(human_id, human, &human_hook);
+    try std.testing.expect(std.mem.indexOf(u8, human.send_buf[0..human.send_len], "WEBHOOK: created") != null);
+
+    var bot_hook = try irc_line.parseLine("WEBHOOK CREATE #hooks bothook");
+    bot.send_len = 0;
+    try server.handleWebhook(bot_id, bot, &bot_hook);
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "webhook refused") != null);
+
+    var add_hook = try irc_line.parseLine("BOTGRANT ADD newsbot webhook #hooks 3600");
+    oper.send_len = 0;
+    try server.handleBotGrant(oper, &add_hook);
+    bot.send_len = 0;
+    try server.handleWebhook(bot_id, bot, &bot_hook);
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "WEBHOOK: created") != null);
+    try std.testing.expect(!bot.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), bot.session.oper_priv.count());
+
+    // Expiry refuses without deleting the bot identity. Re-add the speak grant
+    // afterwards so the sealed image still carries a live one.
+    try std.testing.expect(server.bot_grants.expire("newsbot", .speak, "#room"));
+    var expired_msg = try irc_line.parseLine("PRIVMSG #room :expired-speak");
+    peer.send_len = 0;
+    bot.send_len = 0;
+    try server.handleMessage(bot_id, bot, &expired_msg, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "bot grant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, peer.send_buf[0..peer.send_len], "expired-speak") == null);
+    try std.testing.expect(server.accountIsGatedBot("newsbot"));
+
+    try std.testing.expect(server.bot_grants.expire("newsbot", .webhook, "#hooks"));
+    bot.send_len = 0;
+    try server.handleWebhook(bot_id, bot, &bot_hook);
+    try std.testing.expect(std.mem.indexOf(u8, bot.send_buf[0..bot.send_len], "webhook refused") != null);
+
+    oper.send_len = 0;
+    try server.handleBotGrant(oper, &add_speak);
+    try std.testing.expect(server.bot_grants.allows("newsbot", .speak, "#room", server.grantNowU64()));
+    try std.testing.expect(!server.bot_grants.allows("newsbot", .history, "#room", server.grantNowU64()));
+    try std.testing.expect(!server.bot_grants.allows("newsbot", .webhook, "#hooks", server.grantNowU64()));
+
+    // Test clients use fd -1. A world checkpoint refuses a member with no
+    // live socket, so drop the memberships after the behavior checks. The
+    // grants themselves are not channel state.
+    try server.world.part("#room", worldIdFromClient(human_id));
+    try server.world.part("#room", worldIdFromClient(bot_id));
+    try server.world.part("#room", worldIdFromClient(peer_id));
+    try server.world.part("#hooks", worldIdFromClient(human_id));
+    try server.world.part("#hooks", worldIdFromClient(bot_id));
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(server, &pieces, &blobs);
+    try std.testing.expect(upgradeBotGrantBytesForTest(pieces.items) != null);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-bot-grants");
+    current_reactor = &successor.reactors[0];
+
+    try std.testing.expect(successor.bot_registry.isBot("newsbot"));
+    try std.testing.expect(successor.bot_grants.isBot("newsbot"));
+    try std.testing.expect(successor.bot_grants.allows("newsbot", .speak, "#room", successor.grantNowU64()));
+    try std.testing.expect(!successor.bot_grants.allows("newsbot", .history, "#room", successor.grantNowU64()));
+    try std.testing.expect(!successor.bot_grants.allows("newsbot", .webhook, "#hooks", successor.grantNowU64()));
+
+    const bot2_id = try addTestLocalClient(successor, "newsbot", "newsbot");
+    const bot2 = successor.connFor(bot2_id).?;
+    const peer2_id = try addTestLocalClient(successor, "peer2", "peer2");
+    const peer2 = successor.connFor(peer2_id).?;
+    try std.testing.expect(!bot2.session.isOper());
+    try std.testing.expectEqual(@as(usize, 0), bot2.session.oper_priv.count());
+    _ = try successor.world.join("#room", worldIdFromClient(bot2_id));
+    _ = try successor.world.join("#room", worldIdFromClient(peer2_id));
+    _ = try successor.history.append("#room", .{ .msgid = "m2", .sender = "a!u@h", .text = "successor-planted", .timestamp = 9 });
+
+    var kept = try irc_line.parseLine("PRIVMSG #room :kept-across-usr2");
+    peer2.send_len = 0;
+    try successor.handleMessage(bot2_id, bot2, &kept, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, peer2.send_buf[0..peer2.send_len], "kept-across-usr2") != null);
+    try std.testing.expect(!bot2.session.isOper());
+
+    bot2.session.addCap(.chathistory);
+    var hist2 = try irc_line.parseLine("CHATHISTORY LATEST #room * 10");
+    bot2.send_len = 0;
+    try successor.handleChathistory(bot2_id, bot2, &hist2, hist2.raw);
+    try std.testing.expect(std.mem.indexOf(u8, bot2.send_buf[0..bot2.send_len], "history refused") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bot2.send_buf[0..bot2.send_len], "successor-planted") == null);
+
+    successor.config.webhook_enabled = true;
+    var hook2 = try irc_line.parseLine("WEBHOOK CREATE #room bothook");
+    bot2.send_len = 0;
+    try successor.handleWebhook(bot2_id, bot2, &hook2);
+    try std.testing.expect(std.mem.indexOf(u8, bot2.send_buf[0..bot2.send_len], "webhook refused") != null);
+    try std.testing.expectEqual(@as(usize, 0), bot2.session.oper_priv.count());
+
+    const plain_id = try addTestLocalClient(successor, "plain", "plain");
+    const plain = successor.connFor(plain_id).?;
+    plain.session.addCap(.chathistory);
+    _ = try successor.world.join("#room", worldIdFromClient(plain_id));
+    plain.send_len = 0;
+    try successor.handleChathistory(plain_id, plain, &hist2, hist2.raw);
+    try std.testing.expect(std.mem.indexOf(u8, plain.send_buf[0..plain.send_len], "successor-planted") != null);
+
+    current_reactor = null;
+    std.debug.print("GAP-O12 branch=scoped expiring bot grants survive USR2 and are not an oper bit\n", .{});
+}
+
+test "GAP-O12 missing bot-grant checkpoint still adopts" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    current_reactor = &predecessor.reactors[0];
+    const oper_id = try addTestLocalClient(predecessor, "oper", "operacct");
+    const oper = predecessor.connFor(oper_id).?;
+    oper.session.is_oper = true;
+    oper.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_admin});
+    var add_speak = try irc_line.parseLine("BOTGRANT ADD newsbot speak #room 3600");
+    try predecessor.handleBotGrant(oper, &add_speak);
+    try std.testing.expect(predecessor.bot_grants.isBot("newsbot"));
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    var legacy: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer legacy.deinit(alloc);
+    for (pieces.items) |piece| {
+        if (piece.kind == .mesh_checkpoint and bot_grant_snapshot.isCheckpoint(piece.bytes)) continue;
+        try legacy.append(alloc, piece);
+    }
+    try std.testing.expectEqual(pieces.items.len - 1, legacy.items.len);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, legacy.items, "onyx-test-bot-grants-legacy");
+    current_reactor = null;
+    try std.testing.expect(!successor.bot_grants.isBot("newsbot"));
+    try std.testing.expect(!successor.bot_registry.isBot("newsbot"));
+    try std.testing.expectEqual(@as(usize, 0), successor.bot_grants.grantCount());
+    std.debug.print("GAP-O12 branch=a predecessor arena without BGNT adopts an empty bot-grant table\n", .{});
+}
+
+test "GAP-O12 malformed bot-grant checkpoint rejects the handoff" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    var corrupted = false;
+    for (blobs.items) |blob| {
+        if (!bot_grant_snapshot.isCheckpoint(blob) or blob.len <= bot_grant_snapshot.magic.len) continue;
+        blob[bot_grant_snapshot.magic.len] = 0xff;
+        corrupted = true;
+    }
+    try std.testing.expect(corrupted);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try rejectUpgradePiecesForTest(successor, pieces.items, "onyx-test-bot-grants-bad");
+    current_reactor = null;
+    try std.testing.expect(!successor.bot_grants.isBot("newsbot"));
+    std.debug.print("GAP-O12 branch=a malformed BGNT image rejects the whole handoff\n", .{});
 }
 
 test {

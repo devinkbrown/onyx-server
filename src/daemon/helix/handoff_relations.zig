@@ -21,6 +21,7 @@ const relay_v2_outbox = @import("../relay_v2_outbox.zig");
 const mesh_clock_snapshot = @import("mesh_clock_snapshot.zig");
 const mesh_redial = @import("mesh_redial.zig");
 const oper_grant_snapshot = @import("oper_grant_snapshot.zig");
+const bot_grant_snapshot = @import("bot_grant_snapshot.zig");
 const monitor_capsule = @import("monitor_capsule.zig");
 const prop_checkpoint = @import("prop_checkpoint.zig");
 const s2s_snapshot = @import("s2s_snapshot.zig");
@@ -89,6 +90,8 @@ pub const Error = error{
     InvalidMeshClock,
     DuplicateOperGrants,
     InvalidOperGrants,
+    DuplicateBotGrants,
+    InvalidBotGrants,
     UnknownMeshCheckpoint,
 };
 
@@ -108,6 +111,7 @@ pub const Summary = struct {
     e2ee_group_mesh_authority: usize = 0,
     mesh_clock: usize = 0,
     oper_grants: usize = 0,
+    bot_grants: usize = 0,
 };
 
 /// Validate decoded capsules after `live.verifyHandoffManifest` and before any
@@ -336,6 +340,13 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             oper_grant_snapshot.validateCheckpoint(bytes) catch return error.InvalidOperGrants;
             if (summary.oper_grants != 0) return error.DuplicateOperGrants;
             summary.oper_grants = 1;
+            continue;
+        }
+        if (bot_grant_snapshot.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidBotGrants;
+            bot_grant_snapshot.validateCheckpoint(bytes) catch return error.InvalidBotGrants;
+            if (summary.bot_grants != 0) return error.DuplicateBotGrants;
+            summary.bot_grants = 1;
             continue;
         }
         if (item.header.min_supported != descriptor.min_supported)

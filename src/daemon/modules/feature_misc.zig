@@ -28,6 +28,10 @@ fn outhook(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleOutboundWebhook(x.conn, x.parsed);
 }
+fn botgrant(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleBotGrant(x.conn, x.parsed);
+}
 fn media(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMedia(x.id, x.conn, x.parsed);
@@ -67,6 +71,7 @@ pub const module = registry.Module{
         .{ .name = "FILTER", .handler = filter },
         .{ .name = "POLICY", .handler = policyCmd, .summary = "List or roll back ward, filter, class, and ban generations" },
         .{ .name = "OUTHOOK", .handler = outhook, .summary = "Register an outbound webhook URL, secret, and category mask" },
+        .{ .name = "BOTGRANT", .handler = botgrant, .summary = "List, add, or revoke a scoped expiring bot grant" },
         .{ .name = "MEDIA", .feature = "media", .handler = media },
         .{ .name = "MEMO", .handler = memoCmd },
         .{ .name = "WEBPUSH", .handler = webpushCmd, .summary = "Browser push subscriptions (VAPID/SUBSCRIBE/UNSUBSCRIBE/LIST)" },
