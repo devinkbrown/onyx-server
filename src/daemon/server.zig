@@ -62313,6 +62313,104 @@ test "UPGRADE GAP-D1 cold restart restores history msgids and skips ciphertext s
     try std.testing.expectEqualStrings("e2ee-1", adopted_channel[0].msgid);
 }
 
+test "GAP-D1 kill-restart restores channel and DM msgids" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d1-kill.wal");
+    var services = services_mod.Services.init(&store, null);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    first.recordHistoryRelayAt("#room", "alice!a@h", "chan-kill", "PRIVMSG", "hello durableword", null, 20);
+    first.recordHistoryRelayAt("$dm:nick:alice:bob", "alice!a@h", "dm-kill", "PRIVMSG", "dm body", null, 21);
+    first.recordHistoryRelayAt("#room", "alice!a@h", "e2ee-kill", "PRIVMSG", "ONYXROOM1 secretphrase", "+onyx/e2ee=mls", 22);
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d1-kill.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+
+    var out: [4]lotus.Message = undefined;
+    const channel = try second.history.latest("#room", 4, &out);
+    try std.testing.expectEqual(@as(usize, 2), channel.len);
+    try std.testing.expectEqualStrings("e2ee-kill", channel[0].msgid);
+    try std.testing.expectEqualStrings("ONYXROOM1 secretphrase", channel[0].text);
+    try std.testing.expectEqualStrings("chan-kill", channel[1].msgid);
+    var dm_out: [2]lotus.Message = undefined;
+    const dm = try second.history.latest("$dm:nick:alice:bob", 2, &dm_out);
+    try std.testing.expectEqual(@as(usize, 1), dm.len);
+    try std.testing.expectEqualStrings("dm-kill", dm[0].msgid);
+    try std.testing.expectEqualStrings("dm body", dm[0].text);
+    try std.testing.expect(second.search_index.find("durableword").len == 1);
+    try std.testing.expect(second.search_index.find("secretphrase").len == 0);
+    std.debug.print("GAP-D1 branch=kill-restart restored chan-kill and dm-kill\n", .{});
+}
+
+test "GAP-D1 same-image USR2 restores channel and DM msgids" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    predecessor.recordHistoryRelayAt("#room", "alice!a@h", "chan-usr2", "PRIVMSG", "hello durableword", null, 30);
+    predecessor.recordHistoryRelayAt("$dm:nick:alice:bob", "alice!a@h", "dm-usr2", "PRIVMSG", "dm body", null, 31);
+    predecessor.recordHistoryRelayAt("#room", "alice!a@h", "e2ee-usr2", "PRIVMSG", "ONYXROOM1 secretphrase", "+onyx/e2ee=mls", 32);
+    try std.testing.expect(predecessor.search_index.find("durableword").len == 1);
+    try std.testing.expect(predecessor.search_index.find("secretphrase").len == 0);
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+
+    const successor = createTestServer(alloc, config) catch |err| return err;
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    try std.testing.expectEqual(@as(usize, 0), successor.history.totalStoredCount());
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-gap-d1-usr2");
+    current_reactor = null;
+
+    var out: [4]lotus.Message = undefined;
+    const channel = try successor.history.latest("#room", 4, &out);
+    try std.testing.expectEqual(@as(usize, 2), channel.len);
+    try std.testing.expectEqualStrings("e2ee-usr2", channel[0].msgid);
+    try std.testing.expectEqualStrings("ONYXROOM1 secretphrase", channel[0].text);
+    try std.testing.expectEqualStrings("chan-usr2", channel[1].msgid);
+    var dm_out: [2]lotus.Message = undefined;
+    const dm = try successor.history.latest("$dm:nick:alice:bob", 2, &dm_out);
+    try std.testing.expectEqual(@as(usize, 1), dm.len);
+    try std.testing.expectEqualStrings("dm-usr2", dm[0].msgid);
+    try std.testing.expectEqualStrings("dm body", dm[0].text);
+    try std.testing.expect(successor.search_index.find("durableword").len == 1);
+    try std.testing.expect(successor.search_index.find("secretphrase").len == 0);
+    std.debug.print("GAP-D1 branch=same-image USR2 restored chan-usr2 and dm-usr2\n", .{});
+}
+
 test "UPGRADE mandatory state round trip is exact and deterministic" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
