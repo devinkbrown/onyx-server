@@ -106,7 +106,9 @@ pub const Hlc = packed struct {
 
 /// Dotted version vector with a small inline replica table.
 pub const VersionVector = struct {
-    pub const max_entries = 64;
+    /// 65 distinct replicas fit. The next `increment` or `merge` returns
+    /// `error.CapacityExceeded`. Callers size wire buffers from this width.
+    pub const max_entries = 65;
 
     pub const Error = error{
         CapacityExceeded,

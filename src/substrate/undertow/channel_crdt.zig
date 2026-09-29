@@ -229,7 +229,7 @@ pub const ChannelCrdt = struct {
     pub fn merge(self: *Self, other: *const Self) !void {
         // Merge must be all-or-nothing. The version-vector merges below fail
         // with error.CapacityExceeded once a channel has seen more than
-        // `VersionVector.max_entries` (64) distinct writing replicas, and the
+        // `VersionVector.max_entries` distinct writing replicas, and the
         // original code bumped `self.hlc` and merged some members BEFORE that
         // error surfaced — leaving `self` half-merged with `self.modes` never
         // merged, permanently wedging convergence. Validate every fallible VV
@@ -475,7 +475,7 @@ fn applyRandomOp(state: *ChannelCrdt, random: std.Random, step: u64) !void {
 /// join delta authored by `replica_id`. Using `replica_id` as the member id
 /// too keeps every member's causal context at length 1, so only the
 /// top-level version vector grows — letting a test drive `dst.vv.len` toward
-/// the 64-replica cap without tripping the per-member context cap.
+/// the replica cap without tripping the per-member context cap.
 fn seedReplica(dst: *ChannelCrdt, replica_id: u64, physical: u64) !void {
     var src = ChannelCrdt.init(dst.allocator, replica_id);
     defer src.deinit();
@@ -493,7 +493,7 @@ test "merge exceeding the version-vector cap leaves self unchanged and does not 
     defer b.deinit();
 
     // `a` observes 40 distinct writing replicas, `b` another disjoint 40; their
-    // union (80) exceeds VersionVector.max_entries (64), so a.merge(&b) must
+    // union (80) exceeds VersionVector.max_entries, so a.merge(&b) must
     // fail. `b` is seeded with strictly later physical time so its HLC beats
     // a's — the pre-fix bug advanced a.hlc to b.hlc before the merge failed.
     var r: u64 = 0;
@@ -536,9 +536,9 @@ test "merge exceeding a single member's context cap fails closed with self uncha
 
     var b = ChannelCrdt.init(allocator, 2);
     defer b.deinit();
-    // b's top vv is a subset of a's (union stays at 40 <= 64), but member 1's
-    // context carries 50 disjoint replicas (41..90) — so ONLY the per-member
-    // union (90) exceeds the 64 cap.
+    // b's top vv is a subset of a's (union stays at 40, inside the cap), but
+    // member 1's context carries 50 disjoint replicas (41..90) — so ONLY the
+    // per-member union (90) exceeds the cap.
     b.vv.entries[0] = .{ .replica = 1, .counter = 1 };
     b.vv.len = 1;
     var b_ctx = VersionVector.init();
@@ -565,17 +565,22 @@ test "merge at exactly the version-vector cap converges and is idempotent on rep
     var b = ChannelCrdt.init(allocator, 2);
     defer b.deinit();
 
-    // 32 distinct replicas each; the union is exactly max_entries (64) — the
-    // merge must succeed at the boundary and carry every member across.
+    // Split the cap across the two sides so the union lands on max_entries.
+    // The merge must succeed at that boundary and carry every member across.
+    const cap = VersionVector.max_entries;
+    const left_n: u64 = cap / 2;
+    const right_n: u64 = cap - left_n;
     var r: u64 = 0;
-    while (r < 32) : (r += 1) try seedReplica(&a, 300 + r, 3_000 + r);
+    while (r < left_n) : (r += 1) try seedReplica(&a, 300 + r, 3_000 + r);
     r = 0;
-    while (r < 32) : (r += 1) try seedReplica(&b, 400 + r, 4_000 + r);
+    while (r < right_n) : (r += 1) try seedReplica(&b, 400 + r, 4_000 + r);
 
     try a.merge(&b);
-    try std.testing.expectEqual(@as(usize, VersionVector.max_entries), a.vv.len);
-    for (300..332) |m| try std.testing.expect(a.containsMember(@intCast(m)));
-    for (400..432) |m| try std.testing.expect(a.containsMember(@intCast(m)));
+    try std.testing.expectEqual(cap, a.vv.len);
+    r = 0;
+    while (r < left_n) : (r += 1) try std.testing.expect(a.containsMember(@intCast(300 + r)));
+    r = 0;
+    while (r < right_n) : (r += 1) try std.testing.expect(a.containsMember(@intCast(400 + r)));
 
     // Replaying the identical merge converges to the same state (idempotent).
     var snapshot = try a.clone();

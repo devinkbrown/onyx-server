@@ -27,12 +27,14 @@
 //! failed on those members — no silent divergence, no cross-version corruption.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 
 pub const magic = [_]u8{ 'G', 'M', 'B', 'C' };
 pub const version: u8 = 1;
 
-/// Frontier entries are bounded by `VersionVector.max_entries`.
-pub const max_context = 64;
+/// Frontier width matches `VersionVector.max_entries`, so a merged vector of
+/// that many replicas round-trips. One more entry is `Oversize`.
+pub const max_context = clock.VersionVector.max_entries;
 /// Live adds carried per member. Matches the dense codec's `max_adds` bound so a
 /// member the dense form accepts on adds is never rejected here for adds alone.
 pub const max_adds = 128;
@@ -360,4 +362,38 @@ test "Undertow mesh member_compact encode rejects oversize context and adds" {
     var big_ctx: [max_context + 1]Entry = undefined;
     for (&big_ctx, 0..) |*e, i| e.* = .{ .replica = i, .counter = 1 };
     try std.testing.expectError(error.Oversize, encode(&buf, 1, 0, big_ctx[0..], &.{}));
+}
+
+test "GAP-M1 65 replicas merge and round-trip member_compact" {
+    var left = clock.VersionVector.init();
+    var right = clock.VersionVector.init();
+    var i: u64 = 0;
+    while (i < 32) : (i += 1) _ = try left.increment(i);
+    i = 0;
+    while (i < 33) : (i += 1) _ = try right.increment(1_000 + i);
+
+    try left.merge(&right);
+    try std.testing.expectEqual(@as(usize, 65), left.len);
+
+    // Callers copy the vector by value and size the compact buffer from the
+    // same entry count. Both have to hold every replica.
+    const copied = left;
+    try std.testing.expectEqual(@as(usize, 65), copied.len);
+    var ctx: [65]Entry = undefined;
+    for (copied.entries[0..copied.len], 0..) |entry, idx| {
+        ctx[idx] = .{ .replica = entry.replica, .counter = entry.counter };
+    }
+
+    var buf: [max_bytes]u8 = undefined;
+    const bytes = try encode(&buf, 7, 1, ctx[0..], &.{});
+    const view = try decode(bytes);
+    try std.testing.expectEqual(@as(usize, 65), view.context_len);
+    for (ctx, 0..) |entry, idx| {
+        try std.testing.expectEqual(entry.replica, view.context[idx].replica);
+        try std.testing.expectEqual(entry.counter, view.context[idx].counter);
+    }
+
+    var one_more = copied;
+    try std.testing.expectError(error.CapacityExceeded, one_more.increment(9_000));
+    std.debug.print("GAP-M1 branch=65 replicas merge and round-trip member_compact\n", .{});
 }
