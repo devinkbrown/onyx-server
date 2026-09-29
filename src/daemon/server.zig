@@ -176,6 +176,8 @@ const ircx_modex = @import("../proto/ircx_modex.zig");
 const auditorium = @import("../proto/auditorium.zig");
 const s2s_link = @import("s2s_link.zig");
 const tracelog = @import("../substrate/trace.zig");
+const circuit_breaker = @import("../substrate/circuit_breaker.zig");
+const backoff = @import("../substrate/backoff.zig");
 const geoip = @import("../substrate/geoip.zig");
 const geo_services = @import("geo_services.zig");
 const rdns = @import("rdns.zig");
@@ -3586,6 +3588,9 @@ pub const LinuxServer = struct {
     /// a fast-failing first peer cannot be retried forever ahead of later peers.
     mesh_dial_cursor: usize = 0,
     mesh_boot_remaining: usize = 0,
+    /// Times the open transition logged "mooring circuit open". A later failure
+    /// while the breaker is already open does not increment this.
+    mooring_breaker_logs: u64 = 0,
     /// Cross-shard outbound delivery fabric (per-shard mailbox + wake + shared
     /// pool). Null in the single-reactor configuration (no cross-shard handoff is
     /// ever needed); allocated by `runThreaded` when `reactors.len > 1`.
@@ -6236,6 +6241,9 @@ pub const LinuxServer = struct {
         if (self.isMaintenanceReactor()) _ = self.access.pruneExpired();
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
         // rate-capped per peer, no-op while a dial is in flight or established).
+        // Stall accounting runs first so an open breaker is visible before the
+        // same tick decides whether a retry is allowed.
+        if (self.isMaintenanceReactor()) self.sweepMooringStalls();
         _ = self.sweepMeshAutoConnect(false, 1);
         // Mesh RTT samples for status.json / MESH: timestamped PING→PONG on each
         // established peer. Reactor-0-only (S2S links live here); cadence is short
@@ -8878,6 +8886,7 @@ pub const LinuxServer = struct {
         const line = std.fmt.bufPrint(&buf, "mesh S2S established ({s}) peer={s}", .{ kind, name }) catch "mesh S2S established";
         srvLog("onyx-server: {s}\n", .{line});
         self.traceLog(.info, .s2s, line);
+        if (self.meshDialForConn(conn)) |dial| self.noteMeshDialSuccess(dial);
     }
 
     /// Drive a PQ-secured S2S peer: feed inbound bytes through the framed Mooring
@@ -8886,6 +8895,7 @@ pub const LinuxServer = struct {
         const was = link.established();
         const now: u64 = @intCast(@max(0, self.nowMs()));
         link.feed(bytes, now) catch |err| {
+            self.noteMeshConnectFailure(conn.token, "S2S handshake failed");
             var err_buf: [128]u8 = undefined;
             const detail = std.fmt.bufPrint(&err_buf, "secured link handshake/feed failed: {s}", .{@errorName(err)}) catch "secured link handshake/feed failed";
             // Journal-visible: auto-connect only logs "dial initiated", so a
@@ -9126,6 +9136,7 @@ pub const LinuxServer = struct {
         const was = link.established();
         const now: u64 = @intCast(@max(0, self.nowMs()));
         link.feed(bytes, now, self.s2s_feed_seq) catch {
+            self.noteMeshConnectFailure(conn.token, "S2S handshake failed");
             conn.closing = true;
             return;
         };
@@ -9247,6 +9258,7 @@ pub const LinuxServer = struct {
             return;
         }
         if (event.res < 0) {
+            self.noteMeshConnectFailure(event.token, "S2S connect failed");
             try self.closeConn(event.token, "S2S connect failed");
             return;
         }
@@ -9263,6 +9275,7 @@ pub const LinuxServer = struct {
         const link = conn.s2s orelse return;
         const now: u64 = @intCast(@max(0, self.nowMs()));
         link.start(now) catch {
+            self.noteMeshConnectFailure(event.token, "S2S handshake failed");
             try self.closeConn(event.token, "S2S handshake failed");
             return;
         };
@@ -29934,6 +29947,149 @@ pub const LinuxServer = struct {
 
     const MeshDialAttempt = enum { skipped, attempted, sq_full };
 
+    /// Delay after `failures` handshake or stall failures. `failures == 1` is the
+    /// first retry and yields the flat redial base; each further failure doubles
+    /// it through `backoff.exponential`, clamped at 32× the base.
+    fn meshBackoffDelayMs(failures: u32) i64 {
+        const base: u64 = @intCast(mesh_redial_interval_ms);
+        const attempt: u32 = if (failures == 0) 0 else failures - 1;
+        return @intCast(backoff.exponential(base, 2, base * 32, attempt));
+    }
+
+    /// True while this dial must not open another TCP attempt. An open breaker
+    /// waits out its cooldown even on the forced boot pass. Backoff applies to
+    /// every pass. The healthy flat interval applies only to non-forced redials
+    /// that have not failed.
+    fn meshRedialWaiting(dial: *const MeshDial, now: i64, force: bool) bool {
+        if (dial.breaker.state() == .open) {
+            const opened: u64 = dial.breaker.opened_at_ms orelse 0;
+            const now_u: u64 = @intCast(@max(now, 0));
+            if (now_u -| opened < dial.breaker.config.cooldown_ms) return true;
+        }
+        if (dial.retry_not_before_ms != 0 and now < dial.retry_not_before_ms) return true;
+        if (force) return false;
+        if (dial.backoff_failures == 0 and dial.last_attempt_ms != 0 and now - dial.last_attempt_ms < mesh_redial_interval_ms) return true;
+        return false;
+    }
+
+    fn publishMooringBreakerGauge(self: *LinuxServer) void {
+        var open: i64 = 0;
+        for (self.mesh_dials) |dial| {
+            if (dial.breaker.state() == .open) open += 1;
+        }
+        self.stats.mooring_breakers_open.store(open, .release);
+    }
+
+    /// `allow` on an open breaker consumes the half-open probe before the dial
+    /// runs. A local refusal (full submission queue, no client slot) is not a
+    /// peer failure, so the probe is handed back and the breaker stays put.
+    fn releaseMooringProbe(dial: *MeshDial, before: circuit_breaker.BreakerState) void {
+        if (before == .open or before == .half_open) dial.breaker.half_open_in_flight -|= 1;
+    }
+
+    fn noteMeshDialFailure(self: *LinuxServer, dial: *MeshDial, reason: []const u8) void {
+        const now_i = self.nowMs();
+        const now_u: u64 = @intCast(@max(now_i, 0));
+        const was_open = dial.breaker.state() == .open;
+        dial.breaker.onFailure(now_u);
+        dial.backoff_failures +|= 1;
+        const delay = meshBackoffDelayMs(dial.backoff_failures);
+        dial.retry_not_before_ms = if (now_i > std.math.maxInt(i64) - delay) std.math.maxInt(i64) else now_i + delay;
+        if (!was_open and dial.breaker.state() == .open) {
+            self.mooring_breaker_logs +|= 1;
+            srvLog("onyx-server: mooring circuit open peer={s} after {s}\n", .{ dial.spec, reason });
+        }
+        self.publishMooringBreakerGauge();
+    }
+
+    fn noteMeshDialSuccess(self: *LinuxServer, dial: *MeshDial) void {
+        if (dial.backoff_failures == 0 and dial.breaker.state() == .closed and dial.retry_not_before_ms == 0) return;
+        dial.breaker.onSuccess();
+        dial.backoff_failures = 0;
+        dial.retry_not_before_ms = 0;
+        self.publishMooringBreakerGauge();
+    }
+
+    fn meshDialForToken(self: *LinuxServer, token: RingFdToken) ?*MeshDial {
+        for (self.mesh_dials) |*dial| {
+            const tok = dial.token orelse continue;
+            if (tok.slot == token.slot and tok.gen == token.gen) return dial;
+        }
+        return null;
+    }
+
+    fn meshDialForConn(self: *LinuxServer, conn: *const ConnState) ?*MeshDial {
+        if (self.meshDialForToken(conn.token)) |dial| return dial;
+        if (!conn.s2s_initiator) return null;
+        for (self.mesh_dials) |*dial| {
+            const addr = dial.addr orelse continue;
+            if (sameSockaddrIn(conn.s2s_connect_addr, addr)) return dial;
+        }
+        return null;
+    }
+
+    fn noteMeshConnectFailure(self: *LinuxServer, token: RingFdToken, reason: []const u8) void {
+        const dial = self.meshDialForToken(token) orelse return;
+        self.noteMeshDialFailure(dial, reason);
+    }
+
+    fn noteMeshDialSuccessByName(self: *LinuxServer, name: []const u8) void {
+        if (name.len == 0) return;
+        var it = self.reactors[0].clients.iterator();
+        while (it.next()) |entry| {
+            const conn = entry.value;
+            const remote = establishedPeerName(conn) orelse continue;
+            if (!std.ascii.eqlIgnoreCase(remote, name)) continue;
+            if (self.meshDialForConn(conn)) |dial| self.noteMeshDialSuccess(dial);
+        }
+    }
+
+    /// Handshake not finished, or anti-entropy quiet, long enough to count.
+    fn mooringStallReason(self: *LinuxServer, conn: *const ConnState, now_u: u64) ?[]const u8 {
+        if (conn.closing) return null;
+        if (conn.s2s == null and conn.s2s_secured == null) return null;
+        if (establishedPeerName(conn) == null) {
+            const idle_from: u64 = @intCast(@max(conn.last_activity_ms, 0));
+            if (now_u -| idle_from < mooring_stall_ms) return null;
+            return "handshake stall";
+        }
+        const name = establishedPeerName(conn).?;
+        const health = self.peer_health.get(name) orelse return null;
+        if (health.since(now_u) < mooring_stall_ms) return null;
+        const last = health.last_anti_entropy_ms orelse return "anti-entropy stall";
+        if (now_u -| last < mooring_stall_ms) return null;
+        return "anti-entropy stall";
+    }
+
+    /// One stall sample per dial per backoff window. An already-open breaker
+    /// drops the stuck TCP slot instead of accepting another unsigned frame or
+    /// extending the cooldown on every tick.
+    fn sweepMooringStalls(self: *LinuxServer) void {
+        if (!self.isMaintenanceReactor()) return;
+        const now_u = self.nowU64();
+        const now_i = self.nowMs();
+        var closing: std.ArrayListUnmanaged(RingFdToken) = .empty;
+        defer closing.deinit(self.allocator);
+        var it = self.reactors[0].clients.iterator();
+        while (it.next()) |entry| {
+            const conn = entry.value;
+            const reason = self.mooringStallReason(conn, now_u) orelse continue;
+            const dial = self.meshDialForConn(conn) orelse continue;
+            if (dial.breaker.state() == .open) {
+                closing.append(self.allocator, conn.token) catch continue;
+                continue;
+            }
+            if (dial.retry_not_before_ms != 0 and now_i < dial.retry_not_before_ms) continue;
+            self.noteMeshDialFailure(dial, reason);
+            if (dial.breaker.state() == .open) closing.append(self.allocator, conn.token) catch continue;
+        }
+        for (closing.items) |token| {
+            const conn = self.connForToken(token) catch continue;
+            const reason = self.mooringStallReason(conn, now_u) orelse "mooring circuit open";
+            self.requestS2sClose(conn, reason);
+        }
+    }
+
     fn tryMeshAutoDial(self: *LinuxServer, dial: *MeshDial, force: bool, now: i64) MeshDialAttempt {
         if (dial.token) |tok| {
             if (self.rx().clients.get(idFromToken(tok))) |peer| {
@@ -29942,13 +30098,13 @@ pub const LinuxServer = struct {
             }
             dial.token = null; // dial's connection is gone — eligible again
         }
+        if (meshRedialWaiting(dial, now, force)) return .skipped;
         // A fresh successor's dial table has no cached resolution yet, while an
         // inherited outbound link does retain its exact dial target. Resolve the
         // configured target before looking for that survivor; otherwise the boot
         // pass cannot match an IP-literal/DNS-alias config and opens a duplicate
         // connection beside the zero-drop inherited link.
         if (dial.addr == null) {
-            if (!force and now - dial.last_attempt_ms < mesh_redial_interval_ms) return .skipped;
             dial.addr = sockaddrForHost(dial.host, dial.port, 2_000) catch |err| {
                 dial.last_attempt_ms = now;
                 srvLog("onyx-server: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
@@ -29957,11 +30113,18 @@ pub const LinuxServer = struct {
         }
         // Already linked to this peer via the surviving (possibly inbound)
         // link? Don't dial a duplicate — that just loops collapse→redial.
+        // A live link is not by itself a successful handshake or anti-entropy
+        // round, so it does not close the breaker.
         if (self.meshPeerLinkedByDial(dial)) {
             dial.token = null;
             return .skipped;
         }
-        if (!force and now - dial.last_attempt_ms < mesh_redial_interval_ms) return .skipped;
+        if (meshRedialWaiting(dial, now, force)) return .skipped;
+
+        const now_u: u64 = @intCast(@max(now, 0));
+        const before = dial.breaker.state();
+        if (!dial.breaker.allow(now_u)) return .skipped;
+        if (before != dial.breaker.state()) self.publishMooringBreakerGauge();
 
         const prior_attempt_ms = dial.last_attempt_ms;
         dial.last_attempt_ms = now;
@@ -29972,10 +30135,12 @@ pub const LinuxServer = struct {
             return .attempted;
         } else |err| switch (err) {
             error.SubmissionQueueFull => {
+                releaseMooringProbe(dial, before);
                 dial.last_attempt_ms = prior_attempt_ms;
                 return .sq_full;
             },
             else => {
+                releaseMooringProbe(dial, before);
                 srvLog("onyx-server: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
                 return .attempted;
             },
@@ -50351,6 +50516,7 @@ pub const LinuxServer = struct {
         const h = self.peer_health.upsert(name, now) catch return;
         h.noteAntiEntropy(now);
         h.value_sync = .synced;
+        self.noteMeshDialSuccessByName(name);
     }
 
     /// Account inbound/outbound bytes for a peer link (best-effort), feeding the
@@ -58958,8 +59124,14 @@ fn decodeMeshAdmissionToken(allocator: std.mem.Allocator, text: []const u8) ![]u
 /// Minimum interval between re-dial attempts to one [mesh].connect peer whose
 /// link is down. The boot pass dials immediately; afterwards the sweep timer
 /// re-dials at most this often per peer (no duplicate dial while one is in
-/// flight or established — see `MeshDial.token`).
+/// flight or established — see `MeshDial.token`). After a breaker failure the
+/// wait is `backoff.exponential` of this base instead of the flat interval.
 const mesh_redial_interval_ms: i64 = if (builtin.is_test) 250 else 10_000;
+
+/// How long a TCP-up peer may sit without a finished handshake, or an
+/// established peer may sit without anti-entropy, before that counts as one
+/// breaker failure. The sweep records at most one failure per backoff window.
+const mooring_stall_ms: u64 = if (builtin.is_test) 1_000 else 60_000;
 
 /// One [mesh].connect auto-dial slot. Owned (and only touched) by reactor 0,
 /// the reactor that owns every outbound ConnState the dial creates.
@@ -58980,6 +59152,19 @@ const MeshDial = struct {
     /// Monotonic ms of the last dial attempt (rate cap for re-dials). 0 =
     /// never dialed (the forced boot pass always fires regardless).
     last_attempt_ms: i64 = 0,
+    /// Opens after repeated handshake or anti-entropy stall failures. An open
+    /// breaker refuses another dial until its cooldown, and it never relaxes
+    /// signed-frame admission.
+    breaker: circuit_breaker.CircuitBreaker = circuit_breaker.CircuitBreaker.init(.{
+        .failure_threshold = 5,
+        .cooldown_ms = 30_000,
+        .half_open_max_probes = 1,
+    }),
+    /// Failures fed to `backoff.exponential`. Reset only when the peer's
+    /// handshake or anti-entropy round actually completes.
+    backoff_failures: u32 = 0,
+    /// Earliest monotonic ms a retry may run. 0 keeps the flat redial interval.
+    retry_not_before_ms: i64 = 0,
 };
 
 fn sameSockaddrIn(a: posix.sockaddr.in6, b: posix.sockaddr.in6) bool {
@@ -99313,7 +99498,17 @@ test "configured boot dial resolves and recognizes inherited outbound survivor" 
     const allocator = std.testing.allocator;
 
     var pair = try SessionReplayTestPair.init(allocator);
-    defer pair.deinit();
+    // Each established link holds a by-value copy of its identity signing
+    // page. Link deinit unmaps that page; null the identity pointer before
+    // the identity wipe so the page is not unmapped twice. KEM wipe still runs.
+    defer {
+        pair.a.deinit();
+        pair.b.deinit();
+        pair.ida.sign_kp.secret_key.page = null;
+        pair.idb.sign_kp.secret_key.page = null;
+        pair.ida.deinit();
+        pair.idb.deinit();
+    }
     pair.a.clearOutbound();
     pair.b.clearOutbound();
 
@@ -99353,6 +99548,193 @@ test "configured boot dial resolves and recognizes inherited outbound survivor" 
     try std.testing.expect(server.mesh_dials[0].token == null);
     try std.testing.expectEqual(clients_before, server.rx().clients.len());
     try std.testing.expectEqual(sq_before, server.rx().ring.inner.sq_ready());
+}
+
+test "GAP-O7 handshake and anti-entropy stalls open a breaker and an unsigned frame stays refused" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const specs = [_][]const u8{
+        "127.0.0.1:65081",
+        "127.0.0.1:65082",
+    };
+    var sim = reactor_mod.SimReactor.init(50_000);
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_connect = &specs,
+        .reactor = sim.reactor(),
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expectEqual(@as(usize, 2), server.mesh_dials.len);
+    server.mesh_dials[0].addr = try sockaddrForHost("127.0.0.1", 65081, 2_000);
+
+    var failure: usize = 0;
+    while (failure < 5) : (failure += 1) {
+        const id = try server.rx().clients.alloc(ConnState.init(-1));
+        const conn = server.rx().clients.get(id).?;
+        conn.overflow_allocator = allocator;
+        conn.token = try tokenFromId(id);
+        server.mesh_dials[0].token = conn.token;
+        try server.handleConnect(.{ .token = conn.token, .res = -1 });
+        try std.testing.expect(server.rx().clients.get(id) == null);
+    }
+    try std.testing.expectEqual(circuit_breaker.BreakerState.open, server.mesh_dials[0].breaker.state());
+    try std.testing.expectEqual(@as(u32, 5), server.mesh_dials[0].backoff_failures);
+    try std.testing.expectEqual(@as(u64, 1), server.mooring_breaker_logs);
+    const delay = Server.meshBackoffDelayMs(5);
+    try std.testing.expectEqual(backoff.exponential(@as(u64, @intCast(mesh_redial_interval_ms)), 2, @as(u64, @intCast(mesh_redial_interval_ms)) * 32, 4), @as(u64, @intCast(delay)));
+    try std.testing.expectEqual(sim.clock_ms + delay, server.mesh_dials[0].retry_not_before_ms);
+    var metrics: std.ArrayList(u8) = .empty;
+    defer metrics.deinit(allocator);
+    try server.stats.writePrometheus(allocator, &metrics);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_mooring_breakers_open 1\n") != null);
+
+    // One more connect failure must not log a second open line.
+    {
+        const id = try server.rx().clients.alloc(ConnState.init(-1));
+        const conn = server.rx().clients.get(id).?;
+        conn.overflow_allocator = allocator;
+        conn.token = try tokenFromId(id);
+        server.mesh_dials[0].token = conn.token;
+        try server.handleConnect(.{ .token = conn.token, .res = -1 });
+    }
+    try std.testing.expectEqual(@as(u64, 1), server.mooring_breaker_logs);
+    try std.testing.expectEqual(circuit_breaker.BreakerState.open, server.mesh_dials[0].breaker.state());
+
+    // An unsigned membership frame is still dropped while the breaker is open.
+    // Accepting it would be the "keep the link up" path this gauge forbids.
+    var sender: s2s_link.S2sLink = undefined;
+    try sender.init(.{
+        .allocator = allocator,
+        .local_node_id = 81,
+        .remote_node_id = 82,
+        .local_epoch_ms = 100,
+        .server_name = "unsigned-peer.test",
+    });
+    defer sender.deinit();
+    const receiver = try allocator.create(s2s_link.S2sLink);
+    var receiver_live = true;
+    try receiver.init(.{
+        .allocator = allocator,
+        .local_node_id = 82,
+        .remote_node_id = 81,
+        .local_epoch_ms = 101,
+        .server_name = "breaker.test",
+    });
+    errdefer if (receiver_live) {
+        receiver.deinit();
+        allocator.destroy(receiver);
+    };
+    try std.testing.expect(receiver.peer.config.require_signed_frames);
+    try sender.start(102);
+    try receiver.start(102);
+    try pumpLinkPair(&sender, receiver, allocator);
+    try std.testing.expect(receiver.established());
+    try sender.sendMembership("#room", "bob", 0, 60, true, .{ .username = "u", .realname = "r", .host = "h" }, "");
+    const frame = try allocator.dupe(u8, sender.outbound());
+    defer allocator.free(frame);
+    sender.clearOutbound();
+    try std.testing.expect(frame.len != 0);
+    const unsigned_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const unsigned = server.rx().clients.get(unsigned_id).?;
+    unsigned.overflow_allocator = allocator;
+    unsigned.token = try tokenFromId(unsigned_id);
+    unsigned.s2s = receiver;
+    unsigned.s2s_burst_done = true;
+    defer {
+        if (server.rx().clients.get(unsigned_id)) |live| live.s2s = null;
+        if (receiver_live) {
+            receiver.deinit();
+            allocator.destroy(receiver);
+            receiver_live = false;
+        }
+    }
+    server.driveS2s(unsigned, receiver, frame);
+    try std.testing.expect(!unsigned.closing);
+    const changes = try receiver.takeMembershipChanges();
+    defer {
+        for (changes) |*change| change.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), changes.len);
+    try std.testing.expectEqual(circuit_breaker.BreakerState.open, server.mesh_dials[0].breaker.state());
+    try std.testing.expect(server.meshDialForConn(unsigned) == null);
+
+    // Cooldown still blocks the retry that the backoff helper would otherwise allow.
+    server.config.max_clients = 0;
+    const attempt_before = server.mesh_dials[0].last_attempt_ms;
+    sim.advance(delay);
+    try std.testing.expectEqual(Server.MeshDialAttempt.skipped, server.tryMeshAutoDial(&server.mesh_dials[0], false, sim.clock_ms));
+    try std.testing.expectEqual(attempt_before, server.mesh_dials[0].last_attempt_ms);
+    const opened = server.mesh_dials[0].breaker.opened_at_ms orelse return error.TestExpectedEqual;
+    // The sixth failure refreshed opened_at. Step to the cooldown boundary.
+    sim.clock_ms = @as(i64, @intCast(opened)) + @as(i64, @intCast(server.mesh_dials[0].breaker.config.cooldown_ms));
+    try std.testing.expectEqual(Server.MeshDialAttempt.attempted, server.tryMeshAutoDial(&server.mesh_dials[0], false, sim.clock_ms));
+    try std.testing.expectEqual(sim.clock_ms, server.mesh_dials[0].last_attempt_ms);
+    try std.testing.expectEqual(circuit_breaker.BreakerState.half_open, server.mesh_dials[0].breaker.state());
+    try std.testing.expectEqual(@as(i64, 0), server.stats.mooring_breakers_open.load(.acquire));
+
+    // Anti-entropy quiet on the second configured peer opens its own breaker.
+    var stall_sender: s2s_link.S2sLink = undefined;
+    try stall_sender.init(.{
+        .allocator = allocator,
+        .local_node_id = 83,
+        .remote_node_id = 84,
+        .local_epoch_ms = 100,
+        .server_name = "stall-peer.test",
+    });
+    defer stall_sender.deinit();
+    const stall_receiver = try allocator.create(s2s_link.S2sLink);
+    var stall_live = true;
+    try stall_receiver.init(.{
+        .allocator = allocator,
+        .local_node_id = 84,
+        .remote_node_id = 83,
+        .local_epoch_ms = 101,
+        .server_name = "stall-local.test",
+    });
+    errdefer if (stall_live) {
+        stall_receiver.deinit();
+        allocator.destroy(stall_receiver);
+    };
+    try stall_sender.start(102);
+    try stall_receiver.start(102);
+    try pumpLinkPair(&stall_sender, stall_receiver, allocator);
+    try std.testing.expectEqualStrings("stall-peer.test", stall_receiver.remoteName());
+    const stall_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const stall = server.rx().clients.get(stall_id).?;
+    stall.overflow_allocator = allocator;
+    stall.token = try tokenFromId(stall_id);
+    stall.s2s = stall_receiver;
+    stall.s2s_initiator = true;
+    server.mesh_dials[1].token = stall.token;
+    server.markPeerHealth("stall-peer.test", .established);
+    const health = server.peer_health.get("stall-peer.test") orelse return error.TestExpectedEqual;
+    health.state_since_ms = 0;
+    health.last_anti_entropy_ms = 0;
+    const logs_before = server.mooring_breaker_logs;
+    var stalls: usize = 0;
+    while (server.mesh_dials[1].breaker.state() != .open) {
+        stalls += 1;
+        try std.testing.expect(stalls <= 5);
+        const before_failures = server.mesh_dials[1].backoff_failures;
+        server.sweepMooringStalls();
+        try std.testing.expectEqual(before_failures + 1, server.mesh_dials[1].backoff_failures);
+        if (server.mesh_dials[1].breaker.state() == .open) break;
+        const wait = server.mesh_dials[1].retry_not_before_ms - sim.clock_ms;
+        sim.advance(wait + 1);
+    }
+    try std.testing.expectEqual(@as(usize, 5), stalls);
+    try std.testing.expectEqual(logs_before + 1, server.mooring_breaker_logs);
+    try std.testing.expect(server.rx().clients.get(stall_id) == null);
+    stall_live = false;
+    try std.testing.expectEqual(@as(i64, 1), server.stats.mooring_breakers_open.load(.acquire));
+    std.debug.print("GAP-O7 branch=breaker open on handshake and anti-entropy stall, backoff retry, unsigned frame refused\n", .{});
 }
 
 test "SIGUSR2 handler sets the upgrade-request flag; reactor-0 consume is one-shot" {

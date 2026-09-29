@@ -201,6 +201,9 @@ pub const Stats = struct {
     /// TCP-level S2S peer slots currently open (inbound accept or outbound dial).
     /// Useful for "dial stuck before AKE" diagnosis; not the mesh-health signal.
     s2s_tcp_active: AtomicI64 = .init(0),
+    /// Configured Mooring peers whose circuit breaker is open. The daemon
+    /// stores the count; this gauge only publishes it.
+    mooring_breakers_open: AtomicI64 = .init(0),
 
     pub fn onAccept(self: *Stats) void {
         _ = self.connections_total.fetchAdd(1, .monotonic);
@@ -266,13 +269,14 @@ pub const Stats = struct {
         value: i128,
     };
 
-    fn rows(self: *const Stats) [10]Row {
+    fn rows(self: *const Stats) [11]Row {
         return .{
             .{ .prom = "onyx_connections_total", .irc = "conns", .help = "Total client connections accepted", .kind = .counter, .value = self.connections_total.load(.acquire) },
             .{ .prom = "onyx_connections_active", .irc = "conns_active", .help = "Currently open client connections", .kind = .gauge, .value = self.connections_active.load(.acquire) },
             .{ .prom = "onyx_s2s_accepts_total", .irc = "s2s", .help = "Total server-to-server TCP peer slots opened", .kind = .counter, .value = self.s2s_accepts_total.load(.acquire) },
             .{ .prom = "onyx_s2s_tcp_active", .irc = "s2s_tcp", .help = "Currently open S2S TCP peer slots (pre- or post-AKE)", .kind = .gauge, .value = self.s2s_tcp_active.load(.acquire) },
             .{ .prom = "onyx_s2s_links_active", .irc = "s2s_active", .help = "Currently Mooring/CRDT-established S2S links", .kind = .gauge, .value = self.s2s_links_active.load(.acquire) },
+            .{ .prom = "onyx_mooring_breakers_open", .irc = "mooring_open", .help = "Configured Mooring peers whose circuit breaker is open", .kind = .gauge, .value = self.mooring_breakers_open.load(.acquire) },
             .{ .prom = "onyx_messages_in_total", .irc = "msgs_in", .help = "Total complete protocol lines received", .kind = .counter, .value = self.messages_in_total.load(.acquire) },
             .{ .prom = "onyx_bytes_in_total", .irc = "bytes_in", .help = "Total bytes received from clients", .kind = .counter, .value = self.bytes_in_total.load(.acquire) },
             .{ .prom = "onyx_bytes_out_total", .irc = "bytes_out", .help = "Total bytes queued to clients", .kind = .counter, .value = self.bytes_out_total.load(.acquire) },
@@ -384,7 +388,7 @@ test "forEachLine emits one token line per metric" {
     };
     var c = Collector{};
     try s.forEachLine(&c, Collector.emit);
-    try testing.expectEqual(@as(usize, 10), c.count);
+    try testing.expectEqual(@as(usize, 11), c.count);
     try testing.expect(c.saw_conns);
 }
 
