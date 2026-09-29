@@ -6343,6 +6343,7 @@ pub const LinuxServer = struct {
         if (self.isMaintenanceReactor() and self.config.nick_delay_ms != 0) _ = self.nick_delay.sweep(self.nowMs());
         // Prune the throttle's expired/empty per-IP state on the same cadence.
         if (self.isMaintenanceReactor()) {
+            self.expireRetainedHistory();
             _ = self.tickOcg2Runtime();
             self.projectOcg2LiveSessions();
             if (self.conn_throttle) |*t| t.prune(self.nowMs());
@@ -23075,6 +23076,84 @@ pub const LinuxServer = struct {
         return if (now > ttl_ms) now - ttl_ms else 0;
     }
 
+    /// RETAIN TTL in milliseconds. 0 means the channel does not expire history.
+    /// A stored value that is not a whole number of seconds inside the PROP
+    /// bounds is off, same as a missing property.
+    fn channelRetainTtlMs(self: *LinuxServer, channel: []const u8) u64 {
+        if (channel.len == 0 or (channel[0] != '#' and channel[0] != '&')) return 0;
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const ev = self.props.getProp(entity, "RETAIN") catch return 0;
+        const secs = std.fmt.parseInt(u64, ev.value, 10) catch return 0;
+        if (secs == 0 or secs < retain_min_secs or secs > retain_max_secs) return 0;
+        return std.math.mul(u64, secs, 1000) catch 0;
+    }
+
+    fn historyHoldsText(self: *const LinuxServer, text: []const u8) bool {
+        var it = self.history.deterministicIterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.message.text, text)) return true;
+        }
+        return false;
+    }
+
+    /// Delete history older than each channel's RETAIN property. The row, its
+    /// search id, and a memo whose body is only that stored text (plaintext or
+    /// ciphertext) all go. The body is not decrypted.
+    fn expireRetainedHistory(self: *LinuxServer) void {
+        const now = self.meshWallMs();
+        var names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (names.items) |name| self.allocator.free(name);
+            names.deinit(self.allocator);
+        }
+        const Collect = struct {
+            server: *LinuxServer,
+            names: *std.ArrayList([]u8),
+            now: u64,
+            fn visit(ctx: *@This(), target: []const u8) void {
+                const ttl_ms = ctx.server.channelRetainTtlMs(target);
+                if (ttl_ms == 0 or ctx.now < ttl_ms) return;
+                const owned = ctx.server.allocator.dupe(u8, target) catch return;
+                ctx.names.append(ctx.server.allocator, owned) catch {
+                    ctx.server.allocator.free(owned);
+                };
+            }
+        };
+        var collect = Collect{ .server = self, .names = &names, .now = now };
+        self.history.forEachTarget(&collect, Collect.visit);
+
+        var removed_history = false;
+        var removed_memos: usize = 0;
+        for (names.items) |target| {
+            const ttl_ms = self.channelRetainTtlMs(target);
+            if (ttl_ms == 0 or now < ttl_ms) continue;
+            const cutoff = now - ttl_ms;
+            while (self.history.oldestNotAfter(target, cutoff)) |row| {
+                if (row.msgid.len > 1024 or row.text.len > e2ee_policy.max_room_envelope_wire_len) break;
+                var msgid_buf: [1024]u8 = undefined;
+                @memcpy(msgid_buf[0..row.msgid.len], row.msgid);
+                const msgid = msgid_buf[0..row.msgid.len];
+                var text_buf: [e2ee_policy.max_room_envelope_wire_len]u8 = undefined;
+                @memcpy(text_buf[0..row.text.len], row.text);
+                const text = text_buf[0..row.text.len];
+                self.history.forget(target, msgid) catch break;
+                removed_history = true;
+                _ = self.search_index.remove(msgid);
+                if (text.len != 0 and !self.historyHoldsText(text)) {
+                    removed_memos += self.memo.removeCopies(text);
+                }
+            }
+        }
+        if (removed_history) self.snapshotDurableHistory();
+        if (removed_memos != 0) {
+            if (self.account_services) |svc| {
+                memo_durable.replaceAll(svc.store, &self.memo) catch |err| {
+                    srvLog("onyx-server: memo durable snapshot failed ({s})\n", .{@errorName(err)});
+                };
+            }
+        }
+    }
+
     fn writeHistoryReplayLine(
         writer: anytype,
         session: *const dispatch.ClientSession,
@@ -33244,6 +33323,15 @@ pub const LinuxServer = struct {
             if (!std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "1")) return .bad_value;
             return .not_handled;
         }
+        if (std.ascii.eqlIgnoreCase(key, "RETAIN")) {
+            // How long this channel keeps a history row, in whole seconds.
+            // 0 or delete turns expiry off. The value stays in the generic
+            // prop store. Expiry deletes the row; EPHEMERAL only hides replay.
+            if (deleting) return .not_handled;
+            const secs = std.fmt.parseInt(u64, value, 10) catch return .bad_value;
+            if (secs != 0 and (secs < retain_min_secs or secs > retain_max_secs)) return .bad_value;
+            return .not_handled;
+        }
         if (std.ascii.eqlIgnoreCase(key, "PINS")) {
             // Pinned messages: a comma-separated list of msgids. Op-gated (all
             // channel prop writes are), bounded here, then persisted+propagated
@@ -33393,6 +33481,10 @@ pub const LinuxServer = struct {
     const ephemeral_max_secs: u64 = 30 * 24 * 60 * 60;
     /// SLOWMODE upper bound: one day. Zero disables. Not a table-size cap.
     const slowmode_max_secs: u64 = 24 * 60 * 60;
+    /// RETAIN bounds match EPHEMERAL: at least a minute, at most 30 days.
+    /// Zero disables. Not a table-size cap.
+    const retain_min_secs: u64 = 60;
+    const retain_max_secs: u64 = 30 * 24 * 60 * 60;
     /// Folded channel, a separator, and the nick. Protocol name limits fit;
     /// a longer pair fails closed instead of truncating into another member.
     const slowmode_key_max: usize = 512;
@@ -62444,6 +62536,234 @@ test "DST GAP-P2 channel slowmode gap survives USR2 with oper and voice exemptio
     try expectContains(later_ear.send_buf[0..later_ear.send_len], "PRIVMSG #slow :s4");
 
     std.debug.print("GAP-P2 branch=PROP SLOWMODE gap; oper exempt; SLOWVOICE gates voice; raid set and clear; configured gap restored by property checkpoint; in-window timer starts empty after adopt\n", .{});
+}
+
+fn gapP4Send(server: *Server, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
+    var parsed = try irc_line.parseLine(line);
+    try server.handleMessage(id, conn, &parsed, parsed.command);
+}
+
+fn gapP4SearchHas(index: *search_index_mod.SearchIndex, word: []const u8, msgid: []const u8) bool {
+    for (index.find(word)) |hit| {
+        if (std.mem.eql(u8, hit, msgid)) return true;
+    }
+    return false;
+}
+
+fn gapP4BodyIndexed(index: *search_index_mod.SearchIndex, body: []const u8, msgid: []const u8) bool {
+    const payload = if (std.mem.startsWith(u8, body, e2ee_policy.room_envelope_prefix))
+        body[e2ee_policy.room_envelope_prefix.len..]
+    else
+        body;
+    var start: ?usize = null;
+    for (payload, 0..) |byte, index_at| {
+        const word = std.ascii.isAlphanumeric(byte) or byte == '_';
+        if (word) {
+            if (start == null) start = index_at;
+            continue;
+        }
+        if (start) |from| {
+            if (gapP4SearchHas(index, payload[from..index_at], msgid)) return true;
+            start = null;
+        }
+    }
+    if (start) |from| return gapP4SearchHas(index, payload[from..], msgid);
+    return false;
+}
+
+fn gapP4RoomBody(raw: *const [33]u8, out: []u8) []const u8 {
+    const prefix = e2ee_policy.room_envelope_prefix;
+    @memcpy(out[0..prefix.len], prefix);
+    const payload = std.base64.url_safe_no_pad.Encoder.encode(out[prefix.len..], raw);
+    return out[0 .. prefix.len + payload.len];
+}
+
+fn gapP4Newest(server: *Server, target: []const u8, id_out: []u8) !struct { id: []const u8, text: []const u8 } {
+    var msgs: [1]lotus.Message = undefined;
+    const found = try server.history.latest(target, 1, &msgs);
+    if (found.len == 0 or found[0].msgid.len > id_out.len) return error.NotFound;
+    @memcpy(id_out[0..found[0].msgid.len], found[0].msgid);
+    return .{ .id = id_out[0..found[0].msgid.len], .text = found[0].text };
+}
+
+test "DST GAP-P4 channel retention TTL deletes history search ids and memo copies" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    var sim = reactor_mod.SimReactor.init(5_000_000);
+    server.reactor = sim.reactor();
+
+    const founder_id = try addTestLocalClient(server, "Founder", "founder");
+    const member_id = try addTestLocalClient(server, "Member", "member");
+    const founder = server.connFor(founder_id).?;
+    const member = server.connFor(member_id).?;
+    founder.ircx = true;
+    member.ircx = true;
+    founder.session.addCap(.message_tags);
+
+    _ = try server.world.join("#retain", worldIdFromClient(founder_id));
+    _ = try server.world.join("#secret", worldIdFromClient(founder_id));
+    _ = try server.world.join("#plain", worldIdFromClient(founder_id));
+    _ = try server.world.join("#eph", worldIdFromClient(founder_id));
+    _ = try server.world.join("#retain", worldIdFromClient(member_id));
+
+    const retain = ircx_prop_store.Entity{ .kind = .channel, .id = "#retain" };
+    const secret = ircx_prop_store.Entity{ .kind = .channel, .id = "#secret" };
+
+    var bad_text = try irc_line.parseLine("PROP #retain RETAIN :nope");
+    try server.handleProp(founder_id, founder, &bad_text);
+    try expectContains(founder.send_buf[0..founder.send_len], "Invalid property value");
+    resetTestSendQ(founder);
+    var bad_low = try irc_line.parseLine("PROP #retain RETAIN :59");
+    try server.handleProp(founder_id, founder, &bad_low);
+    try expectContains(founder.send_buf[0..founder.send_len], "Invalid property value");
+    resetTestSendQ(founder);
+    var bad_high = try irc_line.parseLine("PROP #retain RETAIN :2592001");
+    try server.handleProp(founder_id, founder, &bad_high);
+    try expectContains(founder.send_buf[0..founder.send_len], "Invalid property value");
+    resetTestSendQ(founder);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(retain, "RETAIN"));
+
+    var steal = try irc_line.parseLine("PROP #retain RETAIN :60");
+    try server.handleProp(member_id, member, &steal);
+    try expectContains(member.send_buf[0..member.send_len], "Insufficient access");
+    try std.testing.expectError(error.PropMissing, server.props.getProp(retain, "RETAIN"));
+
+    var set_retain = try irc_line.parseLine("PROP #retain RETAIN :60");
+    try server.handleProp(founder_id, founder, &set_retain);
+    try std.testing.expectEqualStrings("60", (try server.props.getProp(retain, "RETAIN")).value);
+    var set_secret = try irc_line.parseLine("PROP #secret RETAIN :60");
+    try server.handleProp(founder_id, founder, &set_secret);
+    try std.testing.expectEqualStrings("60", (try server.props.getProp(secret, "RETAIN")).value);
+    var set_eph = try irc_line.parseLine("PROP #eph EPHEMERAL :60");
+    try server.handleProp(founder_id, founder, &set_eph);
+    var set_policy = try irc_line.parseLine("PROP #secret encryption-policy :required");
+    try server.handleProp(founder_id, founder, &set_policy);
+    try std.testing.expectEqual(e2ee_policy.Policy.required, server.channelEncryptionPolicy("#secret"));
+
+    resetTestSendQ(founder);
+    try gapP4Send(server, founder_id, founder, "PRIVMSG #secret :not-ciphertext");
+    try expectContains(founder.send_buf[0..founder.send_len], "E2EE_REQUIRED");
+    try std.testing.expectEqual(@as(usize, 0), try server.history.storedCount("#secret"));
+
+    var first_raw: [33]u8 = @splat(0);
+    first_raw[0] = 1;
+    var first_body_buf: [96]u8 = undefined;
+    const first_body = gapP4RoomBody(&first_raw, &first_body_buf);
+    try std.testing.expect(e2ee_policy.isCanonicalRoomEnvelope(first_body));
+    var first_line_buf: [160]u8 = undefined;
+    const first_line = try std.fmt.bufPrint(&first_line_buf, "@+onyx/e2ee=mls PRIVMSG #secret :{s}", .{first_body});
+
+    try gapP4Send(server, founder_id, founder, "PRIVMSG #retain :p4expireword");
+    try gapP4Send(server, founder_id, founder, "PRIVMSG #plain :p4stayword");
+    try gapP4Send(server, founder_id, founder, "PRIVMSG #eph :p4ephword");
+    resetTestSendQ(founder);
+    try gapP4Send(server, founder_id, founder, first_line);
+    try std.testing.expect(std.mem.indexOf(u8, founder.send_buf[0..founder.send_len], "E2EE_REQUIRED") == null);
+
+    var plain_id_buf: [64]u8 = undefined;
+    var cipher_id_buf: [64]u8 = undefined;
+    const plain_row = try gapP4Newest(server, "#retain", &plain_id_buf);
+    const cipher_row = try gapP4Newest(server, "#secret", &cipher_id_buf);
+    const plain_id = plain_row.id;
+    const cipher_id = cipher_row.id;
+    try std.testing.expectEqualStrings("p4expireword", plain_row.text);
+    try std.testing.expectEqualStrings(first_body, cipher_row.text);
+    try std.testing.expect(gapP4SearchHas(&server.search_index, "p4expireword", plain_id));
+    try std.testing.expect(!gapP4BodyIndexed(&server.search_index, first_body, cipher_id));
+
+    _ = try server.storeOfflineMemo("p4box", "Founder", "p4expireword", 1);
+    _ = try server.storeOfflineMemo("p4box", "Founder", first_body, 1);
+    _ = try server.storeOfflineMemo("p4box", "Founder", "independent-note", 1);
+    _ = try server.storeOfflineMemo("p4box", "Founder", "plaintext-the-daemon-never-saw", 1);
+    _ = try server.storeOfflineMemo("p4other", "Founder", "p4expireword", 1);
+    try std.testing.expectEqual(@as(usize, 4), server.memo.count("p4box"));
+    try std.testing.expectEqual(@as(usize, 1), server.memo.count("p4other"));
+
+    server.expireRetainedHistory();
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#retain"));
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#secret"));
+    try std.testing.expectEqual(@as(usize, 4), server.memo.count("p4box"));
+
+    sim.advance(60_000);
+    server.expireRetainedHistory();
+    try std.testing.expectEqual(@as(usize, 0), try server.history.storedCount("#retain"));
+    try std.testing.expectEqual(@as(usize, 0), try server.history.storedCount("#secret"));
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#plain"));
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#eph"));
+    try std.testing.expect(server.history.timestampOf("#retain", plain_id) == null);
+    try std.testing.expect(server.history.timestampOf("#secret", cipher_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), server.search_index.find("p4expireword").len);
+    try std.testing.expect(server.search_index.find("p4stayword").len != 0);
+    try std.testing.expect(server.search_index.find("p4ephword").len != 0);
+    try std.testing.expectEqual(@as(usize, 0), server.memo.count("p4other"));
+    const kept = server.memo.pending("p4box");
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    var saw_note = false;
+    var saw_unknown = false;
+    for (kept) |memo| {
+        try std.testing.expect(!std.mem.eql(u8, memo.text, "p4expireword"));
+        try std.testing.expect(!std.mem.startsWith(u8, memo.text, e2ee_policy.room_envelope_prefix));
+        if (std.mem.eql(u8, memo.text, "independent-note")) saw_note = true;
+        if (std.mem.eql(u8, memo.text, "plaintext-the-daemon-never-saw")) saw_unknown = true;
+    }
+    try std.testing.expect(saw_note and saw_unknown);
+    const history_wire = try server.history.encodeCheckpoint(alloc);
+    defer alloc.free(history_wire);
+
+    try gapP4Send(server, founder_id, founder, "PRIVMSG #retain :p4keeperword");
+    var second_raw: [33]u8 = @splat(0);
+    second_raw[0] = 1;
+    second_raw[10] = 7;
+    var second_body_buf: [96]u8 = undefined;
+    const second_body = gapP4RoomBody(&second_raw, &second_body_buf);
+    try std.testing.expect(e2ee_policy.isCanonicalRoomEnvelope(second_body));
+    try std.testing.expect(!std.mem.eql(u8, first_body, second_body));
+    var second_line_buf: [160]u8 = undefined;
+    const second_line = try std.fmt.bufPrint(&second_line_buf, "@+onyx/e2ee=mls PRIVMSG #secret :{s}", .{second_body});
+    try gapP4Send(server, founder_id, founder, second_line);
+    server.expireRetainedHistory();
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#retain"));
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#secret"));
+    try std.testing.expect(server.search_index.find("p4keeperword").len != 0);
+    var keeper_cipher_buf: [64]u8 = undefined;
+    const keeper_cipher = try gapP4Newest(server, "#secret", &keeper_cipher_buf);
+    try std.testing.expectEqualStrings(second_body, keeper_cipher.text);
+    try std.testing.expect(!gapP4BodyIndexed(&server.search_index, second_body, keeper_cipher.id));
+
+    var clear_retain = try irc_line.parseLine("PROP #retain RETAIN :0");
+    try server.handleProp(founder_id, founder, &clear_retain);
+    try std.testing.expectEqualStrings("0", (try server.props.getProp(retain, "RETAIN")).value);
+    var clear_secret = try irc_line.parseLine("PROP #secret RETAIN :0");
+    try server.handleProp(founder_id, founder, &clear_secret);
+    sim.advance(60_000);
+    server.expireRetainedHistory();
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#retain"));
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#secret"));
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#plain"));
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#eph"));
+    try std.testing.expect(server.search_index.find("p4keeperword").len != 0);
+
+    var drop_retain = try irc_line.parseLine("PROP #retain RETAIN :");
+    try server.handleProp(founder_id, founder, &drop_retain);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(retain, "RETAIN"));
+    server.expireRetainedHistory();
+    try std.testing.expectEqual(@as(usize, 1), try server.history.storedCount("#retain"));
+
+    std.debug.print("GAP-P4 branch=PROP RETAIN ttl; expiry deletes the lotus row, search id, and memo copies; ciphertext expires without plaintext\n", .{});
 }
 
 test "UPGRADE mandatory restored EventHistory and webhook store skip stale disk reload at start" {

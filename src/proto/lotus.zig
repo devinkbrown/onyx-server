@@ -419,6 +419,49 @@ pub fn Lotus(comptime params: Params) type {
             return found.timestamp;
         }
 
+        /// Oldest retained row on `target` at or before `cutoff`, tombstones
+        /// included. The borrowed view dies at the next store mutation.
+        pub fn oldestNotAfter(self: *const Self, target: []const u8, cutoff: u64) ?Message {
+            const log = self.targets.get(target) orelse return null;
+            var index: usize = 0;
+            while (index < log.len) : (index += 1) {
+                const entry = log.entry(index);
+                if (entry.timestamp <= cutoff) return entry.view();
+            }
+            return null;
+        }
+
+        /// Remove one row and its checkpoint bytes. An empty ring drops the
+        /// target. This frees the slot; `redact` only sets a tombstone.
+        pub fn forget(self: *Self, target: []const u8, msgid: []const u8) Error!void {
+            try validateTarget(target);
+            const log = self.targets.getPtr(target) orelse return error.NotFound;
+            var logical: ?usize = null;
+            var scanned: usize = 0;
+            while (scanned < log.len) : (scanned += 1) {
+                const logical_index = log.len - 1 - scanned;
+                if (std.mem.eql(u8, log.entry(logical_index).msgid, msgid)) {
+                    logical = logical_index;
+                    break;
+                }
+            }
+            const index = logical orelse return error.NotFound;
+            self.checkpoint_body_len -= checkpointStoredEntryBodyLen(log.entry(index));
+            log.removeAt(self.allocator, index);
+            if (log.len != 0) return;
+
+            var removed = self.targets.fetchRemove(target).?;
+            self.checkpoint_body_len -= checkpoint_target_prefix_len + removed.key.len;
+            self.allocator.free(removed.key);
+            removed.value.deinit(self.allocator);
+        }
+
+        /// Borrowed target names. The callback must not mutate the store.
+        pub fn forEachTarget(self: *const Self, context: anytype, comptime callback: anytype) void {
+            var it = self.targets.iterator();
+            while (it.next()) |entry| callback(context, entry.key_ptr.*);
+        }
+
         pub fn storedCount(self: *const Self, target: []const u8) Error!usize {
             try validateTarget(target);
             const log = self.targets.get(target) orelse return 0;
@@ -2137,6 +2180,41 @@ test "aggregate checkpoint retention evicts the deterministic global oldest entr
     const wire = try store.encodeCheckpoint(std.testing.allocator);
     defer std.testing.allocator.free(wire);
     try std.testing.expect(wire.len <= 1_070_000);
+}
+
+test "forget drops the row and the checkpoint still round-trips" {
+    const Store = Lotus(.{
+        .max_targets = 2,
+        .max_per_target = 4,
+        .max_text = 32,
+        .max_target = 16,
+        .max_msgid = 8,
+        .max_sender = 16,
+        .max_command = 16,
+        .max_client_tags = 32,
+    });
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    try appendForTest(&store, "#a", "m1", 10, "one");
+    try appendForTest(&store, "#a", "m2", 20, "two");
+    try appendForTest(&store, "#b", "m3", 15, "cipher");
+    const expired = store.oldestNotAfter("#a", 10) orelse return error.NotFound;
+    try std.testing.expectEqualStrings("m1", expired.msgid);
+    try store.forget("#a", "m1");
+    try std.testing.expectError(error.NotFound, store.forget("#a", "m1"));
+    try std.testing.expectEqual(@as(usize, 1), try store.storedCount("#a"));
+    try store.forget("#b", "m3");
+    try std.testing.expectEqual(@as(usize, 0), try store.storedCount("#b"));
+    try std.testing.expectEqual(@as(usize, 1), store.targetCount());
+    const bytes = try store.encodeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var restored = try Store.decodeCheckpoint(std.testing.allocator, bytes);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try restored.storedCount("#a"));
+    try std.testing.expectEqual(@as(usize, 0), try restored.storedCount("#b"));
+    var out: [4]Message = undefined;
+    const left = try restored.latest("#a", 4, &out);
+    try std.testing.expectEqualStrings("m2", left[0].msgid);
 }
 
 fn firstCheckpointEntryOffset(bytes: []const u8) usize {

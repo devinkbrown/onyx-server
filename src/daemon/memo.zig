@@ -130,6 +130,39 @@ pub const MemoBox = struct {
         }
     }
 
+    /// Drop every memo whose body is byte-identical to `text`, in every
+    /// mailbox. An empty body matches nothing. Empty mailboxes are pruned.
+    pub fn removeCopies(self: *MemoBox, text: []const u8) usize {
+        if (text.len == 0) return 0;
+        var removed: usize = 0;
+        var it = self.boxes.iterator();
+        while (it.next()) |entry| {
+            var index: usize = 0;
+            while (index < entry.value_ptr.items.items.len) {
+                if (!std.mem.eql(u8, entry.value_ptr.items.items[index].text, text)) {
+                    index += 1;
+                    continue;
+                }
+                var message = entry.value_ptr.items.swapRemove(index);
+                message.deinit(self.allocator);
+                removed += 1;
+            }
+        }
+        while (true) {
+            var empty: ?[]const u8 = null;
+            var scan = self.boxes.iterator();
+            while (scan.next()) |entry| {
+                if (entry.value_ptr.items.items.len == 0) {
+                    empty = entry.key_ptr.*;
+                    break;
+                }
+            }
+            const account = empty orelse break;
+            _ = self.clear(account);
+        }
+        return removed;
+    }
+
     /// Drop all of `account`'s messages (e.g. after delivery). Returns how many
     /// were removed and prunes the (now-empty) mailbox.
     pub fn clear(self: *MemoBox, account: []const u8) usize {
@@ -180,6 +213,20 @@ test "rejects invalid fields and enforces mailbox cap" {
     var i: usize = 0;
     while (i < default_max_per_account) : (i += 1) _ = try t.send("bob", "x", "m", 0);
     try testing.expectError(error.MailboxFull, t.send("bob", "x", "m", 0));
+}
+
+test "removeCopies drops only the matching body" {
+    var t = MemoBox.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.send("alice", "bob", "same", 1);
+    _ = try t.send("alice", "carol", "other", 2);
+    _ = try t.send("dave", "bob", "same", 3);
+    try testing.expectEqual(@as(usize, 2), t.removeCopies("same"));
+    try testing.expectEqual(@as(usize, 0), t.count("dave"));
+    try testing.expectEqual(@as(usize, 1), t.count("alice"));
+    try testing.expectEqualStrings("other", t.pending("alice")[0].text);
+    try testing.expectEqual(@as(usize, 0), t.removeCopies(""));
+    try testing.expectEqual(@as(usize, 0), t.removeCopies("same"));
 }
 
 test "mailboxes are independent per account" {
