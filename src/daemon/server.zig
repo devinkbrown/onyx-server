@@ -4027,6 +4027,8 @@ pub const LinuxServer = struct {
     /// Started in `start()` when `config.metrics_port != 0`, joined in `deinit()`.
     /// On hot-upgrade it is torn down and re-created on the new process.
     metrics_server: ?metrics_http.MetricsServer = null,
+    /// Loopback TLS listener for GET /history. Joined in deinit.
+    history_https: ?history_http.HttpsListener = null,
     /// Discord-compatible incoming webhook bindings (id → channel). Shared
     /// between the reactor thread (WEBHOOK command create/delete) and the
     /// off-thread HTTP listener (token verify only); mutex-guarded internally.
@@ -6144,6 +6146,39 @@ pub const LinuxServer = struct {
         return cfg;
     }
 
+    /// Bind a loopback HTTPS listener for GET /history. A public address is
+    /// refused before a socket is created. The body is whatever CHATHISTORY
+    /// would already show that account. Joined from `deinit`.
+    pub fn openHistoryHttps(self: *LinuxServer, configured: []const u8, port: u16, tls_config: tls_server.Config) !u16 {
+        if (self.history_https) |*existing| {
+            existing.shutdown();
+            self.history_https = null;
+        }
+        self.history_https = try history_http.HttpsListener.open(self.allocator, configured, port, tls_config, .{
+            .ptr = self,
+            .readFn = historyHttpsRead,
+        });
+        errdefer {
+            self.history_https.?.shutdown();
+            self.history_https = null;
+        }
+        try self.history_https.?.spawn();
+        return self.history_https.?.port;
+    }
+
+    fn historyHttpsRead(ptr: *anyopaque, account: []const u8, target: []const u8, out: []u8) error{Denied}!usize {
+        const server: *LinuxServer = @ptrCast(@alignCast(ptr));
+        var msgs: [8]lotus.Message = undefined;
+        const rows = try server.readAccountHistory(account, target, &msgs);
+        var n: usize = 0;
+        for (rows) |row| {
+            if (n >= out.len) break;
+            const line = std.fmt.bufPrint(out[n..], "{s} {s}\n", .{ row.msgid, row.text }) catch break;
+            n += line.len;
+        }
+        return n;
+    }
+
     pub fn deinit(self: *LinuxServer) void {
         self.clearFlightPanicTarget();
         // Stop + join the /metrics listener thread FIRST, before freeing the
@@ -6152,6 +6187,10 @@ pub const LinuxServer = struct {
         if (self.metrics_server) |*ms| {
             ms.shutdown();
             self.metrics_server = null;
+        }
+        if (self.history_https) |*hs| {
+            hs.shutdown();
+            self.history_https = null;
         }
         // Stop + join the webhook listener before anything it might touch (the
         // shared store) is torn down. shutdown() closes the fd and joins; the
@@ -112526,24 +112565,24 @@ test "GAP-P11 IRCX screens name a handler or a divergence" {
 
     const src = try gapP11ReadSource(alloc);
     defer alloc.free(src);
-    try std.testing.expect(gapP11LineHas(src, 21454, "pub fn handleListx"));
-    try std.testing.expect(gapP11LineHas(src, 55343, "auditorium.visibleTo"));
-    try std.testing.expect(gapP11LineHas(src, 20186, "isHidden(channel)"));
-    try std.testing.expect(gapP11LineHas(src, 32155, "IrcxEventType.parse(params[1])"));
-    try std.testing.expect(gapP11LineHas(src, 36154, "pub fn handleData"));
-    try std.testing.expect(gapP11LineHas(src, 21480, "created_unix > 0"));
+    try std.testing.expect(gapP11LineHas(src, 21493, "pub fn handleListx"));
+    try std.testing.expect(gapP11LineHas(src, 55382, "auditorium.visibleTo"));
+    try std.testing.expect(gapP11LineHas(src, 20225, "isHidden(channel)"));
+    try std.testing.expect(gapP11LineHas(src, 32194, "IrcxEventType.parse(params[1])"));
+    try std.testing.expect(gapP11LineHas(src, 36193, "pub fn handleData"));
+    try std.testing.expect(gapP11LineHas(src, 21519, "created_unix > 0"));
     try std.testing.expect(std.mem.indexOf(u8, src, "fn handle" ++ "Taccess") == null);
     try std.testing.expect(std.mem.indexOf(u8, src, "fn handle" ++ "Btprop") == null);
     try std.testing.expect(std.mem.indexOf(u8, src, "fn handle" ++ "Opforce") == null);
 
     current_reactor = null;
-    std.debug.print("GAP-P11 row=LISTX handler=src/daemon/server.zig:21454 test=GAP-P0c remote LISTX carries the peer topic\n", .{});
-    std.debug.print("GAP-P11 row=NAMES +x handler=src/daemon/server.zig:55343 test=threaded server: +x auditorium hides regular members in NAMES\n", .{});
-    std.debug.print("GAP-P11 row=NAMES +h handler=src/daemon/server.zig:20186 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
-    std.debug.print("GAP-P11 row=EVENT CHANNEL handler=src/daemon/server.zig:32155 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
-    std.debug.print("GAP-P11 row=DATA handler=src/daemon/server.zig:36154 test=threaded server: +V NOCOMICDATA refuses non-op DATA with 531\n", .{});
+    std.debug.print("GAP-P11 row=LISTX handler=src/daemon/server.zig:21493 test=GAP-P0c remote LISTX carries the peer topic\n", .{});
+    std.debug.print("GAP-P11 row=NAMES +x handler=src/daemon/server.zig:55382 test=threaded server: +x auditorium hides regular members in NAMES\n", .{});
+    std.debug.print("GAP-P11 row=NAMES +h handler=src/daemon/server.zig:20225 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
+    std.debug.print("GAP-P11 row=EVENT CHANNEL handler=src/daemon/server.zig:32194 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
+    std.debug.print("GAP-P11 row=DATA handler=src/daemon/server.zig:36193 test=threaded server: +V NOCOMICDATA refuses non-op DATA with 531\n", .{});
     std.debug.print("GAP-P11 divergence=USER events stay operator-only because a connect line names every user\n", .{});
-    std.debug.print("GAP-P11 divergence=remote LISTX creation time stays 0 when the peer did not replicate created_unix handler=src/daemon/server.zig:21480\n", .{});
+    std.debug.print("GAP-P11 divergence=remote LISTX creation time stays 0 when the peer did not replicate created_unix handler=src/daemon/server.zig:21519\n", .{});
     std.debug.print("GAP-P11 divergence=TACCESS, BTPROP, OPFORCE, and Comic Chat avatar payloads stay unwired\n", .{});
     std.debug.print("GAP-P11 branch=handlers at file:line or an explicit divergence and the client stays in the Onyx repo\n", .{});
 }
@@ -112572,22 +112611,94 @@ fn gapP11LineHas(text: []const u8, line_no: usize, needle: []const u8) bool {
     return std.mem.indexOf(u8, rest[0..end], needle) != null;
 }
 
-fn gapP12Fill(ptr: *anyopaque, account: []const u8, target: []const u8, out: []u8) error{Denied}!usize {
-    const server: *Server = @ptrCast(@alignCast(ptr));
-    var msgs: [8]lotus.Message = undefined;
-    const rows = try server.readAccountHistory(account, target, &msgs);
-    var n: usize = 0;
-    for (rows) |row| {
-        if (n >= out.len) break;
-        const line = std.fmt.bufPrint(out[n..], "{s} {s}\n", .{ row.msgid, row.text }) catch break;
-        n += line.len;
+fn gapP12HttpReady(buf: []const u8) bool {
+    const split = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return false;
+    const head = buf[0..split];
+    const body = buf[split + 4 ..];
+    var it = std.mem.splitScalar(u8, head, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, "\r");
+        const prefix = "Content-Length:";
+        if (line.len <= prefix.len) continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix)) continue;
+        const n = std.fmt.parseInt(usize, std.mem.trim(u8, line[prefix.len..], " \t"), 10) catch return false;
+        return body.len >= n;
     }
-    return n;
+    return false;
+}
+
+fn gapP12Https(alloc: std.mem.Allocator, port: u16, anchor: []const u8, request: []const u8, out: []u8) ![]const u8 {
+    const tls_client = @import("../crypto/tls_client.zig");
+    const fd = try connectLoopback(port);
+    defer closeFd(fd);
+    const nodelay: u32 = 1;
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&nodelay), @sizeOf(u32));
+    const tv = linux.timeval{ .sec = 5, .usec = 0 };
+    _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "p12.test", .trust_anchors = &.{anchor} });
+    defer client.deinit();
+    const hello = try client.start();
+    defer alloc.free(hello);
+    try writeAllFd(fd, hello);
+
+    var rbuf: [8192]u8 = undefined;
+    var guard: usize = 0;
+    while (!client.handshakeDone()) : (guard += 1) {
+        if (guard > 32) return error.TestUnexpectedResult;
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        switch (try client.feed(rbuf[0..n])) {
+            .bytes_to_send => |b| {
+                defer alloc.free(b);
+                try writeAllFd(fd, b);
+            },
+            .need_more => {},
+        }
+    }
+    try std.testing.expect(client.handshakeDone());
+
+    const sealed = try client.encrypt(request);
+    defer alloc.free(sealed);
+    try writeAllFd(fd, sealed);
+
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(alloc);
+    var cipher: std.ArrayList(u8) = .empty;
+    defer cipher.deinit(alloc);
+    guard = 0;
+    while (!gapP12HttpReady(plain.items)) : (guard += 1) {
+        if (guard > 32) return error.TestUnexpectedResult;
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) break;
+        try cipher.appendSlice(alloc, rbuf[0..n]);
+        while (cipher.items.len >= 5) {
+            const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+            if (body_len > 18432) return error.TestUnexpectedResult;
+            const wire_len = 5 + @as(usize, body_len);
+            if (cipher.items.len < wire_len) break;
+            switch (try client.decryptApp(cipher.items[0..wire_len])) {
+                .application_data => |pt| {
+                    defer alloc.free(pt);
+                    try plain.appendSlice(alloc, pt);
+                },
+                .control => {},
+            }
+            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+            cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
+        }
+    }
+    if (!gapP12HttpReady(plain.items)) return error.TestUnexpectedResult;
+    if (plain.items.len > out.len) return error.TestUnexpectedResult;
+    @memcpy(out[0..plain.items.len], plain.items);
+    return out[0..plain.items.len];
 }
 
 test "GAP-P12 a loopback history read matches CHATHISTORY visibility" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const Ed25519 = std.crypto.sign.Ed25519;
     defer current_reactor = null;
     const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "p12.test" };
     const server = createTestServer(alloc, config) catch |err| switch (err) {
@@ -112605,23 +112716,44 @@ test "GAP-P12 a loopback history read matches CHATHISTORY visibility" {
     try std.testing.expect(!server.connFor(member_id).?.session.isOper());
     try std.testing.expect(!server.connFor(outsider_id).?.session.isOper());
 
-    const reader = history_http.Reader{ .ptr = server, .readFn = gapP12Fill };
-    var body: [512]u8 = undefined;
-    var outbuf: [1024]u8 = undefined;
-    const allowed = history_http.handleRequest("GET /history?target=%23room HTTP/1.1\r\nAuthorization: Bearer member\r\n\r\n", reader, &body, &outbuf);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x12)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "p12.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x12},
+        .key_pair = kp,
+        .dns_names = &.{"p12.test"},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{der};
+    const tls_cfg = tls_server.Config{ .cert_chain = &chain, .signing_key = kp };
+    try std.testing.expectError(error.PublicBind, server.openHistoryHttps("0.0.0.0", 0, tls_cfg));
+    const v6_port = try server.openHistoryHttps("::1", 0, tls_cfg);
+    try std.testing.expect(v6_port != 0);
+    const port = try server.openHistoryHttps("127.0.0.1", 0, tls_cfg);
+    try std.testing.expect(port != 0);
+
+    var out: [2048]u8 = undefined;
+    const allowed = try gapP12Https(alloc, port, der, "GET /history?target=%23room HTTP/1.1\r\nHost: p12.test\r\nAuthorization: Bearer member\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.indexOf(u8, allowed, " 200 ") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed, "visible line") != null);
 
-    const denied = history_http.handleRequest("GET /history?target=%23room HTTP/1.1\r\nAuthorization: Bearer outsider\r\n\r\n", reader, &body, &outbuf);
+    const denied = try gapP12Https(alloc, port, der, "GET /history?target=%23room HTTP/1.1\r\nHost: p12.test\r\nAuthorization: Bearer outsider\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.indexOf(u8, denied, " 403 ") != null);
     try std.testing.expect(std.mem.indexOf(u8, denied, "visible line") == null);
 
-    const ghost = history_http.handleRequest("GET /history?target=%23room HTTP/1.1\r\nAuthorization: Bearer ghost\r\n\r\n", reader, &body, &outbuf);
+    const ghost = try gapP12Https(alloc, port, der, "GET /history?target=%23room HTTP/1.1\r\nHost: p12.test\r\nAuthorization: Bearer ghost\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.indexOf(u8, ghost, " 403 ") != null);
-    try std.testing.expectError(error.PublicBind, history_http.listenAddr("0.0.0.0"));
+
+    const admin = try gapP12Https(alloc, port, der, "GET /admin HTTP/1.1\r\nHost: p12.test\r\nAuthorization: Bearer member\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, admin, " 404 ") != null);
+    const posted = try gapP12Https(alloc, port, der, "POST /history?target=%23room HTTP/1.1\r\nHost: p12.test\r\nAuthorization: Bearer member\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, posted, " 405 ") != null);
 
     current_reactor = null;
-    std.debug.print("GAP-P12 branch=loopback GET /history returns the lines CHATHISTORY would and a public bind is refused\n", .{});
+    std.debug.print("GAP-P12 branch=loopback HTTPS GET /history returns the lines CHATHISTORY would and a public bind is refused\n", .{});
 }
 
 test {
