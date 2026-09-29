@@ -659,6 +659,7 @@ pub const Config = struct {
         /// a real off switch.
         enabled_explicit: bool = false,
         allow_anonymous: bool = false,
+        oauth_auto_provision: bool = false,
         realm: ?[]const u8 = null,
         /// Path (relative to the daemon cwd) of the WAL-backed account store. When
         /// set, the daemon opens it and verifies SASL credentials against it.
@@ -1453,6 +1454,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("sasl.realm"), &cfg.sasl.realm);
     try setOpt(allocator, resolver, doc.getString("sasl.account_db"), &cfg.sasl.account_db);
     if (doc.getBool("sasl.allow_anonymous")) |b| cfg.sasl.allow_anonymous = b;
+    if (doc.getBool("sasl.oauth_auto_provision")) |b| cfg.sasl.oauth_auto_provision = b;
     try setOpt(allocator, resolver, doc.getString("sasl.oauth_issuer"), &cfg.sasl.oauth_issuer);
     try setOpt(allocator, resolver, doc.getString("sasl.oauth_audience"), &cfg.sasl.oauth_audience);
     try setOpt(allocator, resolver, doc.getString("sasl.oauth_account_claim"), &cfg.sasl.oauth_account_claim);
@@ -2505,7 +2507,19 @@ test "parseToml: listen proxy protocol and SASL enabled gate project" {
     defer omitted.deinit(allocator);
     try testing.expect(!omitted.sasl.enabled_explicit);
     try testing.expect(!omitted.sasl.allow_anonymous);
+    try testing.expect(!omitted.sasl.oauth_auto_provision);
     try testing.expect(omitted.sasl.oauth_account_claim == null);
+}
+
+test "GAP-P0b OAuth auto provision config defaults false and accepts true" {
+    const allocator = testing.allocator;
+    var omitted = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[sasl]\n", .{});
+    defer omitted.deinit(allocator);
+    try testing.expect(!omitted.sasl.oauth_auto_provision);
+
+    var enabled = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[sasl]\noauth_auto_provision=true\n", .{});
+    defer enabled.deinit(allocator);
+    try testing.expect(enabled.sasl.oauth_auto_provision);
 }
 
 test "OCG2 config freezes exact public authority tuple and account store dependency" {

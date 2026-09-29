@@ -159,6 +159,17 @@ pub const AccountStatusGate = struct {
     }
 };
 
+/// Injected predicate: does the canonical account have a registered services
+/// record? A reservation without an account record is not registered.
+pub const AccountKnownGate = struct {
+    ptr: *anyopaque,
+    knownFn: *const fn (ptr: *anyopaque, account: []const u8) bool,
+
+    pub fn known(self: AccountKnownGate, account: []const u8) bool {
+        return self.knownFn(self.ptr, account);
+    }
+};
+
 /// Whether `mechanism` authenticates purely by a knowledge factor (a password or
 /// password-derived secret) and therefore requires a TOTP second factor when the
 /// account has 2FA. EXTERNAL (client cert) and OAUTHBEARER (external IdP) are

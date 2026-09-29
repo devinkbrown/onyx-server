@@ -4337,6 +4337,13 @@ pub const Services = struct {
         return self.accountForbiddenUnlocked(account);
     }
 
+    pub fn accountIsRegistered(self: *Services, account: []const u8) bool {
+        const key = accountKey(account) catch return false;
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        return self.store.family(.accounts).get(key.asSlice()) != null;
+    }
+
     fn accountSuspendedUnlocked(self: *Services, account: []const u8) ServiceError!bool {
         const key = try accountKey(account);
         const value = self.store.family(.accounts).get(key.asSlice()) orelse return false;
@@ -6691,6 +6698,23 @@ test "accountAuthBlocked gates the SASL success chokepoint on suspend and forbid
     // a nick forbid must not slip through a credential path either).
     _ = try services.setAccountForbidden("ghostname", true, &scratch);
     try std.testing.expect(services.accountAuthBlocked("ghostname"));
+}
+
+test "GAP-P0b accountIsRegistered requires a real account record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-oauth-known.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    try std.testing.expect(!services.accountIsRegistered("Alice"));
+    try std.testing.expect(!services.accountIsRegistered("bad/name"));
+    _ = try services.setAccountForbidden("reserved", true, &scratch);
+    try std.testing.expect(!services.accountIsRegistered("reserved"));
+    _ = try services.registerAccount("Alice", "correct horse battery staple", &scratch);
+    try std.testing.expect(services.accountIsRegistered("alice"));
+    try std.testing.expect(services.accountIsRegistered("ALICE"));
 }
 
 test "setAccount refuses password-holder lifecycle flag changes" {

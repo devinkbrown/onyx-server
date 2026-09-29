@@ -321,6 +321,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.sasl.realm) |realm| out.sasl_realm = realm;
     out.sasl_decode_max_bytes = cfg.limits.sasl_decode_max_bytes;
     out.sasl_allow_anonymous = cfg.sasl.allow_anonymous;
+    out.sasl_oauth_auto_provision = cfg.sasl.oauth_auto_provision;
     // [mesh].connect — peers this node auto-dials at boot (strings borrow cfg).
     if (cfg.mesh.connect.len != 0) out.mesh_connect = cfg.mesh.connect;
     // [webauthn] — passkey RP id + allowed origins (strings borrow cfg, which

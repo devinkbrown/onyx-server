@@ -2002,6 +2002,8 @@ pub const Config = struct {
     sasl_oauthbearer: ?sasl_mechrouter.OAuthBearerLookup = null,
     /// Default-off SASL ANONYMOUS gate.
     sasl_allow_anonymous: bool = false,
+    /// Let a valid OAUTHBEARER token bind an unregistered account name.
+    sasl_oauth_auto_provision: bool = false,
     /// Mutual TLS: request a client certificate on the TLS listener so SASL
     /// EXTERNAL has a fingerprint to match. Off by default.
     tls_request_client_cert: bool = false,
@@ -3575,6 +3577,23 @@ fn mergeMeshNickClaim(best: *?s2s_link.NickClaim, candidate: s2s_link.NickClaim)
     if (best.* == null or candidate.higherPriorityThan(best.*.?)) best.* = candidate;
 }
 
+/// One published mesh peer. The name is allocator-owned and is the full remote
+/// name: publication does not stop at 32 peers or 64 bytes.
+const PublishedMeshPeer = struct {
+    name: []u8,
+    node_id: u64 = 0,
+    public_key: [crypto_sign.public_key_len]u8 = @splat(0),
+    public_key_present: bool = false,
+};
+
+/// Borrowed scan row. `storePublishedMeshPeers` copies `name` before return.
+const MeshPeerSeen = struct {
+    name: []const u8,
+    node_id: u64 = 0,
+    public_key: [crypto_sign.public_key_len]u8 = @splat(0),
+    public_key_present: bool = false,
+};
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -4116,22 +4135,16 @@ pub const LinuxServer = struct {
     /// and stores it here; any shard reads it atomically. Single-reactor mode
     /// publishes from the one reactor, so behaviour is unchanged.
     net_peer_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// Published distinct peer NAMES (for cross-shard MAP), written by reactor 0
-    /// in lockstep with net_peer_count. Fixed buffers -> always memory-safe to
-    /// read from any shard; names are written BEFORE the release-store of
-    /// net_peer_count, so a reader that acquire-loads the count sees the matching
-    /// names. The peer set rarely changes and the write is idempotent, so a
-    /// concurrent overwrite is at worst a momentary cosmetic mix in MAP.
-    mesh_peer_names: [32][64]u8 = @splat(@as([64]u8, @splat(0))),
-    mesh_peer_name_lens: [32]u8 = @splat(0),
-    /// Security-sensitive reactor-0 publication paired with the cosmetic name
-    /// snapshot above. Exact mesh reclaim readers copy under this mutex instead
-    /// of traversing another reactor's mutable SlotMap or borrowing link memory.
+    /// Published distinct peers (names plus reclaim identity), written by
+    /// reactor 0 in lockstep with net_peer_count. Readers copy under
+    /// `mesh_peer_identity_mu` and never borrow these bytes across the unlock.
+    /// Names are replaced before the release-store of the count. An allocation
+    /// failure keeps the previous publication instead of dropping a tail.
+    mesh_published_peers: std.ArrayList(PublishedMeshPeer) = .empty,
+    /// Security-sensitive reactor-0 publication. Exact mesh reclaim readers copy
+    /// under this mutex instead of traversing another reactor's mutable SlotMap
+    /// or borrowing link memory.
     mesh_peer_identity_mu: std.atomic.Mutex = .unlocked,
-    mesh_peer_node_ids: [32]u64 = @splat(0),
-    mesh_peer_public_keys: [32][crypto_sign.public_key_len]u8 =
-        @splat(@as([crypto_sign.public_key_len]u8, @splat(0))),
-    mesh_peer_public_key_present: [32]bool = @splat(false),
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Onyx Server media SFU control plane): who is in each call.
@@ -5889,6 +5902,7 @@ pub const LinuxServer = struct {
         // joined, so no recorder can access a histogram after this point.
         self.latency_stats.deinit();
         self.peer_health.deinit();
+        self.freePublishedMeshPeers();
         for (self.reactors) |*reactor| reactor.deinit();
         self.allocator.free(self.reactors);
         if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
@@ -13445,6 +13459,7 @@ pub const LinuxServer = struct {
         // success even when the mechanism verified (closes the SCRAM/OAUTHBEARER
         // status-bypass on the CAP AUTHENTICATE path).
         conn.session.sasl_account_gate = .{ .ptr = self, .blockedFn = accountStatusGateBlocked };
+        conn.session.sasl_account_known = .{ .ptr = self, .knownFn = accountKnownGateKnown };
         // SCRAM (both digests) needs a per-connection server nonce. Generate it
         // once if either SCRAM lookup is configured, then attach whichever
         // lookups are present so SCRAM-SHA-256 and SCRAM-SHA-512 share the nonce.
@@ -13468,6 +13483,7 @@ pub const LinuxServer = struct {
         if (self.config.sasl_session_token) |tok| conn.session.sasl_session_token = tok;
         if (self.config.sasl_oauthbearer) |oauth| conn.session.sasl_oauthbearer = oauth;
         conn.session.sasl_allow_anonymous = self.config.sasl_allow_anonymous;
+        conn.session.sasl_oauth_auto_provision = self.config.sasl_oauth_auto_provision;
         conn.session.sasl_decode_max_bytes = @min(@as(usize, self.config.sasl_decode_max_bytes), sasl_mechrouter.MAX_RAW_MESSAGE);
     }
 
@@ -23478,6 +23494,14 @@ pub const LinuxServer = struct {
         const self: *LinuxServer = @ptrCast(@alignCast(ptr));
         const svc = self.account_services orelse return false;
         return svc.accountAuthBlocked(account);
+    }
+
+    /// `sasl.AccountKnownGate` adapter: unknown OAuth accounts fail closed
+    /// unless the operator explicitly enables session binding for them.
+    fn accountKnownGateKnown(ptr: *anyopaque, account: []const u8) bool {
+        const self: *LinuxServer = @ptrCast(@alignCast(ptr));
+        const svc = self.account_services orelse return false;
+        return svc.accountIsRegistered(account);
     }
 
     /// Whether `account` has ACTIVE TOTP 2FA, ensuring the secret is loaded into
@@ -33574,6 +33598,20 @@ pub const LinuxServer = struct {
             }
         }
 
+        // OAUTHBEARER binds a session only for an account that already
+        // REGISTER'd, unless the operator set sasl.oauth_auto_provision.
+        // Missing services fail closed. The reply stays the generic
+        // authentication failure so the nick is not told "unknown".
+        if (!result.guest and package == .oauthbearer and !conn.session.sasl_oauth_auto_provision) {
+            const registered = if (self.account_services) |svc| svc.accountIsRegistered(account) else false;
+            if (!registered) {
+                conn.session.sasl_router = null;
+                conn.session.sasl_pending = null;
+                try self.ircxAuthFailed(conn, package.token());
+                return;
+            }
+        }
+
         var final_buf: [sasl_mechrouter.MAX_B64_MESSAGE]u8 = undefined;
         const final_copy: ?[]const u8 = if (result.final_data) |final| blk: {
             if (final.len > final_buf.len) break :blk null;
@@ -41662,11 +41700,10 @@ pub const LinuxServer = struct {
     const TrustedReclaimRoute = union(enum) {
         local,
         remote: struct {
-            name: [64]u8,
-            len: u8,
+            name: []u8,
 
             fn slice(self: *const @This()) []const u8 {
-                return self.name[0..self.len];
+                return self.name;
             }
         },
     };
@@ -41685,20 +41722,15 @@ pub const LinuxServer = struct {
         defer self.mesh_peer_identity_mu.unlock();
         const count = @min(
             @as(usize, @intCast(self.net_peer_count.load(.acquire))),
-            self.mesh_peer_node_ids.len,
+            self.mesh_published_peers.items.len,
         );
-        for (0..count) |i| {
-            if (self.mesh_peer_node_ids[i] != origin_node or
-                !self.mesh_peer_public_key_present[i] or
-                !std.mem.eql(u8, &self.mesh_peer_public_keys[i], &signer.signer)) continue;
-            const len = self.mesh_peer_name_lens[i];
-            if (len == 0) return null;
-            var remote: @FieldType(TrustedReclaimRoute, "remote") = .{
-                .name = @splat(0),
-                .len = len,
-            };
-            @memcpy(remote.name[0..len], self.mesh_peer_names[i][0..len]);
-            return .{ .remote = remote };
+        for (self.mesh_published_peers.items[0..count]) |peer| {
+            if (peer.node_id != origin_node or
+                !peer.public_key_present or
+                !std.mem.eql(u8, &peer.public_key, &signer.signer)) continue;
+            if (peer.name.len == 0) return null;
+            const name = self.allocator.dupe(u8, peer.name) catch return null;
+            return .{ .remote = .{ .name = name } };
         }
         return null;
     }
@@ -41759,6 +41791,7 @@ pub const LinuxServer = struct {
                 true,
             ),
             .remote => |remote_route| {
+                defer self.allocator.free(remote_route.name);
                 self.markSessionResumeRetryable(conn);
                 var buf: [default_reply_bytes]u8 = undefined;
                 const line = std.fmt.bufPrint(
@@ -41885,7 +41918,13 @@ pub const LinuxServer = struct {
             // Restore failed mid-way: fall through to the legacy decision so the
             // client still gets a coherent (redirect/deny) answer.
         }
-        const peer_names = self.readPeerNames();
+        const peer_names = self.readPeerNames() catch PeerNameSnapshot{
+            .names = &.{},
+            .count = 0,
+            .allocator = self.allocator,
+            .owned = false,
+        };
+        defer peer_names.deinit();
         var origin_reachable = origin_is_self;
         for (0..peer_names.count) |i| {
             const name = peer_names.name(i);
@@ -49464,15 +49503,16 @@ pub const LinuxServer = struct {
         // at `server.zig:6239-6252`). The `onTimerTick` call site already
         // gates this, but that is not the only path to this function — guard
         // internally too, or a sibling reactor's zero-peer view overwrites the
-        // shared `mesh_peer_*` tables and erases mesh identity for every
-        // shard's cross-shard reads. docs/audit/timer-guard-0.7.md P0-TG-2.
+        // shared publication and erases mesh identity for every shard's
+        // cross-shard reads. docs/audit/timer-guard-0.7.md P0-TG-2.
         if (!self.isMaintenanceReactor()) return;
-        var seen: [32][]const u8 = undefined;
-        var seen_node_ids: [32]u64 = @splat(0);
-        var seen_public_keys: [32][crypto_sign.public_key_len]u8 =
-            @splat(@as([crypto_sign.public_key_len]u8, @splat(0)));
-        var seen_public_key_present: [32]bool = @splat(false);
-        var n: usize = 0;
+        var seen: std.ArrayList(MeshPeerSeen) = .empty;
+        defer seen.deinit(self.allocator);
+        var owned_names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (owned_names.items) |name| self.allocator.free(name);
+            owned_names.deinit(self.allocator);
+        }
         var it = self.rx().clients.iterator();
         outer: while (it.next()) |entry| {
             // A collision loser remains established until its final close, but
@@ -49480,70 +49520,105 @@ pub const LinuxServer = struct {
             // authenticated node/key atomically at collision commitment.
             if (entry.value.closing or entry.value.s2s_dedup) continue;
             const name = establishedPeerName(entry.value) orelse continue;
-            for (seen[0..n]) |s| {
-                if (std.mem.eql(u8, s, name)) continue :outer;
+            for (seen.items) |row| {
+                if (std.mem.eql(u8, row.name, name)) continue :outer;
             }
-            if (n < seen.len) {
-                seen[n] = name;
-                if (entry.value.s2s_secured) |link| {
-                    if (link.remoteNodeId()) |node_id| seen_node_ids[n] = node_id;
-                    if (link.peerNodeKey()) |key| {
-                        seen_public_keys[n] = key;
-                        seen_public_key_present[n] = true;
-                    }
+            const owned = self.allocator.dupe(u8, name) catch return;
+            owned_names.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+                return;
+            };
+            var row = MeshPeerSeen{ .name = owned };
+            if (entry.value.s2s_secured) |link| {
+                if (link.remoteNodeId()) |node_id| row.node_id = node_id;
+                if (link.peerNodeKey()) |key| {
+                    row.public_key = key;
+                    row.public_key_present = true;
                 }
-                n += 1;
             }
+            seen.append(self.allocator, row) catch return;
         }
+        // A failed replacement keeps the previous peers. Publishing a prefix
+        // would hide a live route.
+        self.storePublishedMeshPeers(seen.items) catch return;
+    }
+
+    /// Replace the published set with copies of `seen`. The previous set stays
+    /// in place until every copy has been allocated.
+    fn storePublishedMeshPeers(self: *LinuxServer, seen: []const MeshPeerSeen) !void {
+        var next: std.ArrayList(PublishedMeshPeer) = .empty;
+        var committed = false;
+        errdefer if (!committed) {
+            for (next.items) |peer| self.allocator.free(peer.name);
+            next.deinit(self.allocator);
+        };
+        try next.ensureTotalCapacity(self.allocator, seen.len);
+        for (seen) |row| {
+            const name = try self.allocator.dupe(u8, row.name);
+            next.appendAssumeCapacity(.{
+                .name = name,
+                .node_id = row.node_id,
+                .public_key = row.public_key,
+                .public_key_present = row.public_key_present,
+            });
+        }
+        const count = std.math.cast(u32, next.items.len) orelse return error.PeerCountOverflow;
         lockSpin(&self.mesh_peer_identity_mu);
         defer self.mesh_peer_identity_mu.unlock();
-        for (seen[0..n], 0..) |nm, i| {
-            const len = @min(nm.len, self.mesh_peer_names[i].len);
-            @memcpy(self.mesh_peer_names[i][0..len], nm[0..len]);
-            self.mesh_peer_name_lens[i] = @intCast(len);
-            self.mesh_peer_node_ids[i] = seen_node_ids[i];
-            self.mesh_peer_public_keys[i] = seen_public_keys[i];
-            self.mesh_peer_public_key_present[i] = seen_public_key_present[i];
-        }
-        for (n..self.mesh_peer_names.len) |i| {
-            self.mesh_peer_name_lens[i] = 0;
-            self.mesh_peer_node_ids[i] = 0;
-            self.mesh_peer_public_keys[i] = @splat(0);
-            self.mesh_peer_public_key_present[i] = false;
-        }
-        const count: u32 = @intCast(n);
+        for (self.mesh_published_peers.items) |peer| self.allocator.free(peer.name);
+        self.mesh_published_peers.deinit(self.allocator);
+        self.mesh_published_peers = next;
+        committed = true;
         protocol_inventory.setMeshPeerCount(count);
         self.net_peer_count.store(count, .release);
     }
 
+    fn freePublishedMeshPeers(self: *LinuxServer) void {
+        for (self.mesh_published_peers.items) |peer| self.allocator.free(peer.name);
+        self.mesh_published_peers.deinit(self.allocator);
+    }
+
     const PeerNameSnapshot = struct {
-        names: [32][64]u8 = @splat(@as([64]u8, @splat(0))),
-        lens: [32]u8 = @splat(0),
-        count: usize = 0,
+        names: [][]u8,
+        count: usize,
+        allocator: std.mem.Allocator,
+        owned: bool,
 
         fn name(self: *const PeerNameSnapshot, index: usize) []const u8 {
-            return self.names[index][0..self.lens[index]];
+            return self.names[index];
+        }
+
+        fn deinit(self: PeerNameSnapshot) void {
+            if (!self.owned) return;
+            for (self.names) |peer_name| self.allocator.free(peer_name);
+            self.allocator.free(self.names);
         }
     };
 
     /// Return a caller-owned, internally consistent copy of the published peer
-    /// names. The old API returned slices borrowed from mutable shared storage;
-    /// a same-count route replacement could rewrite those bytes after unlock
-    /// while MAP/SRM1 was still reading them on another shard.
-    fn readPeerNames(self: *LinuxServer) PeerNameSnapshot {
-        var snapshot = PeerNameSnapshot{};
+    /// names. The copy stays valid after a later publication replaces the
+    /// shared list. `deinit` frees it.
+    fn readPeerNames(self: *LinuxServer) !PeerNameSnapshot {
         lockSpin(&self.mesh_peer_identity_mu);
         defer self.mesh_peer_identity_mu.unlock();
-        snapshot.count = @min(
+        const count = @min(
             @as(usize, @intCast(self.net_peer_count.load(.acquire))),
-            snapshot.names.len,
+            self.mesh_published_peers.items.len,
         );
-        for (0..snapshot.count) |i| {
-            const len = @min(@as(usize, self.mesh_peer_name_lens[i]), snapshot.names[i].len);
-            @memcpy(snapshot.names[i][0..len], self.mesh_peer_names[i][0..len]);
-            snapshot.lens[i] = @intCast(len);
+        const names = try self.allocator.alloc([]u8, count);
+        errdefer self.allocator.free(names);
+        var filled: usize = 0;
+        errdefer for (names[0..filled]) |peer_name| self.allocator.free(peer_name);
+        for (0..count) |i| {
+            names[i] = try self.allocator.dupe(u8, self.mesh_published_peers.items[i].name);
+            filled += 1;
         }
-        return snapshot;
+        return .{
+            .names = names,
+            .count = count,
+            .allocator = self.allocator,
+            .owned = true,
+        };
     }
 
     /// MAP — network topology: this server with each established S2S peer (both
@@ -49558,12 +49633,16 @@ pub const LinuxServer = struct {
         // Peer names come from the reactor-0-published snapshot, not this shard's
         // own connection set — otherwise MAP run on a non-zero shard (the peer
         // links live only on reactor 0) would list no peers.
-        const names = self.readPeerNames();
+        const names = self.readPeerNames() catch {
+            try queueNumeric(conn, .RPL_MAPEND, &.{}, "End of /MAP");
+            return;
+        };
+        defer names.deinit();
         for (0..names.count) |i| {
             const rname = names.name(i);
-            var pbuf: [160]u8 = undefined;
-            const pdetail = std.fmt.bufPrint(&pbuf, "  `- {s}", .{rname}) catch continue;
-            try queueNumeric(conn, .RPL_MAP, &.{}, pdetail);
+            const pdetail = std.fmt.allocPrint(self.allocator, "  `- {s}", .{rname}) catch continue;
+            defer self.allocator.free(pdetail);
+            queueNumeric(conn, .RPL_MAP, &.{}, pdetail) catch continue;
         }
         try queueNumeric(conn, .RPL_MAPEND, &.{}, "End of /MAP");
     }
@@ -53271,13 +53350,11 @@ test "secured establishment immediately publishes authenticated trust route" {
     try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
     lockSpin(&server.mesh_peer_identity_mu);
     defer server.mesh_peer_identity_mu.unlock();
-    try std.testing.expectEqual(initiator_identity.shortId(), server.mesh_peer_node_ids[0]);
-    try std.testing.expect(server.mesh_peer_public_key_present[0]);
-    try std.testing.expectEqualSlices(u8, &initiator_identity.sign_kp.public_key, &server.mesh_peer_public_keys[0]);
-    try std.testing.expectEqualStrings(
-        "replay-a.test",
-        server.mesh_peer_names[0][0..server.mesh_peer_name_lens[0]],
-    );
+    try std.testing.expectEqual(@as(usize, 1), server.mesh_published_peers.items.len);
+    try std.testing.expectEqual(initiator_identity.shortId(), server.mesh_published_peers.items[0].node_id);
+    try std.testing.expect(server.mesh_published_peers.items[0].public_key_present);
+    try std.testing.expectEqualSlices(u8, &initiator_identity.sign_kp.public_key, &server.mesh_published_peers.items[0].public_key);
+    try std.testing.expectEqualStrings("replay-a.test", server.mesh_published_peers.items[0].name);
 }
 
 test "mesh peer-count publish and RTT probe refuse a sibling (non-reactor-0) caller" {
@@ -53303,12 +53380,8 @@ test "mesh peer-count publish and RTT probe refuse a sibling (non-reactor-0) cal
     // and the RTT throttle specifically must not advance ahead of its guard
     // (guard theft) even though nothing on this shard gets probed.
     current_reactor = &server.reactors[0];
-    lockSpin(&server.mesh_peer_identity_mu);
     const seeded_name = "reactor0-peer.test";
-    @memcpy(server.mesh_peer_names[0][0..seeded_name.len], seeded_name);
-    server.mesh_peer_name_lens[0] = @intCast(seeded_name.len);
-    server.net_peer_count.store(1, .release);
-    server.mesh_peer_identity_mu.unlock();
+    try server.storePublishedMeshPeers(&.{.{ .name = seeded_name }});
     server.last_peer_rtt_probe_ms = 12_345;
 
     // A connection on the sibling reactor that WOULD be probed and WOULD zero
@@ -53321,8 +53394,7 @@ test "mesh peer-count publish and RTT probe refuse a sibling (non-reactor-0) cal
     server.publishPeerCount();
     server.maybeProbeMeshPeerRtt();
 
-    try std.testing.expectEqual(@as(u8, seeded_name.len), server.mesh_peer_name_lens[0]);
-    try std.testing.expectEqualStrings(seeded_name, server.mesh_peer_names[0][0..seeded_name.len]);
+    try std.testing.expectEqualStrings(seeded_name, server.mesh_published_peers.items[0].name);
     try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
     try std.testing.expectEqual(@as(i64, 12_345), server.last_peer_rtt_probe_ms);
 
@@ -53333,8 +53405,82 @@ test "mesh peer-count publish and RTT probe refuse a sibling (non-reactor-0) cal
     server.publishPeerCount();
     server.maybeProbeMeshPeerRtt();
     try std.testing.expectEqual(@as(u32, 0), server.net_peer_count.load(.acquire));
-    try std.testing.expectEqual(@as(u8, 0), server.mesh_peer_name_lens[0]);
+    try std.testing.expectEqual(@as(usize, 0), server.mesh_published_peers.items.len);
     try std.testing.expect(server.last_peer_rtt_probe_ms != 12_345);
+}
+
+test "published mesh peers grow past the old 32 by 64 ceiling" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x5c)), "growth.test");
+    defer ident.deinit();
+    server.config.node_identity = &ident;
+
+    var long_name: [200]u8 = @splat('n');
+    long_name[0] = 'P';
+    const key: [crypto_sign.public_key_len]u8 = @splat(0xab);
+    const origin = ident.shortId() +% 1;
+
+    var name_buf: [39][8]u8 = undefined;
+    var rows: [40]MeshPeerSeen = undefined;
+    for (0..39) |i| {
+        const n = std.fmt.bufPrint(&name_buf[i], "p{d:0>3}", .{i}) catch unreachable;
+        rows[i] = .{ .name = n };
+    }
+    rows[39] = .{
+        .name = &long_name,
+        .node_id = origin,
+        .public_key = key,
+        .public_key_present = true,
+    };
+    try server.storePublishedMeshPeers(&rows);
+
+    const snap = try server.readPeerNames();
+    defer snap.deinit();
+    try std.testing.expectEqual(@as(usize, 40), snap.count);
+    try std.testing.expectEqual(@as(u32, 40), server.net_peer_count.load(.acquire));
+    try std.testing.expectEqualStrings("p000", snap.name(0));
+    try std.testing.expectEqualStrings(&long_name, snap.name(39));
+    try std.testing.expectEqual(@as(usize, 200), server.mesh_published_peers.items[39].name.len);
+
+    const signed = session_reclaim_attachment.SignedClaim{
+        .claim = .{
+            .kind = .create_new,
+            .account = "",
+            .group_token = @splat(0),
+            .attachment_id = .{ .raw = @splat(0) },
+            .origin_node = 0,
+            .destination_node = 0,
+            .issued_at_ms = 0,
+            .expires_at_ms = 0,
+            .nonce = 0,
+        },
+        .signer = key,
+        .signature = @splat(0),
+        .transcript = &.{},
+        .wire = &.{},
+    };
+    const route = server.trustedReclaimRoute(origin, signed) orelse return error.TestUnexpectedResult;
+    defer switch (route) {
+        .local => {},
+        .remote => |remote| allocator.free(remote.name),
+    };
+    switch (route) {
+        .local => return error.TestUnexpectedResult,
+        .remote => |remote| try std.testing.expectEqualStrings(&long_name, remote.slice()),
+    }
 }
 
 test "stats_peak_clients counts registered clients across shards" {
@@ -53618,7 +53764,7 @@ test "secured establish collision winner teardown trust lifecycle" {
     winner.closing = true;
     server.publishPeerCount();
     winner.closing = false;
-    try std.testing.expectEqual(old_pair.idb.shortId(), server.mesh_peer_node_ids[0]);
+    try std.testing.expectEqual(old_pair.idb.shortId(), server.mesh_published_peers.items[0].node_id);
     try std.testing.expect(!server.resolveS2sCollision(winner, "replay-b.test"));
     try std.testing.expect(old_conn.s2s_dedup);
     server.publishPeerCount();
@@ -53626,14 +53772,15 @@ test "secured establish collision winner teardown trust lifecycle" {
     // The still-established loser remains in the slab until close, but is no
     // longer a route. Publication must select the winner's authenticated key.
     try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
-    try std.testing.expectEqual(winner_pair.idb.shortId(), server.mesh_peer_node_ids[0]);
-    try std.testing.expectEqualSlices(u8, &winner_pair.idb.sign_kp.public_key, &server.mesh_peer_public_keys[0]);
+    try std.testing.expectEqual(winner_pair.idb.shortId(), server.mesh_published_peers.items[0].node_id);
+    try std.testing.expectEqualSlices(u8, &winner_pair.idb.sign_kp.public_key, &server.mesh_published_peers.items[0].public_key);
 
-    const winning_names = server.readPeerNames();
+    const winning_names = try server.readPeerNames();
+    defer winning_names.deinit();
     winner.closing = true;
     server.publishPeerCount();
     try std.testing.expectEqual(@as(u32, 0), server.net_peer_count.load(.acquire));
-    try std.testing.expectEqual(@as(u8, 0), server.mesh_peer_name_lens[0]);
+    try std.testing.expectEqual(@as(usize, 0), server.mesh_published_peers.items.len);
     // The caller-owned pre-teardown view cannot race the same storage rewrite.
     try std.testing.expectEqualStrings("replay-b.test", winning_names.name(0));
 }
@@ -53990,10 +54137,7 @@ test "secured live establishment replaces an expired deterministic collision win
     try std.testing.expect(server.rx().clients.get(old_id) == null);
     try std.testing.expect(!replacement_conn.closing);
     try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
-    try std.testing.expectEqualStrings(
-        "replay-b.test",
-        server.mesh_peer_names[0][0..server.mesh_peer_name_lens[0]],
-    );
+    try std.testing.expectEqualStrings("replay-b.test", server.mesh_published_peers.items[0].name);
     var metrics: std.ArrayList(u8) = .empty;
     defer metrics.deinit(allocator);
     try server.stats.writePrometheus(allocator, &metrics);
@@ -54179,13 +54323,14 @@ test "non-dedup S2S close immediately removes published peer" {
     receiver_owned_by_server = true;
     server.publishPeerCount();
     try std.testing.expectEqual(@as(u32, 1), server.net_peer_count.load(.acquire));
-    const before_close = server.readPeerNames();
+    const before_close = try server.readPeerNames();
+    defer before_close.deinit();
     try std.testing.expectEqualStrings("closing-peer.test", before_close.name(0));
 
     try server.closeConn(conn.token, "test peer close");
     try std.testing.expect(server.rx().clients.get(id) == null);
     try std.testing.expectEqual(@as(u32, 0), server.net_peer_count.load(.acquire));
-    try std.testing.expectEqual(@as(u8, 0), server.mesh_peer_name_lens[0]);
+    try std.testing.expectEqual(@as(usize, 0), server.mesh_published_peers.items.len);
     // Caller-owned copy remains stable after the shared same/zero-count rewrite.
     try std.testing.expectEqualStrings("closing-peer.test", before_close.name(0));
 }
@@ -64219,6 +64364,73 @@ test "TOTP enforcement: IDENTIFY + SASL gated for a 2FA account; tokens revoked 
         try std.testing.expect(Server.ircxAuthIsKnowledgeFactor(.plain));
         try std.testing.expect(Server.ircxAuthIsKnowledgeFactor(.scram_sha_256));
     } else return error.SkipZigTest;
+}
+
+test "GAP-P0b IRCX OAUTHBEARER refuses an unregistered account unless oauth_auto_provision" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-ircx-oauth-known.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const unknown_id = try addTestLocalClient(&server, "oa", null);
+    const unknown = server.connFor(unknown_id).?;
+    unknown.send_len = 0;
+    try server.completeIrcxAuth(unknown_id, unknown, .oauthbearer, .{
+        .account = "alice",
+        .issue_session_token = false,
+    });
+    try std.testing.expect(unknown.session.account() == null);
+    const unknown_reply = unknown.send_buf[0..unknown.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, unknown_reply, "unknown") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_reply, "Authentication failed") != null);
+
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("alice", "correcthorse", &scratch);
+    const known_id = try addTestLocalClient(&server, "ob", null);
+    const known = server.connFor(known_id).?;
+    try server.completeIrcxAuth(known_id, known, .oauthbearer, .{
+        .account = "Alice",
+        .issue_session_token = false,
+    });
+    try std.testing.expectEqualStrings("alice", known.session.account().?);
+
+    const provision_id = try addTestLocalClient(&server, "oc", null);
+    const provision = server.connFor(provision_id).?;
+    provision.session.sasl_oauth_auto_provision = true;
+    try server.completeIrcxAuth(provision_id, provision, .oauthbearer, .{
+        .account = "bob",
+        .issue_session_token = false,
+    });
+    try std.testing.expectEqualStrings("bob", provision.session.account().?);
+    try std.testing.expect(!services.accountIsRegistered("bob"));
+
+    var bare = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer bare.deinit();
+    const bare_id = try addTestLocalClient(&bare, "od", null);
+    const bare_conn = bare.connFor(bare_id).?;
+    bare_conn.send_len = 0;
+    try bare.completeIrcxAuth(bare_id, bare_conn, .oauthbearer, .{
+        .account = "alice",
+        .issue_session_token = false,
+    });
+    try std.testing.expect(bare_conn.session.account() == null);
+
+    std.debug.print("GAP-P0b branch=oauth refuses unknown account unless oauth_auto_provision\n", .{});
 }
 
 test "TOTP CONFIRM revokes an existing session token (no 2FA-free re-entry)" {
@@ -77050,29 +77262,39 @@ test "SESSION RESUME composite rejects malformed terminal and forged exact autho
     try expectContains(claimant.send_buf[0..claimant.send_len], "FAIL SESSION INVALID_TOKEN");
 
     // The synchronized reactor-0 publication is the only remote trust source.
-    // Route results own a fixed name copy, survive publication replacement, and
-    // disappear immediately when the authenticated key or live count changes.
+    // Route results own an allocated name copy, survive publication replacement,
+    // and disappear immediately when the authenticated key or live count changes.
     const foreign_signed = try session_reclaim_attachment.decodeClaim(foreign_wire);
-    lockSpin(&server.mesh_peer_identity_mu);
-    server.mesh_peer_node_ids[0] = foreign_identity.shortId();
-    server.mesh_peer_public_keys[0] = foreign_identity.sign_kp.public_key;
-    server.mesh_peer_public_key_present[0] = true;
     const published_name = "foreign-resume.test";
-    @memcpy(server.mesh_peer_names[0][0..published_name.len], published_name);
-    server.mesh_peer_name_lens[0] = @intCast(published_name.len);
+    const name_copy = try std.testing.allocator.dupe(u8, published_name);
+    lockSpin(&server.mesh_peer_identity_mu);
+    server.mesh_published_peers.append(std.testing.allocator, .{
+        .name = name_copy,
+        .node_id = foreign_identity.shortId(),
+        .public_key = foreign_identity.sign_kp.public_key,
+        .public_key_present = true,
+    }) catch |err| {
+        std.testing.allocator.free(name_copy);
+        server.mesh_peer_identity_mu.unlock();
+        return err;
+    };
     server.net_peer_count.store(1, .release);
     server.mesh_peer_identity_mu.unlock();
     const published_route = server.trustedReclaimRoute(
         foreign_identity.shortId(),
         foreign_signed,
     ) orelse return error.TestUnexpectedResult;
+    defer switch (published_route) {
+        .local => {},
+        .remote => |remote| std.testing.allocator.free(remote.name),
+    };
     switch (published_route) {
         .local => return error.TestUnexpectedResult,
         .remote => |remote| try std.testing.expectEqualStrings(published_name, remote.slice()),
     }
     lockSpin(&server.mesh_peer_identity_mu);
-    @memset(&server.mesh_peer_names[0], 0);
-    server.mesh_peer_public_keys[0] = identity.sign_kp.public_key;
+    @memset(server.mesh_published_peers.items[0].name, 0);
+    server.mesh_published_peers.items[0].public_key = identity.sign_kp.public_key;
     server.mesh_peer_identity_mu.unlock();
     switch (published_route) {
         .local => return error.TestUnexpectedResult,
@@ -77083,7 +77305,7 @@ test "SESSION RESUME composite rejects malformed terminal and forged exact autho
         foreign_signed,
     ) == null);
     lockSpin(&server.mesh_peer_identity_mu);
-    server.mesh_peer_public_keys[0] = foreign_identity.sign_kp.public_key;
+    server.mesh_published_peers.items[0].public_key = foreign_identity.sign_kp.public_key;
     server.net_peer_count.store(0, .release);
     server.mesh_peer_identity_mu.unlock();
     try std.testing.expect(server.trustedReclaimRoute(
@@ -80118,6 +80340,9 @@ test "threaded server: session tracking at cap with all slots attached is surfac
 test "threaded server: OAUTHBEARER login does not auto-elevate oper" {
     var cfg = operTestConfig(0);
     cfg.sasl_oauthbearer = test_oauth_admin_lookup;
+    // This fixture checks elevation, not registration. The default OAuth
+    // policy refuses an account that never REGISTER'd.
+    cfg.sasl_oauth_auto_provision = true;
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,

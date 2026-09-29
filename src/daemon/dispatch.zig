@@ -843,8 +843,11 @@ pub const ClientSession = struct {
     /// their verifiers never consult account status. Null = no gate (e.g. no
     /// account store, where a registered account cannot exist to succeed anyway).
     sasl_account_gate: ?sasl.AccountStatusGate = null,
+    /// Registered-account lookup for default-closed OAUTHBEARER binding.
+    sasl_account_known: ?sasl.AccountKnownGate = null,
     /// Config gate for SASL ANONYMOUS. Default false.
     sasl_allow_anonymous: bool = false,
+    sasl_oauth_auto_provision: bool = false,
     /// Effective maximum decoded SASL message bytes for this session. The router
     /// has a compile-time hard cap; config may lower it for stricter deployments.
     sasl_decode_max_bytes: usize = sasl_mechrouter.MAX_RAW_MESSAGE,
@@ -2012,6 +2015,10 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
                 // vs forbidden vs bad-cred are indistinguishable (no enumeration).
                 if (ctx.session.sasl_account_gate) |gate| {
                     if (gate.blocked(account)) return saslFail(ctx, "SASL authentication failed");
+                }
+                if (mechanism == .oauthbearer and !ctx.session.sasl_oauth_auto_provision) {
+                    const gate = ctx.session.sasl_account_known orelse return saslFail(ctx, "SASL authentication failed");
+                    if (!gate.known(account)) return saslFail(ctx, "SASL authentication failed");
                 }
                 // TOTP second factor: a knowledge-factor SASL success (PLAIN/
                 // SCRAM) for a 2FA-active account is refused here — SASL carries
@@ -3367,6 +3374,60 @@ const TestAccountGate = struct {
         return self.blocked;
     }
 };
+
+const TestAccountKnownGate = struct {
+    known_account: bool,
+
+    fn isKnown(ptr: *anyopaque, account: []const u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.known_account and std.mem.eql(u8, account, "alice");
+    }
+};
+
+test "GAP-P0b OAuth refuses unknown account unless oauth_auto_provision" {
+    const OAuthDb = struct {
+        fn verify(_: *anyopaque, token: []const u8, _: ?[]const u8, account_out: []u8) ?[]const u8 {
+            if (!std.mem.eql(u8, token, "good.jwt")) return null;
+            @memcpy(account_out[0..5], "Alice");
+            return account_out[0..5];
+        }
+    };
+
+    for (0..4) |case_index| {
+        var session = ClientSession.init();
+        session.cap.negotiated.add(.sasl);
+        var anchor: u8 = 0;
+        var known = TestAccountKnownGate{ .known_account = case_index == 2 };
+        session.sasl_oauthbearer = .{ .ptr = &anchor, .verifyFn = OAuthDb.verify };
+        session.sasl_oauth_auto_provision = case_index == 1;
+        if (case_index != 3) session.sasl_account_known = .{ .ptr = &known, .knownFn = TestAccountKnownGate.isKnown };
+
+        var storage: [1024]u8 = undefined;
+        var replies = ReplyCtx.init(&storage);
+        try dispatchText(&session, &replies, "AUTHENTICATE OAUTHBEARER");
+        try expectContains(replies.written(), "AUTHENTICATE +\r\n");
+
+        var b64: [128]u8 = undefined;
+        const encoded = std.base64.standard.Encoder.encode(&b64, "n,,\x01auth=Bearer good.jwt\x01\x01");
+        var linebuf: [160]u8 = undefined;
+        const line = try std.fmt.bufPrint(&linebuf, "AUTHENTICATE {s}", .{encoded});
+        replies.clear();
+        try dispatchText(&session, &replies, line);
+
+        if (case_index == 1 or case_index == 2) {
+            try std.testing.expect(session.logged_in);
+            try std.testing.expectEqualStrings("alice", session.account().?);
+            try expectContains(replies.written(), " 903 ");
+        } else {
+            try std.testing.expect(!session.logged_in);
+            try std.testing.expect(session.account() == null);
+            try expectContains(replies.written(), " 904 ");
+            try expectContains(replies.written(), "SASL authentication failed");
+            try expectNotContains(replies.written(), "unknown");
+        }
+    }
+    std.debug.print("GAP-P0b branch=oauth refuses unknown account unless oauth_auto_provision\n", .{});
+}
 
 // Drive a full SCRAM-SHA-256 client-final with a correct proof through the
 // router and return the reply bytes. Factored out so the account-gate test can

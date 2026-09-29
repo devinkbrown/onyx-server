@@ -503,6 +503,7 @@ Source: struct at `src/daemon/config_format.zig:193`, parsing at `src/daemon/con
 | `allow_anonymous` | bool | `false` | `true` or `false` | Allow SASL ANONYMOUS (RFC 4505) guest logins. Default off (spam vector). A guest binds no account, is left `+r`-unset, and receives no oper/services privileges (`src/daemon/config_format.zig:297`). |
 | `oauth_hmac_key` / `oauth_jwks_file` / `oauth_pubkey` | string or null | unset | secret / path | OAUTHBEARER (RFC 7628) JWT verification key. Exactly one source enables OAUTHBEARER: an HS256 shared secret, an RS256/ES256 JWKS file, or an RS256/ES256 PEM/DER public key. Unset = OAUTHBEARER is not advertised (`src/daemon/oauth_jwt.zig`, `src/daemon/config_format.zig:306`). |
 | `oauth_issuer` / `oauth_audience` / `oauth_account_claim` | string or null | unset / `"sub"` | any string | When set, `iss`/`aud` are required to match; `oauth_account_claim` selects the JWT claim mapped to the account (default `sub`). OAuth identities are federated and are never auto-elevated to oper (`src/daemon/config_format.zig:302`). |
+| `oauth_auto_provision` | bool | `false` | `true` or `false` | Default false: OAUTHBEARER refuses account names without a registered account. Setting true is the operator choosing to let a valid token bind a session for an account name that never REGISTER'd. The daemon still does not create the account and does not auto-elevate oper. |
 
 ## `[acme]`
 
