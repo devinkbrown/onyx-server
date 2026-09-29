@@ -54162,6 +54162,7 @@ const PortableServer = struct {
             io_backend.closeSocket(fd);
             return error.Unexpected;
         }
+        io_backend.setTcpNoDelay(fd);
         const conn = self.allocator.create(PortableConn) catch {
             io_backend.closeSocket(fd);
             return error.OutOfMemory;
@@ -54605,7 +54606,17 @@ test "GAP-X4 PortableServer joins and fans out PRIVMSG" {
     }
     if (!try portableExpect(&server, fds[1], token)) return error.Unexpected;
     if (!try portableExpect(&server, fds[2], token)) return error.Unexpected;
-    std.debug.print("GAP-X4 branch=PortableServer registered three clients, answered 366, and fanned out PRIVMSG on {s}\n", .{@tagName(server.backend.family)});
+    var live_nodelay: usize = 0;
+    for (server.conns) |conn| {
+        if (!conn.live) continue;
+        var nodelay: u32 = 0;
+        var opt_len: posix.socklen_t = @sizeOf(u32);
+        const rc = linux.getsockopt(conn.fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&nodelay), &opt_len);
+        if (posix.errno(rc) != .SUCCESS or nodelay != 1) return error.Unexpected;
+        live_nodelay += 1;
+    }
+    if (live_nodelay != 3) return error.Unexpected;
+    std.debug.print("GAP-X4 branch=PortableServer registered three clients, answered 366, fanned out PRIVMSG, and set TCP_NODELAY on {s}\n", .{@tagName(server.backend.family)});
 }
 
 fn portableChanName(name: []const u8) bool {

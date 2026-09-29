@@ -2330,6 +2330,25 @@ pub fn listenTcp(host: []const u8, port: u16) ListenError!Listener {
     return error.Unsupported;
 }
 
+/// Flush small IRC lines. `TCP_NODELAY` is 1 and `IPPROTO_TCP` is 6 on Linux,
+/// FreeBSD, OpenBSD, and Windows. Best-effort: a refused option leaves the
+/// kernel default in place.
+pub fn setTcpNoDelay(fd: linux.fd_t) void {
+    if (fd < 0) return;
+    const on: i32 = 1;
+    if (comptime builtin.os.tag == .linux) {
+        _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&on), @sizeOf(i32));
+        return;
+    }
+    if (comptime builtin.os.tag == .windows) {
+        _ = setsockopt(@intCast(fd), 6, 1, &on, @intCast(@sizeOf(i32)));
+        return;
+    }
+    if (comptime kqueueOs()) {
+        _ = std.c.setsockopt(fd, 6, 1, &on, @sizeOf(i32));
+    }
+}
+
 pub fn closeSocket(fd: linux.fd_t) void {
     if (fd < 0) return;
     if (comptime builtin.os.tag == .linux) {
