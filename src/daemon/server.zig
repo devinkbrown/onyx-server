@@ -20129,13 +20129,11 @@ pub const LinuxServer = struct {
             }
             return;
         }
-        // A secret (+s) or private (+p) channel's roster is visible only to its
-        // members (and opers) — ShowChannel = public-channel ||
-        // is-member. A non-member gets a bare RPL_ENDOFNAMES, never the member
-        // list, so NAMES cannot enumerate a hidden channel (the WHOIS path
-        // already gates the same way via channelHiddenFromWhois).
+        // A secret (+s), private (+p), or hidden (+h) channel's roster is
+        // visible only to its members and opers. A non-member gets a bare
+        // RPL_ENDOFNAMES, never the member list. WHOIS uses the same gate.
         if (!conn.session.isOper() and
-            (self.world.channelHasFlag(channel, .secret) or self.world.isPrivate(channel)))
+            (self.world.channelHasFlag(channel, .secret) or self.world.isPrivate(channel) or self.world.isHidden(channel)))
         {
             const viewer_wid = self.world.findNick(conn.session.displayName());
             const is_member = if (viewer_wid) |vw| self.world.isMember(channel, vw) else false;
@@ -21070,12 +21068,11 @@ pub const LinuxServer = struct {
     pub fn handleWhox(self: *LinuxServer, conn: *ConnState, target: []const u8, req: whox.Request) !void {
         const requester = conn.session.displayName();
         if (world_model.isChannelName(target) and self.world.channelExists(target)) {
-            // Same ShowChannel gate as plain WHO: a secret(+s)/private(+p)
-            // channel's roster is visible only to members and opers, so a
-            // WHO <chan> %<fields> (WHOX) cannot enumerate a hidden channel
-            // either. Non-member non-oper gets a bare RPL_ENDOFWHO. Fail-closed.
+            // Same ShowChannel gate as plain WHO: a secret(+s), private(+p),
+            // or hidden(+h) roster is visible only to members and opers.
+            // Non-member non-oper gets a bare RPL_ENDOFWHO. Fail-closed.
             if (!conn.session.isOper() and
-                (self.world.channelHasFlag(target, .secret) or self.world.isPrivate(target)))
+                (self.world.channelHasFlag(target, .secret) or self.world.isPrivate(target) or self.world.isHidden(target)))
             {
                 const viewer_wid = self.world.findNick(requester);
                 const is_member = if (viewer_wid) |vw| self.world.isMember(target, vw) else false;
@@ -21131,7 +21128,7 @@ pub const LinuxServer = struct {
     }
 
     fn channelHiddenFromWhois(self: *LinuxServer, channel: []const u8, viewer_wid: world_model.ClientId) bool {
-        if (!self.world.channelHasFlag(channel, .secret) and !self.world.isPrivate(channel)) return false;
+        if (!self.world.channelHasFlag(channel, .secret) and !self.world.isPrivate(channel) and !self.world.isHidden(channel)) return false;
         return !self.world.isMember(channel, viewer_wid);
     }
 
@@ -21220,14 +21217,11 @@ pub const LinuxServer = struct {
         }
 
         if (world_model.isChannelName(target) and self.world.channelExists(target)) {
-            // A secret (+s) or private (+p) channel's roster is visible only to
-            // its members (and opers) — ShowChannel = public-channel
-            // || is-member (and the NAMES gate / channelHiddenFromWhois). A
-            // non-member non-oper gets a bare RPL_ENDOFWHO, never the member
-            // list, so WHO cannot enumerate a hidden channel. Fail-closed: an
-            // unknown viewer is treated as a non-member.
+            // A secret (+s), private (+p), or hidden (+h) roster is visible
+            // only to members and opers. A non-member non-oper gets a bare
+            // RPL_ENDOFWHO. Fail-closed: an unknown viewer is a non-member.
             if (!conn.session.isOper() and
-                (self.world.channelHasFlag(target, .secret) or self.world.isPrivate(target)))
+                (self.world.channelHasFlag(target, .secret) or self.world.isPrivate(target) or self.world.isHidden(target)))
             {
                 const viewer_wid = self.world.findNick(requester);
                 const is_member = if (viewer_wid) |vw| self.world.isMember(target, vw) else false;
@@ -31736,10 +31730,10 @@ pub const LinuxServer = struct {
         const params = parsed.paramSlice();
         const is_oper = conn.session.isOper();
         // Operators retain the full Event Spine command (gated by the
-        // `event_subscribe` privilege). Ordinary clients may use ONLY the IRCX
-        // subscription subcommands (LIST/ADD/CHANGE/DELETE/CLEAR), and ONLY for the
-        // channel-scoped MEDIA type — the call-presence feed for the channels they
-        // are in. BROADCAST and OBSERVE stay operator-only.
+        // `event_subscribe` privilege). Ordinary clients may LIST/ADD/CHANGE/
+        // DELETE/CLEAR the channel-scoped types CHANNEL, MEMBER, and MEDIA.
+        // USER, category feeds, BROADCAST, and OBSERVE stay operator-only.
+        // Delivery of CHANNEL, MEMBER, and MEDIA still requires membership.
         if (is_oper and !self.requirePriv(conn, .event_subscribe)) return;
         // EVENT BROADCAST :<message> — send an oper announce (the former WALLOPS,
         // now folded into the Event Spine): delivered as a chatsvc `:<srv> EVENT
@@ -31819,8 +31813,8 @@ pub const LinuxServer = struct {
             // IRCX plane (CHANNEL/MEMBER/USER/MEDIA) first; a token that is not an
             // IRCX type falls through to the Event Spine CATEGORY plane below.
             if (event_spine.IrcxEventType.parse(params[1])) |typ| {
-                if (!is_oper and typ != .media) {
-                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; only MEDIA events are client-subscribable");
+                if (!clientIrcxTypeAllowed(is_oper, typ)) {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; USER events are for operators");
                     return;
                 }
                 if (conn.session.subscribesToIrcxEvent(typ)) {
@@ -31873,8 +31867,8 @@ pub const LinuxServer = struct {
                 return;
             }
             if (event_spine.IrcxEventType.parse(params[1])) |typ| {
-                if (!is_oper and typ != .media) {
-                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; only MEDIA events are client-subscribable");
+                if (!clientIrcxTypeAllowed(is_oper, typ)) {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; USER events are for operators");
                     return;
                 }
                 if (!conn.session.clearIrcxEventSubscription(typ)) {
@@ -32360,22 +32354,27 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
-    /// The channel of a `"MEDIA <action> <channel> …"` event body (the 3rd token),
-    /// or null if the body is not a well-formed media event.
+    /// CHANNEL, MEMBER, and MEDIA bodies put the channel in the third token.
     fn mediaEventChannel(message: []const u8) ?[]const u8 {
         var it = std.mem.tokenizeScalar(u8, message, ' ');
-        _ = it.next() orelse return null; // "MEDIA"
-        _ = it.next() orelse return null; // action
-        return it.next(); // channel
+        _ = it.next() orelse return null;
+        _ = it.next() orelse return null;
+        return it.next();
+    }
+
+    /// A non-oper may subscribe to channel-scoped IRCX types. USER names every
+    /// connect, so it stays an operator feed.
+    fn clientIrcxTypeAllowed(is_oper: bool, typ: event_spine.IrcxEventType) bool {
+        if (is_oper) return true;
+        return typ == .channel or typ == .member or typ == .media;
     }
 
     /// Whether `message` may be delivered to the recipient identified by `id` /
-    /// `session`. MEDIA events are channel-scoped call presence: a non-oper must be
-    /// a member of the event's channel to receive it, so a non-member can't snoop
-    /// calls in a channel they are not in — including a +s/private channel. Every
-    /// non-media event, and every oper, passes unconditionally.
+    /// `session`. CHANNEL, MEMBER, and MEDIA are channel-scoped: a non-oper must
+    /// be a member of the event's channel. USER and every oper pass here.
     fn mediaEventAllowed(self: *LinuxServer, id: client_model.ClientId, session: *const dispatch.ClientSession, message: []const u8) bool {
-        if (event_spine.IrcxEventType.fromMessage(message) != .media) return true;
+        const typ = event_spine.IrcxEventType.fromMessage(message) orelse return true;
+        if (typ != .channel and typ != .member and typ != .media) return true;
         if (session.isOper()) return true;
         const chan = mediaEventChannel(message) orelse return false;
         return self.world.isMember(chan, worldIdFromClient(id));
@@ -98186,9 +98185,12 @@ test "threaded server: IRCX EVENT subscription numerics" {
     try recvUntil(&b, " 001 B ", 200);
     try writeAllFd(fd_b, "IRCX\r\n");
     try recvUntil(&b, " 800 B 1 0 ", 200);
-    // A non-oper may NOT subscribe to operator event types (CHANNEL/MEMBER/USER)
-    // nor BROADCAST/OBSERVE …
+    // A non-oper may subscribe to channel-scoped CHANNEL, MEMBER, and MEDIA.
+    // USER, BROADCAST, and OBSERVE stay operator-only.
     try writeAllFd(fd_b, "EVENT ADD CHANNEL #x*\r\n");
+    try recvUntil(&b, " 806 B CHANNEL #x* :Event added", 200);
+    b.reset();
+    try writeAllFd(fd_b, "EVENT ADD USER *\r\n");
     try recvUntil(&b, " 481 ", 200);
     b.reset();
     try writeAllFd(fd_b, "EVENT BROADCAST :nope\r\n");
@@ -111261,6 +111263,101 @@ test "GAP-P10 a speak grant registers a command and a run is not an oper bit" {
     try std.testing.expect(!plain.session.isOper());
     current_reactor = null;
     std.debug.print("GAP-P10 branch=a speak grant registers a bounded command and running it is not an oper bit\n", .{});
+}
+
+test "GAP-P11 IRCX screens name a handler or a divergence" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "p11.test" };
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+
+    const hide_id = try addTestLocalClient(server, "HideNick", null);
+    const peek_id = try addTestLocalClient(server, "Peek", null);
+    const hide = server.connFor(hide_id).?;
+    const peek = server.connFor(peek_id).?;
+    _ = try server.world.join("#hid", worldIdFromClient(hide_id));
+    _ = try server.world.setHidden("#hid", true);
+
+    peek.send_len = 0;
+    var peek_names = try irc_line.parseLine("NAMES #hid");
+    try server.handleNames(peek, &peek_names);
+    const peek_names_out = peek.send_buf[0..peek.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, peek_names_out, " 366 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, peek_names_out, "HideNick") == null);
+
+    hide.send_len = 0;
+    var member_names = try irc_line.parseLine("NAMES #hid");
+    try server.handleNames(hide, &member_names);
+    try std.testing.expect(std.mem.indexOf(u8, hide.send_buf[0..hide.send_len], "HideNick") != null);
+
+    peek.send_len = 0;
+    var peek_who = try irc_line.parseLine("WHO #hid");
+    try server.handleWho(peek, &peek_who);
+    try std.testing.expect(std.mem.indexOf(u8, peek.send_buf[0..peek.send_len], "HideNick") == null);
+
+    peek.send_len = 0;
+    var peek_listx = try irc_line.parseLine("LISTX");
+    try server.handleListx(peek, &peek_listx);
+    try std.testing.expect(std.mem.indexOf(u8, peek.send_buf[0..peek.send_len], "#hid") == null);
+
+    const op_id = try addTestLocalClient(server, "AudOp", null);
+    const reg_id = try addTestLocalClient(server, "AudReg", null);
+    const see_id = try addTestLocalClient(server, "AudSee", null);
+    const see = server.connFor(see_id).?;
+    _ = try server.world.join("#aud", worldIdFromClient(op_id));
+    _ = try server.world.join("#aud", worldIdFromClient(reg_id));
+    _ = try server.world.join("#aud", worldIdFromClient(see_id));
+    _ = try server.world.setChannelExtFlag("#aud", .auditorium, true);
+    see.send_len = 0;
+    var aud_names = try irc_line.parseLine("NAMES #aud");
+    try server.handleNames(see, &aud_names);
+    const aud_out = see.send_buf[0..see.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, aud_out, "AudOp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aud_out, "AudSee") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aud_out, "AudReg") == null);
+
+    const mem_id = try addTestLocalClient(server, "EvMem", null);
+    const out_id = try addTestLocalClient(server, "EvOut", null);
+    const mem = server.connFor(mem_id).?;
+    const outsider = server.connFor(out_id).?;
+    _ = try server.world.join("#ev", worldIdFromClient(mem_id));
+    mem.send_len = 0;
+    var add_chan = try irc_line.parseLine("EVENT ADD CHANNEL *");
+    try server.handleEvent(mem, &add_chan);
+    try std.testing.expect(std.mem.indexOf(u8, mem.send_buf[0..mem.send_len], " 806 ") != null);
+    try std.testing.expect(!mem.session.isOper());
+
+    mem.send_len = 0;
+    var add_user = try irc_line.parseLine("EVENT ADD USER *");
+    try server.handleEvent(mem, &add_user);
+    try std.testing.expect(std.mem.indexOf(u8, mem.send_buf[0..mem.send_len], " 481 ") != null);
+    try std.testing.expect(!mem.session.subscribesToIrcxEvent(.user));
+
+    outsider.send_len = 0;
+    var out_add = try irc_line.parseLine("EVENT ADD CHANNEL *");
+    try server.handleEvent(outsider, &out_add);
+    mem.send_len = 0;
+    outsider.send_len = 0;
+    try server.publishChannelEvent("MODE", "#ev");
+    try std.testing.expect(std.mem.indexOf(u8, mem.send_buf[0..mem.send_len], "CHANNEL MODE #ev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outsider.send_buf[0..outsider.send_len], "CHANNEL MODE #ev") == null);
+    try std.testing.expect(!outsider.session.isOper());
+
+    current_reactor = null;
+    std.debug.print("GAP-P11 row=LISTX handler=src/daemon/server.zig:21404 test=GAP-P0c remote LISTX carries the peer topic\n", .{});
+    std.debug.print("GAP-P11 row=NAMES +x handler=src/daemon/server.zig:54781 test=threaded server: +x auditorium hides regular members in NAMES\n", .{});
+    std.debug.print("GAP-P11 row=NAMES +h handler=src/daemon/server.zig:20100 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
+    std.debug.print("GAP-P11 row=EVENT CHANNEL handler=src/daemon/server.zig:31729 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
+    std.debug.print("GAP-P11 divergence=USER events stay operator-only because a connect line names every user\n", .{});
+    std.debug.print("GAP-P11 divergence=remote LISTX creation time stays 0 because creation is not replicated\n", .{});
+    std.debug.print("GAP-P11 divergence=TACCESS BTPROP comic-chat avatar DATA and OPFORCE stay unwired\n", .{});
+    std.debug.print("GAP-P11 branch=handlers at file:line or an explicit divergence and the client stays in the Onyx repo\n", .{});
 }
 
 test {
