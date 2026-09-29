@@ -1231,12 +1231,23 @@ const CertExtOpts = struct {
     /// Null omits KeyUsage. False emits the extension with digitalSignature
     /// clear. True emits digitalSignature.
     key_usage_digital_signature: ?bool = null,
+    /// Extra extension. Empty OID omits it. `extra_value` is the extnValue
+    /// payload (wrapped in an OCTET STRING). Critical copies of OIDs this
+    /// parser does not interpret must fail closed.
+    extra_oid: []const u8 = &.{},
+    extra_critical: bool = false,
+    extra_value: []const u8 = &.{},
 };
 
 fn writeExtTlv(w: *W, oid: []const u8, ext_value: []const u8) void {
+    writeMarkedExt(w, oid, false, ext_value);
+}
+
+fn writeMarkedExt(w: *W, oid: []const u8, critical: bool, ext_value: []const u8) void {
     var body: [224]u8 = undefined;
     var b = W.init(&body);
     b.tlv(0x06, oid); // extnID
+    if (critical) b.tlv(0x01, &[_]u8{0xff});
     b.tlv(0x04, ext_value); // extnValue OCTET STRING
     w.tlv(0x30, b.bytes()); // Extension SEQUENCE
 }
@@ -1340,6 +1351,7 @@ pub fn mintEd25519CertExt(
     if (opts.is_ca) writeBasicConstraintsExt(&esb, opts.path_len);
     if (opts.dns_names.len != 0) writeSanExt(&esb, opts.dns_names);
     if (opts.key_usage_digital_signature) |bit| writeKeyUsageExt(&esb, bit);
+    if (opts.extra_oid.len != 0) writeMarkedExt(&esb, opts.extra_oid, opts.extra_critical, opts.extra_value);
     if (opts.permitted_dns.len != 0 or opts.excluded_dns.len != 0) {
         writeNameConstraintsExt(&esb, opts.permitted_dns, opts.excluded_dns);
     }

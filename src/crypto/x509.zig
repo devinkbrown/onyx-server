@@ -1018,8 +1018,9 @@ fn extensionOidIsSupported(oid_value: []const u8) bool {
     if (std.mem.eql(u8, oid_value, &Oid.authority_info_access)) return true;
     if (std.mem.eql(u8, oid_value, &Oid.tls_feature)) return true;
     if (std.mem.eql(u8, oid_value, &Oid.delegation_usage)) return true;
-    if (std.mem.eql(u8, oid_value, &Oid.crl_distribution_points)) return true;
-    if (std.mem.eql(u8, oid_value, &sct_list_extension_oid)) return true;
+    // cRLDistributionPoints and the CT SCT list are not interpreted. A critical
+    // copy is therefore unsupported (RFC 5280 §4.2). A non-critical copy may
+    // be ignored. This does not fetch a CRL or a CT log.
     return false;
 }
 
@@ -1032,6 +1033,48 @@ fn readExtensionCriticalField(one: *DerReader) Error!bool {
 
 fn rejectUnsupportedCriticalExtension(critical: bool, oid_value: []const u8) Error!void {
     if (critical and !extensionOidIsSupported(oid_value)) return error.UnsupportedCriticalExtension;
+}
+
+test "GAP-K14 a critical CRL distribution point or SCT list is rejected" {
+    const x509_verify = @import("x509_verify.zig");
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x14)));
+    const nb: i64 = 1_704_067_200;
+    const na: i64 = 1_924_991_999;
+    const payload = [_]u8{ 0x30, 0x00 };
+    var buf: [1024]u8 = undefined;
+
+    const critical_crl = try x509_verify.mintEd25519CertExt(&buf, "K14", "K14", kp.public_key.toBytes(), kp, nb, na, .{
+        .dns_names = &.{"k14.test"},
+        .extra_oid = &Oid.crl_distribution_points,
+        .extra_critical = true,
+        .extra_value = &payload,
+    });
+    try std.testing.expectError(error.UnsupportedCriticalExtension, parse(critical_crl));
+
+    const ignored_crl = try x509_verify.mintEd25519CertExt(&buf, "K14", "K14", kp.public_key.toBytes(), kp, nb, na, .{
+        .dns_names = &.{"k14.test"},
+        .extra_oid = &Oid.crl_distribution_points,
+        .extra_value = &payload,
+    });
+    _ = try parse(ignored_crl);
+
+    const critical_sct = try x509_verify.mintEd25519CertExt(&buf, "K14", "K14", kp.public_key.toBytes(), kp, nb, na, .{
+        .dns_names = &.{"k14.test"},
+        .extra_oid = &sct_list_extension_oid,
+        .extra_critical = true,
+        .extra_value = &payload,
+    });
+    try std.testing.expectError(error.UnsupportedCriticalExtension, parse(critical_sct));
+
+    const ignored_sct = try x509_verify.mintEd25519CertExt(&buf, "K14", "K14", kp.public_key.toBytes(), kp, nb, na, .{
+        .dns_names = &.{"k14.test"},
+        .extra_oid = &sct_list_extension_oid,
+        .extra_value = &payload,
+    });
+    _ = try parse(ignored_sct);
+
+    std.debug.print("GAP-K14 branch=a critical CRL distribution point or SCT list is rejected\n", .{});
 }
 
 /// authorityInfoAccess (RFC 5280 §4.2.2.1): capture the id-ad-ocsp responder URI
