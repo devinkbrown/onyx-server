@@ -94310,6 +94310,77 @@ test "WS media admission binds a valid participant MAC to its own stream and act
     try std.testing.expectEqual(@as(usize, 0), receiver.send_len);
 }
 
+test "GAP-V2 a node identity still delivers the signed media handshake" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    const seed = @as([32]u8, @splat(0x5c));
+    var ident = try node_identity.fromSeed(seed, "local");
+    defer ident.deinit();
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .num_shards = 1,
+        .node_identity = &ident,
+        .ws_media_relay = true,
+        .ws_media_require_mac = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const sender_id = try addTestLocalClient(&server, "speaker", "speaker");
+    const peer_id = try addTestLocalClient(&server, "listener", "listener");
+    const sender = server.connFor(sender_id).?;
+    const peer = server.connFor(peer_id).?;
+    sender.session.registration.registered = true;
+    peer.session.registration.registered = true;
+    sender.send_armed = true;
+    peer.send_armed = true;
+    Server.loginSession(sender, "speaker");
+    Server.loginSession(peer, "listener");
+    const speaker_key = try enrollTestMediaIdentity(&server, "speaker", "primary", 0x31);
+    _ = try enrollTestMediaIdentity(&server, "listener", "primary", 0x32);
+
+    try server.world.restoreMember("#media", worldIdFromClient(sender_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#media", worldIdFromClient(peer_id), world_model.MemberModes.empty());
+    _ = try server.addMediaPhysicalAttachment(sender_id, "#media", "speaker", .voice);
+    _ = try server.addMediaPhysicalAttachment(peer_id, "#media", "listener", .voice);
+    try server.media_rooms.join("#media", "speaker", .voice);
+    try server.media_rooms.join("#media", "listener", .voice);
+    sender.setMediaCall("#media", "speaker");
+    peer.setMediaCall("#media", "listener");
+
+    var subscribe = irc_line.LineView{ .raw = "", .command = "EVENT" };
+    subscribe.params[0] = "ADD";
+    subscribe.params[1] = "MEDIA";
+    subscribe.params[2] = "*";
+    subscribe.param_count = 3;
+    try server.handleEvent(sender, &subscribe);
+    try server.handleEvent(peer, &subscribe);
+
+    const attachment: [Server.media_e2ee_attachment_bytes]u8 = @splat(0xa5);
+    var handshake_buf: [std.base64.standard.Encoder.calcSize(Server.media_e2ee_handshake_v2_bytes)]u8 = undefined;
+    const handshake = try encodeTestMediaHandshake(&handshake_buf, attachment, speaker_key, "#media");
+    var media = irc_line.LineView{ .raw = "", .command = "MEDIA" };
+    media.params[0] = "E2EE-HANDSHAKE";
+    media.params[1] = "#media";
+    media.params[2] = handshake;
+    media.param_count = 3;
+    resetTestSendQ(sender);
+    resetTestSendQ(peer);
+    try server.handleMedia(sender_id, sender, &media);
+    try std.testing.expect(sender.media_e2ee_attachment_bound);
+    const delivered = peer.send_buf[0..peer.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, delivered, "E2EE-HANDSHAKE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, delivered, handshake) != null);
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL MEDIA") == null);
+    std.debug.print("GAP-V2 branch=node identity delivers the signed media handshake\n", .{});
+}
+
 test "GAP-V2 a rejected browser media frame returns numeric 404" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     defer current_reactor = null;

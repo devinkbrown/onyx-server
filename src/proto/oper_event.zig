@@ -23,7 +23,9 @@ pub const max_origin_len: usize = 128;
 /// daemon's exact cross-shard subject width so no node or reactor truncates a
 /// signed filtering decision differently.
 pub const max_subject_len: usize = 256;
-pub const max_message_len: usize = 400;
+/// Same width as `event_history.max_message_len`. The signed handshake is
+/// longer than the old 400-byte oper line, and the wire must carry it whole.
+pub const max_message_len: usize = 1024;
 pub const max_severity: u8 = 5;
 pub const pubkey_len: usize = sign.public_key_len;
 pub const sig_len: usize = sign.signature_len;

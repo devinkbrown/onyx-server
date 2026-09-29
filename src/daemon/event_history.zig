@@ -13,7 +13,9 @@ const event_spine = @import("event_spine.zig");
 const rwlock = @import("../substrate/rwlock.zig");
 
 pub const max_origin_len: usize = 64;
-pub const max_message_len: usize = 400;
+/// Wide enough for a signed MEDIA E2EE handshake (~405 bytes) and a max
+/// GROUPKEY line. A 400-byte slot drops that live call event before delivery.
+pub const max_message_len: usize = 1024;
 pub const EventId = [16]u8;
 
 pub const StableEvent = struct {
