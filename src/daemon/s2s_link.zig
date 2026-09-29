@@ -895,6 +895,26 @@ pub const S2sLink = struct {
         return self.peer.takeWards();
     }
 
+    pub fn supportsMeshSearch(self: *const S2sLink) bool {
+        return self.peer.supportsMeshSearch();
+    }
+
+    pub fn sendSearchQuery(self: *S2sLink, wire: []const u8) !void {
+        try self.peer.sendSearchQuery(self.sink(), wire);
+    }
+
+    pub fn sendSearchReply(self: *S2sLink, wire: []const u8) !void {
+        try self.peer.sendSearchReply(self.sink(), wire);
+    }
+
+    pub fn takeSearchQueries(self: *S2sLink) ![][]u8 {
+        return self.peer.takeSearchQueries();
+    }
+
+    pub fn takeSearchReplies(self: *S2sLink) ![][]u8 {
+        return self.peer.takeSearchReplies();
+    }
+
     /// Emit a signed, signing-required Web Push hint for an offline memo/DM.
     /// The peer driver no-ops for non-signing peers so this never rides legacy
     /// plaintext S2S.

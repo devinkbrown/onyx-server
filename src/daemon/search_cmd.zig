@@ -144,6 +144,10 @@ pub fn handle(self: anytype, world_id: anytype, conn: anytype, line: []const u8)
         mesh_search.mergeNewest(found_buf[0..found_len], remote_buf[0..remote_n], max_results, &merged);
     const newest = if (remote_n == 0) found_buf[0..found_len] else merged[0..merged_len];
 
+    // A live link answers later. Hold an empty local merge until that reply
+    // instead of telling the client there were no hits.
+    if (self.dispatchMeshSearchQuery(conn, target, words[0..word_count], newest) and newest.len == 0) return;
+
     // Reverse into chronological (oldest-first) order for replay, matching
     // CHATHISTORY's BATCH ordering. No remote hits leaves the local order alone.
     var ordered: [max_results]lotus.Message = undefined;

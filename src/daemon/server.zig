@@ -890,9 +890,34 @@ const ringlane = @import("ringlane.zig");
 const io_backend = @import("io_backend.zig");
 const sendq = @import("sendq.zig");
 const search_cmd = @import("search_cmd.zig");
+const mesh_search = @import("mesh_search.zig");
 const kernel_linux = @import("kernel_linux.zig");
 
 const RingFdToken = ringlane.FdToken;
+
+/// One in-process mesh peer whose SEARCH frames are pumped through `sink`.
+/// Live secured links are scanned from the reactor tables; this list is how a
+/// test (or any buffer pair) hands the daemon the same `S2sPeer` send path.
+const MeshSearchWire = struct {
+    peer: *s2s_peer_mod.S2sPeer,
+    sink: s2s_peer_mod.ByteSink,
+};
+
+const mesh_search_pending_max: usize = 1024;
+
+const PendingMeshSearch = struct {
+    id: u32,
+    token: RingFdToken,
+    target: []u8,
+    sent_ids: std.ArrayListUnmanaged([]u8) = .empty,
+    sent: usize = 0,
+    expect: usize = 0,
+    got: usize = 0,
+};
+
+fn ringTokenEql(a: RingFdToken, b: RingFdToken) bool {
+    return a.slot == b.slot and a.gen == b.gen;
+}
 const RingCore = ringlane.Ring;
 const RingFeatureSet = ringlane.RingFeatures;
 
@@ -4287,9 +4312,14 @@ pub const LinuxServer = struct {
     /// store and, after reactor 0 fires, in history. The due-record rides a
     /// SCHD mesh checkpoint so a USR2 replay does not send it twice.
     schedules: schedule_snapshot.Table = .{},
-    /// Other nodes whose history SEARCH may ask. Each hit is authorized on
-    /// this node. The list is live process state, not a checkpoint.
+    /// Other nodes whose history SEARCH may ask in-process. Each hit is
+    /// authorized on this node. Live Mooring links use SEARCH_QUERY instead.
     mesh_search_peers: std.ArrayList(*LinuxServer) = .empty,
+    /// Buffer-pair peers asked by SEARCH_QUERY. The peer is borrowed.
+    mesh_search_wires: std.ArrayListUnmanaged(MeshSearchWire) = .empty,
+    /// Searches waiting on a mesh reply. One row per connection. Not a checkpoint.
+    mesh_search_pending: std.ArrayListUnmanaged(PendingMeshSearch) = .empty,
+    next_mesh_search_id: u32 = 0,
     /// Ban appeals. One open filing per host per window. Not a mesh checkpoint.
     appeals: appeal.Table = .{},
     /// First channel messages waiting for an oper to release or drop them.
@@ -6199,6 +6229,8 @@ pub const LinuxServer = struct {
         self.first_holds.deinit();
         self.slash_cmds.deinit();
         self.mesh_search_peers.deinit(self.allocator);
+        self.mesh_search_wires.deinit(self.allocator);
+        self.deinitMeshSearchPending();
         self.warden.deinit();
         self.spamtrap.deinit();
         self.raid_shield.deinit();
@@ -9579,6 +9611,7 @@ pub const LinuxServer = struct {
         self.drainObserveEvents(link);
         self.drainKills(link);
         self.drainWards(link);
+        self.drainMeshSearch(link);
         self.drainMemoPushes(link);
         self.drainMediaWsDatagrams(link);
         self.drainRepairResync(conn, link, true);
@@ -9785,6 +9818,7 @@ pub const LinuxServer = struct {
         self.drainObserveEvents(link);
         self.drainKills(link);
         self.drainWards(link);
+        self.drainMeshSearch(link);
         self.drainRepairResync(conn, link, false);
         if (!conn.s2s_burst_done and link.established()) {
             if (self.sendMeshStateBurstTo(conn)) {
@@ -24391,15 +24425,238 @@ pub const LinuxServer = struct {
         return search_cmd.handle(self, worldIdFromClient(id), conn, line);
     }
 
-    /// Remember a node this process can ask during SEARCH. A live mesh link
-    /// does not have the other daemon's address; tests and in-process pairs
-    /// attach the peer they can call. Asking yourself is a no-op.
+    /// Remember an in-process node SEARCH can call directly. A live Mooring
+    /// link is asked with SEARCH_QUERY instead. Asking yourself is a no-op.
     pub fn attachMeshSearchPeer(self: *LinuxServer, peer: *LinuxServer) !void {
         if (peer == self) return;
         for (self.mesh_search_peers.items) |existing| {
             if (existing == peer) return;
         }
         try self.mesh_search_peers.append(self.allocator, peer);
+    }
+
+    /// Borrow a peer whose SEARCH frames travel through `sink`. The same send
+    /// path `handleSearch` uses for this list also scans live secured links.
+    pub fn noteMeshSearchLink(self: *LinuxServer, peer: *s2s_peer_mod.S2sPeer, sink: s2s_peer_mod.ByteSink) !void {
+        for (self.mesh_search_wires.items) |*existing| {
+            if (existing.peer == peer) {
+                existing.sink = sink;
+                return;
+            }
+        }
+        try self.mesh_search_wires.append(self.allocator, .{ .peer = peer, .sink = sink });
+    }
+
+    fn allocMeshSearchId(self: *LinuxServer) u32 {
+        var id = self.next_mesh_search_id +% 1;
+        if (id == 0) id = 1;
+        self.next_mesh_search_id = id;
+        return id;
+    }
+
+    fn destroyMeshSearchPending(self: *LinuxServer, pending: *PendingMeshSearch) void {
+        self.allocator.free(pending.target);
+        for (pending.sent_ids.items) |id| self.allocator.free(id);
+        pending.sent_ids.deinit(self.allocator);
+    }
+
+    fn deinitMeshSearchPending(self: *LinuxServer) void {
+        for (self.mesh_search_pending.items) |*pending| self.destroyMeshSearchPending(pending);
+        self.mesh_search_pending.deinit(self.allocator);
+    }
+
+    fn dropMeshSearchToken(self: *LinuxServer, token: RingFdToken) void {
+        var i: usize = 0;
+        while (i < self.mesh_search_pending.items.len) {
+            if (ringTokenEql(self.mesh_search_pending.items[i].token, token)) {
+                var old = self.mesh_search_pending.orderedRemove(i);
+                self.destroyMeshSearchPending(&old);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn rememberMeshSearch(
+        self: *LinuxServer,
+        id: u32,
+        conn: *ConnState,
+        target: []const u8,
+        already: []const lotus.Message,
+        expect: usize,
+    ) !void {
+        self.dropMeshSearchToken(conn.token);
+        while (self.mesh_search_pending.items.len >= mesh_search_pending_max) {
+            var old = self.mesh_search_pending.orderedRemove(0);
+            self.destroyMeshSearchPending(&old);
+        }
+        const target_copy = try self.allocator.dupe(u8, target);
+        errdefer self.allocator.free(target_copy);
+        var ids: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (ids.items) |item| self.allocator.free(item);
+            ids.deinit(self.allocator);
+        }
+        for (already) |message| {
+            const copy = try self.allocator.dupe(u8, message.msgid);
+            ids.append(self.allocator, copy) catch |err| {
+                self.allocator.free(copy);
+                return err;
+            };
+        }
+        try self.mesh_search_pending.append(self.allocator, .{
+            .id = id,
+            .token = conn.token,
+            .target = target_copy,
+            .sent_ids = ids,
+            .sent = already.len,
+            .expect = expect,
+        });
+    }
+
+    fn meshSearchSeen(pending: *const PendingMeshSearch, msgid: []const u8) bool {
+        for (pending.sent_ids.items) |id| {
+            if (std.mem.eql(u8, id, msgid)) return true;
+        }
+        return false;
+    }
+
+    /// Ask every negotiated mesh peer. Returns true when at least one query
+    /// was sent and the reply is still outstanding. Local hits already shown
+    /// to the client are remembered so a later reply cannot repeat them or
+    /// pass the hard cap.
+    pub fn dispatchMeshSearchQuery(
+        self: *LinuxServer,
+        conn: *ConnState,
+        target: []const u8,
+        words: []const []const u8,
+        already: []const lotus.Message,
+    ) bool {
+        if (!world_model.isChannelName(target) or words.len == 0) return false;
+        var qbuf: [1024]u8 = undefined;
+        const id = self.allocMeshSearchId();
+        const wire = mesh_search.encodeQuery(id, target, words, &qbuf) orelse return false;
+        var sent: usize = 0;
+        for (self.mesh_search_wires.items) |link| {
+            link.peer.sendSearchQuery(link.sink, wire) catch continue;
+            sent += 1;
+        }
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const secured = entry.value.s2s_secured orelse continue;
+                secured.sendSearchQuery(wire) catch continue;
+                sent += 1;
+            }
+        }
+        if (sent == 0) return false;
+        self.rememberMeshSearch(id, conn, target, already, sent) catch return false;
+        return true;
+    }
+
+    fn answerSearchPayload(self: *LinuxServer, payload: []const u8) ?[]u8 {
+        const query = mesh_search.decodeQuery(payload) orelse return null;
+        if (query.word_count == 0) return null;
+        var hits: [search_cmd.max_results]mesh_search.Borrowed = undefined;
+        const n = search_cmd.serve(self, query.target, query.words[0..query.word_count], &hits);
+        return mesh_search.encodeReply(self.allocator, query.id, hits[0..n], search_cmd.max_results) catch null;
+    }
+
+    fn deliverSearchPayload(self: *LinuxServer, payload: []const u8) void {
+        var decoded: [search_cmd.max_results]mesh_search.HitView = undefined;
+        const view = mesh_search.decodeReply(payload, &decoded) orelse return;
+        var index: ?usize = null;
+        for (self.mesh_search_pending.items, 0..) |pending, i| {
+            if (pending.id == view.id) {
+                index = i;
+                break;
+            }
+        }
+        const at = index orelse return;
+        const pending = &self.mesh_search_pending.items[at];
+        const conn = self.connForToken(pending.token) catch {
+            var old = self.mesh_search_pending.orderedRemove(at);
+            self.destroyMeshSearchPending(&old);
+            return;
+        };
+        const wid = worldIdFromClient(idFromToken(pending.token));
+        const can_see = self.world.isMember(pending.target, wid);
+        var batch: [search_cmd.max_results]lotus.Message = undefined;
+        var batch_len: usize = 0;
+        for (decoded[0..view.count]) |hit| {
+            if (pending.sent >= search_cmd.max_results or batch_len >= batch.len) break;
+            if (meshSearchSeen(pending, hit.msgid)) continue;
+            if (!mesh_search.keep(can_see, hit.text, hit.tags)) continue;
+            const message = lotus.Message{
+                .msgid = hit.msgid,
+                .sender = hit.sender,
+                .text = hit.text,
+                .timestamp = hit.timestamp,
+                .tombstone = false,
+                .command = "PRIVMSG",
+                .client_tags = hit.tags,
+            };
+            if (!historyMessageVisibleTo(&conn.session, message)) continue;
+            const copy = self.allocator.dupe(u8, hit.msgid) catch continue;
+            pending.sent_ids.append(self.allocator, copy) catch {
+                self.allocator.free(copy);
+                continue;
+            };
+            batch[batch_len] = message;
+            batch_len += 1;
+            pending.sent += 1;
+        }
+        if (batch_len != 0) {
+            const replay = self.renderHistoryReplayOwned(conn, "search", pending.target, batch[0..batch_len], null) catch null;
+            if (replay) |owned| {
+                defer self.allocator.free(owned);
+                LinuxServer.appendHistoryReplay(conn, owned) catch self.poisonOwnedDelivery(conn);
+            }
+        }
+        pending.got += 1;
+        if (pending.got >= pending.expect) {
+            var old = self.mesh_search_pending.orderedRemove(at);
+            self.destroyMeshSearchPending(&old);
+        }
+    }
+
+    /// Answer inbound queries and deliver inbound replies. `link` is the
+    /// secured link, the plaintext link, or the test peer bridge.
+    fn drainMeshSearch(self: *LinuxServer, link: anytype) void {
+        const queries = link.takeSearchQueries() catch return;
+        defer {
+            for (queries) |payload| self.allocator.free(payload);
+            if (queries.len != 0) self.allocator.free(queries);
+        }
+        for (queries) |payload| {
+            const reply = self.answerSearchPayload(payload) orelse continue;
+            defer self.allocator.free(reply);
+            link.sendSearchReply(reply) catch {};
+        }
+        const replies = link.takeSearchReplies() catch return;
+        defer {
+            for (replies) |payload| self.allocator.free(payload);
+            if (replies.len != 0) self.allocator.free(replies);
+        }
+        for (replies) |payload| self.deliverSearchPayload(payload);
+    }
+
+    fn drainMeshSearchPeer(self: *LinuxServer, peer: *s2s_peer_mod.S2sPeer, sink: s2s_peer_mod.ByteSink) void {
+        const SearchPeerBridge = struct {
+            peer: *s2s_peer_mod.S2sPeer,
+            sink: s2s_peer_mod.ByteSink,
+            fn takeSearchQueries(s: *@This()) ![][]u8 {
+                return s.peer.takeSearchQueries();
+            }
+            fn takeSearchReplies(s: *@This()) ![][]u8 {
+                return s.peer.takeSearchReplies();
+            }
+            fn sendSearchReply(s: *@This(), wire: []const u8) !void {
+                try s.peer.sendSearchReply(s.sink, wire);
+            }
+        };
+        var bridge = SearchPeerBridge{ .peer = peer, .sink = sink };
+        self.drainMeshSearch(&bridge);
     }
 
     /// `UNFURL ON|OFF|<https-url>`. The daemon flag defaults off. A client that
@@ -111533,6 +111790,161 @@ test "GAP-P5 merged search stays inside the hard cap" {
     try std.testing.expectEqual(@as(usize, 10), countSliceForTest(got, "fromlocal"));
     current_reactor = null;
     std.debug.print("GAP-P5 branch=local and peer hits share one hard cap and each hit stays authorized\n", .{});
+}
+
+test "GAP-P5 a mesh link returns an authorized hit from the other node" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "search.test" };
+    const asker = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(asker);
+    defer asker.deinit();
+    const remote = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(remote);
+    defer remote.deinit();
+
+    const alice_id = try addTestLocalClient(asker, "alice", "alice");
+    const alice = asker.connFor(alice_id).?;
+    alice.session.registration.registered = true;
+    alice.session.addCap(.search);
+    _ = try asker.world.join("#room", worldIdFromClient(alice_id));
+
+    remote.recordHistoryRelayAt("#room", "bob!bob@peer", "plain-1", "PRIVMSG", "meshonlyphrase", null, 1_700_000_000_000);
+    remote.recordHistoryRelayAt("#room", "bob!bob@peer", "cipher-1", "PRIVMSG", "ONYXROOM1 meshonlyphrase", null, 1_700_000_000_100);
+    try remote.search_index.index("cipher-1", "ONYXROOM1 meshonlyphrase");
+    remote.recordHistoryRelayAt("#hidden", "bob!bob@peer", "secret-1", "PRIVMSG", "secretleak", null, 1_700_000_000_200);
+
+    var now_ms: u64 = 10;
+    var asker_state = s2s_peer_mod.ChannelCrdt.init(alloc, 0x51);
+    defer asker_state.deinit();
+    var remote_state = s2s_peer_mod.ChannelCrdt.init(alloc, 0x52);
+    defer remote_state.deinit();
+    var to_remote = ServerPeerTestBuffer{};
+    defer to_remote.deinit();
+    var to_asker = ServerPeerTestBuffer{};
+    defer to_asker.deinit();
+
+    const asker_kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x51)));
+    const remote_kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x52)));
+    var asker_peer = try initServerTestPeer(&asker_state, &now_ms, asker_kp, message_relay.originShortId(remote_kp.public_key), 1000, "asker.test", false);
+    defer asker_peer.deinit();
+    var remote_peer = try initServerTestPeer(&remote_state, &now_ms, remote_kp, message_relay.originShortId(asker_kp.public_key), 2000, "remote.test", false);
+    defer remote_peer.deinit();
+    try asker.noteMeshSearchLink(&asker_peer, to_remote.sink());
+
+    alice.send_len = 0;
+    try asker.handleSearch(alice_id, alice, "SEARCH #room :meshonlyphrase");
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(alice.send_buf[0..alice.send_len], "meshonlyphrase"));
+    try std.testing.expect(!asker_peer.peer_supports_search);
+
+    try asker_peer.startHandshake(to_remote.sink());
+    try remote_peer.startHandshake(to_asker.sink());
+    try pumpServerTestPeers(&asker_peer, &remote_peer, &to_remote, &to_asker, now_ms, 0x5EED);
+    try std.testing.expect(asker_peer.peer_supports_search);
+    try std.testing.expect(remote_peer.peer_supports_search);
+    try std.testing.expectEqual(@as(usize, 0), asker_peer.search_queries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), remote_peer.search_queries.items.len);
+
+    alice.last_search_ms = 0;
+    alice.send_len = 0;
+    try asker.handleSearch(alice_id, alice, "SEARCH #room :meshonlyphrase");
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(alice.send_buf[0..alice.send_len], "meshonlyphrase"));
+    try pumpServerTestPeers(&asker_peer, &remote_peer, &to_remote, &to_asker, now_ms, 0x5EEE);
+    try std.testing.expectEqual(@as(usize, 1), remote_peer.search_queries.items.len);
+    remote.drainMeshSearchPeer(&remote_peer, to_asker.sink());
+    try pumpServerTestPeers(&asker_peer, &remote_peer, &to_remote, &to_asker, now_ms, 0x5EEF);
+    asker.drainMeshSearchPeer(&asker_peer, to_remote.sink());
+    const got = alice.send_buf[0..alice.send_len];
+    try std.testing.expectEqual(@as(usize, 1), countSliceForTest(got, "meshonlyphrase"));
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(got, "ONYXROOM1"));
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(got, "secretleak"));
+
+    alice.last_search_ms = 0;
+    alice.send_len = 0;
+    try asker.handleSearch(alice_id, alice, "SEARCH #hidden :secretleak");
+    const denied = alice.send_buf[0..alice.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, denied, "INVALID_TARGET") != null);
+    try std.testing.expectEqual(@as(usize, 0), countSliceForTest(denied, "secretleak"));
+    current_reactor = null;
+    std.debug.print("GAP-P5 branch=mesh link returns one authorized hit and skips ciphertext\n", .{});
+}
+
+test "GAP-P5 a mesh link keeps the hard cap across both nodes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "search.test" };
+    const asker = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(asker);
+    defer asker.deinit();
+    const remote = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(remote);
+    defer remote.deinit();
+
+    const alice_id = try addTestLocalClient(asker, "alice", "alice");
+    const alice = asker.connFor(alice_id).?;
+    alice.session.registration.registered = true;
+    alice.session.addCap(.search);
+    _ = try asker.world.join("#room", worldIdFromClient(alice_id));
+
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        var id_buf: [16]u8 = undefined;
+        var text_buf: [64]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "L{d}", .{i}) catch return error.TestUnexpectedResult;
+        const text = std.fmt.bufPrint(&text_buf, "capword fromlocal {d}", .{i}) catch return error.TestUnexpectedResult;
+        asker.recordHistoryRelayAt("#room", "alice!alice@asker", id, "PRIVMSG", text, null, 1_700_000_000_000 + i);
+        const peer_id = std.fmt.bufPrint(&id_buf, "R{d}", .{i}) catch return error.TestUnexpectedResult;
+        const peer_text = std.fmt.bufPrint(&text_buf, "capword frompeer {d}", .{i}) catch return error.TestUnexpectedResult;
+        remote.recordHistoryRelayAt("#room", "bob!bob@peer", peer_id, "PRIVMSG", peer_text, null, 1_700_000_100_000 + i);
+    }
+
+    var now_ms: u64 = 20;
+    var asker_state = s2s_peer_mod.ChannelCrdt.init(alloc, 0x61);
+    defer asker_state.deinit();
+    var remote_state = s2s_peer_mod.ChannelCrdt.init(alloc, 0x62);
+    defer remote_state.deinit();
+    var to_remote = ServerPeerTestBuffer{};
+    defer to_remote.deinit();
+    var to_asker = ServerPeerTestBuffer{};
+    defer to_asker.deinit();
+    const asker_kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x61)));
+    const remote_kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x62)));
+    var asker_peer = try initServerTestPeer(&asker_state, &now_ms, asker_kp, message_relay.originShortId(remote_kp.public_key), 3000, "asker-cap.test", false);
+    defer asker_peer.deinit();
+    var remote_peer = try initServerTestPeer(&remote_state, &now_ms, remote_kp, message_relay.originShortId(asker_kp.public_key), 4000, "remote-cap.test", false);
+    defer remote_peer.deinit();
+    try asker_peer.startHandshake(to_remote.sink());
+    try remote_peer.startHandshake(to_asker.sink());
+    try pumpServerTestPeers(&asker_peer, &remote_peer, &to_remote, &to_asker, now_ms, 0xCA90);
+    try std.testing.expect(asker_peer.supportsMeshSearch());
+    try asker.noteMeshSearchLink(&asker_peer, to_remote.sink());
+
+    alice.send_len = 0;
+    try asker.handleSearch(alice_id, alice, "SEARCH #room :capword");
+    try pumpServerTestPeers(&asker_peer, &remote_peer, &to_remote, &to_asker, now_ms, 0xCA91);
+    remote.drainMeshSearchPeer(&remote_peer, to_asker.sink());
+    try pumpServerTestPeers(&asker_peer, &remote_peer, &to_remote, &to_asker, now_ms, 0xCA92);
+    asker.drainMeshSearchPeer(&asker_peer, to_remote.sink());
+    const got = alice.send_buf[0..alice.send_len];
+    try std.testing.expectEqual(@as(usize, 50), countSliceForTest(got, "capword"));
+    try std.testing.expectEqual(@as(usize, 40), countSliceForTest(got, "fromlocal"));
+    try std.testing.expectEqual(@as(usize, 10), countSliceForTest(got, "frompeer"));
+    current_reactor = null;
+    std.debug.print("GAP-P5 branch=mesh link local batch plus peer hits stay inside the hard cap\n", .{});
 }
 
 var gap_p6_fetches: usize = 0;

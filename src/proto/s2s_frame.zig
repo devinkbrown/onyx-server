@@ -155,6 +155,13 @@ pub const FrameType = enum(u8) {
     /// snapshot. A receiver may repair rows omitted since the preceding marker;
     /// without this proof, elapsed wall time alone never authorizes roster loss.
     MEMBERSHIP_SYNC = 0x28,
+    /// Signed history search request. Negotiated by a PING extension because the
+    /// handshake capability byte is full. The body is a target and query words,
+    /// never the asker's account.
+    SEARCH_QUERY = 0x29,
+    /// Signed history search reply. Each hit is authorized again by the asker.
+    /// Ciphertext stays in the body so the asker can drop it.
+    SEARCH_REPLY = 0x2A,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -202,6 +209,8 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.E2EE_GROUP) => .E2EE_GROUP,
             @intFromEnum(FrameType.E2EE_GROUP_ACK) => .E2EE_GROUP_ACK,
             @intFromEnum(FrameType.MEMBERSHIP_SYNC) => .MEMBERSHIP_SYNC,
+            @intFromEnum(FrameType.SEARCH_QUERY) => .SEARCH_QUERY,
+            @intFromEnum(FrameType.SEARCH_REPLY) => .SEARCH_REPLY,
             else => null,
         };
     }
@@ -403,6 +412,8 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .E2EE_GROUP, .token = "E2EE_GROUP", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured opaque E2EEGROUP control with immutable origin signature and RelayId." },
     .{ .frame_type = .E2EE_GROUP_ACK, .token = "E2EE_GROUP_ACK", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured immediate-hop receipt for an admitted E2EEGROUP RelayId." },
     .{ .frame_type = .MEMBERSHIP_SYNC, .token = "MEMBERSHIP_SYNC", .family = .membership, .auth = .signable, .summary = "Authenticated completion marker for a full peer membership snapshot." },
+    .{ .frame_type = .SEARCH_QUERY, .token = "SEARCH_QUERY", .family = .relay, .auth = .signed, .summary = "Signed history search request for one target. Gated by a PING extension, not a new handshake bit." },
+    .{ .frame_type = .SEARCH_REPLY, .token = "SEARCH_REPLY", .family = .relay, .auth = .signed, .summary = "Signed history search hits. The asker authorizes each hit and drops ciphertext." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {

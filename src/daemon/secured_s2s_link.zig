@@ -1198,6 +1198,33 @@ pub const SecuredLink = struct {
         return link.takeWards();
     }
 
+    pub fn supportsMeshSearch(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsMeshSearch();
+    }
+
+    pub fn sendSearchQuery(self: *SecuredLink, wire: []const u8) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendSearchQuery(wire);
+        try self.drainInner();
+    }
+
+    pub fn sendSearchReply(self: *SecuredLink, wire: []const u8) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendSearchReply(wire);
+        try self.drainInner();
+    }
+
+    pub fn takeSearchQueries(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeSearchQueries();
+    }
+
+    pub fn takeSearchReplies(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeSearchReplies();
+    }
+
     /// Emit a signed Web Push hint for an offline memo/DM over the encrypted
     /// S2S leg. The inner peer requires frame signing, so old/non-signing peers
     /// silently get no hint.
