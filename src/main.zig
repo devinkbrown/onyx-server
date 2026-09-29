@@ -107,14 +107,6 @@ fn svcDropChannel(ctx: *anyopaque, channel: []const u8) onyx_server.daemon.servi
 }
 
 pub fn main(init: std.process.Init) !void {
-    std.debug.print(
-        \\
-        \\  Onyx Server {s}
-        \\  Zig-native mesh IRC daemon — Undertow + Mooring mesh
-        \\
-        \\
-    , .{onyx_server.version_full});
-
     const allocator = init.gpa;
 
     // Resolver context for `env:`/`@file:` config indirection. Lives on `main`'s
@@ -147,7 +139,17 @@ pub fn main(init: std.process.Init) !void {
     // what actually boots across a hot upgrade.
     if (args.next()) |exe| srv_cfg.exe_path = exe;
     var config_path_arg: ?[]const u8 = null;
-    if (args.next()) |first| {
+    const first_arg = args.next();
+    if (first_arg == null or !std.mem.eql(u8, first_arg.?, "doctor")) {
+        std.debug.print(
+            \\
+            \\  Onyx Server {s}
+            \\  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+            \\
+            \\
+        , .{onyx_server.version_full});
+    }
+    if (first_arg) |first| {
         // Private, side-effect-free Helix compatibility handshake. The running
         // predecessor executes the exact already-open target image with this
         // flag and refuses a hot handoff unless the complete token matches.
@@ -207,6 +209,38 @@ pub fn main(init: std.process.Init) !void {
             // so it boots with the SAME config (ports/certs/opers/cloak) as the
             // predecessor — not the built-in defaults.
             config_path_arg = args.next();
+        } else
+        // GAP-O4 read-only doctor exits before daemon setup or any listener bind.
+        if (std.mem.eql(u8, first, "doctor")) {
+            const path = args.next() orelse {
+                std.debug.print("usage: onyx-server doctor <config> [metrics-url]\n", .{});
+                std.process.exit(2);
+            };
+            const metrics_url = args.next();
+            if (args.next() != null) {
+                std.debug.print("usage: onyx-server doctor <config> [metrics-url]\n", .{});
+                std.process.exit(2);
+            }
+            const resolver = onyx_server.daemon.config_format.Resolver{
+                .ctx = @ptrCast(&resolver_ctx),
+                .env = envLookup,
+                .file = fileLookup,
+            };
+            const config_text = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20)) catch |err| {
+                std.debug.print("doctor: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+                std.process.exit(1);
+            };
+            defer allocator.free(config_text);
+            var loaded = onyx_server.daemon.config_boot.loadFromText(allocator, config_text, srv_cfg, resolver) catch |err| {
+                std.debug.print("doctor: cannot load {s}: {s}\n", .{ path, @errorName(err) });
+                std.process.exit(1);
+            };
+            defer loaded.deinit(allocator);
+            const result = try onyx_server.daemon.doctor.report(allocator, init.io, &loaded, metrics_url, null, onyx_server.daemon.doctor.fetchMetrics);
+            defer result.deinit(allocator);
+            std.debug.print("{s}", .{result.lines});
+            if (result.failed) std.process.exit(1);
+            return;
         } else
         // `onyx-server --check-config <path>` parses a config and reports OK/ERROR
         // WITHOUT booting (no ports bound, no mesh dialed) — safe pre-deploy
@@ -378,6 +412,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print(
                 \\usage: onyx-server [CONFIG_PATH]
                 \\       onyx-server --check-config <path>
+                \\       onyx-server doctor <config> [metrics-url]
                 \\       onyx-server --version
                 \\       onyx-server acme-issue ...
                 \\       onyx-server delegated-credential inspect|validate ...
