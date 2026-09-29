@@ -3480,6 +3480,44 @@ fn twoPersonIdentity(conn: *const ConnState) []const u8 {
     return conn.session.displayName();
 }
 
+const PolicyKind = enum { ward, filter, class, ban };
+
+const PolicyBanRow = struct {
+    channel: []u8,
+    mask: []u8,
+    setter: []u8,
+    set_at: i64,
+};
+
+/// One undo step. `generation` is the number that was live before the change.
+const PolicyUndo = union(PolicyKind) {
+    ward: struct {
+        generation: u32,
+        wards: std.ArrayListUnmanaged(warden.Ward),
+    },
+    filter: struct {
+        generation: u32,
+        patterns: [][]u8,
+    },
+    class: struct {
+        generation: u32,
+        registry: ?conn_class.Registry,
+    },
+    ban: struct {
+        generation: u32,
+        rows: []PolicyBanRow,
+    },
+
+    fn generation(self: PolicyUndo) u32 {
+        return switch (self) {
+            .ward => |s| s.generation,
+            .filter => |s| s.generation,
+            .class => |s| s.generation,
+            .ban => |s| s.generation,
+        };
+    }
+};
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -3785,6 +3823,17 @@ pub const LinuxServer = struct {
     /// First approval waiting for a second distinct oper. Empty unless
     /// `config.two_person_rule` is on and a gated command is in its window.
     two_person_pending: ?TwoPersonPending = null,
+    /// Live generation of each policy table. Boot is 1, matching the historical
+    /// ProofMark constant, and each committed change increments its own counter.
+    policy_gen_ward: u32 = 1,
+    policy_gen_filter: u32 = 1,
+    policy_gen_class: u32 = 1,
+    policy_gen_ban: u32 = 1,
+    /// Stamped into the next ProofMark. A mutation sets it to the generation
+    /// that just became live; rollback sets it to the restored generation.
+    proof_policy_version: u32 = 1,
+    /// The previous generation of the most recent policy change, if any.
+    policy_undo: ?PolicyUndo = null,
     /// Operator-designated spam-trap (honeypot) registry: nicks/channels a
     /// legitimate user has no reason to contact. A non-oper that touches one
     /// trips the trap (oper alert + offender flagging). Server-wide, so it is
@@ -5739,6 +5788,8 @@ pub const LinuxServer = struct {
         self.event_spine_replay_guard.deinit();
         self.chanstats.deinit();
         if (self.mesh_ban_filter) |*filter| filter.deinit();
+        if (self.policy_undo) |*undo| self.destroyPolicyUndo(undo);
+        self.policy_undo = null;
         self.warden.deinit();
         self.spamtrap.deinit();
         self.raid_shield.deinit();
@@ -19937,6 +19988,8 @@ pub const LinuxServer = struct {
                     }
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
+                    var policy_snap: ?PolicyUndo = self.snapshotBan() catch null;
+                    defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
                     const changed = if (adding)
                         (self.world.addBan(channel, mask, list_setter, list_set_at) catch |e| {
                             try self.maybeListFull(conn, channel, mask, e);
@@ -19945,6 +19998,11 @@ pub const LinuxServer = struct {
                     else
                         (self.world.removeBan(channel, mask) catch continue);
                     if (changed) {
+                        if (policy_snap) |snap| {
+                            self.commitPolicy(snap);
+                            policy_snap = null;
+                        }
+                        _ = self.recordOperAudit(list_setter, .other, mask, "ban change");
                         const sign: u8 = if (adding) '+' else '-';
                         appendParamMode(&applied, &targets, &emitted_sign, sign, 'b', mask);
                         self.announceChannelList(channel, .ban, mask, list_setter, list_set_at, adding);
@@ -24920,6 +24978,8 @@ pub const LinuxServer = struct {
                 .proceed, .confirmed => {},
             }
         }
+        var policy_snap: ?PolicyUndo = self.snapshotWard() catch null;
+        defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
         const now = platform.realtimeMillis();
         const ward = warden.Ward{
             .match = match,
@@ -24935,6 +24995,10 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "WARD: could not add ward (limit or invalid input)");
             return;
         };
+        if (policy_snap) |snap| {
+            self.commitPolicy(snap);
+            policy_snap = null;
+        }
         self.persistWardMirror(conn, ward);
         // A `mesh`-scope ward propagates to every secured peer so already-running
         // nodes enforce it live. A `node`-scope ward stays local.
@@ -24963,8 +25027,17 @@ pub const LinuxServer = struct {
                 .proceed, .confirmed => {},
             }
         }
+        var policy_snap: ?PolicyUndo = if (was_mesh or self.warden.find(match, pattern) != null)
+            self.snapshotWard() catch null
+        else
+            null;
+        defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
         const removed = self.warden.remove(match, pattern);
         if (removed) {
+            if (policy_snap) |snap| {
+                self.commitPolicy(snap);
+                policy_snap = null;
+            }
             self.deleteWardMirror(match, pattern);
             if (was_mesh) {
                 // Propagate the removal so peers forget the network ban too. Only
@@ -48179,6 +48252,217 @@ pub const LinuxServer = struct {
         try self.sendMediaEventReply(conn, "ROSTER-END", channel, end);
     }
 
+    fn destroyPolicyUndo(self: *LinuxServer, undo: *PolicyUndo) void {
+        switch (undo.*) {
+            .ward => |*snap| warden.deinitWardList(self.allocator, &snap.wards),
+            .filter => |snap| {
+                for (snap.patterns) |p| self.allocator.free(p);
+                self.allocator.free(snap.patterns);
+            },
+            .class => |*snap| {
+                if (snap.registry) |*reg| reg.deinit();
+                snap.registry = null;
+            },
+            .ban => |snap| {
+                for (snap.rows) |*row| {
+                    self.allocator.free(row.channel);
+                    self.allocator.free(row.mask);
+                    self.allocator.free(row.setter);
+                }
+                self.allocator.free(snap.rows);
+            },
+        }
+    }
+
+    fn commitPolicy(self: *LinuxServer, undo: PolicyUndo) void {
+        if (self.policy_undo) |*old| self.destroyPolicyUndo(old);
+        const kind = std.meta.activeTag(undo);
+        self.policy_undo = undo;
+        const slot: *u32 = switch (kind) {
+            .ward => &self.policy_gen_ward,
+            .filter => &self.policy_gen_filter,
+            .class => &self.policy_gen_class,
+            .ban => &self.policy_gen_ban,
+        };
+        if (slot.* != std.math.maxInt(u32)) slot.* += 1;
+        self.proof_policy_version = slot.*;
+    }
+
+    fn snapshotWard(self: *LinuxServer) !PolicyUndo {
+        return .{ .ward = .{
+            .generation = self.policy_gen_ward,
+            .wards = try self.warden.clonedWards(),
+        } };
+    }
+
+    fn snapshotFilter(self: *LinuxServer) !PolicyUndo {
+        return .{ .filter = .{
+            .generation = self.policy_gen_filter,
+            .patterns = try self.content_filter.clonedPatterns(),
+        } };
+    }
+
+    fn snapshotClass(self: *LinuxServer) !PolicyUndo {
+        const registry = if (self.config.class_registry) |*reg| try reg.clone() else null;
+        return .{ .class = .{
+            .generation = self.policy_gen_class,
+            .registry = registry,
+        } };
+    }
+
+    fn snapshotBan(self: *LinuxServer) !PolicyUndo {
+        var rows: std.ArrayListUnmanaged(PolicyBanRow) = .empty;
+        errdefer {
+            for (rows.items) |*row| {
+                self.allocator.free(row.channel);
+                self.allocator.free(row.mask);
+                self.allocator.free(row.setter);
+            }
+            rows.deinit(self.allocator);
+        }
+        var it = self.world.channelIterator();
+        while (it.next()) |view| {
+            const bans = self.world.bansOf(view.name) orelse continue;
+            for (bans) |ban| {
+                const channel = try self.allocator.dupe(u8, view.name);
+                errdefer self.allocator.free(channel);
+                const mask = try self.allocator.dupe(u8, ban.mask);
+                errdefer self.allocator.free(mask);
+                const setter = try self.allocator.dupe(u8, ban.setter);
+                try rows.append(self.allocator, .{
+                    .channel = channel,
+                    .mask = mask,
+                    .setter = setter,
+                    .set_at = ban.set_at,
+                });
+            }
+        }
+        return .{ .ban = .{
+            .generation = self.policy_gen_ban,
+            .rows = try rows.toOwnedSlice(self.allocator),
+        } };
+    }
+
+    fn restorePolicy(self: *LinuxServer, undo: *PolicyUndo) !void {
+        switch (undo.*) {
+            .ward => |*snap| self.warden.exchangeWards(&snap.wards),
+            .filter => |snap| try self.content_filter.restorePatterns(snap.patterns),
+            .class => |*snap| {
+                if (self.reload_class_registry) |*old| old.deinit();
+                if (snap.registry) |reg| {
+                    self.reload_class_registry = reg;
+                    self.config.class_registry = reg;
+                    snap.registry = null;
+                } else {
+                    self.reload_class_registry = null;
+                    self.config.class_registry = null;
+                }
+            },
+            .ban => |snap| {
+                var names: std.ArrayListUnmanaged([]u8) = .empty;
+                defer {
+                    for (names.items) |name| self.allocator.free(name);
+                    names.deinit(self.allocator);
+                }
+                var it = self.world.channelIterator();
+                while (it.next()) |view| {
+                    const owned = try self.allocator.dupe(u8, view.name);
+                    try names.append(self.allocator, owned);
+                }
+                for (names.items) |name| {
+                    const bans = self.world.bansOf(name) orelse continue;
+                    var masks: std.ArrayListUnmanaged([]u8) = .empty;
+                    defer {
+                        for (masks.items) |mask| self.allocator.free(mask);
+                        masks.deinit(self.allocator);
+                    }
+                    for (bans) |ban| try masks.append(self.allocator, try self.allocator.dupe(u8, ban.mask));
+                    for (masks.items) |mask| _ = self.world.removeBan(name, mask) catch {};
+                }
+                for (snap.rows) |row| {
+                    _ = self.world.addBan(row.channel, row.mask, row.setter, row.set_at) catch {};
+                }
+            },
+        }
+    }
+
+    fn rollbackPolicy(self: *LinuxServer) !void {
+        if (self.policy_undo == null) return error.NothingToRollback;
+        const kind = std.meta.activeTag(self.policy_undo.?);
+        const generation = self.policy_undo.?.generation();
+        try self.restorePolicy(&self.policy_undo.?);
+        switch (kind) {
+            .ward => self.policy_gen_ward = generation,
+            .filter => self.policy_gen_filter = generation,
+            .class => self.policy_gen_class = generation,
+            .ban => self.policy_gen_ban = generation,
+        }
+        self.proof_policy_version = generation;
+        self.destroyPolicyUndo(&self.policy_undo.?);
+        self.policy_undo = null;
+    }
+
+    /// Install a finished connection-class table and number that generation.
+    /// The server takes ownership of `new_reg`. REHASH uses this path.
+    fn installClassRegistry(self: *LinuxServer, new_reg: conn_class.Registry) void {
+        var policy_snap: ?PolicyUndo = self.snapshotClass() catch null;
+        defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
+        if (self.reload_class_registry) |*old| old.deinit();
+        self.reload_class_registry = new_reg;
+        self.config.class_registry = new_reg;
+        if (policy_snap) |snap| {
+            self.commitPolicy(snap);
+            policy_snap = null;
+            _ = self.recordOperAudit(self.serverName(), .other, "class", "class replace");
+        }
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const conn = &slot.value;
+                if (conn.s2s == null and conn.s2s_secured == null) continue;
+                self.assignConnClass(conn);
+            }
+        }
+    }
+
+    /// `POLICY` lists ward, filter, class, and ban generations.
+    /// `POLICY ROLLBACK` restores the last of those changes. The ProofMark
+    /// version is the generation that is live after the command.
+    pub fn handlePolicy(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        const sub = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "LIST";
+        if (std.ascii.eqlIgnoreCase(sub, "ROLLBACK")) {
+            if (self.policy_undo == null) {
+                try self.noticeTo(conn, "POLICY: nothing to roll back");
+                return;
+            }
+            const kind = std.meta.activeTag(self.policy_undo.?);
+            self.rollbackPolicy() catch {
+                try self.noticeTo(conn, "POLICY: rollback failed");
+                return;
+            };
+            _ = self.recordOperAudit(conn.session.displayName(), .other, @tagName(kind), "policy rollback");
+            var buf: [default_reply_bytes]u8 = undefined;
+            const note = std.fmt.bufPrint(&buf, "POLICY: rolled {s} back to generation {d}", .{
+                @tagName(kind),
+                self.proof_policy_version,
+            }) catch "POLICY: rolled back";
+            try self.noticeTo(conn, note);
+            return;
+        }
+        var buf: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&buf, "POLICY: ward={d} filter={d} class={d} ban={d}", .{
+            self.policy_gen_ward,
+            self.policy_gen_filter,
+            self.policy_gen_class,
+            self.policy_gen_ban,
+        }) catch return;
+        try self.noticeTo(conn, note);
+    }
+
     /// `FILTER ADD|DEL|LIST [pattern]` — oper-only Koshi content-filter control.
     /// ADD/DEL manage case-insensitive substring patterns; LIST reports them.
     /// Matching messages from non-opers are blocked in the message path.
@@ -48205,6 +48489,8 @@ pub const LinuxServer = struct {
         }
         const pattern = parsed.paramSlice()[1];
         if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
+            var policy_snap: ?PolicyUndo = self.snapshotFilter() catch null;
+            defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
             const ok = self.content_filter.add(pattern) catch {
                 try self.failReply(conn, "FILTER", "TEMPORARILY_UNAVAILABLE", "Filter store error");
                 return;
@@ -48213,14 +48499,26 @@ pub const LinuxServer = struct {
                 try self.failReply(conn, "FILTER", "INVALID_PATTERN", "Pattern empty, too long, full, or duplicate");
                 return;
             }
+            if (policy_snap) |snap| {
+                self.commitPolicy(snap);
+                policy_snap = null;
+            }
+            _ = self.recordOperAudit(conn.session.displayName(), .other, pattern, "filter add");
             self.snapshotKoshi();
             try self.noticeTo(conn, "FILTER: pattern added");
         } else if (std.ascii.eqlIgnoreCase(sub, "DEL")) {
+            var policy_snap: ?PolicyUndo = self.snapshotFilter() catch null;
+            defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
             const removed = self.content_filter.remove(pattern) catch false;
             if (!removed) {
                 try self.failReply(conn, "FILTER", "NO_SUCH_PATTERN", "No such filter pattern");
                 return;
             }
+            if (policy_snap) |snap| {
+                self.commitPolicy(snap);
+                policy_snap = null;
+            }
+            _ = self.recordOperAudit(conn.session.displayName(), .other, pattern, "filter del");
             self.snapshotKoshi();
             try self.noticeTo(conn, "FILTER: pattern removed");
         } else {
@@ -48673,7 +48971,7 @@ pub const LinuxServer = struct {
             .target = target,
             .action = action.proofCode(),
             .reason_hash = reason_hash,
-            .policy_version = 1,
+            .policy_version = self.proof_policy_version,
             .issued_ms = ts,
             .expiry_ms = std.math.maxInt(i64),
         };
@@ -49835,21 +50133,7 @@ pub const LinuxServer = struct {
         }
         if (ok) {
             if (cb.finish()) |new_reg| {
-                if (self.reload_class_registry) |*old| old.deinit();
-                self.reload_class_registry = new_reg;
-                self.config.class_registry = new_reg;
-                // Existing mesh links do not pass registration again. Retune
-                // them immediately so a hot-reloaded `server` class takes
-                // effect, while `assignConnClass` preserves the one-max-record
-                // floor required for SESSION_REPLICA progress.
-                for (self.reactors) |*reactor| {
-                    for (reactor.clients.slots.items) |*slot| {
-                        if (!slot.occupied) continue;
-                        const conn = &slot.value;
-                        if (conn.s2s == null and conn.s2s_secured == null) continue;
-                        self.assignConnClass(conn);
-                    }
-                }
+                self.installClassRegistry(new_reg);
             } else |_| {
                 cb.deinit();
             }
@@ -107509,6 +107793,108 @@ test "GAP-O9 DIE, RESTART, and mesh bans wait for a second operator" {
     try std.testing.expectEqual(@as(usize, 1), AuditScan.count(&server.oper_audit, .ward_del, "removed"));
 
     std.debug.print("GAP-O9 branch=two-person rule waits for a second distinct operator; flag off is unchanged\n", .{});
+}
+
+test "GAP-O10 policy rollback restores the last ward, filter, class, and ban generation" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x51)), "policy-rollback.test");
+    defer ident.deinit();
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "policy.test",
+        .node_identity = &ident,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        current_reactor = null;
+        server.deinit();
+    }
+    current_reactor = &server.reactors[0];
+
+    const id = try addTestLocalClient(&server, "op1", null);
+    const conn = server.connFor(id).?;
+    conn.session.is_oper = true;
+    conn.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{ .client_moderate, .server_admin });
+
+    const expectProof = struct {
+        fn check(audit: *const svc_operaudit.OperAudit, action: svc_operaudit.Action, reason: []const u8, version: u32) !void {
+            var i = audit.len();
+            while (i > 0) {
+                i -= 1;
+                const row = audit.at(i).?;
+                if (row.action == action and std.mem.eql(u8, row.reason, reason)) {
+                    try std.testing.expectEqual(version, row.proof_policy_version);
+                    try std.testing.expect(LinuxServer.auditProofVerified(row));
+                    return;
+                }
+            }
+            return error.TestUnexpectedResult;
+        }
+    }.check;
+
+    try std.testing.expectEqual(@as(u32, 1), server.policy_gen_ward);
+    try std.testing.expectEqual(@as(u32, 1), server.policy_gen_filter);
+    try std.testing.expectEqual(@as(u32, 1), server.policy_gen_class);
+    try std.testing.expectEqual(@as(u32, 1), server.policy_gen_ban);
+
+    try server.addWardLive(conn, .host, "evil.example", .node, .expel, 0, "policy-ward", .ward_add);
+    try std.testing.expect(server.warden.find(.host, "evil.example") != null);
+    try std.testing.expectEqual(@as(u32, 2), server.policy_gen_ward);
+    try expectProof(&server.oper_audit, .ward_add, "policy-ward", 2);
+
+    var rollback = try irc_line.parseLine("POLICY ROLLBACK");
+    try server.handlePolicy(conn, &rollback);
+    try std.testing.expect(server.warden.find(.host, "evil.example") == null);
+    try std.testing.expectEqual(@as(u32, 1), server.policy_gen_ward);
+    try expectProof(&server.oper_audit, .other, "policy rollback", 1);
+
+    conn.send_len = 0;
+    try server.handlePolicy(conn, &rollback);
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], "nothing to roll back") != null);
+    try std.testing.expectEqual(@as(u32, 1), server.policy_gen_ward);
+
+    var filter_add = try irc_line.parseLine("FILTER ADD spamword");
+    try server.handleFilter(conn, &filter_add);
+    try std.testing.expect(server.content_filter.matches("buy spamword now"));
+    try std.testing.expectEqual(@as(u32, 2), server.policy_gen_filter);
+    try expectProof(&server.oper_audit, .other, "filter add", 2);
+    try server.handlePolicy(conn, &rollback);
+    try std.testing.expect(!server.content_filter.matches("buy spamword now"));
+    try std.testing.expectEqual(@as(u32, 1), server.policy_gen_filter);
+    try expectProof(&server.oper_audit, .other, "policy rollback", 1);
+
+    var builder = conn_class.Builder.init(allocator);
+    defer builder.deinit();
+    try builder.add(.{ .name = "vip", .policy = .{ .max_per_account = 9 } });
+    server.installClassRegistry(try builder.finish());
+    try std.testing.expectEqual(@as(u32, 9), server.config.class_registry.?.byName("vip").?.policy.max_per_account);
+    try std.testing.expectEqual(@as(u32, 2), server.policy_gen_class);
+    try expectProof(&server.oper_audit, .other, "class replace", 2);
+    try server.handlePolicy(conn, &rollback);
+    try std.testing.expect(server.config.class_registry == null);
+    try std.testing.expectEqual(@as(u32, 1), server.policy_gen_class);
+
+    _ = try server.world.join("#pol", worldIdFromClient(id));
+    var mode = try irc_line.parseLine("MODE #pol +b *!*@banned.example");
+    try server.handleMode(id, conn, &mode);
+    const bans = server.world.bansOf("#pol") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), bans.len);
+    try std.testing.expectEqualStrings("*!*@banned.example", bans[0].mask);
+    try std.testing.expectEqual(@as(u32, 2), server.policy_gen_ban);
+    try expectProof(&server.oper_audit, .other, "ban change", 2);
+    try server.handlePolicy(conn, &rollback);
+    const after = server.world.bansOf("#pol") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+    try std.testing.expectEqual(@as(u32, 1), server.policy_gen_ban);
+    try expectProof(&server.oper_audit, .other, "policy rollback", 1);
+
+    std.debug.print("GAP-O10 branch=policy rollback restores the last numbered generation and the proof version matches it\n", .{});
 }
 
 test {

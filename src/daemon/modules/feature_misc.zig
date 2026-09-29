@@ -20,6 +20,10 @@ fn filter(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleFilter(x.conn, x.parsed);
 }
+fn policyCmd(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handlePolicy(x.conn, x.parsed);
+}
 fn media(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMedia(x.id, x.conn, x.parsed);
@@ -57,6 +61,7 @@ pub const module = registry.Module{
         .{ .name = "VHOST", .handler = vhost },
         .{ .name = "PRIVS", .handler = privs },
         .{ .name = "FILTER", .handler = filter },
+        .{ .name = "POLICY", .handler = policyCmd, .summary = "List or roll back ward, filter, class, and ban generations" },
         .{ .name = "MEDIA", .feature = "media", .handler = media },
         .{ .name = "MEMO", .handler = memoCmd },
         .{ .name = "WEBPUSH", .handler = webpushCmd, .summary = "Browser push subscriptions (VAPID/SUBSCRIBE/UNSUBSCRIBE/LIST)" },

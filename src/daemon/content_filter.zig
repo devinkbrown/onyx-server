@@ -88,6 +88,46 @@ pub const ContentFilter = struct {
         return self.patterns.items;
     }
 
+    /// Owned copy of the pattern list. The caller frees each string and the slice.
+    pub fn clonedPatterns(self: *const ContentFilter) Error![][]u8 {
+        const out = try self.allocator.alloc([]u8, self.patterns.items.len);
+        var n: usize = 0;
+        errdefer {
+            for (out[0..n]) |p| self.allocator.free(p);
+            self.allocator.free(out);
+        }
+        for (self.patterns.items) |p| {
+            out[n] = try self.allocator.dupe(u8, p);
+            n += 1;
+        }
+        return out;
+    }
+
+    /// Replace the pattern set. The previous set stays in place if allocation fails.
+    pub fn restorePatterns(self: *ContentFilter, patterns: []const []const u8) Error!void {
+        var next: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (next.items) |p| self.allocator.free(p);
+            next.deinit(self.allocator);
+        }
+        for (patterns) |p| {
+            const owned = try self.allocator.dupe(u8, p);
+            errdefer self.allocator.free(owned);
+            try next.append(self.allocator, owned);
+        }
+        var built: ?aho.AhoCorasick = null;
+        errdefer if (built) |*a| a.deinit();
+        if (next.items.len != 0) {
+            built = try aho.AhoCorasick.build(self.allocator, next.items, .{ .case_insensitive = true });
+        }
+        if (self.automaton) |*a| a.deinit();
+        self.automaton = built;
+        built = null;
+        for (self.patterns.items) |p| self.allocator.free(p);
+        self.patterns.deinit(self.allocator);
+        self.patterns = next;
+    }
+
     /// Whether `text` contains any filtered pattern.
     pub fn matches(self: *const ContentFilter, text: []const u8) bool {
         const a = self.automaton orelse return false;

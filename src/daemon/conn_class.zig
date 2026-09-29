@@ -221,6 +221,47 @@ pub const Registry = struct {
         self.allocator.free(self.classes);
         self.* = undefined;
     }
+
+    /// Independent copy. The clone uses this registry's allocator.
+    pub fn clone(self: *const Registry) std.mem.Allocator.Error!Registry {
+        const classes = try self.allocator.alloc(Class, self.classes.len);
+        var n: usize = 0;
+        errdefer {
+            for (classes[0..n]) |*c| {
+                self.allocator.free(c.name);
+                self.allocator.free(c.cidrs);
+                if (c.ident_glob) |g| self.allocator.free(g);
+                if (c.host_glob) |g| self.allocator.free(g);
+            }
+            self.allocator.free(classes);
+        }
+        for (self.classes) |c| {
+            const name = try self.allocator.dupe(u8, c.name);
+            errdefer self.allocator.free(name);
+            const cidrs = try self.allocator.dupe(cidr.Cidr, c.cidrs);
+            errdefer self.allocator.free(cidrs);
+            const ident_glob = if (c.ident_glob) |g| try self.allocator.dupe(u8, g) else null;
+            errdefer if (ident_glob) |g| self.allocator.free(g);
+            const host_glob = if (c.host_glob) |g| try self.allocator.dupe(u8, g) else null;
+            classes[n] = .{
+                .name = name,
+                .policy = c.policy,
+                .cidrs = cidrs,
+                .tls_only = c.tls_only,
+                .account_only = c.account_only,
+                .oper_only = c.oper_only,
+                .ident_glob = ident_glob,
+                .host_glob = host_glob,
+            };
+            n += 1;
+        }
+        return .{
+            .allocator = self.allocator,
+            .classes = classes,
+            .user_idx = self.user_idx,
+            .server_idx = self.server_idx,
+        };
+    }
 };
 
 /// Definition fed to the builder by the config layer (borrowed slices; the

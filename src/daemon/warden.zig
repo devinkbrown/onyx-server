@@ -243,6 +243,21 @@ pub const Registry = struct {
         return self.wards.items.len;
     }
 
+    /// Owned copy of every ward. The caller frees it with `deinitWardList`.
+    pub fn clonedWards(self: *const Registry) std.mem.Allocator.Error!std.ArrayListUnmanaged(Ward) {
+        var out: std.ArrayListUnmanaged(Ward) = .empty;
+        errdefer deinitWardList(self.allocator, &out);
+        for (self.wards.items) |w| try out.append(self.allocator, try self.clone(w));
+        return out;
+    }
+
+    /// Swap the live list with `next`. The caller owns whatever `next` holds after.
+    pub fn exchangeWards(self: *Registry, next: *std.ArrayListUnmanaged(Ward)) void {
+        const old = self.wards;
+        self.wards = next.*;
+        next.* = old;
+    }
+
     pub fn pruneExpired(self: *Registry, now_ms: i64) void {
         var i: usize = 0;
         while (i < self.wards.items.len) {
@@ -260,7 +275,7 @@ pub const Registry = struct {
         if (w.set_by.len > self.params.max_setter) return error.SetterTooLong;
     }
 
-    fn clone(self: *Registry, w: Ward) std.mem.Allocator.Error!Ward {
+    fn clone(self: *const Registry, w: Ward) std.mem.Allocator.Error!Ward {
         const pattern = try self.allocator.dupe(u8, w.pattern);
         errdefer self.allocator.free(pattern);
         const reason = try self.allocator.dupe(u8, w.reason);
@@ -291,6 +306,12 @@ fn freeWard(allocator: std.mem.Allocator, w: *Ward) void {
     allocator.free(w.reason);
     allocator.free(w.set_by);
     w.* = undefined;
+}
+
+pub fn deinitWardList(allocator: std.mem.Allocator, wards: *std.ArrayListUnmanaged(Ward)) void {
+    for (wards.items) |*w| freeWard(allocator, w);
+    wards.deinit(allocator);
+    wards.* = .empty;
 }
 
 // ── mesh WARD wire codec ───────────────────────────────────────────────────
