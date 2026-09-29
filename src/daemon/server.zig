@@ -53273,6 +53273,14 @@ fn emitReplyLine(conn: *ConnState, line: []const u8) ServerError!void {
     return appendToConn(conn, line);
 }
 
+/// Queue one already-framed plaintext line on this connection.
+/// `appendToConn` is the channel-delivery choke point. A fresh connection
+/// has no TLS session, WebSocket adapter, or labeled-response capture, so
+/// the line lands in the inline SendQ.
+pub fn enqueuePlainFanout(conn: *ConnState, bytes: []const u8) ServerError!void {
+    return appendToConn(conn, bytes);
+}
+
 fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
     // labeled-response: divert this connection's own plaintext replies into the
     // active capture buffer (before WS framing / TLS encryption) so the caller
@@ -53632,6 +53640,23 @@ test "GAP-X2 SendQ per-class cap also bounds the inline fast path" {
     try std.testing.expectError(error.OutputTooSmall, rawAppendToConn(&conn, "x"));
     try std.testing.expectEqual(@as(usize, 3), conn.send_len);
     try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
+}
+
+test "GAP-X5 enqueuePlainFanout queues one line on the connection SendQ" {
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = std.testing.allocator;
+    defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+
+    const line = ":nick!u@h PRIVMSG #c :hi";
+    try enqueuePlainFanout(&conn, line);
+    try std.testing.expectEqualStrings(line, conn.send_buf[0..conn.send_len]);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.recv_overflow.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.session_list_cache.rows.items.len);
+    std.debug.print(
+        "GAP-X5 branch=plaintext fan-out line queued on the inline SendQ; ConnState bytes={d}\n",
+        .{@sizeOf(ConnState)},
+    );
 }
 
 /// Real encrypted link pair for daemon-level retained-replay tests. Keeping the

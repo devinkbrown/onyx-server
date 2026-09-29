@@ -786,6 +786,23 @@ pub fn build(b: *std.Build) void {
     const bench_live_step = b.step("bench-live", "Live-daemon P0-1 axes: TLS/shards/ring JOIN+PRIVMSG RTT + RSS (throwaway loopback; not orochi)");
     bench_live_step.dependOn(&bench_live_run.step);
 
+    // GAP-X5. Separate from `bench` so the default harness does not compile
+    // server.zig. ReleaseFast, same rule as `bench`. Not part of `zig build test`.
+    const bench_x5_exe = b.addExecutable(.{
+        .name = "onyx-server-bench-gap-x5",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/substrate/bench_x5.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "onyx_server", .module = bench_onyx_mod }},
+        }),
+    });
+    const bench_x5_run = b.addRunArtifact(bench_x5_exe);
+    bench_x5_run.addPassthruArgs();
+    const bench_x5_step = b.step("bench-gap-x5", "GAP-X5: bytes per connection and microseconds per fan-out recipient (no shrink)");
+    bench_x5_step.dependOn(&bench_x5_run.step);
+
     // `zig build fuzz` — the coverage-guided fuzz targets (roadmap 0.2 follow-up).
     // These are the `cov-fuzz:` tests in src/crypto/tls_fuzz.zig: one
     // `std.testing.fuzz` target per attacker-facing wire parser (X.509, TLS

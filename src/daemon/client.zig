@@ -436,7 +436,7 @@ pub const Channel = struct {
 pub fn Table(comptime T: type, comptime Id: type) type {
     return struct {
         const Self = @This();
-        const Slot = struct {
+        pub const Slot = struct {
             value: T = undefined,
             gen: u32 = 1,
             occupied: bool = false,

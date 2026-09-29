@@ -164,6 +164,7 @@ TLS / `num_shards` / `ring_entries`×`cqe_batch` matrix. kTLS is the configured 
 zig build bench-live -- --quick
 tools/bench.sh --live -o docs/audit/bench-live-<version>.md
 zig build bench-live -- --gap-x4 -o docs/audit/bench-gap-x4.md
+zig build bench-gap-x5 -- -o docs/audit/bench-gap-x5.md
 ```
 
 Default matrix: plaintext at shards 1 and 2, `ring_entries` 32 vs 128, `cqe_batch`
@@ -174,6 +175,14 @@ matrix: `[io] sqpoll` on and off, TLS off and userspace (`ktls = "off"`), and
 enable `defer_taskrun` or kTLS `txrx`. A TLS cell that cannot handshake
 (for example Python `ssl` vs an Ed25519 bootstrap leaf) is recorded as a failed
 cell — never silently skipped. Do not fold `bench-live` into `zig build test`.
+
+`zig build bench-gap-x5` is a separate ReleaseFast binary. It prints
+`@sizeOf(ConnState)`, the client-table slot that holds one connection, and the
+microseconds to enqueue one plaintext line per fan-out recipient through
+`enqueuePlainFanout`. It does not shrink the connection and it does not bump
+the Helix clients capsule. The offline `fanout-frame` rows above are the
+framing model; they are not this measurement, and live RSS/client is not
+bytes per connection.
 
 ## Recording a baseline
 
