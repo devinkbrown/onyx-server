@@ -283,6 +283,7 @@ pub const CapId = enum(u6) {
     utf8_only,
     netsplit,
     netjoin,
+    onyx_2fa,
 };
 
 const CapSet = struct {
@@ -440,6 +441,9 @@ const cap_specs = [_]CapSpec{
     .{ .id = .utf8_only, .name = "utf8-only" },
     .{ .id = .netsplit, .name = "draft/netsplit" },
     .{ .id = .netjoin, .name = "draft/netjoin" },
+    // Accounts with 2FA complete login through IDENTIFY. Surface this before
+    // clients choose a SASL mechanism, without treating IDENTIFY as one.
+    .{ .id = .onyx_2fa, .name = "onyx/2fa", .value_302 = "IDENTIFY" },
 };
 
 /// Exact upper bound on the rendered, space-separated negotiated-cap-name list
@@ -2627,6 +2631,26 @@ test "CAP LS gates sasl on configured session mechanisms" {
     session.sasl_plain = .{ .ptr = &anchor, .verifyFn = TestPlainChecker.verify };
     try dispatchText(&session, &replies, "CAP LS 302");
     try expectContains(replies.written(), "sasl=PLAIN");
+}
+
+test "GAP-P0b advertises IDENTIFY for 2FA before AUTHENTICATE" {
+    var session = ClientSession.init();
+    var storage: [4096]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP LS 302");
+    try expectContains(replies.written(), "onyx/2fa=IDENTIFY");
+    try expectNotContains(replies.written(), "sasl=");
+    replies.clear();
+
+    var anchor: u8 = 0;
+    session.sasl_plain = .{ .ptr = &anchor, .verifyFn = TestPlainChecker.verify };
+    try dispatchText(&session, &replies, "CAP LS 302");
+    try expectContains(replies.written(), "onyx/2fa=IDENTIFY");
+    try expectContains(replies.written(), "sasl=PLAIN");
+    try expectNotContains(replies.written(), "sasl=IDENTIFY");
+
+    std.debug.print("GAP-P0b branch=cap onyx/2fa=IDENTIFY before AUTHENTICATE\n", .{});
 }
 
 test "CAP LS advertises configured draft/multiline limits" {
