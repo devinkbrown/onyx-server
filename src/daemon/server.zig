@@ -1456,6 +1456,9 @@ pub const Config = struct {
     /// event_history_path`); loaded at boot, rewritten on the stats cadence.
     /// Empty = in-memory only (per-process lifetime).
     event_history_path: []const u8 = "",
+    /// Operator-named flight recorder file (`[trace] file`). Empty keeps the
+    /// ring in memory for oper DEBUG and writes nothing on a fault.
+    flight_recorder_path: []const u8 = "",
     /// Auto-enable the +j override umode on elevation for opers with the
     /// oper_override privilege (full channel authority without `/mode +j`).
     /// `[oper] auto_override`.
@@ -3373,6 +3376,41 @@ const PublishedMeshPeer = struct {
     public_key_present: bool = false,
 };
 
+/// Operator path cap and the byte cap of one fault dump. The file is replaced,
+/// never appended, and the body is tracelog text.
+const flight_path_max: usize = 1024;
+const flight_recorder_max_file_bytes: usize = 96 * 1024;
+
+/// Server address registered from `start` (and from tests once the value is
+/// stored). `init` returns the server by value, so the pointer is not stable there.
+var flight_panic_server: std.atomic.Value(usize) = .init(0);
+
+fn writeAllLinux(fd: linux.fd_t, bytes: []const u8) bool {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                if (n == 0) return false;
+                off += n;
+            },
+            .INTR => continue,
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// Panic entry. The daemon panic handler calls this, then aborts. A unit test
+/// calls it directly and does not abort.
+pub fn flushFlightRecorderOnPanic(msg: []const u8) void {
+    const raw = flight_panic_server.load(.acquire);
+    if (raw == 0) return;
+    const server: *LinuxServer = @ptrFromInt(raw);
+    server.flushFlightRecorder(.reactor, msg);
+}
+
 /// Borrowed scan row. `storePublishedMeshPeers` copies `name` before return.
 const MeshPeerSeen = struct {
     name: []const u8,
@@ -3768,6 +3806,9 @@ pub const LinuxServer = struct {
     /// dumped on oper DEBUG / crash) + per-category level filter.
     trace_recorder: tracelog.FlightRecorder(256) = .{},
     trace_filter: tracelog.CategoryFilter = tracelog.CategoryFilter.init(.info),
+    /// When set under the test build, `runOnce` fails before the ring so
+    /// `runLoopResilient` can reach its real give-up return.
+    reactor_fail_for_test: bool = false,
     /// Observability: allocation-free runtime counters (totals + gauges), bumped
     /// inline on the hot path and rendered on demand (STATS z / Prometheus).
     stats: server_stats.Stats = .{},
@@ -4687,6 +4728,7 @@ pub const LinuxServer = struct {
     /// (called by main after construction; init() returns by value so `self`
     /// is not stable inside it).
     pub fn start(self: *LinuxServer) void {
+        self.bindFlightPanicTarget();
         // An inherited arena is an unpublished authoritative image. Starting
         // webhook/media/metrics workers before it is adopted lets off-reactor
         // producers observe and mutate the fresh boot image, then race the
@@ -5552,6 +5594,7 @@ pub const LinuxServer = struct {
     }
 
     pub fn deinit(self: *LinuxServer) void {
+        self.clearFlightPanicTarget();
         // Stop + join the /metrics listener thread FIRST, before freeing the
         // snapshot it reads. shutdown() signals the stop flag, closes the
         // listener fd, and joins. No-op when the endpoint was never started.
@@ -7190,6 +7233,9 @@ pub const LinuxServer = struct {
     /// Process at least one io_uring completion. Callers may loop this until
     /// their own stop condition is satisfied.
     pub fn runOnce(self: *LinuxServer) !void {
+        if (comptime builtin.is_test) {
+            if (self.reactor_fail_for_test) return error.ReactorGiveUp;
+        }
         // Bind this thread to its reactor so every handler's rx() resolves to the
         // reactor whose ring produced the completions. A multi-reactor worker has
         // already bound its own shard before looping (so we never clobber it);
@@ -7494,6 +7540,7 @@ pub const LinuxServer = struct {
                 );
                 if (consecutive_failures >= 64) {
                     srvLog("onyx-server: reactor giving up after persistent errors\n", .{});
+                    self.flushFlightRecorder(.reactor, "reactor giving up after persistent errors");
                     return;
                 }
             }
@@ -13409,6 +13456,7 @@ pub const LinuxServer = struct {
             if (conn.recv_overflow.capacity > 0) conn.recv_overflow.deinit(conn.overflow_allocator);
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
+                self.flushFlightRecorder(.s2s, "mooring link dropped");
                 const publish_peer_snapshot = !conn.s2s_dedup;
                 const dropped_node = link.peerShortId();
                 if (!conn.s2s_dedup and link.remoteName().len != 0) {
@@ -30052,6 +30100,66 @@ pub const LinuxServer = struct {
     fn traceLog(self: *LinuxServer, comptime level: tracelog.Level, category: tracelog.Category, msg: []const u8) void {
         const now: u64 = @intCast(@max(0, self.nowMs()));
         tracelog.emit(.debug, level, &self.trace_filter, self.trace_recorder.sink(), category, now, 0, msg, &.{}) catch {};
+    }
+
+    fn bindFlightPanicTarget(self: *LinuxServer) void {
+        flight_panic_server.store(@intFromPtr(self), .release);
+    }
+
+    fn clearFlightPanicTarget(self: *LinuxServer) void {
+        _ = flight_panic_server.cmpxchgStrong(@intFromPtr(self), 0, .release, .monotonic);
+    }
+
+    /// Record `fault`, then replace the operator file with tracelog lines.
+    /// An empty path does nothing. IO errors are swallowed so a dump cannot fault.
+    fn flushFlightRecorder(self: *LinuxServer, category: tracelog.Category, fault: []const u8) void {
+        const path = self.config.flight_recorder_path;
+        if (path.len == 0) return;
+        self.traceLog(.fatal, category, fault);
+        if (path.len > flight_path_max) return;
+
+        var path_buf: [flight_path_max + 1]u8 = undefined;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        const opened = linux.open(path_buf[0..path.len :0], .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        }, 0o600);
+        if (linux.errno(opened) != .SUCCESS) return;
+        const fd: linux.fd_t = @intCast(opened);
+        defer _ = linux.close(fd);
+
+        // Same oldest-to-newest window as FlightRecorder.dump, one event at a
+        // time, so the fault path does not stage the whole ring on the stack.
+        const capacity = self.trace_recorder.events.len;
+        const head = self.trace_recorder.head.load(.acquire);
+        var tail = self.trace_recorder.tail.load(.acquire);
+        if (head -% tail > capacity) tail = head - capacity;
+        var written: usize = 0;
+        var index = tail;
+        while (index != head) : (index +%= 1) {
+            const ev = self.trace_recorder.events[index % capacity];
+            var fields: [tracelog.max_fields]tracelog.Field = undefined;
+            var n: usize = 0;
+            while (n < fields.len) : (n += 1) {
+                fields[n] = ev.field(n) orelse break;
+            }
+            var line: [640]u8 = undefined;
+            const rendered = tracelog.render(.{
+                .level = ev.level,
+                .category = ev.category,
+                .ts_mono_ns = ev.ts_mono_ns,
+                .hlc = ev.hlc,
+                .msg = ev.message(),
+                .fields = fields[0..n],
+            }, &line) catch continue;
+            if (written + rendered.len + 1 > flight_recorder_max_file_bytes) break;
+            if (!writeAllLinux(fd, rendered)) return;
+            if (!writeAllLinux(fd, "\n")) return;
+            written += rendered.len + 1;
+        }
     }
 
     /// DEBUG — oper command: dump the flight recorder (last N structured events)
@@ -54332,6 +54440,106 @@ test "GAP-V6 the room reads the speaking queue and the server forwards positions
     try std.testing.expect(std.mem.indexOf(u8, room, "gain") == null);
 
     std.debug.print("GAP-V6 branch=queue is listed in raise order; a non-head still speaks; positions are forwarded unchanged\n", .{});
+}
+
+fn expectFlightOnce(haystack: []const u8, needle: []const u8) !void {
+    const at = std.mem.indexOf(u8, haystack, needle) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, haystack[at + needle.len ..], needle) == null);
+}
+
+test "GAP-O3 a fault writes the tracelog to the named file" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    server.bindFlightPanicTarget();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try rehashTmpPath(allocator, tmp, "flight.log");
+    defer allocator.free(path);
+
+    // An empty operator path must not create the file and must not record the fault.
+    flushFlightRecorderOnPanic("GAP-O3 panic fault");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(std.testing.io, "flight.log", allocator, .limited(64)));
+
+    server.config.flight_recorder_path = path;
+    server.traceLog(.info, .reactor, "GAP-O3 recorder marker");
+    flushFlightRecorderOnPanic("GAP-O3 panic fault");
+    const panic_body = try tmp.dir.readFileAlloc(std.testing.io, "flight.log", allocator, .limited(flight_recorder_max_file_bytes + 1));
+    defer allocator.free(panic_body);
+    try std.testing.expect(panic_body.len <= flight_recorder_max_file_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, panic_body, "level=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, panic_body, "category=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, panic_body, "msg=") != null);
+    try expectFlightOnce(panic_body, "GAP-O3 recorder marker");
+    try expectFlightOnce(panic_body, "GAP-O3 panic fault");
+    try std.testing.expect(std.mem.indexOf(u8, panic_body, "reactor giving up after persistent errors") == null);
+    try std.testing.expect(std.mem.indexOf(u8, panic_body, "mooring link dropped") == null);
+
+    server.reactor_fail_for_test = true;
+    var run = std.atomic.Value(bool).init(true);
+    server.runLoopResilient(&run);
+    server.reactor_fail_for_test = false;
+    const give_up = try tmp.dir.readFileAlloc(std.testing.io, "flight.log", allocator, .limited(flight_recorder_max_file_bytes + 1));
+    defer allocator.free(give_up);
+    try std.testing.expect(give_up.len <= flight_recorder_max_file_bytes);
+    try expectFlightOnce(give_up, "GAP-O3 recorder marker");
+    try expectFlightOnce(give_up, "GAP-O3 panic fault");
+    try expectFlightOnce(give_up, "reactor giving up after persistent errors");
+
+    var pair = try SessionReplayTestPair.init(allocator);
+    const link = allocator.create(secured_s2s_link.SecuredLink) catch |err| {
+        pair.deinit();
+        return err;
+    };
+    // The established link is moved onto the heap so closeConn can destroy it.
+    // The stack copy keeps the same bytes for any interior pointers and is not
+    // deinited; closeConn owns the heap link from here.
+    link.* = pair.a;
+    var link_live = true;
+    defer {
+        pair.b.deinit();
+        // Inner deinit unmaps the shared signing page. Drop the dangling
+        // identity pointer before the identity wipe.
+        pair.ida.sign_kp.secret_key.page = null;
+        pair.idb.sign_kp.secret_key.page = null;
+        pair.ida.deinit();
+        pair.idb.deinit();
+    }
+    errdefer {
+        if (link_live) {
+            link.deinit();
+            allocator.destroy(link);
+        }
+    }
+
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.s2s_secured = link;
+    try server.closeConn(conn.token, "mooring test");
+    link_live = false;
+    try std.testing.expect(server.rx().clients.get(id) == null);
+
+    const dropped = try tmp.dir.readFileAlloc(std.testing.io, "flight.log", allocator, .limited(flight_recorder_max_file_bytes + 1));
+    defer allocator.free(dropped);
+    try std.testing.expect(dropped.len <= flight_recorder_max_file_bytes);
+    try expectFlightOnce(dropped, "GAP-O3 recorder marker");
+    try expectFlightOnce(dropped, "GAP-O3 panic fault");
+    try expectFlightOnce(dropped, "reactor giving up after persistent errors");
+    try expectFlightOnce(dropped, "mooring link dropped");
+    try std.testing.expect(std.mem.indexOf(u8, dropped, "category=s2s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dropped, "qlog") == null);
+
+    std.debug.print("GAP-O3 branch=tracelog file on panic, reactor give-up, and mooring death\n", .{});
 }
 
 /// Real encrypted link pair for daemon-level retained-replay tests. Keeping the

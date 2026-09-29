@@ -65,6 +65,9 @@ pub const Config = struct {
     news: News = .{},
     geo: Geo = .{},
     oper: OperSection = .{},
+    /// `[trace] file` — operator-named flight-recorder dump. Unset keeps the
+    /// ring in memory for oper DEBUG.
+    trace: Trace = .{},
     oper_ocg2: OperOcg2 = .{},
     wasm: Wasm = .{},
     listen: Listen = .{},
@@ -257,6 +260,12 @@ pub const Config = struct {
         /// (KICK/MODE/TOPIC/PROP/…) without a manual `/mode +j`. Default false
         /// keeps override an explicit, audited opt-in.
         auto_override: bool = false,
+    };
+
+    /// `[trace]` flight-recorder file. A fault overwrites this path with the
+    /// existing tracelog text. Unset writes nothing.
+    pub const Trace = struct {
+        file: ?[]const u8 = null,
     };
 
     /// Inactive OCG2 durable operator-authority root. Every participating node
@@ -974,6 +983,7 @@ pub const Config = struct {
         if (self.geo.news_cache_dir) |v| allocator.free(v);
         if (self.oper.grants_path) |v| allocator.free(v);
         if (self.oper.event_history_path) |v| allocator.free(v);
+        if (self.trace.file) |v| allocator.free(v);
         if (self.wasm.plugin_dir) |v| allocator.free(v);
         freeWasmRegistry(allocator, self.wasm.registry);
         allocator.free(self.wasm.revoked_blake3);
@@ -1194,6 +1204,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [oper]
     try setOpt(allocator, resolver, doc.getString("oper.grants_path"), &cfg.oper.grants_path);
     try setOpt(allocator, resolver, doc.getString("oper.event_history_path"), &cfg.oper.event_history_path);
+    try setOpt(allocator, resolver, doc.getString("trace.file"), &cfg.trace.file);
     if (doc.getBool("oper.auto_override")) |b| cfg.oper.auto_override = b;
     try setOpt(allocator, resolver, doc.getString("wasm.plugin_dir"), &cfg.wasm.plugin_dir);
     cfg.wasm.max_plugin_bytes = @intCast(try uintField(doc, "wasm.max_plugin_bytes", cfg.wasm.max_plugin_bytes, 1024, 64 * 1024 * 1024));
@@ -2259,6 +2270,17 @@ test "parseToml: [limits] keylen round-trips and rejects out-of-range" {
     // 0 (below min) and 65 (above the parser's 64-byte ceiling) both fail closed.
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[limits]\nkeylen=0\n", .{}));
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[limits]\nkeylen=65\n", .{}));
+}
+
+test "GAP-O3 trace file is the operator path" {
+    const allocator = testing.allocator;
+    var cfg = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[trace]\nfile = \"/var/lib/onyx/flight.log\"\n", .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqualStrings("/var/lib/onyx/flight.log", cfg.trace.file.?);
+
+    var absent = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{});
+    defer absent.deinit(allocator);
+    try testing.expect(absent.trace.file == null);
 }
 
 test "parseToml: backup section projects directory and cadence" {

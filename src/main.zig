@@ -106,6 +106,14 @@ fn svcDropChannel(ctx: *anyopaque, channel: []const u8) onyx_server.daemon.servi
     try srv.markChannelRegistered(channel, false);
 }
 
+fn daemonPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    if (comptime builtin.os.tag == .linux)
+        onyx_server.daemon.server.flushFlightRecorderOnPanic(msg);
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
+pub const panic = std.debug.FullPanic(daemonPanic);
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
