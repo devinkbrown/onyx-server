@@ -140,6 +140,7 @@ const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const search_index_mod = @import("search_index.zig");
 const history_durable = @import("history_durable.zig");
+const memo_durable = @import("memo_durable.zig");
 const chanstats_mod = @import("chanstats.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const chathistory_targets = @import("../proto/chathistory_targets.zig");
@@ -4784,6 +4785,7 @@ pub const LinuxServer = struct {
             durable_property_candidate = null;
         }
         self.restoreDurableHistory();
+        self.restoreDurableMemos();
     }
 
     /// By-value construction, kept for callers that own the result directly.
@@ -22249,6 +22251,33 @@ pub const LinuxServer = struct {
             .client_tags = tags orelse "",
         }) catch |err| {
             srvLog("onyx-server: history durable append failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn storeOfflineMemo(self: *LinuxServer, account: []const u8, from: []const u8, text: []const u8, now_ms: i64) !usize {
+        const n = try self.memo.send(account, from, text, now_ms);
+        if (self.account_services) |svc| {
+            memo_durable.append(svc.store, account, from, text, now_ms) catch |err| {
+                srvLog("onyx-server: memo durable append failed ({s})\n", .{@errorName(err)});
+            };
+        }
+        return n;
+    }
+
+    fn clearOfflineMemo(self: *LinuxServer, account: []const u8) usize {
+        const n = self.memo.clear(account);
+        if (self.account_services) |svc| {
+            memo_durable.replaceAll(svc.store, &self.memo) catch |err| {
+                srvLog("onyx-server: memo durable snapshot failed ({s})\n", .{@errorName(err)});
+            };
+        }
+        return n;
+    }
+
+    fn restoreDurableMemos(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        memo_durable.restoreInto(svc.store, &self.memo) catch |err| {
+            srvLog("onyx-server: memo durable restore failed closed ({s})\n", .{@errorName(err)});
         };
     }
 
@@ -45148,7 +45177,7 @@ pub const LinuxServer = struct {
                 try self.failReply(conn, "MEMO", "ACCOUNT_REQUIRED", "Log in to clear your offline memos");
                 return;
             };
-            const n = self.memo.clear(acct);
+            const n = self.clearOfflineMemo(acct);
             var buf: [default_reply_bytes]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, "MEMO: Cleared {d} message(s)", .{n}) catch return;
             try self.noticeTo(conn, line);
@@ -45297,7 +45326,7 @@ pub const LinuxServer = struct {
                     };
                 }
             }
-            _ = self.memo.send(delivery, from, text, platform.realtimeMillis()) catch |err| {
+            _ = self.storeOfflineMemo(delivery, from, text, platform.realtimeMillis()) catch |err| {
                 const code: []const u8 = switch (err) {
                     error.MailboxFull => "MAILBOX_FULL",
                     error.MessageInvalid => "INVALID_MESSAGE",
@@ -45663,7 +45692,7 @@ pub const LinuxServer = struct {
             const line = std.fmt.bufPrint(&buf, "MEMO from {s} :{s}", .{ m.from, m.text }) catch continue;
             try self.noticeTo(conn, line);
         }
-        _ = self.memo.clear(account);
+        _ = self.clearOfflineMemo(account);
     }
 
     fn mediaPhysicalIndex(self: *const LinuxServer, id: client_model.ClientId, channel: []const u8, nick: []const u8) ?usize {
@@ -57880,6 +57909,43 @@ fn eventHistoryBytesForTest(
     defer writer.deinit();
     try history.serializeInto(&writer.writer);
     return allocator.dupe(u8, writer.written());
+}
+
+test "UPGRADE GAP-D2 offline memo survives the dropped process image" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d2.wal");
+    var services = services_mod.Services.init(&store, null);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(usize, 1), try first.storeOfflineMemo("carol", "alice", "waiting offline", 77));
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d2.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+    const pending = second.memo.pending("carol");
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqualStrings("alice", pending[0].from);
+    try std.testing.expectEqualStrings("waiting offline", pending[0].text);
+    try std.testing.expectEqual(@as(i64, 77), pending[0].sent_ms);
 }
 
 test "UPGRADE GAP-D1 cold restart restores history msgids and skips ciphertext search" {

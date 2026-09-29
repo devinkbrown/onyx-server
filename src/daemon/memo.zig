@@ -120,6 +120,16 @@ pub const MemoBox = struct {
         return self.pending(account).len;
     }
 
+    /// Visit every stored memo. `callback` may not mutate the box.
+    pub fn forEach(self: *const MemoBox, context: anytype, comptime callback: anytype) !void {
+        var accounts = self.boxes.iterator();
+        while (accounts.next()) |entry| {
+            for (entry.value_ptr.items.items) |*message| {
+                try callback(context, entry.key_ptr.*, message);
+            }
+        }
+    }
+
     /// Drop all of `account`'s messages (e.g. after delivery). Returns how many
     /// were removed and prunes the (now-empty) mailbox.
     pub fn clear(self: *MemoBox, account: []const u8) usize {
