@@ -263,6 +263,13 @@ pub fn main(init: std.process.Init) !void {
                         std.debug.print("config ERROR in {s}: {s}\n", .{ path, why });
                         std.process.exit(1);
                     }
+                    if (onyx_server.daemon.config_boot.unsecuredMeshPeerError(
+                        l.parsed.mesh.connect.len,
+                        l.parsed.mesh.require_secured,
+                    )) |why| {
+                        std.debug.print("config ERROR in {s}: {s}\n", .{ path, why });
+                        std.process.exit(1);
+                    }
                     if (l.ocg2.enabled) {
                         if (!onyx_server.daemon.config_boot.ocg2RuntimeModeSupported(l.ocg2.mode)) {
                             std.debug.print(
@@ -401,6 +408,13 @@ pub fn main(init: std.process.Init) !void {
             defer allocator.free(text); // string fields are duped by the parser
             if (onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
                 if (onyx_server.daemon.config_boot.configCheckError(loaded.io, loaded.tls.ktls)) |why| {
+                    std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
+                    std.process.exit(1);
+                }
+                if (onyx_server.daemon.config_boot.unsecuredMeshPeerError(
+                    loaded.parsed.mesh.connect.len,
+                    loaded.parsed.mesh.require_secured,
+                )) |why| {
                     std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
                     std.process.exit(1);
                 }

@@ -60033,6 +60033,209 @@ test "MESSAGE_V2 egress retains a partitioned neighbor's obligation and retires 
     }
 }
 
+test "DST GAP-A2 one accepted id survives partition and USR2 without a duplicate or a legacy twin" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var pair = try SessionReplayTestPair.initWithSeeds(alloc, 0xB2, 0xB3);
+    defer pair.deinit();
+    const local_root = std.fmt.bytesToHex(pair.ida.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(pair.idb.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 41,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    try std.testing.expect(server.authoredRelayV2Configured());
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer_conn = server.rx().clients.get(peer_id).?;
+    peer_conn.overflow_allocator = alloc;
+    peer_conn.token = try tokenFromId(peer_id);
+    peer_conn.send_armed = true;
+    peer_conn.sendq_cap = default_sendq_cap;
+    peer_conn.s2s_secured = &pair.a;
+    defer {
+        peer_conn.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+    current_reactor = &server.reactors[0];
+
+    const legacy_control = s2s_link.RelayMessage{
+        .verb = .privmsg,
+        .target = "#gap-a2",
+        .source_nick = "Alice",
+        .source_prefix = "Alice!u@origin.test",
+        .text = "legacy control",
+        .origin_node = pair.ida.shortId(),
+        .hlc = 1,
+    };
+    try std.testing.expectEqual(@as(usize, 1), server.relayLegacyToPeers(legacy_control, .all, false));
+    resetTestSendQ(peer_conn);
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+    try std.testing.expectEqual(@as(usize, 0), peer_conn.send_len);
+
+    const event_hlc = server.nextMeshHlc();
+    var accepted = (try server.admitAuthoredRelayV2(
+        .privmsg,
+        "#gap-a2",
+        0,
+        "Alice!u@origin.test",
+        "alice",
+        "",
+        "",
+        "one owed hop",
+        .channel,
+        "",
+        null,
+        0,
+        null,
+        event_hlc,
+        null,
+        null,
+    )) orelse return error.TestUnexpectedResult;
+    defer accepted.deinit(alloc);
+    const relay_id = accepted.relay_id;
+    try std.testing.expect((try server.admitAuthoredRelayV2(
+        .privmsg,
+        "#gap-a2",
+        0,
+        "Alice!u@origin.test",
+        "alice",
+        "",
+        "",
+        "one owed hop",
+        .channel,
+        "",
+        null,
+        0,
+        null,
+        event_hlc,
+        null,
+        null,
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
+
+    const legacy_twin = s2s_link.RelayMessage{
+        .verb = .privmsg,
+        .target = "#gap-a2",
+        .source_nick = "Alice",
+        .source_prefix = "Alice!u@origin.test",
+        .account = "alice",
+        .text = "one owed hop",
+        .origin_node = pair.ida.shortId(),
+        .hlc = event_hlc,
+    };
+    try std.testing.expectEqual(@as(usize, 0), server.relayLegacyToPeers(legacy_twin, .all, true));
+    try std.testing.expectEqual(@as(usize, 0), peer_conn.send_len);
+
+    for (0..8) |_| {
+        var work: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
+        const work_len = server.collectRelayV2RetryWork(&work);
+        defer for (work[0..work_len]) |item| alloc.free(item.wire);
+        try std.testing.expectEqual(@as(usize, 1), work_len);
+        try std.testing.expectEqual(pair.idb.shortId(), work[0].peer);
+        try std.testing.expectEqual(relay_id, work[0].relay_id);
+        try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
+        var matching: usize = 0;
+        for (server.relay_v2_outbox.items()) |item| {
+            if (std.mem.eql(u8, &item.relay_id, &relay_id)) matching += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), matching);
+    }
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(server, &pieces, &blobs);
+
+    const successor = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 41,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-gap-a2");
+    current_reactor = null;
+    try std.testing.expect(successor.authoredRelayV2Configured());
+    try std.testing.expectEqual(@as(usize, 1), successor.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 1), successor.relay_v2_outbox.len());
+    try std.testing.expect(successor.relay_v2_outbox.contains(pair.idb.shortId(), relay_id));
+    var matching: usize = 0;
+    for (successor.relay_v2_outbox.items()) |item| {
+        if (std.mem.eql(u8, &item.relay_id, &relay_id)) matching += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), matching);
+    try std.testing.expect((try successor.admitAuthoredRelayV2(
+        .privmsg,
+        "#gap-a2",
+        0,
+        "Alice!u@origin.test",
+        "alice",
+        "",
+        "",
+        "one owed hop",
+        .channel,
+        "",
+        null,
+        0,
+        null,
+        event_hlc,
+        null,
+        null,
+    )) == null);
+
+    var retry: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
+    const retry_len = successor.collectRelayV2RetryWork(&retry);
+    defer for (retry[0..retry_len]) |item| alloc.free(item.wire);
+    try std.testing.expectEqual(@as(usize, 1), retry_len);
+    try std.testing.expectEqual(pair.idb.shortId(), retry[0].peer);
+    try std.testing.expectEqual(relay_id, retry[0].relay_id);
+
+    try std.testing.expect(successor.commitRelayV2NeighborAck(pair.idb.shortId(), relay_id));
+    try std.testing.expect(!successor.relay_v2_outbox.contains(pair.idb.shortId(), relay_id));
+    try std.testing.expect(successor.commitRelayV2NeighborAck(pair.idb.shortId(), relay_id));
+    var tail: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
+    const tail_len = successor.collectRelayV2RetryWork(&tail);
+    defer for (tail[0..tail_len]) |item| alloc.free(item.wire);
+    for (tail[0..tail_len]) |item| {
+        try std.testing.expect(item.peer != pair.idb.shortId());
+    }
+    std.debug.print("GAP-A2 branch=dst active partition+usr2 no-duplicate no-legacy-twin\n", .{});
+}
+
 test "MESSAGE_V2 Helix restore relation rejects individually valid torn authorities" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;

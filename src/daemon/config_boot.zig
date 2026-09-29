@@ -576,6 +576,17 @@ pub fn configCheckError(io: IoBootConfig, ktls: config_format.Config.KtlsMode) ?
     return null;
 }
 
+/// A configured `[mesh].connect` peer is a mesh neighbor. v2 authoring, oper
+/// grants, and Event Spine v2 run on a Mooring SecuredLink, so `--check-config`
+/// and boot refuse a dial list left with `require_secured` false. An empty
+/// connect list, including a listen-only `s2s` port, keeps today's default.
+pub const unsecured_mesh_peer_reason: []const u8 = "mesh.connect without mesh.require_secured is refused: a configured mesh peer must use a Mooring SecuredLink";
+
+pub fn unsecuredMeshPeerError(connect_count: usize, require_secured: bool) ?[]const u8 {
+    if (connect_count != 0 and !require_secured) return unsecured_mesh_peer_reason;
+    return null;
+}
+
 pub fn mapAcmeBootConfig(cfg: config_format.Config) AcmeBootConfig {
     return .{
         .enabled = cfg.acme.enabled,
@@ -975,6 +986,83 @@ test "config check rejects ktls txrx footgun and resolveKtlsOffload keeps RX off
     try testing.expect(!off.tx);
     try testing.expect(!off.rx);
     std.debug.print("GAP-A6 branch=footgun rx=off ktls-stays-tx\n", .{});
+}
+
+test "config check GAP-A2 refuses a mesh peer without require_secured and keeps compat" {
+    const allocator = testing.allocator;
+    const unsecured =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[mesh]
+        \\connect = ["peer.example:6900"]
+        \\
+    ;
+    var refused = try loadFromText(allocator, unsecured, .{ .port = 6680 }, .{});
+    defer refused.deinit(allocator);
+    try testing.expect(configCheckError(refused.io, refused.tls.ktls) == null);
+    const why = unsecuredMeshPeerError(
+        refused.parsed.mesh.connect.len,
+        refused.parsed.mesh.require_secured,
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(unsecured_mesh_peer_reason, why);
+    try testing.expect(refused.config.relay_v2_authoring == .compat);
+    try testing.expect(refused.parsed.mesh.relay_v2_authoring == .compat);
+
+    const secured =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[mesh]
+        \\connect = ["peer.example:6900"]
+        \\require_secured = true
+        \\
+    ;
+    var allowed = try loadFromText(allocator, secured, .{ .port = 6680 }, .{});
+    defer allowed.deinit(allocator);
+    try testing.expect(unsecuredMeshPeerError(
+        allowed.parsed.mesh.connect.len,
+        allowed.parsed.mesh.require_secured,
+    ) == null);
+    try testing.expect(allowed.config.relay_v2_authoring == .compat);
+    try testing.expect(allowed.parsed.mesh.relay_v2_authoring == .compat);
+
+    const listen_only =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\s2s = 7700
+        \\
+    ;
+    var listening = try loadFromText(allocator, listen_only, .{ .port = 6680 }, .{});
+    defer listening.deinit(allocator);
+    try testing.expectEqual(@as(usize, 0), listening.parsed.mesh.connect.len);
+    try testing.expect(!listening.parsed.mesh.require_secured);
+    try testing.expect(unsecuredMeshPeerError(
+        listening.parsed.mesh.connect.len,
+        listening.parsed.mesh.require_secured,
+    ) == null);
+
+    const empty_connect =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[mesh]
+        \\connect = []
+        \\
+    ;
+    var empty = try loadFromText(allocator, empty_connect, .{ .port = 6680 }, .{});
+    defer empty.deinit(allocator);
+    try testing.expectEqual(@as(usize, 0), empty.parsed.mesh.connect.len);
+    try testing.expect(unsecuredMeshPeerError(
+        empty.parsed.mesh.connect.len,
+        empty.parsed.mesh.require_secured,
+    ) == null);
+    std.debug.print("GAP-A2 branch=check-config refuse unsecured mesh.connect; compat default\n", .{});
 }
 
 test "config GAP-V1 hold-off: media.dtls13 defaults off" {

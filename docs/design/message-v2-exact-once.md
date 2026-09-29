@@ -261,7 +261,9 @@ restart (`systemctl restart`, not `reload`) before that obligation to C is
 ACKed, no checkpoint was ever captured — capture happens only at the USR2 re-exec
 boundary — and B's in-memory RVL2/RVO2/RVG2/ADS1 state is gone. The last custody
 copy of that message is lost, and exact-once delivery to C is not recovered. This
-plane is therefore **not crash-durable**.
+plane is therefore **not crash-durable**. The client must tolerate that dropped
+tail: an upstream ACK is not proof the downstream recipient still has the
+message, and a power loss or cold restart does not restore the owed hop.
 
 **Supported contract.** The only custody-preserving transition is a
 connection-preserving Helix migration (`systemctl reload onyx-server`), where the
