@@ -875,6 +875,7 @@ pub const ReplyCode = Numeric;
 const ringlane = @import("ringlane.zig");
 const io_backend = @import("io_backend.zig");
 const sendq = @import("sendq.zig");
+const search_cmd = @import("search_cmd.zig");
 
 const RingFdToken = ringlane.FdToken;
 const RingCore = ringlane.Ring;
@@ -8300,7 +8301,7 @@ pub const LinuxServer = struct {
     /// S2sLink and queue any outbound frames the link produced for sending.
     /// Monotonic time in ms, routed through the reactor seam when one is injected
     /// (deterministic simulation), else the system monotonic clock.
-    fn nowMs(self: *const LinuxServer) i64 {
+    pub fn nowMs(self: *const LinuxServer) i64 {
         return if (self.reactor) |r| r.nowMillis() else platform.monotonicMillis();
     }
 
@@ -9663,7 +9664,7 @@ pub const LinuxServer = struct {
 
     /// Mark a failure discovered by the target owner itself. The caller must not
     /// touch `conn` after the next abort sweep because it may free the slot.
-    fn poisonOwnedDelivery(self: *LinuxServer, conn: *ConnState) void {
+    pub fn poisonOwnedDelivery(self: *LinuxServer, conn: *ConnState) void {
         conn.delivery_gap.store(true, .release);
         self.beginDeliveryGapAbort(conn);
     }
@@ -22194,7 +22195,7 @@ pub const LinuxServer = struct {
         return std.fmt.bufPrint(out, "$dm:{s}:{s}:{s}", .{ scope, first, second }) catch null;
     }
 
-    fn historyKeyForTarget(self: *LinuxServer, conn: *ConnState, target: []const u8, out: []u8) []const u8 {
+    pub fn historyKeyForTarget(self: *LinuxServer, conn: *ConnState, target: []const u8, out: []u8) []const u8 {
         if (world_model.isChannelName(target)) return target;
         const peer_account = if (self.world.findNick(target)) |wid|
             if (self.connFor(clientIdFromWorld(wid))) |peer| peer.session.account() else null
@@ -22783,7 +22784,7 @@ pub const LinuxServer = struct {
         return clientTagsForSession(session, raw, &tag_buf).len != 0;
     }
 
-    fn historyMessageVisibleTo(session: *const dispatch.ClientSession, message: lotus.Message) bool {
+    pub fn historyMessageVisibleTo(session: *const dispatch.ClientSession, message: lotus.Message) bool {
         if (message.tombstone) return false;
         if (historyEntryIsTagmsg(message.command)) return historyTagmsgVisibleTo(session, message);
         if (!session.hasCap(.event_playback) and historyEntryIsEvent(message.command)) return false;
@@ -22839,7 +22840,7 @@ pub const LinuxServer = struct {
     /// counts are already bounded (64 for CHATHISTORY/rewind, 50 for SEARCH);
     /// reserve two ordinary reply frames per row to cover the largest legal
     /// line, plus batch framing.  The caller owns and must free the allocation.
-    fn renderHistoryReplayOwned(
+    pub fn renderHistoryReplayOwned(
         self: *LinuxServer,
         conn: *ConnState,
         ref: []const u8,
@@ -22868,7 +22869,7 @@ pub const LinuxServer = struct {
     /// single append makes the connection firewall close an otherwise healthy
     /// reader; line-wise appends preserve the exact byte stream while allowing
     /// SendQ overflow and TLS/WebSocket framing to operate on bounded records.
-    fn appendHistoryReplay(conn: *ConnState, replay: []const u8) !void {
+    pub fn appendHistoryReplay(conn: *ConnState, replay: []const u8) !void {
         const websocket_open = if (conn.ws) |ws| ws.phase == .open else false;
         const userspace_tls = if (conn.tls) |tls| tls.handshakeDone() and !conn.tls_tx_offloaded else false;
         const raw_bound = linewiseReplayRawBound(replay, websocket_open, userspace_tls) orelse
@@ -23466,158 +23467,13 @@ pub const LinuxServer = struct {
         return !std.mem.eql(u8, command, "PRIVMSG") and !std.mem.eql(u8, command, "NOTICE") and !historyEntryIsTagmsg(command);
     }
 
-    /// draft/search anti-abuse: the minimum gap (monotonic ms) between two SEARCH
-    /// commands from one client. A 5s/client floor.
-    const search_rate_limit_ms: i64 = 5_000;
-    /// draft/search result cap: at most this many messages per query, newest
-    /// first. A fixed per-query result ceiling.
-    const search_max_results: usize = 50;
-    /// draft/search query bound: at most this many distinct words are intersected
-    /// (AND). Excess words are ignored, keeping the per-query cost bounded.
-    const search_max_query_words: usize = 8;
+    /// draft/search result cap. The command body lives in `search_cmd.zig`.
+    const search_max_results = search_cmd.max_results;
 
-    /// Look up a single history message in `store_target` by its exact msgid,
-    /// newest-first. Returns null when no live (non-tombstoned) entry matches.
-    /// Used by SEARCH to re-scope a global index hit to one target's ring.
-    fn historyMessageExact(self: *LinuxServer, store_target: []const u8, msgid: []const u8) ?lotus.Message {
-        var buf: [256]lotus.Message = undefined;
-        const found = self.history.latest(store_target, buf.len, &buf) catch return null;
-        for (found) |message| {
-            if (std.mem.eql(u8, message.msgid, msgid)) return message;
-        }
-        return null;
-    }
-
-    /// `SEARCH <target> [<query...>]` — IRCv3 draft/search full-text message
-    /// search over the CHATHISTORY store. Tokenizes the query into words, finds
-    /// each in the inverted index, AND-intersects the msgid sets (a message must
-    /// contain EVERY query word), re-scopes the surviving msgids to `<target>`'s
-    /// own history (visibility), and replays the matches as a `chathistory` BATCH
-    /// — reusing the CHATHISTORY renderer (BATCH when the client has `batch`,
-    /// plain lines otherwise). Channel targets require membership; a non-channel
-    /// target searches the requester's DM history with that peer. Rate-limited
-    /// per client and capped at `search_max_results` (newest-first).
-    ///
-    /// Design note: rather than a ranked full-text backend (e.g. SQLite FTS5),
-    /// Onyx Server uses a bounded in-memory inverted index with exact,
-    /// case-folded word AND-matching (no stemming, no substring, no relevance
-    /// ranking) — results are ordered newest-first like CHATHISTORY LATEST.
+    /// `SEARCH <target> [<query...>]` — IRCv3 draft/search. The messaging module
+    /// thunk calls this wrapper; the parse, cap, and replay live in `search_cmd.zig`.
     pub fn handleSearch(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
-        if (!conn.session.hasCap(.search)) {
-            try self.failReply(conn, "SEARCH", "NEED_REGISTRATION", "You must negotiate the draft/search capability");
-            return;
-        }
-
-        // Parse: drop the leading `SEARCH` verb, take the first whitespace token as
-        // the target, and treat the remainder (a `:`-trailing is unwrapped) as the
-        // raw query text. Tokenization mirrors the index's word splitter.
-        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
-        var rest = std.mem.trimStart(u8, trimmed, " ");
-        if (std.ascii.startsWithIgnoreCase(rest, "SEARCH")) rest = rest["SEARCH".len..];
-        rest = std.mem.trimStart(u8, rest, " ");
-
-        const target_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
-        const target = rest[0..target_end];
-        var query = std.mem.trimStart(u8, rest[target_end..], " ");
-        if (query.len != 0 and query[0] == ':') query = query[1..];
-
-        if (target.len == 0 or query.len == 0) {
-            try self.failReply(conn, "SEARCH", "INVALID_PARAMS", "Usage: SEARCH <target> :<query>");
-            return;
-        }
-
-        // Rate limit (anti-abuse): reject a too-fast second SEARCH.
-        const now = self.nowMs();
-        if (conn.last_search_ms != 0 and now - conn.last_search_ms < search_rate_limit_ms) {
-            try self.failReply(conn, "SEARCH", "RATE_LIMITED", "Please wait before searching again");
-            return;
-        }
-
-        // Visibility: a channel target requires membership (no leaking non-member
-        // channel history); a non-channel target resolves to the requester's DM
-        // history with that peer via the shared history key.
-        if (world_model.isChannelName(target)) {
-            if (!self.world.isMember(target, worldIdFromClient(id))) {
-                try self.failReply(conn, "SEARCH", "INVALID_TARGET", "You must be a member of the channel");
-                return;
-            }
-        }
-        conn.last_search_ms = now;
-
-        var key_buf: [320]u8 = undefined;
-        const store_target = self.historyKeyForTarget(conn, target, &key_buf);
-
-        // Tokenize the query (bounded) and AND-intersect the index hit sets. The
-        // first word seeds the candidate msgid list; each later word filters it.
-        var words: [search_max_query_words][]const u8 = undefined;
-        var word_count: usize = 0;
-        {
-            var it = std.mem.tokenizeAny(u8, query, " \t");
-            while (it.next()) |w| {
-                if (word_count >= search_max_query_words) break;
-                words[word_count] = w;
-                word_count += 1;
-            }
-        }
-        if (word_count == 0) {
-            try self.failReply(conn, "SEARCH", "INVALID_PARAMS", "Query must contain at least one word");
-            return;
-        }
-
-        // Candidate msgids = hits for the first word, scoped to this target and
-        // requiring every other query word to also hit that msgid (AND). Bounded
-        // by `search_max_results`, newest-first (the history ring is oldest-first,
-        // so we walk it in reverse).
-        var found_buf: [search_max_results]lotus.Message = undefined;
-        var found_len: usize = 0;
-        const seed_hits = self.search_index.find(words[0]);
-        // Iterate seed hits newest-first: the index appends in record order, so
-        // later indices are newer messages.
-        var hit_i: usize = seed_hits.len;
-        while (hit_i > 0 and found_len < search_max_results) {
-            hit_i -= 1;
-            const msgid = seed_hits[hit_i];
-            if (!self.searchMsgidMatchesAll(msgid, words[1..word_count])) continue;
-            const message = self.historyMessageExact(store_target, msgid) orelse continue;
-            if (!historyMessageVisibleTo(&conn.session, message)) continue;
-            found_buf[found_len] = message;
-            found_len += 1;
-        }
-
-        // Reverse into chronological (oldest-first) order for replay, matching
-        // CHATHISTORY's BATCH ordering.
-        var ordered: [search_max_results]lotus.Message = undefined;
-        var k: usize = 0;
-        while (k < found_len) : (k += 1) {
-            ordered[k] = found_buf[found_len - 1 - k];
-        }
-
-        const replay = self.renderHistoryReplayOwned(conn, "search", target, ordered[0..found_len], null) catch {
-            try self.failReply(conn, "SEARCH", "RESULTS_TOO_LARGE", "Too many results; narrow the query");
-            return;
-        };
-        defer self.allocator.free(replay);
-        appendHistoryReplay(conn, replay) catch {
-            self.poisonOwnedDelivery(conn);
-            return;
-        };
-    }
-
-    /// AND semantics: whether `msgid` is in the index hit list for every word in
-    /// `rest`. Empty `rest` (single-word query) is vacuously true.
-    fn searchMsgidMatchesAll(self: *LinuxServer, msgid: []const u8, rest: []const []const u8) bool {
-        for (rest) |word| {
-            const hits = self.search_index.find(word);
-            var present = false;
-            for (hits) |hit| {
-                if (std.mem.eql(u8, hit, msgid)) {
-                    present = true;
-                    break;
-                }
-            }
-            if (!present) return false;
-        }
-        return true;
+        return search_cmd.handle(self, worldIdFromClient(id), conn, line);
     }
 
     /// `OPERMOTD` — show the operator MOTD (RPL_OMOTDSTART/OMOTD/ENDOFOMOTD, or
@@ -48089,7 +47945,7 @@ pub const LinuxServer = struct {
     }
 
     /// Emit an IRCv3 `FAIL <command> <code> :<reason>` standard reply.
-    fn failReply(self: *LinuxServer, conn: *ConnState, command: []const u8, code: []const u8, reason: []const u8) !void {
+    pub fn failReply(self: *LinuxServer, conn: *ConnState, command: []const u8, code: []const u8, reason: []const u8) !void {
         // CWE-93 (CRLF/command injection): these FAIL/NOTICE builders reflect
         // caller-supplied fields onto the wire WITHOUT the `ReplyCtx`
         // `requireNoControlBytes` guard that numeric/message replies enforce.
@@ -52818,7 +52674,7 @@ const CompletionHandler = struct {
     server: *LinuxServer,
     err: ?anyerror = null,
 
-    fn onCompletion(self: *CompletionHandler, completion: ringlane.Completion) void {
+    pub fn onCompletion(self: *CompletionHandler, completion: ringlane.Completion) void {
         // Never abandon the remainder of a CQE batch after one handler error.
         // Later CQEs may be the exact RECV/SEND ownership releases that make a
         // connection safe to close or a Helix snapshot exact. Preserve only the
@@ -96735,7 +96591,7 @@ test "threaded server: SEARCH multi-word AND narrows results" {
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "quick red hen") == null);
 }
 
-test "threaded server: SEARCH rejects a non-member channel search" {
+test "GAP-X2 threaded server: SEARCH rejects a non-member channel search" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -96812,7 +96668,7 @@ test "threaded server: SEARCH returns the requester's own DM history" {
     try recvUntil(&b, "BATCH -search", 200);
 }
 
-test "threaded server: SEARCH rate limit blocks a too-fast second search" {
+test "GAP-X2 threaded server: SEARCH rate limit blocks a too-fast second search" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -96894,7 +96750,7 @@ test "threaded server: SEARCH omits a redacted message from results" {
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "erase target") == null);
 }
 
-test "threaded server: SEARCH caps results at the maximum" {
+test "GAP-X2 threaded server: SEARCH caps results at the maximum" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -96947,6 +96803,7 @@ test "threaded server: SEARCH caps results at the maximum" {
         cursor = pos + 1;
     }
     try std.testing.expectEqual(LinuxServer.search_max_results, count);
+    std.debug.print("GAP-X2 step3 branch=SEARCH command family moved behind the messaging thunk and the membership rate-limit and result cap still hold\n", .{});
 }
 
 test "threaded server: CAP LS advertises draft/search" {
