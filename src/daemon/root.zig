@@ -154,6 +154,7 @@ pub const world = @import("world.zig");
 // GAP-O4 doctor is exported outside the generated block: genroots currently
 // duplicates protected manual exports when regenerating this root.
 pub const doctor = @import("doctor.zig");
+pub const backup_set = @import("backup_set.zig");
 
 // Subsystem packages in subdirectories that genroots does not auto-import
 // (modules/ has no root.zig; helix/ is auto-imported by genroots).
@@ -497,6 +498,7 @@ test {
     _ = world;
     // gen:tests:end
     _ = doctor;
+    _ = backup_set;
 }
 
 test "OCG2ISSUER external import cannot reach identity signer hooks or impl" {

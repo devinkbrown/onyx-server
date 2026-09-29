@@ -391,6 +391,36 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
         } else
+        // GAP-D6 restore drill checks latest.json and reopens the account
+        // snapshot in a scratch directory. It does not boot, bind, or send mail.
+        if (std.mem.eql(u8, first, "--restore-drill")) {
+            const backup_dir = args.next() orelse {
+                std.debug.print("{s}\n", .{onyx_server.daemon.backup_set.drill_usage});
+                std.process.exit(2);
+            };
+            const into_flag = args.next() orelse {
+                std.debug.print("{s}\n", .{onyx_server.daemon.backup_set.drill_usage});
+                std.process.exit(2);
+            };
+            if (!std.mem.eql(u8, into_flag, "--into")) {
+                std.debug.print("{s}\n", .{onyx_server.daemon.backup_set.drill_usage});
+                std.process.exit(2);
+            }
+            const scratch_dir = args.next() orelse {
+                std.debug.print("{s}\n", .{onyx_server.daemon.backup_set.drill_usage});
+                std.process.exit(2);
+            };
+            if (args.next() != null) {
+                std.debug.print("{s}\n", .{onyx_server.daemon.backup_set.drill_usage});
+                std.process.exit(2);
+            }
+            onyx_server.daemon.backup_set.restoreDrill(allocator, init.io, backup_dir, scratch_dir) catch |err| {
+                std.debug.print("restore-drill failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            std.debug.print("restore-drill OK: {s} -> {s}/restored.wal\n", .{ backup_dir, scratch_dir });
+            return;
+        } else
         // `onyx-server acme-issue ...` runs an out-of-band ACME issuance and exits.
         // Linux-only (raw socket syscalls); comptime-gated so non-linux targets
         // never analyze the linux-specific ACME path.
@@ -444,12 +474,13 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print(
                 \\usage: onyx-server [CONFIG_PATH]
                 \\       onyx-server --check-config <path>
+                \\       {s}
                 \\       onyx-server doctor <config> [metrics-url]
                 \\       onyx-server --version
                 \\       onyx-server acme-issue ...
                 \\       onyx-server delegated-credential inspect|validate ...
                 \\
-            , .{});
+            , .{onyx_server.daemon.backup_set.drill_usage});
             return;
         } else if (first.len > 0 and first[0] == '-') {
             // An unrecognized dash-flag must NEVER be treated as a config path — a

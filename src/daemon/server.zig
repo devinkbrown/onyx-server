@@ -145,6 +145,7 @@ const memo_durable = @import("memo_durable.zig");
 const marker_durable = @import("marker_durable.zig");
 const gag_durable = @import("gag_durable.zig");
 const abuse_durable = @import("abuse_durable.zig");
+const backup_set = @import("backup_set.zig");
 const account_abuse_mod = @import("account_abuse.zig");
 const vhost_durable = @import("vhost_durable.zig");
 const chanstats_mod = @import("chanstats.zig");
@@ -6909,66 +6910,34 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn appendBackupManifestFile(
-        w: *std.Io.Writer,
-        first: *bool,
-        kind: []const u8,
-        name: []const u8,
-        source: []const u8,
-    ) !void {
-        if (!first.*) try w.writeByte(',');
-        first.* = false;
-        try w.writeAll("{\"kind\":");
-        try writeJsonEscaped(w, kind);
-        try w.writeAll(",\"name\":");
-        try writeJsonEscaped(w, name);
-        try w.writeAll(",\"source\":");
-        try writeJsonEscaped(w, source);
-        try w.writeByte('}');
-    }
-
     fn writeBackupSet(self: *LinuxServer, io: std.Io) bool {
-        const max_backup_file_bytes: usize = 512 << 20;
         const generated_unix = @divTrunc(platform.realtimeMillis(), 1000);
-        var manifest_buf: [2048]u8 = undefined;
-        var w = std.Io.Writer.fixed(&manifest_buf);
-        w.writeAll("{\"generated_at\":") catch return false;
-        w.print("{d}", .{generated_unix}) catch return false;
-        w.writeAll(",\"files\":[") catch return false;
-        var first = true;
-        var failed = false;
+        const svc = self.account_services orelse return false;
+        svc.compactStoreForBackup() catch return false;
+        var name_buf: [96]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "accounts-{d}.db.snap", .{generated_unix}) catch return false;
+        const source = if (self.config.account_store_path.len != 0) self.config.account_store_path else svc.store.snapshot_path;
+        if (!self.copyFileToBackup(io, svc.store.snapshot_path, name, backup_set.max_backup_file_bytes)) return false;
 
-        if (self.account_services) |svc| {
-            if (svc.compactStoreForBackup()) {
-                var name_buf: [96]u8 = undefined;
-                const name = std.fmt.bufPrint(&name_buf, "accounts-{d}.db.snap", .{generated_unix}) catch "";
-                if (name.len != 0 and self.copyFileToBackup(io, svc.store.snapshot_path, name, max_backup_file_bytes)) {
-                    const source = if (self.config.account_store_path.len != 0) self.config.account_store_path else svc.store.snapshot_path;
-                    appendBackupManifestFile(&w, &first, "accounts", name, source) catch return false;
-                } else {
-                    failed = true;
-                }
-            } else |_| {
-                failed = true;
-            }
-        }
-
+        var files: [2]backup_set.Artifact = undefined;
+        files[0] = .{ .kind = "accounts", .name = name, .source = source };
+        var file_count: usize = 1;
+        var chanstats_included = false;
         if (self.config.chanstats_dir.len != 0) {
             chanstats_mod.saveSnapshot(&self.chanstats, io, self.config.chanstats_dir);
             var src_buf: [1024]u8 = undefined;
-            const src = std.fmt.bufPrint(&src_buf, "{s}/.chanstats.snapshot", .{self.config.chanstats_dir}) catch "";
-            var name_buf: [96]u8 = undefined;
-            const name = std.fmt.bufPrint(&name_buf, "chanstats-{d}.snapshot", .{generated_unix}) catch "";
-            if (src.len != 0 and name.len != 0 and self.copyFileToBackup(io, src, name, max_backup_file_bytes)) {
-                appendBackupManifestFile(&w, &first, "chanstats", name, src) catch return false;
-            } else {
-                failed = true;
-            }
+            const src = std.fmt.bufPrint(&src_buf, "{s}/.chanstats.snapshot", .{self.config.chanstats_dir}) catch return false;
+            var stats_name_buf: [96]u8 = undefined;
+            const stats_name = std.fmt.bufPrint(&stats_name_buf, "chanstats-{d}.snapshot", .{generated_unix}) catch return false;
+            if (!self.copyFileToBackup(io, src, stats_name, backup_set.max_backup_file_bytes)) return false;
+            files[1] = .{ .kind = backup_set.chanstats_name, .name = stats_name, .source = src };
+            file_count = 2;
+            chanstats_included = true;
         }
 
-        if (failed) return false;
-        w.writeAll("]}") catch return false;
-        return writeFileAtomicStatus(io, self.config.backup_dir, "latest.json", w.buffered());
+        var manifest_buf: [4096]u8 = undefined;
+        const manifest = backup_set.writeManifest(&manifest_buf, generated_unix, files[0..file_count], chanstats_included) catch return false;
+        return writeFileAtomicStatus(io, self.config.backup_dir, "latest.json", manifest);
     }
 
     fn copyFileToBackup(self: *LinuxServer, io: std.Io, source_path: []const u8, name: []const u8, limit: usize) bool {
