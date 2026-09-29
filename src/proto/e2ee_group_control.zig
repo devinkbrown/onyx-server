@@ -6,6 +6,13 @@
 //! The daemon is a delivery service, never a group member. This module parses
 //! only the routing metadata the daemon must authorize; `payload` remains
 //! opaque base64url and is never decrypted, derived, or persisted here.
+//!
+//! 1.x threat boundary: ciphertext retained from an old epoch stays readable
+//! by whoever already held that epoch's key. This module has no epoch key, so
+//! it cannot re-encrypt history or erase the key. Metadata-min mode is not a
+//! daemon mode. NAMES, authorized search, and abuse handling still see
+//! membership and the plaintext a caller is allowed to see. Ciphertext bodies
+//! stay out of search. Server history rekey does not follow from this boundary.
 const std = @import("std");
 const e2ee_policy = @import("e2ee_policy.zig");
 

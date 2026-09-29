@@ -99,6 +99,22 @@ fans changes through signed `ENTITY_PROP` replication. This gives clients a
 mesh-visible device-key directory without introducing a second key store or a
 server-side plaintext path.
 
+### 1.x threat boundary
+
+A retained `ONYXROOM1` envelope from an old epoch stays readable by whoever
+held that epoch's key. The daemon does not hold the key. `E2EE.COMMIT`,
+`E2EE.WELCOME`, and `E2EE.KEYPACKAGE` payloads stay opaque base64url, and a
+required room stores the envelope rather than plaintext. Re-encrypting history
+on the server would require the daemon to see the epoch key or the plaintext.
+Erasing a former member's copy of an old epoch key is a client choice. 1.x
+does not add a server history-rekey mode.
+
+Metadata-min mode, which would hide nicks, sizes, and timing from the server,
+is not a daemon mode. `NAMES` still lists members. Authorized search still
+returns plaintext the caller can see, and it still drops ciphertext bodies.
+Abuse handling still sees the connection. Sealed rooms stay unstarted while
+the client group journey is open. Neither feature follows from this boundary.
+
 ## Portable account identity
 
 Ryujin portable identity starts as account-owned Ed25519 assertions. `IDENTITY`

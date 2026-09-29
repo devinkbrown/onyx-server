@@ -8,7 +8,10 @@
 
 const std = @import("std");
 const lotus = @import("../proto/lotus.zig");
+const e2ee_group = @import("../proto/e2ee_group_control.zig");
 const e2ee_policy = @import("../proto/e2ee_policy.zig");
+const names_reply = @import("../proto/names_reply.zig");
+const world_projection = @import("world_projection.zig");
 
 pub const Borrowed = struct {
     target: []const u8,
@@ -364,4 +367,76 @@ test "GAP-P5 mesh search query round trip rejects a short reply" {
     try std.testing.expectEqualStrings("ONYXROOM1 secret", got[1].text);
     try std.testing.expect(decodeReply(reply[0 .. reply.len - 1], &got) == null);
     try std.testing.expect(encodeQuery(1, "#room", &words, qbuf[0..4]) == null);
+}
+
+test "GAP-K7 retained history stays opaque and membership stays visible" {
+    const payload = "AQIDBA";
+    const params = [_][]const u8{ "#root", "commit", "laptop.1", payload };
+    const record = try e2ee_group.parse(&params);
+    try std.testing.expectEqual(payload.ptr, record.payload.ptr);
+    try std.testing.expectEqualStrings(payload, record.payload);
+    try std.testing.expectEqualStrings("E2EE.COMMIT", record.kind.wireTag());
+    try std.testing.expect(!@hasDecl(e2ee_group, "decrypt"));
+    try std.testing.expect(!@hasDecl(e2ee_group, "rekeyHistory"));
+    try std.testing.expect(!@hasDecl(e2ee_group, "metadataMin"));
+    try std.testing.expect(!@hasDecl(e2ee_policy, "decryptRoom"));
+    try std.testing.expect(!@hasDecl(e2ee_policy, "metadataMin"));
+
+    try std.testing.expectEqual(e2ee_policy.Policy.required, e2ee_policy.policyValue("required").?);
+    try std.testing.expect(!e2ee_policy.requiredRoomTextPairing("+onyx/e2ee=mls", "hello from alice"));
+
+    var body: [e2ee_policy.min_room_envelope_decoded_len]u8 = @splat(0);
+    body[0] = e2ee_policy.room_envelope_version;
+    var wire_buf: [e2ee_policy.max_room_envelope_wire_len]u8 = undefined;
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const prefix = e2ee_policy.room_envelope_prefix;
+    const encoded_len = encoder.calcSize(body.len);
+    @memcpy(wire_buf[0..prefix.len], prefix);
+    _ = encoder.encode(wire_buf[prefix.len..][0..encoded_len], &body);
+    const wire = wire_buf[0 .. prefix.len + encoded_len];
+    try std.testing.expect(e2ee_policy.isCanonicalRoomEnvelope(wire));
+    try std.testing.expect(e2ee_policy.requiredRoomTextPairing("+onyx/e2ee=mls", wire));
+    try std.testing.expect(std.mem.indexOf(u8, wire, "hello from alice") == null);
+
+    try std.testing.expect(keep(true, "hello from alice", null));
+    try std.testing.expect(isCiphertext(wire, "+onyx/e2ee=mls"));
+    try std.testing.expect(!keep(true, wire, "+onyx/e2ee=mls"));
+    try std.testing.expect(!keep(false, "hello from alice", null));
+
+    const locals = [_]world_projection.Member{
+        .{ .prefixes = "@", .nick = "alice", .user = "u", .host = "local.host" },
+    };
+    const remotes = [_]world_projection.RemoteMember{
+        .{ .nick = "carol", .prefixes = "+", .server_name = "irc2.mesh" },
+    };
+    const merged = try world_projection.mergeMembers(std.testing.allocator, &locals, &remotes);
+    defer std.testing.allocator.free(merged);
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+
+    var lines: [8]names_reply.NamesLine = undefined;
+    var sink = names_reply.NamesLineSink{ .lines = &lines };
+    var scratch: [2048]u8 = undefined;
+    try names_reply.writeNamesReplies(
+        &scratch,
+        "irc.local",
+        "observer",
+        "#chat",
+        '=',
+        merged,
+        .{ .multi_prefix = true, .userhost_in_names = true },
+        &sink,
+    );
+    var saw_alice = false;
+    var saw_carol = false;
+    for (sink.slice()) |line| {
+        if (std.mem.indexOf(u8, line.bytes, "alice") != null) saw_alice = true;
+        if (std.mem.indexOf(u8, line.bytes, "carol") != null) saw_carol = true;
+    }
+    try std.testing.expect(saw_alice);
+    try std.testing.expect(saw_carol);
+
+    std.debug.print(
+        "GAP-K7 branch=written threat boundary; history rekey is not a daemon mode because the daemon holds no epoch key; metadata-min is refused because NAMES search and abuse require server-visible membership; implementation does not follow\n",
+        .{},
+    );
 }
