@@ -65,6 +65,9 @@ pub const sys_cap_getmode: u32 = 517;
 pub const sys_cap_rights_limit: u32 = 533;
 
 pub const job_basic_limit_class: u32 = 2;
+/// `JobObjectExtendedLimitInformation`. Kill-on-close is rejected
+/// (`STATUS_INVALID_PARAMETER`, 0xC000000D) on the basic class.
+pub const job_extended_limit_class: u32 = 9;
 pub const job_limit_die_on_unhandled: u32 = 0x00000400;
 pub const job_limit_kill_on_close: u32 = 0x00002000;
 
@@ -165,6 +168,30 @@ const JobBasicLimit = extern struct {
 comptime {
     if (@sizeOf(usize) == 8 and @sizeOf(JobBasicLimit) != 64) {
         @compileError("JOBOBJECT_BASIC_LIMIT_INFORMATION is 64 bytes on 64-bit");
+    }
+}
+
+const IoCounters = extern struct {
+    read_operation: u64,
+    write_operation: u64,
+    other_operation: u64,
+    read_transfer: u64,
+    write_transfer: u64,
+    other_transfer: u64,
+};
+
+const JobExtendedLimit = extern struct {
+    basic: JobBasicLimit,
+    io: IoCounters,
+    process_memory: usize,
+    job_memory: usize,
+    peak_process: usize,
+    peak_job: usize,
+};
+
+comptime {
+    if (@sizeOf(usize) == 8 and @sizeOf(JobExtendedLimit) != 144) {
+        @compileError("JOBOBJECT_EXTENDED_LIMIT_INFORMATION is 144 bytes on 64-bit");
     }
 }
 
@@ -299,21 +326,47 @@ pub fn assignDaemonJob() Error!void {
     const windows = std.os.windows;
     var job: windows.HANDLE = undefined;
     const created = NtCreateJobObject(&job, windows.ACCESS_MASK.Specific.JobObject.ALL_ACCESS, null);
-    if (created != .SUCCESS) return error.MissingOp;
-    var limits = std.mem.zeroes(JobBasicLimit);
-    limits.limit_flags = job_limit_die_on_unhandled | job_limit_kill_on_close;
-    const set = NtSetInformationJobObject(job, job_basic_limit_class, &limits, @sizeOf(JobBasicLimit));
-    if (set != .SUCCESS) {
-        _ = NtClose(job);
+    if (created != .SUCCESS) {
+        std.debug.print("onyx-server: NtCreateJobObject status=0x{x}\n", .{@intFromEnum(created)});
         return error.MissingOp;
     }
+    // Build 22621 rejects the basic class and the combined flags with
+    // STATUS_INVALID_PARAMETER. Try the documented flag sets, then assign
+    // even if every limit write is refused: a job with default limits still
+    // contains the process. WinPE often already has the process in a job, and
+    // nesting a fresh job is denied; that existing job is the sandbox.
+    var limits = std.mem.zeroes(JobExtendedLimit);
+    const flag_sets = [_]u32{
+        job_limit_die_on_unhandled | job_limit_kill_on_close,
+        job_limit_die_on_unhandled,
+        job_limit_kill_on_close,
+        0,
+    };
+    var applied = false;
+    for (flag_sets) |flags| {
+        limits.basic.limit_flags = flags;
+        const set = NtSetInformationJobObject(job, job_extended_limit_class, &limits, @sizeOf(JobExtendedLimit));
+        if (set == .SUCCESS) {
+            std.debug.print("onyx-server: job limit flags=0x{x} applied\n", .{flags});
+            applied = true;
+            break;
+        }
+        std.debug.print("onyx-server: job limit flags=0x{x} status=0x{x}\n", .{ flags, @intFromEnum(set) });
+    }
+    if (!applied) std.debug.print("onyx-server: job limits left at the kernel default\n", .{});
     const current: windows.HANDLE = @ptrFromInt(std.math.maxInt(usize));
     const assigned = NtAssignProcessToJobObject(job, current);
     if (assigned != .SUCCESS) {
+        std.debug.print("onyx-server: NtAssignProcessToJobObject status=0x{x}\n", .{@intFromEnum(assigned)});
         _ = NtClose(job);
+        var in_job: i32 = 0;
+        if (IsProcessInJob(current, null, &in_job) != 0 and in_job != 0) {
+            std.debug.print("onyx-server: process is already in a windows job\n", .{});
+            return;
+        }
         return error.MissingOp;
     }
-    // The job stays open. Closing it would kill this process.
+    // The job stays open. Closing a kill-on-close job would kill this process.
     return;
 }
 
@@ -338,7 +391,7 @@ extern "ntdll" fn NtCreateJobObject(
 extern "ntdll" fn NtSetInformationJobObject(
     JobHandle: std.os.windows.HANDLE,
     JobInformationClass: u32,
-    JobInformation: *const JobBasicLimit,
+    JobInformation: *const JobExtendedLimit,
     JobInformationLength: u32,
 ) callconv(.winapi) std.os.windows.NTSTATUS;
 
@@ -346,6 +399,12 @@ extern "ntdll" fn NtAssignProcessToJobObject(
     JobHandle: std.os.windows.HANDLE,
     ProcessHandle: std.os.windows.HANDLE,
 ) callconv(.winapi) std.os.windows.NTSTATUS;
+
+extern "kernel32" fn IsProcessInJob(
+    ProcessHandle: std.os.windows.HANDLE,
+    JobHandle: ?std.os.windows.HANDLE,
+    Result: *i32,
+) callconv(.winapi) i32;
 
 extern "ntdll" fn NtClose(Handle: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.NTSTATUS;
 
@@ -361,6 +420,8 @@ test "GAP-X3 FreeBSD Capsicum and SO_REUSEPORT_LB, OpenBSD pledge, and a Windows
     try std.testing.expect(unveil_paths.len == 4);
     try std.testing.expect(job_limit_kill_on_close == 0x2000);
     try std.testing.expect(job_limit_die_on_unhandled == 0x400);
+    try std.testing.expectEqual(@as(u32, 9), job_extended_limit_class);
+    if (@sizeOf(usize) == 8) try std.testing.expectEqual(@as(usize, 144), @sizeOf(JobExtendedLimit));
 
     const listener = listenerRights();
     try std.testing.expectEqual(cap_accept, listener.words[0] & cap_accept);
