@@ -8,6 +8,10 @@
 //! (FIPS 204 Algorithms 3 and 8). There is no key generation and no signing
 //! here by design.
 //!
+//! 1.x permanently verifies and does not sign. A later signing implementation
+//! requires NIST ACVP `sigGen` vectors and is not 1.x. There is no private
+//! hybrid certificate profile.
+//!
 //! All three FIPS 204 parameter sets are supported, generic over a comptime
 //! `Params` struct so the lattice/NTT/decode machinery is written once:
 //!

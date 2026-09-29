@@ -24,7 +24,10 @@
 
 const std = @import("std");
 const ml_dsa = @import("ml_dsa.zig");
+const slh_dsa = @import("slh_dsa.zig");
 const x509_verify = @import("x509_verify.zig");
+const tls_server = @import("tls_server.zig");
+const tls_signature_scheme = @import("../proto/tls_signature_scheme.zig");
 const testing = std.testing;
 
 const vectors_txt = @embedFile("ml_dsa65_sigver_acvp.txt");
@@ -306,4 +309,101 @@ test "x509 dispatch: verifyCertSignature routes id-ML-DSA-65 to the KAT-verified
         error.InvalidKey,
         x509_verify.verifyCertSignature(v.msg, v.sig, &sig_alg_oid, null, short_spki),
     );
+}
+
+test "GAP-K5 verify-only is the permanent 1.x posture" {
+    const backing = testing.allocator;
+    var vecs = try parseVectors(backing);
+    defer {
+        for (vecs.items) |v| freeVector(backing, v);
+        vecs.deinit(backing);
+    }
+
+    var chosen: ?Vector = null;
+    for (vecs.items) |v| {
+        if (v.expect and v.mode == .external and v.ctx.len == 0) {
+            chosen = v;
+            break;
+        }
+    }
+    const v = chosen orelse return error.NoEmptyContextAcceptVector;
+
+    // The shipped verifier accepts one external ACVP vector and rejects a
+    // flipped signature byte. This is sigVer, not a signature this tree minted.
+    try testing.expect(ml_dsa.verify65(v.pk, v.msg, v.ctx, v.sig));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bad_sig = try a.dupe(u8, v.sig);
+    bad_sig[ml_dsa.CTILDE_LEN + 2] ^= 0x01;
+    try testing.expect(!ml_dsa.verify65(v.pk, v.msg, v.ctx, bad_sig));
+
+    const sig_alg_oid = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12 };
+    const spki = try buildMlDsaSpki(a, v.pk);
+    try x509_verify.verifyCertSignature(v.msg, v.sig, &sig_alg_oid, null, spki);
+    try testing.expectError(
+        error.BadSignature,
+        x509_verify.verifyCertSignature(v.msg, bad_sig, &sig_alg_oid, null, spki),
+    );
+
+    // Empty slices miss the SLH-DSA public-key and signature lengths.
+    try testing.expect(!slh_dsa.Sha2_128s.verify(&.{}, &.{}, &.{}, &.{}));
+
+    const absent = [_][]const u8{ "sign", "sign44", "sign65", "sign87", "keyGen", "generate" };
+    inline for (absent) |name| {
+        try testing.expect(!@hasDecl(ml_dsa, name));
+        try testing.expect(!@hasDecl(slh_dsa, name));
+    }
+    const sets = .{
+        slh_dsa.Sha2_128s,
+        slh_dsa.Sha2_128f,
+        slh_dsa.Sha2_192s,
+        slh_dsa.Sha2_192f,
+        slh_dsa.Sha2_256s,
+        slh_dsa.Sha2_256f,
+        slh_dsa.Shake_128s,
+        slh_dsa.Shake_128f,
+        slh_dsa.Shake_192s,
+        slh_dsa.Shake_192f,
+        slh_dsa.Shake_256s,
+        slh_dsa.Shake_256f,
+    };
+    inline for (sets) |Set| {
+        try testing.expect(@hasDecl(Set, "verify"));
+        try testing.expect(!@hasDecl(Set, "sign"));
+        try testing.expect(!@hasDecl(Set, "keyGen"));
+        try testing.expect(!@hasDecl(Set, "generate"));
+    }
+
+    try testing.expect(@hasField(tls_server.Config, "signing_key"));
+    try testing.expect(@hasField(tls_server.Config, "ecdsa_p256_signing_key"));
+    try testing.expect(@hasField(tls_server.Config, "rsa_signing_key"));
+    try testing.expect(!@hasField(tls_server.Config, "ml_dsa_signing_key"));
+    try testing.expect(!@hasField(tls_server.Config, "slh_dsa_signing_key"));
+
+    const SignatureScheme = tls_signature_scheme.SignatureScheme;
+    try testing.expect(std.meta.stringToEnum(SignatureScheme, "ed25519") != null);
+    try testing.expect(std.meta.stringToEnum(SignatureScheme, "ecdsa_secp256r1_sha256") != null);
+    try testing.expect(std.meta.stringToEnum(SignatureScheme, "rsa_pss_rsae_sha256") != null);
+    try testing.expect(std.meta.stringToEnum(SignatureScheme, "mldsa44") == null);
+    try testing.expect(std.meta.stringToEnum(SignatureScheme, "mldsa65") == null);
+    try testing.expect(std.meta.stringToEnum(SignatureScheme, "mldsa87") == null);
+
+    const info = @typeInfo(SignatureScheme).@"enum";
+    const drafts = [_]u16{ 0x0904, 0x0905, 0x0906 };
+    inline for (info.field_names) |name| {
+        try testing.expect(std.mem.indexOf(u8, name, "ml_dsa") == null);
+        try testing.expect(std.mem.indexOf(u8, name, "mldsa") == null);
+        try testing.expect(std.mem.indexOf(u8, name, "slh") == null);
+        try testing.expect(std.mem.indexOf(u8, name, "sphincs") == null);
+    }
+    inline for (info.field_values) |value| {
+        inline for (drafts) |code| {
+            try testing.expect(value != code);
+        }
+    }
+    inline for (drafts) |code| {
+        const scheme: SignatureScheme = @enumFromInt(code);
+        try testing.expect(std.enums.tagName(SignatureScheme, scheme) == null);
+    }
 }

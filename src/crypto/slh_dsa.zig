@@ -9,6 +9,10 @@
 //! so this module implements only `slh_verify` / `slh_verify_internal`
 //! (FIPS 205 Algorithms 24 and 20). There is no key generation and no signing.
 //!
+//! 1.x permanently verifies and does not sign. A later signing implementation
+//! requires NIST ACVP `sigGen` vectors and is not 1.x. There is no private
+//! hybrid certificate profile.
+//!
 //! A single generic `Verifier(P)` is instantiated once per parameter set
 //! (`Sha2_128s`, `Shake_256f`, …). The parameter sets differ only in the numeric
 //! tree/FORS/Winternitz parameters (Table 2) and the tweakable-hash family

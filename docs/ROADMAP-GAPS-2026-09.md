@@ -1101,7 +1101,7 @@ because each one fights an invariant above.
 | Delegated-credential mint and rotation | A presented credential is verified. Nothing mints or rotates one. |
 | CLI Landlock, seccomp, pledge, and unveil | The armor CLI applies none. Daemon Linux landlock and seccomp stay on the GAP-X3 path. pledge and unveil are absent. |
 | Full DTLS listener for IRC | Media-plane DTLS-SRTP is the DTLS this daemon has. |
-| PQ hybrid certificates of our own design | Wait for a ratified profile (GAP-K5). |
+| PQ hybrid certificates of our own design | 1.x stays verify-only. No private hybrid profile (GAP-K5). |
 | Adopting `substrate/io/ring.zig` as the server | Unfinished, and it is not the live ring. |
 | Multishot recv, buf rings, `send_zc` inside 0.8 | Helix buffer ownership. Separate project after GAP-X1. |
 | XDP, BPF firewall, TPROXY, `SCHED_FIFO` | Not the IRC problem. |
