@@ -42,6 +42,10 @@ pub const id_stop: u8 = 15;
 /// Padding element id (skipped during iteration).
 pub const id_padding: u8 = 0;
 
+/// One-byte extension whose single data byte is the frame's spatial layer.
+/// A packet with no such element is spatial layer 0.
+pub const spatial_layer_id: u8 = 13;
+
 const endian = .big;
 
 pub const Error = error{ Truncated, BadProfile, NotPresent, TooLong };

@@ -46374,6 +46374,7 @@ pub const LinuxServer = struct {
                 return;
             };
             self.native_media.setSelection(channel, nick, .{ .max_spatial = max_spatial, .max_temporal = max_temporal });
+            _ = self.media_plane.setReceiverSpatial(channel, nick, max_spatial);
             var detail_buf: [64]u8 = undefined;
             const detail = std.fmt.bufPrint(&detail_buf, "spatial<={d} temporal<={d}", .{ max_spatial, max_temporal }) catch return;
             try self.sendMediaEventReply(conn, "LAYER", channel, detail);
@@ -46430,6 +46431,7 @@ pub const LinuxServer = struct {
                 return;
             };
             self.native_media.setSelection(channel, nick, .{ .max_spatial = selected.spatial, .max_temporal = @intCast(selected.temporal) });
+            _ = self.media_plane.setReceiverSpatial(channel, nick, selected.spatial);
             var detail_buf: [160]u8 = undefined;
             const keyframe = if (hint.request_keyframe) "true" else "false";
             const detail = std.fmt.bufPrint(&detail_buf, "action={s} bitrate={d} fec={d} keyframe={s} spatial<={d} temporal<={d}", .{
@@ -53878,6 +53880,57 @@ test "GAP-O5 REHASH DRY prints diffs and applies none" {
     try std.testing.expect(server.warden.check(.{ .address = "203.0.113.9" }, 0) != null);
 
     std.debug.print("GAP-O5 branch=REHASH DRY named ward class limit and listener diffs, applied none, then a real REHASH applied the limit without moving the listener\n", .{});
+}
+
+test "GAP-V3 MEDIA ABR stores independent spatial ceilings from the hint" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const low_id = try addTestLocalClient(&server, "low", null);
+    const high_id = try addTestLocalClient(&server, "high", null);
+    _ = try server.world.join("#v", worldIdFromClient(low_id));
+    _ = try server.world.join("#v", worldIdFromClient(high_id));
+    const low = server.rx().clients.get(low_id).?;
+    const high = server.rx().clients.get(high_id).?;
+    low.send_armed = true;
+    high.send_armed = true;
+
+    const join_low = try irc_line.parseLine("MEDIA JOIN #v voice");
+    const join_high = try irc_line.parseLine("MEDIA JOIN #v voice");
+    try server.handleMedia(low_id, low, &join_low);
+    try server.handleMedia(high_id, high, &join_high);
+    try server.native_media.register("#v", "low", .voice, 11, .{});
+    try server.native_media.register("#v", "high", .voice, 12, .{});
+    try std.testing.expect(server.media_plane.allocate("#v", "low") != null);
+    try std.testing.expect(server.media_plane.allocate("#v", "high") != null);
+
+    // Congested report: loss drives abrHint down to the base spatial layer.
+    const abr_low = try irc_line.parseLine("MEDIA ABR #v 200 200 20 10");
+    try server.handleMedia(low_id, low, &abr_low);
+    // Uncongested report with headroom: abrHint raises this receiver only.
+    const abr_high = try irc_line.parseLine("MEDIA ABR #v 1100 6000 0 20");
+    try server.handleMedia(high_id, high, &abr_high);
+
+    try std.testing.expectEqual(@as(u8, 0), server.native_media.selectionOf("#v", "low").max_spatial);
+    try std.testing.expectEqual(@as(u8, 2), server.native_media.selectionOf("#v", "high").max_spatial);
+    try std.testing.expectEqual(@as(u8, 0), server.media_plane.receiverSpatial("#v", "low").?);
+    try std.testing.expectEqual(@as(u8, 2), server.media_plane.receiverSpatial("#v", "high").?);
+
+    const low_reply = low.send_buf[0..low.send_len];
+    const high_reply = high.send_buf[0..high.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, low_reply, "spatial<=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, high_reply, "spatial<=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, low_reply, "action=decrease") != null);
+    try std.testing.expect(std.mem.indexOf(u8, high_reply, "action=increase") != null);
+
+    std.debug.print("GAP-V3 branch=MEDIA ABR applies each receiver's abrHint to its own spatial ceiling\n", .{});
 }
 
 /// Real encrypted link pair for daemon-level retained-replay tests. Keeping the

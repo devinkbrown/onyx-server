@@ -67,6 +67,10 @@ pub fn NativeMediaPlane(comptime max_participants: usize) type {
             }
         }
 
+        pub fn selectionOf(self: *const Self, id: ParticipantId) Selection {
+            return self.selectionFor(id);
+        }
+
         fn selectionFor(self: *const Self, id: ParticipantId) Selection {
             for (self.sel_ids[0..self.sel_len], 0..) |existing, i| {
                 if (existing.eql(&id)) return self.sel_vals[i];

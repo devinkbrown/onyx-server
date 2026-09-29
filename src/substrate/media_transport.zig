@@ -20,8 +20,13 @@ const ice = @import("../proto/ice.zig");
 const stun = @import("../proto/stun.zig");
 const srtp = @import("../proto/srtp.zig");
 const rtp_nack = @import("rtp_nack.zig");
+const rtp_ext = @import("../proto/rtp_ext.zig");
 
 /// Packets retained per sender for NACK retransmission (RFC 4585).
+/// This cache is the product recovery path: at most `rtx_capacity` packets
+/// per publisher, oldest sequence dropped first. A distinct RFC 4588 RTX
+/// SSRC is not the product; DTLS-SRTP cannot re-protect an index already
+/// sent to that recipient without reusing the SRTP nonce.
 pub const rtx_capacity: usize = 512;
 
 /// SRTP master key (16) + master salt (14): the per-call SDES keying material
@@ -43,6 +48,9 @@ pub const Endpoint = struct {
     /// The peer's bound media address, set once a connectivity check succeeds.
     /// Null means ICE has not completed; the SFU skips it as a forward target.
     remote: ?TransportAddress = null,
+    /// Highest spatial layer forwarded to this receiver. 255 accepts every
+    /// layer. Another receiver's ceiling is a different endpoint field.
+    max_spatial: u8 = 255,
     /// The RTP SSRC the participant publishes (learned from its first packet).
     ssrc: u32 = 0,
     /// Media packets/bytes received from this participant and relayed onward.
@@ -224,13 +232,23 @@ pub const MediaTransport = struct {
         if (self.get(channel, participant)) |ep| ep.ssrc = ssrc;
     }
 
+    /// Record the highest spatial layer `participant` will receive. False when
+    /// that endpoint does not exist yet.
+    pub fn setReceiverSpatial(self: *MediaTransport, channel: []const u8, participant: []const u8, max_spatial: u8) bool {
+        const ep = self.get(channel, participant) orelse return false;
+        ep.max_spatial = max_spatial;
+        return true;
+    }
+
     /// Fill `out` with the bound remote addresses of every *other* connected
-    /// participant in `channel` (the SFU forward set for a packet originating
-    /// from `from`). Returns how many were written.
+    /// participant in `channel` whose spatial ceiling admits `spatial`.
+    /// Returns how many were written. A receiver at a lower ceiling is skipped
+    /// without changing anyone else's ceiling.
     pub fn forwardTargets(
         self: *MediaTransport,
         channel: []const u8,
         from: []const u8,
+        spatial: u8,
         out: []TransportAddress,
     ) usize {
         var n: usize = 0;
@@ -240,6 +258,7 @@ pub const MediaTransport = struct {
             const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
             if (!std.mem.eql(u8, key[0..sep], channel)) continue;
             if (std.mem.eql(u8, key[sep + 1 ..], from)) continue; // don't echo to sender
+            if (spatial > entry.value_ptr.max_spatial) continue;
             const remote = entry.value_ptr.remote orelse continue;
             if (n >= out.len) break;
             out[n] = remote;
@@ -324,7 +343,17 @@ pub const MediaTransport = struct {
             if (seq) |s| ep.rtx.onSent(s, packet) catch {};
         }
         const sep = std.mem.indexOfScalar(u8, key, 0) orelse return 0;
-        return self.forwardTargets(key[0..sep], key[sep + 1 ..], out);
+        return self.forwardTargets(key[0..sep], key[sep + 1 ..], rtpSpatialLayer(packet), out);
+    }
+
+    /// Spatial layer from the one-byte RTP extension. No extension, a short
+    /// packet, or a parse failure is layer 0 so an unmarked packet still
+    /// reaches every receiver.
+    fn rtpSpatialLayer(packet: []const u8) u8 {
+        const data = rtp_ext.find(packet, rtp_ext.spatial_layer_id) catch return 0;
+        const bytes = data orelse return 0;
+        if (bytes.len != 1) return 0;
+        return bytes[0];
     }
 
     /// Copy a cached RTP packet (by media SSRC + sequence) into `out` for NACK
@@ -475,14 +504,14 @@ test "forwardTargets returns other connected peers only" {
 
     // No one is connected yet -> empty forward set.
     var out: [8]TransportAddress = undefined;
-    try testing.expectEqual(@as(usize, 0), mt.forwardTargets("#c", "alice", &out));
+    try testing.expectEqual(@as(usize, 0), mt.forwardTargets("#c", "alice", 0, &out));
 
     try testing.expect(mt.bindRemote("#c", "bob", testAddr(2, 5002)));
     try testing.expect(mt.bindRemote("#c", "carol", testAddr(3, 5003)));
     try testing.expect(mt.bindRemote("#other", "dave", testAddr(9, 5009)));
 
     // alice's packet forwards to bob+carol (connected, same channel), not dave.
-    const n = mt.forwardTargets("#c", "alice", &out);
+    const n = mt.forwardTargets("#c", "alice", 0, &out);
     try testing.expectEqual(@as(usize, 2), n);
     for (out[0..n]) |addr| try testing.expect(addr.port == 5002 or addr.port == 5003);
 }
@@ -639,6 +668,61 @@ test "copyRetransmit rejects a cached packet whose header SSRC differs from the 
     try testing.expectEqualSlices(u8, &pkt_aa, rtx[0..ok]);
     // A NACK for 0xAA/11 must NOT return the 0xBB-header packet cached at seq 11.
     try testing.expect(mt.copyRetransmit(0xAA, 11, &rtx) == null);
+}
+
+fn writeSpatialRtp(spatial: u8, seq: u16, out: []u8) usize {
+    var ext_buf: [16]u8 = undefined;
+    var layer = [_]u8{spatial};
+    const ext = rtp_ext.buildOneByteExtension(&.{.{ .id = rtp_ext.spatial_layer_id, .data = &layer }}, &ext_buf) catch unreachable;
+    out[0] = 0x90;
+    out[1] = 96;
+    std.mem.writeInt(u16, out[2..4], seq, .big);
+    @memset(out[4..12], 0);
+    @memcpy(out[12..][0..ext.len], ext);
+    out[12 + ext.len] = 0xAB;
+    return 13 + ext.len;
+}
+
+test "GAP-V3 two receivers keep independent spatial layers" {
+    var prng = std.Random.DefaultPrng.init(0x0A3);
+    var mt = MediaTransport.init(testing.allocator);
+    defer mt.deinit();
+    _ = try mt.allocate("#v", "pub", prng.random());
+    _ = try mt.allocate("#v", "low", prng.random());
+    _ = try mt.allocate("#v", "high", prng.random());
+    const pub_addr = testAddr(1, 7001);
+    try testing.expect(mt.bindRemote("#v", "pub", pub_addr));
+    try testing.expect(mt.bindRemote("#v", "low", testAddr(2, 7002)));
+    try testing.expect(mt.bindRemote("#v", "high", testAddr(3, 7003)));
+    try testing.expect(mt.setReceiverSpatial("#v", "low", 0));
+    try testing.expect(mt.setReceiverSpatial("#v", "high", 2));
+    try testing.expectEqual(@as(usize, 512), rtx_capacity);
+
+    var pkt: [64]u8 = undefined;
+    var out: [8]TransportAddress = undefined;
+
+    const high_len = writeSpatialRtp(2, 1, &pkt);
+    const high_n = mt.forwardFromSource(pub_addr, pkt[0..high_len], 0xA1, 1, &out);
+    try testing.expectEqual(@as(usize, 1), high_n);
+    try testing.expectEqual(@as(u16, 7003), out[0].port);
+
+    const base_len = writeSpatialRtp(0, 2, &pkt);
+    const base_n = mt.forwardFromSource(pub_addr, pkt[0..base_len], 0xA1, 2, &out);
+    try testing.expectEqual(@as(usize, 2), base_n);
+
+    // Lowering the high receiver does not pull the low receiver's ceiling,
+    // and raising the low receiver does not pull the high one back up.
+    try testing.expect(mt.setReceiverSpatial("#v", "high", 0));
+    try testing.expectEqual(@as(u8, 0), mt.get("#v", "low").?.max_spatial);
+    const dropped = writeSpatialRtp(2, 3, &pkt);
+    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(pub_addr, pkt[0..dropped], 0xA1, 3, &out));
+    try testing.expect(mt.setReceiverSpatial("#v", "low", 2));
+    try testing.expectEqual(@as(u8, 0), mt.get("#v", "high").?.max_spatial);
+    const only_low = mt.forwardFromSource(pub_addr, pkt[0..dropped], 0xA1, 4, &out);
+    try testing.expectEqual(@as(usize, 1), only_low);
+    try testing.expectEqual(@as(u16, 7002), out[0].port);
+
+    std.debug.print("GAP-V3 branch=rtp per-receiver spatial ceiling from the packet layer; rtx cache {d} is the product, no separate RTX SSRC\n", .{rtx_capacity});
 }
 
 test "group key is stable per call and released when it empties" {

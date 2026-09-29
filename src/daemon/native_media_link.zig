@@ -167,6 +167,11 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             self.plane.setSelection(id, sel);
         }
 
+        pub fn selectionOf(self: *const Self, id_bytes: []const u8) Selection {
+            const id = ParticipantId.init(id_bytes) catch return .{};
+            return self.plane.selectionOf(id);
+        }
+
         /// Remove a participant (MEDIA LEAVE / disconnect).
         pub fn unregister(self: *Self, id_bytes: []const u8) void {
             const id = ParticipantId.init(id_bytes) catch return;
@@ -345,6 +350,31 @@ test "spatial ceiling drops higher band but keyframes always pass" {
     try testing.expectEqual(@as(usize, 1), link.inbound(frame(10, floor, 2, false, &fbuf), &out));
     // keyframe at base layer -> delivered
     try testing.expectEqual(@as(usize, 1), link.inbound(frame(10, floor, 3, true, &fbuf), &out));
+}
+
+test "GAP-V3 native receivers keep different spatial ceilings" {
+    var link = NativeMediaLink(8).init();
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
+    try link.register("src", .video, 10, mkAddr(1, 6100));
+    try link.register("low", .video, 11, mkAddr(2, 6100));
+    try link.register("high", .video, 12, mkAddr(3, 6100));
+    link.setSelection("low", .{ .max_spatial = 0, .max_temporal = 0 });
+    link.setSelection("high", .{ .max_spatial = 2, .max_temporal = 0 });
+
+    var fbuf: [64]u8 = undefined;
+    var out: [8]TransportAddress = undefined;
+    const high_n = link.inbound(frame(10, floor + 2, 1, false, &fbuf), &out);
+    try testing.expectEqual(@as(usize, 1), high_n);
+    try testing.expect(out[0].eql(mkAddr(3, 6100)));
+
+    const base_n = link.inbound(frame(10, floor, 2, false, &fbuf), &out);
+    try testing.expectEqual(@as(usize, 2), base_n);
+
+    link.setSelection("low", .{ .max_spatial = 1, .max_temporal = 0 });
+    try testing.expectEqual(@as(u8, 2), link.selectionOf("high").max_spatial);
+    const mid_n = link.inbound(frame(10, floor + 1, 3, false, &fbuf), &out);
+    try testing.expectEqual(@as(usize, 2), mid_n);
+    try testing.expectEqual(@as(u8, 1), link.selectionOf("low").max_spatial);
 }
 
 test "unregister removes a participant from the forward set" {

@@ -709,8 +709,10 @@ pub const MediaPlane = struct {
         // retransmit of a packet the recipient RECEIVED-then-lost is fail-closed
         // (returns null, nothing sent), since re-using an SRTP nonce is forbidden.
         // A packet never forwarded to the recipient (e.g. a mid-join gap) still
-        // retransmits. Loss-recovery for already-sent DTLS packets needs RFC 4588
-        // RTX (a distinct retransmission SSRC) — deferred to a later increment.
+        // retransmits. The product recovery path is that cache
+        // (`media_transport.rtx_capacity` packets per publisher). A distinct
+        // RFC 4588 RTX SSRC is not the product: re-protecting an index already
+        // sent to this recipient would reuse an SRTP nonce.
         const req_state = self.dtlsState(requester);
         if (req_state == .unavailable) return; // DTLS peer with no context ⇒ nothing to send
         for (missing) |seq| {
@@ -731,6 +733,23 @@ pub const MediaPlane = struct {
                 }
             }
         }
+    }
+
+    /// Highest spatial layer this RTP receiver accepts, or null when the
+    /// endpoint has not been allocated.
+    pub fn receiverSpatial(self: *MediaPlane, channel: []const u8, participant: []const u8) ?u8 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const ep = self.transport.get(channel, participant) orelse return null;
+        return ep.max_spatial;
+    }
+
+    /// Record a receiver's spatial ceiling on its RTP endpoint. False when
+    /// that endpoint does not exist yet.
+    pub fn setReceiverSpatial(self: *MediaPlane, channel: []const u8, participant: []const u8, max_spatial: u8) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.transport.setReceiverSpatial(channel, participant, max_spatial);
     }
 
     /// Allocate (or rotate) the ICE credentials for a call participant and return

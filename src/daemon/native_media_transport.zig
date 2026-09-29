@@ -405,6 +405,15 @@ pub const NativeMediaTransport = struct {
         link.setSelection(id, sel);
     }
 
+    /// The receiver's stored ceiling, or the default (every layer) when the
+    /// channel or participant has no row yet.
+    pub fn selectionOf(self: *NativeMediaTransport, channel: []const u8, id: []const u8) Selection {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const link = self.channels.getPtr(channel) orelse return .{};
+        return link.selectionOf(id);
+    }
+
     /// Send `bytes` to `dest` on the native socket. Used by the WebRTC relay's
     /// cross-leg sink to deliver cadence-rewrapped frames to native peers.
     pub fn sendTo(self: *NativeMediaTransport, channel: []const u8, dest: TransportAddress, bytes: []const u8) void {
