@@ -3915,6 +3915,9 @@ pub const LinuxServer = struct {
     /// `props`; this table retains delete tombstones for relink convergence.
     channel_prop_clocks: std.StringHashMapUnmanaged(ChannelPropClock) = .empty,
     entity_prop_clocks: std.StringHashMapUnmanaged(EntityPropClock) = .empty,
+    /// Last accepted channel send per member, keyed by folded channel and nick.
+    /// The configured gap is the SLOWMODE prop; this map is only the live timer.
+    slowmode_last: std.StringHashMapUnmanaged(u64) = .empty,
     access: ircx_access_store.AccessStore,
     saccess: ircx_saccess.ServerAccessStore,
     /// Per-channel AKICK (registered auto-kick) list — masks matched on JOIN.
@@ -5815,6 +5818,11 @@ pub const LinuxServer = struct {
                 entry.value_ptr.deinit(self.allocator);
             }
             self.channel_prop_clocks.deinit(self.allocator);
+        }
+        {
+            var it = self.slowmode_last.keyIterator();
+            while (it.next()) |key| self.allocator.free(@constCast(key.*));
+            self.slowmode_last.deinit(self.allocator);
         }
         {
             var it = self.entity_prop_clocks.iterator();
@@ -17018,6 +17026,10 @@ pub const LinuxServer = struct {
         if (is_notice and !sender_op and self.world.channelHasFlag(channel, .no_notice)) return .deny;
         if (min_rank > 0 and modes.rank() < 1) return .deny;
 
+        const slow_exempt = self.remoteHasOverridePrefix(account) or
+            (self.channelSlowmodeVoiceExempt(channel) and modes.canSpeakModerated());
+        if (self.slowmodeDenies(channel, nick, slow_exempt)) return .deny;
+
         return if (opmod_route) .opmoderate else .allow;
     }
 
@@ -22950,6 +22962,107 @@ pub const LinuxServer = struct {
         const ev = self.props.getProp(entity, "EPHEMERAL") catch return 0;
         const secs = std.fmt.parseInt(u64, ev.value, 10) catch return 0;
         return secs *| 1000;
+    }
+
+    /// Configured SLOWMODE gap in milliseconds. 0 means the channel is not limited.
+    fn channelSlowmodeGapMs(self: *LinuxServer, channel: []const u8) u64 {
+        if (channel.len == 0 or (channel[0] != '#' and channel[0] != '&')) return 0;
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const ev = self.props.getProp(entity, "SLOWMODE") catch return 0;
+        const secs = std.fmt.parseInt(u64, ev.value, 10) catch return 0;
+        if (secs == 0 or secs > slowmode_max_secs) return 0;
+        return secs * 1000;
+    }
+
+    /// Voice and channel operators skip the gap unless SLOWVOICE is "0".
+    /// Absent and "1" keep the exemption. Network operators are always exempt.
+    fn channelSlowmodeVoiceExempt(self: *LinuxServer, channel: []const u8) bool {
+        if (channel.len == 0 or (channel[0] != '#' and channel[0] != '&')) return true;
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const ev = self.props.getProp(entity, "SLOWVOICE") catch return true;
+        return !std.mem.eql(u8, ev.value, "0");
+    }
+
+    fn slowmodeKey(channel: []const u8, nick: []const u8, buf: []u8) ?[]const u8 {
+        if (channel.len == 0 or nick.len == 0) return null;
+        if (channel.len + 1 + nick.len > buf.len) return null;
+        for (channel, 0..) |byte, index| buf[index] = std.ascii.toLower(byte);
+        buf[channel.len] = 0;
+        for (nick, 0..) |byte, index| buf[channel.len + 1 + index] = std.ascii.toLower(byte);
+        return buf[0 .. channel.len + 1 + nick.len];
+    }
+
+    fn slowmodeTooSoon(self: *LinuxServer, channel: []const u8, nick: []const u8, gap_ms: u64) bool {
+        var buf: [slowmode_key_max]u8 = undefined;
+        const key = slowmodeKey(channel, nick, &buf) orelse return true;
+        const last = self.slowmode_last.get(key) orelse return false;
+        const now = self.nowU64();
+        if (now < last) return true;
+        return now - last < gap_ms;
+    }
+
+    fn noteSlowmodeSend(self: *LinuxServer, channel: []const u8, nick: []const u8) bool {
+        var buf: [slowmode_key_max]u8 = undefined;
+        const key = slowmodeKey(channel, nick, &buf) orelse return false;
+        const now = self.nowU64();
+        if (self.slowmode_last.getPtr(key)) |slot| {
+            slot.* = now;
+            return true;
+        }
+        const owned = self.allocator.dupe(u8, key) catch return false;
+        self.slowmode_last.put(self.allocator, owned, now) catch {
+            self.allocator.free(owned);
+            return false;
+        };
+        return true;
+    }
+
+    /// True when this send must be refused. An allowed, non-exempt send records
+    /// the timer. A refusal leaves the previous timestamp where it was.
+    fn slowmodeDenies(self: *LinuxServer, channel: []const u8, nick: []const u8, exempt: bool) bool {
+        if (exempt) return false;
+        const gap_ms = self.channelSlowmodeGapMs(channel);
+        if (gap_ms == 0) return false;
+        if (self.slowmodeTooSoon(channel, nick, gap_ms)) return true;
+        return !self.noteSlowmodeSend(channel, nick);
+    }
+
+    fn publishSlowmodeProp(
+        self: *LinuxServer,
+        channel: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        present: bool,
+    ) void {
+        const hlc = self.nextChannelPropHlc();
+        var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+        const ps = self.signLocalChannelProp(present, channel, key, value, owner, hlc, &pk_buf, &sig_buf);
+        if (self.recordChannelPropClock(channel, key, owner, hlc, present, ps.node, ps.pubkey, ps.sig)) {
+            self.announceChannelProp(channel, key, value, owner, hlc, present, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
+        }
+    }
+
+    /// Raid-shield entry for the same SLOWMODE prop a channel operator sets.
+    /// `null` or 0 clears it. The value is what the property checkpoint restores.
+    pub fn setChannelSlowmode(self: *LinuxServer, channel: []const u8, gap_secs: ?u64) !void {
+        if (channel.len == 0 or (channel[0] != '#' and channel[0] != '&')) return error.InvalidChannel;
+        const secs = gap_secs orelse 0;
+        if (secs > slowmode_max_secs) return error.InvalidGap;
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        if (secs == 0) {
+            self.props.deleteProp(entity, "SLOWMODE") catch |err| switch (err) {
+                error.PropMissing => {},
+                else => return err,
+            };
+            self.publishSlowmodeProp(channel, "SLOWMODE", "", "raid-shield", false);
+            return;
+        }
+        var buf: [20]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d}", .{secs}) catch return error.InvalidGap;
+        const ev = try self.props.setProp(entity, "SLOWMODE", text, .{ .id = "raid-shield", .access = .host });
+        self.publishSlowmodeProp(channel, ev.key, ev.value, ev.owner, true);
     }
 
     /// The oldest message timestamp (epoch ms) still visible in `channel`, or 0
@@ -33115,6 +33228,22 @@ pub const LinuxServer = struct {
             if (secs != 0 and (secs < ephemeral_min_secs or secs > ephemeral_max_secs)) return .bad_value;
             return .not_handled;
         }
+        if (std.ascii.eqlIgnoreCase(key, "SLOWMODE")) {
+            // Minimum gap between one member's channel messages, in whole seconds.
+            // 0 or delete clears. The value stays in the generic prop store so the
+            // property checkpoint restores it across USR2.
+            if (deleting) return .not_handled;
+            const secs = std.fmt.parseInt(u64, value, 10) catch return .bad_value;
+            if (secs > slowmode_max_secs) return .bad_value;
+            return .not_handled;
+        }
+        if (std.ascii.eqlIgnoreCase(key, "SLOWVOICE")) {
+            // "0" makes voice and channel operators wait out the gap. "1" or
+            // delete keeps them exempt. Network operators are always exempt.
+            if (deleting) return .not_handled;
+            if (!std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "1")) return .bad_value;
+            return .not_handled;
+        }
         if (std.ascii.eqlIgnoreCase(key, "PINS")) {
             // Pinned messages: a comma-separated list of msgids. Op-gated (all
             // channel prop writes are), bounded here, then persisted+propagated
@@ -33262,6 +33391,11 @@ pub const LinuxServer = struct {
     /// at most 30 days (beyond that, just leave it non-ephemeral).
     const ephemeral_min_secs: u64 = 60;
     const ephemeral_max_secs: u64 = 30 * 24 * 60 * 60;
+    /// SLOWMODE upper bound: one day. Zero disables. Not a table-size cap.
+    const slowmode_max_secs: u64 = 24 * 60 * 60;
+    /// Folded channel, a separator, and the nick. Protocol name limits fit;
+    /// a longer pair fails closed instead of truncating into another member.
+    const slowmode_key_max: usize = 512;
 
     /// A PINS value is a comma-separated list of msgid tokens: each printable,
     /// non-empty, bounded, no whitespace/commas.
@@ -50533,6 +50667,13 @@ pub const LinuxServer = struct {
             return .deny;
         }
 
+        const slow_exempt = conn.session.isOper() or
+            (self.channelSlowmodeVoiceExempt(chan) and member_modes.canSpeakModerated());
+        if (self.slowmodeDenies(chan, conn.session.displayName(), slow_exempt)) {
+            if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (slowmode)");
+            return .deny;
+        }
+
         return if (opmod_route) .opmoderate else .allow;
     }
 
@@ -62044,6 +62185,267 @@ test "DST GAP-A7 listener add or remove refuses UPGRADE with cold restart requir
     server.reactors[0].deferred_upgrade = null;
     std.debug.print("GAP-A7 branch=refuse cold restart required before UPGRADE; unchanged listeners still queue\n", .{});
 }
+
+fn gapP2Say(server: *Server, id: client_model.ClientId, conn: *ConnState, command: []const u8, text: []const u8) !void {
+    var buf: [128]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "{s} #slow :{s}", .{ command, text });
+    var parsed = try irc_line.parseLine(line);
+    try server.handleMessage(id, conn, &parsed, command);
+}
+
+test "DST GAP-P2 channel slowmode gap survives USR2 with oper and voice exemptions" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    var sim = reactor_mod.SimReactor.init(1_000_000);
+    server.reactor = sim.reactor();
+
+    const founder_id = try addTestLocalClient(server, "Founder", "founder");
+    const member_id = try addTestLocalClient(server, "Member", "member");
+    const voiced_id = try addTestLocalClient(server, "Voiced", "voiced");
+    const oper_id = try addTestLocalClient(server, "Oper", "oper");
+    const ear_id = try addTestLocalClient(server, "Ear", "ear");
+    const founder = server.connFor(founder_id).?;
+    const member = server.connFor(member_id).?;
+    const voiced = server.connFor(voiced_id).?;
+    const oper = server.connFor(oper_id).?;
+    const ear = server.connFor(ear_id).?;
+    founder.ircx = true;
+    oper.session.is_oper = true;
+
+    _ = try server.world.join("#slow", worldIdFromClient(founder_id));
+    _ = try server.world.join("#slow", worldIdFromClient(member_id));
+    _ = try server.world.join("#slow", worldIdFromClient(voiced_id));
+    _ = try server.world.join("#slow", worldIdFromClient(oper_id));
+    _ = try server.world.join("#slow", worldIdFromClient(ear_id));
+    _ = try server.world.setMemberMode("#slow", worldIdFromClient(voiced_id), .voice, true);
+
+    const channel = ircx_prop_store.Entity{ .kind = .channel, .id = "#slow" };
+
+    var bad_text = try irc_line.parseLine("PROP #slow SLOWMODE :nope");
+    try server.handleProp(founder_id, founder, &bad_text);
+    try expectContains(founder.send_buf[0..founder.send_len], "Invalid property value");
+    resetTestSendQ(founder);
+    var bad_range = try irc_line.parseLine("PROP #slow SLOWMODE :86401");
+    try server.handleProp(founder_id, founder, &bad_range);
+    try expectContains(founder.send_buf[0..founder.send_len], "Invalid property value");
+    resetTestSendQ(founder);
+    var bad_voice = try irc_line.parseLine("PROP #slow SLOWVOICE :2");
+    try server.handleProp(founder_id, founder, &bad_voice);
+    try expectContains(founder.send_buf[0..founder.send_len], "Invalid property value");
+    resetTestSendQ(founder);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(channel, "SLOWMODE"));
+
+    var set_gap = try irc_line.parseLine("PROP #slow SLOWMODE :2");
+    try server.handleProp(founder_id, founder, &set_gap);
+    try std.testing.expectEqualStrings("2", (try server.props.getProp(channel, "SLOWMODE")).value);
+    try std.testing.expectEqualStrings("Founder", (try server.props.getProp(channel, "SLOWMODE")).owner);
+
+    resetTestSendQ(member);
+    var steal = try irc_line.parseLine("PROP #slow SLOWMODE :9");
+    try server.handleProp(member_id, member, &steal);
+    try expectContains(member.send_buf[0..member.send_len], "Insufficient access");
+    try std.testing.expectEqualStrings("2", (try server.props.getProp(channel, "SLOWMODE")).value);
+    resetTestSendQ(member);
+
+    resetTestSendQ(ear);
+    try gapP2Say(server, member_id, member, "PRIVMSG", "m1");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :m1");
+    resetTestSendQ(member);
+    resetTestSendQ(ear);
+    try gapP2Say(server, member_id, member, "PRIVMSG", "m2");
+    try expectContains(member.send_buf[0..member.send_len], "slowmode");
+    try std.testing.expect(std.mem.indexOf(u8, ear.send_buf[0..ear.send_len], "PRIVMSG #slow :m2") == null);
+    resetTestSendQ(member);
+    resetTestSendQ(ear);
+    try gapP2Say(server, member_id, member, "NOTICE", "n1");
+    try std.testing.expect(std.mem.indexOf(u8, member.send_buf[0..member.send_len], "404") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ear.send_buf[0..ear.send_len], "NOTICE #slow :n1") == null);
+
+    sim.advance(2_000);
+    resetTestSendQ(ear);
+    try gapP2Say(server, member_id, member, "PRIVMSG", "m3");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :m3");
+
+    resetTestSendQ(ear);
+    try gapP2Say(server, oper_id, oper, "PRIVMSG", "o1");
+    try gapP2Say(server, oper_id, oper, "PRIVMSG", "o2");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :o1");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :o2");
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "slowmode") == null);
+
+    resetTestSendQ(ear);
+    try gapP2Say(server, voiced_id, voiced, "PRIVMSG", "v1");
+    try gapP2Say(server, voiced_id, voiced, "PRIVMSG", "v2");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :v1");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :v2");
+
+    resetTestSendQ(founder);
+    var voice_off = try irc_line.parseLine("PROP #slow SLOWVOICE :0");
+    try server.handleProp(founder_id, founder, &voice_off);
+    try std.testing.expectEqualStrings("0", (try server.props.getProp(channel, "SLOWVOICE")).value);
+
+    resetTestSendQ(voiced);
+    resetTestSendQ(ear);
+    try gapP2Say(server, voiced_id, voiced, "PRIVMSG", "v3");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :v3");
+    resetTestSendQ(voiced);
+    resetTestSendQ(ear);
+    try gapP2Say(server, voiced_id, voiced, "PRIVMSG", "v4");
+    try expectContains(voiced.send_buf[0..voiced.send_len], "slowmode");
+    try std.testing.expect(std.mem.indexOf(u8, ear.send_buf[0..ear.send_len], "PRIVMSG #slow :v4") == null);
+
+    resetTestSendQ(founder);
+    resetTestSendQ(ear);
+    try gapP2Say(server, founder_id, founder, "PRIVMSG", "f1");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :f1");
+    resetTestSendQ(founder);
+    resetTestSendQ(ear);
+    try gapP2Say(server, founder_id, founder, "PRIVMSG", "f2");
+    try expectContains(founder.send_buf[0..founder.send_len], "slowmode");
+
+    resetTestSendQ(oper);
+    resetTestSendQ(ear);
+    try gapP2Say(server, oper_id, oper, "PRIVMSG", "o3");
+    try gapP2Say(server, oper_id, oper, "PRIVMSG", "o4");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :o3");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :o4");
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "slowmode") == null);
+
+    sim.advance(2_000);
+    try server.setChannelSlowmode("#slow", null);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(channel, "SLOWMODE"));
+    resetTestSendQ(member);
+    resetTestSendQ(ear);
+    try gapP2Say(server, member_id, member, "PRIVMSG", "m4");
+    try gapP2Say(server, member_id, member, "PRIVMSG", "m5");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :m4");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :m5");
+    try std.testing.expect(std.mem.indexOf(u8, member.send_buf[0..member.send_len], "slowmode") == null);
+
+    try std.testing.expectError(error.InvalidChannel, server.setChannelSlowmode("Member", 2));
+    try std.testing.expectError(error.InvalidGap, server.setChannelSlowmode("#slow", 24 * 60 * 60 + 1));
+    try server.setChannelSlowmode("#slow", 2);
+    try std.testing.expectEqualStrings("2", (try server.props.getProp(channel, "SLOWMODE")).value);
+    try std.testing.expectEqualStrings("raid-shield", (try server.props.getProp(channel, "SLOWMODE")).owner);
+
+    sim.advance(2_000);
+    resetTestSendQ(member);
+    resetTestSendQ(ear);
+    try gapP2Say(server, member_id, member, "PRIVMSG", "m6");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #slow :m6");
+    resetTestSendQ(member);
+    resetTestSendQ(ear);
+    try gapP2Say(server, member_id, member, "PRIVMSG", "m7");
+    try expectContains(member.send_buf[0..member.send_len], "slowmode");
+
+    // The world checkpoint resolves members by a live fd. These fixtures use
+    // fd -1, so they cannot ride that image. The SLOWMODE prop is a separate
+    // checkpoint and must still be there after they leave.
+    try server.world.part("#slow", worldIdFromClient(founder_id));
+    try server.world.part("#slow", worldIdFromClient(member_id));
+    try server.world.part("#slow", worldIdFromClient(voiced_id));
+    try server.world.part("#slow", worldIdFromClient(oper_id));
+    try server.world.part("#slow", worldIdFromClient(ear_id));
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(server, &pieces, &blobs);
+
+    const successor = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    current_reactor = null;
+    _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-gap-p2");
+    current_reactor = &successor.reactors[0];
+    var sim_after = reactor_mod.SimReactor.init(5_000_000);
+    successor.reactor = sim_after.reactor();
+
+    try std.testing.expectEqual(@as(usize, 0), successor.slowmode_last.count());
+    try std.testing.expectEqualStrings("2", (try successor.props.getProp(channel, "SLOWMODE")).value);
+    try std.testing.expectEqualStrings("raid-shield", (try successor.props.getProp(channel, "SLOWMODE")).owner);
+    try std.testing.expectEqualStrings("0", (try successor.props.getProp(channel, "SLOWVOICE")).value);
+
+    const later_id = try addTestLocalClient(successor, "Later", null);
+    const later_voice_id = try addTestLocalClient(successor, "LaterV", null);
+    const later_oper_id = try addTestLocalClient(successor, "LaterO", null);
+    const later_ear_id = try addTestLocalClient(successor, "LaterE", null);
+    const later = successor.connFor(later_id).?;
+    const later_voice = successor.connFor(later_voice_id).?;
+    const later_oper = successor.connFor(later_oper_id).?;
+    const later_ear = successor.connFor(later_ear_id).?;
+    later_oper.session.is_oper = true;
+    _ = try successor.world.join("#slow", worldIdFromClient(later_id));
+    _ = try successor.world.join("#slow", worldIdFromClient(later_voice_id));
+    _ = try successor.world.join("#slow", worldIdFromClient(later_oper_id));
+    _ = try successor.world.join("#slow", worldIdFromClient(later_ear_id));
+    _ = try successor.world.setMemberMode("#slow", worldIdFromClient(later_voice_id), .voice, true);
+
+    resetTestSendQ(later_ear);
+    try gapP2Say(successor, later_id, later, "PRIVMSG", "s1");
+    try expectContains(later_ear.send_buf[0..later_ear.send_len], "PRIVMSG #slow :s1");
+    resetTestSendQ(later);
+    resetTestSendQ(later_ear);
+    try gapP2Say(successor, later_id, later, "PRIVMSG", "s2");
+    try expectContains(later.send_buf[0..later.send_len], "slowmode");
+    try std.testing.expect(std.mem.indexOf(u8, later_ear.send_buf[0..later_ear.send_len], "PRIVMSG #slow :s2") == null);
+
+    resetTestSendQ(later_voice);
+    resetTestSendQ(later_ear);
+    try gapP2Say(successor, later_voice_id, later_voice, "PRIVMSG", "sv1");
+    try expectContains(later_ear.send_buf[0..later_ear.send_len], "PRIVMSG #slow :sv1");
+    resetTestSendQ(later_voice);
+    resetTestSendQ(later_ear);
+    try gapP2Say(successor, later_voice_id, later_voice, "PRIVMSG", "sv2");
+    try expectContains(later_voice.send_buf[0..later_voice.send_len], "slowmode");
+
+    resetTestSendQ(later_oper);
+    resetTestSendQ(later_ear);
+    try gapP2Say(successor, later_oper_id, later_oper, "PRIVMSG", "so1");
+    try gapP2Say(successor, later_oper_id, later_oper, "PRIVMSG", "so2");
+    try expectContains(later_ear.send_buf[0..later_ear.send_len], "PRIVMSG #slow :so1");
+    try expectContains(later_ear.send_buf[0..later_ear.send_len], "PRIVMSG #slow :so2");
+    try std.testing.expect(std.mem.indexOf(u8, later_oper.send_buf[0..later_oper.send_len], "slowmode") == null);
+
+    try successor.setChannelSlowmode("#slow", null);
+    try std.testing.expectError(error.PropMissing, successor.props.getProp(channel, "SLOWMODE"));
+    sim_after.advance(2_000);
+    resetTestSendQ(later);
+    resetTestSendQ(later_ear);
+    try gapP2Say(successor, later_id, later, "PRIVMSG", "s3");
+    try gapP2Say(successor, later_id, later, "PRIVMSG", "s4");
+    try expectContains(later_ear.send_buf[0..later_ear.send_len], "PRIVMSG #slow :s3");
+    try expectContains(later_ear.send_buf[0..later_ear.send_len], "PRIVMSG #slow :s4");
+
+    std.debug.print("GAP-P2 branch=PROP SLOWMODE gap; oper exempt; SLOWVOICE gates voice; raid set and clear; configured gap restored by property checkpoint; in-window timer starts empty after adopt\n", .{});
+}
+
 test "UPGRADE mandatory restored EventHistory and webhook store skip stale disk reload at start" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
