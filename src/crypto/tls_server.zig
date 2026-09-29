@@ -2023,7 +2023,12 @@ pub const Server = struct {
         const psk_body_offset = findPskExtensionBodyOffset(client_hello_raw) catch return null;
         const truncated_len = psk_body_offset + binder_list_offset;
         if (truncated_len > client_hello_raw.len) return null;
-        if (!self.verifyPskBinder(suite, opened.opened.psk, client_hello_raw[0..truncated_len], binder)) return null;
+        if (!self.verifyPskBinder(suite, opened.opened.psk, client_hello_raw, client_hello_raw[0..truncated_len], binder)) {
+            // RFC 8446 §4.2.11.2: a binder that skips the HelloRetryRequest
+            // transcript aborts. A first ClientHello falls through.
+            if (self.hrr_sent) return error.BadHandshake;
+            return null;
+        }
 
         @memcpy(self.accepted_psk[0..opened.opened.psk.len], opened.opened.psk);
         self.accepted_psk_len = opened.opened.psk.len;
@@ -2067,21 +2072,34 @@ pub const Server = struct {
         return abs_diff <= @as(i64, self.config.early_data_age_skew_ms);
     }
 
-    fn verifyPskBinder(self: *Server, suite: CipherSuite, psk: []const u8, truncated_client_hello: []const u8, binder: []const u8) bool {
-        _ = self;
+    fn verifyPskBinder(self: *Server, suite: CipherSuite, psk: []const u8, client_hello_raw: []const u8, truncated_client_hello: []const u8, binder: []const u8) bool {
+        // `feed` appends the full ClientHello before this runs. The binder covers
+        // the transcript up to, but not including, that hello, then the truncated
+        // hello. After HelloRetryRequest the prefix is message_hash(CH1) || HRR.
+        const items = self.transcript.items;
+        if (client_hello_raw.len > items.len) return false;
+        const prefix_end = items.len - client_hello_raw.len;
+        if (!std.mem.eql(u8, items[prefix_end..], client_hello_raw)) return false;
+        const prefix = items[0..prefix_end];
         return switch (suite.hashAlg()) {
-            .sha256 => verifyPskBinderT(Sha256, psk, truncated_client_hello, binder),
-            .sha384 => verifyPskBinderT(Sha384, psk, truncated_client_hello, binder),
+            .sha256 => self.verifyPskBinderT(Sha256, psk, prefix, truncated_client_hello, binder),
+            .sha384 => self.verifyPskBinderT(Sha384, psk, prefix, truncated_client_hello, binder),
         };
     }
 
-    fn verifyPskBinderT(comptime KS: type, psk: []const u8, truncated_client_hello: []const u8, binder: []const u8) bool {
+    fn verifyPskBinderT(self: *Server, comptime KS: type, psk: []const u8, prefix: []const u8, truncated_client_hello: []const u8, binder: []const u8) bool {
         if (psk.len != KS.hash_len or binder.len != KS.hash_len) return false;
         var early = KS.earlySecret(psk);
         defer early.wipe();
         var binder_key = KS.deriveSecret(&early, "res binder", &KS.emptyTranscriptHash()) catch return false;
         defer binder_key.wipe();
-        const th = KS.transcriptHash(truncated_client_hello);
+        const th = if (prefix.len == 0) KS.transcriptHash(truncated_client_hello) else blk: {
+            var joined: std.ArrayList(u8) = .empty;
+            defer joined.deinit(self.allocator);
+            joined.appendSlice(self.allocator, prefix) catch return false;
+            joined.appendSlice(self.allocator, truncated_client_hello) catch return false;
+            break :blk KS.transcriptHash(joined.items);
+        };
         const expected = tls_finished.For(KS).verifyData(binder_key.declassify(), th);
         return switch (KS.hash_len) {
             Sha256.hash_len => std.crypto.timing_safe.eql([Sha256.hash_len]u8, expected, binder[0..Sha256.hash_len].*),

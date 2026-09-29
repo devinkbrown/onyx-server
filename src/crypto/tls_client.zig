@@ -6771,3 +6771,212 @@ test "exploit: a change_cipher_spec with an illegal body is rejected by the clie
         try std.testing.expectError(error.BadRecord, client.feed(rec));
     }
 }
+
+/// Offset of the PSK binders list inside a ClientHello handshake message.
+/// The binder hashes everything before that list.
+fn gapK8TruncatedLen(hs: []const u8) !usize {
+    if (hs.len < 4 or hs[0] != @intFromEnum(HandshakeType.client_hello)) return error.TestUnexpectedResult;
+    var pos: usize = 4;
+    if (hs.len < pos + 2 + 32 + 1) return error.TestUnexpectedResult;
+    pos += 2 + 32;
+    const sid_len: usize = hs[pos];
+    pos += 1;
+    if (hs.len < pos + sid_len + 2) return error.TestUnexpectedResult;
+    pos += sid_len;
+    const cs_len = std.mem.readInt(u16, hs[pos..][0..2], .big);
+    pos += 2;
+    if (hs.len < pos + cs_len + 1) return error.TestUnexpectedResult;
+    pos += cs_len;
+    const comp_len: usize = hs[pos];
+    pos += 1;
+    if (hs.len < pos + comp_len + 2) return error.TestUnexpectedResult;
+    pos += comp_len;
+    const ext_len = std.mem.readInt(u16, hs[pos..][0..2], .big);
+    pos += 2;
+    const ext_end = pos + @as(usize, ext_len);
+    if (ext_end > hs.len) return error.TestUnexpectedResult;
+    var e: usize = pos;
+    while (e + tls_extension.header_len <= ext_end) {
+        const typ = std.mem.readInt(u16, hs[e..][0..2], .big);
+        const len = std.mem.readInt(u16, hs[e + 2 ..][0..2], .big);
+        const data_at = e + tls_extension.header_len;
+        if (data_at + @as(usize, len) > ext_end) return error.TestUnexpectedResult;
+        if (typ == @intFromEnum(tls_extension.ExtensionType.pre_shared_key)) {
+            const binders_at = try tls_psk.binderListOffset(hs[data_at .. data_at + len]);
+            return data_at + binders_at;
+        }
+        e = data_at + len;
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn gapK8ClientHello2(server: anytype, client: *Client, alloc: std.mem.Allocator) ![]u8 {
+    const ch1 = try client.start();
+    defer alloc.free(ch1);
+    const hrr = switch (try server.feed(ch1)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(hrr);
+    if (!server.hrr_sent) return error.TestUnexpectedResult;
+    return switch (try client.feed(hrr)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+}
+
+/// Replace `record`'s binder with one computed over `prefix || truncated CH`.
+/// `binder_client` must hold the same ticket. Its transcript is restored.
+fn gapK8SpliceBinder(alloc: std.mem.Allocator, binder_client: *Client, record: []const u8, prefix: []const u8) ![]u8 {
+    if (record.len < tls_record.record_header_len) return error.TestUnexpectedResult;
+    const hs = record[tls_record.record_header_len..];
+    const truncated_len = try gapK8TruncatedLen(hs);
+    const offer = binder_client.resume_offer orelse return error.TestUnexpectedResult;
+    const hash_len = offer.psk_len;
+    if (truncated_len + 3 + hash_len > hs.len) return error.TestUnexpectedResult;
+    const saved = try alloc.dupe(u8, binder_client.transcript.items);
+    defer alloc.free(saved);
+    binder_client.transcript.clearRetainingCapacity();
+    try binder_client.transcript.appendSlice(binder_client.allocator, prefix);
+    var binder: [max_hash_len]u8 = undefined;
+    try binder_client.computePskBinder(hs[0..truncated_len], binder[0..hash_len]);
+    binder_client.transcript.clearRetainingCapacity();
+    try binder_client.transcript.appendSlice(binder_client.allocator, saved);
+    const copy = try alloc.dupe(u8, record);
+    const at = tls_record.record_header_len + truncated_len + 2 + 1;
+    @memcpy(copy[at..][0..hash_len], binder[0..hash_len]);
+    secureZero(binder[0..hash_len]);
+    return copy;
+}
+
+test "GAP-K8 an HRR resumption with a correct binder resumes and an omitting binder is rejected" {
+    const tls_server = @import("tls_server.zig");
+    const alloc = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6e)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x6e, 0x08 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try tls_server.Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+    });
+    defer server.deinit();
+    var client = try Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    var resumed_server = try tls_server.Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+    });
+    defer resumed_server.deinit();
+    var resumed_client = try Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    try resumed_client.setSessionTicket(stored, 0);
+    resumed_client.offerNoSharesForTest();
+    const ch2 = try gapK8ClientHello2(&resumed_server, &resumed_client, alloc);
+    defer alloc.free(ch2);
+
+    const hs = ch2[tls_record.record_header_len..];
+    try std.testing.expect(std.mem.endsWith(u8, resumed_client.transcript.items, hs));
+    const prefix = resumed_client.transcript.items[0 .. resumed_client.transcript.items.len - hs.len];
+    const hash_len = resumed_client.resume_offer.?.psk_len;
+    try std.testing.expect(prefix.len > 4 + hash_len);
+    try std.testing.expectEqual(@as(u8, 0xFE), prefix[0]);
+    try std.testing.expect(prefix[4 + hash_len ..].len > 0);
+
+    const resumed_flight = switch (try resumed_server.feed(ch2)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(resumed_flight);
+    try std.testing.expect(resumed_server.acceptedSessionTicket());
+    const resumed_fin = switch (try resumed_client.feed(resumed_flight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(resumed_fin);
+    try std.testing.expect(resumed_client.handshakeDone());
+    try std.testing.expect(resumed_client.leaf_key == null);
+    _ = try resumed_server.feed(resumed_fin);
+    try std.testing.expect(resumed_server.handshakeDone());
+
+    const down = try resumed_server.encrypt("hrr resumed");
+    defer alloc.free(down);
+    const got = try resumed_client.decrypt(down);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("hrr resumed", got);
+
+    // Each omission is a fresh HelloRetryRequest. The binder is the shipped
+    // client computation over a transcript missing ClientHello1, the
+    // HelloRetryRequest, or both.
+    const kind_count: usize = 3;
+    for (0..kind_count) |kind| {
+        var bad_server = try tls_server.Server.init(alloc, .{
+            .cert_chain = &.{der},
+            .signing_key = kp,
+            .ticket_key = ticket_key,
+        });
+        defer bad_server.deinit();
+        var bad_client = try Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+        defer bad_client.deinit();
+        try bad_client.setSessionTicket(stored, 0);
+        bad_client.offerNoSharesForTest();
+        const bad_ch2 = try gapK8ClientHello2(&bad_server, &bad_client, alloc);
+        defer alloc.free(bad_ch2);
+        const bad_hs = bad_ch2[tls_record.record_header_len..];
+        try std.testing.expect(std.mem.endsWith(u8, bad_client.transcript.items, bad_hs));
+        const bad_prefix_live = bad_client.transcript.items[0 .. bad_client.transcript.items.len - bad_hs.len];
+        try std.testing.expect(bad_prefix_live.len > 4 + hash_len);
+        const owned_prefix = try alloc.dupe(u8, bad_prefix_live);
+        defer alloc.free(owned_prefix);
+        const omit: []const u8 = switch (kind) {
+            0 => &.{},
+            1 => owned_prefix[0 .. 4 + hash_len],
+            2 => owned_prefix[4 + hash_len ..],
+            else => unreachable,
+        };
+        const spliced = try gapK8SpliceBinder(alloc, &bad_client, bad_ch2, omit);
+        defer alloc.free(spliced);
+        const truncated_len = try gapK8TruncatedLen(bad_hs);
+        const binder_at = tls_record.record_header_len + truncated_len + 2 + 1;
+        try std.testing.expect(!std.mem.eql(u8, bad_ch2[binder_at..][0..hash_len], spliced[binder_at..][0..hash_len]));
+        try std.testing.expectError(error.BadHandshake, bad_server.feed(spliced));
+        try std.testing.expect(!bad_server.acceptedSessionTicket());
+        try std.testing.expect(!bad_server.handshakeDone());
+    }
+
+    std.debug.print("GAP-K8 branch=an HRR resumption binder covers ClientHello1 and the HelloRetryRequest\n", .{});
+}
