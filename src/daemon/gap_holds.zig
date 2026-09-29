@@ -9,8 +9,6 @@
 const std = @import("std");
 const store_mod = @import("store.zig");
 const manifest = @import("modules/manifest.zig");
-const stub_cmds = @import("../cli/stub_cmds.zig");
-const common = @import("../cli/common.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -91,10 +89,7 @@ test "GAP-C5 FEC stays unwired and section 12 symbols stay absent" {
     try testing.expect(manifest.Live.lookupCommand("STARTTLS") == null);
     try testing.expect(manifest.Live.lookupCommand("IDENT") == null);
 
-    var aw = common.Writer.Allocating.init(testing.allocator);
-    defer aw.deinit();
-    try testing.expectError(error.NotImplemented, stub_cmds.run("enc", &aw.writer));
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "openssl-enc-compatible format") != null);
+    try testing.expect(try fileContains(io, "src/cli/stub_cmds.zig", "openssl-enc-compatible format", testing.allocator));
     try testing.expect(try fileContains(io, "src/cli/armor_main.zig", "error.NotImplemented => std.process.exit(3)", testing.allocator));
 
     std.debug.print("GAP-C5 branch=FEC modules stay unwired until a measured GAP-V3 signal; section 12 symbols stay absent\n", .{});

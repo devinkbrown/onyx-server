@@ -50,3 +50,11 @@ test "armorcli stubs answer deterministically" {
     try testing.expectError(error.NotImplemented, run("enc", &aw.writer));
     try testing.expect(std.mem.indexOf(u8, aw.written(), "not yet implemented") != null);
 }
+
+test "GAP-C5 armor enc stays unimplemented" {
+    var aw = Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+    try testing.expectError(error.NotImplemented, run("enc", &aw.writer));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "openssl-enc-compatible format") != null);
+    std.debug.print("GAP-C5 branch=armor enc stays an AEAD-only stub\n", .{});
+}
