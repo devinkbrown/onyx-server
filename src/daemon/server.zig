@@ -53921,6 +53921,10 @@ const PortableServer = struct {
         io_backend.refusePortableReactor(builtin.os.tag, config.ring_entries) catch |err| return err;
         unreachable;
     }
+    /// Heap slot used by `main`. Same refusal as `init`: the reactor loop is the Linux ring.
+    pub fn initInPlace(self: *PortableServer, allocator: std.mem.Allocator, config: Config) ServerError!void {
+        self.* = try init(allocator, config);
+    }
     pub fn deinit(_: *PortableServer) void {}
     pub fn start(_: *PortableServer) void {}
     pub fn boundPort(_: *PortableServer) ServerError!u16 {
@@ -53946,6 +53950,8 @@ const PortableServer = struct {
 
 test "GAP-X1 PortableServer init fails closed through the IoBackend" {
     try std.testing.expectError(error.Unsupported, PortableServer.init(std.testing.allocator, .{ .port = 0 }));
+    var portable: PortableServer = undefined;
+    try std.testing.expectError(error.Unsupported, portable.initInPlace(std.testing.allocator, .{ .port = 0 }));
     std.debug.print("GAP-X1 branch=PortableServer init refuses through the IoBackend\n", .{});
 }
 
