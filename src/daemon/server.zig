@@ -54005,7 +54005,8 @@ test "session replica live publication pairs a newer lease and detached publicat
     const renewed = server.session_replica_store.getAttachmentLease(token, ident.shortId()).?;
     try std.testing.expect(renewed.revision.compare(detached_offer.revision) == .gt);
     try std.testing.expect(server.session_replica_store.hasAttachedOriginOtherThan(token, 999, renewed.issued_at_ms));
-    try std.testing.expect(!server.session_replica_store.hasAttachedOriginOtherThan(token, 999, renewed.expires_at_ms + 1));
+    try std.testing.expect(server.session_replica_store.hasAttachedOriginOtherThan(token, 999, renewed.expires_at_ms + 1));
+    try std.testing.expect(!server.session_replica_store.hasAttachedOriginOtherThan(token, 999, detached_offer.expires_at_ms + 1));
 
     // Detaching one sibling while another exact-token portable attachment
     // survives must advance both OFFER and lease, not create a false-offline.
@@ -54024,6 +54025,105 @@ test "session replica live publication pairs a newer lease and detached publicat
     const sibling_lease = server.session_replica_store.getAttachmentLease(token, ident.shortId()).?;
     try std.testing.expect(sibling_lease.revision.compare(sibling_offer.revision) == .gt);
     try std.testing.expect(server.session_replica_store.hasAttachedOriginOtherThan(token, 999, sibling_lease.issued_at_ms));
+}
+
+test "DST GAP-A10 late lease refresh does not emit QUIT while the session is live" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var home = try node_identity.fromSeed(@as([32]u8, @splat(0x81)), "late-lease-home.test");
+    defer home.deinit();
+    var remote = try node_identity.fromSeed(@as([32]u8, @splat(0x82)), "late-lease-remote.test");
+    defer remote.deinit();
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = home.shortId(),
+        .node_identity = &home,
+        .server_name = "late-lease-home.test",
+        .crypto_io = std.testing.io,
+        .session_migrate_on_detach = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "RemoteLive", "remote-acct");
+    const conn = server.connFor(id).?;
+    const token = server.sessions.resumeHandleForClient("remote-acct", monitorIdFromClient(id)).?.token;
+    try std.testing.expect(server.sessions.markPortableResumeIssued("remote-acct", monitorIdFromClient(id)));
+    try server.world.restoreMember("#late-lease", worldIdFromClient(id), world_model.MemberModes.empty());
+    const observer_id = try addTestLocalClient(&server, "Observer", null);
+    const observer = server.connFor(observer_id).?;
+    try server.world.restoreMember("#late-lease", worldIdFromClient(observer_id), world_model.MemberModes.empty());
+
+    const now: i64 = @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64) - 3_600_000)));
+    const physical: u64 = @intCast(now);
+    const origin = message_relay.originShortId(remote.sign_kp.public_key);
+    const snapshot = try (migration_relay.Snapshot{
+        .nick = "RemoteLive",
+        .umodes = "+i",
+        .channels = &.{},
+        .channel_modes = &.{},
+        .account = "remote-acct",
+    }).encode(allocator);
+    defer allocator.free(snapshot);
+
+    const offer_epoch = physical - 2_000;
+    const offer_wire = try session_replica_v2.encodeOffer(allocator, .{
+        .operation = .upsert,
+        .token = token,
+        .revision = .{
+            .epoch = offer_epoch,
+            .sequence = (offer_epoch << mesh_clock_mod.seq_bits) | 1,
+            .origin_node = origin,
+        },
+        .issued_at_ms = now - 2_000,
+        .expires_at_ms = now + 3_600_000,
+        .account = "remote-acct",
+        .nick = "RemoteLive",
+        .snapshot = snapshot,
+    }, &remote.sign_kp);
+    defer allocator.free(offer_wire);
+    const offered = try server.session_replica_store.applySignedOffer(
+        try session_replica_v2.decodeOffer(offer_wire),
+        origin,
+        now,
+    );
+    try std.testing.expectEqual(session_replica_v2.ApplyDisposition.inserted, offered.disposition);
+
+    const lease_epoch = physical - 1_000;
+    const lease_wire = try session_replica_v2.encodeAttachmentLease(allocator, .{
+        .token = token,
+        .revision = .{
+            .epoch = lease_epoch,
+            .sequence = (lease_epoch << mesh_clock_mod.seq_bits) | 2,
+            .origin_node = origin,
+        },
+        .issued_at_ms = now - 1_000,
+        .expires_at_ms = now - 1,
+    }, &remote.sign_kp);
+    defer allocator.free(lease_wire);
+    try std.testing.expectEqual(
+        session_replica_v2.AttachmentLeaseDisposition.inserted,
+        try server.session_replica_store.applySignedAttachmentLease(
+            try session_replica_v2.decodeAttachmentLease(lease_wire),
+            now,
+        ),
+    );
+
+    try std.testing.expect(server.connHasExactRemoteSessionAuthority(id, conn));
+    var quit_line = try irc_line.parseLine("QUIT :partition blip");
+    try server.handleQuit(id, conn, &quit_line);
+    try std.testing.expect(server.world.nickOf(worldIdFromClient(id)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, observer.send_buf[0..observer.send_len], " QUIT ") == null);
+
+    const live_offer = server.session_replica_store.getOrigin(token, origin) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!server.session_replica_store.hasAttachedOriginOtherThan(
+        token,
+        server.config.node_id,
+        live_offer.expires_at_ms + 1,
+    ));
 }
 
 test "session attachment lease encode OOM retains exact dirty token until full retry succeeds" {

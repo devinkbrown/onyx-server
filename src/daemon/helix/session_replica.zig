@@ -1693,10 +1693,12 @@ pub const Store = struct {
     }
 
     /// Positive liveness proof for teardown. A retained OFFER alone is never
-    /// sufficient: the matching origin must also hold a nonconflicted,
-    /// nonexpired lease from the same signing key whose revision is newer than
-    /// the current OFFER. Publishing a newer detached OFFER therefore
-    /// invalidates every older live lease without a separate negative object.
+    /// sufficient: the matching origin must also hold a nonconflicted lease
+    /// from the same signing key whose revision is newer than the current
+    /// OFFER. The lease expiry is a refresh hint. Logical presence continues
+    /// until the OFFER's own expiry (the session TTL) or a newer OFFER, which
+    /// is how an explicit detach invalidates an older lease. `now_ms` is the
+    /// caller's local clock. A newer revision by itself does not mean dead.
     pub fn hasAttachedOriginOtherThan(
         self: *const Store,
         token: Token,
@@ -1707,16 +1709,26 @@ pub const Store = struct {
         var it = @constCast(&self.attachment_leases).iterator();
         while (it.next()) |slot| {
             if (!tokenEql(slot.key_ptr.token, token) or slot.key_ptr.origin_node == excluded_origin) continue;
-            const lease = slot.value_ptr;
-            if (lease.conflicted or now_ms > lease.expires_at_ms) continue;
-            const offer = self.getOrigin(token, slot.key_ptr.origin_node) orelse continue;
-            if (offer.quarantine_until_ms != null or now_ms > offer.expires_at_ms) continue;
-            if (lease.revision.compare(offer.revision) != .gt) continue;
-            const signed_offer = decodeOffer(offer.wire) catch continue;
-            if (!std.crypto.timing_safe.eql(sign.PublicKey, signed_offer.signer, lease.signer)) continue;
-            return true;
+            if (self.positiveLeaseCoversUnexpiredOffer(slot.key_ptr.*, slot.value_ptr, now_ms)) return true;
         }
         return false;
+    }
+
+    /// A late lease refresh must not look like a detach while the session
+    /// OFFER is still inside its TTL. Conflicted leases and newer OFFERs do
+    /// not qualify.
+    fn positiveLeaseCoversUnexpiredOffer(
+        self: *const Store,
+        key: OriginKey,
+        lease: *const AttachmentLeaseEntry,
+        now_ms: i64,
+    ) bool {
+        if (lease.conflicted or self.isQuarantined(key.token)) return false;
+        const offer = self.getOrigin(key.token, key.origin_node) orelse return false;
+        if (offer.quarantine_until_ms != null or now_ms > offer.expires_at_ms) return false;
+        if (lease.revision.compare(offer.revision) != .gt) return false;
+        const signed_offer = decodeOffer(offer.wire) catch return false;
+        return std.crypto.timing_safe.eql(sign.PublicKey, signed_offer.signer, lease.signer);
     }
 
     /// Test for any or one exact anti-entropy parent of an authority origin.
@@ -1855,7 +1867,9 @@ pub const Store = struct {
             var victim: ?OriginKey = null;
             var it = self.attachment_leases.iterator();
             while (it.next()) |slot| {
-                if (now_ms > slot.value_ptr.replay_until_ms) {
+                if (now_ms > slot.value_ptr.replay_until_ms and
+                    !self.positiveLeaseCoversUnexpiredOffer(slot.key_ptr.*, slot.value_ptr, now_ms))
+                {
                     victim = slot.key_ptr.*;
                     break;
                 }
@@ -3118,7 +3132,11 @@ test "session replica attachment lease makes retained OFFER liveness explicit an
     try testing.expectEqual(AttachmentLeaseDisposition.superseded, try store.applySignedAttachmentLease(lease_2.decoded, 170));
     try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 170));
     try testing.expect(!store.hasAttachedOriginOtherThan(token, signed_frame.originShortId(origin.public_key), 170));
-    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 261));
+    // The lease refresh is late (expires at 260) and the session OFFER is
+    // still inside its TTL, so the attachment stays present. It ends at the
+    // session TTL, not because a newer clock value arrived.
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 261));
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 10_001));
 
     const reissued_old_clock = try signedAttachmentLease(testing.allocator, .{
         .token = testToken(0xb2),
@@ -3179,7 +3197,8 @@ test "session replica attachment lease conflict and allocation failure stay fail
     try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 160));
     _ = store.sweep(251);
     try testing.expectEqual(@as(usize, 1), store.attachmentLeaseCount());
-    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 251));
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 251));
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 10_001));
     _ = store.sweep(300_203);
     try testing.expectEqual(@as(usize, 0), store.attachmentLeaseCount());
 }
@@ -3213,9 +3232,56 @@ test "session replica attachment lease replay floor rejects older live lease aft
     try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 150));
     _ = store.sweep(201);
     try testing.expectEqual(@as(usize, 1), store.attachmentLeaseCount());
-    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 201));
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 201));
     try testing.expectEqual(AttachmentLeaseDisposition.stale, try store.applySignedAttachmentLease(older_long.decoded, 201));
-    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 201));
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 201));
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 10_001));
+}
+
+test "DST GAP-A10 late attachment lease stays present until the session TTL" {
+    var origin = try testKey(0xa9);
+    defer origin.deinit();
+    const token = testToken(0xa9);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const offer = try signedOffer(testing.allocator, upsertOffer(&origin, token, 200, 1, "live"), &origin);
+    defer testing.allocator.free(offer.wire);
+    const late = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 201, 1),
+        .issued_at_ms = 100,
+        .expires_at_ms = 300,
+    }, &origin);
+    defer testing.allocator.free(late.wire);
+    _ = try store.applySignedOffer(offer.decoded, 0, 150);
+    _ = try store.applySignedAttachmentLease(late.decoded, 150);
+
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 150));
+    // Local clock is past the lease expiry and past the lease revision's
+    // physical component. The session OFFER has not expired, so this is a
+    // late refresh, not a dead peer.
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 301));
+
+    const refreshed = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&origin, 400, 1),
+        .issued_at_ms = 400,
+        .expires_at_ms = 500,
+    }, &origin);
+    defer testing.allocator.free(refreshed.wire);
+    try testing.expectEqual(
+        AttachmentLeaseDisposition.superseded,
+        try store.applySignedAttachmentLease(refreshed.decoded, 400),
+    );
+    try testing.expect(store.hasAttachedOriginOtherThan(token, 999, 400));
+
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 10_001));
+
+    const detached = try signedOffer(testing.allocator, upsertOffer(&origin, token, 600, 1, "detached"), &origin);
+    defer testing.allocator.free(detached.wire);
+    _ = try store.applySignedOffer(detached.decoded, 0, 450);
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 999, 450));
 }
 
 test "session replica attachment lease conflict floor survives unequal expiry replay" {
@@ -5243,7 +5309,8 @@ test "session replica upgrade checkpoint v2 preserves attachment leases and acce
     var expired = try Store.restoreUpgradeCheckpoint(testing.allocator, source.cfg, checkpoint, 351);
     defer expired.deinit();
     try testing.expectEqual(@as(usize, 2), expired.attachmentLeaseCount());
-    try testing.expect(!expired.hasAttachedOriginOtherThan(live_token, 999, 351));
+    try testing.expect(expired.hasAttachedOriginOtherThan(live_token, 999, 351));
+    try testing.expect(!expired.hasAttachedOriginOtherThan(live_token, 999, 10_001));
     try testing.expect(!expired.hasAttachedOriginOtherThan(conflicted_token, 999, 351));
     try testing.expectEqual(@as(usize, 2), expired.entryCount());
 
