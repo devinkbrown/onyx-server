@@ -1282,7 +1282,7 @@ pub fn main(init: std.process.Init) !void {
     // sampled that as 1<->2 oscillation). Fixed: servers come from a reactor-0
     // atomic, users from the shared world nick registry.
 
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .freebsd or builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
         onyx_server.daemon.server.installDaemonKernelSandbox(srv_cfg.config_path) catch |err| {
             std.debug.print("onyx-server: fatal — kernel sandbox: {s}\n", .{@errorName(err)});
             std.process.exit(1);

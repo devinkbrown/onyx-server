@@ -895,6 +895,7 @@ const media_cmd = @import("media_cmd.zig");
 const oper_cmd = @import("oper_cmd.zig");
 const mesh_search = @import("mesh_search.zig");
 const kernel_linux = @import("kernel_linux.zig");
+const kernel_other = @import("kernel_other.zig");
 
 const RingFdToken = ringlane.FdToken;
 
@@ -53982,8 +53983,13 @@ test "GAP-X3 live listener sets TCP_FASTOPEN, TCP_USER_TIMEOUT, and SO_INCOMING_
 
 /// Landlock allowlist plus the seccomp denylist for the long-running daemon.
 pub fn installDaemonKernelSandbox(config_path: ?[]const u8) !void {
-    if (builtin.os.tag != .linux) return;
-    return kernel_linux.installDaemonSandbox(config_path);
+    switch (comptime builtin.os.tag) {
+        .linux => return kernel_linux.installDaemonSandbox(config_path),
+        .freebsd => return kernel_other.enterDaemonCapsicum(&.{}),
+        .openbsd => return kernel_other.pledgeDaemonPaths(),
+        .windows => return kernel_other.assignDaemonJob(),
+        else => return error.MissingOp,
+    }
 }
 
 fn expectPidfdIsSelf(fd: linux.fd_t) !void {
