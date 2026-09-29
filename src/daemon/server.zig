@@ -891,6 +891,7 @@ const ringlane = @import("ringlane.zig");
 const io_backend = @import("io_backend.zig");
 const sendq = @import("sendq.zig");
 const search_cmd = @import("search_cmd.zig");
+const media_cmd = @import("media_cmd.zig");
 const mesh_search = @import("mesh_search.zig");
 const kernel_linux = @import("kernel_linux.zig");
 
@@ -2698,17 +2699,17 @@ pub const ConnState = struct {
         self.clearMediaE2eeAttachment();
     }
 
-    fn bindMediaE2eeAttachment(self: *ConnState, attachment: [16]u8) void {
+    pub fn bindMediaE2eeAttachment(self: *ConnState, attachment: [16]u8) void {
         self.media_e2ee_attachment = attachment;
         self.media_e2ee_attachment_bound = true;
     }
 
-    fn clearMediaE2eeAttachment(self: *ConnState) void {
+    pub fn clearMediaE2eeAttachment(self: *ConnState) void {
         self.media_e2ee_attachment = @splat(0);
         self.media_e2ee_attachment_bound = false;
     }
 
-    fn mediaE2eeAttachmentMatches(self: *const ConnState, attachment: [16]u8) bool {
+    pub fn mediaE2eeAttachmentMatches(self: *const ConnState, attachment: [16]u8) bool {
         return self.media_e2ee_attachment_bound and
             std.crypto.timing_safe.eql([16]u8, self.media_e2ee_attachment, attachment);
     }
@@ -31893,7 +31894,7 @@ pub const LinuxServer = struct {
     }
 
     /// Send a server NOTICE to a single connection.
-    fn noticeTo(self: *LinuxServer, conn: *ConnState, text: []const u8) !void {
+    pub fn noticeTo(self: *LinuxServer, conn: *ConnState, text: []const u8) !void {
         // CWE-93 (CRLF injection): `text` is reflected into a NOTICE line by many
         // callers that pass user-influenced content (WEBHOOK URLs, echoed params,
         // service messages). This builder bypasses the `ReplyCtx` control-byte
@@ -32651,7 +32652,7 @@ pub const LinuxServer = struct {
     /// broadcast did not). Subject is the channel so MEDIA subscribers' channel-glob
     /// masks match; delivery to a NON-oper additionally requires channel membership
     /// (see `mediaEventAllowed`), preserving member-only visibility.
-    fn publishMediaEvent(self: *LinuxServer, action: []const u8, channel: []const u8, nick: []const u8, detail: []const u8) !void {
+    pub fn publishMediaEvent(self: *LinuxServer, action: []const u8, channel: []const u8, nick: []const u8, detail: []const u8) !void {
         // E2EE key-exchange envelopes are still bounded by the IRC/Event Spine
         // line ceiling, but can legitimately exceed the old presence-only
         // scratch size. The server relays these opaque tokens; it never parses
@@ -32665,18 +32666,18 @@ pub const LinuxServer = struct {
     }
 
     const media_e2ee_p256_public_bytes: usize = 65;
-    const media_e2ee_attachment_bytes: usize = 16;
+    pub const media_e2ee_attachment_bytes: usize = 16;
     const media_e2ee_handshake_unsigned_bytes: usize = 211;
-    const media_e2ee_handshake_v2_bytes: usize = 275;
+    pub const media_e2ee_handshake_v2_bytes: usize = 275;
     const media_e2ee_handshake_domain = "onyx-media-handshake-v2\x00";
-    const media_e2ee_max_wrapped_key_bytes: usize = 512;
-    const media_e2ee_max_base64_bytes: usize = std.base64.standard.Encoder.calcSize(media_e2ee_max_wrapped_key_bytes);
+    pub const media_e2ee_max_wrapped_key_bytes: usize = 512;
+    pub const media_e2ee_max_base64_bytes: usize = std.base64.standard.Encoder.calcSize(media_e2ee_max_wrapped_key_bytes);
 
     /// Validate canonical padded RFC 4648 base64 without interpreting the
     /// decoded cryptographic payload. Decoding into fixed stack storage proves
     /// both the alphabet/padding and decoded-size bounds; re-encoding rejects
     /// alternate/non-canonical encodings of the same bytes.
-    fn validMediaE2eeBase64(encoded: []const u8, min_decoded: usize, max_decoded: usize) bool {
+    pub fn validMediaE2eeBase64(encoded: []const u8, min_decoded: usize, max_decoded: usize) bool {
         if (encoded.len == 0 or encoded.len > media_e2ee_max_base64_bytes or encoded.len % 4 != 0) return false;
         const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return false;
         if (decoded_len < min_decoded or decoded_len > max_decoded) return false;
@@ -32693,7 +32694,7 @@ pub const LinuxServer = struct {
     /// leaving its cryptographic contents opaque to the relay. Return the stable
     /// physical attachment id so subsequent GROUPKEY authorship can be bound to
     /// this exact authenticated connection.
-    fn mediaE2eeHandshakeAttachment(encoded: []const u8) ?[media_e2ee_attachment_bytes]u8 {
+    pub fn mediaE2eeHandshakeAttachment(encoded: []const u8) ?[media_e2ee_attachment_bytes]u8 {
         if (!validMediaE2eeBase64(encoded, media_e2ee_handshake_v2_bytes, media_e2ee_handshake_v2_bytes)) return null;
         var envelope: [media_e2ee_handshake_v2_bytes]u8 = undefined;
         std.base64.standard.Decoder.decode(&envelope, encoded) catch return null;
@@ -32724,7 +32725,7 @@ pub const LinuxServer = struct {
         return out[0..offset];
     }
 
-    fn mediaE2eeHandshakeSignatureValid(channel: []const u8, envelope: *const [media_e2ee_handshake_v2_bytes]u8) bool {
+    pub fn mediaE2eeHandshakeSignatureValid(channel: []const u8, envelope: *const [media_e2ee_handshake_v2_bytes]u8) bool {
         const Ed25519 = std.crypto.sign.Ed25519;
         const public_bytes: [Ed25519.PublicKey.encoded_length]u8 = envelope[179..211].*;
         const public_key = Ed25519.PublicKey.fromBytes(public_bytes) catch return false;
@@ -32736,7 +32737,7 @@ pub const LinuxServer = struct {
         return true;
     }
 
-    fn mediaE2eeAttachmentToken(token: []const u8) ?[media_e2ee_attachment_bytes]u8 {
+    pub fn mediaE2eeAttachmentToken(token: []const u8) ?[media_e2ee_attachment_bytes]u8 {
         if (token.len != base64url.encodedLen(media_e2ee_attachment_bytes)) return null;
         var raw: [media_e2ee_attachment_bytes]u8 = undefined;
         const decoded = base64url.decode(&raw, token) catch return null;
@@ -32748,7 +32749,7 @@ pub const LinuxServer = struct {
         return raw;
     }
 
-    fn accountHasMediaIdentityKey(self: *LinuxServer, account: []const u8, public_key: [account_identity.public_key_len]u8) bool {
+    pub fn accountHasMediaIdentityKey(self: *LinuxServer, account: []const u8, public_key: [account_identity.public_key_len]u8) bool {
         const entity = ircx_prop_store.Entity{ .kind = .user, .id = account };
         var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
         const rows = self.props.listProps(entity, &views) catch return false;
@@ -32762,7 +32763,7 @@ pub const LinuxServer = struct {
 
     /// Epochs are opaque client ratchet coordinates, but their wire form is
     /// canonical and bounded: unsigned decimal u64, no sign or leading zeroes.
-    fn validMediaE2eeEpoch(epoch: []const u8) bool {
+    pub fn validMediaE2eeEpoch(epoch: []const u8) bool {
         if (epoch.len == 0 or epoch.len > 20) return false;
         if (epoch.len > 1 and epoch[0] == '0') return false;
         for (epoch) |ch| if (!std.ascii.isDigit(ch)) return false;
@@ -32773,7 +32774,7 @@ pub const LinuxServer = struct {
     /// Render a caller-only MEDIA response in Event Spine wire form. Transport
     /// credentials and MAC keys are intentionally targeted to the requesting
     /// session instead of published to all MEDIA subscribers.
-    fn sendMediaEventReply(self: *LinuxServer, conn: *ConnState, action: []const u8, channel: []const u8, detail: []const u8) !void {
+    pub fn sendMediaEventReply(self: *LinuxServer, conn: *ConnState, action: []const u8, channel: []const u8, detail: []const u8) !void {
         var msg_buf: [event_spine.max_event_line_len]u8 = undefined;
         const message = if (detail.len != 0)
             std.fmt.bufPrint(&msg_buf, "MEDIA {s} {s} {s}", .{ action, channel, detail }) catch return error.OutputTooSmall
@@ -48505,7 +48506,7 @@ pub const LinuxServer = struct {
     }
 
     /// Closed-tab call invite when someone first joins media in a room.
-    fn webpushNotifyCallInvite(self: *LinuxServer, channel: []const u8, from: []const u8) void {
+    pub fn webpushNotifyCallInvite(self: *LinuxServer, channel: []const u8, from: []const u8) void {
         if (self.webpush_worker == null) return;
         var members = self.world.memberIterator(channel) orelse return;
         while (members.next()) |member| {
@@ -48614,7 +48615,7 @@ pub const LinuxServer = struct {
         _ = self.clearOfflineMemo(account);
     }
 
-    fn mediaPhysicalIndex(self: *const LinuxServer, id: client_model.ClientId, channel: []const u8, nick: []const u8) ?usize {
+    pub fn mediaPhysicalIndex(self: *const LinuxServer, id: client_model.ClientId, channel: []const u8, nick: []const u8) ?usize {
         for (self.media_physical_attachments.items, 0..) |*entry, idx| {
             if (entry.client.eql(id) and
                 std.ascii.eqlIgnoreCase(entry.channelSlice(), channel) and
@@ -48643,7 +48644,7 @@ pub const LinuxServer = struct {
 
     /// Stage one physical membership before publishing nick-level MediaRooms
     /// state. Returns whether this is the first physical publisher of `kind`.
-    fn addMediaPhysicalAttachment(
+    pub fn addMediaPhysicalAttachment(
         self: *LinuxServer,
         id: client_model.ClientId,
         channel: []const u8,
@@ -48663,7 +48664,7 @@ pub const LinuxServer = struct {
         return .{ .first_kind = first_kind, .changed = true };
     }
 
-    fn rollbackMediaPhysicalKind(self: *LinuxServer, id: client_model.ClientId, channel: []const u8, nick: []const u8, kind: media_room.MediaKind) void {
+    pub fn rollbackMediaPhysicalKind(self: *LinuxServer, id: client_model.ClientId, channel: []const u8, nick: []const u8, kind: media_room.MediaKind) void {
         const idx = self.mediaPhysicalIndex(id, channel, nick) orelse return;
         const bit = mediaKindBit(kind);
         self.media_physical_attachments.items[idx].kind_bits &= ~bit;
@@ -48694,7 +48695,7 @@ pub const LinuxServer = struct {
     /// old World membership and nick are still available for Event Spine routing.
     /// A surviving same-nick publisher gets attachment-granular crypto teardown;
     /// the final publisher keeps the existing nick-wide LEAVE lifecycle edge.
-    fn retireMediaPhysicalChannel(
+    pub fn retireMediaPhysicalChannel(
         self: *LinuxServer,
         id: client_model.ClientId,
         conn: *ConnState,
@@ -48728,537 +48729,21 @@ pub const LinuxServer = struct {
         return removal;
     }
 
-    /// `MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER|E2EE-*> <#chan> [kind] [arg]` —
-    /// Onyx Server media control plane. Drives the per-channel SFU participant model and
-    /// emits call state through the MEDIA Event Spine plane. The media bytes flow
-    /// over the transport substrate, not this control socket. Caller must be a
-    /// channel member.
+    pub const reply_scratch_bytes: usize = default_reply_bytes;
+
+    pub fn replyNumeric(self: *LinuxServer, conn: *ConnState, code: Numeric, params: []const []const u8, trailing: []const u8) !void {
+        _ = self;
+        return queueNumeric(conn, code, params, trailing);
+    }
+
+    pub fn worldIdOf(self: *LinuxServer, id: client_model.ClientId) world_model.ClientId {
+        _ = self;
+        return worldIdFromClient(id);
+    }
+
+    /// MEDIA control plane. The command body lives in `media_cmd.zig`.
     pub fn handleMedia(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        // TURN has no allocation API and no auth secret. Refuse it before any
-        // channel lookup so a secret or a channel name is not treated as a relay.
-        if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "TURN")) {
-            try self.failReply(conn, "MEDIA", "TURN_CUT", "TURN relay is not offered");
-            return;
-        }
-        if (parsed.param_count < 2) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER> <#chan> [kind]");
-            return;
-        }
-        const sub = parsed.paramSlice()[0];
-        const channel = parsed.paramSlice()[1];
-        if (!world_model.isChannelName(channel) or !self.world.channelExists(channel)) {
-            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
-            return;
-        }
-        // QUALITY is readable by a channel member or an oper who is not on the
-        // channel. A non-member who is not an oper still gets 442. The check
-        // is here, before the membership gate, because that gate would hide
-        // the summary from every oper who is not in the channel.
-        if (std.ascii.eqlIgnoreCase(sub, "QUALITY")) {
-            if (!self.world.isMember(channel, worldIdFromClient(id)) and !conn.session.isOper()) {
-                try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
-                return;
-            }
-            try self.mediaQuality(conn, channel);
-            return;
-        }
-        if (!self.world.isMember(channel, worldIdFromClient(id))) {
-            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
-            return;
-        }
-        const nick = conn.session.displayName();
-
-        if (std.ascii.eqlIgnoreCase(sub, "ROSTER")) {
-            try self.mediaRoster(conn, channel);
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "OFFER")) {
-            if (conn.session.hasUmode(.media_tx_deny)) {
-                try self.failReply(conn, "MEDIA", "TX_DENIED", "Media transmission is disabled for your session");
-                return;
-            }
-            try self.mediaOffer(
-                conn,
-                channel,
-                if (parsed.param_count >= 3) parsed.paramSlice()[2] else "",
-                if (parsed.param_count >= 4) parsed.paramSlice()[3..] else &.{},
-            );
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "ANSWER")) {
-            try self.mediaAnswer(
-                conn,
-                channel,
-                if (parsed.param_count >= 3) parsed.paramSlice()[2] else "",
-                if (parsed.param_count >= 4) parsed.paramSlice()[3..] else &.{},
-            );
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "PROFILE")) {
-            if (self.media_rooms.profileOf(channel)) |prof|
-                try self.mediaNegotiatedReply(conn, channel, "PROFILE", prof.slice(), prof.fec)
-            else
-                try self.failReply(conn, "MEDIA", "NO_OFFER", "No active call profile for this channel");
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "STATS")) {
-            try self.mediaStats(conn, channel);
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "CONSENT")) {
-            if (parsed.param_count < 3) {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA CONSENT <#chan> <on|off>");
-                return;
-            }
-            if (!self.media_rooms.isParticipant(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before setting consent");
-                return;
-            }
-            const token = parsed.paramSlice()[2];
-            const on = std.ascii.eqlIgnoreCase(token, "on") or std.mem.eql(u8, token, "1");
-            const off = std.ascii.eqlIgnoreCase(token, "off") or std.mem.eql(u8, token, "0");
-            if (!on and !off) {
-                try self.failReply(conn, "MEDIA", "BAD_CONSENT", "Consent must be on or off");
-                return;
-            }
-            if (!try self.media_rooms.setConsent(channel, nick, on)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before setting consent");
-                return;
-            }
-            if (!on and self.media_rooms.stopRecording(channel)) {
-                try self.broadcastMediaEvent(channel, "RECORD", nick, "stopped");
-            }
-            try self.broadcastMediaEvent(channel, "CONSENT", nick, if (on) "on" else "off");
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "RECORD")) {
-            if (!self.media_rooms.isParticipant(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before recording");
-                return;
-            }
-            if (parsed.param_count >= 3 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[2], "stop")) {
-                if (self.media_rooms.stopRecording(channel)) {
-                    try self.broadcastMediaEvent(channel, "RECORD", nick, "stopped");
-                } else {
-                    try self.sendMediaEventReply(conn, "RECORD", channel, "active=0");
-                }
-                return;
-            }
-            if (!self.media_rooms.allConsented(channel)) {
-                try self.failReply(conn, "MEDIA", "CONSENT_REQUIRED", "Every current member must consent before recording");
-                return;
-            }
-            if (self.media_rooms.recordingOf(channel)) |rec| {
-                if (rec.active) {
-                    var buf: [96]u8 = undefined;
-                    const detail = std.fmt.bufPrint(&buf, "active=1 by={s}", .{rec.by()}) catch return;
-                    try self.sendMediaEventReply(conn, "RECORD", channel, detail);
-                    return;
-                }
-            }
-            if (!try self.media_rooms.startRecording(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "CONSENT_REQUIRED", "Every current member must consent before recording");
-                return;
-            }
-            try self.broadcastMediaEvent(channel, "RECORD", nick, "started");
-            try self.sendMediaEventReply(conn, "RECORD", channel, "started");
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "LAYER")) {
-            // `MEDIA LAYER <#chan> <max_spatial> <max_temporal>` — receiver-driven
-            // simulcast: ask the native SFU to forward this receiver only up to
-            // the given spatial/temporal layer (e.g. a small screen / slow link
-            // requests the base layer). The SFU drops higher layers without ever
-            // decoding; keyframes at/below the ceiling always pass.
-            if (parsed.param_count < 4) {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA LAYER <#chan> <max_spatial> <max_temporal>");
-                return;
-            }
-            if (!self.media_rooms.isParticipant(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before setting a layer ceiling");
-                return;
-            }
-            const max_spatial = std.fmt.parseInt(u8, parsed.paramSlice()[2], 10) catch {
-                try self.failReply(conn, "MEDIA", "BAD_LAYER", "max_spatial must be 0-255");
-                return;
-            };
-            const max_temporal = std.fmt.parseInt(u3, parsed.paramSlice()[3], 10) catch {
-                try self.failReply(conn, "MEDIA", "BAD_LAYER", "max_temporal must be 0-7");
-                return;
-            };
-            self.native_media.setSelection(channel, nick, .{ .max_spatial = max_spatial, .max_temporal = max_temporal });
-            _ = self.media_plane.setReceiverSpatial(channel, nick, max_spatial);
-            var detail_buf: [64]u8 = undefined;
-            const detail = std.fmt.bufPrint(&detail_buf, "spatial<={d} temporal<={d}", .{ max_spatial, max_temporal }) catch return;
-            try self.sendMediaEventReply(conn, "LAYER", channel, detail);
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "ABR")) {
-            // `MEDIA ABR <#chan> <current_kbps> <available_kbps> <loss_pct> <rtt_ms> [nack_per_sec]`
-            // applies the existing Undertow ABR hint and simulcast selector to this
-            // receiver's native layer ceiling. It is a control-plane hint only; the
-            // SFU still forwards opaque codec bytes and never transcodes.
-            if (parsed.param_count < 6) {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA ABR <#chan> <current_kbps> <available_kbps> <loss_pct> <rtt_ms> [nack_per_sec]");
-                return;
-            }
-            if (!self.media_rooms.isParticipant(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before reporting ABR");
-                return;
-            }
-            const current_kbps = std.fmt.parseInt(u32, parsed.paramSlice()[2], 10) catch {
-                try self.failReply(conn, "MEDIA", "BAD_ABR", "current_kbps must be a positive integer");
-                return;
-            };
-            const available_kbps = std.fmt.parseInt(u32, parsed.paramSlice()[3], 10) catch {
-                try self.failReply(conn, "MEDIA", "BAD_ABR", "available_kbps must be an integer");
-                return;
-            };
-            const loss_pct = std.fmt.parseInt(u8, parsed.paramSlice()[4], 10) catch {
-                try self.failReply(conn, "MEDIA", "BAD_ABR", "loss_pct must be 0-100");
-                return;
-            };
-            const rtt_ms = std.fmt.parseInt(u16, parsed.paramSlice()[5], 10) catch {
-                try self.failReply(conn, "MEDIA", "BAD_ABR", "rtt_ms must be 0-65535");
-                return;
-            };
-            const nack_per_sec = if (parsed.param_count >= 7)
-                std.fmt.parseInt(u16, parsed.paramSlice()[6], 10) catch {
-                    try self.failReply(conn, "MEDIA", "BAD_ABR", "nack_per_sec must be 0-65535");
-                    return;
-                }
-            else
-                0;
-            const hint = undertow_media.abrHint(.{}, .{
-                .current_bitrate_kbps = current_kbps,
-                .available_bitrate_kbps = available_kbps,
-                .packet_loss_percent = loss_pct,
-                .rtt_ms = rtt_ms,
-                .nack_per_second = nack_per_sec,
-            }) catch {
-                try self.failReply(conn, "MEDIA", "BAD_ABR", "Invalid ABR report");
-                return;
-            };
-            const selected = mediaAbrSelection(hint) catch {
-                try self.failReply(conn, "MEDIA", "BAD_ABR", "No active simulcast layer");
-                return;
-            };
-            self.native_media.setSelection(channel, nick, .{ .max_spatial = selected.spatial, .max_temporal = @intCast(selected.temporal) });
-            _ = self.media_plane.setReceiverSpatial(channel, nick, selected.spatial);
-            const stored = self.media_rooms.setQuality(channel, nick, .{
-                .loss_pct = loss_pct,
-                .rtt_ms = rtt_ms,
-                .spatial = selected.spatial,
-                .bitrate_kbps = hint.target_bitrate_kbps,
-            }) catch {
-                try self.failReply(conn, "MEDIA", "BAD_ABR", "Could not store the quality sample");
-                return;
-            };
-            if (!stored) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before reporting ABR");
-                return;
-            }
-            var detail_buf: [160]u8 = undefined;
-            const keyframe = if (hint.request_keyframe) "true" else "false";
-            const detail = std.fmt.bufPrint(&detail_buf, "action={s} bitrate={d} fec={d} keyframe={s} spatial<={d} temporal<={d}", .{
-                mediaAbrActionName(hint.action),
-                hint.target_bitrate_kbps,
-                hint.fec_level,
-                keyframe,
-                selected.spatial,
-                selected.temporal,
-            }) catch return;
-            try self.sendMediaEventReply(conn, "ABR", channel, detail);
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "BREAKOUT")) {
-            if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0) {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA BREAKOUT <#chan> <room>");
-                return;
-            }
-            // Must already be in the call to move between breakouts.
-            if (!self.media_rooms.isParticipant(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before choosing a breakout");
-                return;
-            }
-            const bname = parsed.paramSlice()[2];
-            self.media_rooms.setBreakout(channel, nick, bname) catch {
-                try self.failReply(conn, "MEDIA", "BREAKOUT_FAILED", "Could not set breakout");
-                return;
-            };
-            try self.broadcastMediaEvent(channel, "BREAKOUT", nick, bname);
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "POS")) {
-            if (parsed.param_count < 4) {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA POS <#chan> <x> <y>");
-                return;
-            }
-            if (!self.media_rooms.isParticipant(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before setting a position");
-                return;
-            }
-            const x = std.fmt.parseInt(i32, parsed.paramSlice()[2], 10) catch {
-                try self.failReply(conn, "MEDIA", "INVALID_POSITION", "x and y must be integers");
-                return;
-            };
-            const y = std.fmt.parseInt(i32, parsed.paramSlice()[3], 10) catch {
-                try self.failReply(conn, "MEDIA", "INVALID_POSITION", "x and y must be integers");
-                return;
-            };
-            self.media_rooms.setPosition(channel, nick, .{ .x = x, .y = y }) catch {
-                try self.failReply(conn, "MEDIA", "POS_FAILED", "Could not set position");
-                return;
-            };
-            var xy_buf: [32]u8 = undefined;
-            const xy = std.fmt.bufPrint(&xy_buf, "{d} {d}", .{ x, y }) catch return;
-            try self.broadcastMediaEvent(channel, "POS", nick, xy);
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "CAPTION")) {
-            if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0) {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA CAPTION <#chan> :<text>");
-                return;
-            }
-            if (!self.media_rooms.isParticipant(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before captioning");
-                return;
-            }
-            const text = parsed.paramSlice()[2];
-            _ = self.transcript.push(channel, nick, text, platform.realtimeMillis()) catch {}; // retention is best-effort
-            // Live fan-out via the MEDIA event plane (text is the trailing detail,
-            // so spaces are preserved as the rest of the event body).
-            try self.publishMediaEvent("CAPTION", channel, nick, text);
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "TRANSCRIPT")) {
-            for (self.transcript.recent(channel)) |c| {
-                var buf: [default_reply_bytes]u8 = undefined;
-                const detail = std.fmt.bufPrint(&buf, "{s} :{s}", .{ c.speaker, c.text }) catch continue;
-                try self.sendMediaEventReply(conn, "TRANSCRIPT", channel, detail);
-            }
-            var end_buf: [default_reply_bytes]u8 = undefined;
-            const end = std.fmt.bufPrint(&end_buf, "count={d}", .{self.transcript.recent(channel).len}) catch return;
-            try self.sendMediaEventReply(conn, "TRANSCRIPT-END", channel, end);
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "E2EE-HANDSHAKE") or
-            std.ascii.eqlIgnoreCase(sub, "E2EE-GROUPKEY"))
-        {
-            // E2EE signaling is available only to a stable authenticated
-            // identity that is currently participating in this channel's call.
-            // The outer IRC/TLS session supplies sender authentication; the
-            // server only validates framing/authority and relays opaque crypto.
-            if (conn.session.account() == null) {
-                try self.failReply(conn, "MEDIA", "AUTH_REQUIRED", "Authenticate before exchanging media encryption state");
-                return;
-            }
-            if (self.mediaPhysicalIndex(id, channel, nick) == null or !self.media_rooms.isParticipant(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before exchanging media encryption state");
-                return;
-            }
-
-            if (std.ascii.eqlIgnoreCase(sub, "E2EE-HANDSHAKE")) {
-                if (parsed.param_count != 3) {
-                    try self.failReply(conn, "MEDIA", "BAD_E2EE_HANDSHAKE", "Usage: MEDIA E2EE-HANDSHAKE <#chan> :<base64-signed-v2-envelope>");
-                    return;
-                }
-                const attachment = mediaE2eeHandshakeAttachment(parsed.paramSlice()[2]) orelse {
-                    try self.failReply(conn, "MEDIA", "BAD_E2EE_HANDSHAKE", "Handshake must be a canonical signed-v2 envelope");
-                    return;
-                };
-                var envelope: [media_e2ee_handshake_v2_bytes]u8 = undefined;
-                std.base64.standard.Decoder.decode(&envelope, parsed.paramSlice()[2]) catch unreachable;
-                const identity_public: [account_identity.public_key_len]u8 = envelope[179..211].*;
-                if (!self.accountHasMediaIdentityKey(conn.session.account().?, identity_public)) {
-                    try self.failReply(conn, "MEDIA", "UNENROLLED_E2EE_IDENTITY", "Handshake identity key is not enrolled for this account");
-                    return;
-                }
-                if (!mediaE2eeHandshakeSignatureValid(channel, &envelope)) {
-                    try self.failReply(conn, "MEDIA", "BAD_E2EE_HANDSHAKE", "Handshake signature does not authenticate this channel envelope");
-                    return;
-                }
-                // A physical connection owns at most one live crypto attachment.
-                // Retire a superseded attachment before announcing its replacement
-                // so peers never retain both A and B for this transport. Clear the
-                // local binding immediately after the detach publishes: if the new
-                // handshake publication then fails, the connection is fail-closed
-                // instead of continuing to authorize the already-retired A.
-                if (conn.media_e2ee_attachment_bound and !conn.mediaE2eeAttachmentMatches(attachment)) {
-                    const superseded = conn.media_e2ee_attachment;
-                    try self.publishMediaE2eeDetach(channel, nick, superseded);
-                    conn.clearMediaE2eeAttachment();
-                }
-                var detail_buf: [media_e2ee_max_base64_bytes + 1]u8 = undefined;
-                const detail = std.fmt.bufPrint(&detail_buf, ":{s}", .{parsed.paramSlice()[2]}) catch return error.OutputTooSmall;
-                try self.publishMediaEvent("E2EE-HANDSHAKE", channel, nick, detail);
-                conn.bindMediaE2eeAttachment(attachment);
-                return;
-            }
-
-            if (std.ascii.eqlIgnoreCase(sub, "E2EE-GROUPKEY")) {
-                if (parsed.param_count != 7) {
-                    try self.failReply(conn, "MEDIA", "BAD_E2EE_GROUPKEY", "Usage: MEDIA E2EE-GROUPKEY <#chan> <sender-attachment> <target-nick> <target-attachment> <group-epoch> :<base64-wrapped-key>");
-                    return;
-                }
-                const sender_attachment_token = parsed.paramSlice()[2];
-                const target = parsed.paramSlice()[3];
-                const target_attachment_token = parsed.paramSlice()[4];
-                const epoch = parsed.paramSlice()[5];
-                const wrapped = parsed.paramSlice()[6];
-                const sender_attachment = mediaE2eeAttachmentToken(sender_attachment_token) orelse {
-                    try self.failReply(conn, "MEDIA", "BAD_E2EE_SENDER", "Sender attachment must be canonical base64url");
-                    return;
-                };
-                if (!conn.mediaE2eeAttachmentMatches(sender_attachment)) {
-                    try self.failReply(conn, "MEDIA", "BAD_E2EE_SENDER", "Sender attachment does not match this connection's accepted handshake");
-                    return;
-                }
-                if (target.len == 0 or target.len > client_model.MAX_NICK_BYTES or
-                    !self.world.isMemberByNick(channel, target) or
-                    !self.media_rooms.isParticipant(channel, target))
-                {
-                    try self.failReply(conn, "MEDIA", "BAD_E2EE_TARGET", "Target must be a current participant in this channel's call");
-                    return;
-                }
-                _ = mediaE2eeAttachmentToken(target_attachment_token) orelse {
-                    try self.failReply(conn, "MEDIA", "BAD_E2EE_TARGET", "Target attachment must be canonical base64url");
-                    return;
-                };
-                if (!validMediaE2eeEpoch(epoch) or !validMediaE2eeBase64(wrapped, 1, media_e2ee_max_wrapped_key_bytes)) {
-                    try self.failReply(conn, "MEDIA", "BAD_E2EE_GROUPKEY", "Group epoch and wrapped key must use bounded canonical encodings");
-                    return;
-                }
-                var detail_buf: [base64url.encodedLen(media_e2ee_attachment_bytes) * 2 + client_model.MAX_NICK_BYTES + 20 + media_e2ee_max_base64_bytes + 6]u8 = undefined;
-                const detail = std.fmt.bufPrint(&detail_buf, "{s} {s} {s} {s} :{s}", .{
-                    sender_attachment_token,
-                    target,
-                    target_attachment_token,
-                    epoch,
-                    wrapped,
-                }) catch return error.OutputTooSmall;
-                try self.publishMediaEvent("E2EE-GROUPKEY", channel, nick, detail);
-                return;
-            }
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "QUEUE")) {
-            try self.mediaQueue(conn, channel);
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "HAND")) {
-            if (!self.media_rooms.isParticipant(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before raising your hand");
-                return;
-            }
-            const up = parsed.param_count < 3 or // bare HAND raises
-                std.ascii.eqlIgnoreCase(parsed.paramSlice()[2], "up") or
-                std.ascii.eqlIgnoreCase(parsed.paramSlice()[2], "1");
-            self.media_rooms.setHand(channel, nick, up) catch {
-                try self.failReply(conn, "MEDIA", "HAND_FAILED", "Could not update hand");
-                return;
-            };
-            try self.broadcastMediaEvent(channel, "HAND", nick, if (up) "up" else "down");
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "REACT")) {
-            if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0 or parsed.paramSlice()[2].len > self.config.media_reactions_max_token_bytes) {
-                try self.failReply(conn, "MEDIA", "INVALID_REACTION", "Usage: MEDIA REACT <#chan> <reaction>");
-                return;
-            }
-            if (!self.media_rooms.isParticipant(channel, nick)) {
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before reacting");
-                return;
-            }
-            // Ephemeral: broadcast only, no retention.
-            try self.broadcastMediaEvent(channel, "REACT", nick, parsed.paramSlice()[2]);
-            return;
-        }
-        // E2EE-DETACH is synthesized only by the server when one physical
-        // attachment retires while the shared nick remains in the call. A
-        // client must never be able to forge another device's crypto teardown.
-        if (std.ascii.eqlIgnoreCase(sub, "E2EE-DETACH")) {
-            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "E2EE-DETACH is server-originated");
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(sub, "LEAVE")) {
-            const removal = try self.retireMediaPhysicalChannel(id, conn, channel, nick);
-            if (removal == .absent) try self.noticeTo(conn, "MEDIA: you are not in this call");
-            return;
-        }
-
-        // The remaining subcommands all take a kind (default voice).
-        const kind_tok = if (parsed.param_count >= 3) parsed.paramSlice()[2] else "voice";
-        const kind = media_room.parseKind(kind_tok) orelse {
-            try self.failReply(conn, "MEDIA", "INVALID_KIND", "Kind must be voice, video, or screen");
-            return;
-        };
-        const kname = media_room.kindName(kind);
-
-        if (std.ascii.eqlIgnoreCase(sub, "JOIN")) {
-            if (conn.session.hasUmode(.media_tx_deny)) {
-                try self.failReply(conn, "MEDIA", "TX_DENIED", "Media transmission is disabled for your session");
-                return;
-            }
-            const physical = self.addMediaPhysicalAttachment(id, channel, nick, kind) catch {
-                try self.failReply(conn, "MEDIA", "JOIN_FAILED", "Could not join the call");
-                return;
-            };
-            if (!physical.changed) return;
-            self.media_rooms.join(channel, nick, kind) catch {
-                self.rollbackMediaPhysicalKind(id, channel, nick, kind);
-                try self.failReply(conn, "MEDIA", "JOIN_FAILED", "Could not join the call");
-                return;
-            };
-            if (self.media_physical_attachments.items.len == 1 or physical.first_kind) conn.clearMediaE2eeAttachment();
-            if (physical.first_kind) try self.broadcastMediaEvent(channel, "JOIN", nick, kname);
-            if (physical.first_kind) {
-                if (self.media_rooms.recordingOf(channel)) |rec| {
-                    if (rec.active and !self.media_rooms.hasConsent(channel, nick)) {
-                        _ = self.media_rooms.stopRecording(channel);
-                        try self.broadcastMediaEvent(channel, "RECORD", nick, "stopped");
-                        try self.sendMediaEventReply(conn, "RECORD", channel, "stopped");
-                    }
-                }
-            }
-            // Era 3 C3: closed-tab call invite for co-channel members not yet in media.
-            if (physical.first_kind) self.webpushNotifyCallInvite(channel, nick);
-            // WS media plane: bind this connection to the call and hand it the
-            // per-stream MAC key so its browser can authenticate each datagram.
-            if (self.config.ws_media_relay and conn.ws != null) {
-                conn.setMediaCall(channel, nick);
-                if (conn.mediaCallChannel() != null) self.issueMediaMacKey(conn, channel, nick);
-            }
-        } else if (std.ascii.eqlIgnoreCase(sub, "MUTE")) {
-            if (self.media_rooms.setMuted(channel, nick, kind, true))
-                try self.broadcastMediaEvent(channel, "MUTE", nick, kname)
-            else
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "You are not publishing that kind");
-        } else if (std.ascii.eqlIgnoreCase(sub, "UNMUTE")) {
-            if (conn.session.hasUmode(.media_tx_deny)) {
-                try self.failReply(conn, "MEDIA", "TX_DENIED", "Media transmission is disabled for your session");
-                return;
-            }
-            if (self.media_rooms.setMuted(channel, nick, kind, false))
-                try self.broadcastMediaEvent(channel, "UNMUTE", nick, kname)
-            else
-                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "You are not publishing that kind");
-        } else if (std.ascii.eqlIgnoreCase(sub, "SPEAKING")) {
-            // The speaking queue is visible to the room. This command does not
-            // read it: a member who is not at the head still publishes. The
-            // sender's client enforces "you are not at the head."
-            if (conn.session.hasUmode(.media_tx_deny)) {
-                try self.failReply(conn, "MEDIA", "TX_DENIED", "Media transmission is disabled for your session");
-                return;
-            }
-            const on = parsed.param_count >= 4 and
-                (std.ascii.eqlIgnoreCase(parsed.paramSlice()[3], "on") or std.ascii.eqlIgnoreCase(parsed.paramSlice()[3], "1"));
-            if (self.media_rooms.setSpeaking(channel, nick, kind, on))
-                try self.broadcastMediaEvent(channel, if (on) "SPEAKING" else "SILENT", nick, kname)
-            else
-                try self.failReply(conn, "MEDIA", "NOT_PUBLISHING", "You are not publishing that kind");
-        } else {
-            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, BREAKOUT, POS, HAND, QUEUE, REACT, CAPTION, TRANSCRIPT, CONSENT, RECORD, QUALITY, E2EE-HANDSHAKE, E2EE-GROUPKEY, or ROSTER");
-        }
+        return media_cmd.handle(self, id, conn, parsed);
     }
 
     /// Surface a media (voice/video) presence/state transition through the IRCX
@@ -49266,12 +48751,12 @@ pub const LinuxServer = struct {
     /// `:server EVENT <member> MEDIA …` to MEDIA-subscribed members across all
     /// shards AND every mesh peer (call presence now converges network-wide). The
     /// old local-only media notice broadcast is gone; clients consume EVENT MEDIA.
-    fn broadcastMediaEvent(self: *LinuxServer, channel: []const u8, verb: []const u8, nick: []const u8, kind: []const u8) !void {
+    pub fn broadcastMediaEvent(self: *LinuxServer, channel: []const u8, verb: []const u8, nick: []const u8, kind: []const u8) !void {
         if (self.mediaPresencePrivate(nick)) return;
         try self.publishMediaEvent(verb, channel, nick, kind);
     }
 
-    fn publishMediaE2eeDetach(self: *LinuxServer, channel: []const u8, nick: []const u8, attachment: [media_e2ee_attachment_bytes]u8) !void {
+    pub fn publishMediaE2eeDetach(self: *LinuxServer, channel: []const u8, nick: []const u8, attachment: [media_e2ee_attachment_bytes]u8) !void {
         var token_buf: [base64url.encodedLen(media_e2ee_attachment_bytes)]u8 = undefined;
         const token = base64url.encode(&token_buf, &attachment) catch return error.OutputTooSmall;
         try self.publishMediaEvent("E2EE-DETACH", channel, nick, token);
@@ -49462,7 +48947,7 @@ pub const LinuxServer = struct {
     /// candidates (those are suppressed when unroutable; see
     /// `provisionMediaTransports`). Only the owning participant ever receives
     /// its own key; the server re-derives to verify (stateless).
-    fn issueMediaMacKey(self: *LinuxServer, conn: *ConnState, channel: []const u8, participant: []const u8) void {
+    pub fn issueMediaMacKey(self: *LinuxServer, conn: *ConnState, channel: []const u8, participant: []const u8) void {
         var k32: [cadence_frame.MAC_KEY_BYTES]u8 = undefined;
         cadence_frame.deriveNativeMediaMacKey(&self.native_stream_key, channel, participant, &k32);
         defer std.crypto.secureZero(u8, k32[0..]);
@@ -49633,7 +49118,7 @@ pub const LinuxServer = struct {
 
     /// Emit `MEDIA <label> <#chan> codecs=<list> fec=<scheme>` to the caller as an
     /// Event Spine reply.
-    fn mediaNegotiatedReply(self: *LinuxServer, conn: *ConnState, channel: []const u8, label: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) !void {
+    pub fn mediaNegotiatedReply(self: *LinuxServer, conn: *ConnState, channel: []const u8, label: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) !void {
         var buf: [320]u8 = undefined;
         const detail = formatMediaCodecDetail(&buf, codecs, fec) orelse return;
         try self.sendMediaEventReply(conn, label, channel, detail);
@@ -49655,7 +49140,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn mediaAbrActionName(action: undertow_media.AbrAction) []const u8 {
+    pub fn mediaAbrActionName(action: undertow_media.AbrAction) []const u8 {
         return switch (action) {
             .hold => "hold",
             .increase => "increase",
@@ -49677,7 +49162,7 @@ pub const LinuxServer = struct {
         return if (bps > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(bps);
     }
 
-    fn mediaAbrSelection(hint: undertow_media.AbrHint) !simulcast_select.Selection {
+    pub fn mediaAbrSelection(hint: undertow_media.AbrHint) !simulcast_select.Selection {
         const layers = mediaAbrLayers();
         const target_bps = if (hint.action == .pause) layers[0].bitrate_bps else mediaAbrTargetBps(hint.target_bitrate_kbps);
         return simulcast_select.selectStable(&layers, target_bps, null, 50_000);
@@ -49748,7 +49233,7 @@ pub const LinuxServer = struct {
     /// persist it as the channel's active call profile, and reply with the agreed
     /// set. The UDP transport plane (ICE/STUN/TURN/jitter) is a separate layer;
     /// this is the live signaling/negotiation half.
-    fn mediaOffer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8, extra_args: []const []const u8) !void {
+    pub fn mediaOffer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8, extra_args: []const []const u8) !void {
         var cbuf: [4]sdp.Codec = undefined;
         const cn = parseCodecCsv(&cbuf, codec_csv);
         if (cn == 0) {
@@ -50024,7 +49509,7 @@ pub const LinuxServer = struct {
     /// A DTLS-SRTP answerer may carry its own `fingerprint=sha-256:<hex>`; it is
     /// validated (fail-closed) and stored so the answerer's DTLS leg fails closed
     /// on a certificate mismatch, exactly as the OFFER path.
-    fn mediaAnswer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8, extra_args: []const []const u8) !void {
+    pub fn mediaAnswer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8, extra_args: []const []const u8) !void {
         const prof = self.media_rooms.profileOf(channel) orelse {
             try self.failReply(conn, "MEDIA", "NO_OFFER", "No active call profile; send MEDIA OFFER first");
             return;
@@ -50085,7 +49570,7 @@ pub const LinuxServer = struct {
 
     /// `MEDIA STATS <#chan>` — per-participant transport state: ICE status and
     /// relayed packet/byte counts, terminated by an end line.
-    fn mediaStats(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+    pub fn mediaStats(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         var buf_stats: [64]media_plane_mod.MediaTransport.ParticipantStat = undefined;
         const n = self.media_plane.statsForChannel(channel, &buf_stats);
         for (buf_stats[0..n]) |s| {
@@ -50114,7 +49599,7 @@ pub const LinuxServer = struct {
     /// reported. Loss, RTT, chosen spatial layer, and target bitrate only.
     /// Ice credentials, SRTP keys, and any other keying material are not fields
     /// of the sample and are not copied into the reply.
-    fn mediaQuality(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+    pub fn mediaQuality(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         var emitted: usize = 0;
         for (self.media_rooms.roster(channel)) |p| {
             const sample = self.media_rooms.qualityOf(channel, p.id.slice()) orelse continue;
@@ -50136,7 +49621,7 @@ pub const LinuxServer = struct {
 
     /// `MEDIA QUEUE <#chan>` — raised-hand order, head first. Positions are not
     /// an input, and the reply is only the order the room can read.
-    fn mediaQueue(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+    pub fn mediaQueue(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         var nicks: [media_room.max_participants][]const u8 = undefined;
         const n = self.media_rooms.copySpeakQueue(channel, &nicks);
         for (nicks[0..n], 0..) |speaker, i| {
@@ -50149,7 +49634,7 @@ pub const LinuxServer = struct {
         try self.sendMediaEventReply(conn, "QUEUE-END", channel, end);
     }
 
-    fn mediaRoster(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+    pub fn mediaRoster(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         for (self.media_rooms.roster(channel)) |p| {
             var kinds_buf: [32]u8 = undefined;
             var n: usize = 0;
