@@ -131,6 +131,9 @@ pub const MediaRooms = struct {
     /// Last congestion sample per member. Loss, RTT, chosen spatial layer,
     /// and target bitrate only — never keying material.
     qualities: std.StringHashMap(Quality),
+    /// Raised-hand order per channel. Index 0 is the head. The daemon lists
+    /// this queue and does not refuse speech from a member who is not at the head.
+    queues: std.StringHashMap(std.ArrayList([]u8)),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
         return initConfig(allocator, .{});
@@ -149,6 +152,7 @@ pub const MediaRooms = struct {
             .consents = std.StringHashMap(void).init(allocator),
             .recordings = std.StringHashMap(Recording).init(allocator),
             .qualities = std.StringHashMap(Quality).init(allocator),
+            .queues = std.StringHashMap(std.ArrayList([]u8)).init(allocator),
         };
     }
 
@@ -186,6 +190,13 @@ pub const MediaRooms = struct {
         var qit = self.qualities.keyIterator();
         while (qit.next()) |key| self.allocator.free(key.*);
         self.qualities.deinit();
+        var queue_it = self.queues.iterator();
+        while (queue_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.items) |nick| self.allocator.free(nick);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.queues.deinit();
         self.* = undefined;
     }
 
@@ -206,7 +217,8 @@ pub const MediaRooms = struct {
             self.participant_profiles.count() == 0 and
             self.consents.count() == 0 and
             self.recordings.count() == 0 and
-            self.qualities.count() == 0;
+            self.qualities.count() == 0 and
+            self.queues.count() == 0;
     }
 
     /// Build the "channel\x00participant" composite key into `buf`.
@@ -295,6 +307,10 @@ pub const MediaRooms = struct {
                 };
             }
         } else self.clearHand(channel, pid);
+        if (raised) self.enqueueSpeaker(channel, pid) catch |e| {
+            self.clearHand(channel, pid);
+            return e;
+        };
     }
 
     /// Whether `pid`'s hand is raised in `channel`.
@@ -308,6 +324,61 @@ pub const MediaRooms = struct {
         var kb: [256]u8 = undefined;
         const k = breakoutKey(&kb, channel, pid) orelse return;
         if (self.hands.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+        self.dequeueSpeaker(channel, pid);
+    }
+
+    /// Append `pid` to the channel queue unless they are already in it.
+    /// A non-participant is not queued. The head stays whoever raised first.
+    fn enqueueSpeaker(self: *MediaRooms, channel: []const u8, pid: []const u8) Error!void {
+        if (!self.isParticipant(channel, pid)) return;
+        const gop = try self.queues.getOrPut(channel);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+            gop.key_ptr.* = self.allocator.dupe(u8, channel) catch |e| {
+                _ = self.queues.remove(channel);
+                return e;
+            };
+        }
+        for (gop.value_ptr.items) |existing| {
+            if (std.mem.eql(u8, existing, pid)) return;
+        }
+        if (gop.value_ptr.items.len >= max_participants) return error.ParticipantCapacityExceeded;
+        const owned = self.allocator.dupe(u8, pid) catch |e| return e;
+        gop.value_ptr.append(self.allocator, owned) catch |e| {
+            self.allocator.free(owned);
+            return e;
+        };
+    }
+
+    fn dequeueSpeaker(self: *MediaRooms, channel: []const u8, pid: []const u8) void {
+        const q = self.queues.getPtr(channel) orelse return;
+        var i: usize = 0;
+        while (i < q.items.len) {
+            if (std.mem.eql(u8, q.items[i], pid)) {
+                const owned = q.orderedRemove(i);
+                self.allocator.free(owned);
+                break;
+            }
+            i += 1;
+        }
+        if (q.items.len == 0) self.clearQueue(channel);
+    }
+
+    fn clearQueue(self: *MediaRooms, channel: []const u8) void {
+        if (self.queues.fetchRemove(channel)) |kv| {
+            for (kv.value.items) |nick| self.allocator.free(nick);
+            var list = kv.value;
+            list.deinit(self.allocator);
+            self.allocator.free(kv.key);
+        }
+    }
+
+    /// Copy the speaking queue, head first, into `out`. Returns how many names fit.
+    pub fn copySpeakQueue(self: *const MediaRooms, channel: []const u8, out: [][]const u8) usize {
+        const q = self.queues.get(channel) orelse return 0;
+        const n = @min(out.len, q.items.len);
+        for (q.items[0..n], 0..) |nick, i| out[i] = nick;
+        return n;
     }
 
     /// The room for `channel`, or null when no call is active there.
@@ -568,6 +639,7 @@ pub const MediaRooms = struct {
         const r = entry.value_ptr.*;
         self.clearProfile(key);
         self.clearRecording(key);
+        self.clearQueue(key);
         self.rooms.removeByPtr(entry.key_ptr);
         self.allocator.free(key);
         self.allocator.destroy(r);
@@ -722,6 +794,36 @@ test "GAP-V5 quality sample is per member and clears on leave" {
     try testing.expect(!m.upgradeContinuityReady());
     try testing.expect(m.leaveAll("#c", "alice"));
     try testing.expect(m.qualityOf("#c", "alice") == null);
+    try testing.expect(m.upgradeContinuityReady());
+}
+
+test "GAP-V6 speaking queue keeps raise order and drops on leave" {
+    var m = MediaRooms.init(testing.allocator);
+    defer m.deinit();
+    try m.join("#c", "alice", .voice);
+    try m.join("#c", "bob", .voice);
+    try m.join("#c", "carol", .voice);
+    try m.setHand("#c", "alice", true);
+    try m.setHand("#c", "alice", true);
+    try m.setHand("#c", "bob", true);
+    try m.setHand("#c", "carol", true);
+    var names: [8][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 3), m.copySpeakQueue("#c", &names));
+    try testing.expectEqualStrings("alice", names[0]);
+    try testing.expectEqualStrings("bob", names[1]);
+    try testing.expectEqualStrings("carol", names[2]);
+    try m.setPosition("#c", "alice", .{ .x = 120, .y = -45 });
+    try testing.expectEqual(Position{ .x = 120, .y = -45 }, m.positionOf("#c", "alice"));
+    try m.setHand("#c", "alice", false);
+    try testing.expectEqual(@as(usize, 2), m.copySpeakQueue("#c", &names));
+    try testing.expectEqualStrings("bob", names[0]);
+    try testing.expectEqualStrings("carol", names[1]);
+    try testing.expect(m.leaveAll("#c", "bob"));
+    try testing.expectEqual(@as(usize, 1), m.copySpeakQueue("#c", &names));
+    try testing.expectEqualStrings("carol", names[0]);
+    try testing.expect(m.leaveAll("#c", "alice"));
+    try testing.expect(m.leaveAll("#c", "carol"));
+    try testing.expectEqual(@as(usize, 0), m.copySpeakQueue("#c", &names));
     try testing.expect(m.upgradeContinuityReady());
 }
 

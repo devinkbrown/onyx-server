@@ -46699,6 +46699,10 @@ pub const LinuxServer = struct {
                 return;
             }
         }
+        if (std.ascii.eqlIgnoreCase(sub, "QUEUE")) {
+            try self.mediaQueue(conn, channel);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "HAND")) {
             if (!self.media_rooms.isParticipant(channel, nick)) {
                 try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before raising your hand");
@@ -46797,6 +46801,9 @@ pub const LinuxServer = struct {
             else
                 try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "You are not publishing that kind");
         } else if (std.ascii.eqlIgnoreCase(sub, "SPEAKING")) {
+            // The speaking queue is visible to the room. This command does not
+            // read it: a member who is not at the head still publishes. The
+            // sender's client enforces "you are not at the head."
             if (conn.session.hasUmode(.media_tx_deny)) {
                 try self.failReply(conn, "MEDIA", "TX_DENIED", "Media transmission is disabled for your session");
                 return;
@@ -46808,7 +46815,7 @@ pub const LinuxServer = struct {
             else
                 try self.failReply(conn, "MEDIA", "NOT_PUBLISHING", "You are not publishing that kind");
         } else {
-            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, BREAKOUT, POS, HAND, REACT, CAPTION, TRANSCRIPT, CONSENT, RECORD, QUALITY, E2EE-HANDSHAKE, E2EE-GROUPKEY, or ROSTER");
+            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, BREAKOUT, POS, HAND, QUEUE, REACT, CAPTION, TRANSCRIPT, CONSENT, RECORD, QUALITY, E2EE-HANDSHAKE, E2EE-GROUPKEY, or ROSTER");
         }
     }
 
@@ -47655,6 +47662,21 @@ pub const LinuxServer = struct {
         var end_buf: [64]u8 = undefined;
         const end = std.fmt.bufPrint(&end_buf, "count={d}", .{emitted}) catch return;
         try self.sendMediaEventReply(conn, "QUALITY-END", channel, end);
+    }
+
+    /// `MEDIA QUEUE <#chan>` — raised-hand order, head first. Positions are not
+    /// an input, and the reply is only the order the room can read.
+    fn mediaQueue(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+        var nicks: [media_room.max_participants][]const u8 = undefined;
+        const n = self.media_rooms.copySpeakQueue(channel, &nicks);
+        for (nicks[0..n], 0..) |speaker, i| {
+            var buf: [default_reply_bytes]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buf, "{d} {s}", .{ i, speaker }) catch continue;
+            try self.sendMediaEventReply(conn, "QUEUE", channel, detail);
+        }
+        var end_buf: [64]u8 = undefined;
+        const end = std.fmt.bufPrint(&end_buf, "count={d}", .{n}) catch return;
+        try self.sendMediaEventReply(conn, "QUEUE-END", channel, end);
     }
 
     fn mediaRoster(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
@@ -54224,6 +54246,92 @@ test "GAP-V5 a participant or oper reads loss rtt and layer without key material
     try std.testing.expect(std.mem.indexOf(u8, refused, "loss=") == null);
 
     std.debug.print("GAP-V5 branch=participant and oper read loss rtt spatial bitrate; key material is absent\n", .{});
+}
+
+test "GAP-V6 the room reads the speaking queue and the server forwards positions" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const carol_id = try addTestLocalClient(&server, "carol", null);
+    _ = try server.world.join("#q", worldIdFromClient(alice_id));
+    _ = try server.world.join("#q", worldIdFromClient(bob_id));
+    _ = try server.world.join("#q", worldIdFromClient(carol_id));
+    const alice = server.rx().clients.get(alice_id).?;
+    const bob = server.rx().clients.get(bob_id).?;
+    const carol = server.rx().clients.get(carol_id).?;
+    alice.send_armed = true;
+    bob.send_armed = true;
+    carol.send_armed = true;
+
+    const join_a = try irc_line.parseLine("MEDIA JOIN #q voice");
+    const join_b = try irc_line.parseLine("MEDIA JOIN #q voice");
+    const join_c = try irc_line.parseLine("MEDIA JOIN #q voice");
+    try server.handleMedia(alice_id, alice, &join_a);
+    try server.handleMedia(bob_id, bob, &join_b);
+    try server.handleMedia(carol_id, carol, &join_c);
+
+    const hand_a = try irc_line.parseLine("MEDIA HAND #q up");
+    const hand_b = try irc_line.parseLine("MEDIA HAND #q up");
+    const hand_c = try irc_line.parseLine("MEDIA HAND #q up");
+    try server.handleMedia(alice_id, alice, &hand_a);
+    try server.handleMedia(bob_id, bob, &hand_b);
+    try server.handleMedia(carol_id, carol, &hand_c);
+
+    bob.send_len = 0;
+    const queue = try irc_line.parseLine("MEDIA QUEUE #q");
+    try server.handleMedia(bob_id, bob, &queue);
+    const listed = bob.send_buf[0..bob.send_len];
+    const alice_at = std.mem.indexOf(u8, listed, "0 alice") orelse return error.TestUnexpectedResult;
+    const bob_at = std.mem.indexOf(u8, listed, "1 bob") orelse return error.TestUnexpectedResult;
+    const carol_at = std.mem.indexOf(u8, listed, "2 carol") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(alice_at < bob_at and bob_at < carol_at);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "count=3") != null);
+
+    // Carol is last in the queue. Speaking still succeeds.
+    carol.send_len = 0;
+    const speak = try irc_line.parseLine("MEDIA SPEAKING #q voice on");
+    try server.handleMedia(carol_id, carol, &speak);
+    const speak_reply = carol.send_buf[0..carol.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, speak_reply, "FAIL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, speak_reply, "head") == null);
+    var carol_speaking = false;
+    for (server.media_rooms.roster("#q")) |p| {
+        if (std.mem.eql(u8, p.id.slice(), "carol")) carol_speaking = p.speaking.contains(.voice);
+    }
+    try std.testing.expect(carol_speaking);
+
+    const hand_down = try irc_line.parseLine("MEDIA HAND #q down");
+    try server.handleMedia(alice_id, alice, &hand_down);
+    bob.send_len = 0;
+    try server.handleMedia(bob_id, bob, &queue);
+    const promoted = bob.send_buf[0..bob.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, promoted, "0 bob") != null);
+    try std.testing.expect(std.mem.indexOf(u8, promoted, "1 carol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, promoted, "0 alice") == null);
+
+    const pos = try irc_line.parseLine("MEDIA POS #q 120 -45");
+    try server.handleMedia(alice_id, alice, &pos);
+    const stored = server.media_rooms.positionOf("#q", "alice");
+    try std.testing.expectEqual(@as(i32, 120), stored.x);
+    try std.testing.expectEqual(@as(i32, -45), stored.y);
+    bob.send_len = 0;
+    const roster = try irc_line.parseLine("MEDIA ROSTER #q");
+    try server.handleMedia(bob_id, bob, &roster);
+    const room = bob.send_buf[0..bob.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, room, "alice voice main 120 -45 - consent=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, room, "distance") == null);
+    try std.testing.expect(std.mem.indexOf(u8, room, "gain") == null);
+
+    std.debug.print("GAP-V6 branch=queue is listed in raise order; a non-head still speaks; positions are forwarded unchanged\n", .{});
 }
 
 /// Real encrypted link pair for daemon-level retained-replay tests. Keeping the
