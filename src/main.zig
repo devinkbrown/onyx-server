@@ -1302,7 +1302,12 @@ pub fn main(init: std.process.Init) !void {
         // unavailable (old kernel / restricted sandbox) the daemon cannot serve,
         // so fail loudly and exit non-zero rather than pretending to have started.
         std.debug.print("onyx-server: fatal — cannot start server: {s}\n", .{@errorName(err)});
-        std.debug.print("onyx-server: the reactor requires io_uring on a 64-bit Linux kernel.\n", .{});
+        const reactor = switch (comptime builtin.os.tag) {
+            .windows => "IOCP",
+            .freebsd, .openbsd, .netbsd, .dragonfly => "kqueue",
+            else => "io_uring on a 64-bit Linux kernel",
+        };
+        std.debug.print("onyx-server: the reactor requires {s}.\n", .{reactor});
         std.process.exit(1);
     };
     defer srv.deinit();
@@ -1510,9 +1515,14 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("onyx-server: WebTransport listening on UDP :{d} (QUIC/HTTP3 → loopback IRC :{d})\n", .{ wt_listener.?.port, irc_port });
     }
 
+    const reactor = switch (comptime builtin.os.tag) {
+        .windows => "IOCP",
+        .freebsd, .openbsd, .netbsd, .dragonfly => "kqueue",
+        else => "Ringlane io_uring",
+    };
     std.debug.print(
-        "onyx-server: listening on 127.0.0.1:{d} (Ringlane io_uring) — PING + registration live\n",
-        .{try srv.boundPort()},
+        "onyx-server: listening on 127.0.0.1:{d} ({s}) — PING + registration live\n",
+        .{ try srv.boundPort(), reactor },
     );
     // Sharded multi-reactor run loop (one worker thread per shard, joined here).
     // runThreaded transparently runs a single in-line reactor when num_shards==1.

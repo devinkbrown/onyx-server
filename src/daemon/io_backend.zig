@@ -3,16 +3,18 @@
 
 //! I/O backend for accept, recv, send, poll, cancel, and timeout.
 //!
-//! Linux keeps today's Ringlane ring (`ringlane.zig`). FreeBSD implements the
-//! same operations on a kqueue fd via `kevent`. Windows implements them on an
-//! I/O completion port: AFD receive and send, AFD wait-for-listen and
-//! AFD poll, `NtCancelIoFileEx`, and an NT timer. `Iocp.open` loads the
-//! Winsock Registered I/O function table and returns `error.MissingOp` when
-//! that table is missing. `dequeueRegistered` is what calls those pointers.
-//! A missing op, a closed port or queue, or a kernel status other than
-//! success or pending returns `error.MissingOp` and is not reported as a
-//! finished transfer. No reactor drains the port. Helix USR2 adoption stays
-//! on `LinuxServer`.
+//! Linux keeps today's Ringlane ring (`ringlane.zig`). FreeBSD, OpenBSD,
+//! NetBSD, and Dragonfly implement the same operations on a kqueue fd.
+//! Windows implements them on an I/O completion port: AFD receive and send,
+//! AFD wait-for-listen and AFD poll, `NtCancelIoFileEx`, and an NT timer.
+//! `Iocp.open` loads the Winsock Registered I/O function table and returns
+//! `error.MissingOp` when that table is missing. `dequeueRegistered` is what
+//! calls those pointers. `reap` finishes accept, recv, and send: the ring
+//! reports the completion, kqueue performs the syscall, and IOCP collects
+//! `NtRemoveIoCompletion` then `accept`s a waited listen. A missing op, a
+//! closed port or queue, or a kernel status other than success or pending
+//! returns `error.MissingOp` and is not reported as a finished transfer.
+//! Helix USR2 adoption stays on `LinuxServer`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,6 +29,22 @@ pub const Family = enum { ringlane, iocp, kqueue };
 pub const Op = enum { accept, recv, send, poll, cancel, timeout };
 
 pub const required_ops = [_]Op{ .accept, .recv, .send, .poll, .cancel, .timeout };
+
+/// One finished accept, recv, send, poll, or timeout from `reap`.
+/// `result` is the new socket for accept, the byte count for recv and send,
+/// or a negative errno. Timeout uses `0`.
+pub const Reaped = struct {
+    op: Op,
+    token: ringlane.FdToken,
+    result: i32,
+};
+
+pub const Listener = struct {
+    fd: linux.fd_t,
+    port: u16,
+};
+
+pub const ListenError = error{ InvalidAddress, SocketUnavailable, AddressInUse, PermissionDenied, Unsupported };
 
 /// One `RIODequeueCompletion` against the table `Iocp.open` stored.
 /// `ok` is true only when that call returned a 4-byte success and the peer
@@ -230,7 +248,7 @@ pub const IoBackend = struct {
 
     pub fn recv(self: *IoBackend, token: ringlane.FdToken, fd: linux.fd_t, buffer: []u8) !void {
         switch (self.family) {
-            .kqueue => return (try self.kqueuePtr()).enqueueRecv(token, fd),
+            .kqueue => return (try self.kqueuePtr()).enqueueRecv(token, fd, buffer),
             .iocp => return (try self.iocpPtr()).enqueueRecv(token, fd, buffer),
             .ringlane => {
                 if (comptime builtin.os.tag != .linux) return error.MissingOp;
@@ -242,7 +260,7 @@ pub const IoBackend = struct {
 
     pub fn send(self: *IoBackend, token: ringlane.FdToken, fd: linux.fd_t, buffer: []const u8) !void {
         switch (self.family) {
-            .kqueue => return (try self.kqueuePtr()).enqueueSend(token, fd),
+            .kqueue => return (try self.kqueuePtr()).enqueueSend(token, fd, buffer),
             .iocp => return (try self.iocpPtr()).enqueueSend(token, fd, buffer),
             .ringlane => {
                 if (comptime builtin.os.tag != .linux) return error.MissingOp;
@@ -298,6 +316,59 @@ pub const IoBackend = struct {
                 return ring.submit();
             },
         }
+    }
+
+    /// kqueue stays armed after a successful submit. The ring and IOCP post
+    /// one operation and the caller queues the next one.
+    pub fn levelTriggered(self: *const IoBackend) bool {
+        return self.family == .kqueue;
+    }
+
+    pub fn queueFd(self: *const IoBackend) linux.fd_t {
+        if (self.kq) |kq| return kq.fd;
+        return -1;
+    }
+
+    /// Wait up to `wait_ms` for completions. `0` does not block. A closed
+    /// backend is `error.MissingOp`. An empty wait is `0`, not a transfer.
+    pub fn reap(self: *IoBackend, out: []Reaped, wait_ms: u32) !u32 {
+        switch (self.family) {
+            .kqueue => return (try self.kqueuePtr()).reap(out, wait_ms),
+            .iocp => return (try self.iocpPtr()).reap(out, wait_ms),
+            .ringlane => {
+                if (comptime builtin.os.tag != .linux) return error.MissingOp;
+                return self.reapRing(out, wait_ms);
+            },
+        }
+    }
+
+    fn reapRing(self: *IoBackend, out: []Reaped, wait_ms: u32) !u32 {
+        const ring = self.ringPtr() orelse return error.MissingOp;
+        var cqes: [32]linux.io_uring_cqe = undefined;
+        const Sink = struct {
+            dest: []Reaped,
+            n: usize = 0,
+
+            pub fn onCompletion(sink: *@This(), completion: ringlane.Completion) void {
+                if (sink.n >= sink.dest.len) return;
+                const item: ?Reaped = switch (completion) {
+                    .accept => |ev| .{ .op = .accept, .token = ev.token, .result = ev.res },
+                    .recv => |ev| .{ .op = .recv, .token = ev.token, .result = ev.res },
+                    .send => |ev| .{ .op = .send, .token = ev.token, .result = ev.res },
+                    .poll => |ev| .{ .op = .poll, .token = ev.token, .result = ev.res },
+                    .timeout => .{ .op = .timeout, .token = .{ .slot = 0, .gen = 0 }, .result = 0 },
+                    .connect, .other => null,
+                };
+                if (item) |got| {
+                    sink.dest[sink.n] = got;
+                    sink.n += 1;
+                }
+            }
+        };
+        var sink = Sink{ .dest = out };
+        const wait_nr: u32 = if (wait_ms == 0) 0 else 1;
+        try ring.reapCompletions(cqes[0..@min(cqes.len, @max(out.len, 1))], wait_nr, &sink);
+        return @intCast(sink.n);
     }
 
     /// Send four bytes through the Registered I/O table stored on this port
@@ -380,14 +451,12 @@ pub fn submitTimeout(ring: *ringlane.Ring, token: ringlane.FdToken, ts: *const l
     };
 }
 
-/// PortableServer's init. Opens the native backend, requires every op, then
-/// still refuses: the reactor loop is the Linux ring. A missing op is the
-/// same refusal. The Linux ring used by `LinuxServer` is `openLinuxRing`.
+/// Opens the native backend and requires every op. A missing op is
+/// `error.Unsupported`. The Linux ring used by `LinuxServer` is `openLinuxRing`.
 pub fn refusePortableReactor(tag: std.Target.Os.Tag, entries: u16) error{Unsupported}!void {
     var backend = IoBackend.openOwned(familyFor(tag), entries, .{}) catch return error.Unsupported;
     defer backend.deinit();
     backend.requireAll() catch return error.Unsupported;
-    return error.Unsupported;
 }
 
 /// Non-Linux Helix path. Refuses adoption; does not decode a capsule into a session.
@@ -402,14 +471,23 @@ pub fn refuseForeignCapsule() error{Unsupported}!void {
     }
 }
 
-/// FreeBSD kqueue. One `kevent` submit is at most `submit_batch` changes;
-/// that bound is the syscall batch, not a connection ceiling. Registrations
-/// grow. A closed queue, a full batch, an unknown cancel, or a `kevent`
-/// error returns `error.MissingOp` and is not a completed submit.
+fn kqueueOs() bool {
+    return switch (builtin.os.tag) {
+        .freebsd, .openbsd, .netbsd, .dragonfly => true,
+        else => false,
+    };
+}
+
+/// kqueue on FreeBSD, OpenBSD, NetBSD, and Dragonfly. One `kevent` submit is
+/// at most `submit_batch` changes; that bound is the syscall batch, not a
+/// connection ceiling. Registrations grow. A closed queue, a full batch, an
+/// unknown cancel, or a `kevent` error returns `error.MissingOp`.
 ///
-/// `std.c.Kevent` is `void` off FreeBSD, and this daemon does not link libc
-/// on Linux. Every libc call sits in a function that is not analyzed unless
-/// `builtin.os.tag == .freebsd`.
+/// FreeBSD submit ORs `EV_RECEIPT` and requires one zero-error receipt per
+/// change. The other three apply the change list with `nevents == 0` and
+/// treat a zero return as success. `EV_RECEIPT` is not set there. libc calls
+/// sit in functions that are not analyzed unless `kqueueOs()` is true, so
+/// the Linux daemon does not link libc.
 const Kqueue = struct {
     fd: i32 = -1,
     cap: u16 = 0,
@@ -450,6 +528,9 @@ const Kqueue = struct {
         ident: usize = 0,
         filter: i16 = 0,
         live: bool = false,
+        kind: ringlane.OpKind = .other,
+        buf_ptr: usize = 0,
+        len: usize = 0,
     };
 
     pub fn unopened(entries: u16) Kqueue {
@@ -458,12 +539,12 @@ const Kqueue = struct {
 
     pub fn open(entries: u16) !Kqueue {
         if (entries == 0) return error.MissingOp;
-        if (comptime builtin.os.tag != .freebsd) return error.MissingOp;
+        if (comptime !kqueueOs()) return error.MissingOp;
         return .{ .fd = try openFd(), .cap = batchCap(entries) };
     }
 
     pub fn deinit(self: *Kqueue) void {
-        if (comptime builtin.os.tag == .freebsd) self.closeFreeBsd();
+        if (comptime kqueueOs()) self.closeQueue();
         self.fd = -1;
         self.n = 0;
         if (self.regs.len != 0) {
@@ -473,21 +554,23 @@ const Kqueue = struct {
     }
 
     pub fn enqueueAccept(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t) !void {
-        return self.enqueueFilter(token, fd, evfilt_read, ev_add | ev_enable, 0, false);
+        return self.enqueueFilter(token, fd, evfilt_read, ev_add | ev_enable, 0, false, .accept, "");
     }
 
-    pub fn enqueueRecv(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t) !void {
-        return self.enqueueFilter(token, fd, evfilt_read, ev_add | ev_enable, 0, false);
+    pub fn enqueueRecv(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t, buffer: []u8) !void {
+        if (buffer.len == 0) return error.MissingOp;
+        return self.enqueueFilter(token, fd, evfilt_read, ev_add | ev_enable, 0, false, .recv, buffer);
     }
 
-    pub fn enqueueSend(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t) !void {
-        return self.enqueueFilter(token, fd, evfilt_write, ev_add | ev_enable, 0, false);
+    pub fn enqueueSend(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t, buffer: []const u8) !void {
+        if (buffer.len == 0) return error.MissingOp;
+        return self.enqueueFilter(token, fd, evfilt_write, ev_add | ev_enable, 0, false, .send, buffer);
     }
 
     pub fn enqueuePoll(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t, poll_mask: u32) !void {
         if (poll_mask == 0) return error.MissingOp;
         const filter: i16 = if ((poll_mask & linux.POLL.OUT) != 0) evfilt_write else evfilt_read;
-        return self.enqueueFilter(token, fd, filter, ev_add | ev_enable, 0, false);
+        return self.enqueueFilter(token, fd, filter, ev_add | ev_enable, 0, false, .poll, "");
     }
 
     pub fn enqueueCancel(self: *Kqueue, kind: ringlane.OpKind, token: ringlane.FdToken) !void {
@@ -514,13 +597,22 @@ const Kqueue = struct {
 
     pub fn enqueueTimeout(self: *Kqueue, token: ringlane.FdToken, ts: *const linux.kernel_timespec) !void {
         const ms = try timeoutMillis(ts);
-        return self.enqueueFilter(token, 0, evfilt_timer, ev_add | ev_oneshot, ms, true);
+        return self.enqueueFilter(token, 0, evfilt_timer, ev_add | ev_oneshot, ms, true, .timeout, "");
     }
 
     pub fn submit(self: *Kqueue) !u32 {
         if (self.fd < 0 or self.n == 0) return error.MissingOp;
-        if (comptime builtin.os.tag != .freebsd) return error.MissingOp;
-        return self.submitFreeBsd();
+        if (comptime builtin.os.tag == .freebsd) return self.submitFreeBsd();
+        if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .netbsd or builtin.os.tag == .dragonfly) {
+            return self.submitAck();
+        }
+        return error.MissingOp;
+    }
+
+    pub fn reap(self: *Kqueue, out: []Reaped, wait_ms: u32) !u32 {
+        if (self.fd < 0) return error.MissingOp;
+        if (comptime !kqueueOs()) return error.MissingOp;
+        return self.reapNative(out, wait_ms);
     }
 
     fn enqueueFilter(
@@ -531,6 +623,8 @@ const Kqueue = struct {
         flags: u16,
         data: i64,
         timer: bool,
+        kind: ringlane.OpKind,
+        buf: []const u8,
     ) !void {
         const token_key = packToken(token);
         const ident: usize = if (timer) token_key else blk: {
@@ -544,7 +638,7 @@ const Kqueue = struct {
             .data = data,
             .udata = token_key,
         };
-        try self.remember(change);
+        try self.remember(change, kind, if (buf.len == 0) 0 else @intFromPtr(buf.ptr), buf.len);
         return self.pushStored(change);
     }
 
@@ -570,11 +664,14 @@ const Kqueue = struct {
         if (self.fd < 0) return error.MissingOp;
     }
 
-    fn remember(self: *Kqueue, change: Change) !void {
+    fn remember(self: *Kqueue, change: Change, kind: ringlane.OpKind, buf_ptr: usize, len: usize) !void {
         var i: usize = 0;
         while (i < self.regs.len) : (i += 1) {
             if (self.regs[i].live and self.regs[i].token == change.udata and self.regs[i].filter == change.filter) {
                 self.regs[i].ident = change.ident;
+                self.regs[i].kind = kind;
+                self.regs[i].buf_ptr = buf_ptr;
+                self.regs[i].len = len;
                 return;
             }
         }
@@ -586,6 +683,9 @@ const Kqueue = struct {
                     .ident = change.ident,
                     .filter = change.filter,
                     .live = true,
+                    .kind = kind,
+                    .buf_ptr = buf_ptr,
+                    .len = len,
                 };
                 return;
             }
@@ -604,6 +704,9 @@ const Kqueue = struct {
             .ident = change.ident,
             .filter = change.filter,
             .live = true,
+            .kind = kind,
+            .buf_ptr = buf_ptr,
+            .len = len,
         };
         self.regs = grown;
     }
@@ -652,7 +755,7 @@ const Kqueue = struct {
         return raw;
     }
 
-    fn closeFreeBsd(self: *Kqueue) void {
+    fn closeQueue(self: *Kqueue) void {
         if (self.fd >= 0) _ = std.c.close(self.fd);
     }
 
@@ -693,6 +796,169 @@ const Kqueue = struct {
         return @intCast(n_changes);
     }
 
+    fn fillKevent(change: Change) std.c.Kevent {
+        var ev = std.mem.zeroes(std.c.Kevent);
+        ev.ident = change.ident;
+        ev.filter = @intCast(change.filter);
+        ev.flags = @intCast(change.flags);
+        ev.fflags = @intCast(change.fflags);
+        ev.data = @intCast(change.data);
+        ev.udata = change.udata;
+        return ev;
+    }
+
+    fn submitAck(self: *Kqueue) !u32 {
+        const n_changes: usize = self.n;
+        if (n_changes == 0 or n_changes > submit_batch) return error.MissingOp;
+        var batch: [submit_batch]std.c.Kevent = undefined;
+        var i: usize = 0;
+        while (i < n_changes) : (i += 1) batch[i] = fillKevent(self.changes[i]);
+        self.n = 0;
+        var out: [1]std.c.Kevent = undefined;
+        const timeout = std.c.timespec{ .sec = 0, .nsec = 0 };
+        const rc = std.c.kevent(self.fd, &batch, @intCast(n_changes), &out, 0, &timeout);
+        if (rc != 0) return error.MissingOp;
+        return @intCast(n_changes);
+    }
+
+    fn reapNative(self: *Kqueue, out: []Reaped, wait_ms: u32) !u32 {
+        var evs: [32]std.c.Kevent = undefined;
+        const max: usize = @min(out.len, evs.len);
+        if (max == 0) return 0;
+        var none: [1]std.c.Kevent = .{std.mem.zeroes(std.c.Kevent)};
+        const ts = std.c.timespec{
+            .sec = @intCast(wait_ms / 1000),
+            .nsec = @intCast(@as(u64, wait_ms % 1000) * 1_000_000),
+        };
+        const rc = std.c.kevent(self.fd, &none, 0, &evs, @intCast(max), &ts);
+        if (rc < 0) return error.MissingOp;
+        const got: usize = @intCast(rc);
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < got and n < out.len) : (i += 1) {
+            const ev = evs[i];
+            const filter: i16 = @intCast(ev.filter);
+            const flags: u16 = @truncate(ev.flags);
+            const data: i64 = @intCast(ev.data);
+            const token = unpackToken(ev.udata);
+            if ((flags & ev_error) != 0) {
+                const errno: i32 = if (data > 0 and data <= std.math.maxInt(i32)) @intCast(data) else 1;
+                out[n] = .{ .op = opForFilter(filter), .token = token, .result = -errno };
+                n += 1;
+                continue;
+            }
+            if (filter == evfilt_timer) {
+                out[n] = .{ .op = .timeout, .token = token, .result = 0 };
+                n += 1;
+                continue;
+            }
+            const reg = self.findReg(ev.udata, filter);
+            if (filter == evfilt_read) {
+                if (reg) |slot| {
+                    if (slot.kind == .accept) {
+                        out[n] = .{ .op = .accept, .token = token, .result = self.acceptReady(ev.ident) };
+                        n += 1;
+                        continue;
+                    }
+                }
+                out[n] = .{ .op = .recv, .token = token, .result = transfer(.recv, ev.ident, reg) };
+                n += 1;
+                continue;
+            }
+            if (filter == evfilt_write) {
+                out[n] = .{ .op = .send, .token = token, .result = transfer(.send, ev.ident, reg) };
+                self.deleteFilter(ev.ident, filter);
+                if (reg) |slot| slot.live = false;
+                n += 1;
+            }
+        }
+        return @intCast(n);
+    }
+
+    fn acceptReady(self: *Kqueue, ident: usize) i32 {
+        _ = self;
+        const listened: i32 = @intCast(ident);
+        const fd = std.c.accept(listened, null, null);
+        if (fd < 0) return -positiveErrno();
+        if (!setNonBlock(fd)) {
+            _ = std.c.close(fd);
+            return -1;
+        }
+        return fd;
+    }
+
+    fn deleteFilter(self: *Kqueue, ident: usize, filter: i16) void {
+        var batch: [1]std.c.Kevent = .{fillKevent(.{
+            .ident = ident,
+            .filter = filter,
+            .flags = ev_delete,
+        })};
+        var out: [1]std.c.Kevent = undefined;
+        const timeout = std.c.timespec{ .sec = 0, .nsec = 0 };
+        _ = std.c.kevent(self.fd, &batch, 1, &out, 0, &timeout);
+    }
+
+    fn findReg(self: *Kqueue, token: usize, filter: i16) ?*Reg {
+        var i: usize = self.regs.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.regs[i].live and self.regs[i].token == token and self.regs[i].filter == filter) return &self.regs[i];
+        }
+        return null;
+    }
+
+    fn unpackToken(key: usize) ringlane.FdToken {
+        return .{ .slot = @truncate(key), .gen = @truncate(key >> 32) };
+    }
+
+    fn opForFilter(filter: i16) Op {
+        if (filter == Kqueue.evfilt_write) return .send;
+        if (filter == Kqueue.evfilt_timer) return .timeout;
+        return .recv;
+    }
+
+    fn positiveErrno() i32 {
+        const err = std.c._errno().*;
+        if (err <= 0) return 1;
+        return err;
+    }
+
+    fn setNonBlock(fd: i32) bool {
+        // F_GETFL = 3, F_SETFL = 4, O_NONBLOCK = 4 on these BSDs.
+        const flags = std.c.fcntl(fd, @as(i32, 3), @as(i32, 0));
+        if (flags < 0) return false;
+        return std.c.fcntl(fd, @as(i32, 4), flags | @as(@TypeOf(flags), 4)) >= 0;
+    }
+
+    fn transfer(kind: ringlane.OpKind, ident: usize, reg: ?*Reg) i32 {
+        const slot = reg orelse return -1;
+        if (slot.buf_ptr == 0 or slot.len == 0) return -1;
+        const fd: i32 = @intCast(ident);
+        var done: usize = 0;
+        while (done < slot.len) {
+            const ptr: [*]u8 = @ptrFromInt(slot.buf_ptr + done);
+            const n: isize = if (kind == .recv)
+                std.c.recv(fd, ptr, slot.len - done, 0)
+            else
+                std.c.send(fd, ptr, slot.len - done, 0);
+            if (n < 0) {
+                const err = std.c._errno().*;
+                if (err == 4) continue;
+                if (err == 35) {
+                    if (done == 0) return -35;
+                    break;
+                }
+                if (done == 0) return if (err == 0) -1 else -err;
+                break;
+            }
+            if (n == 0) break;
+            done += @intCast(n);
+            if (kind == .recv) break;
+        }
+        if (done > std.math.maxInt(i32)) return std.math.maxInt(i32);
+        return @intCast(done);
+    }
+
     fn bsdStreamSocket() !i32 {
         const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
         if (fd < 0) return error.MissingOp;
@@ -724,7 +990,7 @@ const Kqueue = struct {
         try backend.requireAll();
         const sock = try bsdStreamSocket();
         defer {
-            if (comptime builtin.os.tag == .freebsd) _ = std.c.close(sock);
+            if (comptime kqueueOs()) _ = std.c.close(sock);
         }
         const submitted = try proveQueued(&backend, sock);
         if (submitted == 0) return error.MissingOp;
@@ -744,6 +1010,9 @@ const Kqueue = struct {
             _ = std.c.close(sock);
         } else |_| {}
         exerciseLive() catch {};
+        if (listenTcp("127.0.0.1", 0)) |listener| {
+            closeSocket(listener.fd);
+        } else |_| {}
     }
 };
 
@@ -817,6 +1086,10 @@ const Iocp = struct {
     /// Live for the life of the port. A pending NT request writes these after
     /// `postOne` returns; a stack copy would dangle.
     iosbs: [submit_batch]std.os.windows.IO_STATUS_BLOCK = undefined,
+    /// In-flight AFD ops. A slot stays live until `reap` collects its IOSB.
+    /// `submit_batch` is the in-flight batch, not a connection ceiling.
+    slot_live: [submit_batch]bool = @splat(false),
+    slot_pkt: [submit_batch]Packet = @splat(.{}),
     poll_infos: [submit_batch]AfdPollInfo = undefined,
     wsa_bufs: [submit_batch]AfdWsaBuf = undefined,
     data_infos: [submit_batch]AfdDataInfo = undefined,
@@ -992,6 +1265,12 @@ const Iocp = struct {
         return self.submitWindows();
     }
 
+    pub fn reap(self: *Iocp, out: []Reaped, wait_ms: u32) !u32 {
+        if (self.port == 0) return error.MissingOp;
+        if (comptime builtin.os.tag != .windows) return error.MissingOp;
+        return self.reapWindows(out, wait_ms);
+    }
+
     fn pushStored(self: *Iocp, packet: Packet) !void {
         if (self.n >= self.cap) return error.MissingOp;
         self.packets[self.n] = packet;
@@ -1098,17 +1377,56 @@ const Iocp = struct {
         var queued: [submit_batch]Packet = undefined;
         @memcpy(queued[0..n_packets], self.packets[0..n_packets]);
         self.n = 0;
+        var need: u16 = 0;
+        var free_slots: u16 = 0;
         var i: u16 = 0;
         while (i < n_packets) : (i += 1) {
-            try self.postOne(i, queued[i]);
+            switch (queued[i].op) {
+                op_accept, op_recv, op_send, op_poll => need += 1,
+                else => {},
+            }
         }
+        i = 0;
+        while (i < submit_batch) : (i += 1) {
+            if (!self.slot_live[i]) free_slots += 1;
+        }
+        if (need > free_slots) {
+            @memcpy(self.packets[0..n_packets], queued[0..n_packets]);
+            self.n = n_packets;
+            return error.MissingOp;
+        }
+        i = 0;
+        while (i < n_packets) : (i += 1) try self.postOne(queued[i]);
         return n_packets;
     }
 
-    fn postOne(self: *Iocp, index: u16, packet: Packet) !void {
-        const w = std.os.windows;
+    fn claimSlot(self: *Iocp, packet: Packet) !u16 {
+        var i: u16 = 0;
+        while (i < submit_batch) : (i += 1) {
+            if (self.slot_live[i]) continue;
+            self.slot_live[i] = true;
+            self.slot_pkt[i] = packet;
+            self.iosbs[i] = std.mem.zeroes(std.os.windows.IO_STATUS_BLOCK);
+            return i;
+        }
+        return error.MissingOp;
+    }
+
+    fn postOne(self: *Iocp, packet: Packet) !void {
+        switch (packet.op) {
+            op_cancel => return self.cancelOne(packet),
+            op_timeout => return self.armTimer(packet),
+            op_accept, op_recv, op_send, op_poll => {},
+            else => return error.MissingOp,
+        }
+        if ((packet.op == op_recv or packet.op == op_send) and
+            (packet.buf == 0 or packet.length == 0 or packet.ioctl == 0))
+        {
+            return error.MissingOp;
+        }
+        const index = try self.claimSlot(packet);
+        errdefer self.slot_live[index] = false;
         const iosb = &self.iosbs[index];
-        iosb.* = std.mem.zeroes(w.IO_STATUS_BLOCK);
         switch (packet.op) {
             op_accept => {
                 const out = &self.accept_outs[index];
@@ -1151,8 +1469,6 @@ const Iocp = struct {
                 const bytes = std.mem.asBytes(info);
                 try self.device(packet, iosb, bytes, bytes);
             },
-            op_cancel => try self.cancelOne(packet),
-            op_timeout => try self.armTimer(packet),
             else => return error.MissingOp,
         }
     }
@@ -1200,7 +1516,7 @@ const Iocp = struct {
             @ptrFromInt(packet.handle),
             null,
             null,
-            null,
+            @ptrCast(iosb),
             iosb,
             code,
             if (in_buf.len == 0) null else @ptrCast(in_buf.ptr),
@@ -1255,6 +1571,68 @@ const Iocp = struct {
         };
     }
 
+    fn reapWindows(self: *Iocp, out: []Reaped, wait_ms: u32) !u32 {
+        var n: u32 = 0;
+        var waited = false;
+        while (n < out.len) {
+            const item = try self.takeOne(if (waited) 0 else wait_ms);
+            waited = true;
+            if (item) |got| {
+                out[n] = got;
+                n += 1;
+            } else break;
+        }
+        return n;
+    }
+
+    fn takeOne(self: *Iocp, wait_ms: u32) !?Reaped {
+        const w = std.os.windows;
+        var key: ?*anyopaque = null;
+        var apc: ?*anyopaque = null;
+        var iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
+        var due: w.LARGE_INTEGER = if (wait_ms == 0) 0 else -@as(w.LARGE_INTEGER, wait_ms) * 10_000;
+        const status = NtRemoveIoCompletion(@ptrFromInt(self.port), &key, &apc, &iosb, &due);
+        if (status == .TIMEOUT) return null;
+        if (status != .SUCCESS) return error.MissingOp;
+        const apc_addr = @intFromPtr(apc);
+        var i: usize = 0;
+        while (i < submit_batch) : (i += 1) {
+            if (!self.slot_live[i]) continue;
+            if (@intFromPtr(&self.iosbs[i]) != apc_addr) continue;
+            const packet = self.slot_pkt[i];
+            self.slot_live[i] = false;
+            return finishPosted(packet, iosb);
+        }
+        return null;
+    }
+
+    fn finishPosted(packet: Packet, iosb: std.os.windows.IO_STATUS_BLOCK) Reaped {
+        const token = ringlane.FdToken{
+            .slot = @truncate(packet.token),
+            .gen = @truncate(packet.token >> 32),
+        };
+        const op: Op = switch (packet.op) {
+            op_accept => .accept,
+            op_recv => .recv,
+            op_send => .send,
+            op_poll => .poll,
+            else => .cancel,
+        };
+        if (iosb.u.Status != .SUCCESS) return .{ .op = op, .token = token, .result = -1 };
+        if (packet.op == op_accept) {
+            const sock = accept(packet.handle, null, null);
+            if (sock == 0 or sock == std.math.maxInt(usize) or sock > std.math.maxInt(i32)) {
+                if (sock != 0 and sock != std.math.maxInt(usize)) _ = closesocket(sock);
+                return .{ .op = .accept, .token = token, .result = -1 };
+            }
+            return .{ .op = .accept, .token = token, .result = @intCast(sock) };
+        }
+        if (iosb.Information > std.math.maxInt(i32)) {
+            return .{ .op = op, .token = token, .result = std.math.maxInt(i32) };
+        }
+        return .{ .op = op, .token = token, .result = @intCast(iosb.Information) };
+    }
+
     fn proveQueued(backend: *IoBackend, sock: linux.fd_t) !u32 {
         const token = ringlane.FdToken{ .slot = 1, .gen = 1 };
         var buf: [4]u8 = .{ 0, 0, 0, 0 };
@@ -1293,6 +1671,9 @@ const Iocp = struct {
         var iosb = std.mem.zeroes(std.os.windows.IO_STATUS_BLOCK);
         _ = NtRemoveIoCompletion(@ptrFromInt(raw), &key, &apc, &iosb, null);
         exerciseLive() catch {};
+        if (listenTcp("127.0.0.1", 0)) |listener| {
+            closeSocket(listener.fd);
+        } else |_| {}
     }
 };
 
@@ -1789,6 +2170,130 @@ fn dequeueLoadedRio(table: *const RioTable) RioWitness {
     };
 }
 
+fn ipv4Bits(host: []const u8) ListenError!u32 {
+    if (host.len == 0 or std.mem.eql(u8, host, "0.0.0.0")) return 0;
+    const parsed = std.Io.net.Ip4Address.parse(host, 0) catch return error.InvalidAddress;
+    return @bitCast(parsed.bytes);
+}
+
+/// Bind an IPv4 TCP listener. `port` 0 asks the kernel for an ephemeral port.
+/// The returned fd is close-on-exec. BSD listeners are nonblocking so a second
+/// `accept` cannot stall the reap loop. The Linux ring path stays blocking;
+/// io_uring waits, and userspace does not call `accept` again.
+pub fn listenTcp(host: []const u8, port: u16) ListenError!Listener {
+    if (comptime builtin.os.tag == .linux) return listenLinux(host, port);
+    if (comptime builtin.os.tag == .windows) return listenWindows(host, port);
+    if (comptime kqueueOs()) return listenBsd(host, port);
+    return error.Unsupported;
+}
+
+pub fn closeSocket(fd: linux.fd_t) void {
+    if (fd < 0) return;
+    if (comptime builtin.os.tag == .linux) {
+        _ = linux.close(fd);
+        return;
+    }
+    if (comptime builtin.os.tag == .windows) {
+        _ = closesocket(@intCast(fd));
+        return;
+    }
+    if (comptime kqueueOs()) _ = std.c.close(fd);
+}
+
+fn listenLinux(host: []const u8, port: u16) ListenError!Listener {
+    const ip = try ipv4Bits(host);
+    const rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    const fd: linux.fd_t = switch (std.posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .ACCES, .PERM => return error.PermissionDenied,
+        else => return error.SocketUnavailable,
+    };
+    errdefer _ = linux.close(fd);
+    var yes: i32 = 1;
+    _ = linux.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(i32));
+    var addr = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = ip,
+    };
+    switch (std.posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in)))) {
+        .SUCCESS => {},
+        .ACCES, .PERM => return error.PermissionDenied,
+        .ADDRINUSE => return error.AddressInUse,
+        else => return error.SocketUnavailable,
+    }
+    switch (std.posix.errno(linux.listen(fd, 128))) {
+        .SUCCESS => {},
+        .ACCES, .PERM => return error.PermissionDenied,
+        .ADDRINUSE => return error.AddressInUse,
+        else => return error.SocketUnavailable,
+    }
+    var storage: linux.sockaddr.storage = undefined;
+    var slen: std.posix.socklen_t = @sizeOf(linux.sockaddr.storage);
+    if (std.posix.errno(linux.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS) return error.SocketUnavailable;
+    const bound: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, bound.port) };
+}
+
+fn listenBsd(host: []const u8, port: u16) ListenError!Listener {
+    const ip = try ipv4Bits(host);
+    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
+    if (fd < 0) return error.SocketUnavailable;
+    errdefer _ = std.c.close(fd);
+    var yes: i32 = 1;
+    _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &yes, @sizeOf(i32));
+    var addr = std.c.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = ip,
+    };
+    const addr_ptr: *std.c.sockaddr = @ptrCast(&addr);
+    if (std.c.bind(fd, addr_ptr, @intCast(@sizeOf(std.c.sockaddr.in))) != 0) return bsdListenError();
+    if (std.c.listen(fd, 128) != 0) return bsdListenError();
+    if (std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) < 0) return error.SocketUnavailable;
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(i32, 0));
+    if (flags < 0) return error.SocketUnavailable;
+    if (std.c.fcntl(fd, std.c.F.SETFL, flags | @as(@TypeOf(flags), 4)) < 0) return error.SocketUnavailable;
+    var len: std.c.socklen_t = @intCast(@sizeOf(std.c.sockaddr.in));
+    if (std.c.getsockname(fd, addr_ptr, &len) != 0) return error.SocketUnavailable;
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
+}
+
+fn bsdListenError() ListenError {
+    const err = std.c._errno().*;
+    if (err == 48 or err == 98) return error.AddressInUse;
+    if (err == 1 or err == 13) return error.PermissionDenied;
+    return error.SocketUnavailable;
+}
+
+fn listenWindows(host: []const u8, port: u16) ListenError!Listener {
+    const ip = try ipv4Bits(host);
+    var startup: [408]u8 = @splat(0);
+    if (WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+    const sock = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    if (sock == 0 or sock == std.math.maxInt(usize)) return error.SocketUnavailable;
+    errdefer _ = closesocket(sock);
+    const limit: usize = @intCast(std.math.maxInt(i32));
+    if (sock > limit) return error.SocketUnavailable;
+    const fd: linux.fd_t = @intCast(sock);
+    var addr = RioSockAddr{
+        .family = @intCast(wsa_af_inet),
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = ip,
+        .zero = @splat(0),
+    };
+    if (bind(sock, &addr, @sizeOf(RioSockAddr)) != 0) return windowsListenError();
+    if (listen(sock, 128) != 0) return windowsListenError();
+    var name_len: i32 = @sizeOf(RioSockAddr);
+    if (getsockname(sock, &addr, &name_len) != 0) return error.SocketUnavailable;
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
+}
+
+fn windowsListenError() ListenError {
+    const err = WSAGetLastError();
+    if (err == 10048) return error.AddressInUse;
+    if (err == 10013) return error.PermissionDenied;
+    return error.SocketUnavailable;
+}
+
 fn posixSocket() !linux.fd_t {
     const rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
     switch (std.posix.errno(rc)) {
@@ -1956,12 +2461,12 @@ test "GAP-X1 IoBackend queues accept recv send poll cancel and timeout on the li
     try std.testing.expectError(error.Usr2Refused, live.refuseCapsule(allocator, encoded));
     try std.testing.expectError(error.Unsupported, refusePortableReactor(.windows, 32));
     try std.testing.expectError(error.Unsupported, refusePortableReactor(.freebsd, 32));
-    try std.testing.expectError(error.Unsupported, refusePortableReactor(.linux, live.entries));
+    try refusePortableReactor(.linux, live.entries);
     try std.testing.expectError(error.Unsupported, refuseForeignCapsule());
     if (comptime builtin.os.tag == .freebsd) try Kqueue.exerciseLive();
     if (comptime builtin.os.tag == .windows) try Iocp.exerciseLive();
 
-    std.debug.print("GAP-X1 branch=linux ring queued six ops; this host did not execute kqueue or IOCP; closed kqueue describes FreeBSD filters; closed IOCP describes AFD wait-for-listen and AFD poll and returns MissingOp; portable init refuses; USR2 capsule refused\n", .{});
+    std.debug.print("GAP-X1 branch=linux ring queued six ops; this host did not execute kqueue or IOCP; closed kqueue describes FreeBSD filters; closed IOCP describes AFD wait-for-listen and AFD poll and returns MissingOp; portable init opens the native backend and refuses a missing op; USR2 capsule refused\n", .{});
 }
 
 test "GAP-X3 Windows RIO fails closed off Windows" {

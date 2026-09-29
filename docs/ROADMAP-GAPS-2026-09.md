@@ -969,9 +969,10 @@ GAP-K1 and GAP-P4 are done and the boundary still demands it.
 ### GAP-X1 — Portable reactor
 
 **Size XL.** `Server` is `LinuxServer` on Linux and `PortableServer` elsewhere.
-`PortableServer.init` returns `error.Unsupported` (`server.zig` ~52011). Clocks,
-entropy, and pid are already portable (`substrate/platform.zig`). That is not
-a reactor.
+`PortableServer.init` opens the native `IoBackend`, listens, and `runOnce`
+accepts and answers through `processLine`. Clocks, entropy, and pid are
+already portable (`substrate/platform.zig`). Helix `USR2` adoption stays on
+`LinuxServer`.
 
 `substrate/io/ring.zig` is an unfinished prototype: no connect, poll, or cancel,
 and it does not register provided buffers with the kernel. The production ring
@@ -985,12 +986,19 @@ refuse a USR2 capsule instead of adopting it wrong. A `zig build` of the daemon
 succeeds for `x86_64-linux` and at least one non-Linux triple.
 
 FreeBSD 14.5-RELEASE-p1 executed the shipped kqueue submit
-(`GAP-X1 freebsd kqueue submitted=6 errno=0`). Windows 11 22H2 WinPE, build
+(`GAP-X1 freebsd kqueue submitted=6 errno=0`). OpenBSD 7.9 executed the
+shipped kqueue accept and recv twice
+(`GAP-X1 openbsd kqueue submitted=1 accepted=6 bytes=8 errno=0`), then pledge
+(`GAP-X3 openbsd pledge result=ok errno=0`). Windows 11 22H2 WinPE, build
 22621.525, executed the shipped IOCP submit twice
 (`GAP-X1 windows iocp submitted=6`, `GUEST_EXIT:0`). The same boots dequeued
-Registered I/O (`GAP-X3 windows rio dequeue=1 bytes=4 status=0`). The heading
-stays unmarked and the whole Accept stays unclaimed. `PortableServer.init`
-still returns `Unsupported`.
+Registered I/O (`GAP-X3 windows rio dequeue=1 bytes=4 status=0`). On Linux,
+`PortableServer` answered `PING lane` with `PONG` through `processLine` on
+ringlane (the GAP-X1 test, twice, 0 leaked). NetBSD linked the same kqueue
+guest. DragonFly typechecks that guest; this Zig has no DragonFly libc, so
+that guest was not linked or executed. The heading stays unmarked and the
+whole Accept stays unclaimed. A Windows or BSD `onyx-server` process has not
+been witnessed booting this listener.
 
 ### GAP-X2 — `server.zig` strangler, only as a seam is touched
 
@@ -1157,9 +1165,10 @@ This roadmap does not authorize a deploy.
 FreeBSD 14.5-RELEASE-p1 executed the shipped kqueue submit
 (`GAP-X1 freebsd kqueue submitted=6 errno=0`) and kernel TLS
 (`GAP-X3 freebsd ktls result=ok errno=0` with `kern.ipc.tls.enable=1`).
-OpenBSD 7.9 executed the shipped pledge
-(`GAP-X3 openbsd pledge result=ok errno=0`). Windows 11 22H2 WinPE, build
-22621.525, executed the shipped IOCP submit twice
+OpenBSD 7.9 executed the shipped kqueue accept and recv twice
+(`GAP-X1 openbsd kqueue submitted=1 accepted=6 bytes=8 errno=0`) and the
+shipped pledge (`GAP-X3 openbsd pledge result=ok errno=0`). Windows 11 22H2
+WinPE, build 22621.525, executed the shipped IOCP submit twice
 (`GAP-X1 windows iocp submitted=6`, `GUEST_EXIT:0`) and dequeued Registered I/O
 twice (`GAP-X3 windows rio dequeue=1 bytes=4 status=0`) through the table
 `Iocp.open` loaded. The live `IDENTIFY` sentence (eshmaki.me / ircx.us)

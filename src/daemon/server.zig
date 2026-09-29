@@ -53948,47 +53948,364 @@ pub const LinuxServer = struct {
 };
 
 /// Public entry point. `LinuxServer` is the io_uring fast path. Other targets
-/// construct `PortableServer`, whose `init` asks `IoBackend` and fails closed
-/// when accept, recv, send, poll, cancel, or timeout is missing.
+/// construct `PortableServer`, which serves on the native `IoBackend`.
+/// Helix USR2 adoption stays on `LinuxServer`.
 pub const Server = if (builtin.os.tag == .linux) LinuxServer else PortableServer;
 
-const PortableServer = struct {
-    pub fn init(_: std.mem.Allocator, config: Config) ServerError!PortableServer {
-        io_backend.refusePortableReactor(builtin.os.tag, config.ring_entries) catch |err| return err;
-        unreachable;
+const PortableConn = struct {
+    fd: linux.fd_t = -1,
+    token: RingFdToken = .{ .slot = 0, .gen = 0 },
+    state: *ConnState,
+    recv_buf: [512]u8 = undefined,
+    line_buf: [512]u8 = undefined,
+    line_len: usize = 0,
+    send_buf: [1024]u8 = undefined,
+    send_len: usize = 0,
+    send_off: usize = 0,
+    recv_armed: bool = false,
+    send_armed: bool = false,
+    live: bool = true,
+};
+
+const PortableSendSink = struct {
+    conn: *PortableConn,
+
+    fn write(self: *PortableSendSink, bytes: []const u8) ServerError!void {
+        if (self.conn.send_len + bytes.len > self.conn.send_buf.len) return error.OutputTooSmall;
+        @memcpy(self.conn.send_buf[self.conn.send_len..][0..bytes.len], bytes);
+        self.conn.send_len += bytes.len;
     }
-    /// Heap slot used by `main`. Same refusal as `init`: the reactor loop is the Linux ring.
+};
+
+const PortableServer = struct {
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    backend: io_backend.IoBackend = undefined,
+    listener: linux.fd_t = -1,
+    port: u16 = 0,
+    conns: []*PortableConn = &.{},
+    next_slot: u32 = 1,
+    pending: bool = false,
+    wake_armed: bool = false,
+    wake: linux.kernel_timespec = .{ .sec = 0, .nsec = 200_000_000 },
+
+    pub fn init(allocator: std.mem.Allocator, config: Config) ServerError!PortableServer {
+        var backend = io_backend.IoBackend.openOwned(io_backend.familyFor(builtin.os.tag), config.ring_entries, .{}) catch return error.Unsupported;
+        backend.requireAll() catch {
+            backend.deinit();
+            return error.Unsupported;
+        };
+        const listener = io_backend.listenTcp(config.host, config.port) catch |err| {
+            backend.deinit();
+            return err;
+        };
+        const listen_token = RingFdToken{ .slot = 0, .gen = 1 };
+        backend.accept(listen_token, listener.fd) catch {
+            io_backend.closeSocket(listener.fd);
+            backend.deinit();
+            return error.Unsupported;
+        };
+        _ = backend.submit() catch {
+            io_backend.closeSocket(listener.fd);
+            backend.deinit();
+            return error.Unsupported;
+        };
+        if (comptime builtin.os.tag == .freebsd) {
+            kernel_other.enterDaemonCapsicum(&.{ listener.fd, backend.queueFd() }) catch {
+                io_backend.closeSocket(listener.fd);
+                backend.deinit();
+                return error.Unsupported;
+            };
+        }
+        return .{
+            .allocator = allocator,
+            .backend = backend,
+            .listener = listener.fd,
+            .port = listener.port,
+        };
+    }
+    /// Heap slot used by `main`. Same listener and backend as `init`.
     pub fn initInPlace(self: *PortableServer, allocator: std.mem.Allocator, config: Config) ServerError!void {
         self.* = try init(allocator, config);
     }
-    pub fn deinit(_: *PortableServer) void {}
+    pub fn deinit(self: *PortableServer) void {
+        const listen_token = RingFdToken{ .slot = 0, .gen = 1 };
+        self.backend.cancel(.accept, listen_token) catch {};
+        for (self.conns) |conn| {
+            if (conn.recv_armed) self.backend.cancel(.recv, conn.token) catch {};
+            if (conn.send_armed) self.backend.cancel(.send, conn.token) catch {};
+        }
+        _ = self.backend.submit() catch {};
+        var evs: [8]io_backend.Reaped = undefined;
+        var spins: u8 = 0;
+        while (spins < 8) : (spins += 1) {
+            // wait_ms 0 does not block. A positive wait on the ring asks for
+            // one CQE and will sit there after the last completion.
+            const n = self.backend.reap(&evs, 0) catch break;
+            if (n == 0) break;
+        }
+        self.backend.deinit();
+        for (self.conns) |conn| {
+            io_backend.closeSocket(conn.fd);
+            self.allocator.destroy(conn.state);
+            self.allocator.destroy(conn);
+        }
+        if (self.conns.len != 0) self.allocator.free(self.conns);
+        self.conns = &.{};
+        io_backend.closeSocket(self.listener);
+        self.listener = -1;
+    }
+
     pub fn start(_: *PortableServer) void {}
-    pub fn boundPort(_: *PortableServer) ServerError!u16 {
-        return error.Unsupported;
+
+    pub fn boundPort(self: *PortableServer) ServerError!u16 {
+        if (self.port == 0) return error.Unsupported;
+        return self.port;
     }
     pub fn s2sBoundPort(_: *PortableServer) ServerError!u16 {
         return error.Unsupported;
     }
-    pub fn runOnce(_: *PortableServer) ServerError!void {
-        return error.Unsupported;
+    pub fn runOnce(self: *PortableServer) ServerError!void {
+        if (self.backend.family == .ringlane and !self.wake_armed) {
+            self.backend.timeout(.{ .slot = 0, .gen = 0 }, &self.wake) catch return error.Unsupported;
+            self.wake_armed = true;
+            self.pending = true;
+        }
+        if (self.pending) {
+            _ = self.backend.submit() catch return error.Unsupported;
+            self.pending = false;
+        }
+        var evs: [16]io_backend.Reaped = undefined;
+        const n = self.backend.reap(&evs, 200) catch return error.Unsupported;
+        var i: usize = 0;
+        while (i < n) : (i += 1) try self.dispatch(evs[i]);
+        if (self.pending) {
+            _ = self.backend.submit() catch return error.Unsupported;
+            self.pending = false;
+        }
     }
-    /// Symbol parity with LinuxServer so the threaded end-to-end tests compile on
-    /// non-Linux targets. Never reached: `init` returns Unsupported first, so the
-    /// tests SkipZigTest before any thread is spawned.
-    pub fn runThreaded(_: *PortableServer, _: *std.atomic.Value(bool)) void {}
+    /// Serve loop `main` runs after `init` returns a listener.
+    pub fn runThreaded(self: *PortableServer, run: *std.atomic.Value(bool)) void {
+        while (run.load(.acquire)) self.runOnce() catch return;
+    }
     /// Symbol parity for the services → world +r bridge (see LinuxServer).
     pub fn markChannelRegistered(_: *PortableServer, _: []const u8, _: bool) std.mem.Allocator.Error!void {}
-    /// Symbol parity so `main.zig` type-checks on non-Linux targets. Never
-    /// reached: `init` returns Unsupported before any of these can run.
+    /// Services bridge. A non-Linux boot does not replay a Linux Helix capsule.
     pub fn replayServicesLiveState(_: *PortableServer, _: *services_mod.Services) void {}
     pub fn loadWasmPlugins(_: *PortableServer) void {}
+
+    fn dispatch(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
+        switch (ev.op) {
+            .timeout => self.wake_armed = false,
+            .cancel, .poll => {},
+            .accept => try self.onAccept(ev),
+            .recv => try self.onRecv(ev),
+            .send => try self.onSend(ev),
+        }
+    }
+
+    fn onAccept(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
+        if (ev.token.slot != 0 or ev.token.gen != 1) return;
+        if (!self.backend.levelTriggered()) try self.armAccept();
+        if (ev.result < 0) return;
+        try self.adopt(@intCast(ev.result));
+    }
+
+    fn onRecv(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
+        const conn = self.findConn(ev.token) orelse return;
+        if (!self.backend.levelTriggered()) conn.recv_armed = false;
+        if (ev.result < 0) {
+            if (portableAgain(ev.result)) {
+                if (!self.backend.levelTriggered()) try self.armRecv(conn);
+                return;
+            }
+            self.dropConn(conn);
+            return;
+        }
+        if (ev.result == 0) {
+            self.dropConn(conn);
+            return;
+        }
+        try self.takeBytes(conn, @intCast(ev.result));
+        if (conn.live and !self.backend.levelTriggered()) try self.armRecv(conn);
+    }
+
+    fn onSend(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
+        const conn = self.findConn(ev.token) orelse return;
+        conn.send_armed = false;
+        if (ev.result < 0) {
+            if (portableAgain(ev.result)) {
+                try self.armSend(conn);
+                return;
+            }
+            self.dropConn(conn);
+            return;
+        }
+        const sent: usize = @intCast(ev.result);
+        if (conn.send_off + sent > conn.send_len) {
+            self.dropConn(conn);
+            return;
+        }
+        conn.send_off += sent;
+        try self.armSend(conn);
+    }
+
+    fn adopt(self: *PortableServer, fd: linux.fd_t) ServerError!void {
+        if (self.next_slot == 0) {
+            io_backend.closeSocket(fd);
+            return error.Unexpected;
+        }
+        const conn = self.allocator.create(PortableConn) catch {
+            io_backend.closeSocket(fd);
+            return error.OutOfMemory;
+        };
+        const state = self.allocator.create(ConnState) catch {
+            self.allocator.destroy(conn);
+            io_backend.closeSocket(fd);
+            return error.OutOfMemory;
+        };
+        state.* = .{};
+        conn.* = .{
+            .fd = fd,
+            .token = .{ .slot = self.next_slot, .gen = 1 },
+            .state = state,
+        };
+        const grown = self.allocator.alloc(*PortableConn, self.conns.len + 1) catch {
+            self.allocator.destroy(state);
+            self.allocator.destroy(conn);
+            io_backend.closeSocket(fd);
+            return error.OutOfMemory;
+        };
+        if (self.conns.len != 0) {
+            @memcpy(grown[0..self.conns.len], self.conns);
+            self.allocator.free(self.conns);
+        }
+        grown[grown.len - 1] = conn;
+        self.conns = grown;
+        self.next_slot += 1;
+        self.armRecv(conn) catch |err| {
+            self.dropConn(conn);
+            return err;
+        };
+    }
+
+    fn takeBytes(self: *PortableServer, conn: *PortableConn, n: usize) ServerError!void {
+        var i: usize = 0;
+        while (i < n) {
+            if (!conn.live) return;
+            if (conn.line_len >= conn.line_buf.len) {
+                self.dropConn(conn);
+                return;
+            }
+            const byte = conn.recv_buf[i];
+            i += 1;
+            if (byte != '\n') {
+                conn.line_buf[conn.line_len] = byte;
+                conn.line_len += 1;
+                continue;
+            }
+            var end = conn.line_len;
+            if (end > 0 and conn.line_buf[end - 1] == '\r') end -= 1;
+            const line = conn.line_buf[0..end];
+            conn.line_len = 0;
+            if (line.len == 0) continue;
+            var sink = PortableSendSink{ .conn = conn };
+            processLine(conn.state, line, &sink) catch {
+                self.dropConn(conn);
+                return;
+            };
+            try self.armSend(conn);
+        }
+    }
+
+    fn armAccept(self: *PortableServer) ServerError!void {
+        self.backend.accept(.{ .slot = 0, .gen = 1 }, self.listener) catch return error.Unsupported;
+        self.pending = true;
+    }
+
+    fn armRecv(self: *PortableServer, conn: *PortableConn) ServerError!void {
+        if (!conn.live or conn.recv_armed) return;
+        self.backend.recv(conn.token, conn.fd, &conn.recv_buf) catch return error.Unsupported;
+        conn.recv_armed = true;
+        self.pending = true;
+    }
+
+    fn armSend(self: *PortableServer, conn: *PortableConn) ServerError!void {
+        if (!conn.live or conn.send_armed) return;
+        if (conn.send_off >= conn.send_len) {
+            conn.send_off = 0;
+            conn.send_len = 0;
+            return;
+        }
+        self.backend.send(conn.token, conn.fd, conn.send_buf[conn.send_off..conn.send_len]) catch return error.Unsupported;
+        conn.send_armed = true;
+        self.pending = true;
+    }
+
+    fn dropConn(self: *PortableServer, conn: *PortableConn) void {
+        if (!conn.live) return;
+        conn.live = false;
+        if (conn.recv_armed) self.backend.cancel(.recv, conn.token) catch {};
+        if (conn.send_armed) self.backend.cancel(.send, conn.token) catch {};
+        conn.recv_armed = false;
+        conn.send_armed = false;
+        self.pending = true;
+        io_backend.closeSocket(conn.fd);
+        conn.fd = -1;
+    }
+
+    fn findConn(self: *PortableServer, token: RingFdToken) ?*PortableConn {
+        for (self.conns) |conn| {
+            if (conn.live and conn.token.slot == token.slot and conn.token.gen == token.gen) return conn;
+        }
+        return null;
+    }
 };
 
-test "GAP-X1 PortableServer init fails closed through the IoBackend" {
-    try std.testing.expectError(error.Unsupported, PortableServer.init(std.testing.allocator, .{ .port = 0 }));
-    var portable: PortableServer = undefined;
-    try std.testing.expectError(error.Unsupported, portable.initInPlace(std.testing.allocator, .{ .port = 0 }));
-    std.debug.print("GAP-X1 branch=PortableServer init refuses through the IoBackend\n", .{});
+fn portableAgain(result: i32) bool {
+    return result == -4 or result == -11 or result == -35;
+}
+
+test "GAP-X1 PortableServer answers PING through processLine" {
+    var server = PortableServer.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    const raw = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    if (posix.errno(raw) != .SUCCESS) return error.SkipZigTest;
+    const client: linux.fd_t = @intCast(raw);
+    defer _ = linux.close(client);
+    var addr = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    if (posix.errno(linux.connect(client, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.Unexpected;
+    var tv = linux.timeval{ .sec = 2, .usec = 0 };
+    _ = linux.setsockopt(client, posix.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+    const msg = "PING lane\r\n";
+    var off: usize = 0;
+    while (off < msg.len) {
+        const wrote = linux.write(client, msg[off..].ptr, msg.len - off);
+        switch (posix.errno(wrote)) {
+            .SUCCESS => {
+                if (wrote == 0) return error.Unexpected;
+                off += wrote;
+            },
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+    var spins: u8 = 0;
+    while (spins < 12) : (spins += 1) try server.runOnce();
+    var got: [128]u8 = @splat(0);
+    const read_rc = linux.read(client, &got, got.len);
+    if (posix.errno(read_rc) != .SUCCESS or read_rc == 0) return error.Unexpected;
+    const text = got[0..read_rc];
+    try std.testing.expect(std.mem.indexOf(u8, text, "PONG") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "lane") != null);
+    try std.testing.expectError(error.Unsupported, io_backend.refuseForeignCapsule());
+    std.debug.print("GAP-X1 branch=PortableServer answered PING lane with PONG through processLine on {s}\n", .{@tagName(server.backend.family)});
 }
 
 fn expectListenerKernelOptions(fd: linux.fd_t, cpu: u32) !void {
@@ -54021,10 +54338,11 @@ pub fn installDaemonKernelSandbox(config_path: ?[]const u8) !void {
     switch (comptime builtin.os.tag) {
         .linux => return kernel_linux.installDaemonSandbox(config_path),
         .freebsd => {
-            // Keep the setsockopt in the image. Boot has no traffic key, so
-            // this does not enable kernel TLS and does not swallow MissingOp.
+            // Keep the setsockopt in the image. Boot has no listener yet, so
+            // Capsicum starts in `PortableServer.init` after the listener and
+            // the kqueue exist. An empty fd list still fails closed.
             std.mem.doNotOptimizeAway(kernel_other.kernel_tls_anchor);
-            return kernel_other.enterDaemonCapsicum(&.{});
+            return;
         },
         .openbsd => return kernel_other.pledgeDaemonPaths(),
         .windows => return kernel_other.assignDaemonJob(),

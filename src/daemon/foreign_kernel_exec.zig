@@ -119,6 +119,83 @@ pub fn executeFreeBsdKtls() !void {
     std.debug.print("GAP-X3 freebsd ktls result=ok errno={d}\n", .{errnoNow()});
 }
 
+pub fn executeBsdKqueueServe() !void {
+    const listener = io_backend.listenTcp("127.0.0.1", 0) catch |err| {
+        std.debug.print("GAP-X1 {s} kqueue submitted=missing stage=listen errno={d}\n", .{ @tagName(builtin.os.tag), errnoNow() });
+        return err;
+    };
+    defer io_backend.closeSocket(listener.fd);
+    var backend = io_backend.IoBackend.openOwned(.kqueue, 32, .{}) catch |err| {
+        std.debug.print("GAP-X1 {s} kqueue submitted=missing stage=open errno={d}\n", .{ @tagName(builtin.os.tag), errnoNow() });
+        return err;
+    };
+    defer backend.deinit();
+    const listen_token = ringlane.FdToken{ .slot = 0, .gen = 1 };
+    backend.accept(listen_token, listener.fd) catch |err| {
+        std.debug.print("GAP-X1 {s} kqueue submitted=missing stage=accept errno={d}\n", .{ @tagName(builtin.os.tag), errnoNow() });
+        return err;
+    };
+    const submitted = backend.submit() catch |err| {
+        std.debug.print("GAP-X1 {s} kqueue submitted=missing stage=submit errno={d}\n", .{ @tagName(builtin.os.tag), errnoNow() });
+        return err;
+    };
+    const client = tcpSocket() catch |err| {
+        std.debug.print("GAP-X1 {s} kqueue submitted={d} accepted=missing stage=client errno={d}\n", .{ @tagName(builtin.os.tag), submitted, errnoNow() });
+        return err;
+    };
+    defer _ = std.c.close(client);
+    var addr = std.c.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, listener.port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    const addr_ptr: *const std.c.sockaddr = @ptrCast(&addr);
+    if (std.c.connect(client, addr_ptr, @intCast(@sizeOf(std.c.sockaddr.in))) != 0) {
+        std.debug.print("GAP-X1 {s} kqueue submitted={d} accepted=missing stage=connect errno={d}\n", .{ @tagName(builtin.os.tag), submitted, errnoNow() });
+        return error.MissingOp;
+    }
+    const ping = "PING x\r\n";
+    if (std.c.send(client, ping, ping.len, 0) < 0) {
+        std.debug.print("GAP-X1 {s} kqueue submitted={d} accepted=missing stage=send errno={d}\n", .{ @tagName(builtin.os.tag), submitted, errnoNow() });
+        return error.MissingOp;
+    }
+    var evs: [4]io_backend.Reaped = undefined;
+    const n_accept = backend.reap(&evs, 1000) catch |err| {
+        std.debug.print("GAP-X1 {s} kqueue submitted={d} accepted=missing stage=reap errno={d}\n", .{ @tagName(builtin.os.tag), submitted, errnoNow() });
+        return err;
+    };
+    var accepted: i32 = -1;
+    var i: usize = 0;
+    while (i < n_accept) : (i += 1) {
+        if (evs[i].op == .accept and evs[i].result >= 0) accepted = evs[i].result;
+    }
+    if (accepted < 0) {
+        std.debug.print("GAP-X1 {s} kqueue submitted={d} accepted={d} bytes=0 errno={d}\n", .{ @tagName(builtin.os.tag), submitted, accepted, errnoNow() });
+        return error.MissingOp;
+    }
+    defer io_backend.closeSocket(accepted);
+    var buf: [64]u8 = @splat(0);
+    const recv_token = ringlane.FdToken{ .slot = 1, .gen = 1 };
+    backend.recv(recv_token, accepted, &buf) catch |err| {
+        std.debug.print("GAP-X1 {s} kqueue submitted={d} accepted={d} bytes=missing stage=recv errno={d}\n", .{ @tagName(builtin.os.tag), submitted, accepted, errnoNow() });
+        return err;
+    };
+    _ = backend.submit() catch |err| {
+        std.debug.print("GAP-X1 {s} kqueue submitted={d} accepted={d} bytes=missing stage=recv-submit errno={d}\n", .{ @tagName(builtin.os.tag), submitted, accepted, errnoNow() });
+        return err;
+    };
+    const n_recv = backend.reap(&evs, 1000) catch |err| {
+        std.debug.print("GAP-X1 {s} kqueue submitted={d} accepted={d} bytes=missing stage=recv-reap errno={d}\n", .{ @tagName(builtin.os.tag), submitted, accepted, errnoNow() });
+        return err;
+    };
+    var bytes: i32 = 0;
+    i = 0;
+    while (i < n_recv) : (i += 1) {
+        if (evs[i].op == .recv) bytes = evs[i].result;
+    }
+    std.debug.print("GAP-X1 {s} kqueue submitted={d} accepted={d} bytes={d} errno={d}\n", .{ @tagName(builtin.os.tag), submitted, accepted, bytes, errnoNow() });
+    if (bytes <= 0) return error.MissingOp;
+}
+
 pub fn executeOpenBsdPledge() !void {
     const paths = [_][:0]const u8{ "/etc", "/usr", "/var", "/tmp" };
     for (paths) |path| {
@@ -330,7 +407,12 @@ pub fn main() !void {
         return;
     }
     if (comptime builtin.os.tag == .openbsd) {
+        try executeBsdKqueueServe();
         try executeOpenBsdPledge();
+        return;
+    }
+    if (comptime builtin.os.tag == .netbsd or builtin.os.tag == .dragonfly) {
+        try executeBsdKqueueServe();
         return;
     }
     if (comptime builtin.os.tag == .windows) {
