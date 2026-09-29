@@ -467,7 +467,8 @@ pub const Server = struct {
         const suite = self.selected_suite orelse return error.BadState;
         const limit = tls_record.recordContentLimit12(self.peer_record_size_limit);
         if (appdata.len <= limit) {
-            const out = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.server_write, self.app_write_seq, .application_data, appdata);
+            const seq = try tls12.reserveAppSeq(self.app_write_seq);
+            const out = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.server_write, seq, .application_data, appdata);
             self.app_write_seq += 1;
             return out;
         }
@@ -480,7 +481,8 @@ pub const Server = struct {
         var off: usize = 0;
         while (off < appdata.len) {
             const n = @min(limit, appdata.len - off);
-            const rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.server_write, self.app_write_seq, .application_data, appdata[off .. off + n]);
+            const seq = try tls12.reserveAppSeq(self.app_write_seq);
+            const rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.server_write, seq, .application_data, appdata[off .. off + n]);
             defer self.allocator.free(rec);
             try buf.appendSlice(self.allocator, rec);
             self.app_write_seq += 1;
@@ -492,7 +494,8 @@ pub const Server = struct {
     pub fn decrypt(self: *Server, record: []const u8) Error![]u8 {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.client_write, self.app_read_seq, record);
+        const seq = try tls12.reserveAppSeq(self.app_read_seq);
+        const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.client_write, seq, record);
         self.app_read_seq += 1;
         errdefer self.allocator.free(opened.plaintext);
         if (opened.content_type == .alert) return error.TlsAlert;
@@ -1448,6 +1451,77 @@ fn runLoopback(comptime suite_kind: LoopbackSuite) !void {
     const c_plain = try client.decrypt(s_app);
     defer allocator.free(c_plain);
     try std.testing.expectEqualSlices(u8, "server to client", c_plain);
+}
+
+test "GAP-K13 an application record after the last sequence fails closed" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+    try std.testing.expect(client.handshakeDone());
+    try std.testing.expect(server.handshakeDone());
+
+    const last = std.math.maxInt(u64);
+    const s2c = try server.encrypt("nonce-zero");
+    defer allocator.free(s2c);
+    const got_c = try client.decrypt(s2c);
+    defer allocator.free(got_c);
+    try std.testing.expectEqualStrings("nonce-zero", got_c);
+
+    server.app_write_seq = last;
+    try std.testing.expectError(error.SequenceExhausted, server.encrypt("wrap"));
+    try std.testing.expectEqual(last, server.app_write_seq);
+
+    client.app_read_seq = last;
+    try std.testing.expectError(error.SequenceExhausted, client.decrypt(s2c));
+    try std.testing.expectEqual(last, client.app_read_seq);
+
+    const c2s = try client.encrypt("nonce-zero-c");
+    defer allocator.free(c2s);
+    const got_s = try server.decrypt(c2s);
+    defer allocator.free(got_s);
+    try std.testing.expectEqualStrings("nonce-zero-c", got_s);
+
+    client.app_write_seq = last;
+    try std.testing.expectError(error.SequenceExhausted, client.encrypt("wrap"));
+    try std.testing.expectEqual(last, client.app_write_seq);
+
+    server.app_read_seq = last;
+    try std.testing.expectError(error.SequenceExhausted, server.decrypt(c2s));
+    try std.testing.expectEqual(last, server.app_read_seq);
+
+    std.debug.print("GAP-K13 branch=an application record after the last sequence fails closed\n", .{});
 }
 
 // F6 regression: `buildServerFlight` used to wrap the WHOLE first flight

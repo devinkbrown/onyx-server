@@ -1043,7 +1043,8 @@ pub const Client = struct {
         const suite = self.selected_suite orelse return error.BadState;
         const limit = tls_record.recordContentLimit(self.peer_record_size_limit);
         if (appdata.len <= limit) {
-            const out = try sealRecordAlloc(self.allocator, suite, &self.client_app_keys, self.app_write_seq, .application_data, appdata);
+            const seq = try tls_record.reserveAppSeq(self.app_write_seq);
+            const out = try sealRecordAlloc(self.allocator, suite, &self.client_app_keys, seq, .application_data, appdata);
             self.app_write_seq += 1;
             return out;
         }
@@ -1054,7 +1055,8 @@ pub const Client = struct {
         var off: usize = 0;
         while (off < appdata.len) {
             const n = @min(limit, appdata.len - off);
-            const rec = try sealRecordAlloc(self.allocator, suite, &self.client_app_keys, self.app_write_seq, .application_data, appdata[off .. off + n]);
+            const seq = try tls_record.reserveAppSeq(self.app_write_seq);
+            const rec = try sealRecordAlloc(self.allocator, suite, &self.client_app_keys, seq, .application_data, appdata[off .. off + n]);
             defer self.allocator.free(rec);
             try buf.appendSlice(self.allocator, rec);
             self.app_write_seq += 1;
@@ -1066,7 +1068,8 @@ pub const Client = struct {
     pub fn decrypt(self: *Client, record: []const u8) Error![]u8 {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        const opened = try openRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_read_seq, record);
+        const seq = try tls_record.reserveAppSeq(self.app_read_seq);
+        const opened = try openRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, record);
         self.app_read_seq += 1;
         errdefer self.allocator.free(opened.content);
         if (opened.content_type == .alert) {
@@ -1093,7 +1096,8 @@ pub const Client = struct {
     pub fn decryptApp(self: *Client, record: []const u8) Error!AppRead {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        const opened = try openRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_read_seq, record);
+        const seq = try tls_record.reserveAppSeq(self.app_read_seq);
+        const opened = try openRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, record);
         self.app_read_seq += 1;
         switch (opened.content_type) {
             .application_data => return .{ .application_data = opened.content },
@@ -1207,7 +1211,8 @@ pub const Client = struct {
         var hs: std.ArrayList(u8) = .empty;
         defer hs.deinit(self.allocator);
         try writeHandshake(self.allocator, &hs, .key_update, &[_]u8{@intFromEnum(request)});
-        const record = try sealRecordAlloc(self.allocator, suite, &self.client_app_keys, self.app_write_seq, .handshake, hs.items);
+        const seq = try tls_record.reserveAppSeq(self.app_write_seq);
+        const record = try sealRecordAlloc(self.allocator, suite, &self.client_app_keys, seq, .handshake, hs.items);
         defer self.allocator.free(record);
         self.app_write_seq += 1;
         try self.post_handshake_send.appendSlice(self.allocator, record);

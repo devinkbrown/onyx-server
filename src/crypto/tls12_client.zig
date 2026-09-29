@@ -556,7 +556,8 @@ pub const Client = struct {
         const suite = self.selected_suite orelse return error.BadState;
         const limit = tls_record.recordContentLimit12(self.peer_record_size_limit);
         if (appdata.len <= limit) {
-            const out = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.app_write_seq, .application_data, appdata);
+            const seq = try tls12.reserveAppSeq(self.app_write_seq);
+            const out = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, seq, .application_data, appdata);
             self.app_write_seq += 1;
             return out;
         }
@@ -567,7 +568,8 @@ pub const Client = struct {
         var off: usize = 0;
         while (off < appdata.len) {
             const n = @min(limit, appdata.len - off);
-            const rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.app_write_seq, .application_data, appdata[off .. off + n]);
+            const seq = try tls12.reserveAppSeq(self.app_write_seq);
+            const rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, seq, .application_data, appdata[off .. off + n]);
             defer self.allocator.free(rec);
             try buf.appendSlice(self.allocator, rec);
             self.app_write_seq += 1;
@@ -579,7 +581,8 @@ pub const Client = struct {
     pub fn decrypt(self: *Client, record: []const u8) Error![]u8 {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.server_write, self.app_read_seq, record);
+        const seq = try tls12.reserveAppSeq(self.app_read_seq);
+        const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.server_write, seq, record);
         self.app_read_seq += 1;
         errdefer self.allocator.free(opened.plaintext);
         if (opened.content_type == .alert) return error.TlsAlert;

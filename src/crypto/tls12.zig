@@ -37,6 +37,13 @@ pub const Error = error{
     UnsupportedCipherSuite,
 } || std.mem.Allocator.Error;
 
+/// Refuse sequence `2^64 - 1`. Callers increment only after a successful seal
+/// or open, so the counter never wraps to nonce 0 under one traffic key.
+pub fn reserveAppSeq(seq: u64) Error!u64 {
+    if (seq == std.math.maxInt(u64)) return error.SequenceExhausted;
+    return seq;
+}
+
 pub const ContentType = enum(u8) {
     change_cipher_spec = 20,
     alert = 21,

@@ -869,7 +869,8 @@ pub const Server = struct {
             .wait_client_hello, .wait_second_client_hello => return alertRecordForError(self.allocator, err),
             .wait_client_cert, .wait_client_cert_verify, .wait_client_finished => {
                 const suite = self.selected_suite orelse return null;
-                const rec = alertRecordEncrypted(self.allocator, err, suite, &self.server_app_keys, self.app_write_seq) orelse return null;
+                const seq = tls_record.reserveAppSeq(self.app_write_seq) catch return null;
+                const rec = alertRecordEncrypted(self.allocator, err, suite, &self.server_app_keys, seq) orelse return null;
                 self.app_write_seq += 1;
                 return rec;
             },
@@ -1270,7 +1271,8 @@ pub const Server = struct {
         const suite = self.selected_suite orelse return error.BadState;
         const limit = tls_record.recordContentLimit(self.peer_record_size_limit);
         if (appdata.len <= limit) {
-            const out = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_write_seq, .application_data, appdata);
+            const seq = try tls_record.reserveAppSeq(self.app_write_seq);
+            const out = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .application_data, appdata);
             self.app_write_seq += 1;
             return out;
         }
@@ -1282,7 +1284,8 @@ pub const Server = struct {
         var off: usize = 0;
         while (off < appdata.len) {
             const n = @min(limit, appdata.len - off);
-            const rec = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_write_seq, .application_data, appdata[off .. off + n]);
+            const seq = try tls_record.reserveAppSeq(self.app_write_seq);
+            const rec = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .application_data, appdata[off .. off + n]);
             defer self.allocator.free(rec);
             try buf.appendSlice(self.allocator, rec);
             self.app_write_seq += 1;
@@ -1294,7 +1297,8 @@ pub const Server = struct {
     pub fn decrypt(self: *Server, record: []const u8) Error![]u8 {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        const opened = try openRecordAlloc(self.allocator, suite, &self.client_app_keys, self.app_read_seq, record);
+        const seq = try tls_record.reserveAppSeq(self.app_read_seq);
+        const opened = try openRecordAlloc(self.allocator, suite, &self.client_app_keys, seq, record);
         self.app_read_seq += 1;
         errdefer self.allocator.free(opened.content);
         if (opened.content_type == .handshake) {
@@ -1422,7 +1426,8 @@ pub const Server = struct {
         var hs: std.ArrayList(u8) = .empty;
         defer hs.deinit(self.allocator);
         try writeHandshake(self.allocator, &hs, .key_update, &[_]u8{@intFromEnum(request)});
-        const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_write_seq, .handshake, hs.items);
+        const seq = try tls_record.reserveAppSeq(self.app_write_seq);
+        const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .handshake, hs.items);
         errdefer self.allocator.free(record);
         self.app_write_seq += 1;
         try self.applyKeyUpdate(&self.server_app_secret, &self.server_app_keys);
@@ -2783,7 +2788,8 @@ pub const Server = struct {
         var hs: std.ArrayList(u8) = .empty;
         defer hs.deinit(self.allocator);
         try writeHandshake(self.allocator, &hs, .new_session_ticket, ticket_body);
-        const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_write_seq, .handshake, hs.items);
+        const seq = try tls_record.reserveAppSeq(self.app_write_seq);
+        const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .handshake, hs.items);
         defer self.allocator.free(record);
         self.app_write_seq += 1;
         try self.post_handshake_send.appendSlice(self.allocator, record);
@@ -8440,4 +8446,73 @@ test "GAP-K10 a second 0-RTT flight is rejected without a ReplayGuard" {
     try std.testing.expect(resume_client.handshakeDone());
 
     std.debug.print("GAP-K10 branch=a second 0-RTT flight is rejected without a ReplayGuard\n", .{});
+}
+
+test "GAP-K13 an application record after the last sequence fails closed" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x13)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x13, 0x13 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+    try std.testing.expect(client.handshakeDone());
+
+    const last = std.math.maxInt(u64);
+    const s2c = try server.encrypt("nonce-zero");
+    defer alloc.free(s2c);
+    const got_c = try client.decrypt(s2c);
+    defer alloc.free(got_c);
+    try std.testing.expectEqualStrings("nonce-zero", got_c);
+
+    server.app_write_seq = last;
+    try std.testing.expectError(error.SequenceExhausted, server.encrypt("wrap"));
+    try std.testing.expectEqual(last, server.app_write_seq);
+    try std.testing.expectError(error.SequenceExhausted, server.encrypt("wrap"));
+
+    client.app_read_seq = last;
+    try std.testing.expectError(error.SequenceExhausted, client.decrypt(s2c));
+    try std.testing.expectEqual(last, client.app_read_seq);
+
+    const c2s = try client.encrypt("nonce-zero-c");
+    defer alloc.free(c2s);
+    const got_s = try server.decrypt(c2s);
+    defer alloc.free(got_s);
+    try std.testing.expectEqualStrings("nonce-zero-c", got_s);
+
+    client.app_write_seq = last;
+    try std.testing.expectError(error.SequenceExhausted, client.encrypt("wrap"));
+    try std.testing.expectEqual(last, client.app_write_seq);
+
+    server.app_read_seq = last;
+    try std.testing.expectError(error.SequenceExhausted, server.decrypt(c2s));
+    try std.testing.expectEqual(last, server.app_read_seq);
+
+    std.debug.print("GAP-K13 branch=an application record after the last sequence fails closed\n", .{});
 }
