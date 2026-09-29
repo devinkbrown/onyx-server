@@ -321,6 +321,41 @@ pub fn buildPathFacts(chain: []const []const u8, out: []CaPathFact) usize {
     return n;
 }
 
+/// Apply every presented CA's dNSName constraints to each certificate below
+/// it. An intermediate's own dNSName is held to the CA that issued it.
+pub fn enforcePresentedNameConstraints(chain: []const []const u8) Error!void {
+    var ancestor: usize = 1;
+    while (ancestor < chain.len) : (ancestor += 1) {
+        const issuer = try x509.parse(chain[ancestor]);
+        var below: usize = 0;
+        while (below < ancestor) : (below += 1) {
+            const subject = try x509.parse(chain[below]);
+            try enforceNameConstraints(issuer, subject);
+        }
+    }
+}
+
+/// RFC 5280 initializes name constraints and pathLenConstraint from the trust
+/// anchor. A normal TLS chain omits that certificate, so the anchor from the
+/// caller's trust store is applied after its signature has matched.
+pub fn enforceExternalAnchor(chain: []const []const u8, anchor_der: []const u8) Error!void {
+    const anchor = try x509.parse(anchor_der);
+    for (chain) |der| {
+        if (std.mem.eql(u8, der, anchor_der)) continue;
+        const subject = try x509.parse(der);
+        try enforceNameConstraints(anchor, subject);
+    }
+    if (chain.len > 0 and std.mem.eql(u8, chain[chain.len - 1], anchor_der)) return;
+    var facts_buf: [17]CaPathFact = undefined;
+    const n = buildPathFacts(chain, facts_buf[0..16]);
+    const anchor_self = if (linkInfo(anchor_der)) |info| info.isSelfIssued() else |_| false;
+    facts_buf[n] = .{
+        .path_len = anchor.basic_constraints_path_len,
+        .self_issued = anchor_self,
+    };
+    try enforcePathLen(facts_buf[0 .. n + 1]);
+}
+
 /// Enforce an issuing CA's NameConstraints (dNSName) against the leaf's SAN
 /// dNSNames (RFC 5280 §4.2.1.10). Each leaf name must match no excluded
 /// subtree and, when permitted dNSName subtrees exist, at least one permitted
@@ -1188,9 +1223,10 @@ const CertExtOpts = struct {
     path_len: ?u8 = null,
     /// SubjectAltName dNSName entries.
     dns_names: []const []const u8 = &.{},
-    /// NameConstraints permittedSubtrees (dNSName only; no excludedSubtrees —
-    /// the F1 regression tests below only need permitted-subtree rejection).
+    /// NameConstraints permittedSubtrees (dNSName). Empty omits the field.
     permitted_dns: []const []const u8 = &.{},
+    /// NameConstraints excludedSubtrees (dNSName). Empty omits the field.
+    excluded_dns: []const []const u8 = &.{},
 };
 
 fn writeExtTlv(w: *W, oid: []const u8, ext_value: []const u8) void {
@@ -1222,23 +1258,31 @@ fn writeSanExt(w: *W, dns_names: []const []const u8) void {
     writeExtTlv(w, &oid_subject_alt_name_bytes, v.bytes());
 }
 
-/// NameConstraints permittedSubtrees only (RFC 5280 §4.2.1.10):
-/// SEQUENCE { permittedSubtrees [0] GeneralSubtrees }, GeneralSubtrees =
-/// SEQUENCE OF GeneralSubtree, GeneralSubtree = SEQUENCE { base GeneralName }
-/// (minimum/maximum omitted — both OPTIONAL/DEFAULT).
-fn writeNameConstraintsExt(w: *W, permitted_dns: []const []const u8) void {
-    var subtrees_body: [160]u8 = undefined;
-    var sb = W.init(&subtrees_body);
+/// NameConstraints (RFC 5280 §4.2.1.10): SEQUENCE { permittedSubtrees [0]
+/// OPTIONAL, excludedSubtrees [1] OPTIONAL }. GeneralSubtree omits
+/// minimum and maximum (both OPTIONAL/DEFAULT).
+fn writeNameConstraintsExt(w: *W, permitted_dns: []const []const u8, excluded_dns: []const []const u8) void {
+    var permitted_body: [160]u8 = undefined;
+    var pb = W.init(&permitted_body);
     for (permitted_dns) |name| {
         var gs_body: [96]u8 = undefined;
         var gsb = W.init(&gs_body);
         gsb.tlv(0x82, name); // base: dNSName [2]
-        sb.tlv(0x30, gsb.bytes()); // GeneralSubtree SEQUENCE
+        pb.tlv(0x30, gsb.bytes()); // GeneralSubtree SEQUENCE
     }
-    var nc_body: [176]u8 = undefined;
+    var excluded_body: [160]u8 = undefined;
+    var eb = W.init(&excluded_body);
+    for (excluded_dns) |name| {
+        var gs_body: [96]u8 = undefined;
+        var gsb = W.init(&gs_body);
+        gsb.tlv(0x82, name);
+        eb.tlv(0x30, gsb.bytes());
+    }
+    var nc_body: [360]u8 = undefined;
     var ncb = W.init(&nc_body);
-    ncb.tlv(0xa0, sb.bytes()); // permittedSubtrees [0]
-    var val: [192]u8 = undefined;
+    if (permitted_dns.len != 0) ncb.tlv(0xa0, pb.bytes());
+    if (excluded_dns.len != 0) ncb.tlv(0xa1, eb.bytes());
+    var val: [380]u8 = undefined;
     var v = W.init(&val);
     v.tlv(0x30, ncb.bytes());
     writeExtTlv(w, &oid_name_constraints_bytes, v.bytes());
@@ -1281,7 +1325,9 @@ pub fn mintEd25519CertExt(
     var esb = W.init(&ext_seq_body);
     if (opts.is_ca) writeBasicConstraintsExt(&esb, opts.path_len);
     if (opts.dns_names.len != 0) writeSanExt(&esb, opts.dns_names);
-    if (opts.permitted_dns.len != 0) writeNameConstraintsExt(&esb, opts.permitted_dns);
+    if (opts.permitted_dns.len != 0 or opts.excluded_dns.len != 0) {
+        writeNameConstraintsExt(&esb, opts.permitted_dns, opts.excluded_dns);
+    }
     if (esb.pos != 0) {
         var ext_seq: [520]u8 = undefined;
         var es = W.init(&ext_seq);

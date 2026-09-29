@@ -3537,11 +3537,10 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
         // A CA in the path must be allowed to sign certificates and be valid now.
         if (issuer.key_usage_present and !issuer.key_usage_cert_sign) return error.BadCertificate;
         if (now) |t| try x509_verify.validateParsedAt(issuer, t);
-        // RFC 5280 §4.2.1.10: a CA's NameConstraints bind the leaf's SAN
-        // dNSNames. Shared with the hardened TLS 1.2 client (x509_verify.zig)
-        // so the two engines cannot silently diverge on this check.
-        try x509_verify.enforceNameConstraints(issuer, leaf);
     }
+    // Every presented CA's dNSName constraints bind each certificate below it,
+    // including an intermediate's own names. Shared with the TLS 1.2 client.
+    try x509_verify.enforcePresentedNameConstraints(chain);
 
     // RFC 5280 §4.2.1.10 / §6.1.4(m): pathLenConstraint enforcement, shared
     // with the hardened TLS 1.2 client. Reduce the chain to per-cert facts
@@ -3572,6 +3571,9 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
             dbg("trust-anchor DN matched but signature check failed: {s}", .{@errorName(err)});
             continue;
         };
+        // The anchor's own name constraints and pathLenConstraint bind the
+        // path even when that certificate is not resent in the chain.
+        try x509_verify.enforceExternalAnchor(chain, anchor_der);
         return;
     }
     return error.UnknownCa;
@@ -6698,6 +6700,100 @@ test "TLS 1.3 client rejects a name-constrained CA's cross-domain leaf (F1 contr
         error.BadCertificate,
         verifyChainToTrustAnchors(&chain, &anchors, "login.victim-bank.com", null),
     );
+}
+
+test "GAP-K11 a trust anchor's name constraints and path length bind a chain that omits it" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const nb: i64 = 1_704_067_200;
+    const na: i64 = 1_924_991_999;
+    const anchor_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x11)));
+    const mid_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x22)));
+    const leaf_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x33)));
+    const anchor_pub = anchor_kp.public_key.toBytes();
+    const mid_pub = mid_kp.public_key.toBytes();
+    const leaf_pub = leaf_kp.public_key.toBytes();
+    var anchor_buf: [1024]u8 = undefined;
+    var mid_buf: [1024]u8 = undefined;
+    var leaf_buf: [1024]u8 = undefined;
+
+    // The anchor is not resent. A leaf outside its permitted subtree is rejected,
+    // and a leaf inside that subtree still verifies.
+    const anchor_nc = try x509_verify.mintEd25519CertExt(&anchor_buf, "Anchor NC", "Anchor NC", anchor_pub, anchor_kp, nb, na, .{
+        .is_ca = true,
+        .permitted_dns = &.{"example.com"},
+        .excluded_dns = &.{"bad.example.com"},
+    });
+    const outside = try x509_verify.mintEd25519CertExt(&leaf_buf, "Anchor NC", "out.other", leaf_pub, anchor_kp, nb, na, .{
+        .dns_names = &.{"out.other"},
+    });
+    const outside_chain = [_][]const u8{outside};
+    const nc_anchors = [_][]const u8{anchor_nc};
+    try std.testing.expectError(error.BadCertificate, verifyChainToTrustAnchors(&outside_chain, &nc_anchors, "out.other", null));
+
+    const inside = try x509_verify.mintEd25519CertExt(&leaf_buf, "Anchor NC", "host.example.com", leaf_pub, anchor_kp, nb, na, .{
+        .dns_names = &.{"host.example.com"},
+    });
+    const inside_chain = [_][]const u8{inside};
+    try verifyChainToTrustAnchors(&inside_chain, &nc_anchors, "host.example.com", null);
+
+    // pathLen 0 on the omitted anchor forbids a non-self-issued intermediate.
+    const anchor_pl = try x509_verify.mintEd25519CertExt(&anchor_buf, "Anchor PL", "Anchor PL", anchor_pub, anchor_kp, nb, na, .{
+        .is_ca = true,
+        .path_len = 0,
+        .permitted_dns = &.{"example.com"},
+    });
+    const mid_pl = try x509_verify.mintEd25519CertExt(&mid_buf, "Anchor PL", "Mid CA", mid_pub, anchor_kp, nb, na, .{
+        .is_ca = true,
+        .dns_names = &.{"mid.example.com"},
+    });
+    const leaf_pl = try x509_verify.mintEd25519CertExt(&leaf_buf, "Mid CA", "host.example.com", leaf_pub, mid_kp, nb, na, .{
+        .dns_names = &.{"host.example.com"},
+    });
+    const pl_chain = [_][]const u8{ leaf_pl, mid_pl };
+    const pl_anchors = [_][]const u8{anchor_pl};
+    try std.testing.expectError(error.BadCertificate, verifyChainToTrustAnchors(&pl_chain, &pl_anchors, "host.example.com", null));
+
+    // An intermediate dNSName outside the omitted anchor's permitted subtree,
+    // or inside its excluded subtree, is rejected. pathLen 1 keeps the path
+    // length from being the reason.
+    const anchor_name = try x509_verify.mintEd25519CertExt(&anchor_buf, "Anchor Name", "Anchor Name", anchor_pub, anchor_kp, nb, na, .{
+        .is_ca = true,
+        .path_len = 1,
+        .permitted_dns = &.{"example.com"},
+        .excluded_dns = &.{"bad.example.com"},
+    });
+    const mid_out = try x509_verify.mintEd25519CertExt(&mid_buf, "Anchor Name", "Evil CA", mid_pub, anchor_kp, nb, na, .{
+        .is_ca = true,
+        .dns_names = &.{"evil.other"},
+    });
+    const leaf_under_out = try x509_verify.mintEd25519CertExt(&leaf_buf, "Evil CA", "host.example.com", leaf_pub, mid_kp, nb, na, .{
+        .dns_names = &.{"host.example.com"},
+    });
+    const out_chain = [_][]const u8{ leaf_under_out, mid_out };
+    const name_anchors = [_][]const u8{anchor_name};
+    try std.testing.expectError(error.BadCertificate, verifyChainToTrustAnchors(&out_chain, &name_anchors, "host.example.com", null));
+
+    const mid_excl = try x509_verify.mintEd25519CertExt(&mid_buf, "Anchor Name", "Bad CA", mid_pub, anchor_kp, nb, na, .{
+        .is_ca = true,
+        .dns_names = &.{"bad.example.com"},
+    });
+    const leaf_under_excl = try x509_verify.mintEd25519CertExt(&leaf_buf, "Bad CA", "host.example.com", leaf_pub, mid_kp, nb, na, .{
+        .dns_names = &.{"host.example.com"},
+    });
+    const excl_chain = [_][]const u8{ leaf_under_excl, mid_excl };
+    try std.testing.expectError(error.BadCertificate, verifyChainToTrustAnchors(&excl_chain, &name_anchors, "host.example.com", null));
+
+    const mid_ok = try x509_verify.mintEd25519CertExt(&mid_buf, "Anchor Name", "Mid CA", mid_pub, anchor_kp, nb, na, .{
+        .is_ca = true,
+        .dns_names = &.{"mid.example.com"},
+    });
+    const leaf_ok = try x509_verify.mintEd25519CertExt(&leaf_buf, "Mid CA", "host.example.com", leaf_pub, mid_kp, nb, na, .{
+        .dns_names = &.{"host.example.com"},
+    });
+    const ok_chain = [_][]const u8{ leaf_ok, mid_ok };
+    try verifyChainToTrustAnchors(&ok_chain, &name_anchors, "host.example.com", null);
+
+    std.debug.print("GAP-K11 branch=a trust anchor's name constraints and path length bind a chain that omits it\n", .{});
 }
 
 // ---------------------------------------------------------------------------
