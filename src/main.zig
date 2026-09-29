@@ -1274,6 +1274,13 @@ pub fn main(init: std.process.Init) !void {
     // sampled that as 1<->2 oscillation). Fixed: servers come from a reactor-0
     // atomic, users from the shared world nick registry.
 
+    if (comptime builtin.os.tag == .linux) {
+        onyx_server.daemon.server.installDaemonKernelSandbox(srv_cfg.config_path) catch |err| {
+            std.debug.print("onyx-server: fatal — kernel sandbox: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    }
+
     const Server = onyx_server.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
         // The reactor requires io_uring on a 64-bit Linux kernel. If it is

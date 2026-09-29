@@ -25,7 +25,7 @@ const node_short_id = @import("../crypto/node_short_id.zig");
 
 const Blake3 = std.crypto.hash.Blake3;
 
-pub const Error = error{ BadSeed, BadRealm } || std.crypto.errors.IdentityElementError || xwing.Error;
+pub const Error = error{ BadSeed, BadRealm, SecretPageUnavailable } || std.crypto.errors.IdentityElementError || xwing.Error;
 
 pub const NodeIdentity = struct {
     sign_kp: sign.KeyPair,

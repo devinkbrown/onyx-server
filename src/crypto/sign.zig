@@ -9,6 +9,9 @@
 //! for Undertow/MeshPass uses where signatures must not be reusable across
 //! node identity, capability token, and operator challenge contexts.
 const std = @import("std");
+const builtin = @import("builtin");
+const linux = std.os.linux;
+const posix = std.posix;
 const Secret = @import("secret.zig").Secret;
 
 const StdEd25519 = std.crypto.sign.Ed25519;
@@ -24,6 +27,68 @@ pub const PublicKey = [public_key_len]u8;
 pub const Signature = [signature_len]u8;
 pub const Seed = [seed_len]u8;
 pub const SecretKey = Secret([secret_key_len]u8);
+
+/// One private anonymous page holding the only long-lived copy of an Ed25519
+/// secret. On Linux the page is MADV_DONTDUMP and MADV_WIPEONFORK.
+pub const SealedSecretKey = struct {
+    page: ?[]align(4096) u8 = null,
+
+    pub fn seal(bytes: *const [secret_key_len]u8) error{SecretPageUnavailable}!SealedSecretKey {
+        const page = try mapSecretPage();
+        @memcpy(page[0..secret_key_len], bytes);
+        return .{ .page = page };
+    }
+
+    pub fn expose(self: *const SealedSecretKey) []const u8 {
+        const page = self.page orelse return &.{};
+        return page[0..secret_key_len];
+    }
+
+    pub fn declassify(self: *const SealedSecretKey) [secret_key_len]u8 {
+        var out: [secret_key_len]u8 = @splat(0);
+        const src = self.expose();
+        if (src.len != secret_key_len) return out;
+        @memcpy(&out, src);
+        return out;
+    }
+
+    pub fn toBytes(self: *const SealedSecretKey) [secret_key_len]u8 {
+        return self.declassify();
+    }
+
+    pub fn wipe(self: *SealedSecretKey) void {
+        const page = self.page orelse return;
+        std.crypto.secureZero(u8, page);
+        self.page = null;
+        if (comptime builtin.os.tag == .linux) {
+            _ = linux.munmap(page.ptr, page.len);
+        } else {
+            std.heap.page_allocator.free(page);
+        }
+    }
+};
+
+fn mapSecretPage() error{SecretPageUnavailable}![]align(4096) u8 {
+    if (comptime builtin.os.tag != .linux) {
+        return std.heap.page_allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), 4096) catch return error.SecretPageUnavailable;
+    }
+    const prot: linux.PROT = .{ .READ = true, .WRITE = true };
+    const flags: linux.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
+    const rc = linux.mmap(null, 4096, prot, flags, -1, 0);
+    if (posix.errno(rc) != .SUCCESS) return error.SecretPageUnavailable;
+    const ptr: [*]u8 = @ptrFromInt(rc);
+    const advised = linux.madvise(ptr, 4096, linux.MADV.DONTDUMP);
+    if (posix.errno(advised) != .SUCCESS) {
+        _ = linux.munmap(ptr, 4096);
+        return error.SecretPageUnavailable;
+    }
+    const wiped = linux.madvise(ptr, 4096, linux.MADV.WIPEONFORK);
+    if (posix.errno(wiped) != .SUCCESS) {
+        _ = linux.munmap(ptr, 4096);
+        return error.SecretPageUnavailable;
+    }
+    return @alignCast(ptr[0..4096]);
+}
 
 pub const SignError = std.crypto.errors.IdentityElementError ||
     std.crypto.errors.KeyMismatchError ||
@@ -60,30 +125,40 @@ const known_infix_len: usize = 1;
 /// Ed25519 storage, and is wiped by `deinit`.
 pub const KeyPair = struct {
     public_key: PublicKey,
-    secret_key: SecretKey,
+    secret_key: SealedSecretKey,
+
+    /// Address of the dedicated secret page, when this pair still owns one.
+    pub fn secretPage(self: *const KeyPair) ?[*]u8 {
+        const page = self.secret_key.page orelse return null;
+        return page.ptr;
+    }
 
     /// Generate a new key pair using the caller-provided Zig 0.16 `std.Io`
     /// randomness source.
-    pub fn generate(io: std.Io) KeyPair {
+    pub fn generate(io: std.Io) error{SecretPageUnavailable}!KeyPair {
         var kp = StdEd25519.KeyPair.generate(io);
         defer secureZero(std.mem.asBytes(&kp.secret_key));
+        var material = kp.secret_key.toBytes();
+        defer secureZero(&material);
         return .{
             .public_key = kp.public_key.toBytes(),
-            .secret_key = SecretKey.init(kp.secret_key.toBytes()),
+            .secret_key = try SealedSecretKey.seal(&material),
         };
     }
 
     /// Deterministically derive a key pair from a 32-byte Ed25519 seed.
-    pub fn fromSeed(seed: Seed) std.crypto.errors.IdentityElementError!KeyPair {
+    pub fn fromSeed(seed: Seed) (std.crypto.errors.IdentityElementError || error{SecretPageUnavailable})!KeyPair {
         var kp = try StdEd25519.KeyPair.generateDeterministic(seed);
         defer secureZero(std.mem.asBytes(&kp.secret_key));
+        var material = kp.secret_key.toBytes();
+        defer secureZero(&material);
         return .{
             .public_key = kp.public_key.toBytes(),
-            .secret_key = SecretKey.init(kp.secret_key.toBytes()),
+            .secret_key = try SealedSecretKey.seal(&material),
         };
     }
 
-    /// Zeroize the wrapped private key material.
+    /// Zeroize the wrapped private key material and unmap its page.
     pub fn deinit(self: *KeyPair) void {
         self.secret_key.wipe();
     }

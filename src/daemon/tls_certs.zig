@@ -19,6 +19,8 @@
 //! `main.zig`, which owns the handshake. The cert chain bytes are caller-owned —
 //! call `Loaded.deinit` to release them.
 const std = @import("std");
+const builtin = @import("builtin");
+const kernel_linux = @import("kernel_linux.zig");
 
 const pem = @import("../proto/pem.zig");
 const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
@@ -59,7 +61,7 @@ pub const Error = error{
     NothingToLoad,
     /// A PEM cert file contained no CERTIFICATE block.
     NoCertificate,
-} ||
+} || kernel_linux.ReadError ||
     std.Io.Dir.ReadFileAllocError ||
     pem.Error ||
     ed25519_pkcs8.ParseError ||
@@ -380,6 +382,9 @@ fn isPem(bytes: []const u8) bool {
 /// Read a whole file into an owned buffer, bounded by `max_file_bytes`. Uses the
 /// Zig 0.16 `std.Io` layer so the caller controls the IO implementation.
 fn readFileOwned(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error![]u8 {
+    if (comptime builtin.os.tag == .linux) {
+        return kernel_linux.readFileResolved(allocator, path, max_file_bytes);
+    }
     return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_file_bytes));
 }
 

@@ -5,7 +5,7 @@
 //!
 //! Generation is 100% substrate: ECDSA P-256 via crypto/ecdsa_p256.zig
 //! (`KeyPair.generate`), Ed25519 via crypto/sign.zig (`KeyPair.generate`,
-//! secret material wrapped in `Secret` and wiped). This module only adds the
+//! secret material held on a sealed page and wiped). This module only adds the
 //! standard *serialization* wrappers around the substrate key material:
 //! SEC1 `EC PRIVATE KEY` (RFC 5915, mirroring the file-private encoder in
 //! src/daemon/acme_runner.zig:668 — exporting that is a noted substrate gap)
@@ -157,7 +157,7 @@ pub fn generatePem(io: std.Io, alg: Algorithm, buf: []u8) ![]const u8 {
             return pem.encode(buf, "EC PRIVATE KEY", &der);
         },
         .ed25519 => {
-            var kp = ed25519.KeyPair.generate(io);
+            var kp = try ed25519.KeyPair.generate(io);
             defer kp.deinit(); // wipes the Secret-wrapped secret key
             var seed: [32]u8 = undefined;
             defer std.crypto.secureZero(u8, &seed);

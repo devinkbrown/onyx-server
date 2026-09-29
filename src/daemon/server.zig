@@ -3498,6 +3498,12 @@ pub const LinuxServer = struct {
     /// `reactors[0]` is the single-reactor fast path; reached through `rx()` so
     /// every handler resolves to the reactor whose ring produced its completion.
     reactors: []Reactor,
+    /// pidfd_open of this process. Closed in deinit.
+    self_pidfd: linux.fd_t = -1,
+    /// Surplus inherited listener fds were closed with one close_range.
+    surplus_closed_with_close_range: bool = false,
+    /// Multi-reactor boot posted IORING_OP_MSG_RING and drained both rings.
+    msg_ring_booted: bool = false,
     /// `[mesh].connect` auto-dial table — one slot per valid configured peer,
     /// parsed once at init (invalid specs are logged and dropped). Owned by
     /// reactor 0 at run time: the boot dial and the sweep re-dials run only on
@@ -4254,6 +4260,12 @@ pub const LinuxServer = struct {
     ) !void {
         if (builtin.os.tag != .linux) return error.Unsupported;
 
+        const self_pidfd = try kernel_linux.openSelfPidfd();
+        var self_pidfd_owned = true;
+        errdefer if (self_pidfd_owned) {
+            _ = linux.close(self_pidfd);
+        };
+
         // Ignore SIGPIPE process-wide. The reactors do socket I/O through io_uring
         // (which reports -EPIPE in the completion, never a signal), but raw
         // `write()`/`send()` on a peer-closed socket — done by the test harness
@@ -4333,8 +4345,14 @@ pub const LinuxServer = struct {
         // A predecessor with MORE shards than this successor carried extra
         // listener fds no reactor adopted: close them now so they neither leak
         // nor keep receiving SO_REUSEPORT-balanced SYNs nobody will accept.
+        var surplus_closed_with_close_range = false;
         if (config.inherited_listener_fds.len > shard_count) {
-            for (config.inherited_listener_fds[shard_count..]) |fd| closeFd(fd);
+            surplus_closed_with_close_range = try kernel_linux.closeOwnedFdSpan(config.inherited_listener_fds[shard_count..]);
+        }
+        var msg_ring_booted = false;
+        if (shard_count >= 2) {
+            try reactors[0].ring.bootMsgRing(&reactors[1].ring);
+            msg_ring_booted = true;
         }
 
         var tls_ticket_key: tls_resumption.TicketKey = @splat(0);
@@ -4494,6 +4512,7 @@ pub const LinuxServer = struct {
         var raid_state = try raid_shield.Shield.init(allocator);
         errdefer raid_state.deinit();
 
+        self_pidfd_owned = false;
         self.* = .{
             .allocator = allocator,
             .config = config,
@@ -4522,6 +4541,9 @@ pub const LinuxServer = struct {
                 break :blk k;
             },
             .reactors = reactors,
+            .self_pidfd = self_pidfd,
+            .surplus_closed_with_close_range = surplus_closed_with_close_range,
+            .msg_ring_booted = msg_ring_booted,
             .mesh_dials = mesh_dials,
             .mesh_trusted_node_keys = mesh_trusted_node_keys,
             .relay_v2_required_nodes = relay_v2_required_nodes,
@@ -5729,6 +5751,10 @@ pub const LinuxServer = struct {
         self.latency_stats.deinit();
         self.peer_health.deinit();
         self.freePublishedMeshPeers();
+        if (self.self_pidfd >= 0) {
+            closeFd(self.self_pidfd);
+            self.self_pidfd = -1;
+        }
         for (self.reactors) |*reactor| reactor.deinit();
         self.allocator.free(self.reactors);
         if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
@@ -52699,7 +52725,186 @@ test "GAP-X3 live listener sets TCP_FASTOPEN, TCP_USER_TIMEOUT, and SO_INCOMING_
     defer server.deinit();
     try std.testing.expect(server.reactors.len > 0);
     try expectListenerKernelOptions(server.reactors[0].listener_fd, kernel_linux.shardIncomingCpu(0));
-    std.debug.print("GAP-X3 branch=linux listener sets TCP_FASTOPEN TCP_USER_TIMEOUT and SO_INCOMING_CPU; landlock seccomp madvise msg_ring openat2 pidfd and close_range stay unmet\n", .{});
+    try expectPidfdIsSelf(server.self_pidfd);
+    std.debug.print("GAP-X3 branch=linux listener sets TCP_FASTOPEN TCP_USER_TIMEOUT and SO_INCOMING_CPU and stores a pidfd\n", .{});
+}
+
+/// Landlock allowlist plus the seccomp denylist for the long-running daemon.
+pub fn installDaemonKernelSandbox(config_path: ?[]const u8) !void {
+    if (builtin.os.tag != .linux) return;
+    return kernel_linux.installDaemonSandbox(config_path);
+}
+
+fn expectPidfdIsSelf(fd: linux.fd_t) !void {
+    try std.testing.expect(fd >= 0);
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/self/fdinfo/{d}", .{fd}, 0) catch return error.Unexpected;
+    const raw = linux.openat(linux.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (posix.errno(raw) != .SUCCESS) return error.Unexpected;
+    const rfd: linux.fd_t = @intCast(raw);
+    defer _ = linux.close(rfd);
+    var text_buf: [512]u8 = undefined;
+    const n = linux.read(rfd, &text_buf, text_buf.len);
+    if (posix.errno(n) != .SUCCESS or n == 0) return error.Unexpected;
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "Pid:\t{d}", .{linux.getpid()}) catch return error.Unexpected;
+    try std.testing.expect(std.mem.indexOf(u8, text_buf[0..n], needle) != null);
+}
+
+fn expectSecretPageAdvised(page: [*]u8) !void {
+    const raw = linux.openat(linux.AT.FDCWD, "/proc/self/smaps", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (posix.errno(raw) != .SUCCESS) return error.Unexpected;
+    const rfd: linux.fd_t = @intCast(raw);
+    defer _ = linux.close(rfd);
+    const buf = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(buf);
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = linux.read(rfd, buf[filled..].ptr, buf.len - filled);
+        switch (posix.errno(n)) {
+            .SUCCESS => {
+                if (n == 0) break;
+                filled += n;
+            },
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+    var addr_buf: [32]u8 = undefined;
+    const marker = std.fmt.bufPrint(&addr_buf, "{x}-", .{@intFromPtr(page)}) catch return error.Unexpected;
+    const text = buf[0..filled];
+    const at = std.mem.indexOf(u8, text, marker) orelse return error.TestUnexpectedResult;
+    const window = text[at..@min(text.len, at + 2000)];
+    const flags_at = std.mem.indexOf(u8, window, "VmFlags:") orelse return error.TestUnexpectedResult;
+    const rest = window[flags_at..];
+    const line_len = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const line = rest[0..line_len];
+    try std.testing.expect(std.mem.indexOf(u8, line, " dd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, " wf") != null);
+}
+
+test "GAP-X3 secret page is DONTDUMP and WIPEONFORK" {
+    var id = try node_identity.fromSeed(@as([32]u8, @splat(0x5a)), "gap-x3");
+    defer id.deinit();
+    const page = id.sign_kp.secretPage() orelse return error.TestUnexpectedResult;
+    try expectSecretPageAdvised(page);
+    const pre = try id.signedPrekey(1, 1000, 10_000, 0, 0);
+    try pre.verify(1500);
+    std.debug.print("GAP-X3 branch=node identity Ed25519 secret page has MADV_DONTDUMP and MADV_WIPEONFORK; the X-Wing KEM seed stays inline\n", .{});
+}
+
+test "GAP-X3 openat2 resolves regular files beneath their directory and rejects magic links" {
+    var dir_buf: [80]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "/tmp/onyx-x3-rd-{d}", .{linux.getpid()}, 0) catch return error.Unexpected;
+    if (posix.errno(linux.mkdir(dir.ptr, 0o700)) != .SUCCESS) return error.Unexpected;
+    var plain_buf: [96]u8 = undefined;
+    const plain = std.fmt.bufPrintSentinel(&plain_buf, "{s}/plain", .{dir}, 0) catch return error.Unexpected;
+    var outside_buf: [96]u8 = undefined;
+    const outside = std.fmt.bufPrintSentinel(&outside_buf, "/tmp/onyx-x3-out-{d}", .{linux.getpid()}, 0) catch return error.Unexpected;
+    var link_buf: [96]u8 = undefined;
+    const link = std.fmt.bufPrintSentinel(&link_buf, "{s}/link", .{dir}, 0) catch return error.Unexpected;
+    defer {
+        _ = linux.unlinkat(linux.AT.FDCWD, plain.ptr, 0);
+        _ = linux.unlinkat(linux.AT.FDCWD, link.ptr, 0);
+        _ = linux.unlinkat(linux.AT.FDCWD, outside.ptr, 0);
+        _ = linux.unlinkat(linux.AT.FDCWD, dir.ptr, linux.AT.REMOVEDIR);
+    }
+    const plain_fd_raw = linux.openat(linux.AT.FDCWD, plain.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (posix.errno(plain_fd_raw) != .SUCCESS) return error.Unexpected;
+    const plain_fd: linux.fd_t = @intCast(plain_fd_raw);
+    if (posix.errno(linux.write(plain_fd, "plain-bytes".ptr, 11)) != .SUCCESS) return error.Unexpected;
+    const outside_fd_raw = linux.openat(linux.AT.FDCWD, outside.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (posix.errno(outside_fd_raw) != .SUCCESS) return error.Unexpected;
+    const outside_fd: linux.fd_t = @intCast(outside_fd_raw);
+    if (posix.errno(linux.write(outside_fd, "outside-bytes".ptr, 13)) != .SUCCESS) return error.Unexpected;
+    _ = linux.close(outside_fd);
+    if (posix.errno(linux.symlink(outside.ptr, link.ptr)) != .SUCCESS) return error.Unexpected;
+
+    const before = kernel_linux.beneath_open_count;
+    const plain_bytes = try kernel_linux.readFileResolved(std.testing.allocator, plain, 64);
+    defer std.testing.allocator.free(plain_bytes);
+    try std.testing.expectEqualStrings("plain-bytes", plain_bytes);
+    try std.testing.expect(kernel_linux.beneath_open_count > before);
+    const link_bytes = try kernel_linux.readFileResolved(std.testing.allocator, link, 64);
+    defer std.testing.allocator.free(link_bytes);
+    try std.testing.expectEqualStrings("outside-bytes", link_bytes);
+
+    var magic_buf: [64]u8 = undefined;
+    const magic = std.fmt.bufPrintSentinel(&magic_buf, "/proc/self/fd/{d}", .{plain_fd}, 0) catch return error.Unexpected;
+    try std.testing.expectError(error.AccessDenied, kernel_linux.readFileResolved(std.testing.allocator, magic, 64));
+    _ = linux.close(plain_fd);
+    std.debug.print("GAP-X3 branch=openat2 RESOLVE_BENEATH and RESOLVE_NO_MAGICLINKS read certificate paths\n", .{});
+}
+
+test "GAP-X3 close_range drops surplus inherited fds and msg_ring boots a second reactor" {
+    var source = ringlane.Ring.init(32, .{}) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.ArgumentsInvalid => return error.SkipZigTest,
+        else => return err,
+    };
+    defer source.deinit();
+    var target = try ringlane.Ring.init(32, .{});
+    defer target.deinit();
+    try source.bootMsgRing(&target);
+
+    const listener = createListener("127.0.0.1", 0, 8) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    var pipes: [2]linux.fd_t = undefined;
+    if (posix.errno(linux.pipe(&pipes)) != .SUCCESS) return error.Unexpected;
+    if (posix.errno(linux.dup2(pipes[0], 2048)) != .SUCCESS) return error.Unexpected;
+    if (posix.errno(linux.dup2(pipes[1], 2049)) != .SUCCESS) return error.Unexpected;
+    _ = linux.close(pipes[0]);
+    _ = linux.close(pipes[1]);
+    var inherited = [_]linux.fd_t{ listener, 2048, 2049 };
+    var closed = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .inherited_listener_fds = &inherited,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closed.deinit();
+    try std.testing.expect(closed.surplus_closed_with_close_range);
+    try std.testing.expect(posix.errno(linux.fcntl(2048, posix.F.GETFD, 0)) == .BADF);
+    try std.testing.expect(posix.errno(linux.fcntl(2049, posix.F.GETFD, 0)) == .BADF);
+    try expectPidfdIsSelf(closed.self_pidfd);
+
+    var sharded = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer sharded.deinit();
+    try std.testing.expect(sharded.msg_ring_booted);
+    try std.testing.expect(sharded.reactors.len == 2);
+    std.debug.print("GAP-X3 branch=close_range drops surplus listeners and IORING_OP_MSG_RING boots a second reactor\n", .{});
+}
+
+test "GAP-X3 landlock and seccomp restrict a forked daemon sandbox" {
+    const child = linux.fork();
+    if (posix.errno(child) != .SUCCESS) return error.Unexpected;
+    if (child == 0) linux.exit_group(kernel_linux.sandboxChildStatus());
+    var status: i32 = 0;
+    const waited = linux.waitpid(@intCast(child), &status, 0);
+    if (posix.errno(waited) != .SUCCESS) return error.Unexpected;
+    try std.testing.expect((status & 0x7f) == 0);
+    const code: u8 = @intCast((status >> 8) & 0xff);
+    var dir_buf: [80]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "/tmp/onyx-x3-ll-{d}", .{child}, 0) catch return error.Unexpected;
+    var file_buf: [96]u8 = undefined;
+    const file_path = std.fmt.bufPrintSentinel(&file_buf, "{s}/inside", .{dir}, 0) catch return error.Unexpected;
+    _ = linux.unlinkat(linux.AT.FDCWD, file_path.ptr, 0);
+    _ = linux.unlinkat(linux.AT.FDCWD, dir.ptr, linux.AT.REMOVEDIR);
+    if (code != 0) {
+        std.debug.print("GAP-X3 sandbox child status {d}\n", .{code});
+        return error.TestUnexpectedResult;
+    }
+    std.debug.print("GAP-X3 branch=landlock confines a directory and seccomp denies ptrace\n", .{});
 }
 
 const CompletionHandler = struct {

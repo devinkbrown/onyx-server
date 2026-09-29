@@ -246,6 +246,27 @@ pub const Ring = struct {
             handler.onCompletion(completion);
         }
     }
+
+    /// Post one completion onto `target` with IORING_OP_MSG_RING, then drain
+    /// both rings so the boot handshake is not left for the accept loop.
+    pub fn bootMsgRing(source: *Ring, target: *Ring) !void {
+        const token = FdToken{ .slot = 1, .gen = 1 };
+        const posted = try encodeUserData(.poll, token);
+        const sqe = try source.inner.get_sqe();
+        sqe.prep_rw(.MSG_RING, target.inner.fd, 0, 1, posted);
+        sqe.user_data = try encodeUserData(.other, token);
+        sqe.rw_flags = 0;
+        _ = try source.inner.submit_and_wait(1);
+        var source_cqe: [1]linux.io_uring_cqe = undefined;
+        const source_n = try source.inner.copy_cqes(&source_cqe, 0);
+        if (source_n != 1 or source_cqe[0].res != 0) return error.Unexpected;
+        if (source_cqe[0].user_data != try encodeUserData(.other, token)) return error.Unexpected;
+        _ = try target.inner.submit_and_wait(1);
+        var target_cqe: [1]linux.io_uring_cqe = undefined;
+        const target_n = try target.inner.copy_cqes(&target_cqe, 0);
+        if (target_n != 1 or target_cqe[0].res != 1) return error.Unexpected;
+        if (target_cqe[0].user_data != posted) return error.Unexpected;
+    }
 };
 
 test "GAP-X2 ringlane submission identity round-trips and completions keep their flags" {
