@@ -279,11 +279,15 @@ test "GAP-P0c WHOIS 335 follows bot mode while the registry and board stay uncal
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "const bot_registry_mod = @import(\"bot_registry.zig\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "const announce_board_mod = @import(\"announce_board.zig\");") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "bot_registry_mod.") == null);
+    // BOTGRANT records the account so isBot matches the grant. The registry
+    // does not build WHOIS 335 and does not answer channel ! commands.
+    try std.testing.expect(std.mem.indexOf(u8, text, "self.bot_registry.register(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "self.bot_registry.isBot(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bot_registry.mayAnnounce") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "announce_board_mod.") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "!weather") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "!news") != null);
-    std.debug.print("GAP-P0c branch=WHOIS 335 and +B are the bot surface and the in-channel commands stay weather and news\n", .{});
+    std.debug.print("GAP-P0c branch=WHOIS 335 follows bot mode; BOTGRANT marks isBot; announce board stays uncalled; in-channel commands stay weather and news\n", .{});
 }
 
 test "rpl whoisbot numeric build" {

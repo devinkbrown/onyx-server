@@ -626,9 +626,11 @@ marker, which it already does — then the gap is just the 2FA and OAuth rows.
   closed even for an oper (`policy_is_oper = false`).
 - `draft/multiline` reassembles inbound batches and does not split the
   server's own long replies.
-- `bot_registry.zig` and `announce_board.zig` are imported by `server.zig` and
-  never called. `+B` / WHOIS `335` are live. The in-channel bot surface is
-  `!weather` / `!news`.
+- `announce_board.zig` is imported by `server.zig` and never called.
+  `BOTGRANT` records the account in `bot_registry` so `isBot` matches the
+  grant; that registry does not build WHOIS 335 or answer `!` commands.
+  `+B` / WHOIS `335` are live. The in-channel bot surface is `!weather` /
+  `!news`.
 - `oper` message-tag is absent. `draft/whoami` is absent from the live
   capability list. `file-upload` exists only on the stale `proto/cap.zig`
   table, which is not the live registry.
