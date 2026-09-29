@@ -672,3 +672,14 @@ test "http_fetch Options default CT and CRL policy is fail-open" {
     try std.testing.expect(opts.crl == null);
     try std.testing.expect(!opts.require_crl);
 }
+
+test "GAP-K6 CRL and CT callers pass DER and the fetch defaults stay fail-open" {
+    const opts = Options{};
+    try std.testing.expect(opts.crl == null);
+    try std.testing.expect(!opts.require_crl);
+    try std.testing.expectEqual(@as(u8, 0), opts.require_sct);
+    try std.testing.expectEqual(@as(usize, 0), opts.ct_logs.len);
+    const url = try parseUrl("http://crl.example/leaf.crl");
+    try std.testing.expectEqualStrings("crl.example", url.host);
+    try std.testing.expectEqualStrings("/leaf.crl", url.path);
+}

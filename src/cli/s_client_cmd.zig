@@ -206,6 +206,38 @@ test "armorcli s_client loopback handshake prints suite, SNI, and verify ok" {
     try testing.expect(std.mem.indexOf(u8, aw.written(), "Verify return code: 0 (ok)") != null);
 }
 
+test "GAP-K6 armor s_client -connect returns NotImplemented and opens no socket" {
+    const gpa = testing.allocator;
+    const pem = onyx_server.proto.pem;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6c)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x6c, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var pem_buf: [2048]u8 = undefined;
+    const pem_text = try pem.encode(&pem_buf, "CERTIFICATE", der);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ca.pem", .data = pem_text });
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/ca.pem", .{&tmp.sub_path});
+
+    var aw = Writer.Allocating.init(gpa);
+    defer aw.deinit();
+    try testing.expectError(error.NotImplemented, run(gpa, std.testing.io, .{
+        .connect = "127.0.0.1:1",
+        .ca_file = path,
+    }, &aw.writer));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "Protocol  :") == null);
+}
+
 test "armorcli s_client live path still requires -connect and -CAfile" {
     try testing.expectError(error.Usage, run(testing.allocator, std.testing.io, .{}, undefined));
     try testing.expectError(error.Usage, run(

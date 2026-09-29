@@ -4018,6 +4018,41 @@ test "parseToml: [[tls.ech_keys]] rejects malformed private key" {
     try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
 }
 
+test "GAP-K6 parseToml: [[tls.sni]] is the operator certificate list" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[tls]
+        \\enabled = true
+        \\cert_path = "/etc/onyx/default.pem"
+        \\key_path = "/etc/onyx/default.key"
+        \\[[tls.sni]]
+        \\server_names = ["irc.example.test", "*.example.test"]
+        \\cert_path = "/etc/onyx/example.pem"
+        \\key_path = "/etc/onyx/example.key"
+        \\[[tls.sni]]
+        \\server_names = ["alt.test"]
+        \\cert_path = "/etc/onyx/alt.pem"
+        \\key_path = "/etc/onyx/alt.key"
+        \\[[tls.ech_keys]]
+        \\config_path = "/etc/onyx/echconfig.bin"
+        \\private_key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), cfg.tls.sni.len);
+    try std.testing.expectEqualStrings("irc.example.test", cfg.tls.sni[0].server_names[0]);
+    try std.testing.expectEqualStrings("*.example.test", cfg.tls.sni[0].server_names[1]);
+    try std.testing.expectEqualStrings("/etc/onyx/example.pem", cfg.tls.sni[0].cert_path);
+    try std.testing.expectEqualStrings("alt.test", cfg.tls.sni[1].server_names[0]);
+    try std.testing.expectEqual(@as(usize, 1), cfg.tls.ech_keys.len);
+    try std.testing.expectEqualStrings("/etc/onyx/echconfig.bin", cfg.tls.ech_keys[0].config_path);
+}
+
 test "parseToml: [[tls.sni]] projects additional SNI certs onto Config" {
     // Arrange
     const allocator = testing.allocator;

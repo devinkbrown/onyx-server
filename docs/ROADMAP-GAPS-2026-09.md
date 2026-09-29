@@ -933,12 +933,12 @@ posture is written down as the permanent 1.x choice. No private hybrid profile.
 | In-daemon CRL CDP and CT-log fetch | Callers pass DER. Default policy is fail-open unless `require_crl` / `require_sct`. ACME forces those off. |
 | `enforce_cert_signature_algorithms` defaults off | Chain scheme checks run only when the flag is set. |
 | BoGo lane | `tools/bogo/expected-baseline.txt` is 24 pass / 3 skip. The exploratory full corpus is not that lane. Disabled tests include ECH, HRR, resumption, 0-RTT, mTLS, DC, P-384, P-521, DTLS. |
-| Multi-certificate TOML | `[[tls.ech_keys]]` parses. An operator-facing list of SNI certificates in the daemon config was not found in `config_format.zig`. The engine can select `sni_certs` once the daemon loads them. |
+| Multi-certificate TOML | `[[tls.sni]]` parses in `config_format.zig` and the listener selects `sni_certs`. `[[tls.ech_keys]]` remains the ECH list. |
 | Delegated-credential mint and rotation | Both roles verify a presented DC. Nothing in-tree mints or rotates one. |
-| CLI sandbox | No Landlock, seccomp, pledge, or unveil anywhere in `src/`. |
+| CLI sandbox | The armor CLI calls none of Landlock, seccomp, pledge, or unveil. Daemon Linux landlock and seccomp live in `kernel_linux.zig` (GAP-X3). pledge and unveil are absent. |
 
 **Accept:** each row is either implemented with a test or moved to the cut list
-in section 11 with a reason. BoGo's accept is a pinned runner whose
+in section 12 with a reason. BoGo's accept is a pinned runner whose
 `DisabledTests` name a reason per entry. A 24/3 baseline stays honest.
 
 ### GAP-K7 — Forward-secure history rekey and metadata-min mode
@@ -1086,6 +1086,18 @@ because each one fights an invariant above.
 | --- | --- |
 | `armor enc` openssl-compatible format | AEAD substrate only. Exit 3 stays. |
 | TURN relay allocation | No sockets and no auth secret. `MEDIA TURN` fails `TURN_CUT`. `substrate/turn.zig` stays framing-only. |
+| ECH with HelloRetryRequest | An accepted ECH inner that needs a retry fails `EchHrrUnsupported`. An ECH client fails `HelloRetryRequestUnsupported`. No ClientHello2 re-seal. |
+| AES-GCM HPKE for ECH | `hpke.aead_id` stays ChaCha20-Poly1305 `0x0003`. Any other AEAD fails `UnsupportedEchSuite`. |
+| x448, P-384, and P-521 key shares | The ClientHello offers X25519, P-256, and X25519MLKEM768 only. P-384 ECDSA certificate verify stays. |
+| AES-CCM cipher suites | Named, and `isAllowed` is false. No caller. |
+| brotli and zstd certificate compression | `pickSupported` returns zlib only. |
+| `armor s_server` | Exit 3. No standalone listener socket. |
+| `armor s_client -connect` | `run` returns `NotImplemented` after the client is built. `handshakeInMemory` stays. |
+| In-daemon CRL and CT fetch | Callers pass DER. `require_crl` defaults false and `require_sct` defaults 0. No CDP or CT URL fetch. |
+| `enforce_cert_signature_algorithms` on by default | The default stays off. The chain check runs only when the flag is set. |
+| BoGo beyond the pinned 24/3 lane | `DisabledTests` names a reason per entry. A missing BoringSSL checkout is not a pass. |
+| Delegated-credential mint and rotation | A presented credential is verified. Nothing mints or rotates one. |
+| CLI Landlock, seccomp, pledge, and unveil | The armor CLI applies none. Daemon Linux landlock and seccomp stay on the GAP-X3 path. pledge and unveil are absent. |
 | Full DTLS listener for IRC | Media-plane DTLS-SRTP is the DTLS this daemon has. |
 | PQ hybrid certificates of our own design | Wait for a ratified profile (GAP-K5). |
 | Adopting `substrate/io/ring.zig` as the server | Unfinished, and it is not the live ring. |

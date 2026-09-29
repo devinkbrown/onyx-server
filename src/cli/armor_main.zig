@@ -167,6 +167,16 @@ test {
 
 const testing = std.testing;
 
+test "GAP-K6 armor enc and s_server stay unimplemented" {
+    var aw = Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+    try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "enc", &.{}, &aw.writer));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "openssl-enc-compatible format") != null);
+    aw.clearRetainingCapacity();
+    try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "s_server", &.{}, &aw.writer));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "not yet implemented") != null);
+}
+
 test "armor dispatch routes ciphers and rejects unknown commands" {
     var aw = Writer.Allocating.init(testing.allocator);
     defer aw.deinit();

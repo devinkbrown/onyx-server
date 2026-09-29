@@ -3776,7 +3776,55 @@ test "loopback: a no-ECH ClientHello against an ECH-configured server takes the 
     try std.testing.expectEqualStrings("plain", got_c);
 }
 
-test "ECH×HRR: server FAILS CLOSED when an accepted inner would require a HelloRetryRequest" {
+test "GAP-K6 enforce_cert_signature_algorithms stays off until an operator sets it" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6c)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x6c},
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    try std.testing.expect(!server.config.enforce_cert_signature_algorithms);
+    var schemes_buf: [8]u8 = undefined;
+    const schemes = try tls_signature_scheme.build(&schemes_buf, &.{.ed25519});
+    server.client_sig_algs = try alloc.dupe(u8, schemes);
+    server.config.cert_chain = &.{"not-a-certificate"};
+    try server.enforceCertChainSigAlgs();
+    server.config.enforce_cert_signature_algorithms = true;
+    try std.testing.expectError(error.NoCompatibleCertificate, server.enforceCertChainSigAlgs());
+}
+
+test "GAP-K6 a server without a presented credential mints nothing" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6d)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x6d},
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    try std.testing.expect(server.config.delegated_credential == null);
+    try std.testing.expect(server.dc_scheme == null);
+    try std.testing.expect(server.activeDelegatedCredential() == null);
+    try std.testing.expectError(error.Truncated, delegated_credential.parse(&.{}));
+}
+
+test "GAP-K6 ECH×HRR: server FAILS CLOSED when an accepted inner would require a HelloRetryRequest" {
     const tls_client = @import("tls_client.zig");
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
@@ -3826,7 +3874,7 @@ test "ECH×HRR: server FAILS CLOSED when an accepted inner would require a Hello
     try std.testing.expectEqual(State.wait_client_hello, server.state);
 }
 
-test "ECH×HRR: an ECH-active client FAILS CLOSED on receiving a HelloRetryRequest" {
+test "GAP-K6 ECH×HRR: an ECH-active client FAILS CLOSED on receiving a HelloRetryRequest" {
     const tls_client = @import("tls_client.zig");
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
@@ -7233,7 +7281,7 @@ fn runSniHandshakeSelectedIndex(
     return server.sni_cert;
 }
 
-test "loopback: SNI selects the matching certificate among multiple" {
+test "GAP-K6 loopback: SNI selects the matching certificate among multiple" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
 
