@@ -1001,11 +1001,12 @@ shipped kqueue accept and recv twice
 (`GAP-X1 windows iocp submitted=6`, `GUEST_EXIT:0`). The same boots dequeued
 Registered I/O (`GAP-X3 windows rio dequeue=1 bytes=4 status=0`). On Linux,
 `PortableServer` answered `PING lane` with `PONG` through `processLine` on
-ringlane (the GAP-X1 test, twice, 0 leaked). NetBSD linked the same kqueue
-guest. DragonFly typechecks that guest; this Zig has no DragonFly libc, so
-that guest was not linked or executed. The heading stays unmarked and the
-whole Accept stays unclaimed. A Windows or BSD `onyx-server` process has not
-been witnessed booting this listener.
+ringlane (the GAP-X1 test, twice, 0 leaked). NetBSD and DragonFly are out of
+scope. The witnessed non-Linux `onyx-server` processes are FreeBSD 14.5
+kqueue (`0.7.0+ddf11915`, three PONGs, capability mode), OpenBSD 7.9 kqueue
+(`0.7.0+ddf11915`, three PONGs, after pledge), and Windows 11 22H2 WinPE IOCP
+(`0.7.0+d4ea0097`, three PONGs, job flags `0x2400`). The headings stay
+unmarked. Live `IDENTIFY` and live `relay_v2_authoring=active` stay unmet.
 
 ### GAP-X2 — `server.zig` strangler, only as a seam is touched
 
@@ -1178,11 +1179,12 @@ shipped pledge (`GAP-X3 openbsd pledge result=ok errno=0`). Windows 11 22H2
 WinPE, build 22621.525, executed the shipped IOCP submit twice
 (`GAP-X1 windows iocp submitted=6`, `GUEST_EXIT:0`) and dequeued Registered I/O
 twice (`GAP-X3 windows rio dequeue=1 bytes=4 status=0`) through the table
-`Iocp.open` loaded. The live `IDENTIFY` sentence (eshmaki.me / ircx.us)
-and the live `relay_v2_authoring=active` flip stay unmet. Wine is not a
-Windows kernel, and commit `838ee337` does not close GAP-X3. Headings stay
-unmarked. This waiver does not mark those Accepts done, and the roadmap stays
-open.
+`Iocp.open` loaded. Those same kernels later answered process `PING`/`PONG`: FreeBSD
+kqueue `0.7.0+ddf11915`, OpenBSD kqueue `0.7.0+ddf11915`, and Windows IOCP
+`0.7.0+d4ea0097`. NetBSD and DragonFly are out of scope. The live `IDENTIFY`
+sentence (eshmaki.me / ircx.us) and the live `relay_v2_authoring=active` flip
+stay unmet. Wine is not a Windows kernel, and commit `838ee337` does not close
+GAP-X3. Headings stay unmarked, and the roadmap stays open.
 
 ### First three slices a worker can pick up
 
