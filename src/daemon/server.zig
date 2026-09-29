@@ -2613,6 +2613,10 @@ pub const ConnState = struct {
     /// a fresh signed-v2 handshake after reconnect/Helix adoption.
     media_e2ee_attachment: [16]u8 = @splat(0),
     media_e2ee_attachment_bound: bool = false,
+    /// Last monotonic millisecond a dropped browser media frame was reported.
+    /// Zero means none yet. One numeric per second keeps a bad encoder from
+    /// filling the IRC send queue. Not sealed across USR2.
+    media_drop_notice_ms: i64 = 0,
     /// Per-connection pending WebAuthn (passkey) ceremony challenge. Single-use
     /// and time-bounded: set by `WEBAUTHN REGISTER`/`AUTH`, consumed (and cleared)
     /// by the matching `*-FINISH`. Inline (no heap); an in-flight challenge simply
@@ -48794,13 +48798,19 @@ pub const LinuxServer = struct {
     /// never feeds it into the native↔WebRTC rewrap bridge — doing so would either
     /// require a group key the server does not hold, or would ship undecryptable
     /// ciphertext to native/RTP peers. Cross-leg mixed calls remain native UDP ↔
-    /// WebRTC RTP only. Media is loss-tolerant — any problem drops this datagram,
-    /// never the IRC session.
+    /// WebRTC RTP only. A bad datagram is not relayed and does not close the IRC
+    /// session. The sender is told with numeric 404, at most once a second.
     fn handleWsMediaDatagram(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, datagram: []const u8) void {
         if (!self.config.ws_media_relay) return;
         if (!conn.session.registered()) return;
-        if (conn.session.hasUmode(.media_tx_deny)) return;
-        const channel = conn.mediaCallChannel() orelse return;
+        if (conn.session.hasUmode(.media_tx_deny)) {
+            self.noteMediaFrameDrop(conn, "*", "Media transmission is disabled");
+            return;
+        }
+        const channel = conn.mediaCallChannel() orelse {
+            self.noteMediaFrameDrop(conn, "*", "Join the call before sending media");
+            return;
+        };
         const participant = conn.mediaCallParticipant();
 
         // One call validates the frame shape AND lenient-verifies a present tag,
@@ -48812,17 +48822,39 @@ pub const LinuxServer = struct {
             participant,
             datagram,
             self.config.ws_media_require_mac,
-        ) catch return;
-        const frame = cadence_frame.decode(frame_bytes) catch return;
+        ) catch {
+            self.noteMediaFrameDrop(conn, channel, "Media frame rejected");
+            return;
+        };
+        const frame = cadence_frame.decode(frame_bytes) catch {
+            self.noteMediaFrameDrop(conn, channel, "Media frame rejected");
+            return;
+        };
 
         // The participant-scoped MAC proves possession of this connection's
         // media key, not that the caller used its own stream id or an authorized
         // media kind. Bind both after MAC verification and before any relay so a
         // participant cannot MAC a victim's stream id and impersonate that track.
-        if (!self.wsMediaFrameAuthorized(id, channel, participant, frame)) return;
+        if (!self.wsMediaFrameAuthorized(id, channel, participant, frame)) {
+            self.noteMediaFrameDrop(conn, channel, "Media frame rejected");
+            return;
+        }
 
         // Opaque WS fan-out only — never rewrap into native/RTP (E2EE).
         self.relayWsMediaDatagram(id, channel, datagram);
+    }
+
+    /// Tell the sender that a browser media datagram was not relayed. The IRC
+    /// session stays up. A one-second quiet period keeps a stream of bad frames
+    /// from filling the send queue.
+    fn noteMediaFrameDrop(self: *LinuxServer, conn: *ConnState, channel: []const u8, why: []const u8) void {
+        const now = self.nowMs();
+        const quiet_until = std.math.add(i64, conn.media_drop_notice_ms, 1000) catch std.math.maxInt(i64);
+        if (conn.media_drop_notice_ms != 0 and now < quiet_until) return;
+        conn.media_drop_notice_ms = now;
+        const chan = if (channel.len == 0) "*" else channel;
+        queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{chan}, why) catch return;
+        if (conn.fd >= 0) self.armSendIfNeeded(conn) catch {};
     }
 
     fn wsMediaFrameAuthorized(
@@ -93458,6 +93490,119 @@ test "WS media admission binds a valid participant MAC to its own stream and act
     resetTestSendQ(receiver);
     server.handleWsMediaDatagram(sender_id, sender, accepted_good);
     try std.testing.expectEqual(@as(usize, 0), receiver.send_len);
+}
+
+test "GAP-V2 a rejected browser media frame returns numeric 404" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .num_shards = 1,
+        .ws_media_relay = true,
+        .ws_media_require_mac = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const sender_id = try addTestLocalClient(&server, "browser", "browser");
+    const peer_id = try addTestLocalClient(&server, "listener", "listener");
+    const sender = server.connFor(sender_id).?;
+    const peer = server.connFor(peer_id).?;
+    sender.session.registration.registered = true;
+    peer.session.registration.registered = true;
+    peer.send_armed = true;
+
+    const sender_ws = try std.testing.allocator.create(WsState);
+    sender_ws.* = .{ .phase = .open, .subprotocol = .onyx_irc_media };
+    sender.ws = sender_ws;
+    const peer_ws = try std.testing.allocator.create(WsState);
+    peer_ws.* = .{ .phase = .open, .subprotocol = .onyx_irc_media };
+    peer.ws = peer_ws;
+
+    try server.world.restoreMember("#media", worldIdFromClient(sender_id), world_model.MemberModes.empty());
+    try server.world.restoreMember("#media", worldIdFromClient(peer_id), world_model.MemberModes.empty());
+    _ = try server.addMediaPhysicalAttachment(sender_id, "#media", "browser", .voice);
+    _ = try server.addMediaPhysicalAttachment(peer_id, "#media", "listener", .voice);
+    try server.media_rooms.join("#media", "browser", .voice);
+    try server.media_rooms.join("#media", "listener", .voice);
+    sender.setMediaCall("#media", "browser");
+    peer.setMediaCall("#media", "listener");
+
+    // The stock-browser failure: a 27-byte unsigned CadenceVox container.
+    var bare_payload = [_]u8{ 1, 2, 3, 4 };
+    var bare_buf: [64]u8 = undefined;
+    const bare_len = try cadence_frame.encode(.{
+        .band_id = cadence_frame.MEDIA_BAND_FLOOR,
+        .stream_id = 1,
+        .sequence = 1,
+        .timestamp = 1,
+        .keyframe = false,
+        .codec = .cadencevox_audio,
+        .payload = &bare_payload,
+    }, &bare_buf);
+    try std.testing.expectEqual(@as(usize, 27), bare_len);
+    var ws_buf: [128]u8 = undefined;
+    const bare_frame = try websocket.encodeFrame(WsState.max_media_frame, .{
+        .opcode = .binary,
+        .mask_key = .{ 1, 2, 3, 4 },
+    }, bare_buf[0..bare_len], &ws_buf);
+    try server.driveWs(sender_id, sender, bare_frame);
+    try std.testing.expect(!sender.closing);
+    try std.testing.expectEqual(@as(usize, 0), peer.send_len);
+    const first = sender.send_buf[0..sender.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, first, " 404 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "Media frame rejected") != null);
+    const first_hits = std.mem.count(u8, first, " 404 ");
+
+    // A second bad frame inside the quiet window must not stack another numeric.
+    try server.driveWs(sender_id, sender, bare_frame);
+    try std.testing.expectEqual(first_hits, std.mem.count(u8, sender.send_buf[0..sender.send_len], " 404 "));
+    try std.testing.expectEqual(@as(usize, 0), peer.send_len);
+
+    // A frame that satisfies the same admission path is relayed and adds no 404.
+    const sender_attachment: [Server.media_e2ee_attachment_bytes]u8 = @splat(0xa1);
+    sender.bindMediaE2eeAttachment(sender_attachment);
+    const expected_stream = Server.browserMediaStreamId("#media", "browser", "audio");
+    var signed_payload: [Server.media_e2ee_attachment_bytes + 1 + account_identity.signature_len]u8 = @splat(0x5a);
+    @memcpy(signed_payload[0..Server.media_e2ee_attachment_bytes], &sender_attachment);
+    var good_buf: [160]u8 = undefined;
+    const good_len = try cadence_frame.encode(.{
+        .band_id = cadence_frame.MEDIA_BAND_FLOOR,
+        .stream_id = expected_stream,
+        .sequence = 2,
+        .timestamp = 2,
+        .keyframe = false,
+        .codec = .cadencevox_audio,
+        .payload = &signed_payload,
+    }, &good_buf);
+    var tagged_buf: [192]u8 = undefined;
+    const good = try cadence_frame.appendNativeMediaMac(
+        &server.native_stream_key,
+        "#media",
+        "browser",
+        good_buf[0..good_len],
+        &tagged_buf,
+    );
+    var good_ws_buf: [256]u8 = undefined;
+    const good_frame = try websocket.encodeFrame(WsState.max_media_frame, .{
+        .opcode = .binary,
+        .mask_key = .{ 5, 6, 7, 8 },
+    }, good, &good_ws_buf);
+    resetTestSendQ(peer);
+    try server.driveWs(sender_id, sender, good_frame);
+    try std.testing.expect(!sender.closing);
+    try std.testing.expectEqual(first_hits, std.mem.count(u8, sender.send_buf[0..sender.send_len], " 404 "));
+    try std.testing.expect(peer.send_len != 0);
+    const delivered = try websocket.decodeFrame(WsState.max_media_frame, .server_to_client, peer.send_buf[0..peer.send_len], &.{});
+    try std.testing.expectEqual(websocket.Opcode.binary, delivered.frame.opcode);
+    try std.testing.expectEqualSlices(u8, good, delivered.frame.payload);
+    std.debug.print("GAP-V2 branch=a rejected browser frame returns numeric 404 and is not relayed\n", .{});
 }
 
 test "MEDIA WS OFFER suppresses unroutable NATIVE/TRANSPORT; non-WS still gets UDP candidates" {
