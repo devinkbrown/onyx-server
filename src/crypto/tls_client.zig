@@ -2467,6 +2467,17 @@ pub const Client = struct {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
 
+        // RFC 8446 §4.4.1: accepted 0-RTT places EndOfEarlyData after the server
+        // Finished (already in the transcript) and before the client Finished.
+        // The message was sent under the early keys in `start`; it joins the
+        // transcript only once the server has accepted early data.
+        if (self.early_data_accepted orelse false) {
+            var eoed: std.ArrayList(u8) = .empty;
+            defer eoed.deinit(self.allocator);
+            try writeHandshake(self.allocator, &eoed, .end_of_early_data, "");
+            try self.appendTranscript(eoed.items);
+        }
+
         // mTLS (test-only): if the server requested a client certificate, send
         // a client Certificate first (empty when declining), then a
         // CertificateVerify when a key pair is configured. Each goes out as its
@@ -6979,4 +6990,188 @@ test "GAP-K8 an HRR resumption with a correct binder resumes and an omitting bin
     }
 
     std.debug.print("GAP-K8 branch=an HRR resumption binder covers ClientHello1 and the HelloRetryRequest\n", .{});
+}
+
+fn gapK9Count(transcript: []const u8, typ: HandshakeType) !usize {
+    var off: usize = 0;
+    var n: usize = 0;
+    while (off < transcript.len) {
+        const msg = try parseHandshake(transcript, &off);
+        if (msg.typ == typ) n += 1;
+    }
+    return n;
+}
+
+const GapK9Finished = struct { prefix: []u8, verify_data: []u8 };
+
+fn gapK9SplitLastFinished(alloc: std.mem.Allocator, transcript: []const u8) !GapK9Finished {
+    var off: usize = 0;
+    var last_start: ?usize = null;
+    var last_body: []const u8 = &.{};
+    while (off < transcript.len) {
+        const start = off;
+        const msg = try parseHandshake(transcript, &off);
+        if (msg.typ == .finished) {
+            last_start = start;
+            last_body = msg.body;
+        }
+    }
+    const start = last_start orelse return error.TestUnexpectedResult;
+    const prefix = try alloc.dupe(u8, transcript[0..start]);
+    errdefer alloc.free(prefix);
+    const verify_data = try alloc.dupe(u8, last_body);
+    return .{ .prefix = prefix, .verify_data = verify_data };
+}
+
+fn gapK9Without(alloc: std.mem.Allocator, transcript: []const u8, drop: HandshakeType) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var off: usize = 0;
+    var dropped = false;
+    while (off < transcript.len) {
+        const msg = try parseHandshake(transcript, &off);
+        if (!dropped and msg.typ == drop) {
+            dropped = true;
+            continue;
+        }
+        try out.appendSlice(alloc, msg.raw);
+    }
+    if (!dropped) return error.TestUnexpectedResult;
+    return try out.toOwnedSlice(alloc);
+}
+
+test "GAP-K9 accepted 0-RTT puts EndOfEarlyData on both transcripts" {
+    const tls_server = @import("tls_server.zig");
+    const alloc = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x79)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x79, 0x09 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try tls_server.Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 4096,
+    });
+    defer server.deinit();
+    var client = try Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+    try std.testing.expectEqual(@as(usize, 0), try gapK9Count(client.transcript.items, .end_of_early_data));
+
+    var early_server = try tls_server.Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .enable_session_tickets = true,
+    });
+    defer early_server.deinit();
+    var early_client = try Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer early_client.deinit();
+    try early_client.setSessionTicket(stored, 0);
+    try early_client.setEarlyData("GET /early");
+
+    const early_hello = try early_client.start();
+    defer alloc.free(early_hello);
+    const eflight = switch (try early_server.feed(early_hello)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(eflight);
+    try std.testing.expect(early_server.earlyDataAccepted());
+    const early = (try early_server.takeEarlyData()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(early);
+    try std.testing.expectEqualStrings("GET /early", early);
+
+    const efin = switch (try early_client.feed(eflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(efin);
+    try std.testing.expectEqual(@as(?bool, true), early_client.earlyDataAccepted());
+    try std.testing.expect(early_client.handshakeDone());
+    _ = try early_server.feed(efin);
+    try std.testing.expect(early_server.handshakeDone());
+    try std.testing.expect(std.mem.eql(u8, early_client.transcript.items, early_server.transcript.items));
+    try std.testing.expectEqual(@as(usize, 1), try gapK9Count(early_client.transcript.items, .end_of_early_data));
+    try std.testing.expectEqual(@as(usize, 1), try gapK9Count(early_server.transcript.items, .end_of_early_data));
+
+    const split = try gapK9SplitLastFinished(alloc, early_client.transcript.items);
+    defer alloc.free(split.prefix);
+    defer alloc.free(split.verify_data);
+    const saved = try alloc.dupe(u8, early_client.transcript.items);
+    defer alloc.free(saved);
+    early_client.transcript.clearRetainingCapacity();
+    try early_client.transcript.appendSlice(early_client.allocator, split.prefix);
+    try std.testing.expect(early_client.finishedVerify(&early_client.client_hs_secret, split.verify_data));
+    const omitted = try gapK9Without(alloc, split.prefix, .end_of_early_data);
+    defer alloc.free(omitted);
+    early_client.transcript.clearRetainingCapacity();
+    try early_client.transcript.appendSlice(early_client.allocator, omitted);
+    try std.testing.expect(!early_client.finishedVerify(&early_client.client_hs_secret, split.verify_data));
+    early_client.transcript.clearRetainingCapacity();
+    try early_client.transcript.appendSlice(early_client.allocator, saved);
+
+    const ticket_b_record = (try early_server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_b_record);
+    try std.testing.expectEqual(AppRead.control, try early_client.decryptApp(ticket_b_record));
+    const stored_b = early_client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored_b);
+
+    var resumed_server = try tls_server.Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+    });
+    defer resumed_server.deinit();
+    var resumed_client = try Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    try resumed_client.setSessionTicket(stored_b, 0);
+    const rch = try resumed_client.start();
+    defer alloc.free(rch);
+    const rflight = switch (try resumed_server.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rflight);
+    try std.testing.expect(resumed_server.acceptedSessionTicket());
+    const rfin = switch (try resumed_client.feed(rflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rfin);
+    _ = try resumed_server.feed(rfin);
+    try std.testing.expect(resumed_server.handshakeDone());
+    try std.testing.expect(resumed_client.handshakeDone());
+
+    std.debug.print("GAP-K9 branch=accepted 0-RTT puts EndOfEarlyData on both transcripts\n", .{});
 }

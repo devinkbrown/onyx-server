@@ -2839,6 +2839,10 @@ pub const Server = struct {
                     if (off != opened.content.len or msg.typ != .end_of_early_data or msg.body.len != 0) {
                         return error.BadHandshake;
                     }
+                    // RFC 8446 §4.4.1: EndOfEarlyData sits after the server Finished
+                    // and before the client Finished. The server Finished is already
+                    // in the transcript; the client Finished has not arrived.
+                    try self.appendTranscript(msg.raw);
                     self.early_data_done = true;
                 },
                 else => return error.BadRecord,
