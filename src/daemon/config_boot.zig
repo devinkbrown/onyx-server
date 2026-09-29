@@ -235,6 +235,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.webhook_rate_per_min = cfg.webhook.rate_per_min;
     out.webhook_rate_burst = cfg.webhook.rate_burst;
     if (cfg.webhook.public_url_base) |u| out.webhook_public_base = u;
+    out.webhook_allow_private = cfg.webhook.allow_private_targets;
     if (cfg.geoip.database.len != 0) out.geoip_db_path = cfg.geoip.database;
     if (cfg.geoip.asn_database.len != 0) out.geoip_asn_db_path = cfg.geoip.asn_database;
     out.backlog = cfg.limits.backlog;
@@ -1246,6 +1247,7 @@ test "webhook section overlays the server config and parses the bind address" {
     try testing.expectEqual(@as(u32, 30), loaded.config.webhook_rate_per_min);
     try testing.expectEqual(@as(u32, 5), loaded.config.webhook_rate_burst);
     try testing.expectEqualStrings("https://irc.example.com", loaded.config.webhook_public_base);
+    try testing.expect(!loaded.config.webhook_allow_private);
 }
 
 test "webhook omitted keeps the feature off (byte-identical default)" {
@@ -1259,7 +1261,24 @@ test "webhook omitted keeps the feature off (byte-identical default)" {
     , .{ .port = 6680 }, .{});
     defer loaded.deinit(allocator);
     try testing.expect(!loaded.config.webhook_enabled);
+    try testing.expect(!loaded.config.webhook_allow_private);
     try testing.expectEqual(@as(u16, 0), loaded.config.webhook_port);
+}
+
+test "GAP-O11 allow_private_targets reaches the server config without enabling inbound" {
+    const allocator = testing.allocator;
+    var loaded = try loadFromText(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[webhook]
+        \\allow_private_targets = true
+        \\
+    , .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expect(loaded.config.webhook_allow_private);
+    try testing.expect(!loaded.config.webhook_enabled);
 }
 
 test "media enabled maps to server gate and disabled feature" {

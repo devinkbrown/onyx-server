@@ -657,6 +657,9 @@ pub const Config = struct {
         /// CREATE reply (e.g. `https://irc.example.com`). Null ⇒ derived from the
         /// bind/port as `http://<bind>:<port>`.
         public_url_base: ?[]const u8 = null,
+        /// Outbound webhooks may target loopback and link-local hosts only when
+        /// this is set. Default false. Does not change the inbound listener.
+        allow_private_targets: bool = false,
     };
 
     pub const Geoip = struct {
@@ -1468,6 +1471,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.webhook.rate_per_min = @intCast(try uintField(doc, "webhook.rate_per_min", cfg.webhook.rate_per_min, 0, 1_000_000));
     cfg.webhook.rate_burst = @intCast(try uintField(doc, "webhook.rate_burst", cfg.webhook.rate_burst, 1, 1_000_000));
     try setOpt(allocator, resolver, doc.getString("webhook.public_url_base"), &cfg.webhook.public_url_base);
+    if (doc.getBool("webhook.allow_private_targets")) |b| cfg.webhook.allow_private_targets = b;
 
     try setStr(allocator, resolver, doc.getString("geoip.database"), &cfg.geoip.database);
     try setStr(allocator, resolver, doc.getString("geoip.asn_database"), &cfg.geoip.asn_database);
@@ -2592,6 +2596,19 @@ test "parseToml: listen proxy protocol and SASL enabled gate project" {
     try testing.expect(!omitted.sasl.allow_anonymous);
     try testing.expect(!omitted.sasl.oauth_auto_provision);
     try testing.expect(omitted.sasl.oauth_account_claim == null);
+}
+
+test "GAP-O11 outbound webhook private targets default off and parse on" {
+    const allocator = testing.allocator;
+    var omitted = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{});
+    defer omitted.deinit(allocator);
+    try testing.expect(!omitted.webhook.allow_private_targets);
+    try testing.expect(!omitted.webhook.enabled);
+
+    var allowed = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[webhook]\nallow_private_targets=true\n", .{});
+    defer allowed.deinit(allocator);
+    try testing.expect(allowed.webhook.allow_private_targets);
+    try testing.expect(!allowed.webhook.enabled);
 }
 
 test "GAP-O9 two-person rule defaults off and parses on" {

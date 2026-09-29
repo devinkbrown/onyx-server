@@ -1641,6 +1641,9 @@ pub const Config = struct {
     webhook_rate_burst: u32 = 10,
     /// Public URL base for the WEBHOOK CREATE reply; empty ⇒ derive from bind/port.
     webhook_public_base: []const u8 = "",
+    /// When false, outbound webhooks refuse loopback and link-local targets.
+    /// The inbound listener is unchanged.
+    webhook_allow_private: bool = false,
     /// UDP port for the media (SFU) transport plane; 0 = ephemeral. Bound on boot.
     media_port: u16 = 0,
     /// Host/IP advertised to native/WebRTC clients as the server's media (ICE)
@@ -3518,6 +3521,18 @@ const PolicyUndo = union(PolicyKind) {
     }
 };
 
+/// Outbound event webhooks. Separate from the inbound Discord-compatible store.
+const outbound_webhook_slots: usize = 8;
+const outbound_webhook_attempt_cap: u8 = 3;
+const outbound_webhook_url_max: usize = 512;
+const outbound_webhook_secret_max: usize = 128;
+
+const OutboundWebhook = struct {
+    url: []u8,
+    secret: []u8,
+    mask: event_spine.CategoryMask,
+};
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -3976,6 +3991,11 @@ pub const LinuxServer = struct {
     /// `start()` when `webhook_enabled` and `webhook_port != 0`; joined in
     /// `deinit()`. Re-created on the new process across a USR2 hot-upgrade.
     webhook_server: ?webhook_http.WebhookServer = null,
+    /// Oper-registered outbound subscriptions. Not the inbound webhook store.
+    outbound_webhooks: [outbound_webhook_slots]?OutboundWebhook = @splat(null),
+    outbound_webhook_attempts: u64 = 0,
+    outbound_webhook_delivered: u64 = 0,
+    outbound_webhook_dropped: u64 = 0,
     /// #33 ACTIVITY: per-channel real-time activity-stream subscribers.
     activity_subs: activity_subscriptions.SubscriptionStore,
     /// Phase 3: per-account live session registry (multi-device / bouncer).
@@ -5555,6 +5575,190 @@ pub const LinuxServer = struct {
         }) catch buf[0..0];
     }
 
+    fn destroyOutboundWebhooks(self: *LinuxServer) void {
+        for (&self.outbound_webhooks) |*slot| self.clearOutboundSlot(slot);
+    }
+
+    fn clearOutboundSlot(self: *LinuxServer, slot: *?OutboundWebhook) void {
+        if (slot.*) |sub| {
+            self.allocator.free(sub.url);
+            @memset(sub.secret, 0);
+            self.allocator.free(sub.secret);
+            slot.* = null;
+        }
+    }
+
+    fn outboundWebhookCount(self: *const LinuxServer) usize {
+        var n: usize = 0;
+        for (self.outbound_webhooks) |slot| {
+            if (slot != null) n += 1;
+        }
+        return n;
+    }
+
+    /// `OUTHOOK ADD <url> <secret> <categories>` registers a push target.
+    /// `DEL` removes one. `LIST` shows URLs and categories, never the secret.
+    /// Loopback and link-local targets are refused unless
+    /// `webhook_allow_private` is set. Inbound `WEBHOOK` is unchanged.
+    pub fn handleOutboundWebhook(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (!self.requirePriv(conn, .server_admin)) return;
+        const p = parsed.paramSlice();
+        if (p.len < 1) {
+            try self.noticeTo(conn, "Usage: OUTHOOK ADD <url> <secret> <categories> | DEL <url> | LIST");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "LIST")) {
+            if (self.outboundWebhookCount() == 0) {
+                try self.noticeTo(conn, "OUTHOOK: none");
+                return;
+            }
+            for (self.outbound_webhooks) |slot| {
+                const sub = slot orelse continue;
+                var cats: [256]u8 = undefined;
+                const shown = outboundCategoryText(sub.mask, &cats);
+                var buf: [default_reply_bytes]u8 = undefined;
+                const note = std.fmt.bufPrint(&buf, "OUTHOOK: {s} categories={s}", .{ sub.url, shown }) catch continue;
+                try self.noticeTo(conn, note);
+            }
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "DEL") or std.ascii.eqlIgnoreCase(p[0], "DELETE")) {
+            if (p.len < 2) {
+                try self.noticeTo(conn, "Usage: OUTHOOK DEL <url>");
+                return;
+            }
+            for (&self.outbound_webhooks) |*slot| {
+                const sub = slot.* orelse continue;
+                if (!std.mem.eql(u8, sub.url, p[1])) continue;
+                self.clearOutboundSlot(slot);
+                _ = self.recordOperAudit(conn.session.displayName(), .other, p[1], "outbound webhook del");
+                try self.noticeTo(conn, "OUTHOOK: removed");
+                return;
+            }
+            try self.noticeTo(conn, "OUTHOOK: no such url");
+            return;
+        }
+        if (!std.ascii.eqlIgnoreCase(p[0], "ADD")) {
+            try self.noticeTo(conn, "OUTHOOK: subcommand must be ADD, DEL, or LIST");
+            return;
+        }
+        if (p.len < 4) {
+            try self.noticeTo(conn, "Usage: OUTHOOK ADD <url> <secret> <categories>");
+            return;
+        }
+        const url = p[1];
+        const secret = p[2];
+        if (url.len == 0 or url.len > outbound_webhook_url_max or secret.len == 0 or secret.len > outbound_webhook_secret_max) {
+            try self.noticeTo(conn, "OUTHOOK: url or secret is empty or too long");
+            return;
+        }
+        const parsed_url = http_fetch.parseUrl(url) catch {
+            try self.noticeTo(conn, "OUTHOOK: bad url");
+            return;
+        };
+        if (!self.config.webhook_allow_private and outboundHostPrivate(parsed_url.host)) {
+            try self.noticeTo(conn, "OUTHOOK: refusing link-local or loopback target");
+            return;
+        }
+        const mask = parseOutboundCategories(p[3]) orelse {
+            try self.noticeTo(conn, "OUTHOOK: unknown category");
+            return;
+        };
+        const url_copy = self.allocator.dupe(u8, url) catch {
+            try self.noticeTo(conn, "OUTHOOK: out of memory");
+            return;
+        };
+        const secret_copy = self.allocator.dupe(u8, secret) catch {
+            self.allocator.free(url_copy);
+            try self.noticeTo(conn, "OUTHOOK: out of memory");
+            return;
+        };
+        var replaced = false;
+        for (&self.outbound_webhooks) |*slot| {
+            const sub = slot.* orelse continue;
+            if (!std.mem.eql(u8, sub.url, url)) continue;
+            self.clearOutboundSlot(slot);
+            slot.* = .{ .url = url_copy, .secret = secret_copy, .mask = mask };
+            replaced = true;
+            break;
+        }
+        if (!replaced) {
+            var stored = false;
+            for (&self.outbound_webhooks) |*slot| {
+                if (slot.* != null) continue;
+                slot.* = .{ .url = url_copy, .secret = secret_copy, .mask = mask };
+                stored = true;
+                break;
+            }
+            if (!stored) {
+                self.allocator.free(url_copy);
+                @memset(secret_copy, 0);
+                self.allocator.free(secret_copy);
+                try self.noticeTo(conn, "OUTHOOK: limit reached");
+                return;
+            }
+        }
+        _ = self.recordOperAudit(conn.session.displayName(), .other, url, "outbound webhook");
+        try self.noticeTo(conn, if (replaced) "OUTHOOK: updated" else "OUTHOOK: registered");
+    }
+
+    /// Push one admitted oper event to every subscription whose mask includes
+    /// `category`. Each delivery signs the body and retries up to the cap.
+    fn deliverOutboundWebhooks(self: *LinuxServer, category: event_spine.EventCategory, severity: event_spine.EventSeverity, message: []const u8) void {
+        var body_buf: [1024]u8 = undefined;
+        const body = formatOutboundBody(&body_buf, category, severity, self.serverName(), message) orelse {
+            self.outbound_webhook_dropped += 1;
+            return;
+        };
+        for (self.outbound_webhooks) |slot| {
+            const sub = slot orelse continue;
+            if (!sub.mask.contains(category)) continue;
+            self.postOutboundWebhook(sub, body);
+        }
+    }
+
+    fn postOutboundWebhook(self: *LinuxServer, sub: OutboundWebhook, body: []const u8) void {
+        const parsed = http_fetch.parseUrl(sub.url) catch {
+            self.outbound_webhook_dropped += 1;
+            return;
+        };
+        if (self.outboundDeliveryBlocked(parsed.host, parsed.port)) {
+            self.outbound_webhook_dropped += 1;
+            return;
+        }
+        var sig_buf: [71]u8 = undefined;
+        const signature = outboundSignature(sub.secret, body, &sig_buf);
+        const opts = http_fetch.Options{
+            .connect_timeout_ms = 400,
+            .recv_timeout_ms = 400,
+            .max_response_bytes = 4096,
+        };
+        var attempt: u8 = 0;
+        while (attempt < outbound_webhook_attempt_cap) : (attempt += 1) {
+            self.outbound_webhook_attempts += 1;
+            const resp = http_fetch.postSigned(self.allocator, parsed, body, signature, opts) catch continue;
+            defer self.allocator.free(resp);
+            if (httpStatus2xx(resp)) {
+                self.outbound_webhook_delivered += 1;
+                return;
+            }
+        }
+        self.outbound_webhook_dropped += 1;
+    }
+
+    fn outboundDeliveryBlocked(self: *LinuxServer, host: []const u8, port: u16) bool {
+        if (self.config.webhook_allow_private) return false;
+        if (outboundHostPrivate(host)) return true;
+        if (http_fetch.resolveHostA(host, port, 400)) |addr| {
+            return outboundAddrPrivate(addr);
+        } else |_| {}
+        return false;
+    }
+
     test "server start gates media transports on media_enabled" {
         if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
         const allocator = std.testing.allocator;
@@ -5790,6 +5994,7 @@ pub const LinuxServer = struct {
         if (self.mesh_ban_filter) |*filter| filter.deinit();
         if (self.policy_undo) |*undo| self.destroyPolicyUndo(undo);
         self.policy_undo = null;
+        self.destroyOutboundWebhooks();
         self.warden.deinit();
         self.spamtrap.deinit();
         self.raid_shield.deinit();
@@ -49418,6 +49623,7 @@ pub const LinuxServer = struct {
             const event_id = (try self.admitEventSpineV2(event)) orelse return;
             self.deliverOperEventV2Local(event, event_id, category, severity, subject);
             self.meshBroadcastAuthoredOperEventV2(event);
+            self.deliverOutboundWebhooks(category, severity, message);
             return;
         }
 
@@ -49427,6 +49633,7 @@ pub const LinuxServer = struct {
         self.event_stats.record(@intFromEnum(category), @intFromEnum(severity));
         self.deliverOperEventLocal(self.serverName(), category, severity, subject, message);
         self.meshBroadcastOperEvent(category, severity, message);
+        self.deliverOutboundWebhooks(category, severity, message);
     }
 
     /// A failed shard-wide Event-Spine handoff is an ordering gap only for the
@@ -107895,6 +108102,438 @@ test "GAP-O10 policy rollback restores the last ward, filter, class, and ban gen
     try expectProof(&server.oper_audit, .other, "policy rollback", 1);
 
     std.debug.print("GAP-O10 branch=policy rollback restores the last numbered generation and the proof version matches it\n", .{});
+}
+
+fn appendRaw(buf: []u8, n: *usize, text: []const u8) bool {
+    if (n.* + text.len > buf.len) return false;
+    @memcpy(buf[n.*..][0..text.len], text);
+    n.* += text.len;
+    return true;
+}
+
+fn appendJsonQuoted(buf: []u8, n: *usize, text: []const u8) bool {
+    if (!appendRaw(buf, n, "\"")) return false;
+    const hex = "0123456789abcdef";
+    for (text) |c| {
+        if (c == '"') {
+            if (!appendRaw(buf, n, "\\\"")) return false;
+        } else if (c == '\\') {
+            if (!appendRaw(buf, n, "\\\\")) return false;
+        } else if (c == '\n') {
+            if (!appendRaw(buf, n, "\\n")) return false;
+        } else if (c == '\r') {
+            if (!appendRaw(buf, n, "\\r")) return false;
+        } else if (c < 0x20) {
+            const piece = [_]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0xf] };
+            if (!appendRaw(buf, n, &piece)) return false;
+        } else {
+            if (n.* >= buf.len) return false;
+            buf[n.*] = c;
+            n.* += 1;
+        }
+    }
+    return appendRaw(buf, n, "\"");
+}
+
+fn formatOutboundBody(
+    buf: []u8,
+    category: event_spine.EventCategory,
+    severity: event_spine.EventSeverity,
+    origin: []const u8,
+    message: []const u8,
+) ?[]const u8 {
+    var n: usize = 0;
+    if (!appendRaw(buf, &n, "{\"category\":")) return null;
+    if (!appendJsonQuoted(buf, &n, category.code())) return null;
+    if (!appendRaw(buf, &n, ",\"severity\":")) return null;
+    if (!appendJsonQuoted(buf, &n, severity.token())) return null;
+    if (!appendRaw(buf, &n, ",\"server\":")) return null;
+    if (!appendJsonQuoted(buf, &n, origin)) return null;
+    if (!appendRaw(buf, &n, ",\"message\":")) return null;
+    if (!appendJsonQuoted(buf, &n, message)) return null;
+    if (!appendRaw(buf, &n, "}")) return null;
+    return buf[0..n];
+}
+
+fn outboundSignature(secret: []const u8, body: []const u8, out: *[71]u8) []const u8 {
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, body, secret);
+    const prefix = "sha256=";
+    @memcpy(out[0..prefix.len], prefix);
+    const hex = "0123456789abcdef";
+    for (mac, 0..) |b, i| {
+        out[prefix.len + i * 2] = hex[b >> 4];
+        out[prefix.len + i * 2 + 1] = hex[b & 0xf];
+    }
+    return out;
+}
+
+fn outboundNormalizeHost(raw: []const u8, buf: []u8) []const u8 {
+    var host = std.mem.trim(u8, raw, " \t");
+    if (host.len >= 2 and host[0] == '[') {
+        if (std.mem.indexOfScalar(u8, host, ']')) |end| host = host[1..end];
+    }
+    if (std.mem.indexOfScalar(u8, host, '%')) |zone| host = host[0..zone];
+    if (host.len == 0 or host.len > buf.len) return "";
+    for (host, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return buf[0..host.len];
+}
+
+fn ipv4Private(bytes: [4]u8) bool {
+    if (bytes[0] == 127) return true;
+    if (bytes[0] == 169 and bytes[1] == 254) return true;
+    return false;
+}
+
+fn outboundAddrPrivate(addr: std.Io.net.IpAddress) bool {
+    switch (addr) {
+        .ip4 => |a| return ipv4Private(a.bytes),
+        .ip6 => |a| {
+            if (std.Io.net.Ip4Address.fromIp6(a)) |mapped| return ipv4Private(mapped.bytes);
+            if (a.bytes[0] == 0xfe and (a.bytes[1] & 0xc0) == 0x80) return true;
+            const loopback = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+            return std.mem.eql(u8, &a.bytes, &loopback);
+        },
+    }
+}
+
+fn outboundHostPrivate(raw: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    const host = outboundNormalizeHost(raw, &buf);
+    if (host.len == 0) return true;
+    if (std.ascii.eqlIgnoreCase(host, "localhost") or std.ascii.eqlIgnoreCase(host, "localhost.")) return true;
+    const parsed = std.Io.net.IpAddress.parse(host, 0) catch return false;
+    return outboundAddrPrivate(parsed);
+}
+
+fn parseOutboundCategories(raw: []const u8) ?event_spine.CategoryMask {
+    var mask = event_spine.CategoryMask.empty();
+    var any = false;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const tok = std.mem.trim(u8, part, " \t");
+        if (tok.len == 0) return null;
+        if (std.ascii.eqlIgnoreCase(tok, "ALL")) {
+            mask = event_spine.CategoryMask.all();
+            any = true;
+            continue;
+        }
+        const cat = event_spine.EventCategory.parse(tok) orelse return null;
+        mask.add(cat);
+        any = true;
+    }
+    if (!any or mask.isEmpty()) return null;
+    return mask;
+}
+
+fn outboundCategoryText(mask: event_spine.CategoryMask, buf: []u8) []const u8 {
+    var n: usize = 0;
+    inline for (@typeInfo(event_spine.EventCategory).@"enum".field_names) |field_name| {
+        const cat: event_spine.EventCategory = @field(event_spine.EventCategory, field_name);
+        if (mask.contains(cat)) {
+            const name = cat.code();
+            if (n != 0 and n < buf.len) {
+                buf[n] = ',';
+                n += 1;
+            }
+            if (n + name.len <= buf.len) {
+                @memcpy(buf[n..][0..name.len], name);
+                n += name.len;
+            }
+        }
+    }
+    return buf[0..n];
+}
+
+fn httpStatus2xx(resp: []const u8) bool {
+    const sp = std.mem.indexOfScalar(u8, resp, ' ') orelse return false;
+    if (sp + 4 > resp.len) return false;
+    const code = std.fmt.parseInt(u16, resp[sp + 1 .. sp + 4], 10) catch return false;
+    return code >= 200 and code < 300;
+}
+
+const BoundTcp = struct { fd: linux.fd_t, port: u16 };
+
+fn bindLoopback(do_listen: bool) ServerError!BoundTcp {
+    const fd = try socketTcp();
+    errdefer closeFd(fd);
+    var yes: u32 = 1;
+    _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
+    var addr = linux.sockaddr.in{
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
+    };
+    if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        return error.Unexpected;
+    if (do_listen) {
+        if (posix.errno(linux.listen(fd, 16)) != .SUCCESS) return error.Unexpected;
+        var tv = linux.timeval{ .sec = 0, .usec = 200_000 };
+        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+    }
+    var storage: posix.sockaddr.storage = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (posix.errno(linux.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS)
+        return error.Unexpected;
+    const bound: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, bound.port) };
+}
+
+const OutboundHookProbe = struct {
+    stop: std.atomic.Value(bool) = .init(false),
+    listen_fd: linux.fd_t = -1,
+    mu: std.atomic.Mutex = .unlocked,
+    hits: usize = 0,
+    req: [2][1500]u8 = undefined,
+    req_len: [2]usize = .{ 0, 0 },
+    started: bool = false,
+    thread: std.Thread = undefined,
+
+    fn headerContentLength(head: []const u8) ?usize {
+        var it = std.mem.splitScalar(u8, head, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            const key = "content-length:";
+            if (line.len < key.len) continue;
+            if (!std.ascii.eqlIgnoreCase(line[0..key.len], key)) continue;
+            const v = std.mem.trim(u8, line[key.len..], " \t");
+            return std.fmt.parseInt(usize, v, 10) catch null;
+        }
+        return null;
+    }
+
+    fn serve(self: *OutboundHookProbe, fd: linux.fd_t) void {
+        var tv = linux.timeval{ .sec = 1, .usec = 0 };
+        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        var buf: [1500]u8 = undefined;
+        var n: usize = 0;
+        while (n < buf.len) {
+            const rc = linux.read(fd, buf[n..].ptr, buf.len - n);
+            if (posix.errno(rc) != .SUCCESS) break;
+            const got: usize = @intCast(rc);
+            if (got == 0) break;
+            n += got;
+            if (std.mem.indexOf(u8, buf[0..n], "\r\n\r\n")) |head| {
+                const want = headerContentLength(buf[0..head]) orelse 0;
+                if (n >= head + 4 + want) break;
+            }
+        }
+        lockSpin(&self.mu);
+        const hit = self.hits;
+        if (hit < self.req.len and n > 0) {
+            const copy = @min(n, self.req[hit].len);
+            @memcpy(self.req[hit][0..copy], buf[0..copy]);
+            self.req_len[hit] = copy;
+        }
+        self.hits += 1;
+        self.mu.unlock();
+        const resp = if (hit == 0)
+            "HTTP/1.1 500 No\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        else
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        var off: usize = 0;
+        while (off < resp.len) {
+            const rc = linux.write(fd, resp[off..].ptr, resp.len - off);
+            if (posix.errno(rc) != .SUCCESS) break;
+            const wrote: usize = @intCast(rc);
+            if (wrote == 0) break;
+            off += wrote;
+        }
+    }
+
+    fn run(self: *OutboundHookProbe) void {
+        while (!self.stop.load(.acquire)) {
+            const rc = linux.accept4(self.listen_fd, null, null, posix.SOCK.CLOEXEC);
+            if (posix.errno(rc) != .SUCCESS) continue;
+            const fd: linux.fd_t = @intCast(rc);
+            self.serve(fd);
+            closeFd(fd);
+        }
+    }
+};
+
+fn outboundRequestBody(raw: []const u8) ?[]const u8 {
+    const mark = "\r\n\r\n";
+    const at = std.mem.indexOf(u8, raw, mark) orelse return null;
+    return raw[at + mark.len ..];
+}
+
+fn outboundRequestSigned(secret: []const u8, raw: []const u8) bool {
+    const body = outboundRequestBody(raw) orelse return false;
+    const head_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return false;
+    const head = raw[0..head_end];
+    const prefix = "X-Onyx-Signature: ";
+    const at = std.mem.indexOf(u8, head, prefix) orelse return false;
+    const rest = head[at + prefix.len ..];
+    const end = std.mem.indexOfAny(u8, rest, "\r\n") orelse rest.len;
+    const got = std.mem.trim(u8, rest[0..end], " \t");
+    var expect: [71]u8 = undefined;
+    const want = outboundSignature(secret, body, &expect);
+    return std.mem.eql(u8, got, want);
+}
+
+test "GAP-O11 outbound webhooks sign retries and refuse loopback" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "hook.test",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        current_reactor = null;
+        server.deinit();
+    }
+    current_reactor = &server.reactors[0];
+
+    var probe = OutboundHookProbe{};
+    defer {
+        probe.stop.store(true, .release);
+        if (probe.listen_fd >= 0) closeFd(probe.listen_fd);
+        if (probe.started) probe.thread.join();
+    }
+    const listener = bindLoopback(true) catch return error.SkipZigTest;
+    probe.listen_fd = listener.fd;
+    probe.thread = std.Thread.spawn(.{}, OutboundHookProbe.run, .{&probe}) catch return error.SkipZigTest;
+    probe.started = true;
+
+    const dead = bindLoopback(false) catch return error.SkipZigTest;
+    defer closeFd(dead.fd);
+
+    const user_id = try addTestLocalClient(&server, "user", null);
+    const user = server.connFor(user_id).?;
+    const oper_id = try addTestLocalClient(&server, "oper", null);
+    const oper = server.connFor(oper_id).?;
+    oper.session.is_oper = true;
+    oper.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_admin});
+
+    var denied = try irc_line.parseLine("OUTHOOK ADD http://203.0.113.5/hook secret KILL");
+    try server.handleOutboundWebhook(user, &denied);
+    try std.testing.expect(std.mem.indexOf(u8, user.send_buf[0..user.send_len], "not an IRC operator") != null);
+    try std.testing.expectEqual(@as(usize, 0), server.outboundWebhookCount());
+
+    var live_url: [96]u8 = undefined;
+    const live = std.fmt.bufPrint(&live_url, "http://127.0.0.1:{d}/hook", .{listener.port}) catch unreachable;
+    var refuse_live: [160]u8 = undefined;
+    const refuse_line = std.fmt.bufPrint(&refuse_live, "OUTHOOK ADD {s} s3cret-token KILL", .{live}) catch unreachable;
+    var refuse_cmd = try irc_line.parseLine(refuse_line);
+    oper.send_len = 0;
+    try server.handleOutboundWebhook(oper, &refuse_cmd);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "refusing link-local or loopback") != null);
+    try std.testing.expectEqual(@as(usize, 0), server.outboundWebhookCount());
+    try std.testing.expectEqual(@as(u64, 0), server.outbound_webhook_attempts);
+    lockSpin(&probe.mu);
+    try std.testing.expectEqual(@as(usize, 0), probe.hits);
+    probe.mu.unlock();
+
+    const private_urls = [_][]const u8{
+        "http://127.0.0.8/hook",
+        "http://localhost/hook",
+        "http://LOCALHOST:8080/hook",
+        "http://169.254.1.1/hook",
+        "http://[::1]/hook",
+        "http://[fe80::1]/hook",
+        "http://[::ffff:127.0.0.1]/hook",
+    };
+    for (private_urls) |url| {
+        var line_buf: [192]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "OUTHOOK ADD {s} s3cret-token KILL", .{url}) catch unreachable;
+        var cmd = try irc_line.parseLine(line);
+        oper.send_len = 0;
+        try server.handleOutboundWebhook(oper, &cmd);
+        try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "refusing link-local or loopback") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.outboundWebhookCount());
+
+    var public_cmd = try irc_line.parseLine("OUTHOOK ADD http://203.0.113.5/hook s3cret-token KILL,POLICY");
+    oper.send_len = 0;
+    try server.handleOutboundWebhook(oper, &public_cmd);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "OUTHOOK: registered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "s3cret-token") == null);
+    var rfc1918 = try irc_line.parseLine("OUTHOOK ADD http://10.1.2.3/hook s3cret-token KILL");
+    try server.handleOutboundWebhook(oper, &rfc1918);
+    var v6doc = try irc_line.parseLine("OUTHOOK ADD http://[2001:db8::1]/hook s3cret-token KILL");
+    try server.handleOutboundWebhook(oper, &v6doc);
+    try std.testing.expectEqual(@as(usize, 3), server.outboundWebhookCount());
+    var list_cmd = try irc_line.parseLine("OUTHOOK LIST");
+    oper.send_len = 0;
+    try server.handleOutboundWebhook(oper, &list_cmd);
+    const listed = oper.send_buf[0..oper.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, listed, "203.0.113.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "KILL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "POLICY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "s3cret-token") == null);
+    var bad_cat = try irc_line.parseLine("OUTHOOK ADD http://203.0.113.9/hook s3cret-token NOTACAT");
+    oper.send_len = 0;
+    try server.handleOutboundWebhook(oper, &bad_cat);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "unknown category") != null);
+    try std.testing.expectEqual(@as(usize, 3), server.outboundWebhookCount());
+    var del_public = try irc_line.parseLine("OUTHOOK DEL http://203.0.113.5/hook");
+    try server.handleOutboundWebhook(oper, &del_public);
+    var del_rfc = try irc_line.parseLine("OUTHOOK DEL http://10.1.2.3/hook");
+    try server.handleOutboundWebhook(oper, &del_rfc);
+    var del_v6 = try irc_line.parseLine("OUTHOOK DEL http://[2001:db8::1]/hook");
+    try server.handleOutboundWebhook(oper, &del_v6);
+    try std.testing.expectEqual(@as(usize, 0), server.outboundWebhookCount());
+
+    server.config.webhook_allow_private = true;
+    var dead_url: [96]u8 = undefined;
+    const dead_target = std.fmt.bufPrint(&dead_url, "http://127.0.0.1:{d}/dead", .{dead.port}) catch unreachable;
+    var dead_line: [160]u8 = undefined;
+    const dead_text = std.fmt.bufPrint(&dead_line, "OUTHOOK ADD {s} s3cret-token KILL", .{dead_target}) catch unreachable;
+    var dead_cmd = try irc_line.parseLine(dead_text);
+    oper.send_len = 0;
+    try server.handleOutboundWebhook(oper, &dead_cmd);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "OUTHOOK: registered") != null);
+    try server.publishOperEvent(.flood, .warn, "flood-ignored");
+    try std.testing.expectEqual(@as(u64, 0), server.outbound_webhook_attempts);
+    try server.publishOperEvent(.kill, .warn, "dead-port-kill");
+    try std.testing.expectEqual(@as(u64, outbound_webhook_attempt_cap), server.outbound_webhook_attempts);
+    try std.testing.expectEqual(@as(u64, 0), server.outbound_webhook_delivered);
+    try std.testing.expectEqual(@as(u64, 1), server.outbound_webhook_dropped);
+    var del_dead = try irc_line.parseLine(dead_text);
+    // DEL needs the stored URL, which is the ADD argument, not the whole line.
+    var del_dead_line: [160]u8 = undefined;
+    const del_dead_text = std.fmt.bufPrint(&del_dead_line, "OUTHOOK DEL {s}", .{dead_target}) catch unreachable;
+    del_dead = try irc_line.parseLine(del_dead_text);
+    try server.handleOutboundWebhook(oper, &del_dead);
+    try std.testing.expectEqual(@as(usize, 0), server.outboundWebhookCount());
+
+    var add_live = try irc_line.parseLine(refuse_line);
+    oper.send_len = 0;
+    try server.handleOutboundWebhook(oper, &add_live);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "OUTHOOK: registered") != null);
+    const attempts_before = server.outbound_webhook_attempts;
+    try server.publishOperEvent(.flood, .warn, "flood-still-ignored");
+    try std.testing.expectEqual(attempts_before, server.outbound_webhook_attempts);
+    try server.publishOperEvent(.kill, .warn, "live-kill");
+    try std.testing.expectEqual(attempts_before + 2, server.outbound_webhook_attempts);
+    try std.testing.expectEqual(@as(u64, 1), server.outbound_webhook_delivered);
+    lockSpin(&probe.mu);
+    try std.testing.expectEqual(@as(usize, 2), probe.hits);
+    try std.testing.expect(probe.req_len[0] > 0);
+    try std.testing.expect(probe.req_len[1] > 0);
+    const first = probe.req[0][0..probe.req_len[0]];
+    const second = probe.req[1][0..probe.req_len[1]];
+    try std.testing.expect(outboundRequestSigned("s3cret-token", first));
+    try std.testing.expect(outboundRequestSigned("s3cret-token", second));
+    const body = outboundRequestBody(first) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"category\":\"KILL\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "live-kill") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "hook.test") != null);
+    probe.mu.unlock();
+
+    try std.testing.expect(!server.config.webhook_enabled);
+    var inbound = try irc_line.parseLine("WEBHOOK LIST #hooks");
+    oper.send_len = 0;
+    try server.handleWebhook(oper_id, oper, &inbound);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "not enabled") != null);
+
+    std.debug.print("GAP-O11 branch=outbound webhooks sign and retry with a cap; link-local and loopback stay refused unless config allows them\n", .{});
 }
 
 test {

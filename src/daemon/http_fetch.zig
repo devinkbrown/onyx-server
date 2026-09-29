@@ -162,12 +162,40 @@ pub fn post(
         .{ .name = "Accept", .value = "application/ocsp-response" },
         .{ .name = "Connection", .value = "close" },
     };
+    return postWithHeaders(allocator, url, &headers, body, opts);
+}
+
+/// POST a JSON body with `X-Onyx-Signature`. The signature is the caller's
+/// HMAC over the exact body bytes. Used by outbound event webhooks.
+pub fn postSigned(
+    allocator: std.mem.Allocator,
+    url: Url,
+    body: []const u8,
+    signature: []const u8,
+    opts: Options,
+) Error![]u8 {
+    const headers = [_]http1.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "X-Onyx-Signature", .value = signature },
+        .{ .name = "Connection", .value = "close" },
+    };
+    return postWithHeaders(allocator, url, &headers, body, opts);
+}
+
+fn postWithHeaders(
+    allocator: std.mem.Allocator,
+    url: Url,
+    headers: []const http1.Header,
+    body: []const u8,
+    opts: Options,
+) Error![]u8 {
     // buildRequest writes method/path/Host + each header + Content-Length + body.
-    // 256 bytes covers the fixed framing and the three short headers above.
-    const cap = body.len + url.host.len + url.path.len + content_type.len + 256;
+    var extra: usize = url.host.len + url.path.len + 256;
+    for (headers) |h| extra += h.name.len + h.value.len + 4;
+    const cap = std.math.add(usize, body.len, extra) catch return error.ResponseTooLarge;
     const req_buf = try allocator.alloc(u8, cap);
     defer allocator.free(req_buf);
-    const request_bytes = http1.buildRequest(req_buf, "POST", url.host, url.path, &headers, body) catch
+    const request_bytes = http1.buildRequest(req_buf, "POST", url.host, url.path, headers, body) catch
         return error.ResponseTooLarge;
     return get(allocator, url.host, url.port, url.tls, request_bytes, opts);
 }
