@@ -4427,7 +4427,75 @@ pub const Services = struct {
         };
         if (!access.level.allows(needed)) return error.Forbidden;
     }
+
+    pub const DirectoryReconcile = struct { copied: usize };
+
+    /// Copy account verifiers, channel registrations, ACCESS rows, and AKICK
+    /// rows that one store lacks. The account bytes are the stored salt and
+    /// hash. A key that both stores already hold with different bytes is left
+    /// untouched and the call fails closed before any copy.
+    pub fn reconcileDirectory(self: *Services, peer: *Services) !DirectoryReconcile {
+        if (self == peer or self.store == peer.store) return .{ .copied = 0 };
+        const self_first = @intFromPtr(self) <= @intFromPtr(peer);
+        if (self_first) {
+            self.lock.lockExclusive();
+            peer.lock.lockExclusive();
+        } else {
+            peer.lock.lockExclusive();
+            self.lock.lockExclusive();
+        }
+        defer {
+            self.lock.unlockExclusive();
+            peer.lock.unlockExclusive();
+        }
+        if (directoryConflicts(self.store, peer.store)) return error.DirectoryDisagreement;
+        const copied = try copyMissingDirectory(self.store, peer.store) + try copyMissingDirectory(peer.store, self.store);
+        return .{ .copied = copied };
+    }
 };
+
+const DirectoryFamily = struct {
+    family: store_mod.Family,
+    prefix: ?[]const u8,
+};
+
+const directory_families = [_]DirectoryFamily{
+    .{ .family = .accounts, .prefix = null },
+    .{ .family = .chanregs, .prefix = null },
+    .{ .family = .props, .prefix = access_prefix },
+    .{ .family = .props, .prefix = akick_prefix },
+};
+
+fn directoryKeyIncluded(key: []const u8, prefix: ?[]const u8) bool {
+    if (prefix) |wanted| return std.mem.startsWith(u8, key, wanted);
+    return true;
+}
+
+fn directoryConflicts(left: *OroStore, right: *OroStore) bool {
+    for (directory_families) |spec| {
+        var it = left.maps[@intFromEnum(spec.family)].map.iterator();
+        while (it.next()) |entry| {
+            if (!directoryKeyIncluded(entry.key_ptr.*, spec.prefix)) continue;
+            const other = right.get(spec.family, entry.key_ptr.*) orelse continue;
+            if (!std.mem.eql(u8, other, entry.value_ptr.*)) return true;
+        }
+    }
+    return false;
+}
+
+fn copyMissingDirectory(dst: *OroStore, src: *OroStore) !usize {
+    var copied: usize = 0;
+    for (directory_families) |spec| {
+        var it = src.maps[@intFromEnum(spec.family)].map.iterator();
+        while (it.next()) |entry| {
+            if (!directoryKeyIncluded(entry.key_ptr.*, spec.prefix)) continue;
+            if (dst.get(spec.family, entry.key_ptr.*) != null) continue;
+            try dst.put(spec.family, entry.key_ptr.*, entry.value_ptr.*);
+            copied += 1;
+        }
+    }
+    return copied;
+}
 
 fn validatePassword(password: []const u8) ServiceError!void {
     try validatePasswordPolicy(password, default_password_min_len, default_password_max_len);
@@ -9156,6 +9224,125 @@ test "S6C5 Services tombstone equivocation and every C4 cause" {
             else => return error.TestUnexpectedResult,
         }
     }
+}
+
+fn accessListsMatch(left: []const AccessInfo, right: []const AccessInfo) bool {
+    if (left.len != right.len) return false;
+    for (left) |row| {
+        var found = false;
+        for (right) |other| {
+            if (row.level == other.level and
+                std.mem.eql(u8, row.account.asSlice(), other.account.asSlice()) and
+                std.mem.eql(u8, row.channel.asSlice(), other.channel.asSlice()))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn akickListsMatch(left: []const AkickInfo, right: []const AkickInfo) bool {
+    if (left.len != right.len) return false;
+    for (left) |row| {
+        var found = false;
+        for (right) |other| {
+            if (std.mem.eql(u8, row.mask.asSlice(), other.mask.asSlice()) and
+                std.mem.eql(u8, row.reason.asSlice(), other.reason.asSlice()) and
+                std.mem.eql(u8, row.setter.asSlice(), other.setter.asSlice()) and
+                std.mem.eql(u8, row.channel.asSlice(), other.channel.asSlice()))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+test "DST GAP-A9 account verifiers and channel AKICK replicate and disagree fail closed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const password = "correct horse battery staple";
+    const fast = Config{ .pbkdf2_rounds = 1 };
+
+    var home_store = try openTestStore(tmp, "gap-a9-home.wal");
+    defer home_store.deinit();
+    var peer_store = try openTestStore(tmp, "gap-a9-peer.wal");
+    defer peer_store.deinit();
+    var home = Services.initWithConfig(&home_store, null, fast);
+    var peer = Services.initWithConfig(&peer_store, null, fast);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try home.registerAccount("alice", password, &scratch);
+    _ = try home.registerAccount("bob", "another good passphrase", &scratch);
+    _ = try home.registerChannel("#room", "alice", &scratch);
+    _ = try home.channelAccess("#room", "alice", "bob", .grant, .op, &scratch);
+    _ = try home.channelAkick("#room", "alice", "*!*@spam.example", .add, "spam", &scratch);
+    try home_store.family(.props).put("scram:alice", "not-a-verifier");
+
+    const synced = try home.reconcileDirectory(&peer);
+    try std.testing.expect(synced.copied > 0);
+    const again = try peer.reconcileDirectory(&home);
+    try std.testing.expectEqual(@as(usize, 0), again.copied);
+
+    const stored = peer_store.family(.accounts).get("alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, stored, password) == null);
+    try std.testing.expect(std.mem.startsWith(u8, stored, "A2|alice|"));
+    try std.testing.expect(peer_store.family(.props).get("scram:alice") == null);
+
+    switch (try peer.identifyAccount("Alice", password)) {
+        .identified => |acct| try std.testing.expectEqualStrings("alice", acct.name.asSlice()),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.AuthFailed, peer.identifyAccount("alice", "wrong password"));
+
+    switch (try peer.channelInfo("#room")) {
+        .channel_info => |info| try std.testing.expectEqualStrings("alice", info.founder.asSlice()),
+        else => return error.TestUnexpectedResult,
+    }
+    var home_access: [8]AccessInfo = undefined;
+    var peer_access: [8]AccessInfo = undefined;
+    const home_list = try home.channelAccessList("#room", "alice", &home_access);
+    const peer_list = try peer.channelAccessList("#room", "alice", &peer_access);
+    try std.testing.expect(accessListsMatch(home_list, peer_list));
+    try std.testing.expectEqual(@as(usize, 2), peer_list.len);
+
+    var home_akick: [4]AkickInfo = undefined;
+    var peer_akick: [4]AkickInfo = undefined;
+    const home_kicks = try home.channelAkickList("#room", "alice", &home_akick);
+    const peer_kicks = try peer.channelAkickList("#room", "alice", &peer_akick);
+    try std.testing.expect(akickListsMatch(home_kicks, peer_kicks));
+    try std.testing.expectEqual(@as(usize, 1), peer_kicks.len);
+
+    var drifted_home = try openTestStore(tmp, "gap-a9-drift-home.wal");
+    defer drifted_home.deinit();
+    var drifted_peer = try openTestStore(tmp, "gap-a9-drift-peer.wal");
+    defer drifted_peer.deinit();
+    var left = Services.initWithConfig(&drifted_home, null, fast);
+    var right = Services.initWithConfig(&drifted_peer, null, fast);
+    _ = try left.registerAccount("carol", "left-side passphrase", &scratch);
+    _ = try right.registerAccount("carol", "right-side passphrase", &scratch);
+    const left_before = try std.testing.allocator.dupe(u8, drifted_home.family(.accounts).get("carol").?);
+    defer std.testing.allocator.free(left_before);
+    const right_before = try std.testing.allocator.dupe(u8, drifted_peer.family(.accounts).get("carol").?);
+    defer std.testing.allocator.free(right_before);
+
+    try std.testing.expectError(error.DirectoryDisagreement, left.reconcileDirectory(&right));
+    try std.testing.expectEqualStrings(left_before, drifted_home.family(.accounts).get("carol").?);
+    try std.testing.expectEqualStrings(right_before, drifted_peer.family(.accounts).get("carol").?);
+    switch (try left.identifyAccount("carol", "left-side passphrase")) {
+        .identified => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (try right.identifyAccount("carol", "right-side passphrase")) {
+        .identified => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.AuthFailed, right.identifyAccount("carol", "left-side passphrase"));
 }
 
 test "S6C5 Services malformed expected is invalid_work without state access" {
