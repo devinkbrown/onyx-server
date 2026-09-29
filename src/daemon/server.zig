@@ -309,7 +309,9 @@ fn bridgeOnRtpFrame(ctx: *anyopaque, channel: []const u8, rtp: []const u8, keyfr
     defer self.media_bridges_mu.unlock();
     const br = self.media_bridges.getPtr(channel) orelse return;
     var sctx = BridgeSendCtx{ .server = self, .channel = channel };
+    const started_at_ms = self.nowMs();
     br.fanoutWebrtcToNative(rtp, keyframe_hint, &sctx, bridgeSendToNative);
+    self.recordElapsedLatency(.media_relay, started_at_ms);
 }
 
 /// Cross-leg sink invoked by the WebRTC relay for RTCP feedback: translate
@@ -3948,6 +3950,9 @@ pub const LinuxServer = struct {
     /// Observability: allocation-free runtime counters (totals + gauges), bumped
     /// inline on the hot path and rendered on demand (STATS z / Prometheus).
     stats: server_stats.Stats = .{},
+    /// Four bounded latency series. Each live reactor records in its own slot;
+    /// reactor 0 merges the slots for the published /metrics snapshot.
+    latency_stats: server_stats.LatencyStats,
     /// Per-command dispatch counters backing `STATS m` (RPL_STATSCOMMANDS, 212).
     /// Bumped once per complete line on the dispatch path; lock-free for verbs
     /// already seen.
@@ -4093,7 +4098,7 @@ pub const LinuxServer = struct {
     partition_components: usize = 1,
     /// Per-S2S-peer link health (EWMA RTT, byte counters, state timestamps),
     /// keyed by remote server name, surfaced in the MESH peer table.
-    peer_health: link_health_mod.Registry = .{},
+    peer_health: link_health_mod.Registry,
     /// Monotonic ms of the last mesh RTT probe sweep (reactor 0).
     last_peer_rtt_probe_ms: i64 = 0,
     /// Recently-emitted synthetic oper-prefix (+Y/-Y) announcements, for
@@ -4266,6 +4271,19 @@ pub const LinuxServer = struct {
     /// the `rx()` fallback. docs/audit/timer-guard-0.7.md P0-TG-4.
     fn isMaintenanceReactor(self: *const LinuxServer) bool {
         return current_reactor == &self.reactors[0];
+    }
+
+    fn latencyReactorIndex() usize {
+        return if (current_reactor) |reactor| reactor.shard_id else 0;
+    }
+
+    fn recordElapsedLatency(
+        self: *LinuxServer,
+        series: server_stats.LatencyStats.Series,
+        started_at_ms: i64,
+    ) void {
+        const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), self.nowMs() - started_at_ms));
+        self.latency_stats.record(series, latencyReactorIndex(), elapsed_ms *| 1000);
     }
 
     /// Effective worker-reactor count, clamped to `[1, max_shards]`. Multi-reactor
@@ -4649,6 +4667,9 @@ pub const LinuxServer = struct {
             .max_headlines = @intCast(@min(config.news_count, 5)),
         });
 
+        var latency_stats = try server_stats.LatencyStats.init(allocator, reactors.len);
+        errdefer latency_stats.deinit();
+
         self.* = .{
             .allocator = allocator,
             .config = config,
@@ -4750,6 +4771,8 @@ pub const LinuxServer = struct {
             // secure_fns/getrandom) so ids are opaque and disjoint across boots.
             .msgid_gen = msgid_mod.Generator.init(secure_fns.randomU64()),
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
+            .latency_stats = latency_stats,
+            .peer_health = link_health_mod.Registry.init(allocator),
             .metrics_snapshot = metrics_http.MetricsSnapshot.init(allocator),
             .sessions = sessions_mod.SessionStore.initWithConfig(allocator, .{
                 .max_accounts = @intCast(config.session_max_accounts),
@@ -4923,8 +4946,11 @@ pub const LinuxServer = struct {
     fn refreshMetricsSnapshot(self: *LinuxServer) void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
+        if (self.isMaintenanceReactor()) self.latency_stats.mergeShards();
         self.stats.writePrometheus(self.allocator, &out) catch return;
+        self.latency_stats.writePrometheus(self.allocator, &out) catch return;
         self.writeNodeHealthPrometheus(self.allocator, &out) catch return;
+        self.peer_health.writePrometheus(self.allocator, &out) catch return;
         self.writeE2eeGroupPrometheus(self.allocator, &out) catch return;
         self.metrics_snapshot.set(out.items) catch return;
     }
@@ -5859,6 +5885,10 @@ pub const LinuxServer = struct {
         // Join any worker threads (no-op if runThreaded already joined), then tear
         // down each reactor's ring/table/wake/listeners and free the slice + fabric.
         self.pool.deinit();
+        // Media pumps are already stopped above, and reactor producers are now
+        // joined, so no recorder can access a histogram after this point.
+        self.latency_stats.deinit();
+        self.peer_health.deinit();
         for (self.reactors) |*reactor| reactor.deinit();
         self.allocator.free(self.reactors);
         if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
@@ -6379,7 +6409,13 @@ pub const LinuxServer = struct {
                 slot.value.session_replica_resync_burst_pending = true;
                 continue;
             }
-            _ = self.sendMeshStateBurstTo(&slot.value);
+            const peer_name = establishedPeerName(&slot.value);
+            if (peer_name) |name| {
+                if (self.peer_health.get(name)) |h| h.value_sync = .syncing;
+            }
+            if (self.sendMeshStateBurstTo(&slot.value)) {
+                if (peer_name) |name| self.notePeerAntiEntropy(name);
+            }
         }
     }
 
@@ -6876,8 +6912,7 @@ pub const LinuxServer = struct {
     fn currentNodeHealth(self: *LinuxServer) stats_report.NodeHealth {
         var peers_total: u32 = 0;
         var peers_up: u32 = 0;
-        for (&self.peer_health.slots) |*slot| {
-            if (!slot.used) continue;
+        for (self.peer_health.entries.items) |*slot| {
             peers_total += 1;
             if (slot.health.state == .established) peers_up += 1;
         }
@@ -7062,8 +7097,7 @@ pub const LinuxServer = struct {
 
         w.writeAll(",\"peers\":[") catch return w.buffered();
         var first = true;
-        for (&self.peer_health.slots) |*slot| {
-            if (!slot.used) continue;
+        for (self.peer_health.entries.items) |*slot| {
             const h = &slot.health;
             if (!first) w.writeAll(",") catch return w.buffered();
             first = false;
@@ -8969,6 +9003,7 @@ pub const LinuxServer = struct {
         if (link.established()) {
             self.accountPeerBytes(link.remoteName(), bytes.len, out_len);
             self.syncPeerRtt(link.remoteName(), link.lastRttMs());
+            self.notePeerSendBacklog(link.remoteName(), connSendBacklog(conn));
         }
         // Apply signed session authority BEFORE user-message delivery. OFFER and
         // the first MESSAGE can share one socket read; draining the frame-family
@@ -9186,6 +9221,7 @@ pub const LinuxServer = struct {
         if (link.established()) {
             self.accountPeerBytes(link.remoteName(), bytes.len, out.len);
             self.syncPeerRtt(link.remoteName(), link.lastRttMs());
+            self.notePeerSendBacklog(link.remoteName(), connSendBacklog(conn));
         }
         // Drain inbound cross-node user messages and deliver to local clients.
         if (link.takeInbound()) |inbound| {
@@ -9221,6 +9257,7 @@ pub const LinuxServer = struct {
         if (!conn.s2s_burst_done and link.established()) {
             if (self.sendMeshStateBurstTo(conn)) {
                 conn.s2s_burst_done = true;
+                self.notePeerAntiEntropy(link.remoteName());
             }
         }
     }
@@ -9251,7 +9288,7 @@ pub const LinuxServer = struct {
                 return;
             };
             link.clearOutbound();
-            _ = self.sendMeshStateBurstTo(conn);
+            if (self.sendMeshStateBurstTo(conn)) self.notePeerAntiEntropy(link.remoteName());
         }
     }
 
@@ -9512,6 +9549,7 @@ pub const LinuxServer = struct {
                     // false-trip an idle disconnect.
                     conn.last_activity_ms = self.nowMs();
                     conn.awaiting_pong = false;
+                    if (establishedPeerName(conn)) |peer_name| self.notePeerStillHere(peer_name, 0);
                     self.stats.onBytesIn(pt.len);
                     if (!try self.driveClientBytes(id, conn, pt)) return .freed;
                     survived = true;
@@ -9621,6 +9659,8 @@ pub const LinuxServer = struct {
             // clear a pending ping-timeout (the client answered, PONG or not).
             conn.last_activity_ms = self.nowMs();
             conn.awaiting_pong = false;
+            // Inbound bytes are presence. The peer's hybrid logical clock is not read.
+            if (establishedPeerName(conn)) |peer_name| self.notePeerStillHere(peer_name, 0);
             if (conn.proxy_pending) {
                 if (!try self.driveProxyHeader(id, conn, chunk)) return;
             } else {
@@ -13734,6 +13774,8 @@ pub const LinuxServer = struct {
     /// decrypted plaintext into the normal line parser. A handshake/record fault
     /// closes only this connection.
     fn driveTls(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, chunk: []const u8) !void {
+        const handshake_pending = !conn.tls.?.handshakeDone();
+        const started_at_ms = self.nowMs();
         const outcome = conn.tls.?.onInbound(chunk) catch |err| {
             // RFC 8446 §6: send a fatal alert so the peer learns WHY the handshake
             // failed instead of seeing a bare reset. `takeAlert` returns a plaintext
@@ -13747,6 +13789,9 @@ pub const LinuxServer = struct {
             conn.closing = true;
             return;
         };
+        if (handshake_pending and conn.tls.?.handshakeDone()) {
+            self.recordElapsedLatency(.tls_handshake, started_at_ms);
+        }
         // Once the mTLS handshake completes, bind the presented client cert's
         // fingerprint to the session so SASL EXTERNAL can match it to an account.
         if (conn.session.tls_certfp == null and conn.tls.?.handshakeDone()) {
@@ -49181,8 +49226,7 @@ pub const LinuxServer = struct {
         const public_activity = self.chanstats.publicSummary(platform.realtimeMillis());
         var peers_total: u32 = 0;
         var peers_up: u32 = 0;
-        for (&self.peer_health.slots) |*slot| {
-            if (!slot.used) continue;
+        for (self.peer_health.entries.items) |*slot| {
             peers_total += 1;
             if (slot.health.state == .established) peers_up += 1;
         }
@@ -49542,6 +49586,37 @@ pub const LinuxServer = struct {
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         const h = self.peer_health.upsert(name, now) catch return;
         h.transition(state, now);
+        if (state == .down) h.partitioned = false;
+    }
+
+    /// Bytes waiting in this connection's SendQ. Inline tail plus overflow.
+    fn connSendBacklog(conn: *const ConnState) u64 {
+        const inline_queued = conn.send_len -| conn.send_offset;
+        return std.math.add(u64, inline_queued, conn.send_overflow.items.len) catch std.math.maxInt(u64);
+    }
+
+    /// Record that `name` is still reachable. `peer_hlc` is ignored: an older
+    /// hybrid logical clock must not freeze the local activity stamp.
+    fn notePeerStillHere(self: *LinuxServer, name: []const u8, peer_hlc: u64) void {
+        if (name.len == 0) return;
+        const h = self.peer_health.get(name) orelse return;
+        h.noteStillHere(self.nowU64(), peer_hlc);
+    }
+
+    fn notePeerSendBacklog(self: *LinuxServer, name: []const u8, bytes: u64) void {
+        if (name.len == 0) return;
+        const h = self.peer_health.get(name) orelse return;
+        h.noteSendBacklog(bytes);
+    }
+
+    /// Stamp the last finished anti-entropy round and mark value-sync complete.
+    /// Value-sync stays its own field from Ripple suspicion.
+    fn notePeerAntiEntropy(self: *LinuxServer, name: []const u8) void {
+        if (name.len == 0) return;
+        const now = self.nowU64();
+        const h = self.peer_health.upsert(name, now) catch return;
+        h.noteAntiEntropy(now);
+        h.value_sync = .synced;
     }
 
     /// Account inbound/outbound bytes for a peer link (best-effort), feeding the
@@ -49557,6 +49632,7 @@ pub const LinuxServer = struct {
     /// Fold a live mesh RTT sample into the peer health table (status.json / MESH).
     fn syncPeerRtt(self: *LinuxServer, name: []const u8, rtt_ms: ?u32) void {
         const sample = rtt_ms orelse return;
+        self.latency_stats.record(.mooring_rtt, latencyReactorIndex(), @as(u64, sample) * 1000);
         if (name.len == 0) return;
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         const h = self.peer_health.get(name) orelse return;
@@ -49629,6 +49705,7 @@ pub const LinuxServer = struct {
                 std.debug.assert(slot.value.s2s_probe_pending_bytes == 0);
                 std.debug.assert(slot.value.awaiting_pong);
                 self.syncPeerRtt(link.remoteName(), link.lastRttMs());
+                self.notePeerSendBacklog(link.remoteName(), connSendBacklog(&slot.value));
             } else if (slot.value.s2s) |link| {
                 if (!link.established()) continue;
                 link.probeRtt(now_u) catch continue;
@@ -49640,6 +49717,7 @@ pub const LinuxServer = struct {
                 slot.value.awaiting_pong = true;
                 slot.value.ping_sent_ms = now;
                 self.syncPeerRtt(link.remoteName(), link.lastRttMs());
+                self.notePeerSendBacklog(link.remoteName(), connSendBacklog(&slot.value));
             }
         }
     }
@@ -49824,11 +49902,10 @@ pub const LinuxServer = struct {
             return;
         }
 
-        var peers: [64]mesh_report.PeerLink = undefined;
-        var npeer: usize = 0;
+        var peers: std.ArrayList(mesh_report.PeerLink) = .empty;
+        defer peers.deinit(self.allocator);
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
-            if (npeer == peers.len) break;
             const c = entry.value;
             // Reflect both plaintext and secured S2S links as mesh peers.
             var name: []const u8 = "";
@@ -49841,6 +49918,7 @@ pub const LinuxServer = struct {
                 established = link.established();
             } else continue;
             if (name.len == 0) continue;
+            self.notePeerSendBacklog(name, connSendBacklog(c));
             var peer = mesh_report.PeerLink{
                 .name = name,
                 .state = if (established) .established else .handshaking,
@@ -49855,12 +49933,11 @@ pub const LinuxServer = struct {
                 const now_unix = @divTrunc(platform.realtimeMillis(), 1000);
                 peer.since_unix = now_unix - @as(i64, @intCast(h.since(now) / 1000));
             }
-            peers[npeer] = peer;
-            npeer += 1;
+            try peers.append(self.allocator, peer);
         }
 
         var established_peers: u32 = 0;
-        for (peers[0..npeer]) |p| {
+        for (peers.items) |p| {
             if (p.state == .established) established_peers += 1;
         }
 
@@ -49884,19 +49961,20 @@ pub const LinuxServer = struct {
 
         const snap = mesh_report.MeshSnapshot{
             .local_node = protocol_inventory.currentServerName(),
-            .peers = peers[0..npeer],
+            .peers = peers.items,
             .reachable_nodes = reachable_nodes,
             .partitioned_nodes = partitioned_nodes,
         };
 
-        var body_buf: [4096]u8 = undefined;
-        var w = std.Io.Writer.fixed(&body_buf);
-        mesh_report.renderMesh(snap, &w) catch {};
-        var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            try self.noticeTo(conn, line);
-        }
+        var body = std.Io.Writer.Allocating.init(self.allocator);
+        defer body.deinit();
+        mesh_report.renderMesh(snap, &body.writer) catch {};
+        try self.noticeBody(conn, body.writer.buffered());
+
+        var facts: std.ArrayList(u8) = .empty;
+        defer facts.deinit(self.allocator);
+        try self.peer_health.writeOperView(self.allocator, &facts);
+        try self.noticeBody(conn, facts.items);
 
         // Split-brain summary: a strict majority of known nodes reachable from
         // here holds quorum (reachable > partitioned). Operators read this to
@@ -49914,50 +49992,43 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, summary);
     }
 
-    /// Collect this node's established S2S peer names into `out`, returning the
-    /// count. Shared by ROUTE and NETHEALTH so they reflect the same live view.
-    fn collectPeers(self: *LinuxServer, out: [][]const u8) usize {
-        var n: usize = 0;
+    fn noticeBody(self: *LinuxServer, conn: *ConnState, text: []const u8) !void {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try self.noticeTo(conn, line);
+        }
+    }
+
+    /// Append this node's established S2S peer names. Shared by ROUTE and
+    /// NETHEALTH so they reflect the same live view. The list grows with the
+    /// number of peers.
+    fn collectPeerNames(self: *LinuxServer, out: *std.ArrayList([]const u8)) !void {
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
-            if (n == out.len) break;
-            const c = entry.value;
-            var name: []const u8 = "";
-            var established = false;
-            if (c.s2s) |l| {
-                name = l.remoteName();
-                established = l.established();
-            } else if (c.s2s_secured) |l| {
-                name = l.remoteName();
-                established = l.established();
-            } else continue;
-            if (!established or name.len == 0) continue;
-            out[n] = name;
-            n += 1;
+            const name = establishedPeerName(entry.value) orelse continue;
+            try out.append(self.allocator, name);
         }
-        return n;
     }
 
     /// ROUTE — oper view of the mesh routing table: this node (distance 0) plus a
     /// one-hop route to every established peer. Rendered by the pure route_report
     /// renderer. Multi-hop routes light up when the route table substrate lands.
     pub fn handleRoute(self: *LinuxServer, conn: *ConnState) !void {
-        var names: [64][]const u8 = undefined;
-        const np = self.collectPeers(&names);
-        var routes: [65]route_report.RouteEntry = undefined;
-        routes[0] = .{ .dest = protocol_inventory.currentServerName(), .next_hop = "", .distance = 0, .reachable = true };
-        for (names[0..np], 0..) |name, i| {
-            routes[i + 1] = .{ .dest = name, .next_hop = name, .distance = 1, .reachable = true };
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(self.allocator);
+        try self.collectPeerNames(&names);
+        var routes: std.ArrayList(route_report.RouteEntry) = .empty;
+        defer routes.deinit(self.allocator);
+        try routes.append(self.allocator, .{ .dest = protocol_inventory.currentServerName(), .next_hop = "", .distance = 0, .reachable = true });
+        for (names.items) |name| {
+            try routes.append(self.allocator, .{ .dest = name, .next_hop = name, .distance = 1, .reachable = true });
         }
-        const snap = route_report.RouteSnapshot{ .local_node = protocol_inventory.currentServerName(), .routes = routes[0 .. np + 1] };
-        var body_buf: [4096]u8 = undefined;
-        var w = std.Io.Writer.fixed(&body_buf);
-        route_report.renderRoutes(snap, &w) catch {};
-        var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            try self.noticeTo(conn, line);
-        }
+        const snap = route_report.RouteSnapshot{ .local_node = protocol_inventory.currentServerName(), .routes = routes.items };
+        var body = std.Io.Writer.Allocating.init(self.allocator);
+        defer body.deinit();
+        route_report.renderRoutes(snap, &body.writer) catch {};
+        try self.noticeBody(conn, body.writer.buffered());
     }
 
     /// NETHEALTH — this node plus each established peer, marked alive, with link
@@ -49966,28 +50037,26 @@ pub const LinuxServer = struct {
     /// ping timeout, and `witness_quorum` cannot bury a pair.
     pub fn handleNethealth(self: *LinuxServer, conn: *ConnState) !void {
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-        var names: [63][]const u8 = undefined;
-        const np = self.collectPeers(&names);
-        var nodes: [64]ripple_report.NodeStatus = undefined;
-        nodes[0] = .{ .node = protocol_inventory.currentServerName(), .health = .alive, .last_ack_ms_ago = 0 };
-        for (names[0..np], 0..) |name, i| {
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(self.allocator);
+        try self.collectPeerNames(&names);
+        var nodes: std.ArrayList(ripple_report.NodeStatus) = .empty;
+        defer nodes.deinit(self.allocator);
+        try nodes.append(self.allocator, .{ .node = protocol_inventory.currentServerName(), .health = .alive, .last_ack_ms_ago = 0 });
+        for (names.items) |name| {
             var rtt: u32 = 0;
             var idle: u64 = 0;
             if (self.peer_health.get(name)) |h| {
                 rtt = h.snapshotRtt();
                 idle = h.idleMs(now);
             }
-            nodes[i + 1] = .{ .node = name, .health = .alive, .last_ack_ms_ago = idle, .rtt_ms = rtt };
+            try nodes.append(self.allocator, .{ .node = name, .health = .alive, .last_ack_ms_ago = idle, .rtt_ms = rtt });
         }
-        const snap = ripple_report.HealthSnapshot{ .local_node = protocol_inventory.currentServerName(), .nodes = nodes[0 .. np + 1] };
-        var body_buf: [4096]u8 = undefined;
-        var w = std.Io.Writer.fixed(&body_buf);
-        ripple_report.renderHealth(snap, &w) catch {};
-        var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            try self.noticeTo(conn, line);
-        }
+        const snap = ripple_report.HealthSnapshot{ .local_node = protocol_inventory.currentServerName(), .nodes = nodes.items };
+        var body = std.Io.Writer.Allocating.init(self.allocator);
+        defer body.deinit();
+        ripple_report.renderHealth(snap, &body.writer) catch {};
+        try self.noticeBody(conn, body.writer.buffered());
         // Quorum/partition summary from the live transition tracker (consumes the
         // persistent `partition_quorum` / `partition_components` signals so opers
         // can tell a healthy mesh from a minority island this node sits in).
@@ -51069,7 +51138,11 @@ pub const LinuxServer = struct {
                 // no mesh authority, no Lotus row, and no cross-node flood.
                 var held_time_buf: [40]u8 = undefined;
                 const held_tags = MsgTags{ .time_value = serverTimeValueAt(&held_time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
-                try self.broadcastChannelMinRank(chan, held_tags, eff_msg, id, 2, .ordinary);
+                const fanout_started_at_ms = if (!is_notice) self.nowMs() else 0;
+                {
+                    defer if (!is_notice) self.recordElapsedLatency(.privmsg_fanout, fanout_started_at_ms);
+                    try self.broadcastChannelMinRank(chan, held_tags, eff_msg, id, 2, .ordinary);
+                }
                 self.publishModerationHeld(chan, conn, eff_text);
                 return;
             }
@@ -51138,23 +51211,27 @@ pub const LinuxServer = struct {
                 .ordinary;
             var time_buf: [40]u8 = undefined;
             const ctags = MsgTags{ .time_value = serverTimeValueAt(&time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
-            if (min_rank == 0) {
-                try self.broadcastChannelTagged(
-                    chan,
-                    ctags,
-                    eff_msg,
-                    id,
-                    delivery_mode,
-                );
-            } else {
-                try self.broadcastChannelMinRank(
-                    chan,
-                    ctags,
-                    eff_msg,
-                    id,
-                    min_rank,
-                    delivery_mode,
-                );
+            const fanout_started_at_ms = if (!is_notice) self.nowMs() else 0;
+            {
+                defer if (!is_notice) self.recordElapsedLatency(.privmsg_fanout, fanout_started_at_ms);
+                if (min_rank == 0) {
+                    try self.broadcastChannelTagged(
+                        chan,
+                        ctags,
+                        eff_msg,
+                        id,
+                        delivery_mode,
+                    );
+                } else {
+                    try self.broadcastChannelMinRank(
+                        chan,
+                        ctags,
+                        eff_msg,
+                        id,
+                        min_rank,
+                        delivery_mode,
+                    );
+                }
             }
             if (echo) try self.deliverTaggedMode(
                 id,
@@ -72534,7 +72611,7 @@ test "prometheus export includes mesh health and E2EEGROUP drain gauges" {
         server.partition_components = 2;
 
         server.refreshMetricsSnapshot();
-        var buf: [8192]u8 = undefined;
+        var buf: [65536]u8 = undefined;
         const text = try server.metrics_snapshot.copyInto(&buf);
         try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE onyx_mesh_quorum gauge") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "onyx_mesh_quorum 0") != null);
@@ -72551,6 +72628,149 @@ test "prometheus export includes mesh health and E2EEGROUP drain gauges" {
         try std.testing.expect(std.mem.indexOf(u8, text, "onyx_e2ee_group_ingress_receipts 0") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "onyx_e2ee_group_pending 0") != null);
     } else return error.SkipZigTest;
+}
+
+test "GAP-O1 merges reactor latency samples once into the metrics snapshot" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const previous_reactor = current_reactor;
+    defer current_reactor = previous_reactor;
+
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        current_reactor = null;
+        server.deinit();
+        allocator.destroy(server);
+    }
+    try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
+
+    current_reactor = &server.reactors[0];
+    server.latency_stats.record(.tls_handshake, LinuxServer.latencyReactorIndex(), 100);
+    current_reactor = &server.reactors[1];
+    server.latency_stats.record(.tls_handshake, LinuxServer.latencyReactorIndex(), 500);
+
+    const buf = try allocator.alloc(u8, 65_536);
+    defer allocator.free(buf);
+    current_reactor = &server.reactors[0];
+    server.refreshMetricsSnapshot();
+    var metrics_text = try server.metrics_snapshot.copyInto(buf);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_text, "onyx_tls_handshake_us_count 2\n") != null);
+
+    current_reactor = &server.reactors[1];
+    server.refreshMetricsSnapshot();
+    metrics_text = try server.metrics_snapshot.copyInto(buf);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_text, "onyx_tls_handshake_us_count 2\n") != null);
+
+    current_reactor = &server.reactors[0];
+    server.latency_stats.record(.tls_handshake, LinuxServer.latencyReactorIndex(), 1000);
+    server.refreshMetricsSnapshot();
+    metrics_text = try server.metrics_snapshot.copyInto(buf);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_text, "onyx_tls_handshake_us_count 3\n") != null);
+}
+
+test "GAP-O2 MESH and metrics expose peer rtt backlog anti-entropy and partitioned versus down" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+
+    server.markPeerHealth("slow.peer", .established);
+    server.markPeerHealth("split.peer", .established);
+    server.markPeerHealth("gone.peer", .established);
+    const gone = server.peer_health.get("gone.peer").?;
+    gone.partitioned = true;
+    server.markPeerHealth("gone.peer", .down);
+    try std.testing.expect(server.peer_health.get("gone.peer").?.isDown());
+    try std.testing.expect(!server.peer_health.get("gone.peer").?.partitioned);
+
+    server.syncPeerRtt("slow.peer", 800);
+    server.notePeerSendBacklog("slow.peer", 4096);
+    server.notePeerAntiEntropy("slow.peer");
+    const slow = server.peer_health.get("slow.peer").?;
+    slow.ripple = .suspect;
+    slow.value_sync = .syncing;
+    slow.partitioned = false;
+    const split = server.peer_health.get("split.peer").?;
+    split.partitioned = true;
+
+    slow.last_activity_ms = 1;
+    server.notePeerStillHere("slow.peer", 0);
+    try std.testing.expectEqual(server.nowU64(), slow.last_activity_ms);
+    slow.last_activity_ms = 1;
+    server.notePeerStillHere("slow.peer", std.math.maxInt(u64));
+    try std.testing.expectEqual(server.nowU64(), slow.last_activity_ms);
+    try std.testing.expect(slow.idleMs(server.nowU64()) == 0);
+    const anti_entropy_ms = slow.last_anti_entropy_ms orelse 0;
+    try std.testing.expectEqual(server.nowU64(), anti_entropy_ms);
+
+    var extra: usize = 0;
+    while (extra < 80) : (extra += 1) {
+        var name_buf: [8]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "p{d:0>3}", .{extra}) catch unreachable;
+        server.markPeerHealth(name, .established);
+    }
+
+    server.refreshMetricsSnapshot();
+    const metrics_buf = try allocator.alloc(u8, 512 * 1024);
+    defer allocator.free(metrics_buf);
+    const metrics = try server.metrics_snapshot.copyInto(metrics_buf);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "onyx_peer_rtt_ms{peer=\"slow.peer\"} 800\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "onyx_peer_send_backlog_bytes{peer=\"slow.peer\"} 4096\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "onyx_peer_partitioned{peer=\"slow.peer\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "onyx_peer_down{peer=\"slow.peer\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "onyx_peer_partitioned{peer=\"split.peer\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "onyx_peer_down{peer=\"split.peer\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "onyx_peer_partitioned{peer=\"gone.peer\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "onyx_peer_down{peer=\"gone.peer\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "onyx_peer_ripple_suspicion{peer=\"slow.peer\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "onyx_peer_value_sync{peer=\"slow.peer\"} 1\n") != null);
+    var anti_line_buf: [96]u8 = undefined;
+    const anti_line = std.fmt.bufPrint(&anti_line_buf, "onyx_peer_last_anti_entropy_ms{{peer=\"slow.peer\"}} {d}\n", .{anti_entropy_ms}) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, metrics, anti_line) != null);
+
+    var peer_rows: usize = 0;
+    var rest = metrics;
+    const row_needle = "onyx_peer_rtt_ms{peer=\"p";
+    while (std.mem.indexOf(u8, rest, row_needle)) |at| {
+        peer_rows += 1;
+        rest = rest[at + row_needle.len ..];
+    }
+    try std.testing.expectEqual(@as(usize, 80), peer_rows);
+
+    var oper = ConnState.init(-1);
+    oper.overflow_allocator = allocator;
+    oper.sendq_cap = 1 << 20;
+    defer if (oper.send_overflow.capacity > 0) oper.send_overflow.deinit(allocator);
+    const parsed = try irc_line.parseLine("MESH");
+    try server.handleMesh(&oper, &parsed);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(allocator);
+    try got.appendSlice(allocator, oper.send_buf[oper.send_offset..oper.send_len]);
+    try got.appendSlice(allocator, oper.send_overflow.items);
+    const body = got.items;
+    try std.testing.expect(std.mem.indexOf(u8, body, "peer=slow.peer rtt_ms=800 send_backlog=4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "partitioned=0 down=0 ripple=suspect value_sync=syncing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "peer=split.peer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "peer=gone.peer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "peer=p000 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "peer=p079 ") != null);
+    std.debug.print("GAP-O2 branch=peer rtt backlog anti-entropy partitioned-vs-down; hlc does not gate liveness\n", .{});
 }
 
 test "oper-prefix dedup: collapses repeat +Y within the window, allows real transitions" {

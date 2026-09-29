@@ -11,6 +11,173 @@
 //! These complement the structured `qlog`/`trace` flight recorder (which keeps
 //! the last N *events*); this keeps monotonic *totals* and a couple of gauges.
 const std = @import("std");
+const HdrHistogram = @import("../substrate/hdr_histogram.zig").HdrHistogram;
+
+fn lockSpin(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.Thread.yield() catch {};
+}
+
+/// Four fixed, unlabeled latency series. Each reactor owns one recording slot.
+pub const LatencyStats = struct {
+    pub const Series = enum(u2) {
+        tls_handshake,
+        privmsg_fanout,
+        mooring_rtt,
+        media_relay,
+    };
+
+    const series_count = 4;
+    const bounds = [_]u64{ 100, 500, 1000, 5000, 10000, 50000, 100000 };
+    const names = [_][]const u8{
+        "onyx_tls_handshake_us",
+        "onyx_privmsg_fanout_us",
+        "onyx_mooring_rtt_us",
+        "onyx_media_relay_us",
+    };
+    const config = @import("../substrate/hdr_histogram.zig").Config{
+        .significant_figures = 2,
+        .max_trackable_value = 60_000_000,
+    };
+
+    const Slot = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        histograms: [series_count]HdrHistogram,
+        exact_sums: [series_count]u128 = .{ 0, 0, 0, 0 },
+        boundary_corrections: [series_count][bounds.len]u64 = std.mem.zeroes([series_count][bounds.len]u64),
+    };
+
+    allocator: std.mem.Allocator,
+    published: Slot,
+    reactors: []Slot,
+
+    pub fn init(allocator: std.mem.Allocator, reactor_count: usize) !LatencyStats {
+        var published: Slot = undefined;
+        var ready: usize = 0;
+        errdefer for (published.histograms[0..ready]) |*hist| hist.deinit();
+        for (&published.histograms) |*hist| {
+            hist.* = try HdrHistogram.init(allocator, config);
+            ready += 1;
+        }
+        published.exact_sums = .{ 0, 0, 0, 0 };
+        published.boundary_corrections = std.mem.zeroes(@TypeOf(published.boundary_corrections));
+        published.mutex = .unlocked;
+
+        const reactors = try allocator.alloc(Slot, reactor_count);
+        errdefer allocator.free(reactors);
+        var initialized: usize = 0;
+        errdefer {
+            for (reactors[0..initialized]) |*slot| {
+                for (&slot.histograms) |*hist| hist.deinit();
+            }
+        }
+        for (reactors) |*slot| {
+            var slot_ready: usize = 0;
+            errdefer for (slot.histograms[0..slot_ready]) |*hist| hist.deinit();
+            for (&slot.histograms) |*hist| {
+                hist.* = try HdrHistogram.init(allocator, config);
+                slot_ready += 1;
+            }
+            slot.exact_sums = .{ 0, 0, 0, 0 };
+            slot.boundary_corrections = std.mem.zeroes(@TypeOf(slot.boundary_corrections));
+            slot.mutex = .unlocked;
+            initialized += 1;
+        }
+        return .{ .allocator = allocator, .published = published, .reactors = reactors };
+    }
+
+    pub fn deinit(self: *LatencyStats) void {
+        for (&self.published.histograms) |*hist| hist.deinit();
+        for (self.reactors) |*slot| {
+            for (&slot.histograms) |*hist| hist.deinit();
+        }
+        self.allocator.free(self.reactors);
+    }
+
+    /// Recording is allocation-free. The caller must use its owning reactor index.
+    pub fn record(self: *LatencyStats, series: Series, reactor_index: usize, value_us: u64) void {
+        const idx = @intFromEnum(series);
+        const slot = &self.reactors[reactor_index];
+        lockSpin(&slot.mutex);
+        defer slot.mutex.unlock();
+        slot.histograms[idx].recordValue(value_us);
+        slot.exact_sums[idx] += value_us;
+        // HDR buckets can straddle a fixed Prometheus `le` boundary. Retain
+        // the count on the included side so cumulative buckets stay exact.
+        const sample = @max(@as(u64, 1), value_us);
+        const magnitude = slot.histograms[idx].sub_bucket_half_count_magnitude;
+        const bits_needed: u32 = 64 - @clz(sample);
+        const bucket: u32 = if (bits_needed <= magnitude + 1) 0 else bits_needed - magnitude - 1;
+        const width = @as(u64, 1) << @as(u6, @intCast(bucket));
+        const lower = (sample / width) * width;
+        for (bounds, 0..) |bound, bound_idx| {
+            if (sample <= bound and lower + width - 1 > bound) {
+                slot.boundary_corrections[idx][bound_idx] += 1;
+            }
+        }
+    }
+
+    /// Only reactor 0 may call this. Slot locks protect concurrent recorders.
+    pub fn mergeShards(self: *LatencyStats) void {
+        lockSpin(&self.published.mutex);
+        defer self.published.mutex.unlock();
+        for (self.reactors) |*slot| {
+            {
+                lockSpin(&slot.mutex);
+                defer slot.mutex.unlock();
+                for (0..series_count) |idx| {
+                    self.published.histograms[idx].merge(slot.histograms[idx]) catch unreachable;
+                    slot.histograms[idx].reset();
+                    self.published.exact_sums[idx] += slot.exact_sums[idx];
+                    slot.exact_sums[idx] = 0;
+                    for (0..bounds.len) |bound_idx| {
+                        self.published.boundary_corrections[idx][bound_idx] += slot.boundary_corrections[idx][bound_idx];
+                        slot.boundary_corrections[idx][bound_idx] = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn writePrometheus(self: *const LatencyStats, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        const published = @constCast(&self.published);
+        lockSpin(&published.mutex);
+        defer published.mutex.unlock();
+        for (names, 0..) |name, idx| {
+            const hist = self.published.histograms[idx];
+            try out.print(allocator, "# HELP {s} Observed latency in microseconds\n", .{name});
+            try out.print(allocator, "# TYPE {s} histogram\n", .{name});
+            for (bounds, 0..) |bound, bound_idx| {
+                try out.print(allocator, "{s}_bucket{{le=\"{d}\"}} {d}\n", .{ name, bound, cumulativeCount(hist, bound) + self.published.boundary_corrections[idx][bound_idx] });
+            }
+            try out.print(allocator, "{s}_bucket{{le=\"+Inf\"}} {d}\n", .{ name, hist.totalCount() });
+            try out.print(allocator, "{s}_count {d}\n", .{ name, hist.totalCount() });
+            try out.print(allocator, "{s}_sum {d}\n", .{ name, self.published.exact_sums[idx] });
+        }
+    }
+
+    /// Count buckets wholly below the boundary; exact straddling counts are
+    /// added from the bounded correction counters recorded with each sample.
+    fn cumulativeCount(hist: HdrHistogram, bound: u64) u64 {
+        var count: u64 = 0;
+        for (hist.counts, 0..) |n, index| {
+            if (n == 0) continue;
+            var lower: u64 = undefined;
+            var width: u64 = undefined;
+            if (index < hist.sub_bucket_count) {
+                lower = @intCast(index);
+                width = 1;
+            } else {
+                const relative = index - hist.sub_bucket_count;
+                const bucket = relative / hist.sub_bucket_half_count + 1;
+                const offset = relative % hist.sub_bucket_half_count;
+                width = @as(u64, 1) << @as(u6, @intCast(bucket));
+                lower = (@as(u64, hist.sub_bucket_half_count) + offset) * width;
+            }
+            if (lower + width - 1 <= bound) count += n;
+        }
+        return count;
+    }
+};
 
 /// Monotonic counters (only ever increase) plus two gauges (active connections,
 /// established S2S links) which move both ways. The server embeds one.
@@ -219,4 +386,59 @@ test "forEachLine emits one token line per metric" {
     try s.forEachLine(&c, Collector.emit);
     try testing.expectEqual(@as(usize, 10), c.count);
     try testing.expect(c.saw_conns);
+}
+
+test "GAP-O1 fixed histograms preserve counts sums and peer health" {
+    const allocator = testing.allocator;
+    var latency = try LatencyStats.init(allocator, 2);
+    defer latency.deinit();
+    latency.record(.tls_handshake, 0, 100);
+    latency.record(.tls_handshake, 0, 100_000);
+    latency.record(.privmsg_fanout, 1, 501);
+    latency.record(.mooring_rtt, 0, 1_500_000);
+    latency.record(.media_relay, 1, 1_001);
+    latency.mergeShards();
+    latency.mergeShards();
+
+    var stats = Stats{};
+    stats.onS2sEstablished();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try stats.writePrometheus(allocator, &out);
+    try latency.writePrometheus(allocator, &out);
+    try testing.expect(std.mem.indexOf(u8, out.items, "onyx_s2s_links_active 1\n") != null);
+    for ([_][]const u8{
+        "onyx_tls_handshake_us_count 2\n",
+        "onyx_tls_handshake_us_bucket{le=\"100000\"} 2\n",
+        "onyx_tls_handshake_us_sum 100100\n",
+        "onyx_privmsg_fanout_us_count 1\n",
+        "onyx_mooring_rtt_us_count 1\n",
+        "onyx_media_relay_us_count 1\n",
+        "onyx_mooring_rtt_us_sum 1500000\n",
+        "onyx_privmsg_fanout_us_sum 501\n",
+    }) |expected| try testing.expect(std.mem.indexOf(u8, out.items, expected) != null);
+
+    var bucket_lines: usize = 0;
+    var lines = std.mem.splitScalar(u8, out.items, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "_bucket{le=\"") == null) continue;
+        bucket_lines += 1;
+        var allowed = false;
+        inline for ([_][]const u8{ "100", "500", "1000", "5000", "10000", "50000", "100000", "+Inf" }) |label| {
+            const suffix = "_bucket{le=\"" ++ label ++ "\"}";
+            if (std.mem.indexOf(u8, line, suffix) != null) allowed = true;
+        }
+        try testing.expect(allowed);
+    }
+    try testing.expectEqual(@as(usize, 32), bucket_lines);
+
+    var empty = try LatencyStats.init(allocator, 1);
+    defer empty.deinit();
+    var down = Stats{};
+    var empty_out: std.ArrayList(u8) = .empty;
+    defer empty_out.deinit(allocator);
+    try down.writePrometheus(allocator, &empty_out);
+    try empty.writePrometheus(allocator, &empty_out);
+    try testing.expect(std.mem.indexOf(u8, empty_out.items, "onyx_s2s_links_active 0\n") != null);
+    try testing.expect(std.mem.indexOf(u8, empty_out.items, "onyx_mooring_rtt_us_count 0\n") != null);
 }
