@@ -89,7 +89,7 @@ fn measure(report: *Report) []const u8 {
 
     // A fresh connection must not hide heap behind the struct size.
     {
-        var probe = ConnState.init(-1);
+        const probe = ConnState.init(-1);
         if (probe.send_overflow.items.len != 0 or probe.recv_overflow.items.len != 0 or
             probe.session_list_cache.rows.items.len != 0)
             fail("fresh ConnState allocated before any fan-out");
@@ -358,12 +358,13 @@ fn appendHost(report: *Report) void {
 }
 
 fn appendUtc(report: *Report) void {
-    const now = std.time.timestamp();
-    if (now < 0) {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
+    if (ts.sec < 0) {
         report.append("unknown");
         return;
     }
-    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(now) };
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(ts.sec) };
     const year_day = epoch.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     const day_secs = epoch.getDaySeconds();
