@@ -259,6 +259,10 @@ pub fn main(init: std.process.Init) !void {
                             std.process.exit(1);
                         };
                     }
+                    if (onyx_server.daemon.config_boot.configCheckError(l.io, l.tls.ktls)) |why| {
+                        std.debug.print("config ERROR in {s}: {s}\n", .{ path, why });
+                        std.process.exit(1);
+                    }
                     if (l.ocg2.enabled) {
                         if (!onyx_server.daemon.config_boot.ocg2RuntimeModeSupported(l.ocg2.mode)) {
                             std.debug.print(
@@ -396,6 +400,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20))) |text| {
             defer allocator.free(text); // string fields are duped by the parser
             if (onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
+                if (onyx_server.daemon.config_boot.configCheckError(loaded.io, loaded.tls.ktls)) |why| {
+                    std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
+                    std.process.exit(1);
+                }
                 held = loaded;
                 // Preserve the Helix handoff fields set above: `srv_cfg = loaded.config`
                 // replaces the whole struct, and these are not config-file keys.
@@ -988,12 +996,14 @@ pub fn main(init: std.process.Init) !void {
                 // kernel offers the TLS ULP. `tx` offloads server→client encryption;
                 // `txrx` additionally offloads client→server decryption.
                 const ktls_capable = onyx_server.daemon.ktls.probeUlpSupport();
-                srv_cfg.tls_ktls_tx = (h.tls.ktls != .off and ktls_capable);
-                srv_cfg.tls_ktls_rx = (h.tls.ktls == .txrx and ktls_capable);
-                if (h.tls.ktls != .off) {
+                const ktls_offload = onyx_server.daemon.config_boot.resolveKtlsOffload(h.tls.ktls, ktls_capable);
+                srv_cfg.tls_ktls_tx = ktls_offload.tx;
+                srv_cfg.tls_ktls_rx = ktls_offload.rx;
+                if (ktls_offload.footgun) |msg| {
+                    std.debug.print("onyx-server: {s}\n", .{msg});
+                } else if (h.tls.ktls != .off) {
                     if (ktls_capable) {
-                        const dirs = if (h.tls.ktls == .txrx) "TX+RX" else "TX";
-                        std.debug.print("onyx-server: kTLS {s} offload ACTIVE ({s}) — TLS 1.3 record crypto runs in the kernel\n", .{ dirs, @tagName(h.tls.ktls) });
+                        std.debug.print("onyx-server: kTLS TX offload ACTIVE (tx) — TLS 1.3 record crypto runs in the kernel\n", .{});
                     } else {
                         std.debug.print("onyx-server: kTLS {s} requested but this kernel has no TLS ULP — TLS stays in userspace\n", .{@tagName(h.tls.ktls)});
                     }
@@ -1155,10 +1165,25 @@ pub fn main(init: std.process.Init) !void {
     if (held) |*h| {
         if (h.parsed.ocsp.enabled and h.parsed.tls.enabled and h.parsed.tls.cert_path != null) {
             if (comptime builtin.os.tag == .linux) {
+                var trust_anchors: []const []const u8 = &.{};
+                const bundle_text: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(init.io, h.parsed.acme.ca_bundle_path, allocator, .limited(@intCast(h.parsed.acme.ca_bundle_max_bytes))) catch |err| blk: {
+                    std.debug.print("onyx-server: [ocsp] trust store {s} unreadable ({s}); HTTPS responder fetches fail closed\n", .{ h.parsed.acme.ca_bundle_path, @errorName(err) });
+                    break :blk null;
+                };
+                if (bundle_text) |text| {
+                    defer allocator.free(text);
+                    if (onyx_server.daemon.acme_cli.loadTrustAnchors(allocator, text)) |anchors| {
+                        trust_anchors = anchors.items;
+                        std.debug.print("onyx-server: [ocsp] using daemon trust store {s} ({d} anchors)\n", .{ h.parsed.acme.ca_bundle_path, anchors.items.len });
+                    } else |err| {
+                        std.debug.print("onyx-server: [ocsp] trust store parse failed ({s}); HTTPS responder fetches fail closed\n", .{@errorName(err)});
+                    }
+                }
                 const svc = try allocator.create(OcspStapleService);
                 svc.* = OcspStapleService.init(allocator, init.io, &srv, &h.parsed.tls, .{
                     .check_interval_ms = h.parsed.ocsp.check_interval_ms,
                 });
+                svc.trust_anchors = trust_anchors;
                 ocsp_staple = svc;
                 svc.start();
             } else {

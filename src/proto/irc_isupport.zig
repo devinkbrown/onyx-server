@@ -6,6 +6,8 @@
 //! This module is intentionally self-contained: it owns parsed keys and values,
 //! imports only `std`, and does not depend on Onyx Server registration code.
 const std = @import("std");
+const protocol_inventory = @import("protocol_inventory.zig");
+const chanmode = @import("../daemon/chanmode.zig");
 
 pub const MAX_TOKENS_PER_LINE: usize = 13;
 pub const TRAILING_TEXT = "are supported by this server";
@@ -277,8 +279,8 @@ fn hexValue(byte: u8) ?u8 {
 }
 
 const common_tokens = [_]Token{
-    .{ .key = "CHANMODES", .value = "b,k,l,imnpst" },
-    .{ .key = "PREFIX", .value = "(ov)@+" },
+    .{ .key = "CHANMODES", .value = protocol_inventory.chanmodes_token["CHANMODES=".len..] },
+    .{ .key = "PREFIX", .value = chanmode.MemberModes.isupport_prefix },
     .{ .key = "CHANTYPES", .value = "#&" },
     .{ .key = "NETWORK", .value = "Onyx" },
     .{ .key = "CASEMAPPING", .value = "rfc1459" },
@@ -320,8 +322,8 @@ test "round-trip parse of common ISUPPORT tokens" {
     var map = try parseLine(std.testing.allocator, out);
     defer map.deinit();
 
-    try std.testing.expectEqualStrings("b,k,l,imnpst", map.getStr("CHANMODES").?);
-    try std.testing.expectEqualStrings("(ov)@+", map.getStr("PREFIX").?);
+    try std.testing.expectEqualStrings(protocol_inventory.chanmodes_token["CHANMODES=".len..], map.getStr("CHANMODES").?);
+    try std.testing.expectEqualStrings(chanmode.MemberModes.isupport_prefix, map.getStr("PREFIX").?);
     try std.testing.expectEqualStrings("#&", map.getStr("CHANTYPES").?);
     try std.testing.expectEqualStrings("Onyx", map.getStr("NETWORK").?);
     try std.testing.expectEqualStrings("rfc1459", map.getStr("CASEMAPPING").?);

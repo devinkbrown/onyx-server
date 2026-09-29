@@ -49,6 +49,13 @@
 //! Both are self-consistent (client + server from this lib interoperate) and
 //! MUST be validated against a real DTLS 1.3 client before the flag is enabled
 //! in production.
+
+/// GAP-V1 hold. The RFC 9147 transcript caveats above are not browser-proven.
+/// `[media].dtls13` stays default-off until an unmodified browser completes
+/// DTLS 1.3 and media flows. DTLS 1.2 is a separate engine and is not weakened
+/// by this hold. Do not clear this while the caveat stands.
+pub const browser_interop_caveat_held = true;
+
 const std = @import("std");
 
 const p_record = @import("dtls12_record.zig"); // epoch-0 DTLSPlaintext framing

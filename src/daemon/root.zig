@@ -169,6 +169,9 @@ pub const ocg2_runtime = @import("ocg2_runtime.zig");
 /// exported for the integrator but owns no session, mesh, issuer, or minting
 /// capability.
 pub const ocg2_projection_runtime = @import("ocg2_projection_runtime.zig");
+comptime {
+    _ = @import("isupport_advertise.zig");
+}
 
 // Compile the inactive issuer leaf without publishing the module or its Impl.
 comptime {

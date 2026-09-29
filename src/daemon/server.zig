@@ -139,6 +139,7 @@ const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const search_index_mod = @import("search_index.zig");
+const history_durable = @import("history_durable.zig");
 const chanstats_mod = @import("chanstats.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const chathistory_targets = @import("../proto/chathistory_targets.zig");
@@ -4782,6 +4783,7 @@ pub const LinuxServer = struct {
             self.entity_prop_clocks = candidate.entity_clocks;
             durable_property_candidate = null;
         }
+        self.restoreDurableHistory();
     }
 
     /// By-value construction, kept for callers that own the result directly.
@@ -12694,7 +12696,7 @@ pub const LinuxServer = struct {
         prepared_delivery.release();
 
         if (history_row) |row| {
-            self.search_index.index(stable_msgid, row.text) catch {};
+            self.indexHistoryBody(stable_msgid, row.text, null);
             self.chanstatsMessage(row.target, row.sender, row.command, row.text);
         }
 
@@ -22220,6 +22222,50 @@ pub const LinuxServer = struct {
         return @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
     }
 
+    fn indexHistoryBody(self: *LinuxServer, msgid: []const u8, text: []const u8, tags: ?[]const u8) void {
+        if (e2ee_policy.encryptedTagPresent(tags)) return;
+        if (std.mem.startsWith(u8, text, e2ee_policy.room_envelope_prefix)) return;
+        self.search_index.index(msgid, text) catch {};
+    }
+
+    fn persistHistoryRecord(
+        self: *LinuxServer,
+        target: []const u8,
+        msgid: []const u8,
+        sender: []const u8,
+        text: []const u8,
+        timestamp_ms: u64,
+        command: []const u8,
+        tags: ?[]const u8,
+    ) void {
+        const svc = self.account_services orelse return;
+        history_durable.append(svc.store, .{
+            .target = target,
+            .msgid = msgid,
+            .sender = sender,
+            .text = text,
+            .timestamp = timestamp_ms,
+            .command = command,
+            .client_tags = tags orelse "",
+        }) catch |err| {
+            srvLog("onyx-server: history durable append failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn restoreDurableHistory(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        history_durable.restoreInto(HistoryStore, svc.store, &self.history, &self.search_index) catch |err| {
+            srvLog("onyx-server: history durable restore failed closed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    fn snapshotDurableHistory(self: *LinuxServer) void {
+        const svc = self.account_services orelse return;
+        history_durable.replaceAll(HistoryStore, svc.store, &self.history) catch |err| {
+            srvLog("onyx-server: history durable snapshot failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
     /// Record a message into the CHATHISTORY ring (Lotus) at an explicit event
     /// timestamp. Stable mesh events pass the physical lane of the same HLC that
     /// minted their msgid/live server-time, keeping replay byte-identical even
@@ -22244,11 +22290,13 @@ pub const LinuxServer = struct {
             .command = command,
             .client_tags = client_tags,
         }) catch {};
+        self.persistHistoryRecord(store_target, msgid, sender, text, timestamp_ms, command, client_tags);
         // Forward-index the message body for draft/search (word -> msgid). Bounded
         // by the index Config (max words/ids/token bytes); oversize indexes are a
         // best-effort drop, never an error to the sender. msgid uniquely keys the
         // entry; `handleSearch` re-scopes a hit to a target's own history.
-        self.search_index.index(msgid, text) catch {};
+        // E2EE ciphertext stays in the ring and is not indexed as text.
+        self.indexHistoryBody(msgid, text, client_tags);
         self.chanstatsMessage(store_target, sender, command, text);
     }
 
@@ -22284,7 +22332,8 @@ pub const LinuxServer = struct {
             .command = command,
             .client_tags = client_tags,
         }) catch {};
-        self.search_index.index(msgid, text) catch {};
+        self.persistHistoryRecord(store_target, msgid, sender_prefix, text, timestamp_ms, command, client_tags);
+        self.indexHistoryBody(msgid, text, client_tags);
         self.chanstatsMessage(store_target, sender_prefix, command, text);
     }
 
@@ -22312,6 +22361,7 @@ pub const LinuxServer = struct {
             .command = "TAGMSG",
             .client_tags = tags,
         }) catch {};
+        self.persistHistoryRecord(store_target, msgid, sender, "", timestamp_ms, "TAGMSG", tags);
     }
 
     /// Record a draft/event-playback EVENT (a non-message channel action such as
@@ -22333,6 +22383,7 @@ pub const LinuxServer = struct {
         var msgid_buf: [msgid_mod.id_len]u8 = undefined;
         const msgid = self.msgid_gen.next(&msgid_buf);
         _ = self.history.append(store_target, .{ .msgid = msgid, .sender = sender, .text = text, .timestamp = ts, .command = command }) catch {};
+        self.persistHistoryRecord(store_target, msgid, sender, text, ts, command, null);
         self.chanstatsEvent(store_target, sender, command, text);
     }
 
@@ -28089,6 +28140,7 @@ pub const LinuxServer = struct {
         self.mesh_clock_lock.unlock();
         std.mem.swap(HistoryStore, &self.history, &history_replacement);
         std.mem.swap(search_index_mod.SearchIndex, &self.search_index, &search_replacement);
+        self.snapshotDurableHistory();
         self.event_history.publishCheckpoint(&event_history_replacement);
         std.mem.swap(
             relay_v2_replay_guard.Guard,
@@ -51030,7 +51082,7 @@ pub const LinuxServer = struct {
             // chan). Only the message body + sender prefix are stored.
             if (min_rank == 0) {
                 if (accepted_v2 != null) {
-                    self.search_index.index(message_id, eff_text) catch {};
+                    self.indexHistoryBody(message_id, eff_text, clean_client_tags);
                     var history_prefix_buf: [256]u8 = undefined;
                     if (clientPrefix(conn, &history_prefix_buf)) |history_prefix|
                         self.chanstatsMessage(chan, history_prefix, command, eff_text)
@@ -51346,7 +51398,7 @@ pub const LinuxServer = struct {
             if (accepted_direct_v2) |accepted| {
                 message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
                 if (direct_history_key) |key| {
-                    self.search_index.index(message_id, text) catch {};
+                    self.indexHistoryBody(message_id, text, clean_client_tags);
                     self.chanstatsMessage(key, authored_prefix, command, text);
                 }
             } else {
@@ -57828,6 +57880,77 @@ fn eventHistoryBytesForTest(
     defer writer.deinit();
     try history.serializeInto(&writer.writer);
     return allocator.dupe(u8, writer.written());
+}
+
+test "UPGRADE GAP-D1 cold restart restores history msgids and skips ciphertext search" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d1.wal");
+    var services = services_mod.Services.init(&store, null);
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    };
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    first.recordHistoryRelayAt("#room", "alice!a@h", "chan-1", "PRIVMSG", "hello durableword", null, 10);
+    first.recordHistoryRelayAt("$dm:nick:alice:bob", "alice!a@h", "dm-1", "PRIVMSG", "dm body", null, 11);
+    first.recordHistoryRelayAt("#room", "alice!a@h", "e2ee-1", "PRIVMSG", "ONYXROOM1 secretphrase", "+onyx/e2ee=mls", 12);
+    try std.testing.expect(first.search_index.find("durableword").len == 1);
+    try std.testing.expect(first.search_index.find("secretphrase").len == 0);
+    first.deinit();
+    alloc.destroy(first);
+    store.deinit();
+
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d1.wal");
+    defer store2.deinit();
+    var services2 = services_mod.Services.init(&store2, null);
+    var cfg2 = cfg;
+    cfg2.account_services = &services2;
+    const second = createTestServer(alloc, cfg2) catch |err| return err;
+    defer alloc.destroy(second);
+    defer second.deinit();
+
+    var out: [4]lotus.Message = undefined;
+    const channel = try second.history.latest("#room", 4, &out);
+    try std.testing.expectEqual(@as(usize, 2), channel.len);
+    try std.testing.expectEqualStrings("e2ee-1", channel[0].msgid);
+    try std.testing.expectEqualStrings("ONYXROOM1 secretphrase", channel[0].text);
+    try std.testing.expectEqualStrings("chan-1", channel[1].msgid);
+    var dm_out: [2]lotus.Message = undefined;
+    const dm = try second.history.latest("$dm:nick:alice:bob", 2, &dm_out);
+    try std.testing.expectEqual(@as(usize, 1), dm.len);
+    try std.testing.expectEqualStrings("dm-1", dm[0].msgid);
+    try std.testing.expectEqualStrings("dm body", dm[0].text);
+    try std.testing.expect(second.search_index.find("durableword").len == 1);
+    try std.testing.expect(second.search_index.find("secretphrase").len == 0);
+
+    const lotus_wire = try second.history.encodeCheckpoint(alloc);
+    defer alloc.free(lotus_wire);
+    const search_wire = try second.search_index.encodeCheckpoint(alloc);
+    defer alloc.free(search_wire);
+    var event_writer = std.Io.Writer.Allocating.init(alloc);
+    defer event_writer.deinit();
+    try second.event_history.serializeInto(&event_writer.writer);
+    const bundle = try history_checkpoint.encode(alloc, .{}, .{
+        .lotus = lotus_wire,
+        .search_index = search_wire,
+        .event_history = event_writer.written(),
+    });
+    defer alloc.free(bundle);
+    const payloads = try history_checkpoint.decode(.{}, bundle);
+    var adopted = try HistoryStore.decodeCheckpoint(alloc, payloads.lotus);
+    defer adopted.deinit();
+    var adopted_msgs: [4]lotus.Message = undefined;
+    const adopted_channel = try adopted.latest("#room", 4, &adopted_msgs);
+    try std.testing.expectEqualStrings("chan-1", adopted_channel[1].msgid);
+    try std.testing.expectEqualStrings("e2ee-1", adopted_channel[0].msgid);
 }
 
 test "UPGRADE mandatory state round trip is exact and deterministic" {

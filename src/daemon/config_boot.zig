@@ -541,6 +541,41 @@ pub fn mapIoBootConfig(cfg: config_format.Config) IoBootConfig {
     };
 }
 
+/// Kernel reason `--check-config` prints when both flags are set.
+/// `RingFeatures.setupFlags` always adds `IORING_SETUP_SINGLE_ISSUER` next to
+/// `IORING_SETUP_DEFER_TASKRUN`, and Linux rejects that trio with SQPOLL
+/// (`EINVAL`). The four-reactor boot also created rings before the worker
+/// thread bound, which returned `InvalidThread`. The safe combination is
+/// SQPOLL without `defer_taskrun`.
+pub const sqpoll_defer_taskrun_reason: []const u8 = "io.sqpoll + io.defer_taskrun rejected: kernel returns EINVAL for IORING_SETUP_SQPOLL|IORING_SETUP_DEFER_TASKRUN|IORING_SETUP_SINGLE_ISSUER";
+
+/// `txrx` stays a documented footgun until a TLS 1.3 peer can rekey both
+/// directions with kTLS RX on and no reconnect. `--check-config` and boot
+/// refuse the mode; the previous safe behavior is `tx` (RX stays off).
+pub const ktls_txrx_footgun: []const u8 = "[tls] ktls=txrx is a documented footgun: TLS 1.3 KeyUpdate with request_peer has no TLS_TX reinstall, so the binary refuses txrx and kTLS stays tx";
+
+/// What the daemon actually arms. `rx` stays false until the both-direction
+/// rekey above is proven against the kernel.
+pub const KtlsOffload = struct {
+    tx: bool = false,
+    rx: bool = false,
+    footgun: ?[]const u8 = null,
+};
+
+pub fn resolveKtlsOffload(mode: config_format.Config.KtlsMode, ktls_capable: bool) KtlsOffload {
+    if (mode == .txrx) return .{ .tx = ktls_capable, .rx = false, .footgun = ktls_txrx_footgun };
+    if (mode == .off or !ktls_capable) return .{ .tx = false, .rx = false };
+    return .{ .tx = true, .rx = false };
+}
+
+/// Refusal shared by `--check-config` and normal boot. Null means the loaded
+/// file is allowed to start. Io is reported before kTLS when both are unsafe.
+pub fn configCheckError(io: IoBootConfig, ktls: config_format.Config.KtlsMode) ?[]const u8 {
+    if (io.sqpoll and io.defer_taskrun) return sqpoll_defer_taskrun_reason;
+    if (ktls == .txrx) return ktls_txrx_footgun;
+    return null;
+}
+
 pub fn mapAcmeBootConfig(cfg: config_format.Config) AcmeBootConfig {
     return .{
         .enabled = cfg.acme.enabled,
@@ -882,6 +917,84 @@ test "io defer_taskrun and sqpoll project onto Loaded.io and Config.features wit
     try testing.expect(loaded.config.features.defer_taskrun);
     try testing.expect(loaded.config.features.sqpoll);
     try testing.expectEqual(@as(u16, 256), loaded.config.cqe_batch);
+    const why = configCheckError(loaded.io, loaded.tls.ktls) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, why, "defer_taskrun") != null);
+    try testing.expect(std.mem.indexOf(u8, why, "sqpoll") != null);
+    try testing.expect(std.mem.indexOf(u8, why, "EINVAL") != null);
+}
+
+test "config check rejects sqpoll plus defer_taskrun with the kernel EINVAL reason" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[io]
+        \\defer_taskrun = true
+        \\sqpoll = true
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    const why = configCheckError(loaded.io, loaded.tls.ktls) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(sqpoll_defer_taskrun_reason, why);
+    std.debug.print("GAP-A5 branch=refuse {s}\n", .{why});
+}
+
+test "config check rejects ktls txrx footgun and resolveKtlsOffload keeps RX off" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[tls]
+        \\ktls = "txrx"
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqual(config_format.Config.KtlsMode.txrx, loaded.tls.ktls);
+    const why = configCheckError(loaded.io, loaded.tls.ktls) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(ktls_txrx_footgun, why);
+    try testing.expect(std.mem.indexOf(u8, why, "txrx") != null);
+    try testing.expect(std.mem.indexOf(u8, why, "footgun") != null);
+
+    const armed = resolveKtlsOffload(.txrx, true);
+    try testing.expect(armed.tx);
+    try testing.expect(!armed.rx);
+    try testing.expect(armed.footgun != null);
+
+    const tx_only = resolveKtlsOffload(.tx, true);
+    try testing.expect(tx_only.tx);
+    try testing.expect(!tx_only.rx);
+    try testing.expect(tx_only.footgun == null);
+
+    const off = resolveKtlsOffload(.off, true);
+    try testing.expect(!off.tx);
+    try testing.expect(!off.rx);
+    std.debug.print("GAP-A6 branch=footgun rx=off ktls-stays-tx\n", .{});
+}
+
+test "config GAP-V1 hold-off: media.dtls13 defaults off" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[media]
+        \\dtls_srtp = true
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expect(loaded.config.media_dtls_srtp);
+    try testing.expect(!loaded.parsed.media.dtls13);
+    try testing.expect(!loaded.config.media_dtls13);
+    try testing.expect(configCheckError(loaded.io, loaded.tls.ktls) == null);
+    std.debug.print("GAP-V1 branch=hold-off dtls13=off caveat=kept\n", .{});
 }
 
 test "media listen overlays media port and candidate host" {

@@ -13,6 +13,9 @@
 //! pin the registry's declared inventory to this list.
 
 const std = @import("std");
+const chanmode = @import("../daemon/chanmode.zig");
+const chanmode_ext = @import("chanmode_ext.zig");
+const ircx = @import("ircx.zig");
 
 /// Default network name advertised in ISUPPORT `NETWORK=` and the welcome
 /// burst. Operators override it via `[network] name` (see `setNetworkName`).
@@ -55,8 +58,45 @@ pub fn setServerName(name: ?[]const u8) void {
     }
 }
 
-/// Channel-mode advertisement token (`CHANMODES=<A>,<B>,<C>,<D>`).
-pub const chanmodes_token = "CHANMODES=beIZ,k,lfj,imnstCTNMSgWOAVUFD";
+/// World-layer list/parameter modes in server.handleChannelMode. These have no
+/// compact chanmode spec: Z is quiet, f is forward, and j is join throttle.
+/// Divergence: IRCX MODEX calls f NOFORMAT, while ordinary MODE uses f for
+/// forward. CHANMODES describes ordinary MODE and therefore puts f in class C.
+const world_modes = .{ .{ 'Z', chanmode.ModeKind.list_a }, .{ 'f', chanmode.ModeKind.param_c }, .{ 'j', chanmode.ModeKind.param_c } };
+
+/// Built from the two catalogs consumed by the MODE handler, with the three
+/// world-layer modes above. Duplicate letters share their one protocol class.
+pub const chanmodes_token = deriveChanmodes();
+
+fn deriveChanmodes() []const u8 {
+    comptime {
+        var classes: [4][64]u8 = @splat(@splat(0));
+        var lengths: [4]usize = @splat(0);
+        for (chanmode.default_specs) |spec| addMode(&classes, &lengths, spec.letter, spec.kind);
+        for (world_modes) |row| addMode(&classes, &lengths, row[0], row[1]);
+        for (chanmode_ext.mode_specs) |spec| {
+            // MODEX's NOFORMAT f conflicts with ordinary MODE's forward f.
+            if (spec.letter == 'f') continue;
+            addMode(&classes, &lengths, spec.letter, .flag_d);
+        }
+        return std.fmt.comptimePrint("CHANMODES={s},{s},{s},{s}", .{
+            classes[0][0..lengths[0]], classes[1][0..lengths[1]],
+            classes[2][0..lengths[2]], classes[3][0..lengths[3]],
+        });
+    }
+}
+
+fn addMode(classes: *[4][64]u8, lengths: *[4]usize, letter: u8, kind: chanmode.ModeKind) void {
+    const index: usize = switch (kind) {
+        .list_a => 0,
+        .param_b => 1,
+        .param_c => 2,
+        .flag_d => 3,
+    };
+    for (classes[index][0..lengths[index]]) |existing| if (existing == letter) return;
+    classes[index][lengths[index]] = letter;
+    lengths[index] += 1;
+}
 
 /// The static RPL_ISUPPORT (005) tokens, in advertisement order. Dynamic
 /// per-connection tokens (if any are added later) are appended by the emitter.
@@ -85,6 +125,23 @@ pub const isupport_tokens = [_][]const u8{
     "KEYLEN=64",
     "MONITOR=128",
     "SILENCE=32",
+    // The live CHATHISTORY handler caps each reply at its 64-message buffer;
+    // TARGETS uses the same 64-result query cap.
+    "CHATHISTORY=64",
+    // ELIST parser accepts creation/topic age, include/exclude masks, and
+    // user-count comparisons (C/M/N/T/U).
+    "ELIST=CMNTU",
+    "SAFELIST",
+    // MAXTARGETS is config-overridden by buildIsupportTokens. TARGMAX would
+    // need the same override; until then its dynamic per-command value is an
+    // explicit 005 divergence, not a misleading static limit.
+    "EXCEPTS=e",
+    "INVEX=I",
+    std.fmt.comptimePrint("MAXPROP={d}", .{ircx.MAX_PROP_VALUE}),
+    std.fmt.comptimePrint("MAXACCESS={d}", .{ircx.MAX_ACCESS_MASK}),
+    // IRCX CODEPAGE/LANGUAGE setters are absent; zero is the enforced surface.
+    "MAXCODEPAGE=0",
+    "MAXLANGUAGE=0",
     "CASEMAPPING=ascii",
     // PREFIX and STATUSMSG are appended by the daemon's `buildIsupportTokens`,
     // derived from the single source of truth in `daemon/chanmode.zig`

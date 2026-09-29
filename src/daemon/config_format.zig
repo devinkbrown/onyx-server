@@ -755,6 +755,9 @@ pub const Config = struct {
         /// SPKI for SASL EXTERNAL CertFP. Default false keeps the classic path.
         raw_public_key: bool = false,
         /// kTLS (kernel TLS offload) mode — see `Config.KtlsMode`. Default `off`.
+        /// `tx` is the safe opt-in. `txrx` parses, but boot refuses it: a
+        /// request_peer KeyUpdate has no kernel TLS_TX reinstall (documented
+        /// footgun in `config_boot.ktls_txrx_footgun`).
         ktls: KtlsMode = .off,
         /// Additional SNI-selectable certificates (`[[tls.sni]]`, owned). When a
         /// ClientHello's server_name matches an entry's `server_names`, the TLS

@@ -988,6 +988,41 @@ test "MediaPlane: DTLS-SRTP on but dtls13 off leaves the 1.3 engine down (1.2-on
     try testing.expect(plane.dtls13 == null); // 1.3 stays down by default
 }
 
+test "DTLS-SRTP GAP-V1 hold-off: dtls13 off still answers a DTLS 1.2 ClientHello" {
+    try testing.expect(dtls13_server.browser_interop_caveat_held);
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+    plane.dtls_enabled = true;
+    try testing.expect(!plane.dtls13_enabled);
+    try plane.start(loopback_be, 0);
+    try testing.expect(plane.dtls != null);
+    try testing.expect(plane.dtls13 == null);
+
+    var client = try MediaSocket.bind(loopback_be, 0);
+    defer client.deinit();
+    client.setRecvTimeoutMs(2000);
+
+    var rnd: [32]u8 = undefined;
+    for (&rnd, 0..) |*b, i| b.* = @intCast(i +% 1);
+    var ch_body: [512]u8 = undefined;
+    const chb = try dtls_messages.buildClientHello(&ch_body, .{
+        .random = rnd,
+        .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80},
+    });
+    var dgram: [700]u8 = undefined;
+    const dlen = try dtls_server.framePlaintextHandshake(&dgram, .client_hello, 0, 0, 0, chb);
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, plane.port);
+    client.sendTo(server_addr, dgram[0..dlen]);
+
+    var cbuf: [media_socket.max_datagram]u8 = undefined;
+    const got = client.recvFrom(&cbuf) orelse return error.TestUnexpectedResult;
+    const rdec = try dtls_record.RecordHeader.decode(got.data);
+    try testing.expectEqual(dtls_record.ContentType.handshake, rdec.hdr.content_type);
+    const hh = try dtls_handshake.Header.decode(rdec.fragment);
+    try testing.expectEqual(dtls_handshake.HandshakeType.hello_verify_request, hh.hdr.msg_type);
+    std.debug.print("GAP-V1 branch=hold-off dtls13=off caveat=kept dtls12=HelloVerifyRequest\n", .{});
+}
+
 test "MediaPlane: version seam routes a DTLS 1.3 ClientHello to the 1.3 engine (HRR)" {
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();

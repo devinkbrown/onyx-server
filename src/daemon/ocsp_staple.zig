@@ -85,6 +85,77 @@ pub fn backoffSeconds(failures: u32, min_s: i64, max_s: i64) i64 {
     return std.math.clamp(delay, min_s, max_s);
 }
 
+/// Transport options for an OCSP POST. Verification uses `trust_anchors`
+/// (the daemon trust store). A bad responder certificate fails the fetch;
+/// the caller keeps the previous staple.
+pub fn ocspTransportOptions(trust_anchors: []const []const u8, opts: Options) http_fetch.Options {
+    return .{
+        .trust_anchors = trust_anchors,
+        .insecure_skip_verify = false,
+        .connect_timeout_ms = opts.connect_timeout_ms,
+        .recv_timeout_ms = opts.recv_timeout_ms,
+        .max_response_bytes = opts.max_response_bytes,
+    };
+}
+
+/// Outcome of one responder fetch. `.keep` means the previous staple stays
+/// (transport failure, bad certificate, bad signature, or a revoked leaf).
+/// `.publish` is an owned DER body the caller hands to the server.
+pub const StapleDecision = union(enum) {
+    keep,
+    publish: []u8,
+};
+
+/// POST `request_der` and decide whether the body may replace the staple.
+/// This is the function `Service.fetchAndPublish` uses. A TLS failure,
+/// including an untrusted responder certificate, returns `.keep`.
+pub fn fetchAndDecide(
+    allocator: std.mem.Allocator,
+    url: http_fetch.Url,
+    request_der: []const u8,
+    trust_anchors: []const []const u8,
+    opts: Options,
+    issuer_spki: []const u8,
+    serial: []const u8,
+    now: i64,
+) StapleDecision {
+    const http_resp = http_fetch.post(allocator, url, ocsp_request_content_type, request_der, ocspTransportOptions(trust_anchors, opts)) catch |err| {
+        dlog.log("onyx-server: ocsp fetch failed ({s}); keeping current staple\n", .{@errorName(err)});
+        return .keep;
+    };
+    defer allocator.free(http_resp);
+
+    const der = extractOcspBody(http_resp) orelse {
+        dlog.log("onyx-server: ocsp fetch: responder returned no usable OCSPResponse body\n", .{});
+        return .keep;
+    };
+
+    // Signature checks are unchanged: a revoked verdict is honored only when
+    // the response is issuer-signed (or signed by an issuer-authorized
+    // delegated responder). An unsigned body cannot forge a revocation.
+    if (ocsp.parse(der)) |parsed| {
+        if (ocsp.verifyResponseSignatureWithChain(parsed, issuer_spki, now)) {
+            if (ocsp.statusForSerial(parsed, serial)) |status| {
+                if (status == .revoked) {
+                    dlog.log("onyx-server: CRITICAL ocsp responder reports THIS server's certificate REVOKED — not stapling\n", .{});
+                    return .keep;
+                }
+            }
+        }
+    } else |_| {}
+
+    if (!ocsp.isStapleServable(der, issuer_spki, serial, now, opts.skew_seconds)) {
+        dlog.log("onyx-server: ocsp response not servable (bad sig/status/freshness); keeping current staple\n", .{});
+        return .keep;
+    }
+
+    const owned = allocator.dupe(u8, der) catch {
+        dlog.log("onyx-server: ocsp staple skipped: out of memory copying response\n", .{});
+        return .keep;
+    };
+    return .{ .publish = owned };
+}
+
 /// Extract the DER OCSPResponse body from a complete HTTP response, or null if
 /// the status is not 200 or the body is empty. `http_response` is decoded in
 /// place (chunked/Content-Length framing); the returned slice aliases it.
@@ -102,6 +173,10 @@ pub const Service = struct {
     server: *server_mod.Server,
     tls: *const config_format.Config.Tls,
     opts: Options,
+    /// Daemon trust store (DER anchors). HTTPS OCSP fetches verify against
+    /// this set. Empty fails closed; `insecure_skip_verify` is not used.
+    /// Borrowed for the process lifetime (same store as ACME / Web Push).
+    trust_anchors: []const []const u8 = &.{},
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 
@@ -239,56 +314,15 @@ pub const Service = struct {
             dlog.log("onyx-server: ocsp staple skipped: malformed AIA URL\n", .{});
             return false;
         };
-        // The OCSPResponse is signature-verified against the issuer below, so the
-        // responder's transport authentication is not load-bearing — skip cert
-        // verification for the (rare) HTTPS responder to avoid a trust-anchor loop.
-        const http_resp = http_fetch.post(self.allocator, url, ocsp_request_content_type, req, .{
-            .insecure_skip_verify = true,
-            .connect_timeout_ms = self.opts.connect_timeout_ms,
-            .recv_timeout_ms = self.opts.recv_timeout_ms,
-            .max_response_bytes = self.opts.max_response_bytes,
-        }) catch |err| {
-            dlog.log("onyx-server: ocsp fetch failed ({s}); keeping current staple\n", .{@errorName(err)});
-            return false;
-        };
-        defer self.allocator.free(http_resp);
-
-        const der = extractOcspBody(http_resp) orelse {
-            dlog.log("onyx-server: ocsp fetch: responder returned no usable OCSPResponse body\n", .{});
-            return false;
-        };
-
-        // Surface a revocation of our OWN leaf loudly; never staple it. Trust the
-        // revoked verdict only if the response is actually issuer-signed — the
-        // transport runs with cert verification off (the response signature is the
-        // real authenticator), so an unsigned injected "revoked" must not forge a
-        // CRITICAL alert.
-        if (ocsp.parse(der)) |parsed| {
-            // Chain-aware: honor a revoked verdict signed by an issuer-authorized
-            // delegated responder too (the common CA setup), not just a directly
-            // issuer-signed one — otherwise a real revocation could be missed.
-            if (ocsp.verifyResponseSignatureWithChain(parsed, issuer.spki_der, now)) {
-                if (ocsp.statusForSerial(parsed, leaf.serial_der)) |status| {
-                    if (status == .revoked) {
-                        dlog.log("onyx-server: CRITICAL ocsp responder reports THIS server's certificate REVOKED — not stapling\n", .{});
-                        return false;
-                    }
-                }
-            }
-        } else |_| {}
-
-        if (!ocsp.isStapleServable(der, issuer.spki_der, leaf.serial_der, now, self.opts.skew_seconds)) {
-            dlog.log("onyx-server: ocsp response not servable (bad sig/status/freshness); keeping current staple\n", .{});
-            return false;
+        const decision = fetchAndDecide(self.allocator, url, req, self.trust_anchors, self.opts, issuer.spki_der, leaf.serial_der, now);
+        switch (decision) {
+            .keep => return false,
+            .publish => |owned| {
+                self.recordPublished(owned, leaf.serial_der, now);
+                self.server.publishOcspStaple(owned);
+                return true;
+            },
         }
-
-        const owned = self.allocator.dupe(u8, der) catch {
-            dlog.log("onyx-server: ocsp staple skipped: out of memory copying response\n", .{});
-            return false;
-        };
-        self.server.publishOcspStaple(owned);
-        self.recordPublished(der, leaf.serial_der, now);
-        return true;
     }
 
     /// True when the last published staple covers `serial` and it is not yet time
@@ -392,6 +426,182 @@ test "extractOcspBody returns body only for a 200 with content" {
         defer allocator.free(raw);
         try std.testing.expect(extractOcspBody(raw) == null);
     }
+}
+
+const Ed25519 = std.crypto.sign.Ed25519;
+const x509_selfsign = @import("../proto/x509_selfsign.zig");
+const tls_conn = @import("tls_conn.zig");
+const posix = std.posix;
+
+const OcspStub = struct {
+    listen_fd: linux.fd_t,
+    der: []const u8,
+    kp: Ed25519.KeyPair,
+    stop: *std.atomic.Value(bool),
+    app_posts: *std.atomic.Value(u32),
+};
+
+fn ocspWriteAll(fd: linux.fd_t, bytes: []const u8) void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        if (posix.errno(rc) != .SUCCESS) return;
+        const n: usize = @intCast(rc);
+        if (n == 0) return;
+        off += n;
+    }
+}
+
+fn ocspListenLoopback() !struct { fd: linux.fd_t, port: u16 } {
+    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return error.Socket;
+    const fd: linux.fd_t = @intCast(rc);
+    errdefer _ = linux.close(fd);
+    var yes: u32 = 1;
+    _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
+    var addr = linux.sockaddr.in{
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
+    };
+    if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.Bind;
+    if (posix.errno(linux.listen(fd, 8)) != .SUCCESS) return error.Listen;
+    var storage: posix.sockaddr.storage = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (posix.errno(linux.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS) return error.Bind;
+    const bound: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, bound.port) };
+}
+
+fn ocspStubServe(alloc: std.mem.Allocator, fd: linux.fd_t, stub: *OcspStub) void {
+    defer _ = linux.close(fd);
+    const rtv = linux.timeval{ .sec = 2, .usec = 0 };
+    _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&rtv), @sizeOf(linux.timeval));
+    var conn = tls_conn.TlsConn.init(alloc, .{ .cert_chain = &.{stub.der}, .signing_key = stub.kp }) catch return;
+    defer conn.deinit();
+    var buf: [16 * 1024]u8 = undefined;
+    var plain_acc: [4096]u8 = undefined;
+    var plain_len: usize = 0;
+    while (!stub.stop.load(.acquire)) {
+        const rc = linux.read(fd, &buf, buf.len);
+        if (posix.errno(rc) != .SUCCESS) return;
+        const n: usize = @intCast(rc);
+        if (n == 0) return;
+        const out = conn.onInbound(buf[0..n]) catch |err| {
+            if (conn.takeAlert(err)) |alert| {
+                defer alloc.free(alert);
+                ocspWriteAll(fd, alert);
+            }
+            return;
+        };
+        if (out.handshake_bytes.len != 0) {
+            const flight = alloc.dupe(u8, out.handshake_bytes) catch return;
+            defer alloc.free(flight);
+            ocspWriteAll(fd, flight);
+        }
+        if (out.plaintext.len != 0 and plain_len < plain_acc.len) {
+            const take = @min(out.plaintext.len, plain_acc.len - plain_len);
+            @memcpy(plain_acc[plain_len..][0..take], out.plaintext[0..take]);
+            plain_len += take;
+        }
+        if (conn.handshakeDone() and std.mem.indexOf(u8, plain_acc[0..plain_len], "\r\n\r\n") != null) {
+            _ = stub.app_posts.fetchAdd(1, .monotonic);
+            const body = "nope";
+            var hdr_buf: [160]u8 = undefined;
+            const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/ocsp-response\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
+            const cipher = conn.write(hdr) catch return;
+            const owned = alloc.dupe(u8, cipher) catch return;
+            defer alloc.free(owned);
+            ocspWriteAll(fd, owned);
+            return;
+        }
+    }
+}
+
+fn ocspStubAccept(stub: *OcspStub) void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const tv = linux.timeval{ .sec = 0, .usec = 200_000 };
+    _ = linux.setsockopt(stub.listen_fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+    while (!stub.stop.load(.acquire)) {
+        const rc = linux.accept4(stub.listen_fd, null, null, posix.SOCK.CLOEXEC);
+        switch (posix.errno(rc)) {
+            .SUCCESS => ocspStubServe(alloc, @intCast(rc), stub),
+            .AGAIN, .INTR, .CONNABORTED => continue,
+            else => return,
+        }
+    }
+}
+
+test "tls ocsp fetch uses the daemon trust store and a bad certificate keeps the previous staple" {
+    if (comptime @import("builtin").os.tag != .linux) return;
+    const allocator = std.testing.allocator;
+
+    const good_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x41)));
+    const bad_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x42)));
+    var good_buf: [1400]u8 = undefined;
+    var bad_buf: [1400]u8 = undefined;
+    const good_der = try x509_selfsign.buildSelfSigned(&good_buf, .{
+        .common_name = "127.0.0.1",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x01, 0x02 },
+        .key_pair = good_kp,
+        .dns_names = &.{"127.0.0.1"},
+        .is_ca = true,
+    });
+    const bad_der = try x509_selfsign.buildSelfSigned(&bad_buf, .{
+        .common_name = "127.0.0.1",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x03, 0x04 },
+        .key_pair = bad_kp,
+        .dns_names = &.{"127.0.0.1"},
+        .is_ca = true,
+    });
+
+    const listener = try ocspListenLoopback();
+    var stop = std.atomic.Value(bool).init(false);
+    var posts = std.atomic.Value(u32).init(0);
+    var stub = OcspStub{
+        .listen_fd = listener.fd,
+        .der = good_der,
+        .kp = good_kp,
+        .stop = &stop,
+        .app_posts = &posts,
+    };
+    const thread = try std.Thread.spawn(.{}, ocspStubAccept, .{&stub});
+    defer {
+        stop.store(true, .release);
+        _ = linux.close(listener.fd);
+        thread.join();
+    }
+
+    const url_text = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/ocsp", .{listener.port});
+    defer allocator.free(url_text);
+    const url = try http_fetch.parseUrl(url_text);
+    const opts = Options{ .connect_timeout_ms = 2000, .recv_timeout_ms = 3000 };
+    const previous = "previous-staple";
+    const transport = ocspTransportOptions(&.{good_der}, opts);
+    try std.testing.expect(!transport.insecure_skip_verify);
+    try std.testing.expectEqual(@as(usize, 1), transport.trust_anchors.len);
+    try std.testing.expectEqual(good_der.ptr, transport.trust_anchors[0].ptr);
+
+    const untrusted = fetchAndDecide(allocator, url, "ocsp-request", &.{bad_der}, opts, "issuer-spki", "serial", 1_700_000_000);
+    try std.testing.expect(untrusted == .keep);
+    try std.testing.expectEqual(@as(u32, 0), posts.load(.monotonic));
+
+    const trusted_garbage = fetchAndDecide(allocator, url, "ocsp-request", &.{good_der}, opts, "issuer-spki", "serial", 1_700_000_000);
+    switch (trusted_garbage) {
+        .keep => {},
+        .publish => |owned| {
+            allocator.free(owned);
+            return error.TestUnexpectedResult;
+        },
+    }
+    try std.testing.expect(posts.load(.monotonic) >= 1);
+    try std.testing.expectEqualStrings("previous-staple", previous);
+    std.debug.print("GAP-A8 branch=trust-store bad-cert=keep signature-fail=keep previous={s}\n", .{previous});
 }
 
 test {

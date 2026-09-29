@@ -9,7 +9,8 @@
 //! the 512-octet message limit including CRLF.
 const std = @import("std");
 const numeric = @import("../proto/numeric.zig");
-const limits_config = @import("limits_config.zig");
+const protocol_inventory = @import("protocol_inventory.zig");
+const chanmode = @import("../daemon/chanmode.zig");
 
 pub const MAX_TOKENS_PER_LINE: usize = 13;
 pub const MAX_IRC_LINE_BYTES: usize = 512;
@@ -251,148 +252,24 @@ pub fn emitDefault(server_name: []const u8, requester: []const u8, sink: *ReplyS
     }).emit(sink);
 }
 
-/// Modern default token set. Modules may copy these into a `TokenMap` and
-/// replace entries as policy/config changes.
-pub const default_tokens = [_]Token{
-    .{ .name = "CHANTYPES", .value = "#&" },
-    .{ .name = "PREFIX", .value = "(qaohv)~&@%+" },
-    .{ .name = "CHANMODES", .value = "b,k,l,imnpst" },
-    .{ .name = "NICKLEN", .value = "64" },
-    .{ .name = "CHANNELLEN", .value = "64" },
-    .{ .name = "TOPICLEN", .value = "512" },
-    .{ .name = "AWAYLEN", .value = "390" },
-    .{ .name = "CASEMAPPING", .value = "ascii" },
-    .{ .name = "NETWORK", .value = "Onyx" },
-    .{ .name = "ELIST", .value = "CMNTU" },
-    .{ .name = "MONITOR", .value = "512" },
-    .{ .name = "CHATHISTORY", .value = "1000" },
-    .{ .name = "UTF8ONLY" },
-    .{ .name = "BOT" },
-    .{ .name = "SAFELIST" },
-    .{ .name = "STATUSMSG", .value = "~&@%+" },
-    .{ .name = "TARGMAX", .value = "JOIN:,WHOIS:1,PRIVMSG:,NOTICE:,MONITOR:" },
-    .{ .name = "CHANLIMIT", .value = "#:100" },
-    .{ .name = "MAXLIST", .value = "b:100,e:100,I:100" },
-    .{ .name = "MODES", .value = "4" },
-    .{ .name = "EXCEPTS", .value = "e" },
-    .{ .name = "INVEX", .value = "I" },
-    .{ .name = "EXTBAN", .value = "$,acgmrz" },
-    .{ .name = "ACCOUNTEXTBAN", .value = "a" },
-    .{ .name = "WHOX" },
-    .{ .name = "IRCX" },
-    .{ .name = "MAXCODEPAGE", .value = "0" },
-    .{ .name = "MAXLANGUAGE", .value = "0" },
-    .{ .name = "MAXPROP", .value = "512" },
-    .{ .name = "MAXACCESS", .value = "128" },
-};
+/// Default helper surface follows the shipped inventory. The daemon appends
+/// PREFIX/STATUSMSG from MemberModes, so this helper does the same.
+pub const default_tokens = makeDefaultTokens();
 
-/// Config-driven ISUPPORT token surface.
-///
-/// `TokenSet` owns inline storage for the numeric/composite token values that
-/// vary with policy (NICKLEN, CHANLIMIT, MAXLIST, ...) so the resulting `Token`
-/// slice can be emitted exactly like `default_tokens`. The valueless capability
-/// tokens (UTF8ONLY, BOT, IRCX, ...) are preserved in the same order as
-/// `default_tokens`, so a `Limits{}` default reproduces the historical 005
-/// surface byte-for-byte.
-///
-/// Build with `TokenSet.fromLimits`, then pass `set.slice()` to a `Builder` or
-/// call `emitFromLimits` directly.
-pub const TokenSet = struct {
-    /// Inline scratch for all formatted token values. 512 bytes is comfortably
-    /// larger than the sum of every value the default surface produces.
-    storage: [512]u8 = undefined,
-    used: usize = 0,
-    tokens: [default_tokens.len]Token = undefined,
-    count: usize = 0,
-
-    fn fmtUint(self: *TokenSet, value: u64) []const u8 {
-        const start = self.used;
-        const written = std.fmt.bufPrint(self.storage[start..], "{d}", .{value}) catch unreachable;
-        self.used += written.len;
-        return self.storage[start .. start + written.len];
+fn makeDefaultTokens() [protocol_inventory.isupport_tokens.len + 2]Token {
+    comptime {
+        var out: [protocol_inventory.isupport_tokens.len + 2]Token = undefined;
+        for (protocol_inventory.isupport_tokens, 0..) |raw, i| {
+            if (std.mem.indexOfScalar(u8, raw, '=')) |eq| {
+                out[i] = .{ .name = raw[0..eq], .value = raw[eq + 1 ..] };
+            } else {
+                out[i] = .{ .name = raw };
+            }
+        }
+        out[protocol_inventory.isupport_tokens.len] = .{ .name = "PREFIX", .value = chanmode.MemberModes.isupport_prefix };
+        out[protocol_inventory.isupport_tokens.len + 1] = .{ .name = "STATUSMSG", .value = chanmode.MemberModes.statusmsg_symbols };
+        return out;
     }
-
-    fn fmtComposite(self: *TokenSet, comptime tmpl: []const u8, args: anytype) []const u8 {
-        const start = self.used;
-        const written = std.fmt.bufPrint(self.storage[start..], tmpl, args) catch unreachable;
-        self.used += written.len;
-        return self.storage[start .. start + written.len];
-    }
-
-    fn pushValue(self: *TokenSet, name: []const u8, value: []const u8) void {
-        self.tokens[self.count] = .{ .name = name, .value = value };
-        self.count += 1;
-    }
-
-    fn pushValueless(self: *TokenSet, name: []const u8) void {
-        self.tokens[self.count] = .{ .name = name };
-        self.count += 1;
-    }
-
-    pub fn slice(self: *const TokenSet) []const Token {
-        return self.tokens[0..self.count];
-    }
-
-    /// Build the ISUPPORT token surface from policy limits into caller-owned
-    /// `self`. Order matches `default_tokens`. The caller must keep `self` alive
-    /// while emitting, because token values alias `self.storage`.
-    pub fn build(self: *TokenSet, limits: *const limits_config.Limits) void {
-        self.used = 0;
-        self.count = 0;
-        self.pushValue("CHANTYPES", limits.chantypes.slice());
-        self.pushValue("PREFIX", limits.prefix.slice());
-        self.pushValue("CHANMODES", limits.chanmodes.slice());
-        self.pushValue("NICKLEN", self.fmtUint(limits.nick_len));
-        self.pushValue("CHANNELLEN", self.fmtUint(limits.channel_len));
-        self.pushValue("TOPICLEN", self.fmtUint(limits.topic_len));
-        self.pushValue("AWAYLEN", self.fmtUint(limits.away_len));
-        self.pushValue("CASEMAPPING", limits.casemapping.slice());
-        self.pushValue("NETWORK", limits.network.slice());
-        self.pushValue("ELIST", limits.elist.slice());
-        self.pushValue("MONITOR", self.fmtUint(limits.monitor_targets));
-        self.pushValue("CHATHISTORY", self.fmtUint(limits.history_max_messages_advertised));
-        self.pushValueless("UTF8ONLY");
-        self.pushValueless("BOT");
-        self.pushValueless("SAFELIST");
-        self.pushValue("STATUSMSG", limits.statusmsg.slice());
-        self.pushValue("TARGMAX", limits.targmax.slice());
-        self.pushValue("CHANLIMIT", self.fmtComposite("#:{d}", .{limits.chan_limit}));
-        self.pushValue("MAXLIST", self.fmtComposite("b:{d},e:{d},I:{d}", .{
-            limits.max_ban_list,
-            limits.max_except_list,
-            limits.max_invex_list,
-        }));
-        self.pushValue("MODES", self.fmtUint(limits.modes_per_line));
-        self.pushValue("EXCEPTS", limits.excepts_mode.slice());
-        self.pushValue("INVEX", limits.invex_mode.slice());
-        self.pushValue("EXTBAN", limits.extban.slice());
-        self.pushValue("ACCOUNTEXTBAN", limits.account_extban.slice());
-        self.pushValueless("WHOX");
-        self.pushValueless("IRCX");
-        self.pushValue("MAXCODEPAGE", self.fmtUint(limits.ircx_max_codepage));
-        self.pushValue("MAXLANGUAGE", self.fmtUint(limits.ircx_max_language));
-        self.pushValue("MAXPROP", self.fmtUint(limits.ircx_max_prop));
-        self.pushValue("MAXACCESS", self.fmtUint(limits.ircx_max_access));
-    }
-};
-
-/// Emit the ISUPPORT surface derived from policy `limits`. The orchestrator
-/// calls this once `Limits` has been overlaid from config; with `Limits{}` the
-/// output matches `emitDefault` exactly.
-pub fn emitFromLimits(
-    server_name: []const u8,
-    requester: []const u8,
-    limits: *const limits_config.Limits,
-    sink: *ReplySink,
-) IsupportError!void {
-    var set = TokenSet{};
-    set.build(limits);
-    try (Builder{
-        .server_name = server_name,
-        .requester = requester,
-        .tokens = set.slice(),
-        .trailing = limits.isupport_trailing.slice(),
-    }).emit(sink);
 }
 
 fn fixedLineLen(server_name: []const u8, requester: []const u8, trailing: []const u8) usize {
@@ -633,40 +510,6 @@ test "validation rejects malformed tokens and parameters" {
         .requester = "n",
         .tokens = &tokens,
     }).emit(&sink));
-}
-
-test "limits-derived token surface matches default_tokens with default limits" {
-    const limits = limits_config.Limits{};
-    var set = TokenSet{};
-    set.build(&limits);
-    const tokens = set.slice();
-
-    try std.testing.expectEqual(default_tokens.len, tokens.len);
-    for (default_tokens, tokens) |want, got| {
-        try std.testing.expectEqualStrings(want.name, got.name);
-        try std.testing.expectEqual(want.value == null, got.value == null);
-        if (want.value) |wv| try std.testing.expectEqualStrings(wv, got.value.?);
-    }
-}
-
-test "emitFromLimits reflects overridden policy values" {
-    var limits = limits_config.Limits{};
-    limits.nick_len = 32;
-    limits.network.set("TestNet");
-
-    var line_slots: [8]ReplyLine = undefined;
-    var storage: [2048]u8 = undefined;
-    var sink = ReplySink{ .lines = &line_slots, .storage = &storage };
-    try emitFromLimits("irc.example.test", "alice", &limits, &sink);
-
-    var saw_nicklen = false;
-    var saw_network = false;
-    for (sink.slice()) |line| {
-        if (std.mem.indexOf(u8, line.bytes, "NICKLEN=32") != null) saw_nicklen = true;
-        if (std.mem.indexOf(u8, line.bytes, "NETWORK=TestNet") != null) saw_network = true;
-    }
-    try std.testing.expect(saw_nicklen);
-    try std.testing.expect(saw_network);
 }
 
 test "default tokens are valid and emit multiple bounded lines" {

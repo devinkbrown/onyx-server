@@ -57,15 +57,9 @@ const MAX_EVENT_MASK_BYTES: usize = 256;
 const EVENT_CATEGORY_COUNT: usize = @typeInfo(event_spine.EventCategory).@"enum".field_names.len;
 
 /// ISUPPORT CHANMODES token. Every advertised letter MUST be enforced by the
-/// channel-MODE handler (see `server.zig` handleChannelMode); this is the single
-/// source of truth shared by the welcome burst and the honesty test below.
-///   A (list, always param):   b e I Z   (ban, exempt, invex, MUTE quiet)
-///   B (param to set/unset):   k         (key)
-///   C (param to set only):    l f j     (limit, forward target, join throttle)
-///   D (flag, never param):    i m n s t C T N M S g
-/// `f`/`j`/`Z` live in the world layer (per-channel storage) rather than the
-/// compact `chanmode.ChannelMode` enum, but are fully parsed and enforced.
-/// Sourced from the shared protocol inventory (single source of truth).
+/// channel-MODE handler (see `server.zig` handleChannelMode). The inventory
+/// derives its classes from the compact and IRCX mode catalogs, plus the
+/// world-layer Z/f/j handlers; the test below checks the advertised surface.
 pub const CHANMODES_TOKEN = protocol_inventory.chanmodes_token;
 
 /// Max bytes retained for a captured `@label` value (post-unescape). Matches
@@ -3041,10 +3035,11 @@ test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
     const class_d = it.next().?;
     try std.testing.expect(it.next() == null); // exactly four classes
 
-    try std.testing.expectEqualStrings("beIZ", class_a);
+    try std.testing.expectEqualStrings(protocol_inventory.chanmodes_token, CHANMODES_TOKEN);
+    for ("beIZ") |letter| try std.testing.expect(std.mem.indexOfScalar(u8, class_a, letter) != null);
     try std.testing.expectEqualStrings("k", class_b);
-    try std.testing.expectEqualStrings("lfj", class_c);
-    try std.testing.expectEqualStrings("imnstCTNMSgWOAVUFD", class_d);
+    for ("lfj") |letter| try std.testing.expect(std.mem.indexOfScalar(u8, class_c, letter) != null);
+    for ("phuadErzxw") |letter| try std.testing.expect(std.mem.indexOfScalar(u8, class_d, letter) != null);
 
     // Letters backed by the compact chanmode.ChannelMode enum must resolve in the
     // catalog with the matching protocol class.
@@ -3072,7 +3067,7 @@ test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
     // The advertisement must not leak any letter the handler does not enforce.
     // The full enforced set across both layers (V = NOCOMICDATA, U = OPMODERATE,
     // F = FREETARGET, D = DISFORWARD).
-    const enforced = "beIZklfjimnstCTNMSgWOAVUFD";
+    const enforced = "beIZklfjimnstCTNMSgWOAVUFDphuadErzxw";
     for (class_a) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
     for (class_b) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
     for (class_c) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
