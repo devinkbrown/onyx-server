@@ -1,0 +1,10 @@
+[node]
+id = 1
+[listen]
+irc = 16680
+[sasl]
+account_db = "accounts.oro"
+[oper.ocg2]
+enabled = true
+authority_node_id = "379304d44f202c35"
+authority_public_key = "4721b5b632272e65a68dda7ac25b4185f8b01916db185c14287db92e2b770fae"

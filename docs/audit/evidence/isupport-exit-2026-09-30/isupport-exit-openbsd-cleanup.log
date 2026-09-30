@@ -1,0 +1,2 @@
+PASS: no fixture daemon; no generated key; exact fixture files removed
+PASS: graceful shutdown completed; owned QEMU name absent; PID file removed; fixture SSH port 2225 closed.

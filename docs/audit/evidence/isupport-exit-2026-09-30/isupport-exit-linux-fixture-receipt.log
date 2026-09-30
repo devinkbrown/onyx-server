@@ -1,0 +1,4 @@
+baseline: sha256=425f21c954072092cecef1ad4145e8b4dfa4491d8514a8dcf06ef5debd2ee3e7 exit=1 leak_records=16 leaked_bytes=694 key_absent=True
+debug: sha256=b545e691225f070327b9e624d9705d9b490394363489f8302c3443f703bc2576 exit=1 leak_records=0 leaked_bytes=0 key_absent=True
+rs: sha256=a5dfbbf309b04c2c5260b7f61030a34f7cb580583b1740d0c5984abe52b08270 exit=1 leak_records=0 leaked_bytes=0 key_absent=True
+PASS: same isolated OCG2 missing-key error return; no generated key; baseline 16/694, patched Debug and ReleaseSafe 0/0.

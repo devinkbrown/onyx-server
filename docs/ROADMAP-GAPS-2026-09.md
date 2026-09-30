@@ -21,9 +21,12 @@ OpenBSD port uses the shared complete daemon. Actual native Debug/ReleaseSafe
 gates cover TLS 1.2/1.3, WSS, IPv4/IPv6, services/WAL authentication, secured
 three-host partition/rejoin, stable reusable sessions and all three Helix
 upgrades (51 events / 243 bounded deliveries). Full Linux suites each pass
-8759/8783 with 24 skips and zero failures. Native evidence and the existing
+8761/8785 with 24 skips and zero failures. Native evidence and the existing
 far-nickname and same-IP mesh limitations are recorded in
-[the full-port record](dev/openbsd-full-port.md).
+[the full-port record](dev/openbsd-full-port.md). The subsequent
+[ISUPPORT cleanup follow-up](audit/evidence/isupport-exit-2026-09-30/README.md)
+closes the rejected-candidate missing-key allocation leak, with actual Linux
+and OpenBSD Debug/ReleaseSafe before/after boot-error evidence.
 The live account-directory
 acceptance and MESSAGE_V2 authoring activation remain unverified here.
 Fresh bounded review also found a remaining GAP-P16 seam: MARKREAD GET/SET

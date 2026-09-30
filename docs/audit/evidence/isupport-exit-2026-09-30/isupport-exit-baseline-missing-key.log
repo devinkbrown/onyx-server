@@ -1,0 +1,272 @@
+
+  Onyx Server 0.7.0+e83b2939-dirty
+  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+
+onyx-server: loaded config from /home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-fixture/config.toml
+onyx-server: fatal — OCG2 requires existing node key /home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-fixture/onyx-server-node.key (FileNotFound)
+error: FileNotFound
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Threaded.zig:4889:35: 0x1479dfb in dirOpenFilePosix (std.zig)
+                        .NOENT => return error.FileNotFound,
+                                  ^
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:581:5: 0x1315340 in openFile (std.zig)
+    return io.vtable.dirOpenFile(io.userdata, dir, sub_path, options);
+    ^
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:1364:16: 0x301cb24 in readFileAllocOptions__anon_666242 (std.zig)
+    var file = try dir.openFile(io, sub_path, .{
+               ^
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:1342:5: 0x301c7a0 in readFileAlloc (std.zig)
+    return readFileAllocOptions(dir, io, sub_path, gpa, limit, .of(u8), null);
+    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/node_keyfile.zig:143:18: 0x14cd66f in readSeed (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/node_keyfile.zig:108:5: 0x14cd8ad in loadExisting (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:749:21: 0x1525349 in main (main.zig)
+error(SafeAllocator): leaked [addr: 7f0d5a4ea9a8, len: 7 (0x7) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1918c in print__anon_655407 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f18d52 in allocPrint__anon_41264 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1406:47: 0x14e8ddf in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ea8f0, len: 14 (0xe) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f196a7 in print__anon_655435 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f192b3 in allocPrint__anon_41259 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1402:47: 0x14e8c99 in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ea7a8, len: 19 (0x13) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f19b97 in print__anon_655458 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f197c3 in allocPrint__anon_41248 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1401:43: 0x14e8b68 in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ea660, len: 10 (0xa) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1a0ac in print__anon_655502 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f19cc2 in allocPrint__anon_41233 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1394:44: 0x14e895e in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ea5c8, len: 11 (0xb) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1a80c in print__anon_655569 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1a582 in allocPrint__anon_41224 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1392:44: 0x14e87de in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ea480, len: 9 (0x9) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1aa4c in print__anon_655570 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1a642 in allocPrint__anon_41215 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1390:44: 0x14e865e in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ea3d0, len: 12 (0xc) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1b28c in print__anon_655616 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1b002 in allocPrint__anon_41206 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1388:44: 0x14e84de in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ea320, len: 15 (0xf) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1b4cc in print__anon_655617 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1b0c2 in allocPrint__anon_41197 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1386:44: 0x14e835e in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ea288, len: 16 (0x10) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1bd0c in print__anon_655672 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1ba82 in allocPrint__anon_41188 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1384:44: 0x14e81de in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ea140, len: 13 (0xd) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1bf4c in print__anon_655673 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1bb42 in allocPrint__anon_41179 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1382:44: 0x14e805e in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ea0a8, len: 11 (0xb) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1c9cc in print__anon_655729 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1c5c2 in allocPrint__anon_41161 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1378:44: 0x14e7d5e in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4edf28, len: 11 (0xb) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1d20c in print__anon_655776 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1cf82 in allocPrint__anon_41152 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1376:44: 0x14e7bde in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4eddf8, len: 12 (0xc) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1d44c in print__anon_655777 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1d042 in allocPrint__anon_41143 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1374:44: 0x14e7a5e in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4edcb0, len: 10 (0xa) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1c78c in print__anon_655728 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1c502 in allocPrint__anon_41170 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1380:44: 0x14e7ede in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4edc00, len: 12 (0xc) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2f1dd02 in print__anon_655825 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2f1da0c in allocPrint__anon_41133 (std.zig)
+    return gpa.print(fmt, args);
+                    ^
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1372:44: 0x14e78de in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+
+error(SafeAllocator): leaked [addr: 7f0d5a4ed8e8, len: 512 (0x200) align: 8] allocated at: 
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/daemon/server.zig:1368:36: 0x14e7719 in buildIsupportTokens (root.zig)
+/home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-baseline/src/main.zig:695:78: 0x1524031 in main (main.zig)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x15489d8 in callMain (std.zig)
+    return wrapMain(root.main(.{
+                             ^
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:217:5: 0x14c7e61 in _start (std.zig)
+    asm volatile (switch (native_arch) {
+    ^
+

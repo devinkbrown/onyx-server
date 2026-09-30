@@ -1,0 +1,140 @@
+
+  Onyx Server 0.7.0+15e09029-dirty
+  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+
+onyx-server: loaded config from /tmp/onyx-isupport-followup-e83b2939/config.toml
+onyx-server: fatal — OCG2 requires existing node key /tmp/onyx-isupport-followup-e83b2939/onyx-server-node.key (FileNotFound)
+error: FileNotFound
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Threaded.zig:4889:35: 0x2d33b4aeafb in dirOpenFilePosix (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:581:5: 0x2d33b3c8f50 in openFile (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:1364:16: 0x2d33c751dac in readFileAllocOptions__anon_678287 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:1342:5: 0x2d33c751943 in readFileAlloc (onyx-server)
+/home/kain/onyx-server/src/daemon/node_keyfile.zig:143:18: 0x2d33b4e2dd9 in readSeed (onyx-server)
+/home/kain/onyx-server/src/daemon/node_keyfile.zig:108:5: 0x2d33b4e2eb8 in loadExisting (onyx-server)
+/home/kain/onyx-server/src/main.zig:749:21: 0x2d33b524e48 in main (onyx-server)
+error(SafeAllocator): leaked [addr: 2d54fad4018, len: 7 (0x7) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c68e7b8 in print__anon_666795 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c68e4fa in allocPrint__anon_35885 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1406:47: 0x2d33b4f7155 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e97f18, len: 14 (0xe) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c68ebba in print__anon_666823 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c68e90a in allocPrint__anon_35880 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1402:47: 0x2d33b4f6fd9 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e97dd0, len: 19 (0x13) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c68ef6a in print__anon_666846 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c68ed0a in allocPrint__anon_35869 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1401:43: 0x2d33b4f6e70 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e97c88, len: 10 (0xa) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c68f328 in print__anon_666890 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c68f0ba in allocPrint__anon_35854 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1394:44: 0x2d33b4f6cec in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e97bf0, len: 11 (0xb) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c68f8a8 in print__anon_666957 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c68f66a in allocPrint__anon_35845 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1392:44: 0x2d33b4f6b30 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e97aa8, len: 9 (0x9) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c68fad8 in print__anon_666958 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c68f71a in allocPrint__anon_35836 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1390:44: 0x2d33b4f6971 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e979f8, len: 12 (0xc) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c6900c8 in print__anon_667004 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c68fe8a in allocPrint__anon_35827 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1388:44: 0x2d33b4f67b2 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e97948, len: 15 (0xf) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c6902f8 in print__anon_667005 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c68ff3a in allocPrint__anon_35818 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1386:44: 0x2d33b4f65f3 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e978b0, len: 16 (0x10) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c6908e8 in print__anon_667060 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c6906aa in allocPrint__anon_35809 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1384:44: 0x2d33b4f6434 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e97768, len: 13 (0xd) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c690b18 in print__anon_667061 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c69075a in allocPrint__anon_35800 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1382:44: 0x2d33b4f6275 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e976d0, len: 11 (0xb) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c691338 in print__anon_667117 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c690f7a in allocPrint__anon_35782 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1378:44: 0x2d33b4f5ef7 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e975a0, len: 11 (0xb) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c691928 in print__anon_667164 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c6916ea in allocPrint__anon_35773 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1376:44: 0x2d33b4f5d38 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e97470, len: 12 (0xc) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c691b58 in print__anon_667165 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c69179a in allocPrint__anon_35764 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1374:44: 0x2d33b4f5b79 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e97328, len: 10 (0xa) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c691108 in print__anon_667116 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c690eca in allocPrint__anon_35791 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1380:44: 0x2d33b4f60b6 in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e97278, len: 12 (0xc) align: 1] allocated at: 
+/usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x2d33c692158 in print__anon_667213 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x2d33c691f0a in allocPrint__anon_35754 (onyx-server)
+/home/kain/onyx-server/src/daemon/server.zig:1372:44: 0x2d33b4f59ba in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+
+error(SafeAllocator): leaked [addr: 2d5c1e96f60, len: 512 (0x200) align: 8] allocated at: 
+/home/kain/onyx-server/src/daemon/server.zig:1368:36: 0x2d33b4f576e in buildIsupportTokens (onyx-server)
+/home/kain/onyx-server/src/main.zig:695:78: 0x2d33b5239e6 in main (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/start.zig:790:30: 0x2d33b539f32 in callMain (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c:75:7: 0x2d33b3c0b4c in ___start (/usr/local/lib/zig-0.17/lib/zig/libc/openbsd/lib/csu/crt0.c)
+

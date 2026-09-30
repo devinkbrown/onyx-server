@@ -691,9 +691,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Advertise config-driven length limits (TOPICLEN) in ISUPPORT. Built once
-    // here, before any connection is served; owned for the process lifetime.
+    // here, before any connection is served; retained until server teardown.
     const isupport_tokens = try onyx_server.daemon.server.buildIsupportTokens(allocator, srv_cfg);
     onyx_server.proto.protocol_inventory.setIsupportOverride(isupport_tokens);
+    defer {
+        onyx_server.proto.protocol_inventory.setIsupportOverride(null);
+        onyx_server.daemon.server.freeIsupportTokens(allocator, isupport_tokens);
+    }
     // NICKLEN is enforced in the pre-registration dispatch path, which reads the
     // runtime-limits holder rather than a config handle.
     onyx_server.proto.protocol_inventory.setRuntimeLimits(.{ .nicklen = srv_cfg.nicklen });

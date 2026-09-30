@@ -9,6 +9,13 @@ the local source changes, not acceptance of every item in the gap roadmap.
 
 ## Changes and bounds
 
+- Follow-up to full-port commit `e83b2939`: free boot-created ISUPPORT tokens
+  on normal main returns after server teardown, clearing the borrowed global
+  override first. The same missing-key refusal has 16 allocation records /
+  694 bytes in Linux and OpenBSD Debug baselines, and zero in all four
+  patched Debug/ReleaseSafe executions. Explicit process-exit calls still bypass defers. See
+  [the follow-up evidence](evidence/isupport-exit-2026-09-30/README.md).
+
 - GAP-K10: early data requires a server clock plus sealed issue time, age-add,
   and lifetime proof. Refusal does not consume a replay slot; eligible 1-RTT
   fallback completes and exchanges encrypted application data. The same

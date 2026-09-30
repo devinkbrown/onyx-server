@@ -150,10 +150,17 @@ The latter can suppress a redial after a partition in a same-IP fixture.
 Both paths match the pre-port source; neither is counted as solved by these
 native gates. Shared-authoritative-session channel and direct delivery are
 covered across all three distinct hosts. Storage-fault atomicity for TOTP token
-revocation also remains a separate shared-services concern. A rejected candidate
-also exposes a pre-existing 694-byte ISUPPORT allocation leak on process exit;
-[the independent review](../audit/evidence/openbsd-2026-09-30/final-exit-allocation-review.md)
-classifies its lifetime and verifies native descriptor cleanup.
+revocation also remains a separate shared-services concern. The original port acceptance
+exposed a pre-existing 694-byte ISUPPORT allocation leak on the rejected
+candidate's missing-key error return. The subsequent
+[ISUPPORT cleanup follow-up](../audit/evidence/isupport-exit-2026-09-30/README.md)
+clears the global override and frees the tokens after server teardown. The
+same isolated missing-key refusal reproduces 16 leak records on the pre-fix
+commit and zero records in patched Linux Debug and ReleaseSafe. Native OpenBSD
+Debug and ReleaseSafe reproduce the same before/after result. This follow-up has an OpenBSD
+compile check; the original mesh/transport runtime evidence remains pinned to
+the original port artifacts. Explicit process-exit calls still bypass
+deferred cleanup.
 
 The native reactor now treats interrupted `kevent` waits as an empty poll,
 preserving registered operations and buffer custody. A syscall-return-only

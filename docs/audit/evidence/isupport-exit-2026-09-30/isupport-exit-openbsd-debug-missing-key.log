@@ -1,0 +1,14 @@
+
+  Onyx Server 0.7.0+e83b2939-dirty
+  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+
+onyx-server: loaded config from /tmp/onyx-isupport-followup-e83b2939/config.toml
+onyx-server: fatal — OCG2 requires existing node key /tmp/onyx-isupport-followup-e83b2939/onyx-server-node.key (FileNotFound)
+error: FileNotFound
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Threaded.zig:4889:35: 0x39b2557bb4b in dirOpenFilePosix (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:581:5: 0x39b25495fa0 in openFile (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:1364:16: 0x39b2681fa0c in readFileAllocOptions__anon_678289 (onyx-server)
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:1342:5: 0x39b2681f5a3 in readFileAlloc (onyx-server)
+/home/kain/onyx-server/src/daemon/node_keyfile.zig:143:18: 0x39b255afe29 in readSeed (onyx-server)
+/home/kain/onyx-server/src/daemon/node_keyfile.zig:108:5: 0x39b255aff08 in loadExisting (onyx-server)
+/home/kain/onyx-server/src/main.zig:753:21: 0x39b255f1f5d in main (onyx-server)

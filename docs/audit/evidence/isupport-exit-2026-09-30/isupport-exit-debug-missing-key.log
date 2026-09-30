@@ -1,0 +1,28 @@
+
+  Onyx Server 0.7.0+e83b2939-dirty
+  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+
+onyx-server: loaded config from /home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-fixture/config.toml
+onyx-server: fatal — OCG2 requires existing node key /home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-fixture/onyx-server-node.key (FileNotFound)
+error: FileNotFound
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Threaded.zig:4889:35: 0x1479dfb in dirOpenFilePosix (std.zig)
+                        .NOENT => return error.FileNotFound,
+                                  ^
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:581:5: 0x1315340 in openFile (std.zig)
+    return io.vtable.dirOpenFile(io.userdata, dir, sub_path, options);
+    ^
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:1364:16: 0x301d994 in readFileAllocOptions__anon_666218 (std.zig)
+    var file = try dir.openFile(io, sub_path, .{
+               ^
+/usr/local/lib/zig-0.17/lib/zig/std/Io/Dir.zig:1342:5: 0x301d610 in readFileAlloc (std.zig)
+    return readFileAllocOptions(dir, io, sub_path, gpa, limit, .of(u8), null);
+    ^
+/home/kain/onyx-server/src/daemon/node_keyfile.zig:143:18: 0x14cd66f in readSeed (root.zig)
+    const text = try dir.readFileAlloc(io, path, allocator, .limited(max_keyfile_bytes));
+                 ^
+/home/kain/onyx-server/src/daemon/node_keyfile.zig:108:5: 0x14cd8ad in loadExisting (root.zig)
+    return readSeed(allocator, io, dir, path);
+    ^
+/home/kain/onyx-server/src/main.zig:753:21: 0x15253eb in main (main.zig)
+                    return err;
+                    ^

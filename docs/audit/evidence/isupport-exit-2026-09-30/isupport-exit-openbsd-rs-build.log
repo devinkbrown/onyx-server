@@ -1,0 +1,9 @@
+Build Summary: 6/6 steps succeeded
+install success
++- install onyx-server success
+|  +- compile exe onyx-server ReleaseSafe x86_64-openbsd success 4m MaxRSS:1G
+|     +- options cached
++- install armor success
+   +- compile exe armor ReleaseSafe x86_64-openbsd success 49s MaxRSS:372M
+      +- options (reused)
+

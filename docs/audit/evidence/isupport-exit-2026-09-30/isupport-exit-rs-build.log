@@ -1,0 +1,9 @@
+Build Summary: 6/6 steps succeeded
+install success
++- install onyx-server success
+|  +- compile exe onyx-server ReleaseSafe native success 4m MaxRSS:1G
+|     +- options cached
++- install armor success
+   +- compile exe armor ReleaseSafe native success 40s MaxRSS:378M
+      +- options (reused)
+

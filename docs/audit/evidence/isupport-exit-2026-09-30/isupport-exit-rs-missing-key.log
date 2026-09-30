@@ -1,0 +1,7 @@
+
+  Onyx Server 0.7.0+e83b2939-dirty
+  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+
+onyx-server: loaded config from /home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-fixture/config.toml
+onyx-server: fatal — OCG2 requires existing node key /home/kain/onyx-server/.zig-cache/codex-resume/isupport-exit-fixture/onyx-server-node.key (FileNotFound)
+error: FileNotFound
