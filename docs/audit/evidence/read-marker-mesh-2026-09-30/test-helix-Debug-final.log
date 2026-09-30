@@ -1,0 +1,15 @@
+test-helix
++- run test w
+section 10 branch=stop maintaining memo_capsule away_capsule and ratelimit_capsule; CapsuleKind stays 1 through 17; ban_capsule stays
+GAP-A7 branch=refuse cold restart required before UPGRADE; unchanged listeners still queue
+GAP-O12 branch=a malformed BGNT image rejects the whole handoff
+GAP-P1 branch=a malformed THRD image rejects the whole handoff
+GAP-P3 branch=a malformed SCHD image rejects the whole handoff
+GAP-K8 branch=an HRR resumption binder covers ClientHello1 and the HelloRetryRequest
+failed command: ./.zig-cache/o/db4da52fa5ea113837976ef0ddf11dbb/test --cache-dir=./.zig-cache --seed=0x3c3cd763 --listen=-
+
+Build Summary: 4/4 steps succeeded; 775/780 tests passed (5 skipped)
+test-helix success
++- run test 775 pass, 5 skip (780 total) 1m MaxRSS:527M
+   +- compile test Debug native success 9s MaxRSS:664M
+      +- options cached

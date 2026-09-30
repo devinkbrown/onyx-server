@@ -11,7 +11,20 @@ const runtime = @import("../os_runtime.zig");
 const control = @import("native_control.zig");
 const exchange = @import("native_exchange.zig");
 pub const candidate_arg = "--helix-native-successor-v1";
-pub const capability = "onyx-native-helix-v1;strict-capsules;indexed-rights;encrypted-arena;inert-ready;commit-owner";
+pub const predecessor_capability = "onyx-native-helix-v1;strict-capsules;indexed-rights;encrypted-arena;inert-ready;commit-owner";
+pub const capability = predecessor_capability ++ ";read-marker-mesh-v1";
+
+fn acceptsCurrentReply(reply: []const u8) bool {
+    return std.mem.eql(u8, reply, capability);
+}
+
+fn replyForHello(hello: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, hello, capability)) return capability;
+    // Forward bridge only: the new reader can adopt the old writer's state.
+    // A current writer still requires the private-marker reader capability.
+    if (std.mem.eql(u8, hello, predecessor_capability)) return predecessor_capability;
+    return null;
+}
 pub const Error = exchange.Error || std.mem.Allocator.Error || error{ ForkFailed, InvalidCandidate, RandomSourceFailed };
 pub const Process = struct {
     pid: i32 = -1,
@@ -77,7 +90,7 @@ pub const Process = struct {
         try exchange.send(process.fd, hello, capability, &.{}, deadline);
         var reply = try exchange.receive(process.fd, .{ .kind = .capabilities, .identity = identity, .index = 0, .total = 1 }, deadline);
         defer reply.deinit();
-        if (reply.fd_count != 0 or !std.mem.eql(u8, reply.bytes()[exchange.header_len..], capability)) return error.InvalidCandidate;
+        if (reply.fd_count != 0 or !acceptsCurrentReply(reply.bytes()[exchange.header_len..])) return error.InvalidCandidate;
         return process;
     }
 };
@@ -92,6 +105,15 @@ pub fn accept(fd: i32, parent_pid: i32, identity: exchange.Identity, deadline: i
     runtime.setNonblocking(fd) catch return error.InvalidCandidate;
     var hello = try exchange.receive(fd, .{ .kind = .hello, .identity = identity, .index = 0, .total = 1 }, deadline);
     defer hello.deinit();
-    if (hello.fd_count != 0 or !std.mem.eql(u8, hello.bytes()[exchange.header_len..], capability)) return error.InvalidCandidate;
-    try exchange.send(fd, .{ .kind = .capabilities, .identity = identity, .index = 0, .total = 1 }, capability, &.{}, deadline);
+    if (hello.fd_count != 0) return error.InvalidCandidate;
+    const response = replyForHello(hello.bytes()[exchange.header_len..]) orelse return error.InvalidCandidate;
+    try exchange.send(fd, .{ .kind = .capabilities, .identity = identity, .index = 0, .total = 1 }, response, &.{}, deadline);
+}
+
+test "MARKREAD native private reader gate preserves forward upgrade only" {
+    try std.testing.expect(acceptsCurrentReply(capability));
+    try std.testing.expect(!acceptsCurrentReply(predecessor_capability));
+    try std.testing.expectEqualStrings(predecessor_capability, replyForHello(predecessor_capability).?);
+    try std.testing.expectEqualStrings(capability, replyForHello(capability).?);
+    try std.testing.expect(replyForHello(capability ++ ";unknown") == null);
 }

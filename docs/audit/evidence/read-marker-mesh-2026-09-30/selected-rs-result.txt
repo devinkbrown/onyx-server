@@ -1,0 +1,1 @@
+exit=0 elapsed=470.21s command=zig build test-server test-services test-helix test-mesh -Doptimize=ReleaseSafe --summary all

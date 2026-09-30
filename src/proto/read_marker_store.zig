@@ -31,6 +31,8 @@ pub const Params = struct {
 pub const ReadMarkerStoreError = wire.ReadMarkerError || error{
     InvalidOwner,
     OutOfMemory,
+    PreparedMutationActive,
+    PreparedGenerationExhausted,
 };
 
 pub const Request = union(enum) {
@@ -61,6 +63,49 @@ pub fn ReadMarkerStore(comptime params: Params) type {
 
         allocator: std.mem.Allocator,
         entries: std.StringHashMap(Timestamp),
+        active_prepared: ?PreparedPlan = null,
+        next_generation: u64 = 1,
+
+        const PreparedPlan = struct {
+            generation: u64,
+            key: [max_key_bytes]u8,
+            key_len: usize,
+            owned_key: ?[]u8,
+            result: SetResult,
+        };
+
+        /// Caller serializes this reservation through commit/abort. All memory
+        /// is reserved before a durable write; commit only publishes the value.
+        pub const PreparedSet = struct {
+            store: *Self,
+            generation: u64,
+            result: SetResult,
+
+            pub fn commit(self: *PreparedSet) SetResult {
+                const plan = self.store.active_prepared orelse return self.result;
+                if (plan.generation != self.generation) return self.result;
+                if (plan.result.changed) {
+                    if (plan.owned_key) |key| {
+                        self.store.entries.putAssumeCapacityNoClobber(key, plan.result.timestamp);
+                    } else {
+                        self.store.entries.getPtr(plan.key[0..plan.key_len]).?.* = plan.result.timestamp;
+                    }
+                }
+                self.store.active_prepared = null;
+                return plan.result;
+            }
+
+            pub fn abort(self: *PreparedSet) void {
+                const plan = self.store.active_prepared orelse return;
+                if (plan.generation != self.generation) return;
+                if (plan.owned_key) |key| self.store.allocator.free(key);
+                self.store.active_prepared = null;
+            }
+
+            pub fn deinit(self: *PreparedSet) void {
+                self.abort();
+            }
+        };
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
@@ -76,6 +121,10 @@ pub fn ReadMarkerStore(comptime params: Params) type {
         }
 
         pub fn clear(self: *Self) void {
+            if (self.active_prepared) |plan| {
+                if (plan.owned_key) |key| self.allocator.free(key);
+                self.active_prepared = null;
+            }
             var it = self.entries.iterator();
             while (it.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
@@ -93,37 +142,34 @@ pub fn ReadMarkerStore(comptime params: Params) type {
             target: []const u8,
             timestamp: Timestamp,
         ) ReadMarkerStoreError!SetResult {
-            var key_buf: [max_key_bytes]u8 = undefined;
-            const key = try makeKey(owner, target, &key_buf);
+            var prepared = try self.prepareSet(owner, target, timestamp);
+            defer prepared.deinit();
+            return prepared.commit();
+        }
 
-            if (self.entries.getPtr(key)) |stored| {
-                if (!timestamp.newerThan(stored.*)) {
-                    return .{ .timestamp = stored.*, .changed = false };
-                }
-
-                stored.* = timestamp;
-                return .{ .timestamp = timestamp, .changed = true };
+        pub fn prepareSet(self: *Self, owner: []const u8, target: []const u8, timestamp: Timestamp) ReadMarkerStoreError!PreparedSet {
+            if (self.active_prepared != null) return error.PreparedMutationActive;
+            if (self.next_generation == std.math.maxInt(u64)) return error.PreparedGenerationExhausted;
+            var plan: PreparedPlan = .{
+                .generation = self.next_generation,
+                .key = undefined,
+                .key_len = 0,
+                .owned_key = null,
+                .result = .{ .timestamp = timestamp, .changed = true },
+            };
+            const key = try makeKey(owner, target, &plan.key);
+            plan.key_len = key.len;
+            if (self.entries.get(key)) |stored| {
+                if (!timestamp.newerThan(stored)) plan.result = .{ .timestamp = stored, .changed = false };
+            } else {
+                if (self.entries.count() >= params.max_entries) return error.TargetLimitExceeded;
+                plan.owned_key = self.allocator.dupe(u8, key) catch return error.OutOfMemory;
+                errdefer self.allocator.free(plan.owned_key.?);
+                self.entries.ensureUnusedCapacity(1) catch return error.OutOfMemory;
             }
-
-            if (self.entries.count() >= params.max_entries) return error.TargetLimitExceeded;
-
-            const owned_key = self.allocator.dupe(u8, key) catch return error.OutOfMemory;
-            errdefer self.allocator.free(owned_key);
-
-            const gop = self.entries.getOrPut(owned_key) catch return error.OutOfMemory;
-            if (gop.found_existing) {
-                self.allocator.free(owned_key);
-                if (!timestamp.newerThan(gop.value_ptr.*)) {
-                    return .{ .timestamp = gop.value_ptr.*, .changed = false };
-                }
-
-                gop.value_ptr.* = timestamp;
-                return .{ .timestamp = timestamp, .changed = true };
-            }
-
-            gop.key_ptr.* = owned_key;
-            gop.value_ptr.* = timestamp;
-            return .{ .timestamp = timestamp, .changed = true };
+            self.next_generation += 1;
+            self.active_prepared = plan;
+            return .{ .store = self, .generation = plan.generation, .result = plan.result };
         }
 
         pub fn get(
@@ -323,4 +369,49 @@ test "bounded store and no leak after clear" {
     store.clear();
     try std.testing.expectEqual(@as(usize, 0), store.count());
     _ = try store.set("owner", "#after", timestamp);
+}
+
+test "MARKREAD prepared set abort and allocation failures retain monotonic state" {
+    const alloc = std.testing.allocator;
+    const old = try Timestamp.parseWire("2026-06-02T08:09:10.123Z");
+    const next = try Timestamp.parseWire("2026-06-02T08:09:11.000Z");
+    var failure_index: usize = 0;
+    while (true) : (failure_index += 1) {
+        var failing = std.testing.FailingAllocator.init(alloc, .{});
+        var store = DefaultStore.init(failing.allocator());
+        defer store.deinit();
+        _ = try store.set("alice", "#old", old);
+        failing.fail_index = failing.alloc_index + failure_index;
+        failing.resize_fail_index = 0;
+        var candidate = store.prepareSet("alice", "#new", next) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 1), store.count());
+            try std.testing.expect((try store.get("alice", "#new")) == null);
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try store.prepareSet("alice", "#new", next);
+            const allocations = failing.alloc_index;
+            _ = retry.commit();
+            retry.deinit();
+            try std.testing.expectEqual(allocations, failing.alloc_index);
+            try std.testing.expectEqualStrings(next.slice(), (try store.get("alice", "#NEW")).?.slice());
+            continue;
+        };
+        try std.testing.expect((try store.get("alice", "#new")) == null);
+        try std.testing.expectError(error.PreparedMutationActive, store.set("other", "#new", old));
+        candidate.abort();
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expect((try store.get("alice", "#new")) == null);
+        var retry = try store.prepareSet("alice", "#new", next);
+        const allocations = failing.alloc_index;
+        _ = retry.commit();
+        retry.deinit();
+        try std.testing.expectEqual(allocations, failing.alloc_index);
+        try std.testing.expect(failure_index >= 1);
+        var replacement = try store.prepareSet("alice", "#old", next);
+        replacement.abort();
+        try std.testing.expectEqualStrings(old.slice(), (try store.get("alice", "#old")).?.slice());
+        _ = try store.set("alice", "#old", next);
+        try std.testing.expect(!(try store.set("alice", "#old", old)).changed);
+        break;
+    }
 }

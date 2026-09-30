@@ -1,0 +1,12 @@
+test-mod
++- run test w
+MARKREAD allocation sweep inbound=false rejected=16 then success
+MARKREAD allocation sweep inbound=true rejected=16 then success
+MARKREAD restore allocation sweep rejected=7 then success
+failed command: ./.zig-cache/o/b3db4634a1f2ce5736ba9caeb24c3887/test --cache-dir=./.zig-cache --seed=0x92d550be --listen=-
+
+Build Summary: 4/4 steps succeeded; 94/94 tests passed
+test-mod success
++- run test 94 pass (94 total) 17s MaxRSS:485M
+   +- compile test Debug native success 9s MaxRSS:620M
+      +- options cached

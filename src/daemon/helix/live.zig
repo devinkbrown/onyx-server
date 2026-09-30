@@ -298,14 +298,13 @@ const predecessor_v4_upgrade_capability_caps =
 pub const predecessor_v4_upgrade_capability_token =
     "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_v4_upgrade_capability_caps;
 const upgrade_capability_caps =
-    "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,sessions-v4,state-fd-manifest-v1,webhook-store-v1,world-v2";
+    "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,sessions-v4,state-fd-manifest-v1,webhook-store-v1,world-v2";
 pub const upgrade_capability_token =
     "ONYX_HELIX_UPGRADE_CAPS=" ++ upgrade_capability_caps;
 /// Current-first for diagnostics; trailing frozen lines are the narrow
 /// forward-upgrade bridges consumed by deployed v4 (0.5.8) and v3
-/// predecessors. Duplicate current/v4 lines are expected while they still
-/// match and stay required so a later current-token change does not drop
-/// the 0.5.8 exact-line match.
+/// predecessors. The current private-marker reader requirement prevents a
+/// downgrade from inheriting queued facts that an older reader exposes as PROP.
 pub const upgrade_capability_advertisement =
     upgrade_capability_token ++ "\n" ++
     predecessor_v4_upgrade_capability_token ++ "\n" ++
@@ -1395,4 +1394,10 @@ test "exec plan owns argv and envp without committing" {
     try std.testing.expectEqualStrings("--supervisor", plan.argv[1]);
     try std.testing.expectEqualStrings("ONYX_HELIX_ARENA_FD=10", plan.envp[0]);
     try std.testing.expectEqualStrings("ONYX_HELIX_CONTROL_FD=11", plan.envp[1]);
+}
+
+test "MARKREAD private reader refuses hot downgrade and retains forward bridge" {
+    try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_v4_upgrade_capability_token ++ "\n"));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement));
+    try std.testing.expect(hasCompleteOutputLine(upgrade_capability_advertisement, predecessor_v4_upgrade_capability_token));
 }

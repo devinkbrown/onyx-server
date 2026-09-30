@@ -38,12 +38,17 @@ normal stack. Full Linux Debug and ReleaseSafe each pass 8794/8818 with 24
 skips and zero failures. Batch-format stores require the new reader; cold downgrade is
 unsupported. The live account-directory
 acceptance and MESSAGE_V2 authoring activation remain unverified here.
-Fresh bounded review also found a remaining GAP-P16 seam: MARKREAD GET/SET
-and `rememberReadMarker` use the local store, while the cold-restore test's
-second attachment reads that same store. No read-marker mesh relay was found;
-that test does not prove migration to another node keeps the read position.
-The next local slice should reconcile authenticated account-scoped markers
-between distinct nodes and prove monotonic convergence after partition heal.
+The subsequent [account read-marker mesh continuation](audit/read-marker-mesh-2026-09-30.md)
+implements GAP-P16 authenticated account positions across distinct secured nodes:
+atomic per-key durable facts and independent clock, timestamp-max convergence,
+private capability negotiation, original-signature forwarding and retained repair.
+Actual A-B-C client tests cover partition/heal and opposite-edge resume; sequential
+Helix keeps all four shared-account transports participating. Private-reader gates
+refuse hot downgrade before descriptor handoff. Acceptance receipts and limits are
+in [the evidence record](audit/evidence/read-marker-mesh-2026-09-30/README.md).
+Guests remain physical-connection memory only. Marker privacy assumes consistent
+canonical Services account provisioning; global account-directory activation is
+still a separate gap. This continuation has not been deployed.
 The continuation also closes GAP-K10's missing-freshness branch: a clock and
 sealed ticket issue time, age-add, and lifetime are required before early-data
 acceptance can consume a replay slot. Eligible 1-RTT fallback remains available.
@@ -694,6 +699,12 @@ and real host, KNOCK that does not claim delivery it did not do, and a
 reaction tally that survives a subscriber joining late.
 
 ### GAP-P16 — Read markers are this process
+
+**Current continuation:** authenticated account mesh and upgrade positions now
+have implementation and local acceptance evidence linked in the continuation note
+above. The following paragraph describes the frozen baseline audit; it is not a
+current-source defect claim. Guest process continuity and global account ownership
+are outside this bounded slice.
 
 **Size M.** `MARKREAD` keys a process-local map by account or nick. Nothing
 relays it over S2S. The Helix codec is not on the seal path. `onyx/bouncer`

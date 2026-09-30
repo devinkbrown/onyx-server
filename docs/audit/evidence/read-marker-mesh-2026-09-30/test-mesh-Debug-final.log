@@ -1,0 +1,15 @@
+test-mesh
++- run test w
+GAP-A2 branch=check-config refuse unsecured mesh.connect; compat default
+GAP-K7 branch=written threat boundary; history rekey is not a daemon mode because the daemon holds no epoch key; metadata-min is refused because NAMES search and abuse require server-visible membership; implementation does not follow
+GAP-O8 branch=filter exchanged before the ward list; a hit is re-checked and is not the authority
+GAP-O9 branch=two-person rule waits for a second distinct operator; flag off is unchanged
+GAP-P5 branch=mesh link returns one authorized hit and skips ciphertext
+GAP-P5 branch=mesh link local batch plus peer hits stay inside the hard cap
+failed command: ./.zig-cache/o/718f1e4acae36d8f3cc9597e6712d8dd/test --cache-dir=./.zig-cache --seed=0x32ceacbe --listen=-
+
+Build Summary: 4/4 steps succeeded; 506/508 tests passed (2 skipped)
+test-mesh success
++- run test 506 pass, 2 skip (508 total) 46s MaxRSS:508M
+   +- compile test Debug native success 8s MaxRSS:684M
+      +- options cached

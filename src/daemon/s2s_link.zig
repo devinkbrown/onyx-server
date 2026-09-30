@@ -895,6 +895,10 @@ pub const S2sLink = struct {
         return self.peer.takeWards();
     }
 
+    pub fn supportsReadMarkers(self: *const S2sLink) bool {
+        return self.peer.supportsReadMarkers();
+    }
+
     pub fn supportsMeshSearch(self: *const S2sLink) bool {
         return self.peer.supportsMeshSearch();
     }

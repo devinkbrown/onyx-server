@@ -1,0 +1,4 @@
+OpenBSD onyx-obsd-codex.my.domain 7.9 GENERIC.MP#449 amd64
+8192
+Filesystem     Size    Used   Avail Capacity  Mounted on
+/dev/sd0a      1.0G    184M    813M    19%    /

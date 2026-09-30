@@ -682,6 +682,27 @@ pub const SecuredLink = struct {
         origin: s2s_peer.S2sPeer.PropOrigin,
     ) anyerror!void {
         const link = self.inner orelse return;
+        if (key.len >= 12 and std.ascii.eqlIgnoreCase(key[0..12], "read.marker/")) {
+            if (!link.supportsReadMarkers()) return error.ReadMarkersUnavailable;
+            // Reserve both queues before publishing private plaintext. A retry
+            // must not duplicate a fact left behind by outer ciphertext OOM.
+            if (link.outbound().len != 0) return error.PendingInnerOutbound;
+            const transport_len = try entity_prop_event.encodedLen(.{
+                .kind = kind,
+                .entity = entity,
+                .key = key,
+                .value = value,
+                .owner = owner,
+                .hlc = hlc,
+                .present = present,
+                .origin_node = origin.node,
+                .origin_pubkey = origin.pubkey,
+                .origin_sig = origin.sig,
+            });
+            const inner_len = s2s_frame.header_len + signed_frame.header_len + transport_len;
+            try self.out.ensureUnusedCapacity(self.allocator, record_len_prefix + record_tag_len + inner_len);
+            try link.reserveOutboundCapacity(inner_len);
+        }
         try link.sendEntityProp(kind, entity, key, value, owner, hlc, present, origin);
         try self.drainInner();
     }
@@ -1204,6 +1225,11 @@ pub const SecuredLink = struct {
     pub fn takeWards(self: *SecuredLink) anyerror![][]u8 {
         const link = self.inner orelse return &.{};
         return link.takeWards();
+    }
+
+    pub fn supportsReadMarkers(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsReadMarkers();
     }
 
     pub fn supportsMeshSearch(self: *const SecuredLink) bool {

@@ -1,0 +1,23 @@
+test-mod
++- run test 89 pass, 1 fail (90 total)
+MARKREAD restore allocation sweep rejected=7 then success
+error: 'daemon.server.test.MARKREAD secured burst keeps signed frontier through SendQ pressure outer OOM and duplicate repair' failed:
+       MARKREAD allocation sweep inbound=false rejected=16 then success
+       MARKREAD allocation sweep inbound=true rejected=16 then success
+       expected 0, found 319
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x156abe9 in expectEqualInner__anon_46018 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x2e37dfc in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:63668:5: 0x2e3802f in test.MARKREAD secured burst keeps signed frontier through SendQ pressure outer OOM and duplicate repair (root.zig)
+           try std.testing.expectEqual(@as(usize, 0), pair.a.inner.?.outbound().len);
+           ^
+failed command: ./.zig-cache/o/fbcab951d5196152bafec7ed0149ab6f/test --cache-dir=./.zig-cache --seed=0x8034f67d --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 89/90 tests passed (1 failed)
+test-mod transitive failure
++- run test 89 pass, 1 fail (90 total)
+   +- compile test Debug native success 7s MaxRSS:630M
+      +- options cached

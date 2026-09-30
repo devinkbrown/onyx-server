@@ -1,0 +1,42 @@
+test-server
++- run test 465 pass, 4 skip, 3 fail (472 total)
+GAP-D3 branch=same-image USR2 kept gag 192.0.2.11 and granted vhost staff
+GAP-D5 branch=same-image USR2 invalidated the pre-crash verify and reset tokens, then SCRAM and CertFP still resolved and a new token confirmed
+GAP-X2 step3 branch=SEARCH command family moved behind the messaging thunk and the membership rate-limit and result cap still hold
+error: 'daemon.server.test.threaded server: bouncer rewind is suppressed for a non-oper member on a history-policy=opers channel' failed:
+       /home/kain/onyx-server/src/daemon/server.zig:84226:57: 0x1c4b282 in recvUntil (root.zig)
+                   if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+                                                               ^
+       /home/kain/onyx-server/src/daemon/server.zig:62476:5: 0x33c8361 in runBouncerRewindScenario (root.zig)
+           try recvUntil(m, "MARKREAD #rewind timestamp=2000-01-01T00:00:00.000Z\r\n", 200);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:62503:5: 0x33cc179 in test.threaded server: bouncer rewind is suppressed for a non-oper member on a history-policy=opers channel (root.zig)
+           try runBouncerRewindScenario("member", true, false);
+           ^
+error: 'daemon.server.test.threaded server: bouncer rewind still replays for an oper member on a history-policy=opers channel' failed:
+       /home/kain/onyx-server/src/daemon/server.zig:84226:57: 0x1c4b282 in recvUntil (root.zig)
+                   if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+                                                               ^
+       /home/kain/onyx-server/src/daemon/server.zig:62476:5: 0x33c8361 in runBouncerRewindScenario (root.zig)
+           try recvUntil(m, "MARKREAD #rewind timestamp=2000-01-01T00:00:00.000Z\r\n", 200);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:62507:5: 0x33cc0d9 in test.threaded server: bouncer rewind still replays for an oper member on a history-policy=opers channel (root.zig)
+           try runBouncerRewindScenario("boss", true, true);
+           ^
+error: 'daemon.server.test.threaded server: bouncer rewind replays normally for a non-oper member on a default-policy channel' failed:
+       /home/kain/onyx-server/src/daemon/server.zig:84226:57: 0x1c4b282 in recvUntil (root.zig)
+                   if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+                                                               ^
+       /home/kain/onyx-server/src/daemon/server.zig:62476:5: 0x33c8361 in runBouncerRewindScenario (root.zig)
+           try recvUntil(m, "MARKREAD #rewind timestamp=2000-01-01T00:00:00.000Z\r\n", 200);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:62511:5: 0x33ca7b9 in test.threaded server: bouncer rewind replays normally for a non-oper member on a default-policy channel (root.zig)
+           try runBouncerRewindScenario("member", false, true);
+           ^
+failed command: ./.zig-cache/o/3bf25aa16bc86c7b17dc9cf236d79840/test --cache-dir=./.zig-cache --seed=0x5b4fc241 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 465/472 tests passed (4 skipped, 3 failed)
+test-server transitive failure
++- run test 465 pass, 4 skip, 3 fail (472 total)
+   +- compile test Debug native success 12s MaxRSS:639M
+      +- options cached

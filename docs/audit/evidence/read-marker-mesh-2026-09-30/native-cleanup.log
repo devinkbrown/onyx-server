@@ -1,0 +1,8 @@
+OWNED_FIXTURE_REMOVED
+Shutdown NOW!
+shutdown: [pid 75544]
+Connection to 127.0.0.1 closed by remote host.
+Owned QEMU PID 1685626 absent: True
+Port 2225 reachable=False
+Port 2223 reachable=True
+Port 2222 reachable=True

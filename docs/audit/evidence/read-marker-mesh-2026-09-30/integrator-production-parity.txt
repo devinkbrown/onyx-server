@@ -1,0 +1,4 @@
+Final server SHA256: 71221570d685a0c30a5d77ccfdc12094524d369f052fbf9bab119fafc62a1a3a
+Restoring only baseline bouncer test fixture gives: b06200df2e644f579dd062973e0d2e65e475e2543af957f9913bf9318ffd5689
+Also removing only the added v4-only executable test gives: 441a7064aab7dc6a8a7a966cdf92246c3b1c373933ede333967ea4a4c09708a9
+PASS: exact earlier source bytes restored by two test-only changes; no later production delta.

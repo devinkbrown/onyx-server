@@ -1,0 +1,4 @@
+zig build test --summary all: exit 0; 8811/8835 passed, 24 skipped, zero failed. Build-reported compile 33s / module run 23m; CLI 53/53, empty daemon selected runner.
+zig build test -Doptimize=ReleaseSafe --summary all: exit 0; 8811/8835 passed, 24 skipped, zero failed. Build-reported compile 14m / module run 3m; CLI 53/53, empty daemon selected runner.
+Source: final source-sha256.txt, server 71221570d685a0c30a5d77ccfdc12094524d369f052fbf9bab119fafc62a1a3a.
+Actual module contribution 8758 passed / 8782; CLI 53 passed /53; total8811 /8835.

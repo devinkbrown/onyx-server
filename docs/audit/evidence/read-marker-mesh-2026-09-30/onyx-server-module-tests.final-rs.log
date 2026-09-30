@@ -1,0 +1,98 @@
+1/94 root.test_0...OK
+2/94 crypto.root.test_0...OK
+3/94 daemon.root.test_0...OK
+4/94 proto.root.test_0...OK
+5/94 substrate.root.test_0...OK
+6/94 wasm.host.root.test_0...OK
+7/94 substrate.io.root.test_0...OK
+8/94 substrate.ripple_props.test_0...OK
+9/94 substrate.ripple.test_0...OK
+10/94 substrate.undertow.root.test_0...OK
+11/94 substrate.undertow.peer_link.test_0...OK
+12/94 substrate.undertow.s2s_peer.test.MARKREAD mesh extension gates private facts and rejects legacy echo and unsigned frames...OK
+13/94 crypto.sign.test_0...OK
+14/94 substrate.io.buf_ring.test_0...OK
+15/94 substrate.io.ring.test_0...OK
+16/94 proto.asn1_time.test_0...OK
+17/94 proto.certfp.test_0...OK
+18/94 proto.cloak.test_0...OK
+19/94 proto.ircx_modex.test_0...OK
+20/94 proto.ircx_saccess.test_0...OK
+21/94 proto.listx.test_0...OK
+22/94 proto.mooring.test_0...OK
+23/94 proto.mooring_props.test_0...OK
+24/94 proto.quic_handshake.test_0...OK
+25/94 proto.quic_transport_params.test_0...OK
+26/94 proto.read_marker_store.test.parse GET SET and malformed MARKREAD...OK
+27/94 proto.read_marker_store.test.MARKREAD prepared set abort and allocation failures retain monotonic state...OK
+28/94 proto.sasl_external_verify.test_0...OK
+29/94 proto.sasl_mechrouter.test_0...OK
+30/94 proto.sasl_oauthbearer.test_0...OK
+31/94 proto.sasl.test_0...OK
+32/94 proto.sasl_scram512_server.test_0...OK
+33/94 proto.sasl_scram.test_0...OK
+34/94 proto.sasl_scram_server.test_0...OK
+35/94 proto.signed_delta.test_0...OK
+36/94 proto.toml.test_0...OK
+37/94 proto.x509.test_0...OK
+38/94 daemon.modules.manifest.test_0...OK
+39/94 daemon.key_transparency.test_0...OK
+40/94 daemon.acme_cli.test_0...OK
+41/94 daemon.acme_http01_listener.test_0...OK
+42/94 daemon.acme_renewal.test_0...OK
+43/94 daemon.acme_runner.test_0...OK
+44/94 daemon.config_format.test_0...OK
+45/94 daemon.helix.root.test_0...OK
+46/94 daemon.metrics_http.test_0...OK
+47/94 daemon.webhook.test_0...OK
+48/94 daemon.webhook_render.test_0...OK
+49/94 daemon.webhook_http.test_0...OK
+50/94 daemon.oauth_jwt.test_0...OK
+51/94 daemon.ocsp_staple.test_0...OK
+52/94 daemon.reactor_pool.test_0...OK
+53/94 daemon.sasl_bridge.test_0...OK
+54/94 daemon.scram_store.test_0...OK
+55/94 daemon.server.test.MARKREAD atomic live dispatch isolates guests and publishes once to physical account attachments...OK
+56/94 daemon.server.test.MARKREAD signed timestamp max ignores HLC rollback and rejects unsigned forged future facts...OK
+57/94 daemon.server.test.MARKREAD atomic local and inbound admission allocation sweeps retain exact state and retry...MARKREAD allocation sweep inbound=false rejected=16 then success
+MARKREAD allocation sweep inbound=true rejected=16 then success
+OK
+58/94 daemon.server.test.MARKREAD secured burst keeps signed frontier through SendQ pressure outer OOM and duplicate repair...OK
+59/94 daemon.server.test.MARKREAD restore allocation sweep preserves the complete live frontier until a valid swap...MARKREAD restore allocation sweep rejected=7 then success
+OK
+60/94 daemon.server.test.MARKREAD live write short write and sync faults publish no runtime position or account notification...OK
+61/94 daemon.server.test.MARKREAD signed frontier and independent clock cold restore atomically and corrupt fact fails closed...OK
+62/94 daemon.server.test.UPGRADE GAP-P16 MARKREAD survives the dropped process image and rewind stays bounded...OK
+63/94 daemon.server.test.threaded server: MARKREAD set then get...OK
+64/94 daemon.server.test.threaded server: JOIN pushes stored MARKREAD marker...OK
+65/94 daemon.server.test.MARKREAD UPGRADE refuses a v4-only executable preserving private carried ciphertext...SKIP
+66/94 daemon.server.test.threaded server: four-client reusable session and MARKREAD survive sequential Helix upgrades across secured mesh...SKIP
+67/94 daemon.server.test.threaded server: reusable session and MARKREAD stay exact-once across a three-node secured line...SKIP
+68/94 daemon.server.test_0...OK
+69/94 daemon.sessions.test_0...OK
+70/94 daemon.tls_certs.test_0...OK
+71/94 daemon.tls_conn.test_0...OK
+72/94 daemon.tls_sni_load.test_0...OK
+73/94 crypto.tls_server.test_0...OK
+74/94 crypto.tls_record.test_0...OK
+75/94 crypto.hkdf_tls13.test_0...OK
+76/94 crypto.hash.test_0...OK
+77/94 crypto.random.test_0...OK
+78/94 crypto.kx.test_0...OK
+79/94 crypto.xwing.test_0...OK
+80/94 daemon.helix.live.test.MARKREAD private reader refuses hot downgrade and retains forward bridge...OK
+81/94 crypto.tls_client.test_0...OK
+82/94 crypto.sct.test_0...OK
+83/94 daemon.marker_durable.test.MARKREAD durable prepared row and clock preserve abort retry and reopen...OK
+84/94 daemon.marker_durable.test.MARKREAD malformed legacy metadata preserves existing runtime markers...OK
+85/94 daemon.marker_durable.test.MARKREAD durable admission allocation sweep preserves row runtime and clock then retries...OK
+86/94 daemon.marker_durable.test.MARKREAD durable ambiguous I/O retains live marker and clock until reopen...OK
+87/94 daemon.marker_durable.test.MARKREAD repeated per-key commits keep retained durable rows bounded through compaction...OK
+88/94 daemon.helix.native_process.test.MARKREAD native private reader gate preserves forward upgrade only...OK
+89/94 crypto.aead.test_0...OK
+90/94 crypto.ecdsa_kat.test_0...OK
+91/94 crypto.ed25519_batch.test_0...OK
+92/94 crypto.sign_kat.test_0...OK
+93/94 crypto.tls_props.test_0...OK
+94/94 crypto.tls.test_0...OK
+91 passed; 3 skipped; 0 failed.

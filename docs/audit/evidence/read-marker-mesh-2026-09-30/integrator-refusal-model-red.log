@@ -1,0 +1,47 @@
+test-mod
++- run test 71 pass, 1 fail (72 total)
+error: 'daemon.server.test.MARKREAD UPGRADE refuses a v4-only executable with private carried queues unchanged' failed:
+       slices differ. first difference occurs at index 342 (0x156)
+
+       ============ expected this output: =============  len: 342 (0x156)
+
+       ... truncated, start index: 0x140 ...
+       6D 22 E5 A0 63 4E 65 BC  95 2E F6 7E 47 7D B4 D9  m"..cNe....~G}..
+       2C F3 31 A0 6C 52                                 ,.1.lR
+
+       ============= instead found this: ==============  len: 1073 (0x431)
+
+       ... truncated, start index: 0x140 ...
+       6D 22 E5 A0 63 4E 65 BC  95 2E F6 7E 47 7D B4 D9  m"..cNe....~G}..
+       2C F3 31 A0 6C 52 52 01  00 00 3F 5B 6B 05 62 9E  ,.1.lRR...?[k.b.
+       F2 8C 60 44 1B 0D 8B C4  CF 7B 03 F3 9B D7 70 B6  ..`D.␍...{....p.
+       5A 4A C1 D2 3F 3F F4 21  76 F3 20 DE 34 B0 82 22  ZJ..??.!v. .4.."
+       C5 D9 CE 00 EF 95 C2 86  74 34 5F 93 C2 B6 1F 43  ........t4_....C
+       EB 67 C5 CB 0A A9 16 09  23 87 DB 79 ED 1D A8 56  .g..␊..␉#..y...V
+       C0 29 DE 2F 64 01 0A 7D  C4 64 13 B1 A9 85 87 88  .)./d.␊}.d......
+       86 DF 45 CD F0 4B E8 48  B8 EC B0 65 1A 23 5A 0E  ..E..K.H...e.#Z.
+       2C 7E 6B 8A EC C8 A2 D6  84 F9 C8 CC C1 20 6F 93  ,~k.......... o.
+       5A 9D 8F E5 32 82 F3 88  E5 36 85 88 A7 B9 96 58  Z...2....6.....X
+       C9 1C DA DD 68 0E BB 41  5D 49 E1 BF E2 B3 12 89  ....h..A]I......
+       E0 52 99 C6 D2 6B DE E3  26 50 8B 76 FD EB 59 2C  .R...k..&P.v..Y,
+       7F 11 66 BA 91 9A 53 0E  A3 2F 2B 71 93 6B F7 44  ..f...S../+q.k.D
+       B3 C6 10 60 E9 3E 11 9C  2A 8D D8 4D E0 FF 9C 13  ...`.>..*..M....
+       E6 00 D1 66 E9 BA 5C EE  F6 30 35 54 35 9C A9 F0  ...f..\..05T5...
+       93 E2 D6 DB 2E 3D BF E5  E5 FA 94 6D 98 5C EA 59  .....=.....m.\.Y
+       ... truncated, indexes [0x240..] not shown, remaining bytes: 0x1F1 ...
+
+       ================================================
+
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:378:5: 0x16f707d in expectEqualSlices__anon_226391 (std.zig)
+           return error.TestExpectedEqual;
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106271:5: 0x16fc338 in test.MARKREAD UPGRADE refuses a v4-only executable with private carried queues unchanged (root.zig)
+           try std.testing.expectEqualSlices(u8, mesh_pending, mesh_after);
+           ^
+failed command: ./.zig-cache/o/297a9fec029b76e8460871cdae7e7d98/test --cache-dir=./.zig-cache --seed=0x3722a530 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 71/72 tests passed (1 failed)
+test-mod transitive failure
++- run test 71 pass, 1 fail (72 total)
+   +- compile test Debug native success 12s MaxRSS:633M
+      +- options cached

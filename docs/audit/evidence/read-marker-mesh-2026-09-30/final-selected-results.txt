@@ -1,0 +1,4 @@
+test-server-Debug: exit=0 elapsed=281.47s command=zig build test-server -Doptimize=Debug --summary all
+test-services-Debug: exit=0 elapsed=528.64s command=zig build test-services -Doptimize=Debug --summary all
+test-helix-Debug: exit=0 elapsed=72.19s command=zig build test-helix -Doptimize=Debug --summary all
+test-mesh-Debug: exit=0 elapsed=55.13s command=zig build test-mesh -Doptimize=Debug --summary all

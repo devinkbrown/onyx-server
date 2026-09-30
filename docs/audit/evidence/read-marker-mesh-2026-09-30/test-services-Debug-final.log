@@ -1,0 +1,33 @@
+test-services
++- run test w
+GAP-P0b branch=cap onyx/2fa=IDENTIFY before AUTHENTICATE
+GAP-P0b branch=oauth refuses unknown account unless oauth_auto_provision
+GAP-A3 branch=rowless session replica proof; forged account is UID-renamed
+GAP-D2 branch=kill-restart plus same-image USR2 delivered usr2 offline and fired MEMO_PUSH
+GAP-D4 branch=same-image USR2 kept shun spamtrap Koshi reputation and account score; the new connection guard started full
+TOTP atomic allocation sweep disable=false failures=7 then success
+TOTP atomic allocation sweep disable=true failures=5 then success
+TOTP atomic cold replay disable=false write=failed sync=false active=false token_valid=true
+TOTP atomic cold replay disable=false write=short sync=false active=false token_valid=true
+TOTP atomic cold replay disable=false write=none sync=true active=true token_valid=false
+TOTP atomic cold replay disable=true write=failed sync=false active=true token_valid=true
+TOTP atomic cold replay disable=true write=short sync=false active=true token_valid=true
+TOTP atomic cold replay disable=true write=none sync=true active=false token_valid=false
+TOTP atomic RESETPASS allocation failures before password=9 then success
+GAP-P0b branch=oauth refuses unknown account unless oauth_auto_provision
+GAP-P0c branch=remote SYS and ADM DATA tags stay closed even for an operator account
+GAP-P0c branch=whowas account and real host
+TOTP atomic enable: 7 induced allocation failures, retries, and cold reopens
+TOTP atomic disable: 5 induced allocation failures, retries, and cold reopens
+TOTP atomic replace: 7 induced allocation failures, retries, and cold reopens
+TOTP atomic revoke: 3 induced allocation failures, retries, and cold reopens
+TOTP atomic rotate: 11 induced allocation failures, retries, and cold reopens
+TOTP atomic reset: 9 induced allocation failures, retries, and cold reopens
+GAP-D7 branch=a failed pending-address write issues no verification token; live mail stays off
+failed command: ./.zig-cache/o/b6fffc983b4a6c6ecd2ff873b7113824/test --cache-dir=./.zig-cache --seed=0x32763236 --listen=-
+
+Build Summary: 4/4 steps succeeded; 566/566 tests passed
+test-services success
++- run test 566 pass (566 total) 8m MaxRSS:200M
+   +- compile test Debug native success 8s MaxRSS:632M
+      +- options cached

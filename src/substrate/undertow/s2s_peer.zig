@@ -179,6 +179,14 @@ const max_search_frames: usize = 1024;
 const keytrans_head_extension_probe = "onyx-xcap-keytrans-head-1?";
 const keytrans_head_extension_reply = "onyx-xcap-keytrans-head-1!";
 const max_keytrans_heads: usize = 1024;
+const read_marker_extension_probe = "onyx-xcap-read-marker-1?";
+const read_marker_extension_reply = "onyx-xcap-read-marker-1!";
+const read_marker_namespace = "read.marker/";
+
+fn isReadMarkerKey(key: []const u8) bool {
+    return key.len >= read_marker_namespace.len and std.ascii.eqlIgnoreCase(key[0..read_marker_namespace.len], read_marker_namespace);
+}
+
 const session_replica_v3_probe = "onyx-xcap-session-replica-v3?";
 const session_replica_v3_reply = "onyx-xcap-session-replica-v3!";
 
@@ -630,6 +638,9 @@ pub const S2sPeer = struct {
     /// Remote answered the mesh-search PING extension. Send SEARCH_QUERY only
     /// after this is true so an older peer never receives tags 0x29/0x2A.
     peer_supports_search: bool = false,
+    /// Intentionally renegotiated after preserved-link adoption, never inferred
+    /// from ENTITY_PROP support: older peers would expose marker facts as PROP.
+    peer_supports_read_markers: bool = false,
     /// Remote answered the key-transparency head probe. Send KEYTRANS_HEAD
     /// only after this is true so an older peer never receives tag 0x2B.
     peer_supports_keytrans_head: bool = false,
@@ -1297,6 +1308,9 @@ pub const S2sPeer = struct {
                 if (std.mem.eql(u8, frame.payload, keytrans_head_extension_probe) and
                     self.signing_key != null)
                     try emitFrame(self.allocator, sink, .PONG, keytrans_head_extension_reply);
+                if (std.mem.eql(u8, frame.payload, read_marker_extension_probe) and
+                    self.signing_key != null and self.peer_supports_signing)
+                    try emitFrame(self.allocator, sink, .PONG, read_marker_extension_reply);
                 if (std.mem.eql(u8, frame.payload, session_replica_v3_probe) and
                     self.session_replica_attachment_transport_enabled and
                     self.session_replica_transport_enabled and self.signing_key != null and
@@ -1323,6 +1337,11 @@ pub const S2sPeer = struct {
                 if (std.mem.eql(u8, frame.payload, keytrans_head_extension_reply) and
                     self.signing_key != null)
                     self.peer_supports_keytrans_head = true;
+                if (std.mem.eql(u8, frame.payload, read_marker_extension_reply) and
+                    self.signing_key != null and self.peer_supports_signing)
+                {
+                    self.peer_supports_read_markers = true;
+                }
                 if (std.mem.eql(u8, frame.payload, session_replica_v3_reply) and
                     self.session_replica_attachment_transport_enabled and
                     self.peer_supports_signing and self.peer_supports_session_replica_v2)
@@ -1974,6 +1993,11 @@ pub const S2sPeer = struct {
     pub fn sendSearchReply(self: *S2sPeer, sink: ByteSink, wire: []const u8) !void {
         if (!self.established) return error.SearchUnavailable;
         try self.emitSignable(sink, .SEARCH_REPLY, wire);
+    }
+
+    pub fn supportsReadMarkers(self: *const S2sPeer) bool {
+        return self.established and self.signing_key != null and
+            self.peer_supports_signing and self.peer_supports_read_markers;
     }
 
     pub fn supportsMeshSearch(self: *const S2sPeer) bool {
@@ -3763,6 +3787,7 @@ pub const S2sPeer = struct {
     fn recvEntityProp(self: *S2sPeer, frame_payload: []const u8) !void {
         const payload = self.verifiedPayload(.ENTITY_PROP, frame_payload) orelse return;
         const ev = entity_prop_event.decode(payload) catch return;
+        if (isReadMarkerKey(ev.key) and !self.supportsReadMarkers()) return;
         const signed = ev.origin_pubkey.len != 0;
         if (!signed and !self.acceptsDirectOrigin(ev.origin_node)) return;
 
@@ -3811,6 +3836,7 @@ pub const S2sPeer = struct {
         present: bool,
         origin: PropOrigin,
     ) !void {
+        if (isReadMarkerKey(key) and !self.supportsReadMarkers()) return error.ReadMarkersUnavailable;
         const ev = entity_prop_event.EntityPropEvent{
             .present = present,
             .kind = kind,
@@ -4153,6 +4179,7 @@ pub const S2sPeer = struct {
         // are assigned). A new handshake therefore returns to v2 until the
         // authenticated append-only PING/PONG extension is observed again.
         self.peer_supports_session_replica_v3 = false;
+        self.peer_supports_read_markers = false;
         // A preserved established stream can transition from the old negotiated
         // capability set without receiving another RESYNC in this direction.
         // Surface that false->true edge through the daemon's existing gated
@@ -4190,6 +4217,8 @@ pub const S2sPeer = struct {
             try emitFrame(self.allocator, sink, .PING, mesh_search_extension_probe);
         if (self.signing_key != null)
             try emitFrame(self.allocator, sink, .PING, keytrans_head_extension_probe);
+        if (self.signing_key != null and self.peer_supports_signing)
+            try emitFrame(self.allocator, sink, .PING, read_marker_extension_probe);
     }
 
     fn rememberRemote(self: *S2sPeer, hs: Handshake, now_ms: u64) !void {
@@ -9336,4 +9365,53 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
     // Surviving to here with the testing allocator (leak-checked on deinit) is the
     // proof: no parser trapped, over-read, or leaked on any hostile input.
     try std.testing.expect(true);
+}
+
+test "MARKREAD mesh extension gates private facts and rejects legacy echo and unsigned frames" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    const kp_a = try signingKeyFor(0x91);
+    const kp_b = try signingKeyFor(0x92);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a_state = ChannelCrdt.init(allocator, a_short);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, b_short);
+    defer b_state.deinit();
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 17);
+    try std.testing.expect(a.supportsReadMarkers());
+    try std.testing.expect(b.supportsReadMarkers());
+    // A rolling-old peer echoes the probe but never emits the distinct reply.
+    a.peer_supports_read_markers = false;
+    try emitFrame(allocator, b_to_a.sink(), .PONG, read_marker_extension_probe);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 18);
+    try std.testing.expect(!a.supportsReadMarkers());
+    try std.testing.expectError(error.ReadMarkersUnavailable, a.sendEntityProp(a_to_b.sink(), .user, "alice", "read.marker/test", "private", "alice", 1, true, .{}));
+    try std.testing.expectEqual(@as(usize, 0), a_to_b.bytes.items.len);
+    try b.sendEntityProp(b_to_a.sink(), .user, "alice", "READ.MARKER/test", "private", "alice", 1, true, .{});
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 19);
+    const unsupported = try a.takeEntityPropChanges();
+    defer allocator.free(unsupported);
+    try std.testing.expectEqual(@as(usize, 0), unsupported.len);
+    try emitFrame(allocator, b_to_a.sink(), .PONG, read_marker_extension_reply);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 20);
+    try std.testing.expect(a.supportsReadMarkers());
+    var wire_buf: [256]u8 = undefined;
+    const wire = try entity_prop_event.encode(.{ .present = true, .kind = .user, .origin_node = b_short, .hlc = 1, .entity = "alice", .key = "read.marker/test", .value = "private", .owner = "alice" }, &wire_buf);
+    try emitFrame(allocator, b_to_a.sink(), .ENTITY_PROP, wire);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 21);
+    const unsigned = try a.takeEntityPropChanges();
+    defer allocator.free(unsigned);
+    try std.testing.expectEqual(@as(usize, 0), unsigned.len);
+    try std.testing.expect(a.rejected_signature_frames > 0);
 }

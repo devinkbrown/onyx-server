@@ -2609,6 +2609,9 @@ pub const ConnState = struct {
     /// creating an AEAD counter gap, so finish that pass and then wrap once to a
     /// fresh membership-first pass before acknowledging the reset generation.
     mesh_burst_restart_pending: bool = false,
+    /// Process-local negotiation edge; reset after adopt so the signed private
+    /// marker frontier is offered when the preserved link re-negotiates.
+    read_marker_capability_seen: bool = false,
     /// One-shot guard: membership-roster burst sent to this peer once its link
     /// first reaches established (so the peer's NAMES/WHO is correct immediately,
     /// not only after future joins). See sendMembershipBurstTo / docs/planning/16.
@@ -3935,6 +3938,11 @@ pub const LinuxServer = struct {
     whowas: WhowasStore,
     monitor: monitor.MonitorStore,
     read_markers: read_marker_store.DefaultStore,
+    /// Account-only signed position frontier. Keys are account NUL target;
+    /// values retain the complete immutable ENTITY_PROP for repair and relay.
+    read_marker_facts: std.StringHashMapUnmanaged([]u8) = .empty,
+    read_marker_clock: mesh_clock_mod.MeshClock = .{},
+    read_marker_unavailable: bool = false,
     silence: silence.Store,
     /// Operator OBSERVE subscriptions (live Event-Spine surveillance feed).
     observe: observe_mod.Registry,
@@ -6598,6 +6606,7 @@ pub const LinuxServer = struct {
         if (self.ocsp_staple_prev) |prev| self.allocator.free(prev);
         if (self.ocsp_staple_incoming) |incoming| self.allocator.free(incoming);
         self.read_markers.deinit();
+        self.deinitReadMarkerFacts(&self.read_marker_facts);
         self.monitor.deinit();
         self.whowas.deinit();
         self.world.deinit();
@@ -9796,6 +9805,14 @@ pub const LinuxServer = struct {
         // is dropped on its next activity, on its own reactor thread (no
         // cross-reactor mutation). Runs before the peer_up announcement.
         if (link.established() and self.refuseJupedPeer(conn, link.remoteName())) return;
+        const marker_capable = link.supportsReadMarkers();
+        if (marker_capable and !conn.read_marker_capability_seen) {
+            // The initial burst can finish before the distinct extension reply.
+            // Offer again locally without requesting another handshake/RESYNC.
+            conn.session_replica_resync_burst_pending = true;
+            if (conn.mesh_burst_stage != .idle) conn.mesh_burst_restart_pending = true;
+        }
+        conn.read_marker_capability_seen = marker_capable;
         if (!was and link.established()) {
             self.noteS2sEstablished(conn, link.remoteName(), "secured");
             self.logMeshEvent(.peer_up, link.remoteName(), "secured link established");
@@ -14451,6 +14468,7 @@ pub const LinuxServer = struct {
                 return;
             }
             self.dropClientStats(conn);
+            self.clearGuestReadMarkers(conn);
             self.stats.onQuit();
             conn.session_list_cache.reset();
             // Free any in-flight inbound multiline batch buffer.
@@ -16729,6 +16747,7 @@ pub const LinuxServer = struct {
         present: bool,
         origin: s2s_peer_mod.S2sPeer.PropOrigin,
     ) void {
+        if (isReadMarkerPropKey(key)) return;
         if (kind == .user and account_identity.isReservedNamespace(key)) return;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
@@ -17126,6 +17145,9 @@ pub const LinuxServer = struct {
     /// by the store on insert; a malformed id (rejected by `Entity.fromId`) simply
     /// fails to apply.
     fn applyRemoteEntityProp(self: *LinuxServer, ch: anytype) bool {
+        // This namespace has a private timestamp-max admission path. It must
+        // never enter ordinary property LWW or public PROP notification.
+        if (isReadMarkerPropKey(ch.key)) return false;
         if (ch.kind.toStoreKind() == .user and account_identity.isReservedNamespace(ch.key)) {
             self.remote_identity_props_quarantined +|= 1;
             var quarantine_buf: [256]u8 = undefined;
@@ -17230,6 +17252,7 @@ pub const LinuxServer = struct {
     /// prefix. A user prop reaches the target + common-channel IRCX peers; a
     /// member prop reaches the member's channel under the per-tier secret gate.
     fn emitRemoteEntityProp(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
+        if (isReadMarkerPropKey(ch.key)) return;
         const host = if (remote_name.len != 0) remote_name else self.serverName();
         var buf: [900]u8 = undefined;
         const line = if (ch.present)
@@ -17254,7 +17277,11 @@ pub const LinuxServer = struct {
         const changes = link.takeEntityPropChanges() catch return;
         const remote = link.remoteName();
         for (changes) |*ch| {
-            if (self.applyRemoteEntityProp(ch)) {
+            if (isReadMarkerPropKey(ch.key)) {
+                if (comptime @TypeOf(link) == *secured_s2s_link.SecuredLink) {
+                    if (link.supportsReadMarkers()) self.admitRemoteReadMarker(ch) catch {};
+                }
+            } else if (self.applyRemoteEntityProp(ch)) {
                 self.emitRemoteEntityProp(ch, remote);
             }
             ch.deinit(self.allocator);
@@ -17271,6 +17298,7 @@ pub const LinuxServer = struct {
         var it = self.entity_prop_clocks.iterator();
         while (it.next()) |entry| {
             const clock = entry.value_ptr;
+            if (isReadMarkerPropKey(clock.key)) continue;
             if (clock.kind == .user and account_identity.isReservedNamespace(clock.key)) continue;
             var present = clock.present;
             var value: []const u8 = "";
@@ -17291,7 +17319,7 @@ pub const LinuxServer = struct {
                 link.sendEntityProp(clock.kind, clock.entity, clock.key, value, owner, clock.hlc, present, origin) catch return false;
             }
         }
-        return true;
+        return self.sendReadMarkerBurstTo(conn);
     }
 
     fn sendChannelPropBurstTo(self: *LinuxServer, conn: *ConnState) bool {
@@ -22812,13 +22840,19 @@ pub const LinuxServer = struct {
 
     /// MARKREAD <target> [timestamp=…] — IRCv3 read-marker. GET returns the
     /// stored marker (or `*`); SET advances it (monotonic) and echoes it back.
-    /// Keyed by the client's account when logged in, else its nick.
+    /// Authenticated accounts share a durable mesh position. Guests retain only
+    /// this physical connection's local position.
     pub fn handleMarkread(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.hasCap(.read_marker)) {
             try self.failReply(conn, "MARKREAD", "NEED_REGISTRATION", "You must negotiate the draft/read-marker capability");
             return;
         }
-        const owner = conn.session.account() orelse conn.session.displayName();
+        if (self.read_marker_unavailable) {
+            try self.failReply(conn, "MARKREAD", "TEMPORARILY_UNAVAILABLE", "Read markers are unavailable");
+            return;
+        }
+        var owner_buf: [read_marker_store.default_max_owner_bytes]u8 = undefined;
+        const owner = readMarkerOwner(conn, &owner_buf) catch return;
         const req = read_marker_store.parse(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MARKREAD"}, "Invalid MARKREAD parameters");
             return;
@@ -22837,7 +22871,16 @@ pub const LinuxServer = struct {
                     .timestamp => |t| t,
                     .unset => break :blk (read_marker_store.buildResponse(sr.target, .unset, &out_buf) catch return),
                 };
-                const res = self.rememberReadMarker(owner, sr.target, ts) catch return;
+                const res = if (conn.session.account() != null)
+                    self.commitAccountReadMarker(owner, sr.target, ts) catch {
+                        try self.failReply(conn, "MARKREAD", "TEMPORARILY_UNAVAILABLE", "Could not save read marker; retry later");
+                        return;
+                    }
+                else
+                    self.read_markers.set(owner, sr.target, ts) catch return;
+                if (res.changed and conn.session.account() != null) {
+                    self.publishAccountReadMarker(owner, sr.target, res.timestamp, conn);
+                }
                 break :blk (read_marker_store.buildTimestampResponse(sr.target, res.timestamp, &out_buf) catch return);
             },
         };
@@ -22949,8 +22992,10 @@ pub const LinuxServer = struct {
     }
 
     fn pushMarkreadOnJoin(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+        if (self.read_marker_unavailable) return;
         if (!conn.session.hasCap(.read_marker)) return;
-        const owner = conn.session.account() orelse conn.session.displayName();
+        var owner_buf: [read_marker_store.default_max_owner_bytes]u8 = undefined;
+        const owner = readMarkerOwner(conn, &owner_buf) catch return;
         const ts = (self.read_markers.get(owner, channel) catch null) orelse return;
         var out_buf: [default_reply_bytes]u8 = undefined;
         const line = read_marker_store.buildTimestampResponse(channel, ts, &out_buf) catch return;
@@ -23249,23 +23294,361 @@ pub const LinuxServer = struct {
         target: []const u8,
         timestamp: read_marker_store.Timestamp,
     ) !read_marker_store.SetResult {
-        const res = try self.read_markers.set(owner, target, timestamp);
-        if (res.changed) self.snapshotReadMarkers();
-        return res;
+        if (self.read_marker_unavailable) return error.ReadMarkerUnavailable;
+        var target_buf: [read_marker_store.default_max_target_bytes]u8 = undefined;
+        const canonical_target = try canonicalReadMarkerTarget(target, &target_buf);
+        var prepared = try self.read_markers.prepareSet(owner, canonical_target, timestamp);
+        defer prepared.deinit();
+        if (prepared.result.changed) {
+            if (self.account_services) |svc| {
+                svc.lock.lockExclusive();
+                defer svc.lock.unlockExclusive();
+                var durable = try marker_durable.preparePut(svc.store, owner, canonical_target, prepared.result.timestamp, null);
+                defer durable.deinit();
+                durable.commit() catch |err| {
+                    if (svc.store.preparedWritesPoisoned()) self.read_marker_unavailable = true;
+                    return err;
+                };
+            }
+        }
+        const result = prepared.commit();
+        if (result.changed) {
+            var key_buf: [read_marker_store.default_max_owner_bytes + 1 + read_marker_store.default_max_target_bytes]u8 = undefined;
+            if (self.read_marker_facts.fetchRemove(readMarkerFactKey(owner, canonical_target, &key_buf))) |removed| {
+                self.allocator.free(removed.key);
+                self.allocator.free(removed.value);
+            }
+        }
+        return result;
     }
 
-    fn snapshotReadMarkers(self: *LinuxServer) void {
-        const svc = self.account_services orelse return;
-        marker_durable.replaceAll(svc.store, &self.read_markers) catch |err| {
-            srvLog("onyx-server: read-marker durable snapshot failed ({s})\n", .{@errorName(err)});
+    const read_marker_prop_prefix = "read.marker/";
+    const read_marker_wire_max = 512;
+    const ReadMarkerFactMap = std.StringHashMapUnmanaged([]u8);
+
+    fn isReadMarkerPropKey(key: []const u8) bool {
+        return key.len >= read_marker_prop_prefix.len and
+            std.ascii.eqlIgnoreCase(key[0..read_marker_prop_prefix.len], read_marker_prop_prefix);
+    }
+
+    fn readMarkerOwner(conn: *const ConnState, out: *[read_marker_store.default_max_owner_bytes]u8) ![]const u8 {
+        if (conn.session.account()) |account| {
+            const canonical = try services_mod.canonicalAccount(account);
+            const owner = canonical.asSlice();
+            @memcpy(out[0..owner.len], owner);
+            return out[0..owner.len];
+        }
+        const physical: u64 = @bitCast(idFromToken(conn.token));
+        return std.fmt.bufPrint(out, "n:{x:0>16}", .{physical});
+    }
+
+    fn clearGuestReadMarkers(self: *LinuxServer, conn: *const ConnState) void {
+        var owner_buf: [read_marker_store.default_max_owner_bytes]u8 = undefined;
+        const physical: u64 = @bitCast(idFromToken(conn.token));
+        const owner = std.fmt.bufPrint(&owner_buf, "n:{x:0>16}", .{physical}) catch unreachable;
+        var it = self.read_markers.entries.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (key.len <= owner.len or key[owner.len] != 0 or !std.mem.eql(u8, key[0..owner.len], owner)) continue;
+            _ = self.read_markers.entries.remove(key);
+            self.allocator.free(key);
+        }
+    }
+
+    fn canonicalReadMarkerTarget(target: []const u8, out: *[read_marker_store.default_max_target_bytes]u8) ![]const u8 {
+        // Keep the established store's ASCII target folding. Do not silently
+        // introduce a different nick/channel casemap into persisted keys.
+        if (target.len == 0 or target.len > out.len) return error.InvalidTarget;
+        for (target, 0..) |byte, i| {
+            if (byte <= 0x20 or byte == 0x7f or byte == ',' or byte == ':') return error.InvalidTarget;
+            out[i] = std.ascii.toLower(byte);
+        }
+        return out[0..target.len];
+    }
+
+    fn readMarkerPropKey(target: []const u8, out: *[entity_prop_event.max_key_len]u8) []const u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(target, &digest, .{});
+        @memcpy(out[0..read_marker_prop_prefix.len], read_marker_prop_prefix);
+        const encoded = base64url.encode(out[read_marker_prop_prefix.len..], &digest) catch unreachable;
+        return out[0 .. read_marker_prop_prefix.len + encoded.len];
+    }
+
+    fn readMarkerFactKey(owner: []const u8, target: []const u8, out: []u8) []const u8 {
+        @memcpy(out[0..owner.len], owner);
+        out[owner.len] = 0;
+        @memcpy(out[owner.len + 1 ..][0..target.len], target);
+        return out[0 .. owner.len + 1 + target.len];
+    }
+
+    fn deinitReadMarkerFacts(self: *LinuxServer, facts: *ReadMarkerFactMap) void {
+        var it = facts.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        facts.deinit(self.allocator);
+        facts.* = .empty;
+    }
+
+    const StagedReadMarkerFact = struct {
+        key: ?[]u8,
+        wire: ?[]u8,
+
+        fn deinit(self: *StagedReadMarkerFact, allocator: std.mem.Allocator) void {
+            if (self.key) |key| allocator.free(key);
+            if (self.wire) |wire| allocator.free(wire);
+            self.* = .{ .key = null, .wire = null };
+        }
+
+        fn commit(self: *StagedReadMarkerFact, server: *LinuxServer) void {
+            const key = self.key.?;
+            const slot = server.read_marker_facts.getOrPutAssumeCapacity(key);
+            if (slot.found_existing) {
+                server.allocator.free(key);
+                server.allocator.free(slot.value_ptr.*);
+            }
+            slot.value_ptr.* = self.wire.?;
+            self.* = .{ .key = null, .wire = null };
+        }
+    };
+
+    fn stageReadMarkerFact(self: *LinuxServer, owner: []const u8, target: []const u8, wire: []const u8) !StagedReadMarkerFact {
+        var key_buf: [read_marker_store.default_max_owner_bytes + 1 + read_marker_store.default_max_target_bytes]u8 = undefined;
+        const key = readMarkerFactKey(owner, target, &key_buf);
+        if (!self.read_marker_facts.contains(key)) {
+            if (self.read_marker_facts.count() >= read_marker_store.default_max_entries) return error.TargetLimitExceeded;
+            try self.read_marker_facts.ensureUnusedCapacity(self.allocator, 1);
+        }
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        const owned_wire = try self.allocator.dupe(u8, wire);
+        return .{ .key = owned_key, .wire = owned_wire };
+    }
+
+    const ParsedReadMarkerFact = struct {
+        owner: []const u8,
+        target: []const u8,
+        timestamp: read_marker_store.Timestamp,
+    };
+
+    fn validateReadMarkerFact(self: *LinuxServer, event: entity_prop_event.EntityPropEvent) !ParsedReadMarkerFact {
+        if (event.kind != .user or !event.present or event.hlc == 0 or event.value.len <= 25 or event.value[24] != ' ')
+            return error.BadReadMarkerFact;
+        const account = try services_mod.canonicalAccount(event.entity);
+        if (!std.mem.eql(u8, account.asSlice(), event.entity) or !std.mem.eql(u8, event.owner, event.entity))
+            return error.BadReadMarkerFact;
+        const timestamp = try read_marker_store.Timestamp.parseWire(event.value[0..24]);
+        const target = event.value[25..];
+        var target_buf: [read_marker_store.default_max_target_bytes]u8 = undefined;
+        const canonical_target = try canonicalReadMarkerTarget(target, &target_buf);
+        if (!std.mem.eql(u8, target, canonical_target)) return error.BadReadMarkerFact;
+        var key_buf: [entity_prop_event.max_key_len]u8 = undefined;
+        if (!std.mem.eql(u8, event.key, readMarkerPropKey(target, &key_buf))) return error.BadReadMarkerFact;
+        if (try entity_prop_event.verifyOrigin(self.allocator, event) != .verified) return error.BadReadMarkerFact;
+        // The secured mesh carrier authorizes transit origins; the signature
+        // binds their complete self-certifying identity. Our own short id must
+        // additionally match our full configured key, as on MESSAGE_V2.
+        if (event.origin_node == self.config.node_id) {
+            const identity = self.config.node_identity orelse return error.BadReadMarkerFact;
+            if (!std.mem.eql(u8, event.origin_pubkey, &identity.sign_kp.public_key)) return error.BadReadMarkerFact;
+        }
+        return .{ .owner = event.entity, .target = target, .timestamp = timestamp };
+    }
+
+    fn commitAccountReadMarker(self: *LinuxServer, owner: []const u8, raw_target: []const u8, timestamp: read_marker_store.Timestamp) !read_marker_store.SetResult {
+        if (self.read_marker_unavailable) return error.ReadMarkerUnavailable;
+        const svc = self.account_services orelse return error.ReadMarkerUnavailable;
+        var target_buf: [read_marker_store.default_max_target_bytes]u8 = undefined;
+        const target = try canonicalReadMarkerTarget(raw_target, &target_buf);
+        const identity = self.config.node_identity orelse return self.rememberReadMarker(owner, target, timestamp);
+        var prepared = try self.read_markers.prepareSet(owner, target, timestamp);
+        defer prepared.deinit();
+        var fact_key_buf: [read_marker_store.default_max_owner_bytes + 1 + read_marker_store.default_max_target_bytes]u8 = undefined;
+        const fact_key = readMarkerFactKey(owner, target, &fact_key_buf);
+        if (!prepared.result.changed) {
+            // Legacy rows have no authenticated author. Only an explicit SET of
+            // that exact (or newer) position may promote one to a signed fact.
+            if (self.read_marker_facts.contains(fact_key) or
+                !std.mem.eql(u8, timestamp.slice(), prepared.result.timestamp.slice())) return prepared.commit();
+        }
+        var clock_candidate = self.read_marker_clock;
+        if (clock_candidate.last_stamp == std.math.maxInt(u64)) return error.ClockExhausted;
+        const hlc = clock_candidate.stamp(self.meshWallMs(), 0);
+        var key_buf: [entity_prop_event.max_key_len]u8 = undefined;
+        const key = readMarkerPropKey(target, &key_buf);
+        var value_buf: [25 + read_marker_store.default_max_target_bytes]u8 = undefined;
+        @memcpy(value_buf[0..24], prepared.result.timestamp.slice());
+        value_buf[24] = ' ';
+        @memcpy(value_buf[25..][0..target.len], target);
+        var event = entity_prop_event.EntityPropEvent{
+            .kind = .user,
+            .present = true,
+            .origin_node = identity.shortId(),
+            .hlc = hlc,
+            .entity = owner,
+            .key = key,
+            .value = value_buf[0 .. 25 + target.len],
+            .owner = owner,
         };
+        var public_key: [entity_prop_event.pubkey_len]u8 = undefined;
+        var signature: [entity_prop_event.sig_len]u8 = undefined;
+        const transcript = try entity_prop_event.originTranscript(self.allocator, event);
+        defer self.allocator.free(transcript);
+        try entity_prop_event.signInPlace(&event, &identity.sign_kp, transcript, &public_key, &signature);
+        var wire_buf: [read_marker_wire_max]u8 = undefined;
+        const wire = try entity_prop_event.encode(event, &wire_buf);
+        var staged = try self.stageReadMarkerFact(owner, target, wire);
+        defer staged.deinit(self.allocator);
+        {
+            svc.lock.lockExclusive();
+            defer svc.lock.unlockExclusive();
+            var durable = try marker_durable.preparePutWithClock(svc.store, owner, target, prepared.result.timestamp, wire, hlc);
+            defer durable.deinit();
+            durable.commit() catch |err| {
+                if (svc.store.preparedWritesPoisoned()) self.read_marker_unavailable = true;
+                return err;
+            };
+        }
+        const result = prepared.commit();
+        staged.commit(self);
+        self.read_marker_clock = clock_candidate;
+        // The entire signed frontier is retained independently of every send.
+        self.announceReadMarker(event);
+        return result;
+    }
+
+    fn admitRemoteReadMarker(self: *LinuxServer, change: anytype) !void {
+        if (self.read_marker_unavailable) return error.ReadMarkerUnavailable;
+        const event = entity_prop_event.EntityPropEvent{
+            .kind = change.kind,
+            .present = change.present,
+            .origin_node = change.origin_node,
+            .hlc = change.hlc,
+            .entity = change.entity,
+            .key = change.key,
+            .value = change.value,
+            .owner = change.owner,
+            .origin_pubkey = change.origin_pubkey,
+            .origin_sig = change.origin_sig,
+        };
+        const parsed = try self.validateReadMarkerFact(event);
+        var clock_candidate = self.read_marker_clock;
+        try clock_candidate.observeChecked(event.hlc, self.meshWallMs(), mesh_clock_mod.default_max_future_skew_ms);
+        var prepared = try self.read_markers.prepareSet(parsed.owner, parsed.target, parsed.timestamp);
+        defer prepared.deinit();
+        if (!std.mem.eql(u8, parsed.timestamp.slice(), prepared.result.timestamp.slice())) return;
+        var wire_buf: [read_marker_wire_max]u8 = undefined;
+        const wire = try entity_prop_event.encode(event, &wire_buf);
+        var fact_key_buf: [read_marker_store.default_max_owner_bytes + 1 + read_marker_store.default_max_target_bytes]u8 = undefined;
+        const fact_key = readMarkerFactKey(parsed.owner, parsed.target, &fact_key_buf);
+        if (!prepared.result.changed) {
+            if (self.read_marker_facts.get(fact_key)) |stored| {
+                // Equal read positions select one immutable signed winner in a
+                // deterministic order; duplicate repair never repeats delivery.
+                if (std.mem.order(u8, wire, stored) != .gt) return;
+            }
+        }
+        var staged = try self.stageReadMarkerFact(parsed.owner, parsed.target, wire);
+        defer staged.deinit(self.allocator);
+        const svc = self.account_services orelse return error.ReadMarkerUnavailable;
+        {
+            svc.lock.lockExclusive();
+            defer svc.lock.unlockExclusive();
+            var durable = try marker_durable.preparePutWithClock(svc.store, parsed.owner, parsed.target, parsed.timestamp, wire, clock_candidate.last_stamp);
+            defer durable.deinit();
+            durable.commit() catch |err| {
+                if (svc.store.preparedWritesPoisoned()) self.read_marker_unavailable = true;
+                return err;
+            };
+        }
+        const result = prepared.commit();
+        staged.commit(self);
+        self.read_marker_clock = clock_candidate;
+        if (result.changed) self.publishAccountReadMarker(parsed.owner, parsed.target, result.timestamp, null);
+        self.announceReadMarker(event);
+    }
+
+    fn publishAccountReadMarker(self: *LinuxServer, account: []const u8, target: []const u8, timestamp: read_marker_store.Timestamp, excluded: ?*ConnState) void {
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = read_marker_store.buildTimestampResponse(target, timestamp, &line_buf) catch return;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied or slot.value.closing or slot.value.s2s != null or slot.value.s2s_secured != null) continue;
+                if (excluded) |origin| if (&slot.value == origin) continue;
+                if (!slot.value.session.hasCap(.read_marker)) continue;
+                const attached_account = slot.value.session.account() orelse continue;
+                if (!std.ascii.eqlIgnoreCase(account, attached_account)) continue;
+                // One pass over physical slots preserves every same-token
+                // attachment. Cross-reactor delivery uses its owning mailbox.
+                self.enqueueDelivery(slotClientId(reactor, i, slot.gen), line) catch {};
+            }
+        }
+    }
+
+    fn announceReadMarker(self: *LinuxServer, event: entity_prop_event.EntityPropEvent) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied or slot.value.closing) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.supportsReadMarkers()) continue;
+                link.sendEntityProp(event.kind, event.entity, event.key, event.value, event.owner, event.hlc, event.present, .{ .node = event.origin_node, .pubkey = event.origin_pubkey, .sig = event.origin_sig }) catch continue;
+                _ = self.flushSecuredS2sOutboundTo(slotClientId(reactor, i, slot.gen), link);
+            }
+        }
+    }
+
+    fn sendReadMarkerBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (self.read_marker_unavailable) return true;
+        const link = conn.s2s_secured orelse return true;
+        if (!link.supportsReadMarkers()) return true;
+        var it = self.read_marker_facts.valueIterator();
+        while (it.next()) |wire| {
+            const event = entity_prop_event.decode(wire.*) catch return false;
+            link.sendEntityProp(event.kind, event.entity, event.key, event.value, event.owner, event.hlc, event.present, .{ .node = event.origin_node, .pubkey = event.origin_pubkey, .sig = event.origin_sig }) catch return false;
+        }
+        return true;
     }
 
     fn restoreDurableMarkers(self: *LinuxServer) void {
         const svc = self.account_services orelse return;
-        marker_durable.restoreInto(svc.store, &self.read_markers) catch |err| {
+        self.restoreReadMarkerCandidate(svc) catch |err| {
+            self.read_marker_unavailable = true;
             srvLog("onyx-server: read-marker durable restore failed closed ({s})\n", .{@errorName(err)});
         };
+    }
+
+    fn restoreReadMarkerCandidate(self: *LinuxServer, svc: *services_mod.Services) !void {
+        svc.lock.lockExclusive();
+        defer svc.lock.unlockExclusive();
+        var candidate = try marker_durable.stageRestore(svc.store, self.allocator);
+        defer candidate.deinit();
+        var facts: ReadMarkerFactMap = .empty;
+        defer self.deinitReadMarkerFacts(&facts);
+        if (candidate.clock == std.math.maxInt(u64)) return error.BadReadMarkerFact;
+        for (candidate.rows.items) |row| {
+            const wire = row.fact_wire orelse continue;
+            if (wire.len > read_marker_wire_max) return error.BadReadMarkerFact;
+            const event = try entity_prop_event.decode(wire);
+            const parsed = try self.validateReadMarkerFact(event);
+            if (!std.mem.eql(u8, parsed.owner, row.owner) or !std.mem.eql(u8, parsed.target, row.target) or
+                !std.mem.eql(u8, parsed.timestamp.slice(), row.timestamp.slice()) or event.hlc > candidate.clock)
+                return error.BadReadMarkerFact;
+            const restored = (try candidate.markers.get(row.owner, row.target)) orelse return error.BadReadMarkerFact;
+            if (!std.mem.eql(u8, restored.slice(), row.timestamp.slice())) return error.BadReadMarkerFact;
+            var canonical_wire: [read_marker_wire_max]u8 = undefined;
+            if (!std.mem.eql(u8, wire, try entity_prop_event.encode(event, &canonical_wire))) return error.BadReadMarkerFact;
+            var key_buf: [read_marker_store.default_max_owner_bytes + 1 + read_marker_store.default_max_target_bytes]u8 = undefined;
+            const key = try self.allocator.dupe(u8, readMarkerFactKey(row.owner, row.target, &key_buf));
+            errdefer self.allocator.free(key);
+            const owned_wire = try self.allocator.dupe(u8, wire);
+            errdefer self.allocator.free(owned_wire);
+            try facts.put(self.allocator, key, owned_wire);
+        }
+        std.mem.swap(read_marker_store.DefaultStore, &self.read_markers, &candidate.markers);
+        std.mem.swap(ReadMarkerFactMap, &self.read_marker_facts, &facts);
+        self.read_marker_clock = .{ .last_stamp = candidate.clock, .last_physical = mesh_clock_mod.MeshClock.physicalOf(candidate.clock) };
+        self.read_marker_unavailable = false;
     }
 
     fn recordGag(self: *LinuxServer, ip: []const u8) void {
@@ -24170,8 +24553,11 @@ pub const LinuxServer = struct {
     /// (a fresh client has read everything), so we stay silent rather than dump
     /// the full ring. No-op for clients without the cap or without an account.
     fn replayRewindOnJoin(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+        if (self.read_marker_unavailable) return;
         if (!conn.session.hasCap(.onyx_bouncer)) return;
-        const owner = conn.session.account() orelse return;
+        const account = conn.session.account() orelse return;
+        const canonical = services_mod.canonicalAccount(account) catch return;
+        const owner = canonical.asSlice();
         const marker = (self.read_markers.get(owner, channel) catch null) orelse return;
         const marker_ms = markerToMillis(marker.slice()) orelse return;
         // Bouncer rewind replays *channel* history, so it must honor the same
@@ -35439,6 +35825,7 @@ pub const LinuxServer = struct {
                     return;
                 };
                 for (rows) |ev| {
+                    if (isReadMarkerPropKey(ev.key)) continue;
                     if (propIsSecret(entity, ev.key) and !self.maySeeSecretKey(id, conn, entity, ev.key)) continue;
                     try propEmitEntry(conn, ev);
                 }
@@ -35448,6 +35835,7 @@ pub const LinuxServer = struct {
                 var it = std.mem.splitScalar(u8, q.keys, ',');
                 while (it.next()) |key| {
                     if (key.len == 0) continue;
+                    if (isReadMarkerPropKey(key)) continue;
                     const is_secret = propIsSecret(q.entity, key);
                     if (is_secret and !self.maySeeSecretKey(id, conn, q.entity, key)) continue;
                     // Computed/linked built-ins (NAME/MEMBERCOUNT/MEMBERLIMIT and
@@ -35480,6 +35868,10 @@ pub const LinuxServer = struct {
                 try propEmitEnd(conn, q.entity);
             },
             .set => |m| {
+                if (isReadMarkerPropKey(m.key)) {
+                    try queueNumeric(conn, .ERR_SECURITY, &.{m.entity.id}, "Read markers are managed through MARKREAD");
+                    return;
+                }
                 var device_key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
                 if (m.entity.kind == .user and isReservedDevicePropPrefix(m.key)) {
                     const device_key = canonicalDevicePropKey(m.key, &device_key_buf) orelse {
@@ -35561,6 +35953,10 @@ pub const LinuxServer = struct {
                 try propEmitEnd(conn, m.entity);
             },
             .delete => |k| {
+                if (isReadMarkerPropKey(k.key)) {
+                    try queueNumeric(conn, .ERR_SECURITY, &.{k.entity.id}, "Read markers are managed through MARKREAD");
+                    return;
+                }
                 var device_key_buf: [e2ee_policy.device_prop_prefix.len + e2ee_policy.max_device_id_len]u8 = undefined;
                 if (k.entity.kind == .user and k.key.len != 0 and isReservedDevicePropPrefix(k.key)) {
                     const device_key = canonicalDevicePropKey(k.key, &device_key_buf) orelse {
@@ -35600,7 +35996,7 @@ pub const LinuxServer = struct {
                     };
                     if (k.entity.kind == .user) {
                         for (rows) |ev| {
-                            if (isReservedDevicePropPrefix(ev.key)) {
+                            if (isReservedDevicePropPrefix(ev.key) or isReadMarkerPropKey(ev.key)) {
                                 try queueNumeric(conn, .ERR_SECURITY, &.{k.entity.id}, "Delete device properties individually through durable authority");
                                 return;
                             }
@@ -62016,21 +62412,31 @@ fn bouncerRewindConfig(port: u16) Config {
 /// cross-connection ordering is deterministic, and heap-allocates three
 /// LiveClients (founder/poster, witness member, bouncer member).
 fn runBouncerRewindScenario(account: []const u8, set_opers_policy: bool, expect_replay: bool) !void {
-    var server = Server.init(std.testing.allocator, bouncerRewindConfig(0)) catch |err| switch (err) {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "bouncer-rewind.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var config = bouncerRewindConfig(0);
+    // Authenticated MARKREAD acceptance includes its durable account position.
+    // The fixture's custom SASL verifier supplies identity, not persistence.
+    config.account_services = &services;
+    const server = createTestServer(alloc, config) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
+    defer alloc.destroy(server);
     defer server.deinit();
     const port = try server.boundPort();
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
         thr.join();
     }
 
-    const alloc = std.testing.allocator;
     const clients = try alloc.alloc(LiveClient, 3);
     defer alloc.free(clients);
 
@@ -62986,6 +63392,468 @@ test "GAP-D2 kill-restart and same-image USR2 deliver the memo and fire MEMO_PUS
     try std.testing.expectEqualStrings("alice", hint.from);
     try std.testing.expectEqualStrings("usr2 offline", hint.text);
     std.debug.print("GAP-D2 branch=kill-restart plus same-image USR2 delivered usr2 offline and fired MEMO_PUSH\n", .{});
+}
+
+fn readMarkerServerForTest(allocator: std.mem.Allocator, services: *services_mod.Services, identity: *const node_identity.NodeIdentity) !*Server {
+    return createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = services,
+        .node_identity = identity,
+        .node_id = identity.shortId(),
+        .crypto_io = std.testing.io,
+    });
+}
+
+fn readMarkerClientForTest(server: *Server, nick: []const u8, account: ?[]const u8) !client_model.ClientId {
+    const id = try addTestLocalClient(server, nick, account);
+    const conn = server.connFor(id).?;
+    conn.session.registration.registered = true;
+    conn.session.addCap(.read_marker);
+    return id;
+}
+
+fn readMarkerLineForTest(server: *Server, id: client_model.ClientId, line: []const u8) !void {
+    const conn = server.connFor(id).?;
+    resetTestSendQ(conn);
+    try server.processLiveLine(id, conn, line);
+}
+
+fn signedReadMarkerForTest(identity: *const node_identity.NodeIdentity, owner: []const u8, target: []const u8, timestamp: []const u8, hlc: u64, out: []u8) ![]const u8 {
+    var key_buf: [entity_prop_event.max_key_len]u8 = undefined;
+    const key = Server.readMarkerPropKey(target, &key_buf);
+    var value_buf: [25 + read_marker_store.default_max_target_bytes]u8 = undefined;
+    const value = try std.fmt.bufPrint(&value_buf, "{s} {s}", .{ timestamp, target });
+    var event = entity_prop_event.EntityPropEvent{
+        .kind = .user,
+        .present = true,
+        .origin_node = identity.shortId(),
+        .hlc = hlc,
+        .entity = owner,
+        .key = key,
+        .value = value,
+        .owner = owner,
+    };
+    var public_key: [entity_prop_event.pubkey_len]u8 = undefined;
+    var signature: [entity_prop_event.sig_len]u8 = undefined;
+    const transcript = try entity_prop_event.originTranscript(std.testing.allocator, event);
+    defer std.testing.allocator.free(transcript);
+    try entity_prop_event.signInPlace(&event, &identity.sign_kp, transcript, &public_key, &signature);
+    return entity_prop_event.encode(event, out);
+}
+
+test "MARKREAD atomic live dispatch isolates guests and publishes once to physical account attachments" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "marker-dispatch.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC1)), "marker-test");
+    defer identity.deinit();
+    const server = try readMarkerServerForTest(alloc, &services, &identity);
+    defer alloc.destroy(server);
+    defer server.deinit();
+    const writer = try readMarkerClientForTest(server, "Writer", "carol");
+    const sibling = try readMarkerClientForTest(server, "Sibling", "carol");
+    const other = try readMarkerClientForTest(server, "Other", "other");
+    const guest = try readMarkerClientForTest(server, "carol", null);
+    const guest2 = try readMarkerClientForTest(server, "Guest2", null);
+    inline for (.{ writer, sibling, other, guest, guest2 }) |id| resetTestSendQ(server.connFor(id).?);
+    try readMarkerLineForTest(server, writer, "MARKREAD #private timestamp=2026-06-04T12:00:00.000Z");
+    const needle = "MARKREAD #private timestamp=2026-06-04T12:00:00.000Z";
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(server.connFor(sibling).?.send_buf[0..server.connFor(sibling).?.send_len], needle));
+    try std.testing.expectEqual(@as(usize, 0), server.connFor(other).?.send_len);
+    try std.testing.expectEqual(@as(usize, 0), server.connFor(guest).?.send_len);
+    try std.testing.expectEqual(@as(usize, 0), server.connFor(guest2).?.send_len);
+    try readMarkerLineForTest(server, guest, "MARKREAD #private");
+    try expectContains(server.connFor(guest).?.send_buf[0..server.connFor(guest).?.send_len], "MARKREAD #private *");
+    try readMarkerLineForTest(server, guest, "MARKREAD #private timestamp=2099-01-01T00:00:00.000Z");
+    try readMarkerLineForTest(server, guest2, "MARKREAD #private");
+    try expectContains(server.connFor(guest2).?.send_buf[0..server.connFor(guest2).?.send_len], "MARKREAD #private *");
+    try readMarkerLineForTest(server, writer, "MARKREAD #PRIVATE");
+    try expectContains(server.connFor(writer).?.send_buf[0..server.connFor(writer).?.send_len], "timestamp=2026-06-04T12:00:00.000Z");
+    var candidate = try marker_durable.stageRestore(&store, alloc);
+    defer candidate.deinit();
+    try std.testing.expectEqual(@as(usize, 1), candidate.markers.count());
+    try std.testing.expectEqual(@as(usize, 1), candidate.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 1), server.read_marker_facts.count());
+    // Neither ordinary PROP inspection nor a bulk clear can expose or alter
+    // the dedicated private frontier, including an operator override.
+    server.connFor(other).?.ircx = true;
+    try readMarkerLineForTest(server, other, "PROP carol");
+    try std.testing.expect(std.mem.indexOf(u8, server.connFor(other).?.send_buf[0..server.connFor(other).?.send_len], "read.marker/") == null);
+    try readMarkerLineForTest(server, guest, "PROP carol :");
+    try std.testing.expectEqual(@as(u32, 1), server.read_marker_facts.count());
+    const before = server.read_markers.count();
+    server.clearGuestReadMarkers(server.connFor(guest).?);
+    try std.testing.expectEqual(before - 1, server.read_markers.count());
+    try readMarkerLineForTest(server, guest, "MARKREAD #private");
+    try expectContains(server.connFor(guest).?.send_buf[0..server.connFor(guest).?.send_len], "MARKREAD #private *");
+}
+
+test "MARKREAD signed timestamp max ignores HLC rollback and rejects unsigned forged future facts" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "marker-max.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var receiver = try node_identity.fromSeed(@as([32]u8, @splat(0xC2)), "marker-test");
+    defer receiver.deinit();
+    var author = try node_identity.fromSeed(@as([32]u8, @splat(0xC3)), "marker-test");
+    defer author.deinit();
+    const server = try readMarkerServerForTest(alloc, &services, &receiver);
+    defer alloc.destroy(server);
+    defer server.deinit();
+    const attached = try readMarkerClientForTest(server, "Attached", "carol");
+    resetTestSendQ(server.connFor(attached).?);
+    var wire1: [512]u8 = undefined;
+    var wire2: [512]u8 = undefined;
+    const old = try signedReadMarkerForTest(&author, "carol", "#room", "2026-06-04T12:00:00.000Z", 100, &wire1);
+    const newest = try signedReadMarkerForTest(&author, "carol", "#room", "2026-06-04T12:00:01.000Z", 50, &wire2);
+    try server.admitRemoteReadMarker(try entity_prop_event.decode(old));
+    resetTestSendQ(server.connFor(attached).?);
+    try server.admitRemoteReadMarker(try entity_prop_event.decode(newest));
+    try std.testing.expectEqualStrings("2026-06-04T12:00:01.000Z", (try server.read_markers.get("carol", "#room")).?.slice());
+    try std.testing.expectEqual(@as(u64, 100), server.read_marker_clock.last_stamp);
+    try server.admitRemoteReadMarker(try entity_prop_event.decode(old));
+    try server.admitRemoteReadMarker(try entity_prop_event.decode(newest));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(server.connFor(attached).?.send_buf[0..server.connFor(attached).?.send_len], "timestamp=2026-06-04T12:00:01.000Z"));
+    const before_seq = store.next_seq;
+    var bad = try entity_prop_event.decode(newest);
+    bad.origin_pubkey = "";
+    bad.origin_sig = "";
+    try std.testing.expectError(error.BadReadMarkerFact, server.admitRemoteReadMarker(bad));
+    bad = try entity_prop_event.decode(newest);
+    bad.entity = "other";
+    try std.testing.expectError(error.BadReadMarkerFact, server.admitRemoteReadMarker(bad));
+    var future_buf: [512]u8 = undefined;
+    const future = try signedReadMarkerForTest(&author, "carol", "#room", "2026-06-04T12:00:02.000Z", std.math.maxInt(u64), &future_buf);
+    try std.testing.expectError(error.ClockExhausted, server.admitRemoteReadMarker(try entity_prop_event.decode(future)));
+    try std.testing.expectEqual(before_seq, store.next_seq);
+    try std.testing.expectEqual(@as(u64, 100), server.read_marker_clock.last_stamp);
+    try std.testing.expectEqualStrings("2026-06-04T12:00:01.000Z", (try server.read_markers.get("carol", "#room")).?.slice());
+}
+
+test "MARKREAD atomic local and inbound admission allocation sweeps retain exact state and retry" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC4)), "marker-test");
+    defer identity.deinit();
+    var remote_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC5)), "marker-test");
+    defer remote_identity.deinit();
+    const ts = try read_marker_store.Timestamp.parseWire("2026-06-04T12:00:00.000Z");
+    var remote_wire_buf: [512]u8 = undefined;
+    const remote_wire = try signedReadMarkerForTest(&remote_identity, "carol", "#oom", ts.slice(), 1234, &remote_wire_buf);
+    const remote_event = try entity_prop_event.decode(remote_wire);
+    for ([_]bool{ false, true }) |inbound| {
+        var reached_success = false;
+        var failures: usize = 0;
+        for (0..96) |offset| {
+            var failing = std.testing.FailingAllocator.init(alloc, .{});
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var store = try services_mod.OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "marker-oom.wal");
+            defer store.deinit();
+            var services = services_mod.Services.init(&store, null);
+            const server = try readMarkerServerForTest(failing.allocator(), &services, &identity);
+            defer alloc.destroy(server);
+            defer server.deinit();
+            const seq = store.next_seq;
+            const wal_offset = store.wal_offset;
+            failing.fail_index = failing.alloc_index + offset;
+            const admitted = if (inbound) blk: {
+                server.admitRemoteReadMarker(remote_event) catch |err| {
+                    try std.testing.expectEqual(error.OutOfMemory, err);
+                    break :blk false;
+                };
+                break :blk true;
+            } else blk: {
+                _ = server.commitAccountReadMarker("carol", "#oom", ts) catch |err| {
+                    try std.testing.expectEqual(error.OutOfMemory, err);
+                    break :blk false;
+                };
+                break :blk true;
+            };
+            failing.fail_index = std.math.maxInt(usize);
+            if (!admitted) {
+                failures += 1;
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(@as(usize, 0), server.read_markers.count());
+                try std.testing.expectEqual(@as(u32, 0), server.read_marker_facts.count());
+                try std.testing.expectEqual(@as(u64, 0), server.read_marker_clock.last_stamp);
+                try std.testing.expectEqual(seq, store.next_seq);
+                try std.testing.expectEqual(wal_offset, store.wal_offset);
+                try std.testing.expect(server.read_markers.active_prepared == null);
+                if (inbound) try server.admitRemoteReadMarker(remote_event) else _ = try server.commitAccountReadMarker("carol", "#oom", ts);
+            } else {
+                try std.testing.expect(!failing.has_induced_failure);
+                reached_success = true;
+            }
+            try std.testing.expectEqualStrings(ts.slice(), (try server.read_markers.get("carol", "#oom")).?.slice());
+            try std.testing.expectEqual(@as(u32, 1), server.read_marker_facts.count());
+            if (admitted) break;
+        }
+        try std.testing.expect(reached_success);
+        try std.testing.expect(failures > 8);
+        std.debug.print("MARKREAD allocation sweep inbound={} rejected={} then success\n", .{ inbound, failures });
+    }
+}
+
+test "MARKREAD secured burst keeps signed frontier through SendQ pressure outer OOM and duplicate repair" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const pair = try alloc.create(SessionReplayTestPair);
+    defer alloc.destroy(pair);
+    pair.* = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    try std.testing.expect(pair.a.supportsReadMarkers());
+    try std.testing.expect(pair.b.supportsReadMarkers());
+    var tmp1 = std.testing.tmpDir(.{});
+    defer tmp1.cleanup();
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var store1 = try services_mod.OroStore.open(alloc, std.testing.io, tmp1.dir, "marker-pressure-a.wal");
+    defer store1.deinit();
+    var store2 = try services_mod.OroStore.open(alloc, std.testing.io, tmp2.dir, "marker-pressure-b.wal");
+    defer store2.deinit();
+    var services1 = services_mod.Services.init(&store1, null);
+    var services2 = services_mod.Services.init(&store2, null);
+    const author = try readMarkerServerForTest(alloc, &services1, &pair.ida);
+    defer alloc.destroy(author);
+    defer author.deinit();
+    const receiver = try readMarkerServerForTest(alloc, &services2, &pair.idb);
+    defer alloc.destroy(receiver);
+    defer receiver.deinit();
+    const ts = try read_marker_store.Timestamp.parseWire("2026-06-04T12:00:00.000Z");
+    _ = try author.commitAccountReadMarker("carol", "#room", ts);
+    var fact_it = author.read_marker_facts.valueIterator();
+    const retained = try alloc.dupe(u8, fact_it.next().?.*);
+    defer alloc.free(retained);
+    const conn = try alloc.create(ConnState);
+    defer alloc.destroy(conn);
+    conn.* = ConnState.init(-1);
+    conn.overflow_allocator = alloc;
+    conn.send_armed = true;
+    conn.s2s_secured = &pair.a;
+    defer {
+        conn.s2s_secured = null;
+        if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(alloc);
+    }
+    conn.send_len = conn.send_buf.len;
+    conn.sendq_cap = conn.send_buf.len;
+    conn.mesh_burst_stage = .entity_props;
+    try std.testing.expect(!author.sendMeshStateBurstTo(conn));
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(conn.mesh_burst_stage_encoded);
+    try std.testing.expectEqual(MeshBurstStage.entity_props, conn.mesh_burst_stage);
+    try std.testing.expect(pair.a.outbound().len != 0);
+    try std.testing.expectEqual(@as(u32, 1), author.read_marker_facts.count());
+    resetTestSendQ(conn);
+    conn.sendq_cap = default_sendq_cap;
+    try std.testing.expect(author.sendMeshStateBurstTo(conn));
+    const sent = try copyTestSendQ(alloc, conn);
+    defer alloc.free(sent);
+    try pair.b.feed(sent, 700);
+    receiver.drainEntityPropChanges(&pair.b);
+    try std.testing.expectEqualStrings(ts.slice(), (try receiver.read_markers.get("carol", "#room")).?.slice());
+    var received_it = receiver.read_marker_facts.valueIterator();
+    try std.testing.expectEqualSlices(u8, retained, received_it.next().?.*);
+    // A send is not receipt: retain the exact durable winner after delivery.
+    try std.testing.expectEqual(@as(u32, 1), author.read_marker_facts.count());
+    resetTestSendQ(conn);
+    pair.a.out.clearAndFree(alloc);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    pair.a.allocator = failing.allocator();
+    const oom_sent = author.sendReadMarkerBurstTo(conn);
+    pair.a.allocator = alloc;
+    try std.testing.expect(!oom_sent);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.inner.?.outbound().len);
+    try std.testing.expectEqual(@as(u32, 1), author.read_marker_facts.count());
+    try std.testing.expect(author.sendReadMarkerBurstTo(conn));
+    try std.testing.expect(author.flushMeshBurstStage(conn));
+    const replay = try copyTestSendQ(alloc, conn);
+    defer alloc.free(replay);
+    try pair.b.feed(replay, 800);
+    const seq = store2.next_seq;
+    receiver.drainEntityPropChanges(&pair.b);
+    try std.testing.expectEqual(seq, store2.next_seq);
+    try std.testing.expectEqual(@as(u32, 1), receiver.read_marker_facts.count());
+    var replay_it = receiver.read_marker_facts.valueIterator();
+    try std.testing.expectEqualSlices(u8, retained, replay_it.next().?.*);
+}
+
+test "MARKREAD restore allocation sweep preserves the complete live frontier until a valid swap" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC7)), "marker-test");
+    defer identity.deinit();
+    const ts = try read_marker_store.Timestamp.parseWire("2026-06-04T12:00:00.000Z");
+    var success = false;
+    var failures: usize = 0;
+    for (0..96) |offset| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "marker-restore-oom.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        const server = try readMarkerServerForTest(failing.allocator(), &services, &identity);
+        defer alloc.destroy(server);
+        defer server.deinit();
+        _ = try server.commitAccountReadMarker("carol", "#room", ts);
+        const clock = server.read_marker_clock.last_stamp;
+        var before_it = server.read_marker_facts.valueIterator();
+        const before = try alloc.dupe(u8, before_it.next().?.*);
+        defer alloc.free(before);
+        failing.fail_index = failing.alloc_index + offset;
+        const restored = blk: {
+            server.restoreReadMarkerCandidate(&services) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                break :blk false;
+            };
+            break :blk true;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expectEqual(clock, server.read_marker_clock.last_stamp);
+        try std.testing.expectEqualStrings(ts.slice(), (try server.read_markers.get("carol", "#room")).?.slice());
+        var after_it = server.read_marker_facts.valueIterator();
+        try std.testing.expectEqualSlices(u8, before, after_it.next().?.*);
+        if (restored) {
+            try std.testing.expect(!failing.has_induced_failure);
+            success = true;
+            break;
+        }
+        failures += 1;
+        try std.testing.expect(failing.has_induced_failure);
+        try server.restoreReadMarkerCandidate(&services);
+    }
+    try std.testing.expect(success);
+    try std.testing.expect(failures > 4);
+    std.debug.print("MARKREAD restore allocation sweep rejected={} then success\n", .{failures});
+}
+
+test "MARKREAD live write short write and sync faults publish no runtime position or account notification" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC8)), "marker-test");
+    defer identity.deinit();
+    const old = try read_marker_store.Timestamp.parseWire("2026-06-04T12:00:00.000Z");
+    const new = try read_marker_store.Timestamp.parseWire("2026-06-04T12:00:01.000Z");
+    const Fault = @import("store.zig").PreparedIoFault;
+    for ([_]Fault{ .{ .write = .failed }, .{ .write = .short }, .{ .sync = true } }) |fault| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "marker-io.wal");
+            defer store.deinit();
+            var services = services_mod.Services.init(&store, null);
+            const server = try readMarkerServerForTest(alloc, &services, &identity);
+            defer alloc.destroy(server);
+            defer server.deinit();
+            const writer = try readMarkerClientForTest(server, "Writer", "carol");
+            const sibling = try readMarkerClientForTest(server, "Sibling", "carol");
+            _ = try server.commitAccountReadMarker("carol", "#room", old);
+            resetTestSendQ(server.connFor(sibling).?);
+            const clock = server.read_marker_clock.last_stamp;
+            var before_it = server.read_marker_facts.valueIterator();
+            const before = try alloc.dupe(u8, before_it.next().?.*);
+            defer alloc.free(before);
+            store.setPreparedIoFault(fault);
+            try readMarkerLineForTest(server, writer, "MARKREAD #room timestamp=2026-06-04T12:00:01.000Z");
+            const reply = server.connFor(writer).?.send_buf[0..server.connFor(writer).?.send_len];
+            try expectContains(reply, "TEMPORARILY_UNAVAILABLE");
+            try std.testing.expect(std.mem.indexOf(u8, reply, "MARKREAD #room timestamp=") == null);
+            try std.testing.expectEqual(@as(usize, 0), server.connFor(sibling).?.send_len);
+            try std.testing.expectEqualStrings(old.slice(), (try server.read_markers.get("carol", "#room")).?.slice());
+            try std.testing.expectEqual(clock, server.read_marker_clock.last_stamp);
+            var after_it = server.read_marker_facts.valueIterator();
+            try std.testing.expectEqualSlices(u8, before, after_it.next().?.*);
+            try std.testing.expect(server.read_marker_unavailable);
+            try readMarkerLineForTest(server, writer, "MARKREAD #room");
+            try expectContains(server.connFor(writer).?.send_buf[0..server.connFor(writer).?.send_len], "TEMPORARILY_UNAVAILABLE");
+        }
+        var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "marker-io.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        const server = try readMarkerServerForTest(alloc, &services, &identity);
+        defer alloc.destroy(server);
+        defer server.deinit();
+        try std.testing.expect(!server.read_marker_unavailable);
+        const expected = if (fault.sync) new else old;
+        try std.testing.expectEqualStrings(expected.slice(), (try server.read_markers.get("carol", "#room")).?.slice());
+        var it = server.read_marker_facts.valueIterator();
+        const parsed = try server.validateReadMarkerFact(try entity_prop_event.decode(it.next().?.*));
+        try std.testing.expectEqualStrings(expected.slice(), parsed.timestamp.slice());
+    }
+}
+
+test "MARKREAD signed frontier and independent clock cold restore atomically and corrupt fact fails closed" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xC6)), "marker-test");
+    defer identity.deinit();
+    var expected_wire: [512]u8 = undefined;
+    var expected_len: usize = 0;
+    var expected_clock: u64 = 0;
+    const ts = try read_marker_store.Timestamp.parseWire("2026-06-04T12:00:00.000Z");
+    {
+        var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "marker-cold.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        const server = try readMarkerServerForTest(alloc, &services, &identity);
+        defer alloc.destroy(server);
+        defer server.deinit();
+        _ = try server.rememberReadMarker("carol", "#room", ts);
+        try std.testing.expectEqual(@as(u32, 0), server.read_marker_facts.count());
+        const older = try read_marker_store.Timestamp.parseWire("2026-06-04T11:00:00.000Z");
+        _ = try server.commitAccountReadMarker("carol", "#room", older);
+        try std.testing.expectEqual(@as(u32, 0), server.read_marker_facts.count());
+        _ = try server.commitAccountReadMarker("carol", "#room", ts);
+        var it = server.read_marker_facts.valueIterator();
+        const wire = it.next().?.*;
+        expected_len = wire.len;
+        @memcpy(expected_wire[0..wire.len], wire);
+        expected_clock = server.read_marker_clock.last_stamp;
+    }
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "marker-cold.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    const server = try readMarkerServerForTest(alloc, &services, &identity);
+    defer alloc.destroy(server);
+    defer server.deinit();
+    try std.testing.expect(!server.read_marker_unavailable);
+    try std.testing.expectEqual(expected_clock, server.read_marker_clock.last_stamp);
+    var it = server.read_marker_facts.valueIterator();
+    try std.testing.expectEqualSlices(u8, expected_wire[0..expected_len], it.next().?.*);
+    var bad_wire = try alloc.dupe(u8, expected_wire[0..expected_len]);
+    defer alloc.free(bad_wire);
+    bad_wire[bad_wire.len - 1] ^= 1;
+    var bad = try marker_durable.preparePutWithClock(&store, "carol", "#room", ts, bad_wire, expected_clock);
+    defer bad.deinit();
+    try bad.commit();
+    server.restoreDurableMarkers();
+    try std.testing.expect(server.read_marker_unavailable);
+    try std.testing.expectEqualStrings(ts.slice(), (try server.read_markers.get("carol", "#room")).?.slice());
+    var retained_it = server.read_marker_facts.valueIterator();
+    try std.testing.expectEqualSlices(u8, expected_wire[0..expected_len], retained_it.next().?.*);
+    const client = try readMarkerClientForTest(server, "Attached", "carol");
+    try readMarkerLineForTest(server, client, "MARKREAD #room");
+    try expectContains(server.connFor(client).?.send_buf[0..server.connFor(client).?.send_len], "TEMPORARILY_UNAVAILABLE");
 }
 
 test "UPGRADE GAP-P16 MARKREAD survives the dropped process image and rewind stays bounded" {
@@ -103892,14 +104760,15 @@ test "threaded server: CHATHISTORY TARGETS lists active channels and DMs" {
 }
 
 test "threaded server: MARKREAD set then get" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = createTestServer(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
+    defer std.testing.allocator.destroy(server);
     defer server.deinit();
     const port = try server.boundPort();
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -103922,14 +104791,15 @@ test "threaded server: MARKREAD set then get" {
 }
 
 test "threaded server: JOIN pushes stored MARKREAD marker" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = createTestServer(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
+    defer std.testing.allocator.destroy(server);
     defer server.deinit();
     const port = try server.boundPort();
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -105298,6 +106168,177 @@ test "UPGRADE refuses an incompatible target before listener or client CLOEXEC m
     try std.testing.expect((listener_flags & posix.FD_CLOEXEC) != 0);
     try std.testing.expect((client_flags & posix.FD_CLOEXEC) != 0);
     try std.testing.expectEqual(@as(usize, 1), server.reactors[0].clients.len());
+}
+
+test "MARKREAD UPGRADE refuses a v4-only executable preserving private carried ciphertext" {
+    if (comptime builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A tiny executable prints the exact frozen predecessor line. Unlike an
+    // interpreter script, this ELF remains executable through the probe's
+    // pinned CLOEXEC /proc/self/fd path. Its only syscalls are write and exit.
+    const old_reply = helix_live.predecessor_v4_upgrade_capability_token ++ "\n";
+    var image: [161 + old_reply.len]u8 = @splat(0);
+    @memcpy(image[0..7], "\x7fELF\x02\x01\x01");
+    std.mem.writeInt(u16, image[16..18], 2, .little); // ET_EXEC
+    std.mem.writeInt(u16, image[18..20], 62, .little); // EM_X86_64
+    std.mem.writeInt(u32, image[20..24], 1, .little);
+    std.mem.writeInt(u64, image[24..32], 0x400080, .little);
+    std.mem.writeInt(u64, image[32..40], 64, .little);
+    std.mem.writeInt(u16, image[52..54], 64, .little);
+    std.mem.writeInt(u16, image[54..56], 56, .little);
+    std.mem.writeInt(u16, image[56..58], 1, .little);
+    std.mem.writeInt(u32, image[64..68], 1, .little); // PT_LOAD
+    std.mem.writeInt(u32, image[68..72], 5, .little); // read + execute
+    std.mem.writeInt(u64, image[80..88], 0x400000, .little);
+    std.mem.writeInt(u64, image[88..96], 0x400000, .little);
+    std.mem.writeInt(u64, image[96..104], image.len, .little);
+    std.mem.writeInt(u64, image[104..112], image.len, .little);
+    std.mem.writeInt(u64, image[112..120], 4096, .little);
+    @memcpy(image[128..161], &[_]u8{
+        0xb8, 1, 0, 0, 0, // mov eax, SYS_write
+        0xbf, 1, 0, 0, 0, // mov edi, stdout
+        0x48, 0x8d, 0x35, 16, 0, 0, 0, // lea rsi, [rip + reply]
+        0xba, 0, 0, 0, 0, // mov edx, reply length
+        0x0f, 0x05, // syscall
+        0xb8, 60, 0, 0, 0, // mov eax, SYS_exit
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+    });
+    std.mem.writeInt(u32, image[146..150], old_reply.len, .little);
+    @memcpy(image[161..], old_reply);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "v4-only-reader", .data = &image, .flags = .{ .permissions = .executable_file } });
+    var path_buf: [256]u8 = undefined;
+    const old_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/v4-only-reader", .{tmp.sub_path});
+    const probe = try std.process.run(alloc, std.testing.io, .{ .argv = &.{ old_path, helix_live.upgrade_capability_arg } });
+    defer alloc.free(probe.stdout);
+    defer alloc.free(probe.stderr);
+    try std.testing.expect(probe.term.success());
+    try std.testing.expectEqualStrings(old_reply, probe.stdout);
+    try std.testing.expect(!helix_live.hasUpgradeCapabilityLine(probe.stdout));
+
+    const pair = try alloc.create(SessionReplayTestPair);
+    defer alloc.destroy(pair);
+    pair.* = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "v4-refusal.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    const server = try readMarkerServerForTest(alloc, &services, &pair.ida);
+    defer alloc.destroy(server);
+    defer server.deinit();
+    server.config.exe_path = old_path;
+    const client_id = try readMarkerClientForTest(server, "PrivateOwner", "carol");
+    const client = server.connFor(client_id).?;
+    var sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS) return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    client.fd = sockets[0];
+    client.send_armed = true;
+    try readMarkerLineForTest(server, client_id, "MARKREAD #private timestamp=2026-06-04T12:00:00.000Z");
+    const client_pending = try copyTestSendQ(alloc, client);
+    defer alloc.free(client_pending);
+    try std.testing.expect(std.mem.indexOf(u8, client_pending, "MARKREAD #private timestamp=") != null);
+
+    const mesh_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const mesh = server.rx().clients.get(mesh_id).?;
+    mesh.token = try tokenFromId(mesh_id);
+    mesh.overflow_allocator = alloc;
+    mesh.send_armed = true;
+    mesh.s2s_secured = &pair.a;
+    defer mesh.s2s_secured = null; // The pair, rather than Server, owns this link.
+    try std.testing.expect(server.sendReadMarkerBurstTo(mesh));
+    const encrypted = try alloc.dupe(u8, pair.a.outbound());
+    defer alloc.free(encrypted);
+    try std.testing.expect(encrypted.len > 7);
+    try rawAppendToConn(mesh, encrypted);
+    pair.a.clearOutbound();
+    // Separate consecutive records occupy the connection queue and the outer
+    // link queue. Neither queue claims ownership of the other's ciphertext.
+    try std.testing.expect(server.sendReadMarkerBurstTo(mesh));
+    const outer_pending = try alloc.dupe(u8, pair.a.outbound());
+    defer alloc.free(outer_pending);
+    try pair.a.rec_inbuf.appendSlice(alloc, encrypted[0..7]);
+    const mesh_pending = try copyTestSendQ(alloc, mesh);
+    defer alloc.free(mesh_pending);
+    const send_counter = pair.a.send_counter;
+    const receive_counter = pair.a.recv_counter;
+    const marker_clock = server.read_marker_clock;
+    const durable_sequence = store.next_seq;
+    var facts = server.read_marker_facts.valueIterator();
+    const retained = try alloc.dupe(u8, facts.next().?.*);
+    defer alloc.free(retained);
+    const listener_fd = server.reactors[0].listener_fd;
+    try std.testing.expect(setCloexec(listener_fd, true));
+    try std.testing.expect(setCloexec(client.fd, true));
+
+    // The exact reader gate precedes all upgrade staging and fd mutation.
+    try std.testing.expectError(error.UpgradeTargetIncompatible, server.openCompatibleUpgradeTarget(old_path));
+    try std.testing.expect((linux.fcntl(listener_fd, posix.F.GETFD, 0) & posix.FD_CLOEXEC) != 0);
+    try std.testing.expect((linux.fcntl(client.fd, posix.F.GETFD, 0) & posix.FD_CLOEXEC) != 0);
+    try std.testing.expectEqual(@as(usize, 2), server.reactors[0].clients.len());
+    const client_after = try copyTestSendQ(alloc, client);
+    defer alloc.free(client_after);
+    const mesh_after = try copyTestSendQ(alloc, mesh);
+    defer alloc.free(mesh_after);
+    try std.testing.expectEqualSlices(u8, client_pending, client_after);
+    try std.testing.expectEqualSlices(u8, mesh_pending, mesh_after);
+    try std.testing.expectEqualSlices(u8, outer_pending, pair.a.outbound());
+    try std.testing.expectEqualSlices(u8, encrypted[0..7], pair.a.rec_inbuf.items);
+    try std.testing.expectEqual(send_counter, pair.a.send_counter);
+    try std.testing.expectEqual(receive_counter, pair.a.recv_counter);
+    try std.testing.expectEqualDeep(marker_clock, server.read_marker_clock);
+    try std.testing.expectEqual(durable_sequence, store.next_seq);
+    facts = server.read_marker_facts.valueIterator();
+    try std.testing.expectEqualSlices(u8, retained, facts.next().?.*);
+
+    // The public upgrade entry point emits its ordinary signed refusal audit.
+    // That flush is permitted to transfer the pending outer record to SendQ,
+    // but it must preserve the exact encrypted prefix and physical ownership.
+    try std.testing.expectError(error.UpgradeTargetIncompatible, server.performUpgrade(.signal));
+    const audited_pending = try copyTestSendQ(alloc, mesh);
+    defer alloc.free(audited_pending);
+    try std.testing.expect(audited_pending.len > mesh_pending.len + outer_pending.len);
+    try std.testing.expectEqualSlices(u8, mesh_pending, audited_pending[0..mesh_pending.len]);
+    try std.testing.expectEqualSlices(u8, outer_pending, audited_pending[mesh_pending.len..][0..outer_pending.len]);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+    try std.testing.expectEqual(send_counter + 1, pair.a.send_counter);
+    try std.testing.expectEqual(receive_counter, pair.a.recv_counter);
+    try std.testing.expectEqualSlices(u8, encrypted[0..7], pair.a.rec_inbuf.items);
+    try std.testing.expect((linux.fcntl(listener_fd, posix.F.GETFD, 0) & posix.FD_CLOEXEC) != 0);
+    try std.testing.expect((linux.fcntl(client.fd, posix.F.GETFD, 0) & posix.FD_CLOEXEC) != 0);
+    try std.testing.expectEqualDeep(marker_clock, server.read_marker_clock);
+    try std.testing.expectEqual(durable_sequence, store.next_seq);
+    const client_audited = try copyTestSendQ(alloc, client);
+    defer alloc.free(client_audited);
+    try std.testing.expectEqualSlices(u8, client_pending, client_audited);
+    facts = server.read_marker_facts.valueIterator();
+    try std.testing.expectEqualSlices(u8, retained, facts.next().?.*);
+    try pair.b.feed(audited_pending, 900);
+    const carried_facts = try pair.b.takeEntityPropChanges();
+    defer {
+        for (carried_facts) |*change| change.deinit(alloc);
+        alloc.free(carried_facts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), carried_facts.len);
+    const signed = try entity_prop_event.decode(retained);
+    for (carried_facts) |change| {
+        try std.testing.expectEqualStrings(signed.key, change.key);
+        try std.testing.expectEqualStrings(signed.value, change.value);
+        try std.testing.expectEqualSlices(u8, signed.origin_sig, change.origin_sig);
+    }
+    const audit = try pair.b.takeOperEventsV2();
+    defer {
+        for (audit) |*item| item.deinit(alloc);
+        alloc.free(audit);
+    }
+    try std.testing.expectEqual(@as(usize, 1), audit.len);
+    const audit_event = try oper_event.decodeV2(audit[0].wire);
+    try std.testing.expectEqualStrings("UPGRADE refused: target binary failed exact Helix capability probe", audit_event.message);
+    try std.testing.expectEqual(oper_event.VerifyOutcome.verified, oper_event.verifyOrigin(audit_event));
 }
 
 test "failed inherited client adoption does not advance HLC or queue carried output" {
@@ -107041,7 +108082,26 @@ fn expectSharedUpgradeMessage(
     testSleepMs(120);
 }
 
-test "threaded server: four-client reusable session survives sequential Helix upgrades across secured mesh" {
+fn expectSharedUpgradeMarker(clients: []const *LiveClient, author_index: ?usize, timestamp: []const u8) !void {
+    for (clients) |client| client.reset();
+    var command_buf: [128]u8 = undefined;
+    if (author_index) |index| {
+        const command = try std.fmt.bufPrint(&command_buf, "MARKREAD #helix-mesh timestamp={s}\r\n", .{timestamp});
+        try writeAllFd(clients[index].fd, command);
+    } else {
+        for (clients) |client| try writeAllFd(client.fd, "MARKREAD #helix-mesh\r\n");
+    }
+    var needle_buf: [128]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&needle_buf, "MARKREAD #helix-mesh timestamp={s}", .{timestamp});
+    for (clients) |client| try recvUntil(client, needle, 600);
+    testSleepMs(80);
+    for (clients) |client| {
+        try client.readAvailable();
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), needle));
+    }
+}
+
+test "threaded server: four-client reusable session and MARKREAD survive sequential Helix upgrades across secured mesh" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const cross_process_lock = try acquireHeavyMeshAcceptanceTestLock();
@@ -107139,7 +108199,7 @@ test "threaded server: four-client reusable session survives sequential Helix up
     live_storage[2] = .{ .fd = fd_b };
     live_storage[3] = .{ .fd = fd_c };
     const clients = [_]*LiveClient{ &live_storage[0], &live_storage[1], &live_storage[2], &live_storage[3] };
-    const caps = "echo-message message-tags server-time onyx/session-sync";
+    const caps = "echo-message message-tags server-time onyx/session-sync draft/read-marker";
 
     try saslPlainPreludeWithCaps(fd_a, "nova", "pw", caps);
     try writeAllFd(fd_a, "NICK Nova\r\nUSER nova 0 * :Helix origin\r\n");
@@ -107192,6 +108252,7 @@ test "threaded server: four-client reusable session survives sequential Helix up
     try expectContains(clients[3].written(), "JOIN #helix-mesh");
 
     try expectSharedUpgradeMessage(&clients, 0, "#helix-mesh", "before-either-upgrade");
+    try expectSharedUpgradeMarker(&clients, 0, "2026-06-04T12:00:00.000Z");
     for (clients) |client| client.reset();
     testSleepMs(150);
     for (clients) |client| {
@@ -107210,6 +108271,8 @@ test "threaded server: four-client reusable session survives sequential Helix up
     for (clients) |client| try expectLiveSessionToken(client, local_token, node1_config.mesh_pass, "nova");
     try expectMeshPeerVisible(clients[0], "helix-session-node2.test", 100);
     try expectMeshPeerVisible(clients[2], "helix-session-node1.test", 100);
+    try expectSharedUpgradeMarker(&clients, null, "2026-06-04T12:00:00.000Z");
+    try expectSharedUpgradeMarker(&clients, 3, "2026-06-04T12:00:01.000Z");
     inline for (0..4) |sender_index| {
         var body_buf: [64]u8 = undefined;
         const body = try std.fmt.bufPrint(&body_buf, "after-node1-from-{d}", .{sender_index});
@@ -107233,6 +108296,8 @@ test "threaded server: four-client reusable session survives sequential Helix up
     for (clients) |client| try expectLiveSessionToken(client, local_token, node1_config.mesh_pass, "nova");
     try expectMeshPeerVisible(clients[0], "helix-session-node2.test", 100);
     try expectMeshPeerVisible(clients[2], "helix-session-node1.test", 100);
+    try expectSharedUpgradeMarker(&clients, null, "2026-06-04T12:00:01.000Z");
+    try expectSharedUpgradeMarker(&clients, 1, "2026-06-04T12:00:02.000Z");
     inline for (0..4) |sender_index| {
         var body_buf: [64]u8 = undefined;
         const body = try std.fmt.bufPrint(&body_buf, "after-node2-from-{d}", .{sender_index});
@@ -107285,11 +108350,13 @@ test "threaded server: four-client reusable session survives sequential Helix up
     };
     try expectAllUpgradeClientsPing(&all_clients, "after-fifth-attach");
     try expectLiveSessionToken(&extra, local_token, node1_config.mesh_pass, "nova");
+    try expectSharedUpgradeMarker(&all_clients, null, "2026-06-04T12:00:02.000Z");
+    try expectSharedUpgradeMarker(&all_clients, 4, "2026-06-04T12:00:03.000Z");
     try expectSharedUpgradeMessage(&all_clients, 4, "#helix-mesh", "post-upgrade-fifth-client-participates");
     try expectSharedUpgradeMessage(&all_clients, 0, "Nova", "opposite-node-self-dm-after-both-upgrades");
 }
 
-test "threaded server: reusable session stays exact-once across a three-node secured line" {
+test "threaded server: reusable session and MARKREAD stay exact-once across a three-node secured line" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const cross_process_lock = try acquireHeavyMeshAcceptanceTestLock();
@@ -107577,7 +108644,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     // Mint one portable credential on node 1. Only node 2 is directly connected,
     // so node 3 receives the SAME origin-signed OFFER only through node 2's v2
     // forwarding path; no direct edge or intermediate re-signing can help it.
-    const nova_caps = "echo-message message-tags server-time onyx/session-sync";
+    const nova_caps = "echo-message message-tags server-time onyx/session-sync draft/read-marker";
     try saslPlainPreludeWithCaps(fd_a, "nova", "pw", nova_caps);
     try writeAllFd(fd_a, "NICK Nova\r\nUSER nova 0 * :Line attachment A\r\n");
     try recvUntil(a, " 001 Nova ", 200);
@@ -107720,11 +108787,54 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     try Helpers.expectOnce(&d, "PART #mesh-late");
 
     // The independent sender lives on node 3, the far edge from the token origin.
-    try saslPlainPreludeWithCaps(fd_sender, "kazu", "pw", "message-tags server-time");
+    try saslPlainPreludeWithCaps(fd_sender, "kazu", "pw", "message-tags server-time draft/read-marker");
     try writeAllFd(fd_sender, "NICK RelaySender\r\nUSER kazu 0 * :Third-node sender\r\n");
     try recvUntil(sender, " 001 RelaySender ", 200);
     try writeAllFd(fd_sender, "JOIN #mesh-line\r\n");
     try recvUntil(sender, " 366 RelaySender #mesh-line ", 200);
+
+    // Account positions cross the real non-clique secured line and reach all
+    // four physical attachments. An unrelated account sees no private target.
+    const marker1 = "MARKREAD #mesh-line timestamp=2026-06-04T12:00:00.000Z";
+    inline for (.{ a, b, c, &d, sender }) |client| client.reset();
+    try writeAllFd(fd_a, marker1 ++ "\r\n");
+    inline for (.{ a, b, c, &d }) |client| try recvUntil(client, marker1, 600);
+    try Helpers.settle(&.{ a, b, c, &d, sender });
+    inline for (.{ a, b, c, &d }) |client| try Helpers.expectOnce(client, marker1);
+    try std.testing.expect(std.mem.indexOf(u8, sender.written(), "MARKREAD #mesh-line") == null);
+    const MarkerProof = struct {
+        fn wire(server: *Server) ![]u8 {
+            server.world.lockWrite();
+            defer server.world.unlockWrite();
+            var key: [64]u8 = undefined;
+            const row = server.read_marker_facts.get(Server.readMarkerFactKey("nova", "#mesh-line", &key)) orelse return error.TestUnexpectedResult;
+            return std.testing.allocator.dupe(u8, row);
+        }
+    };
+    const origin_wire = try MarkerProof.wire(node1);
+    defer alloc.free(origin_wire);
+    const middle_wire = try MarkerProof.wire(node2);
+    defer alloc.free(middle_wire);
+    const far_wire = try MarkerProof.wire(node3);
+    defer alloc.free(far_wire);
+    try std.testing.expectEqualSlices(u8, origin_wire, middle_wire);
+    try std.testing.expectEqualSlices(u8, origin_wire, far_wire);
+    try std.testing.expectEqual(ident1.shortId(), (try entity_prop_event.decode(far_wire)).origin_node);
+
+    // The far edge may author a greater timestamp for the same account even
+    // while the account also has a local attachment on the origin node.
+    const marker2 = "MARKREAD #mesh-line timestamp=2026-06-04T12:00:01.000Z";
+    inline for (.{ a, b, c, &d, sender }) |client| client.reset();
+    try writeAllFd(fd_d, marker2 ++ "\r\n");
+    inline for (.{ a, b, c, &d }) |client| try recvUntil(client, marker2, 600);
+    try Helpers.settle(&.{ a, b, c, &d, sender });
+    inline for (.{ a, b, c, &d }) |client| try Helpers.expectOnce(client, marker2);
+    try std.testing.expect(std.mem.indexOf(u8, sender.written(), "MARKREAD #mesh-line") == null);
+    sender.reset();
+    try writeAllFd(fd_sender, "PROP nova\r\nMARKREAD #mesh-line\r\n");
+    try recvUntil(sender, "MARKREAD #mesh-line *", 200);
+    try std.testing.expect(std.mem.indexOf(u8, sender.written(), "read.marker/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sender.written(), "2026-06-04T12:00:01.000Z") == null);
 
     // Third-party channel and direct events reach every live attachment exactly
     // once. msgid/time equality proves the two-hop copy is the same event, not a
@@ -107876,6 +108986,15 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     try Helpers.expectPeerAbsent(&admin, "session-line-node3.test");
     try Helpers.expectPeerAbsent(&probe3, "session-line-node2.test");
 
+    const marker3 = "MARKREAD #mesh-line timestamp=2026-06-04T12:00:02.000Z";
+    inline for (.{ a, b, &d, sender }) |client| client.reset();
+    try writeAllFd(fd_a, marker3 ++ "\r\n");
+    try recvUntil(a, marker3, 200);
+    try recvUntil(b, marker3, 200);
+    try writeAllFd(fd_d, "MARKREAD #mesh-line\r\n");
+    try recvUntil(&d, marker2, 200);
+    try std.testing.expect(std.mem.indexOf(u8, d.written(), marker3) == null);
+
     // Mutate the reusable session while the only far edge is physically down.
     // The near-side attachment receives the change, while the far-side
     // attachment cannot. Its later synthetic JOIN is positive proof that SRST
@@ -107933,6 +109052,8 @@ test "threaded server: reusable session stays exact-once across a three-node sec
         &.{ "session-line-node1.test", "session-line-node3.test" },
         160,
     );
+    try recvUntil(&d, marker3, 600);
+    try Helpers.expectOnce(&d, marker3);
     try recvUntil(&d, "JOIN :#mesh-retained", 600);
     try Helpers.expectOnce(&d, "JOIN :#mesh-retained");
     const retained_session_token = switch (try session_resume_credential.decode(local_token)) {
@@ -108030,6 +109151,10 @@ test "threaded server: reusable session stays exact-once across a three-node sec
     try expectContains(e.written(), "JOIN #mesh-line");
     try expectContains(e.written(), "JOIN #mesh-retained");
     try expectLiveSessionToken(&e, local_token, "mesh-session-line-secret", "nova");
+    e.reset();
+    try writeAllFd(fd_e, "MARKREAD #mesh-line\r\n");
+    try recvUntil(&e, marker3, 200);
+    try Helpers.expectOnce(&e, marker3);
 
     sender.reset();
     try writeAllFd(fd_sender, "JOIN #mesh-retained\r\n");

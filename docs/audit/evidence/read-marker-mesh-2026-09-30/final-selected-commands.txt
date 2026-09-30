@@ -1,0 +1,10 @@
+zig build check
+zig build test-helix
+zig build test-mesh
+zig build test-server
+zig build test-services
+zig build test-helix -Doptimize=ReleaseSafe
+zig build test-mesh -Doptimize=ReleaseSafe
+zig build test-server -Doptimize=ReleaseSafe
+zig build test-services -Doptimize=ReleaseSafe
+git diff --check

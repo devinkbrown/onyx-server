@@ -1,0 +1,21 @@
+OpenBSD onyx-obsd-codex.my.domain 7.9 GENERIC.MP#449 amd64
+8192
+SHA256 (onyx-server-module-tests) = 674873de3c3740712be0016d20974698e6f2ab849876be4dc99772e8bbbcdb6f
+88/94 daemon.helix.native_process.test.MARKREAD native private reader gate preserves forward upgrade only...OK
+89/94 crypto.aead.test_0...OK
+90/94 crypto.ecdsa_kat.test_0...OK
+91/94 crypto.ed25519_batch.test_0...OK
+92/94 crypto.sign_kat.test_0...OK
+93/94 crypto.tls_props.test_0...OK
+94/94 crypto.tls.test_0...OK
+91 passed; 3 skipped; 0 failed.
+onyx-server-module-tests EXIT=0
+SHA256 (onyx-server-daemon-tests) = 6d7b97f1f03accecc286e948eb9a6bb4f5207f7632e84c4e8444324a1e6bd2c1
+All 0 tests passed.
+onyx-server-daemon-tests EXIT=0
+SHA256 (onyx-server-cli-tests) = 0bc22cd0a33e2d97b1a292bc279d9c4f74c839f79dca98caad3803aa6daab84f
+1/2 armor_main.test_0...OK
+2/2 root.test_0...OK
+All 2 tests passed.
+onyx-server-cli-tests EXIT=0
+HOST_SSH_EXIT=0 HOST_ELAPSED_SECONDS=7.80
