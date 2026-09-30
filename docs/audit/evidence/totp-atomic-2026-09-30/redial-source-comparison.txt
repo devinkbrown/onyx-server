@@ -1,0 +1,4 @@
+test "threaded server: UPGRADE resume arena re-dials a carried mesh peer": byte-identical vs HEAD; 5056 bytes
+activateInheritedMeshRedials: byte-identical vs HEAD; 1487 bytes
+initiateS2sConnectToAddr: byte-identical vs HEAD; 3975 bytes
+adoptInheritedSessions: byte-identical vs HEAD; 109506 bytes

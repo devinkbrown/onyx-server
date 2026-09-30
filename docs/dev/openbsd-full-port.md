@@ -149,8 +149,12 @@ dial fallback compares peer IP without distinguishing colocated same-IP nodes.
 The latter can suppress a redial after a partition in a same-IP fixture.
 Both paths match the pre-port source; neither is counted as solved by these
 native gates. Shared-authoritative-session channel and direct delivery are
-covered across all three distinct hosts. Storage-fault atomicity for TOTP token
-revocation also remains a separate shared-services concern. The original port acceptance
+covered across all three distinct hosts. The subsequent
+[TOTP storage atomicity follow-up](../audit/evidence/totp-atomic-2026-09-30/README.md)
+closes local policy/token partial publication under storage faults. Its selected
+native storage/TOTP/SCRAM gates pass Debug and ReleaseSafe on the normal stack.
+Those focused gates are separate from the original transport/mesh campaign.
+The original port acceptance
 exposed a pre-existing 694-byte ISUPPORT allocation leak on the rejected
 candidate's missing-key error return. The subsequent
 [ISUPPORT cleanup follow-up](../audit/evidence/isupport-exit-2026-09-30/README.md)

@@ -1,0 +1,11 @@
+Build Summary: 8/8 steps succeeded; 113/113 tests passed
+test success
++- run test 111 pass (111 total) 2s MaxRSS:4M
+|  +- compile test ReleaseSafe native success 41s MaxRSS:815M
+|     +- options cached
++- run test success 695us MaxRSS:2M
+|  +- compile test ReleaseSafe native success 6s MaxRSS:262M
+|     +- options (reused)
++- run test 2 pass (2 total) 654us MaxRSS:2M
+   +- compile test ReleaseSafe native success 7s MaxRSS:264M
+      +- options (reused)

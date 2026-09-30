@@ -1,0 +1,18 @@
+8192
+SHA256 (module-debug) = bc880da52533f176a03065d9e4c05bcedb58ab7d0b6c502caba06f259178419c
+    1m02.92s real     1m00.31s user     0m02.46s system
+TOTP atomic cold replay disable=false write=short sync=false active=false token_valid=true
+TOTP atomic cold replay disable=false write=none sync=true active=true token_valid=false
+TOTP atomic cold replay disable=true write=failed sync=false active=true token_valid=true
+TOTP atomic cold replay disable=true write=short sync=false active=true token_valid=true
+TOTP atomic cold replay disable=true write=none sync=true active=false token_valid=false
+OK
+93/171 daemon.server.test.TOTP atomic live handlers successful enable and disable survive cold WAL reopen...OK
+94/171 daemon.server.test.TOTP atomic live SASL token authority survives rejected policy and is revoked on enable and disable...OK
+95/171 daemon.server.test.TOTP atomic live poisoned services refuse in-flight cached SCRAM through entry and completion gates...OK
+96/171 daemon.server.test.TOTP atomic RESETPASS live handler rejects password admission without success...TOTP atomic RESETPASS allocation failures before password=9 then success
+OK
+97/171 daemon.server.test.TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABLE...Segmentation fault at address 0x798b35ddffc0
+compiler_rt/stack_probe.zig:47:13: 0xe30c3d0f064 in zig_probe_stack (compiler_rt)
+Segmentation fault
+EXIT=139

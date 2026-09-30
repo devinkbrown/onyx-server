@@ -9,6 +9,17 @@ the local source changes, not acceptance of every item in the gap roadmap.
 
 ## Changes and bounds
 
+- Follow-up to `95f75e03`: atomically commit local TOTP policy and opaque SASL
+  token revocation, preserving pending state for admission-failure retry and
+  rejecting new authentication after uncertain I/O until reopen. Token issuance
+  and forced password/SCRAM reset use the same durable transaction. Fresh
+  independent reviews pass. Native OpenBSD Debug and ReleaseSafe each pass
+  170/171 selected tests with one existing Linux-only skip on the default stack.
+  Full Linux Debug and ReleaseSafe each pass 8794/8818, 24 skips, zero failures.
+  Older binaries reject stores after batch use; email reset code consumption
+  remains before password admission. See
+  [the fault and gate evidence](evidence/totp-atomic-2026-09-30/README.md).
+
 - Follow-up to `67eceb46`: free completed ISUPPORT token strings when any
   subsequent construction allocation fails. The previously published override
   remains unchanged, borrowed static tokens retain their pointers, and retry

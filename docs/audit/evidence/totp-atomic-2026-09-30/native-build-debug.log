@@ -1,0 +1,11 @@
+Build Summary: 8/8 steps succeeded
+test-artifacts success
++- install generated to bin/onyx-server-module-tests success
+|  +- compile test Debug x86_64-openbsd success 54s MaxRSS:1G
+|     +- options cached
++- install generated to bin/onyx-server-daemon-tests success
+|  +- compile test Debug x86_64-openbsd success 7s MaxRSS:349M
+|     +- options (reused)
++- install generated to bin/onyx-server-cli-tests success
+   +- compile test Debug x86_64-openbsd success 6s MaxRSS:349M
+      +- options (reused)

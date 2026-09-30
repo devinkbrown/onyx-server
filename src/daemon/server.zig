@@ -15216,6 +15216,15 @@ pub const LinuxServer = struct {
                 _ = try self.dispatchModules(id, conn, &parsed, line);
                 return;
             }
+            if (std.ascii.eqlIgnoreCase(parsed.command, "AUTHENTICATE") and !self.authenticationAvailable()) {
+                conn.session.sasl_router = null;
+                conn.session.sasl_pending = null;
+                conn.session.sasl_issue_session_token = false;
+                conn.session.client.registration.sasl = .failed;
+                var failure_buf: [default_reply_bytes]u8 = undefined;
+                const failure = try std.fmt.bufPrint(&failure_buf, ":{s} 904 {s} :Account storage requires recovery\r\n", .{ self.serverName(), conn.session.displayName() });
+                return appendToConn(conn, failure);
+            }
             const external_exchange = conn.session.sasl_pending == .external;
             var prereg_reply_buf: [default_reply_bytes]u8 = undefined;
             var sink = PreregReplySink{ .buf = &prereg_reply_buf };
@@ -24995,6 +25004,8 @@ pub const LinuxServer = struct {
     /// issued at REGISTER time. The one-argument form keeps legacy behaviour by
     /// using the caller's logged-in account.
     pub fn handleVerify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "VERIFY", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try self.noticeTo(conn, "Usage: VERIFY [account] <code>");
             return;
@@ -25063,7 +25074,14 @@ pub const LinuxServer = struct {
     /// unpersisted enrollment correctly does not require a second factor.
     fn totpRequired(self: *LinuxServer, account: []const u8) bool {
         const svc = self.account_services orelse return false;
+        // Unknown durable policy after ambiguous I/O must never relax 2FA.
+        if (!svc.authenticationAvailable()) return true;
         return svc.totpEnrolled(account);
+    }
+
+    fn authenticationAvailable(self: *LinuxServer) bool {
+        const svc = self.account_services orelse return true;
+        return svc.authenticationAvailable();
     }
 
     /// `sasl.TotpGate` adapter: lets the SASL completion path (which has only the
@@ -25082,7 +25100,7 @@ pub const LinuxServer = struct {
     fn accountStatusGateBlocked(ptr: *anyopaque, account: []const u8) bool {
         const self: *LinuxServer = @ptrCast(@alignCast(ptr));
         const svc = self.account_services orelse return false;
-        return svc.accountAuthBlocked(account);
+        return !svc.authenticationAvailable() or svc.accountAuthBlocked(account);
     }
 
     /// `sasl.AccountKnownGate` adapter: unknown OAuth accounts fail closed
@@ -25098,6 +25116,7 @@ pub const LinuxServer = struct {
     /// subsequent `self.totp.verify` can check a code with the replay guard. Use
     /// `totpRequired` for a pure read-only gate check.
     fn totpActiveForAccount(self: *LinuxServer, account: []const u8) bool {
+        if (!self.authenticationAvailable()) return false;
         if (self.totp.isEnrolled(account)) return true;
         // A pending (unconfirmed) in-memory enrollment is authoritative — never
         // overwrite it with a persisted load (which would discard the pending
@@ -25120,6 +25139,10 @@ pub const LinuxServer = struct {
             return self.failReply(conn, "TOTP", "ACCOUNT_REQUIRED", "Log in to an account before managing TOTP");
         const svc = self.account_services orelse
             return self.failReply(conn, "TOTP", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        if (!svc.authenticationAvailable())
+            return self.failReply(conn, "TOTP", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
+        if (parsed.param_count == 0)
+            return self.failReply(conn, "TOTP", "NEED_MORE_PARAMS", "Usage: TOTP <ENROLL|CONFIRM <code>|DISABLE|STATUS>");
         const sub = parsed.paramSlice()[0];
 
         if (std.ascii.eqlIgnoreCase(sub, "STATUS")) {
@@ -25133,11 +25156,18 @@ pub const LinuxServer = struct {
         }
 
         if (std.ascii.eqlIgnoreCase(sub, "DISABLE")) {
-            const was = self.totpActiveForAccount(account) or self.totp.isPending(account);
-            _ = self.totp.disable(account);
-            svc.totpSecretDelete(account) catch {};
-            // Disabling 2FA also drops any session token minted under it.
-            svc.revokeSessionTokens(account);
+            // Fixed lock order: TotpStore -> Services -> prepared WAL batch.
+            // Pin the runtime entry through durable deletion + token revocation;
+            // a failed admission leaves active/pending state and replay intact.
+            const was = blk: {
+                var change = self.totp.stageRemoval(account);
+                defer change.deinit();
+                const existed = change.outcome == .ok or svc.totpEnrolled(account);
+                svc.totpPolicyCommit(account, null) catch
+                    return self.failReply(conn, "TOTP", "TEMPORARILY_UNAVAILABLE", "Could not persist TOTP policy; try again after storage recovery");
+                _ = change.commitRemoval();
+                break :blk existed;
+            };
             return channelNotice(conn, "TOTP: two-factor authentication {s}", .{if (was) "disabled" else "was not enabled"});
         }
 
@@ -25145,13 +25175,15 @@ pub const LinuxServer = struct {
             // The shared secret must never cross a plaintext link.
             if (!conn.is_tls)
                 return self.failReply(conn, "TOTP", "INSECURE_TRANSPORT", "Enroll TOTP over a secure (TLS) connection; the secret must not cross plaintext");
-            if (self.totpActiveForAccount(account))
+            if (self.totpRequired(account) or self.totp.isEnrolled(account))
                 return self.failReply(conn, "TOTP", "ALREADY_ENROLLED", "TOTP is already active; DISABLE it first to re-enroll");
             const io = self.config.crypto_io orelse
                 return self.failReply(conn, "TOTP", "TEMPORARILY_UNAVAILABLE", "No randomness source configured");
             var rnd: [totp_secret_symbols]u8 = undefined;
+            defer std.crypto.secureZero(u8, &rnd);
             io.random(&rnd);
             var secret: [totp_secret_symbols]u8 = undefined;
+            defer std.crypto.secureZero(u8, &secret);
             for (rnd, 0..) |b, i| secret[i] = totp_b32_alphabet[b & 0x1f];
             self.totp.enroll(account, &secret) catch
                 return self.failReply(conn, "TOTP", "INTERNAL_ERROR", "Could not start enrollment");
@@ -25168,17 +25200,20 @@ pub const LinuxServer = struct {
             if (parsed.param_count < 2)
                 return self.failReply(conn, "TOTP", "NEED_MORE_PARAMS", "Usage: TOTP CONFIRM <code>");
             const code = parsed.paramSlice()[1];
-            const outcome = self.totp.confirm(account, code, totpUnixSeconds()) catch
-                return self.failReply(conn, "TOTP", "INTERNAL_ERROR", "Verification failed");
+            const outcome = blk: {
+                var change = self.totp.stageConfirmation(account, code, totpUnixSeconds());
+                defer change.deinit();
+                if (change.outcome == .ok) {
+                    // The borrowed secret stays pinned by the TOTP lock. The
+                    // batch revokes sst_ authority in the same durable cut.
+                    svc.totpPolicyCommit(account, change.secretB32()) catch
+                        return self.failReply(conn, "TOTP", "TEMPORARILY_UNAVAILABLE", "Could not persist TOTP policy; try again after storage recovery");
+                    change.commitConfirmation();
+                }
+                break :blk change.outcome;
+            };
             switch (outcome) {
                 .ok => {
-                    if (self.totp.secretB32(account)) |b32| svc.totpSecretPut(account, b32) catch {
-                        return channelNotice(conn, "TOTP: confirmed, but the secret could not be persisted; re-enroll after restart", .{});
-                    };
-                    // Enabling 2FA revokes any existing session token (a password-
-                    // equivalent re-entry credential that must not bypass the new
-                    // second factor).
-                    svc.revokeSessionTokens(account);
                     return channelNotice(conn, "TOTP: two-factor authentication is now ACTIVE — future logins require a code", .{});
                 },
                 .bad_code => return self.failReply(conn, "TOTP", "INVALID_CODE", "Incorrect code; try the current one from your authenticator"),
@@ -25194,6 +25229,8 @@ pub const LinuxServer = struct {
     /// entire set and returns plaintext once; LOGIN consumes a code and logs in
     /// (bypasses password + TOTP). Codes are never re-listed after generation.
     pub fn handleRecoveryCodes(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "RECOVERYCODES", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         const svc = self.account_services orelse return self.failReply(conn, "RECOVERYCODES", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         const p = parsed.paramSlice();
         if (p.len < 1) {
@@ -25274,7 +25311,10 @@ pub const LinuxServer = struct {
                 error.AuthFailed, error.NotFound => return self.failReply(conn, "RECOVERYCODES", "AUTH_FAILED", "Invalid or already-used recovery code"),
                 else => return self.failReply(conn, "RECOVERYCODES", "INTERNAL_ERROR", "Could not consume recovery code"),
             };
-            try self.finishLogin(conn, account);
+            self.finishLogin(conn, account) catch |err| switch (err) {
+                error.StorePoisoned => return self.failReply(conn, "RECOVERYCODES", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery"),
+                else => return err,
+            };
             try channelNotice(conn, "RECOVERYCODES: login ok — that code is now spent", .{});
             return;
         }
@@ -35708,6 +35748,13 @@ pub const LinuxServer = struct {
         package: ircx_auth.Package,
         result: sasl_mechrouter.Success,
     ) !void {
+        if (!self.authenticationAvailable()) {
+            conn.session.sasl_router = null;
+            conn.session.sasl_pending = null;
+            conn.session.sasl_issue_session_token = false;
+            try self.ircxAuthFailed(conn, "*");
+            return;
+        }
         if (result.account.len > account_register.MAX_ACCOUNT_BYTES) {
             try self.ircxAuthFailed(conn, package.token());
             return;
@@ -35847,6 +35894,13 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleIrcxAuth(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.authenticationAvailable()) {
+            conn.session.sasl_router = null;
+            conn.session.sasl_pending = null;
+            conn.session.sasl_issue_session_token = false;
+            try self.ircxAuthFailed(conn, "*");
+            return;
+        }
         const req = ircx_auth.parseParams(parsed.paramSlice()) catch |err| {
             if (err == error.UnknownPackage and parsed.param_count >= 1) {
                 try self.ircxAuthUnknownPackage(conn, parsed.paramSlice()[0]);
@@ -39050,6 +39104,7 @@ pub const LinuxServer = struct {
     /// `handleIdentify`; it does NOT emit the "You are now identified" notice so
     /// each caller can print its own success line.
     fn finishLogin(self: *LinuxServer, conn: *ConnState, account: []const u8) !void {
+        if (!self.authenticationAvailable()) return error.StorePoisoned;
         const id = idFromToken(conn.token);
         self.retireMediaBeforeAccountMutation(id, conn, account);
         _ = self.clearOperAuthorityTransition(id, conn, true, "account authentication replaced operator authority");
@@ -39080,6 +39135,8 @@ pub const LinuxServer = struct {
     /// Immediate registration (no email verification step yet); logs the client in
     /// and applies oper elevation if the account is bound in the registry.
     pub fn handleRegister(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "REGISTER", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         const svc = self.account_services orelse return self.failReply(conn, "REGISTER", "TEMPORARILY_UNAVAILABLE", "Account registration is unavailable");
         if (parsed.param_count < 3) {
             try self.failReply(conn, "REGISTER", "NEED_MORE_PARAMS", "Usage: REGISTER <account> <email|*> <password>");
@@ -39095,6 +39152,8 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "REGISTER", registerFailCode(err), "Registration failed");
             return;
         };
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "REGISTER", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         self.retireMediaBeforeAccountMutation(idFromToken(conn.token), conn, account);
         _ = self.clearOperAuthorityTransition(
             idFromToken(conn.token),
@@ -39197,6 +39256,8 @@ pub const LinuxServer = struct {
 
     /// `IDENTIFY <account> <password>` — authenticate to an existing account.
     pub fn handleIdentify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "IDENTIFY", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         const svc = self.account_services orelse return self.failReply(conn, "IDENTIFY", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"IDENTIFY"}, "Usage: IDENTIFY <account> <password> [<2fa-code>]");
@@ -39223,6 +39284,8 @@ pub const LinuxServer = struct {
                 return self.failReply(conn, "IDENTIFY", "TOTP_REQUIRED", "Two-factor code required: IDENTIFY <account> <password> <6-digit-code>");
             }
         }
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "IDENTIFY", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         self.loginRecordSuccess(conn, account);
         self.retireMediaBeforeAccountMutation(idFromToken(conn.token), conn, account);
         _ = self.clearOperAuthorityTransition(
@@ -39376,6 +39439,8 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleSetpass(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "SETPASS", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         const svc = self.account_services orelse return self.failReply(conn, "SETPASS", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         const account = conn.session.account() orelse {
             try self.failReply(conn, "SETPASS", "ACCOUNT_REQUIRED", "Log in to change your password");
@@ -39441,6 +39506,8 @@ pub const LinuxServer = struct {
     /// verified email. Usable while logged out. Requires a configured mail
     /// transport ([mail]); the code is delivered out-of-band only.
     pub fn handleResetpass(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "RESETPASS", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         const svc = self.account_services orelse return self.failReply(conn, "RESETPASS", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         if (parsed.param_count == 0 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"RESETPASS"}, "Usage: RESETPASS <account>  (request a code)  or  RESETPASS <account> <code> <new-password>  (set it)");
@@ -39457,9 +39524,12 @@ pub const LinuxServer = struct {
                     var scratch: [1024]u8 = undefined;
                     svc.setAccountPasswordForced(account, p[2], &scratch) catch |err| {
                         const code: []const u8 = if (err == error.InvalidPassword) "INVALID_PASSWORD" else "TEMPORARILY_UNAVAILABLE";
-                        return self.failReply(conn, "RESETPASS", code, "New password rejected (8-512 chars)");
+                        const message: []const u8 = if (err == error.InvalidPassword) "New password rejected (8-512 chars)" else "Could not complete password reset; account storage may require recovery";
+                        return self.failReply(conn, "RESETPASS", code, message);
                     };
-                    svc.revokeSessionTokens(account);
+                    // Services commits password, SCRAM and token authority
+                    // together. Reset-code consumption above still precedes
+                    // admission, so a failed admission requires a fresh code.
                     var buf: [default_reply_bytes]u8 = undefined;
                     const line = std.fmt.bufPrint(&buf, ":{s} RESETPASS SUCCESS {s} :Password reset; log in with your new password\r\n", .{ self.serverName(), account }) catch return;
                     try appendToConn(conn, line);
@@ -39817,6 +39887,8 @@ pub const LinuxServer = struct {
     /// connection to the caller's logged-in account, enabling future password-less
     /// SASL EXTERNAL logins. Requires both an account login and a presented cert.
     pub fn handleCertAdd(self: *LinuxServer, conn: *ConnState) !void {
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "CERTADD", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         const svc = self.account_services orelse return self.failReply(conn, "CERTADD", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         const account = conn.session.account() orelse return self.failReply(conn, "CERTADD", "NOT_LOGGED_IN", "Log in before binding a certificate");
         const fp = conn.session.tls_certfp orelse return self.failReply(conn, "CERTADD", "NO_CLIENT_CERT", "No TLS client certificate presented on this connection");
@@ -39843,6 +39915,8 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleCertDel(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "CERTDEL", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         const svc = self.account_services orelse return self.failReply(conn, "CERTDEL", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         const account = conn.session.account() orelse return self.failReply(conn, "CERTDEL", "NOT_LOGGED_IN", "Log in before deleting a certificate");
         if (parsed.param_count < 1) {
@@ -41474,6 +41548,8 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleWebauthn(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.authenticationAvailable())
+            return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         const svc = self.account_services orelse
             return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         const rp = self.webauthnRp() orelse
@@ -41797,7 +41873,10 @@ pub const LinuxServer = struct {
         // eqlIgnoreCase gate above already proved they name the same account, and
         // downstream account keying (metadata/silence restore) is case-sensitive.
         self.loginRecordSuccess(conn, target_account);
-        try self.finishLogin(conn, cred.account());
+        self.finishLogin(conn, cred.account()) catch |err| switch (err) {
+            error.StorePoisoned => return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery"),
+            else => return err,
+        };
         var b: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :You are now identified as {s}\r\n", .{ self.serverName(), conn.session.displayName(), conn.session.account() orelse target_account }) catch return;
         try emitReplyLine(conn, line);
@@ -70200,6 +70279,556 @@ test "threaded server: multi-reactor (num_shards=4) survives concurrent clients"
     } else return error.SkipZigTest;
 }
 
+fn totpAtomicServerForTest(services: *services_mod.Services) !*Server {
+    const server = try std.testing.allocator.create(Server);
+    errdefer std.testing.allocator.destroy(server);
+    try server.initInPlace(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = services,
+        .crypto_io = std.testing.io,
+    });
+    return server;
+}
+
+fn totpAtomicClientForTest(server: *Server) !client_model.ClientId {
+    const id = try addTestLocalClient(server, "kain", "kain");
+    const conn = server.connFor(id).?;
+    conn.session.registration.registered = true;
+    conn.is_tls = true;
+    return id;
+}
+
+fn totpAtomicLineForTest(server: *Server, id: client_model.ClientId, line: []const u8) !void {
+    const conn = server.connFor(id).?;
+    conn.send_len = 0;
+    try server.processLiveLine(id, conn, line);
+}
+
+fn totpAtomicCodeForTest(server: *Server, buf: *[6]u8) !void {
+    const ct = @import("../crypto/totp.zig");
+    const raw = try ct.decodeBase32(std.testing.allocator, server.totp.secretB32("kain").?);
+    defer std.testing.allocator.free(raw);
+    const val = try ct.totp(raw, Server.totpUnixSeconds(), 30, 0, 6, .sha1);
+    _ = try std.fmt.bufPrint(buf, "{d:0>6}", .{val});
+}
+
+fn totpAtomicRejectForTest(conn: *const ConnState) !void {
+    const reply = conn.send_buf[0..conn.send_len];
+    try expectContains(reply, "TEMPORARILY_UNAVAILABLE");
+    try std.testing.expect(std.mem.indexOf(u8, reply, "now ACTIVE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "authentication disabled") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "confirmed, but") == null);
+}
+
+test "TOTP atomic live handlers sweep persistence allocations and same-code retry" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    for ([_]bool{ false, true }) |disable| {
+        var reached_success = false;
+        var injected: usize = 0;
+        for (0..128) |fail_index| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var store = try services_mod.OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "totp-alloc.wal");
+            defer store.deinit();
+            var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+            var scratch: [1024]u8 = undefined;
+            _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+            const server = try totpAtomicServerForTest(&services);
+            defer std.testing.allocator.destroy(server);
+            defer server.deinit();
+            const id = try totpAtomicClientForTest(server);
+            const conn = server.connFor(id).?;
+            try totpAtomicLineForTest(server, id, "TOTP ENROLL");
+            try std.testing.expect(server.totp.isPending("kain"));
+            var code: [6]u8 = undefined;
+            try totpAtomicCodeForTest(server, &code);
+            var line_buf: [32]u8 = undefined;
+            const confirm = try std.fmt.bufPrint(&line_buf, "TOTP CONFIRM {s}", .{code});
+            if (disable) try totpAtomicLineForTest(server, id, confirm);
+            const old_token = try services.issueSessionToken("kain", 1000);
+            var account_buf: [64]u8 = undefined;
+            try std.testing.expect(services.validateSessionToken("kain", old_token.tokenSlice(), 1001, &account_buf) != null);
+            const before_entry = server.totp.entries.get("kain").?;
+            const before_wal = try tmp.dir.readFileAlloc(std.testing.io, "totp-alloc.wal", std.testing.allocator, .limited(1 << 20));
+            defer std.testing.allocator.free(before_wal);
+            const before_seq = store.next_seq;
+            const before_changes = store.changeCount();
+            failing.fail_index = failing.alloc_index + fail_index;
+            try totpAtomicLineForTest(server, id, if (disable) "TOTP DISABLE" else confirm);
+            const failed = failing.has_induced_failure;
+            failing.fail_index = std.math.maxInt(usize);
+            if (failed) {
+                injected += 1;
+                try totpAtomicRejectForTest(conn);
+                try std.testing.expect(services.authenticationAvailable());
+                try std.testing.expectEqual(disable, server.totp.isEnrolled("kain"));
+                try std.testing.expectEqual(!disable, server.totp.isPending("kain"));
+                const after_entry = server.totp.entries.get("kain").?;
+                try std.testing.expectEqual(before_entry.phase, after_entry.phase);
+                try std.testing.expectEqual(before_entry.last_step, after_entry.last_step);
+                try std.testing.expectEqual(before_entry.secret.ptr, after_entry.secret.ptr);
+                try std.testing.expectEqualStrings(before_entry.secret_b32, after_entry.secret_b32);
+                try std.testing.expectEqual(disable, services.totpEnrolled("kain"));
+                try std.testing.expect(services.validateSessionToken("kain", old_token.tokenSlice(), 1001, &account_buf) != null);
+                try std.testing.expectEqual(before_seq, store.next_seq);
+                try std.testing.expectEqual(before_changes, store.changeCount());
+                const after_wal = try tmp.dir.readFileAlloc(std.testing.io, "totp-alloc.wal", std.testing.allocator, .limited(1 << 20));
+                defer std.testing.allocator.free(after_wal);
+                try std.testing.expectEqualSlices(u8, before_wal, after_wal);
+                // The same pending secret and exact code must still confirm.
+                try totpAtomicLineForTest(server, id, if (disable) "TOTP DISABLE" else confirm);
+            } else {
+                reached_success = true;
+            }
+            try expectContains(conn.send_buf[0..conn.send_len], if (disable) "authentication disabled" else "now ACTIVE");
+            try std.testing.expectEqual(!disable, server.totp.isEnrolled("kain"));
+            try std.testing.expectEqual(!disable, services.totpEnrolled("kain"));
+            try std.testing.expect(services.validateSessionToken("kain", old_token.tokenSlice(), 1001, &account_buf) == null);
+            if (reached_success) break;
+        }
+        try std.testing.expect(reached_success);
+        try std.testing.expect(injected > 0);
+        std.debug.print("TOTP atomic allocation sweep disable={} failures={d} then success\n", .{ disable, injected });
+    }
+}
+
+test "TOTP atomic live handlers reject record and WAL admission with retry" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    for ([_]bool{ false, true }) |disable| {
+        for ([_]bool{ false, true }) |wal_limit| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "totp-limit.wal");
+            defer store.deinit();
+            var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+            var scratch: [1024]u8 = undefined;
+            _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+            const server = try totpAtomicServerForTest(&services);
+            defer std.testing.allocator.destroy(server);
+            defer server.deinit();
+            const id = try totpAtomicClientForTest(server);
+            const conn = server.connFor(id).?;
+            try totpAtomicLineForTest(server, id, "TOTP ENROLL");
+            var code: [6]u8 = undefined;
+            try totpAtomicCodeForTest(server, &code);
+            var line_buf: [32]u8 = undefined;
+            const confirm = try std.fmt.bufPrint(&line_buf, "TOTP CONFIRM {s}", .{code});
+            if (disable) try totpAtomicLineForTest(server, id, confirm);
+            const old_token = try services.issueSessionToken("kain", 1000);
+            const before_seq = store.next_seq;
+            const before_changes = store.changeCount();
+            const before_wal = try tmp.dir.readFileAlloc(std.testing.io, "totp-limit.wal", std.testing.allocator, .limited(1 << 20));
+            defer std.testing.allocator.free(before_wal);
+            const saved_cfg = store.cfg;
+            if (wal_limit) store.cfg.max_wal_bytes = 1 else store.cfg.max_record_bytes = 16;
+            try totpAtomicLineForTest(server, id, if (disable) "TOTP DISABLE" else confirm);
+            try totpAtomicRejectForTest(conn);
+            try std.testing.expect(services.authenticationAvailable());
+            try std.testing.expectEqual(disable, server.totp.isEnrolled("kain"));
+            try std.testing.expectEqual(!disable, server.totp.isPending("kain"));
+            try std.testing.expectEqual(disable, services.totpEnrolled("kain"));
+            var account_buf: [64]u8 = undefined;
+            try std.testing.expect(services.validateSessionToken("kain", old_token.tokenSlice(), 1001, &account_buf) != null);
+            try std.testing.expectEqual(before_seq, store.next_seq);
+            try std.testing.expectEqual(before_changes, store.changeCount());
+            const after_wal = try tmp.dir.readFileAlloc(std.testing.io, "totp-limit.wal", std.testing.allocator, .limited(1 << 20));
+            defer std.testing.allocator.free(after_wal);
+            try std.testing.expectEqualSlices(u8, before_wal, after_wal);
+            store.cfg = saved_cfg;
+            try totpAtomicLineForTest(server, id, if (disable) "TOTP DISABLE" else confirm);
+            try expectContains(conn.send_buf[0..conn.send_len], if (disable) "authentication disabled" else "now ACTIVE");
+            try std.testing.expect(services.validateSessionToken("kain", old_token.tokenSlice(), 1001, &account_buf) == null);
+        }
+    }
+}
+
+test "TOTP atomic live handlers ambiguous prepared IO denies authentication and cold replay is coherent" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const faults = [_]@import("store.zig").PreparedIoFault{
+        .{ .write = .failed }, .{ .write = .short }, .{ .sync = true },
+    };
+    for ([_]bool{ false, true }) |disable| {
+        for (faults) |fault| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var old_token: [services_mod.session_token_len]u8 = undefined;
+            var secret_copy: [32]u8 = undefined;
+            {
+                var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "totp-io.wal");
+                defer store.deinit();
+                var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+                var scratch: [1024]u8 = undefined;
+                _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+                const server = try totpAtomicServerForTest(&services);
+                defer std.testing.allocator.destroy(server);
+                defer server.deinit();
+                const id = try totpAtomicClientForTest(server);
+                const conn = server.connFor(id).?;
+                try totpAtomicLineForTest(server, id, "TOTP ENROLL");
+                @memcpy(&secret_copy, server.totp.secretB32("kain").?);
+                var code: [6]u8 = undefined;
+                try totpAtomicCodeForTest(server, &code);
+                var line_buf: [32]u8 = undefined;
+                const confirm = try std.fmt.bufPrint(&line_buf, "TOTP CONFIRM {s}", .{code});
+                if (disable) try totpAtomicLineForTest(server, id, confirm);
+                const issued = try services.issueSessionToken("kain", 1000);
+                old_token = issued.token;
+                const before_entry = server.totp.entries.get("kain").?;
+                store.setPreparedIoFault(fault);
+                try totpAtomicLineForTest(server, id, if (disable) "TOTP DISABLE" else confirm);
+                try totpAtomicRejectForTest(conn);
+                try std.testing.expect(!services.authenticationAvailable());
+                try std.testing.expectEqual(disable, server.totp.isEnrolled("kain"));
+                try std.testing.expectEqual(!disable, server.totp.isPending("kain"));
+                const after_entry = server.totp.entries.get("kain").?;
+                try std.testing.expectEqual(before_entry.phase, after_entry.phase);
+                try std.testing.expectEqual(before_entry.last_step, after_entry.last_step);
+                try std.testing.expectEqual(before_entry.secret.ptr, after_entry.secret.ptr);
+                try std.testing.expectEqualStrings(&secret_copy, after_entry.secret_b32);
+                try std.testing.expectEqual(disable, services.totpEnrolled("kain"));
+                var account_buf: [64]u8 = undefined;
+                try std.testing.expect(services.validateSessionToken("kain", &old_token, 1001, &account_buf) == null);
+                try std.testing.expectError(error.StorePoisoned, services.issueSessionToken("kain", 1001));
+                // Resetting the injector does not recover an ambiguous live cut.
+                store.setPreparedIoFault(.{});
+                for ([_][]const u8{ "TOTP STATUS", "TOTP ENROLL", "TOTP DISABLE", confirm }) |line| {
+                    try totpAtomicLineForTest(server, id, line);
+                    try totpAtomicRejectForTest(conn);
+                }
+                const auth_id = try addTestLocalClient(server, "auth", null);
+                const auth = server.connFor(auth_id).?;
+                auth.session.registration.registered = true;
+                var identify_buf: [128]u8 = undefined;
+                const identify = try std.fmt.bufPrint(&identify_buf, "IDENTIFY kain :correct horse battery staple", .{});
+                // Also exercise the direct TOTP-bearing IDENTIFY handler: its
+                // Services bypass/replay path must never consume this code.
+                var parsed = irc_line.LineView{ .raw = "", .command = "IDENTIFY" };
+                parsed.params[0] = "kain";
+                parsed.params[1] = "correct horse battery staple";
+                parsed.params[2] = &code;
+                parsed.param_count = 3;
+                try server.handleIdentify(auth, &parsed);
+                try std.testing.expect(auth.session.account() == null);
+                try expectContains(auth.send_buf[0..auth.send_len], "TEMPORARILY_UNAVAILABLE");
+                try std.testing.expectEqual(before_entry.last_step, server.totp.entries.get("kain").?.last_step);
+                try totpAtomicLineForTest(server, auth_id, identify);
+                try std.testing.expect(auth.session.account() == null);
+                for ([_][]const u8{
+                    "RECOVERYCODES LOGIN kain 01234567890123456789", "WEBAUTHN AUTH-FINISH x x x",
+                    "RESETPASS kain x new-password",                 "REGISTER new * new-password",
+                }) |line| {
+                    try totpAtomicLineForTest(server, auth_id, line);
+                    try expectContains(auth.send_buf[0..auth.send_len], "TEMPORARILY_UNAVAILABLE");
+                    try std.testing.expect(auth.session.account() == null);
+                }
+                // Already attached clients stay logged in despite poison.
+                try std.testing.expectEqualStrings("kain", conn.session.account().?);
+            }
+            // Cold reopen resolves the durable cut. Failed/short writes restore
+            // the predecessor; a full record before sync error restores both
+            // candidate policy and authority deletion, never a half transition.
+            current_reactor = null;
+            var reopened = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "totp-io.wal");
+            defer reopened.deinit();
+            var cold_services = services_mod.Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
+            try std.testing.expect(cold_services.authenticationAvailable());
+            const candidate = fault.sync;
+            const active = if (candidate) !disable else disable;
+            try std.testing.expectEqual(active, cold_services.totpEnrolled("kain"));
+            var b32: [64]u8 = undefined;
+            if (active) try std.testing.expectEqualStrings(&secret_copy, cold_services.totpSecretGet("kain", &b32).?) else try std.testing.expect(cold_services.totpSecretGet("kain", &b32) == null);
+            var account_buf: [64]u8 = undefined;
+            try std.testing.expectEqual(!candidate, cold_services.validateSessionToken("kain", &old_token, 1001, &account_buf) != null);
+            const cold = try totpAtomicServerForTest(&cold_services);
+            defer std.testing.allocator.destroy(cold);
+            defer cold.deinit();
+            try std.testing.expectEqual(active, cold.totpActiveForAccount("kain"));
+            try std.testing.expectEqual(active, cold.totp.isEnrolled("kain"));
+            std.debug.print("TOTP atomic cold replay disable={} write={s} sync={} active={} token_valid={}\n", .{ disable, @tagName(fault.write), fault.sync, active, !candidate });
+        }
+    }
+}
+
+test "TOTP atomic live handlers successful enable and disable survive cold WAL reopen" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var secret: [32]u8 = undefined;
+    var old_token: [services_mod.session_token_len]u8 = undefined;
+    for (0..3) |phase| {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "totp-cold.wal");
+        defer store.deinit();
+        var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        const server = try totpAtomicServerForTest(&services);
+        defer std.testing.allocator.destroy(server);
+        defer server.deinit();
+        const id = try totpAtomicClientForTest(server);
+        const conn = server.connFor(id).?;
+        if (phase == 0) {
+            var scratch: [1024]u8 = undefined;
+            _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+            old_token = (try services.issueSessionToken("kain", 1000)).token;
+            try totpAtomicLineForTest(server, id, "TOTP ENROLL");
+            @memcpy(&secret, server.totp.secretB32("kain").?);
+            var code: [6]u8 = undefined;
+            try totpAtomicCodeForTest(server, &code);
+            var buf: [32]u8 = undefined;
+            try totpAtomicLineForTest(server, id, try std.fmt.bufPrint(&buf, "TOTP CONFIRM {s}", .{code}));
+            try expectContains(conn.send_buf[0..conn.send_len], "now ACTIVE");
+        } else {
+            try std.testing.expectEqual(phase == 1, services.totpEnrolled("kain"));
+            try std.testing.expect(!server.totp.isEnrolled("kain")); // real fresh runtime
+            try std.testing.expectEqual(phase == 1, server.totpActiveForAccount("kain"));
+            var account_buf: [64]u8 = undefined;
+            try std.testing.expect(services.validateSessionToken("kain", &old_token, 1001, &account_buf) == null);
+            if (phase == 1) {
+                try std.testing.expectEqualStrings(&secret, server.totp.secretB32("kain").?);
+                old_token = (try services.issueSessionToken("kain", 1000)).token;
+                try totpAtomicLineForTest(server, id, "TOTP DISABLE");
+                try expectContains(conn.send_buf[0..conn.send_len], "authentication disabled");
+            } else {
+                try totpAtomicLineForTest(server, id, "TOTP STATUS");
+                try expectContains(conn.send_buf[0..conn.send_len], "is disabled");
+            }
+        }
+    }
+}
+
+fn totpAtomicSaslClientForTest(server: *Server) !client_model.ClientId {
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.connFor(id).?;
+    conn.token = try tokenFromId(id);
+    conn.overflow_allocator = server.allocator;
+    conn.is_tls = true;
+    server.injectSessionState(conn);
+    try server.processLiveLine(id, conn, "CAP REQ :sasl");
+    return id;
+}
+
+fn totpAtomicSaslPayloadForTest(server: *Server, id: client_model.ClientId, payload: []const u8) !void {
+    var encoded_buf: [1024]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&encoded_buf, payload);
+    var line_buf: [1100]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "AUTHENTICATE {s}", .{encoded});
+    try totpAtomicLineForTest(server, id, line);
+}
+
+fn totpAtomicTokenAuthForTest(server: *Server, token: []const u8, accepted: bool) !void {
+    const id = try totpAtomicSaslClientForTest(server);
+    const conn = server.connFor(id).?;
+    try totpAtomicLineForTest(server, id, "AUTHENTICATE SESSION-TOKEN");
+    var payload_buf: [128]u8 = undefined;
+    const payload = try std.fmt.bufPrint(&payload_buf, "kain\x00{s}", .{token});
+    try totpAtomicSaslPayloadForTest(server, id, payload);
+    try expectContains(conn.send_buf[0..conn.send_len], if (accepted) " 903 " else " 904 ");
+    try std.testing.expectEqual(accepted, conn.session.account() != null);
+    if (accepted) try std.testing.expectEqualStrings("kain", conn.session.account().?);
+}
+
+test "TOTP atomic live SASL token authority survives rejected policy and is revoked on enable and disable" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const bridge = @import("sasl_bridge.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "totp-sasl-token.wal");
+    defer store.deinit();
+    var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+    var token_lookup = bridge.ServicesSessionTokenLookup{ .services = &services };
+    const server = try totpAtomicServerForTest(&services);
+    defer std.testing.allocator.destroy(server);
+    defer server.deinit();
+    server.config.sasl_session_token = token_lookup.lookup();
+    const id = try totpAtomicClientForTest(server);
+    try totpAtomicLineForTest(server, id, "TOTP ENROLL");
+    var code: [6]u8 = undefined;
+    try totpAtomicCodeForTest(server, &code);
+    var line_buf: [32]u8 = undefined;
+    const confirm = try std.fmt.bufPrint(&line_buf, "TOTP CONFIRM {s}", .{code});
+    const old = try services.issueSessionToken("kain", Server.totpUnixSeconds());
+    try totpAtomicTokenAuthForTest(server, old.tokenSlice(), true);
+    const cfg = store.cfg;
+    store.cfg.max_record_bytes = 16;
+    try totpAtomicLineForTest(server, id, confirm);
+    try totpAtomicRejectForTest(server.connFor(id).?);
+    try totpAtomicTokenAuthForTest(server, old.tokenSlice(), true);
+    store.cfg = cfg;
+    try totpAtomicLineForTest(server, id, confirm);
+    try expectContains(server.connFor(id).?.send_buf[0..server.connFor(id).?.send_len], "now ACTIVE");
+    try std.testing.expect(store.family(.props).get("sessiontokacct\x00kain") == null);
+    try totpAtomicTokenAuthForTest(server, old.tokenSlice(), false);
+    const under_totp = try services.issueSessionToken("kain", Server.totpUnixSeconds());
+    try totpAtomicTokenAuthForTest(server, under_totp.tokenSlice(), true);
+    store.cfg.max_record_bytes = 16;
+    try totpAtomicLineForTest(server, id, "TOTP DISABLE");
+    try totpAtomicRejectForTest(server.connFor(id).?);
+    try totpAtomicTokenAuthForTest(server, under_totp.tokenSlice(), true);
+    store.cfg = cfg;
+    try totpAtomicLineForTest(server, id, "TOTP DISABLE");
+    try expectContains(server.connFor(id).?.send_buf[0..server.connFor(id).?.send_len], "authentication disabled");
+    try std.testing.expect(store.family(.props).get("sessiontokacct\x00kain") == null);
+    try totpAtomicTokenAuthForTest(server, under_totp.tokenSlice(), false);
+}
+
+fn totpAtomicScramFinalForTest(server: *Server, id: client_model.ClientId) !@import("../crypto/sasl_scram_client.zig").Final {
+    const client = @import("../crypto/sasl_scram_client.zig");
+    const alloc = std.testing.allocator;
+    try totpAtomicLineForTest(server, id, "AUTHENTICATE SCRAM-SHA-256");
+    var first = try client.clientFirst(alloc, "kain", "totp-atomic-client-nonce");
+    defer first.deinit();
+    try totpAtomicSaslPayloadForTest(server, id, first.message);
+    const conn = server.connFor(id).?;
+    const reply = conn.send_buf[0..conn.send_len];
+    const start = (std.mem.indexOf(u8, reply, "AUTHENTICATE ") orelse return error.TestUnexpectedResult) + "AUTHENTICATE ".len;
+    const end = start + (std.mem.indexOf(u8, reply[start..], "\r\n") orelse return error.TestUnexpectedResult);
+    const encoded = reply[start..end];
+    var decoded: [1024]u8 = undefined;
+    const len = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+    try std.base64.standard.Decoder.decode(decoded[0..len], encoded);
+    return client.clientFinal(alloc, &first.state, decoded[0..len], "correct horse battery staple");
+}
+
+test "TOTP atomic live poisoned services refuse in-flight cached SCRAM through entry and completion gates" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const scram_mod = @import("scram_store.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "totp-scram-poison.wal");
+    defer store.deinit();
+    var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+    var scram = scram_mod.ScramStore.init(alloc);
+    defer scram.deinit();
+    try scram.storeWithSalt("kain", "correct horse battery staple", "0123456789abcdef", 4096);
+    const server = try totpAtomicServerForTest(&services);
+    defer std.testing.allocator.destroy(server);
+    defer server.deinit();
+    server.config.sasl_scram256 = scram.scram256Lookup();
+    // First prove that this actual cached credential/proof works before poison.
+    const baseline_id = try totpAtomicSaslClientForTest(server);
+    var baseline_final = try totpAtomicScramFinalForTest(server, baseline_id);
+    defer baseline_final.deinit(alloc);
+    try totpAtomicSaslPayloadForTest(server, baseline_id, baseline_final.message);
+    const baseline = server.connFor(baseline_id).?;
+    try expectContains(baseline.send_buf[0..baseline.send_len], " 903 ");
+    try std.testing.expectEqualStrings("kain", baseline.session.account().?);
+    // Both exchanges resolve the credential BEFORE the ambiguous policy write.
+    const live_id = try totpAtomicSaslClientForTest(server);
+    var live_final = try totpAtomicScramFinalForTest(server, live_id);
+    defer live_final.deinit(alloc);
+    const completion_id = try totpAtomicSaslClientForTest(server);
+    var completion_final = try totpAtomicScramFinalForTest(server, completion_id);
+    defer completion_final.deinit(alloc);
+    const management_id = try totpAtomicClientForTest(server);
+    try totpAtomicLineForTest(server, management_id, "TOTP ENROLL");
+    var code: [6]u8 = undefined;
+    try totpAtomicCodeForTest(server, &code);
+    var confirm_buf: [32]u8 = undefined;
+    const confirm = try std.fmt.bufPrint(&confirm_buf, "TOTP CONFIRM {s}", .{code});
+    store.setPreparedIoFault(.{ .sync = true });
+    try totpAtomicLineForTest(server, management_id, confirm);
+    try totpAtomicRejectForTest(server.connFor(management_id).?);
+    try std.testing.expect(!services.authenticationAvailable());
+    try std.testing.expect(!services.totpEnrolled("kain")); // predecessor has no 2FA
+    try std.testing.expect(scram.lookup("kain") != null); // cache remains usable
+    try totpAtomicSaslPayloadForTest(server, live_id, live_final.message);
+    const live = server.connFor(live_id).?;
+    try expectContains(live.send_buf[0..live.send_len], " 904 ");
+    try std.testing.expect(live.session.account() == null);
+    try std.testing.expect(live.session.sasl_router == null);
+    // Drive the full dispatch mechanism with a correct cached proof, bypassing
+    // only the outer server entry check to falsify the installed completion gate.
+    const completion = server.connFor(completion_id).?;
+    var b64: [1024]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&b64, completion_final.message);
+    var line_buf: [1100]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "AUTHENTICATE {s}", .{encoded});
+    completion.send_len = 0;
+    var sink = QueueSink{ .conn = completion };
+    try processLine(completion, line, &sink);
+    try expectContains(completion.send_buf[0..completion.send_len], " 904 ");
+    try std.testing.expect(completion.session.account() == null);
+    try std.testing.expectEqualStrings("kain", baseline.session.account().?);
+    // IRCX AUTH must reject the same cache at its live handler boundary too.
+    const ircx_id = try addTestLocalClient(server, "ircx", null);
+    const ircx = server.connFor(ircx_id).?;
+    ircx.session.registration.registered = true;
+    server.injectSessionState(ircx);
+    try totpAtomicLineForTest(server, ircx_id, "IRCX");
+    try totpAtomicLineForTest(server, ircx_id, "AUTH SCRAM-SHA-256 I");
+    try std.testing.expect(ircx.session.account() == null);
+    try std.testing.expect(ircx.session.sasl_router == null);
+    try expectContains(ircx.send_buf[0..ircx.send_len], " 910 ");
+    // Passkey/recovery completion must also refuse a credential verified before
+    // poison, before account or session authority can be replaced.
+    try std.testing.expectError(error.StorePoisoned, server.finishLogin(ircx, "kain"));
+    try std.testing.expect(ircx.session.account() == null);
+    try std.testing.expectEqualStrings("kain", baseline.session.account().?);
+}
+
+test "TOTP atomic RESETPASS live handler rejects password admission without success" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    var reached_success = false;
+    var admission_failures: usize = 0;
+    for (0..128) |fail_index| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var store = try services_mod.OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "totp-reset.wal");
+        defer store.deinit();
+        var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        var scratch: [1024]u8 = undefined;
+        _ = try services.registerAccount("kain", "old-password-123", &scratch);
+        const old_token = try services.issueSessionToken("kain", 1000);
+        const server = try totpAtomicServerForTest(&services);
+        defer std.testing.allocator.destroy(server);
+        defer server.deinit();
+        const id = try addTestLocalClient(server, "reset", null);
+        const conn = server.connFor(id).?;
+        conn.session.registration.registered = true;
+        const code = "0123456789abcdef0123456789abcdef";
+        try server.reset_store.issue("kain", code, @intCast(@max(0, server.nowMs())));
+        failing.fail_index = failing.alloc_index + fail_index;
+        try totpAtomicLineForTest(server, id, "RESETPASS kain 0123456789abcdef0123456789abcdef new-password-456");
+        const failed = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        const reply = conn.send_buf[0..conn.send_len];
+        var account_buf: [64]u8 = undefined;
+        if (failed) {
+            try expectContains(reply, "TEMPORARILY_UNAVAILABLE");
+            try std.testing.expect(std.mem.indexOf(u8, reply, "RESETPASS SUCCESS") == null);
+            admission_failures += 1;
+            try std.testing.expectError(error.AuthFailed, services.identifyAccount("kain", "new-password-456"));
+            _ = try services.identifyAccount("kain", "old-password-123");
+            try std.testing.expect(services.validateSessionToken("kain", old_token.tokenSlice(), 1001, &account_buf) != null);
+            // Remaining separately owned reset atomicity concern: the handler
+            // consumed this code before storage admission, so retry cannot work.
+            try std.testing.expect(!server.reset_store.isPending("kain"));
+        } else {
+            reached_success = true;
+            try expectContains(reply, "RESETPASS SUCCESS");
+            _ = try services.identifyAccount("kain", "new-password-456");
+            try std.testing.expect(services.validateSessionToken("kain", old_token.tokenSlice(), 1001, &account_buf) == null);
+            break;
+        }
+    }
+    try std.testing.expect(reached_success);
+    try std.testing.expect(admission_failures > 0);
+    std.debug.print("TOTP atomic RESETPASS allocation failures before password={d} then success\n", .{admission_failures});
+}
+
 test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABLE" {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const ct = @import("../crypto/totp.zig");
@@ -70209,13 +70838,14 @@ test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABL
         defer store.deinit();
         var services = services_mod.Services.init(&store, null);
 
-        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        const server = totpAtomicServerForTest(&services) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
         };
+        defer std.testing.allocator.destroy(server);
         defer server.deinit();
 
-        const id = try addTestLocalClient(&server, "kain", "kain"); // logged in to account "kain"
+        const id = try addTestLocalClient(server, "kain", "kain"); // logged in to account "kain"
         const conn = server.connFor(id).?;
         conn.is_tls = true; // ENROLL requires a secure link (the secret crosses it)
 
@@ -70234,14 +70864,14 @@ test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABL
         };
 
         // STATUS: disabled initially.
-        try totp.call(&server, conn, "STATUS", null);
+        try totp.call(server, conn, "STATUS", null);
         try expectContains(conn.send_buf[0..conn.send_len], "is disabled");
 
         // ENROLL mints a secret + otpauth URI; the enrollment is now pending.
-        try totp.call(&server, conn, "ENROLL", null);
+        try totp.call(server, conn, "ENROLL", null);
         try expectContains(conn.send_buf[0..conn.send_len], "TOTP: secret ");
         try expectContains(conn.send_buf[0..conn.send_len], "otpauth://totp/");
-        try totp.call(&server, conn, "STATUS", null);
+        try totp.call(server, conn, "STATUS", null);
         try expectContains(conn.send_buf[0..conn.send_len], "pending");
         try std.testing.expect(!services.totpEnrolled("kain")); // pending is NOT persisted
 
@@ -70253,7 +70883,7 @@ test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABL
         const val = try ct.totp(raw, now_s, 30, 0, 6, .sha1);
         var codebuf: [6]u8 = undefined;
         _ = std.fmt.bufPrint(&codebuf, "{d:0>6}", .{val}) catch unreachable;
-        try totp.call(&server, conn, "CONFIRM", &codebuf);
+        try totp.call(server, conn, "CONFIRM", &codebuf);
         try expectContains(conn.send_buf[0..conn.send_len], "now ACTIVE");
         try std.testing.expect(services.totpEnrolled("kain")); // confirmed secret IS persisted
 
@@ -70265,7 +70895,7 @@ test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABL
         try std.testing.expect(server.totp.isEnrolled("kain"));
 
         // DISABLE clears both memory and persistence.
-        try totp.call(&server, conn, "DISABLE", null);
+        try totp.call(server, conn, "DISABLE", null);
         try expectContains(conn.send_buf[0..conn.send_len], "disabled");
         try std.testing.expect(!services.totpEnrolled("kain"));
         try std.testing.expect(!server.totpActiveForAccount("kain"));
@@ -70281,10 +70911,11 @@ test "TOTP enforcement: IDENTIFY + SASL gated for a 2FA account; tokens revoked 
         defer store.deinit();
         var services = services_mod.Services.init(&store, null);
 
-        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        const server = totpAtomicServerForTest(&services) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
         };
+        defer std.testing.allocator.destroy(server);
         defer server.deinit();
 
         var scratch: [1024]u8 = undefined;
@@ -70294,7 +70925,7 @@ test "TOTP enforcement: IDENTIFY + SASL gated for a 2FA account; tokens revoked 
         const raw = try ct.decodeBase32(std.testing.allocator, secret_b32);
         defer std.testing.allocator.free(raw);
 
-        const id = try addTestLocalClient(&server, "guest", null);
+        const id = try addTestLocalClient(server, "guest", null);
         const conn = server.connFor(id).?;
 
         // IDENTIFY without a code → refused; conn stays logged out.
@@ -70323,7 +70954,7 @@ test "TOTP enforcement: IDENTIFY + SASL gated for a 2FA account; tokens revoked 
         for ([_]ircx_auth.Package{ .plain, .scram_sha_256, .scram_sha_512_plus }, 0..) |pkg, i| {
             var nick_buf: [8]u8 = undefined;
             const nick = std.fmt.bufPrint(&nick_buf, "g{d}", .{i}) catch unreachable;
-            const cid = try addTestLocalClient(&server, nick, null);
+            const cid = try addTestLocalClient(server, nick, null);
             const c = server.connFor(cid).?;
             try server.completeIrcxAuth(cid, c, pkg, .{ .account = "kain" });
             try std.testing.expect(c.session.account() == null);
@@ -70419,7 +71050,7 @@ test "TOTP CONFIRM revokes an existing session token (no 2FA-free re-entry)" {
     const issued = try services.issueSessionToken("kain", 1000);
     var acct_out: [64]u8 = undefined;
     try std.testing.expect(services.validateSessionToken("kain", &issued.token, 1001, &acct_out) != null);
-    services.revokeSessionTokens("kain");
+    try services.revokeSessionTokens("kain");
     try std.testing.expect(services.validateSessionToken("kain", &issued.token, 1001, &acct_out) == null);
 }
 

@@ -1,0 +1,89 @@
+[1/72] root.test_0 ... OK (1us)
+[2/72] crypto.root.test_0 ... OK (1us)
+[3/72] daemon.root.test_0 ... OK (1us)
+[4/72] proto.root.test_0 ... OK (1us)
+[5/72] substrate.root.test_0 ... OK (1us)
+[6/72] wasm.host.root.test_0 ... OK (1us)
+[7/72] substrate.io.root.test_0 ... OK (1us)
+[8/72] substrate.ripple_props.test_0 ... OK (1us)
+[9/72] substrate.ripple.test_0 ... OK (1us)
+[10/72] substrate.undertow.root.test_0 ... OK (1us)
+[11/72] substrate.undertow.peer_link.test_0 ... OK (1us)
+[12/72] substrate.io.buf_ring.test_0 ... OK (1us)
+[13/72] substrate.io.ring.test_0 ... OK (1us)
+[14/72] proto.asn1_time.test_0 ... OK (1us)
+[15/72] proto.certfp.test_0 ... OK (1us)
+[16/72] proto.cloak.test_0 ... OK (3us)
+[17/72] proto.ircx_modex.test_0 ... OK (1us)
+[18/72] proto.ircx_saccess.test_0 ... OK (1us)
+[19/72] proto.listx.test_0 ... OK (1us)
+[20/72] proto.mooring.test_0 ... OK (5us)
+[21/72] proto.mooring_props.test_0 ... OK (1us)
+[22/72] proto.quic_handshake.test_0 ... OK (3us)
+[23/72] proto.quic_transport_params.test_0 ... OK (1us)
+[24/72] proto.sasl_external_verify.test_0 ... OK (1us)
+[25/72] proto.sasl_mechrouter.test_0 ... OK (1us)
+[26/72] proto.sasl_oauthbearer.test_0 ... OK (1us)
+[27/72] proto.sasl.test_0 ... OK (1us)
+[28/72] proto.sasl_scram512_server.test_0 ... OK (1us)
+[29/72] proto.sasl_scram.test_0 ... OK (1us)
+[30/72] proto.sasl_scram_server.test_0 ... OK (1us)
+[31/72] proto.signed_delta.test_0 ... OK (3us)
+[32/72] proto.toml.test_0 ... OK (1us)
+[33/72] proto.x509.test_0 ... OK (1us)
+[34/72] daemon.modules.manifest.test_0 ... OK (1us)
+[35/72] daemon.key_transparency.test_0 ... OK (1us)
+[36/72] daemon.acme_cli.test_0 ... OK (1us)
+[37/72] daemon.acme_http01_listener.test_0 ... OK (1us)
+[38/72] daemon.acme_renewal.test_0 ... OK (1us)
+[39/72] daemon.acme_runner.test_0 ... OK (3us)
+[40/72] daemon.config_format.test_0 ... OK (1us)
+[41/72] daemon.helix.root.test_0 ... OK (1us)
+[42/72] daemon.metrics_http.test_0 ... OK (1us)
+[43/72] daemon.webhook.test_0 ... OK (1us)
+[44/72] daemon.webhook_render.test_0 ... OK (1us)
+[45/72] daemon.webhook_http.test_0 ... OK (1us)
+[46/72] daemon.oauth_jwt.test_0 ... OK (1us)
+[47/72] daemon.ocsp_staple.test_0 ... OK (1us)
+[48/72] daemon.reactor_pool.test_0 ... OK (1us)
+[49/72] daemon.sasl_bridge.test_0 ... OK (1us)
+[50/72] daemon.scram_store.test_0 ... OK (1us)
+[51/72] daemon.server.test.threaded server: UPGRADE resume arena re-dials a carried mesh peer ... OK (85ms)
+[52/72] daemon.server.test_0 ... OK (1us)
+[53/72] daemon.sessions.test_0 ... OK (7us)
+[54/72] daemon.tls_certs.test_0 ... OK (4us)
+[55/72] daemon.tls_conn.test_0 ... OK (1us)
+[56/72] daemon.tls_sni_load.test_0 ... OK (1us)
+[57/72] crypto.tls_server.test_0 ... OK (1us)
+[58/72] crypto.tls_record.test_0 ... OK (1us)
+[59/72] crypto.hkdf_tls13.test_0 ... OK (1us)
+[60/72] crypto.hash.test_0 ... OK (1us)
+[61/72] crypto.random.test_0 ... OK (1us)
+[62/72] crypto.kx.test_0 ... OK (1us)
+[63/72] crypto.sign.test_0 ... OK (4us)
+[64/72] crypto.xwing.test_0 ... OK (1us)
+[65/72] crypto.tls_client.test_0 ... OK (1us)
+[66/72] crypto.sct.test_0 ... OK (1us)
+[67/72] crypto.aead.test_0 ... OK (1us)
+[68/72] crypto.ecdsa_kat.test_0 ... OK (1us)
+[69/72] crypto.ed25519_batch.test_0 ... OK (1us)
+[70/72] crypto.sign_kat.test_0 ... OK (1us)
+[71/72] crypto.tls_props.test_0 ... OK (1us)
+[72/72] crypto.tls.test_0 ... OK (1us)
+verbose test summary: 72 passed; 0 skipped; 0 failed; 0 leaked; 0 log errors; elapsed 85ms
+slowest tests:
+  85ms  daemon.server.test.threaded server: UPGRADE resume arena re-dials a carried mesh peer
+  7us  daemon.sessions.test_0
+  5us  proto.mooring.test_0
+  4us  daemon.tls_certs.test_0
+  4us  crypto.sign.test_0
+  3us  proto.cloak.test_0
+  3us  daemon.acme_runner.test_0
+  3us  proto.signed_delta.test_0
+  3us  proto.quic_handshake.test_0
+  1us  daemon.acme_renewal.test_0
+Build Summary: 4/4 steps succeeded
+test-mod-verbose success
++- run test success 87ms
+   +- compile test Debug native cached 20ms MaxRSS:50M
+      +- options cached

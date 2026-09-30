@@ -1,0 +1,24 @@
+test-mod
++- run test w
+TOTP atomic allocation sweep disable=false failures=7 then success
+TOTP atomic allocation sweep disable=true failures=5 then success
+TOTP atomic cold replay disable=false write=failed sync=false active=false token_valid=true
+TOTP atomic cold replay disable=false write=short sync=false active=false token_valid=true
+TOTP atomic cold replay disable=false write=none sync=true active=true token_valid=false
+TOTP atomic cold replay disable=true write=failed sync=false active=true token_valid=true
+TOTP atomic cold replay disable=true write=short sync=false active=true token_valid=true
+TOTP atomic cold replay disable=true write=none sync=true active=false token_valid=false
+TOTP atomic RESETPASS allocation failures before password=9 then success
+TOTP atomic enable: 7 induced allocation failures, retries, and cold reopens
+TOTP atomic disable: 5 induced allocation failures, retries, and cold reopens
+TOTP atomic replace: 7 induced allocation failures, retries, and cold reopens
+TOTP atomic revoke: 3 induced allocation failures, retries, and cold reopens
+TOTP atomic rotate: 11 induced allocation failures, retries, and cold reopens
+TOTP atomic reset: 9 induced allocation failures, retries, and cold reopens
+failed command: ./.zig-cache/o/77b1b6f1926dc1562c17f94164025f44/test --cache-dir=./.zig-cache --seed=0x11dd9120 --listen=-
+
+Build Summary: 4/4 steps succeeded; 91/91 tests passed
+test-mod success
++- run test 91 pass (91 total) 1m MaxRSS:91M
+   +- compile test Debug native success 6s MaxRSS:556M
+      +- options cached

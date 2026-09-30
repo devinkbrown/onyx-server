@@ -33,6 +33,8 @@ const Enrollment = struct {
     last_step: ?i64,
 
     fn deinit(self: *Enrollment, allocator: std.mem.Allocator) void {
+        std.crypto.secureZero(u8, @constCast(self.secret));
+        std.crypto.secureZero(u8, @constCast(self.secret_b32));
         allocator.free(self.secret);
         allocator.free(self.secret_b32);
         self.* = undefined;
@@ -72,6 +74,62 @@ pub const TotpStore = struct {
     /// lifting that clamp. Every public method takes it; private helpers
     /// (`insert`/`findEntry`/`matchStep`) run under the caller's hold.
     lock: rwlock.RwLock = .{},
+
+    /// Pins one enrollment across a fallible durable policy change. Lock order:
+    /// TotpStore -> caller's Services -> prepared store batch. The caller must
+    /// release this guard before calling any other public TotpStore method.
+    /// Abort is just deinit: phase, secret and replay counter remain identical.
+    pub const PolicyChange = struct {
+        store: *TotpStore,
+        entry: ?std.StringHashMap(Enrollment).Entry,
+        outcome: VerifyOutcome,
+
+        pub fn secretB32(self: *const PolicyChange) []const u8 {
+            std.debug.assert(self.outcome == .ok);
+            return self.entry.?.value_ptr.secret_b32;
+        }
+
+        /// No allocation or verification after durable policy publication.
+        pub fn commitConfirmation(self: *PolicyChange) void {
+            std.debug.assert(self.outcome == .ok);
+            std.debug.assert(self.entry.?.value_ptr.phase == .pending);
+            self.entry.?.value_ptr.phase = .active;
+        }
+
+        /// No-fail removal after the durable policy and token authority commit.
+        pub fn commitRemoval(self: *PolicyChange) bool {
+            const entry = self.entry orelse return false;
+            const owned_key = entry.key_ptr.*;
+            entry.value_ptr.deinit(self.store.allocator);
+            self.store.entries.removeByPtr(entry.key_ptr);
+            self.store.allocator.free(owned_key);
+            self.entry = null;
+            return true;
+        }
+
+        pub fn deinit(self: *PolicyChange) void {
+            self.store.lock.unlockExclusive();
+            self.* = undefined;
+        }
+    };
+
+    /// Validate without activating the secret or consuming a replay step. Holds
+    /// the lock even on a rejected code, so every path must deinit the guard.
+    pub fn stageConfirmation(self: *TotpStore, account: []const u8, code: []const u8, now: i64) PolicyChange {
+        self.lock.lockExclusive();
+        const entry = self.findEntry(account);
+        const outcome: VerifyOutcome = if (entry) |e|
+            if (e.value_ptr.phase != .pending) .not_enrolled else if (self.matchStep(e.value_ptr.secret, code, now) == null) .bad_code else .ok
+        else
+            .not_enrolled;
+        return .{ .store = self, .entry = entry, .outcome = outcome };
+    }
+
+    pub fn stageRemoval(self: *TotpStore, account: []const u8) PolicyChange {
+        self.lock.lockExclusive();
+        const entry = self.findEntry(account);
+        return .{ .store = self, .entry = entry, .outcome = if (entry != null) .ok else .not_enrolled };
+    }
 
     /// Creates an empty TOTP store using caller-provided policy.
     pub fn init(allocator: std.mem.Allocator, params: Params) TotpStore {
@@ -141,14 +199,10 @@ pub const TotpStore = struct {
 
     /// Confirms a pending enrollment and promotes it to active on success.
     pub fn confirm(self: *TotpStore, account: []const u8, code: []const u8, now: i64) Error!VerifyOutcome {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
-        const entry = self.findEntry(account) orelse return .not_enrolled;
-        if (entry.value_ptr.phase != .pending) return .not_enrolled;
-
-        if (self.matchStep(entry.value_ptr.secret, code, now) == null) return .bad_code;
-        entry.value_ptr.phase = .active;
-        return .ok;
+        var change = self.stageConfirmation(account, code, now);
+        defer change.deinit();
+        if (change.outcome == .ok) change.commitConfirmation();
+        return change.outcome;
     }
 
     /// Verifies a login second factor against the active secret with replay guard.
@@ -184,14 +238,9 @@ pub const TotpStore = struct {
 
     /// Removes any enrollment for the account and reports whether one existed.
     pub fn disable(self: *TotpStore, account: []const u8) bool {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
-        const entry = self.findEntry(account) orelse return false;
-        const owned_key = entry.key_ptr.*;
-        entry.value_ptr.deinit(self.allocator);
-        self.entries.removeByPtr(entry.key_ptr);
-        self.allocator.free(owned_key);
-        return true;
+        var change = self.stageRemoval(account);
+        defer change.deinit();
+        return change.commitRemoval();
     }
 
     /// Decodes a base32 secret into store-owned raw bytes, rejecting empties.
@@ -304,6 +353,68 @@ test "enroll then confirm activates the enrollment" {
     try testing.expectEqual(VerifyOutcome.ok, try store.confirm("alice", code, 59));
     try testing.expect(store.isEnrolled("ALICE"));
     try testing.expect(!store.isPending("alice"));
+}
+
+test "TOTP staged confirmation abort preserves exact pending secret and same-code retry" {
+    var store = TotpStore.init(testing.allocator, .{});
+    defer store.deinit();
+    const b32 = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    try store.enroll("Alice", b32);
+    var buf: [6]u8 = undefined;
+    const code = try codeFor(&buf, store.findEntry("alice").?.value_ptr.secret, 59);
+    const before = store.findEntry("alice").?.value_ptr.*;
+    {
+        var staged = store.stageConfirmation("ALICE", code, 59);
+        defer staged.deinit();
+        try testing.expectEqual(VerifyOutcome.ok, staged.outcome);
+        try testing.expectEqualStrings(b32, staged.secretB32());
+        try testing.expectEqual(Phase.pending, staged.entry.?.value_ptr.phase);
+        try testing.expectEqual(before.last_step, staged.entry.?.value_ptr.last_step);
+        // A persistence failure drops the guard without committing.
+    }
+    const after = store.findEntry("alice").?.value_ptr.*;
+    try testing.expectEqual(before.phase, after.phase);
+    try testing.expectEqual(before.last_step, after.last_step);
+    try testing.expectEqual(before.secret.ptr, after.secret.ptr);
+    try testing.expectEqual(before.secret_b32.ptr, after.secret_b32.ptr);
+    try testing.expectEqualSlices(u8, before.secret, after.secret);
+    {
+        var retry = store.stageConfirmation("alice", code, 59);
+        defer retry.deinit();
+        try testing.expectEqual(VerifyOutcome.ok, retry.outcome);
+        retry.commitConfirmation();
+    }
+    try testing.expect(store.isEnrolled("alice"));
+}
+
+test "TOTP staged removal abort preserves active replay guard and pending enrollment" {
+    var store = TotpStore.init(testing.allocator, .{});
+    defer store.deinit();
+    try store.loadActive("alice", "MZXW6YTBOI======");
+    try store.enroll("bob", "MZXW6YTBOI======");
+    var buf: [6]u8 = undefined;
+    const code = try codeFor(&buf, store.findEntry("alice").?.value_ptr.secret, 59);
+    try testing.expectEqual(VerifyOutcome.ok, try store.verify("alice", code, 59));
+    for ([_][]const u8{ "alice", "bob" }) |account| {
+        const before = store.findEntry(account).?.value_ptr.*;
+        {
+            var staged = store.stageRemoval(account);
+            defer staged.deinit();
+            try testing.expectEqual(VerifyOutcome.ok, staged.outcome);
+        }
+        const after = store.findEntry(account).?.value_ptr.*;
+        try testing.expectEqual(before.phase, after.phase);
+        try testing.expectEqual(before.last_step, after.last_step);
+        try testing.expectEqual(before.secret.ptr, after.secret.ptr);
+    }
+    try testing.expectEqual(VerifyOutcome.bad_code, try store.verify("alice", code, 59));
+    try testing.expect(store.isPending("bob"));
+    {
+        var retry = store.stageRemoval("alice");
+        defer retry.deinit();
+        try testing.expect(retry.commitRemoval());
+    }
+    try testing.expect(!store.isEnrolled("alice"));
 }
 
 test "verify accepts the correct active code" {

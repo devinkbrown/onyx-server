@@ -1,0 +1,4 @@
+Build Summary: 3/3 steps succeeded
+check success
++- compile exe onyx-server-check Debug x86_64-openbsd success 12s MaxRSS:345M
+   +- options cached

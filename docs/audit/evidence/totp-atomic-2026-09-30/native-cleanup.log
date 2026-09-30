@@ -1,0 +1,9 @@
+ 9920 ??  Sp       0:00.00 ksh -c ps -ax | grep onyx-totp-atomic; rm -rf /tmp/o
+99985 ??  R/0      0:00.00 grep onyx-totp-atomic
+OWNED_FIXTURE_REMOVED
+Shutdown NOW!
+shutdown: [pid 17006]
+Connection to 127.0.0.1 closed by remote host.
+OWNED_QEMU_EXITED=YES
+OWNED_PORT_2225_CLOSED=YES
+PREEXISTING_PORT_2223_PRESERVED=YES

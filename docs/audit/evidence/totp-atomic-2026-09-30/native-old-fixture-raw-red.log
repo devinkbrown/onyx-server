@@ -1,0 +1,108 @@
+1/171 root.test_0...OK
+2/171 crypto.root.test_0...OK
+3/171 daemon.root.test_0...OK
+4/171 proto.root.test_0...OK
+5/171 substrate.root.test_0...OK
+6/171 wasm.host.root.test_0...OK
+7/171 substrate.io.root.test_0...OK
+8/171 substrate.ripple_props.test_0...OK
+9/171 substrate.ripple.test_0...OK
+10/171 substrate.undertow.root.test_0...OK
+11/171 substrate.undertow.peer_link.test_0...OK
+12/171 substrate.undertow.s2s_peer.test.P2 (F1): a TRUSTED MEMBERSHIP is STORED with the real account (verified ⇒ preserved)...OK
+13/171 crypto.sign.test_0...OK
+14/171 substrate.io.buf_ring.test_0...OK
+15/171 substrate.io.ring.test_0...OK
+16/171 proto.asn1_time.test_0...OK
+17/171 proto.certfp.test_0...OK
+18/171 proto.cloak.test_0...OK
+19/171 proto.ircx_modex.test_0...OK
+20/171 proto.ircx_saccess.test_0...OK
+21/171 proto.listx.test_0...OK
+22/171 proto.mooring.test_0...OK
+23/171 proto.mooring_props.test_0...OK
+24/171 proto.quic_handshake.test_0...OK
+25/171 proto.quic_transport_params.test_0...OK
+26/171 proto.sasl_external_verify.test_0...OK
+27/171 proto.sasl_mechrouter.test.SCRAM-SHA-256 round trip accepts and rejects tampered proof through router...OK
+28/171 proto.sasl_mechrouter.test.SCRAM PLUS mechanisms require tls exporter through router...OK
+29/171 proto.sasl_mechrouter.test_0...OK
+30/171 proto.sasl_oauthbearer.test_0...OK
+31/171 proto.sasl_props.test.SCRAM client-first parser is total over base64-wrapped random bytes...OK
+32/171 proto.sasl_props.test.SCRAM rejects malformed nonce salt iteration and final-message fields...OK
+33/171 proto.sasl_props.test.SCRAM client-final parser is total over random proof-bearing bytes...OK
+34/171 proto.sasl_props.test.SCRAM valid exchange serializes canonical server messages and rejects bad proof...OK
+35/171 proto.sasl.test.SCRAM-SHA-256 full handshake accepts correct proof and rejects wrong proof...OK
+36/171 proto.sasl.test_0...OK
+37/171 proto.sasl_scram512_server.test.SCRAM-SHA-512 round trip accepts proof and computes server signature...OK
+38/171 proto.sasl_scram512_server.test.SCRAM-SHA-512-PLUS requires tls-exporter channel binding...OK
+39/171 proto.sasl_scram512_server.test.SCRAM-SHA-512 round trip rejects a tampered proof...OK
+40/171 proto.sasl_scram512_server.test.defensive parser rejects malformed SCRAM-SHA-512 attributes...OK
+41/171 proto.sasl_scram512_server.test_0...OK
+42/171 proto.sasl_scram.test.RFC 7677 SCRAM-SHA-256 vector accepts proof and computes server signature...OK
+43/171 proto.sasl_scram.test.defensive parser rejects malformed SCRAM attributes...OK
+44/171 proto.sasl_scram.test_0...OK
+45/171 proto.sasl_scram_server.test.RFC 7677 SCRAM-SHA-256 vector accepts proof and computes server signature...OK
+46/171 proto.sasl_scram_server.test.SCRAM-SHA-256-PLUS requires tls-exporter channel binding...OK
+47/171 proto.sasl_scram_server.test.RFC 7677 SCRAM-SHA-256 vector rejects a tampered proof...OK
+48/171 proto.sasl_scram_server.test.defensive parser rejects malformed SCRAM attributes...OK
+49/171 proto.sasl_scram_server.test_0...OK
+50/171 proto.signed_delta.test_0...OK
+51/171 proto.toml.test_0...OK
+52/171 proto.x509.test_0...OK
+53/171 daemon.modules.manifest.test_0...OK
+54/171 daemon.key_transparency.test_0...OK
+55/171 daemon.acme_cli.test_0...OK
+56/171 daemon.acme_http01_listener.test_0...OK
+57/171 daemon.acme_renewal.test_0...OK
+58/171 daemon.acme_runner.test_0...OK
+59/171 daemon.config_format.test_0...OK
+60/171 daemon.dispatch.test.sasl SCRAM-SHA-256 full handshake through the router logs in...OK
+61/171 daemon.dispatch.test.SASL SCRAM success is refused for a suspended account via the account gate...OK
+62/171 daemon.dispatch.test.sasl advertises SCRAM-SHA-512 in 908 list only when provisioned...OK
+63/171 daemon.dispatch.test.sasl CAP LS sasl= value and 908 list agree on SCRAM-SHA-512...OK
+64/171 daemon.dispatch.test.sasl CAP and 908 gate SESSION-TOKEN OAUTHBEARER ANONYMOUS and SCRAM-SHA-512-PLUS...OK
+65/171 daemon.dispatch.test.sasl SCRAM-SHA-512 full handshake through the router logs in...OK
+66/171 daemon.helix.root.test_0...OK
+67/171 daemon.metrics_http.test_0...OK
+68/171 daemon.webhook.test_0...OK
+69/171 daemon.webhook_render.test_0...OK
+70/171 daemon.webhook_http.test_0...OK
+71/171 daemon.oauth_jwt.test_0...OK
+72/171 daemon.ocsp_staple.test_0...OK
+73/171 daemon.reactor_pool.test_0...OK
+74/171 daemon.sasl_bridge.test.registered account completes a SCRAM-SHA-256 exchange via the bridge lookup...OK
+75/171 daemon.sasl_bridge.test.SCRAM-SHA-256 exchange rejects the wrong password for a registered account...OK
+76/171 daemon.sasl_bridge.test.SASL SCRAM proof stays valid but the account gate blocks a suspended or forbidden account...OK
+77/171 daemon.sasl_bridge.test.registered account completes a SCRAM-SHA-512 exchange via the bridge lookup...OK
+78/171 daemon.sasl_bridge.test.SCRAM-SHA-512 exchange rejects the wrong password for a registered account...OK
+79/171 daemon.sasl_bridge.test.SCRAM-SHA-512 bridge lookup returns null for an unregistered account...OK
+80/171 daemon.sasl_bridge.test_0...OK
+81/171 daemon.scram_store.test.SCRAM prepared import allocation failures preserve credentials and retry...OK
+82/171 daemon.scram_store.test.SCRAM prepared import abort preserves prior credential and unlocks...OK
+83/171 daemon.scram_store.test.deriveAndStore then lookup returns SCRAM material for the account...OK
+84/171 daemon.scram_store.test.lookup salt retention is bounded across many SCRAM starts...OK
+85/171 daemon.scram_store.test.serialize/deserialize round-trips a SCRAM record...OK
+86/171 daemon.scram_store.test.importRecord (SHA-256 only) leaves SCRAM-SHA-512 unavailable...OK
+87/171 daemon.scram_store.test_0...OK
+88/171 daemon.server.test.UPGRADE GAP-D5 restart keeps SCRAM and CertFP and invalidates recovery tokens...OK
+89/171 daemon.server.test.GAP-D5 same-image USR2 invalidates recovery tokens and keeps SCRAM and CertFP...SKIP
+90/171 daemon.server.test.TOTP atomic live handlers sweep persistence allocations and same-code retry...TOTP atomic allocation sweep disable=false failures=7 then success
+TOTP atomic allocation sweep disable=true failures=5 then success
+OK
+91/171 daemon.server.test.TOTP atomic live handlers reject record and WAL admission with retry...OK
+92/171 daemon.server.test.TOTP atomic live handlers ambiguous prepared IO denies authentication and cold replay is coherent...TOTP atomic cold replay disable=false write=failed sync=false active=false token_valid=true
+TOTP atomic cold replay disable=false write=short sync=false active=false token_valid=true
+TOTP atomic cold replay disable=false write=none sync=true active=true token_valid=false
+TOTP atomic cold replay disable=true write=failed sync=false active=true token_valid=true
+TOTP atomic cold replay disable=true write=short sync=false active=true token_valid=true
+TOTP atomic cold replay disable=true write=none sync=true active=false token_valid=false
+OK
+93/171 daemon.server.test.TOTP atomic live handlers successful enable and disable survive cold WAL reopen...OK
+94/171 daemon.server.test.TOTP atomic live SASL token authority survives rejected policy and is revoked on enable and disable...OK
+95/171 daemon.server.test.TOTP atomic live poisoned services refuse in-flight cached SCRAM through entry and completion gates...OK
+96/171 daemon.server.test.TOTP atomic RESETPASS live handler rejects password admission without success...TOTP atomic RESETPASS allocation failures before password=9 then success
+OK
+97/171 daemon.server.test.TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABLE...Segmentation fault at address 0x798b35ddffc0
+compiler_rt/stack_probe.zig:47:13: 0xe30c3d0f064 in zig_probe_stack (compiler_rt)
+Segmentation fault

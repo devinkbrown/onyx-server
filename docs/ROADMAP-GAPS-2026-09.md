@@ -31,7 +31,12 @@ and OpenBSD Debug/ReleaseSafe before/after boot-error evidence. The next
 [allocation-failure follow-up](audit/evidence/isupport-oom-2026-09-30/README.md)
 closes partial-construction leaks with all eight optional-token combinations,
 308 induced failures and retries per focused mode, and live native registration.
-The live account-directory
+A subsequent [TOTP storage atomicity follow-up](audit/evidence/totp-atomic-2026-09-30/README.md)
+adds atomic local policy/token publication and forced password/SCRAM reset,
+with native OpenBSD Debug/ReleaseSafe storage/TOTP/SCRAM fault coverage on the
+normal stack. Full Linux Debug and ReleaseSafe each pass 8794/8818 with 24
+skips and zero failures. Batch-format stores require the new reader; cold downgrade is
+unsupported. The live account-directory
 acceptance and MESSAGE_V2 authoring activation remain unverified here.
 Fresh bounded review also found a remaining GAP-P16 seam: MARKREAD GET/SET
 and `rememberReadMarker` use the local store, while the cold-restore test's

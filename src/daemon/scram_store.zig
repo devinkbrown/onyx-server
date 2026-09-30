@@ -316,6 +316,77 @@ pub const ScramStore = struct {
         try self.entries.put(self.allocator, owned_key, new_entry);
     }
 
+    /// Reserves a credential replacement while retaining the exclusive lock.
+    /// The caller may commit its durable account transaction before publishing
+    /// this candidate. Commit and abort allocate nothing. Do not copy an active
+    /// prepared import, or call back into this store until it is consumed.
+    pub fn prepareImportFullRecord(self: *ScramStore, account: []const u8, record: FullRecord) ScramStoreError!PreparedImport {
+        self.lock.lockExclusive();
+        errdefer self.lock.unlockExclusive();
+        if (account.len == 0 or account.len > MAX_ACCOUNT_LEN) return error.InvalidAccount;
+        const key = try self.allocator.dupe(u8, account);
+        errdefer self.allocator.free(key);
+        for (key) |*ch| ch.* = std.ascii.toLower(ch.*);
+        const salt = try self.allocator.dupe(u8, record.salt);
+        errdefer {
+            secureZero(salt);
+            self.allocator.free(salt);
+        }
+        if (!self.entries.contains(key)) try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        return .{
+            .store = self,
+            .key = key,
+            .entry = .{
+                .salt = salt,
+                .iterations = record.iterations,
+                .stored_key = record.stored_key,
+                .server_key = record.server_key,
+                .has_512 = record.has_512,
+                .stored_key_512 = record.stored_key_512,
+                .server_key_512 = record.server_key_512,
+            },
+        };
+    }
+
+    pub const PreparedImport = struct {
+        store: ?*ScramStore,
+        key: []u8,
+        entry: Entry,
+
+        pub fn commit(self: *PreparedImport) void {
+            const store = self.store orelse return;
+            if (store.entries.getEntry(self.key)) |old| {
+                wipeEntry(store.allocator, old.value_ptr);
+                old.value_ptr.* = self.entry;
+                store.allocator.free(self.key);
+            } else {
+                store.entries.putAssumeCapacityNoClobber(self.key, self.entry);
+            }
+            self.store = null;
+            // The map owns the candidate now; clear the token's digest copies.
+            secureZero(std.mem.asBytes(&self.entry));
+            store.lock.unlockExclusive();
+        }
+
+        pub fn abort(self: *PreparedImport) void {
+            const store = self.store orelse return;
+            wipeEntry(store.allocator, &self.entry);
+            store.allocator.free(self.key);
+            self.store = null;
+            store.lock.unlockExclusive();
+        }
+
+        pub fn deinit(self: *PreparedImport) void {
+            self.abort();
+        }
+
+        fn wipeEntry(allocator: std.mem.Allocator, entry: *Entry) void {
+            secureZero(entry.salt);
+            allocator.free(entry.salt);
+            secureZero(std.mem.asBytes(entry));
+        }
+    };
+
     /// A precomputed credential record carrying BOTH the SHA-256 SCRAM material
     /// and, when `has_512` is set, the SHA-512 material derived from the same
     /// password/salt/iterations. The `salt` slice borrows caller memory; copy it
@@ -354,12 +425,13 @@ pub const ScramStore = struct {
     };
 
     /// Backfill source for `resolve`: when an account is missing from the live
-    /// store, `loadFn` is consulted (e.g. a durable on-disk mirror). The returned
-    /// record's `salt` need only stay valid for the duration of the call —
-    /// `resolve` copies it via `importFullRecord` before returning.
+    /// store, `loadFn` is consulted (e.g. a durable on-disk mirror). It must
+    /// protect the source record through import into the destination, ordering
+    /// publication against password reset. No borrowed source bytes escape.
+    /// The callback runs without this store's lock; source locks precede SCRAM.
     pub const Loader = struct {
         ptr: *anyopaque,
-        loadFn: *const fn (ptr: *anyopaque, account: []const u8) ?FullRecord,
+        loadFn: *const fn (ptr: *anyopaque, account: []const u8, destination: *ScramStore) bool,
     };
 
     /// Attach (or clear) the backfill loader consulted on a `resolve` miss.
@@ -378,9 +450,7 @@ pub const ScramStore = struct {
             defer self.lock.unlockShared();
             break :blk self.loader;
         } orelse return false;
-        const loaded = loader.loadFn(loader.ptr, account) orelse return false;
-        self.importFullRecord(account, loaded) catch return false;
-        return true;
+        return loader.loadFn(loader.ptr, account, self);
     }
 
     /// Resolve SCRAM-SHA-256 credentials for `account`: the live store first,
@@ -583,6 +653,89 @@ fn secureZero(buf: []u8) void {
     }
 }
 
+test "SCRAM prepared import allocation failures preserve credentials and retry" {
+    const old: ScramStore.FullRecord = .{
+        .salt = "previous-salt",
+        .iterations = 4096,
+        .stored_key = @splat(1),
+        .server_key = @splat(2),
+        .has_512 = true,
+        .stored_key_512 = @splat(3),
+        .server_key_512 = @splat(4),
+    };
+    var next = old;
+    next.salt = "next-salt";
+    next.stored_key = @splat(5);
+    next.server_key_512 = @splat(6);
+    for ([_]bool{ false, true }) |replace| {
+        var failure_index: usize = 0;
+        while (true) : (failure_index += 1) {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var store = ScramStore.init(failing.allocator());
+            defer store.deinit();
+            if (replace) try store.importFullRecord("alice", old);
+            const original_salt = if (store.entries.get("alice")) |entry| entry.salt.ptr else null;
+            failing.fail_index = failing.alloc_index + failure_index;
+            failing.resize_fail_index = 0;
+            var prepared = store.prepareImportFullRecord("ALICE", next) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expectEqual(@as(u32, if (replace) 1 else 0), store.entries.count());
+                if (replace) {
+                    const entry = store.entries.get("alice").?;
+                    try std.testing.expect(entry.salt.ptr == original_salt.?);
+                    try std.testing.expectEqualSlices(u8, old.salt, entry.salt);
+                    try std.testing.expectEqualSlices(u8, &old.stored_key, &entry.stored_key);
+                    try std.testing.expectEqualSlices(u8, &old.server_key_512, &entry.server_key_512);
+                }
+                failing.fail_index = std.math.maxInt(usize);
+                var retry = try store.prepareImportFullRecord("ALICE", next);
+                const allocations = failing.alloc_index;
+                retry.commit();
+                retry.deinit();
+                try std.testing.expectEqual(allocations, failing.alloc_index);
+                try std.testing.expectEqualSlices(u8, next.salt, store.entries.get("alice").?.salt);
+                continue;
+            };
+            const allocations = failing.alloc_index;
+            prepared.commit();
+            prepared.deinit();
+            try std.testing.expectEqual(allocations, failing.alloc_index);
+            const entry = store.entries.get("alice").?;
+            try std.testing.expectEqualSlices(u8, next.salt, entry.salt);
+            try std.testing.expectEqualSlices(u8, &next.stored_key, &entry.stored_key);
+            try std.testing.expectEqualSlices(u8, &next.server_key_512, &entry.server_key_512);
+            try std.testing.expect(failure_index >= 2);
+            break;
+        }
+    }
+}
+
+test "SCRAM prepared import abort preserves prior credential and unlocks" {
+    var store = ScramStore.init(std.testing.allocator);
+    defer store.deinit();
+    const old: ScramStore.FullRecord = .{
+        .salt = "previous-salt",
+        .iterations = 4096,
+        .stored_key = @splat(1),
+        .server_key = @splat(2),
+    };
+    try store.importFullRecord("alice", old);
+    const original_salt = store.entries.get("alice").?.salt.ptr;
+    var replacement = old;
+    replacement.salt = "replacement";
+    var prepared = try store.prepareImportFullRecord("alice", replacement);
+    prepared.abort();
+    prepared.deinit();
+    const entry = store.entries.get("alice").?;
+    try std.testing.expect(entry.salt.ptr == original_salt);
+    try std.testing.expectEqualSlices(u8, old.salt, entry.salt);
+    try std.testing.expect(store.lookup("alice") != null);
+    var insertion = try store.prepareImportFullRecord("bob", replacement);
+    insertion.deinit();
+    try std.testing.expect(store.lookup("bob") == null);
+    try std.testing.expect(store.lookup("alice") != null);
+}
+
 test "deriveAndStore then lookup returns SCRAM material for the account" {
     // Arrange
     var store = ScramStore.init(std.testing.allocator);
@@ -767,10 +920,12 @@ test "serialize/deserialize round-trips a SCRAM record" {
 
 const TestLoader = struct {
     bytes: []const u8,
-    fn load(ptr: *anyopaque, account: []const u8) ?ScramStore.FullRecord {
+    fn load(ptr: *anyopaque, account: []const u8, destination: *ScramStore) bool {
         const self: *TestLoader = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, account, "alice")) return null;
-        return ScramStore.deserializeFullRecord(self.bytes);
+        if (!std.mem.eql(u8, account, "alice")) return false;
+        const record = ScramStore.deserializeFullRecord(self.bytes) orelse return false;
+        destination.importFullRecord(account, record) catch return false;
+        return true;
     }
 };
 

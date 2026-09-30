@@ -1,0 +1,42 @@
+test
++- run test 71 pass, 2 fail (73 total)
+error: 'daemon.store.test.STORE batch unknown outer kind fails ordinary reopen without rewriting WAL' failed:
+       /home/kain/onyx-server/src/daemon/store.zig:3268:5: 0x1392239 in expectMalformedBatchOuterFailsClosed (root.zig)
+           return error.TestUnexpectedResult;
+           ^
+       /home/kain/onyx-server/src/daemon/store.zig:3272:5: 0x13c4ad9 in test.STORE batch unknown outer kind fails ordinary reopen without rewriting WAL (root.zig)
+           try expectMalformedBatchOuterFailsClosed(false);
+           ^
+error: 'daemon.store.test.STORE batch unknown outer kind fails read-only reopen without rewriting WAL' failed:
+       expected error.UnknownRecordKind, found error.BadRecord
+       /home/kain/onyx-server/src/daemon/store.zig:352:28: 0x13868a6 in openImpl (root.zig)
+                   if (read_only) return StoreError.BadRecord;
+                                  ^
+       /home/kain/onyx-server/src/daemon/store.zig:308:9: 0x138dabd in openReadOnlyWithConfig (root.zig)
+               return openImpl(allocator, io, dir, wal_path, cfg, true);
+               ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x138db6a in expectEqualInner__anon_169120 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x1391e5b in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/store.zig:3261:9: 0x1391f25 in expectMalformedBatchOuterFailsClosed (root.zig)
+               try std.testing.expectEqual(StoreError.UnknownRecordKind, err);
+               ^
+       /home/kain/onyx-server/src/daemon/store.zig:3276:5: 0x13926a9 in test.STORE batch unknown outer kind fails read-only reopen without rewriting WAL (root.zig)
+           try expectMalformedBatchOuterFailsClosed(true);
+           ^
+failed command: ./.zig-cache/o/f191d35c208bf6832bad5a630c41e05d/test --cache-dir=./.zig-cache --seed=0x927b910b --listen=-
+
+Build Summary: 6/8 steps succeeded (1 failed); 73/75 tests passed (2 failed)
+test transitive failure
++- run test 71 pass, 2 fail (73 total)
+|  +- compile test Debug native success 3s MaxRSS:351M
+|     +- options cached
++- run test success 5ms MaxRSS:5M
+|  +- compile test Debug native success 753ms MaxRSS:225M
+|     +- options (reused)
++- run test 2 pass (2 total) 4ms MaxRSS:5M
+   +- compile test Debug native success 774ms MaxRSS:224M
+      +- options (reused)

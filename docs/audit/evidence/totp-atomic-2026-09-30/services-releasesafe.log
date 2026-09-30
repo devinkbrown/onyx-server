@@ -1,0 +1,15 @@
+test-mod
++- run test w
+TOTP atomic enable: 7 induced allocation failures, retries, and cold reopens
+TOTP atomic disable: 5 induced allocation failures, retries, and cold reopens
+TOTP atomic replace: 7 induced allocation failures, retries, and cold reopens
+TOTP atomic revoke: 3 induced allocation failures, retries, and cold reopens
+TOTP atomic rotate: 11 induced allocation failures, retries, and cold reopens
+TOTP atomic reset: 9 induced allocation failures, retries, and cold reopens
+failed command: ./.zig-cache/o/90e94b0a0f19510d79399f3740417b7b/test --cache-dir=./.zig-cache --seed=0x565f6e41 --listen=-
+
+Build Summary: 4/4 steps succeeded; 77/77 tests passed
+test-mod success
++- run test 77 pass (77 total) 7s MaxRSS:3M
+   +- compile test ReleaseSafe native success 37s MaxRSS:620M
+      +- options cached

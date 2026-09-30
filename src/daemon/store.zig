@@ -142,7 +142,57 @@ pub fn ColumnFamily(comptime store_family: Family) type {
     };
 }
 
-const prepared_retirement_capacity = 4;
+const max_batch_mutations = 4;
+const meta_kind_batch: u8 = 0xFB;
+const meta_kind_batch_format: u8 = 0xFA;
+const batch_format_version: u8 = 1;
+const batch_guard_len = record_header_len + 2;
+const prepared_retirement_capacity = max_batch_mutations * 4 + 1;
+
+/// A bounded atomic mutation group. Keys within one family must be distinct.
+/// Put values are mandatory; delete values must be absent.
+pub const BatchMutation = struct {
+    family: Family,
+    kind: MutationKind,
+    key: []const u8,
+    value: ?[]const u8 = null,
+};
+
+const BatchEntry = struct {
+    family: Family,
+    kind: MutationKind,
+    key: ?[]u8 = null,
+    value: ?[]u8 = null,
+    change: ?OwnedMutation = null,
+};
+
+const ActiveBatch = struct {
+    generation: u64,
+    entries: [max_batch_mutations]BatchEntry = undefined,
+    count: usize = 0,
+    record: ?[]u8 = null,
+    final_wal_offset: u64,
+    next_seq_after: u64,
+};
+
+/// Copyable single-use reservation, with ownership retained by its store.
+pub const PreparedBatch = struct {
+    store: *OroStore,
+    generation: u64,
+
+    pub fn commit(self: *PreparedBatch) !void {
+        try self.store.commitBatch(self.generation);
+    }
+
+    pub fn abort(self: *PreparedBatch) void {
+        const active = self.store.active_batch orelse return;
+        if (active.generation == self.generation) self.store.discardActiveBatch();
+    }
+
+    pub fn deinit(self: *PreparedBatch) void {
+        self.abort();
+    }
+};
 
 fn initRetirements() [prepared_retirement_capacity]?Retirement {
     var slots: [prepared_retirement_capacity]?Retirement = undefined;
@@ -223,6 +273,8 @@ pub const OroStore = struct {
     next_seq: u64 = 1,
     cfg: Config = .{},
     active_prepared: ?ActivePrepared = null,
+    active_batch: ?ActiveBatch = null,
+    batch_format_required: bool = false,
     next_prepared_generation: u64 = 1,
     prepared_poisoned: bool = false,
     prepared_io_fault: PreparedIoFault = .{},
@@ -349,6 +401,7 @@ pub const OroStore = struct {
 
     pub fn deinit(self: *OroStore) void {
         self.discardActivePrepared();
+        self.discardActiveBatch();
         self.reclaimRetirements();
         if (self.wal_file) |file| file.close(self.io);
         if (self.staged_write_file) |file| file.close(self.io);
@@ -373,6 +426,8 @@ pub const OroStore = struct {
 
     /// True after a prepared write crossed an ambiguous write/sync boundary.
     /// The store must be reopened before any further mutation is admitted.
+    /// Reads retain the prior published rows, which may differ from durable
+    /// bytes. Authentication callers must refuse authority while this is true.
     pub fn preparedWritesPoisoned(self: *const OroStore) bool {
         return self.prepared_poisoned;
     }
@@ -390,7 +445,7 @@ pub const OroStore = struct {
     ) !PreparedPut {
         if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
-        if (self.active_prepared != null) return StoreError.PreparedMutationActive;
+        if (self.active_prepared != null or self.active_batch != null) return StoreError.PreparedMutationActive;
         if (self.next_prepared_generation == std.math.maxInt(u64)) return StoreError.SequenceExhausted;
         const sequence = try self.reserveSequence();
 
@@ -451,10 +506,158 @@ pub const OroStore = struct {
         return .{ .store = self, .generation = generation };
     }
 
+    /// Reserve all memory, map slots, sequence numbers and deferred retirement
+    /// slots before writing. One checksum covers the entire group. A mandatory
+    /// format guard precedes it in the same append, making a committed batch
+    /// an interior unknown record for older readers (which must refuse it).
+    /// Callers serialize access until commit or abort, as for preparePut.
+    pub fn prepareBatch(self: *OroStore, mutations: []const BatchMutation) !PreparedBatch {
+        if (self.staged_read_only) return StoreError.ReadOnlyStore;
+        if (self.prepared_poisoned) return StoreError.StorePoisoned;
+        if (self.active_prepared != null or self.active_batch != null) return StoreError.PreparedMutationActive;
+        if (self.next_prepared_generation == std.math.maxInt(u64)) return StoreError.SequenceExhausted;
+        const payload_len = try batchPayloadLen(mutations, self.cfg.max_record_bytes);
+        const next_seq_after = std.math.add(u64, self.next_seq, @intCast(mutations.len)) catch return StoreError.SequenceExhausted;
+        const record_len = std.math.add(usize, batch_guard_len + record_header_len, payload_len) catch return StoreError.RecordTooLarge;
+        const final_wal_offset = try self.preflightWalForRecord(record_len);
+        self.reclaimRetirements();
+        const generation = self.next_prepared_generation;
+        self.next_prepared_generation += 1;
+        self.active_batch = .{ .generation = generation, .final_wal_offset = final_wal_offset, .next_seq_after = next_seq_after };
+        errdefer self.discardActiveBatch();
+
+        var additions: [family_count]u32 = @splat(0);
+        for (mutations) |mutation| {
+            if (mutation.kind == .put and self.get(mutation.family, mutation.key) == null)
+                additions[familyIndex(mutation.family)] += 1;
+        }
+        for (additions, 0..) |count, i| if (count != 0) {
+            try self.maps[i].map.ensureUnusedCapacity(count);
+        };
+        const record = try self.allocator.alloc(u8, record_len);
+        self.active_batch.?.record = record;
+        encodeBatchGuard(record[0..batch_guard_len]);
+        const outer = record[batch_guard_len..];
+        writeU32(outer[0..4], @intCast(payload_len));
+        const payload = outer[record_header_len..];
+        payload[0] = meta_kind_batch;
+        payload[1] = batch_format_version;
+        payload[2] = @intCast(mutations.len);
+        var offset: usize = 3;
+        for (mutations, 0..) |mutation, i| {
+            const part_len = try checkedPayloadLen(mutation.kind, mutation.key, mutation.value orelse "", self.cfg.max_record_bytes);
+            writeU32(payload[offset..][0..4], @intCast(part_len));
+            offset += 4;
+            encodeMutation(payload[offset..][0..part_len], mutation);
+            offset += part_len;
+            self.active_batch.?.entries[i] = .{ .family = mutation.family, .kind = mutation.kind };
+            self.active_batch.?.count += 1;
+            const entry = &self.active_batch.?.entries[i];
+            entry.key = try self.allocator.dupe(u8, mutation.key);
+            if (mutation.value) |value| entry.value = try self.allocator.dupe(u8, value);
+            if (self.changefeed.entries.len != 0) entry.change = try OwnedMutation.from(self.allocator, .{
+                .seq = self.next_seq + @as(u64, @intCast(i)),
+                .family = mutation.family,
+                .kind = mutation.kind,
+                .key = mutation.key,
+                .value = mutation.value,
+            });
+        }
+        writeU32(outer[4..8], checksum(payload));
+        return .{ .store = self, .generation = generation };
+    }
+
+    fn commitBatch(self: *OroStore, generation: u64) !void {
+        const active = self.active_batch orelse return StoreError.PreparedAlreadyConsumed;
+        if (active.generation != generation) return StoreError.PreparedAlreadyConsumed;
+        if (self.prepared_poisoned) return StoreError.StorePoisoned;
+        try self.writePreparedBytes(active.record.?, active.final_wal_offset);
+        // No allocation, free or fallible call after the sync boundary.
+        for (self.active_batch.?.entries[0..active.count]) |*entry| {
+            const map = &self.maps[familyIndex(entry.family)].map;
+            const key = entry.key.?;
+            switch (entry.kind) {
+                .put => {
+                    const gop = map.getOrPutAssumeCapacity(key);
+                    if (gop.found_existing) {
+                        self.retireBytes(key);
+                        self.retireBytes(gop.value_ptr.*);
+                    } else gop.key_ptr.* = key;
+                    gop.value_ptr.* = entry.value.?;
+                    entry.value = null;
+                },
+                .delete => {
+                    if (map.getEntry(key)) |existing| {
+                        const old_key = existing.key_ptr.*;
+                        const old_value = existing.value_ptr.*;
+                        map.removeByPtr(existing.key_ptr);
+                        self.retireBytes(@constCast(old_key));
+                        self.retireBytes(old_value);
+                    }
+                    self.retireBytes(key);
+                },
+            }
+            entry.key = null;
+            if (entry.change) |change| {
+                if (self.changefeed.publishPrepared(change)) |evicted| self.retireMutation(evicted);
+                entry.change = null;
+            }
+        }
+        self.retireBytes(active.record.?);
+        self.wal_offset = active.final_wal_offset;
+        self.next_seq = active.next_seq_after;
+        self.batch_format_required = true;
+        self.active_batch = null;
+    }
+
+    fn discardActiveBatch(self: *OroStore) void {
+        if (self.active_batch) |*active| {
+            for (active.entries[0..active.count]) |*entry| {
+                if (entry.key) |key| self.allocator.free(key);
+                if (entry.value) |value| self.allocator.free(value);
+                if (entry.change) |*change| change.deinit(self.allocator);
+            }
+            if (active.record) |record| self.allocator.free(record);
+            self.active_batch = null;
+        }
+    }
+
+    fn writePreparedBytes(self: *OroStore, record: []const u8, final_offset: u64) !void {
+        const file = self.wal_file orelse {
+            self.poisonPreparedStore();
+            return StoreError.IoAmbiguous;
+        };
+        const offset = final_offset - record.len;
+        switch (self.prepared_io_fault.write) {
+            .failed => {
+                self.poisonPreparedStore();
+                return StoreError.IoAmbiguous;
+            },
+            .short => {
+                file.writePositionalAll(self.io, record[0..@max(@as(usize, 1), record.len / 2)], offset) catch {};
+                self.poisonPreparedStore();
+                return StoreError.IoAmbiguous;
+            },
+            .none => {},
+        }
+        file.writePositionalAll(self.io, record, offset) catch {
+            self.poisonPreparedStore();
+            return StoreError.IoAmbiguous;
+        };
+        if (self.prepared_io_fault.sync) {
+            self.poisonPreparedStore();
+            return StoreError.IoAmbiguous;
+        }
+        file.sync(self.io) catch {
+            self.poisonPreparedStore();
+            return StoreError.IoAmbiguous;
+        };
+    }
+
     pub fn put(self: *OroStore, store_family: Family, key: []const u8, value: []const u8) !void {
         if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
-        if (self.active_prepared != null) return StoreError.PreparedMutationActive;
+        if (self.active_prepared != null or self.active_batch != null) return StoreError.PreparedMutationActive;
         const sequence = try self.reserveSequence();
         const record_len = try recordSize(.put, key, value, self.cfg.max_record_bytes);
         _ = try self.preflightWalForRecord(record_len);
@@ -470,7 +673,7 @@ pub const OroStore = struct {
     pub fn delete(self: *OroStore, store_family: Family, key: []const u8) !void {
         if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
-        if (self.active_prepared != null) return StoreError.PreparedMutationActive;
+        if (self.active_prepared != null or self.active_batch != null) return StoreError.PreparedMutationActive;
         const sequence = try self.reserveSequence();
         const record_len = try recordSize(.delete, key, "", self.cfg.max_record_bytes);
         _ = try self.preflightWalForRecord(record_len);
@@ -483,7 +686,7 @@ pub const OroStore = struct {
     pub fn snapshotAndTruncate(self: *OroStore) !void {
         if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
-        if (self.active_prepared != null) return StoreError.PreparedMutationActive;
+        if (self.active_prepared != null or self.active_batch != null) return StoreError.PreparedMutationActive;
         try self.ensureWal();
         var coverage_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
         try self.hashWalPrefix(self.wal_offset, &coverage_digest);
@@ -504,6 +707,12 @@ pub const OroStore = struct {
 
         var offset: u64 = 0;
         offset = try writeNextSeqRecordAt(self.io, snapshot.file, offset, self.allocator, self.next_seq);
+        if (self.batch_format_required) {
+            var guard: [batch_guard_len]u8 = undefined;
+            encodeBatchGuard(&guard);
+            try snapshot.file.writePositionalAll(self.io, &guard, offset);
+            offset += guard.len;
+        }
         for (families) |store_family| {
             var it = self.maps[familyIndex(store_family)].map.iterator();
             while (it.next()) |entry| {
@@ -722,35 +931,7 @@ pub const OroStore = struct {
         if (active.generation != generation) return StoreError.PreparedAlreadyConsumed;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
 
-        const file = self.wal_file orelse {
-            self.poisonPreparedStore();
-            return StoreError.IoAmbiguous;
-        };
-        const record = active.record.?;
-        const append_offset = active.final_wal_offset - record.len;
-
-        if (self.prepared_io_fault.write == .failed) {
-            self.poisonPreparedStore();
-            return StoreError.IoAmbiguous;
-        }
-        if (self.prepared_io_fault.write == .short) {
-            const prefix_len = @max(@as(usize, 1), record.len / 2);
-            file.writePositionalAll(self.io, record[0..prefix_len], append_offset) catch {};
-            self.poisonPreparedStore();
-            return StoreError.IoAmbiguous;
-        }
-        file.writePositionalAll(self.io, record, append_offset) catch {
-            self.poisonPreparedStore();
-            return StoreError.IoAmbiguous;
-        };
-        if (self.prepared_io_fault.sync) {
-            self.poisonPreparedStore();
-            return StoreError.IoAmbiguous;
-        }
-        file.sync(self.io) catch {
-            self.poisonPreparedStore();
-            return StoreError.IoAmbiguous;
-        };
+        try self.writePreparedBytes(active.record.?, active.final_wal_offset);
 
         // Durable publication is deliberately scalar/pointer-only. All
         // retirement slots were made available before admission, and no
@@ -827,6 +1008,7 @@ pub const OroStore = struct {
     fn poisonPreparedStore(self: *OroStore) void {
         self.prepared_poisoned = true;
         self.discardActivePrepared();
+        self.discardActiveBatch();
     }
 
     const ReplayKind = enum {
@@ -918,11 +1100,35 @@ pub const OroStore = struct {
                 offset = record_end;
                 continue;
             }
+            if (payload[0] == meta_kind_batch_format) {
+                if (payload.len != 2 or payload[1] != batch_format_version) return StoreError.BadRecord;
+                self.batch_format_required = true;
+                offset = record_end;
+                continue;
+            }
+            if (payload[0] == meta_kind_batch) {
+                if (replay_kind != .wal or !self.batch_format_required) return StoreError.BadRecord;
+                var decoded: [max_batch_mutations]BatchMutation = undefined;
+                const count = try decodeBatch(payload, &decoded);
+                const next = std.math.add(u64, self.next_seq, @intCast(count)) catch return StoreError.SequenceExhausted;
+                // Validate every component before applying any component. An
+                // allocation failure during replay aborts open entirely.
+                for (decoded[0..count]) |mutation| switch (mutation.kind) {
+                    .put => try self.applyPut(mutation.family, mutation.key, mutation.value.?),
+                    .delete => try self.applyDelete(mutation.family, mutation.key),
+                };
+                self.next_seq = next;
+                offset = record_end;
+                continue;
+            }
             self.applyPayload(payload) catch |err| switch (err) {
                 StoreError.BadRecord,
                 StoreError.UnknownFamily,
                 StoreError.UnknownRecordKind,
-                => if (replay_kind == .wal and record_end == stat.size) return record_offset else return err,
+                // Guarded stores require checksum-valid records to decode
+                // strictly, including an unknown outer kind at EOF. Physical
+                // truncation and checksum failures remain recoverable above.
+                => if (!self.batch_format_required and replay_kind == .wal and record_end == stat.size) return record_offset else return err,
                 else => return err,
             };
             if (replay_kind == .wal and isMutationPayload(payload)) {
@@ -1279,6 +1485,69 @@ fn parseSnapshotCoverage(payload: []const u8) !SnapshotCoverage {
     }
     coverage.count = payload[2];
     return coverage;
+}
+
+fn batchPayloadLen(mutations: []const BatchMutation, limit: usize) !usize {
+    if (mutations.len == 0 or mutations.len > max_batch_mutations) return StoreError.BadRecord;
+    var size: usize = 3;
+    for (mutations, 0..) |mutation, i| {
+        if ((mutation.kind == .put) != (mutation.value != null)) return StoreError.BadRecord;
+        for (mutations[0..i]) |prior| {
+            if (mutation.family == prior.family and std.mem.eql(u8, mutation.key, prior.key)) return StoreError.BadRecord;
+        }
+        const part = try checkedPayloadLen(mutation.kind, mutation.key, mutation.value orelse "", limit);
+        size = std.math.add(usize, size, 4) catch return StoreError.RecordTooLarge;
+        size = std.math.add(usize, size, part) catch return StoreError.RecordTooLarge;
+    }
+    if (size > limit or size > std.math.maxInt(u32)) return StoreError.RecordTooLarge;
+    return size;
+}
+
+fn encodeBatchGuard(record: *[batch_guard_len]u8) void {
+    writeU32(record[0..4], 2);
+    record[record_header_len] = meta_kind_batch_format;
+    record[record_header_len + 1] = batch_format_version;
+    writeU32(record[4..8], checksum(record[record_header_len..]));
+}
+
+fn encodeMutation(payload: []u8, mutation: BatchMutation) void {
+    payload[0] = @intFromEnum(mutation.kind);
+    payload[1] = @intFromEnum(mutation.family);
+    writeU32(payload[2..6], @intCast(mutation.key.len));
+    writeU32(payload[6..10], if (mutation.value) |value| @intCast(value.len) else tombstone_len);
+    @memcpy(payload[payload_header_len..][0..mutation.key.len], mutation.key);
+    if (mutation.value) |value| @memcpy(payload[payload_header_len + mutation.key.len ..], value);
+}
+
+fn decodeBatch(payload: []const u8, out: *[max_batch_mutations]BatchMutation) !usize {
+    if (payload.len < 3 or payload[0] != meta_kind_batch or payload[1] != batch_format_version or payload[2] == 0 or payload[2] > max_batch_mutations)
+        return StoreError.BadRecord;
+    var offset: usize = 3;
+    const count: usize = payload[2];
+    for (out[0..count]) |*mutation| {
+        if (payload.len - offset < 4) return StoreError.BadRecord;
+        const len: usize = readU32(payload[offset..][0..4]);
+        offset += 4;
+        if (len < payload_header_len or len > payload.len - offset) return StoreError.BadRecord;
+        const part = payload[offset..][0..len];
+        const kind: MutationKind = switch (part[0]) {
+            0 => .put,
+            1 => .delete,
+            else => return StoreError.UnknownRecordKind,
+        };
+        const family_value = decodeFamily(part[1]) orelse return StoreError.UnknownFamily;
+        const key_len: usize = readU32(part[2..6]);
+        const value_len = readU32(part[6..10]);
+        if ((kind == .delete) != (value_len == tombstone_len)) return StoreError.BadRecord;
+        if (key_len > len - payload_header_len) return StoreError.BadRecord;
+        const remainder = len - payload_header_len - key_len;
+        if (remainder != (if (kind == .delete) @as(usize, 0) else @as(usize, value_len))) return StoreError.BadRecord;
+        mutation.* = .{ .family = family_value, .kind = kind, .key = part[payload_header_len..][0..key_len], .value = if (kind == .put) part[payload_header_len + key_len ..] else null };
+        offset += len;
+    }
+    if (offset != payload.len) return StoreError.BadRecord;
+    _ = try batchPayloadLen(out[0..count], std.math.maxInt(usize));
+    return count;
 }
 
 fn checkedPayloadLen(
@@ -2504,7 +2773,7 @@ test "STORE prepared replacement retires all four slots without publication allo
     try prepared.commit();
     try std.testing.expectEqual(allocs_before, failing.alloc_index);
     try std.testing.expectEqual(frees_before, failing.deallocations);
-    try std.testing.expectEqual(@as(usize, prepared_retirement_capacity), store.retirement_count);
+    try std.testing.expectEqual(@as(usize, 4), store.retirement_count);
     try std.testing.expectEqualStrings("new", store.family(.accounts).get("alice").?);
 
     var next = try store.preparePut(.accounts, "bob", "next");
@@ -2565,4 +2834,447 @@ test "native Helix read-only store refuses torn WAL without repair and detects p
     defer allocator.free(after);
     try std.testing.expectEqualSlices(u8, before, after);
     try std.testing.expectError(error.FileNotFound, OroStore.openReadOnlyWithConfig(allocator, std.testing.io, tmp.dir, "absent.wal", .{}));
+}
+
+const test_policy_batch = [_]BatchMutation{
+    .{ .family = .props, .kind = .put, .key = "tot\x00alice", .value = "NEWSECRET" },
+    .{ .family = .props, .kind = .delete, .key = "sessiontokacct:alice" },
+    .{ .family = .props, .kind = .put, .key = "new-key", .value = "new-value" },
+};
+
+fn seedPolicyBatch(store: *OroStore) !void {
+    try store.put(.props, "tot\x00alice", "OLDSECRET");
+    try store.put(.props, "sessiontokacct:alice", "old-token-hash");
+}
+
+fn expectPolicyBatch(store: *OroStore, committed: bool) !void {
+    try std.testing.expectEqualStrings(if (committed) "NEWSECRET" else "OLDSECRET", store.get(.props, "tot\x00alice").?);
+    if (committed) {
+        try std.testing.expect(store.get(.props, "sessiontokacct:alice") == null);
+        try std.testing.expectEqualStrings("new-value", store.get(.props, "new-key").?);
+    } else {
+        try std.testing.expectEqualStrings("old-token-hash", store.get(.props, "sessiontokacct:alice").?);
+        try std.testing.expect(store.get(.props, "new-key") == null);
+    }
+}
+
+test "STORE batch reserves OOM atomically and retries every allocation" {
+    var successes: usize = 0;
+    var failures: usize = 0;
+    for (0..64) |fail_offset| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize), .resize_fail_index = 0 });
+        var store = try OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "batch-oom.wal");
+        defer store.deinit();
+        try seedPolicyBatch(&store);
+        const before = try readWalForTest(tmp, "batch-oom.wal");
+        defer std.testing.allocator.free(before);
+        const next_seq = store.next_seq;
+        const offset = store.wal_offset;
+        const change_count = store.changeCount();
+        const secret_ptr = store.get(.props, "tot\x00alice").?.ptr;
+        const token_ptr = store.get(.props, "sessiontokacct:alice").?.ptr;
+        failing.fail_index = failing.alloc_index + fail_offset;
+        var prepared = store.prepareBatch(&test_policy_batch) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            try expectPolicyBatch(&store, false);
+            try std.testing.expectEqual(secret_ptr, store.get(.props, "tot\x00alice").?.ptr);
+            try std.testing.expectEqual(token_ptr, store.get(.props, "sessiontokacct:alice").?.ptr);
+            try std.testing.expectEqual(next_seq, store.next_seq);
+            try std.testing.expectEqual(offset, store.wal_offset);
+            try std.testing.expectEqual(change_count, store.changeCount());
+            try std.testing.expect(store.active_batch == null);
+            const after = try readWalForTest(tmp, "batch-oom.wal");
+            defer std.testing.allocator.free(after);
+            try std.testing.expectEqualSlices(u8, before, after);
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try store.prepareBatch(&test_policy_batch);
+            defer retry.deinit();
+            try retry.commit();
+            try expectPolicyBatch(&store, true);
+            continue;
+        };
+        defer prepared.deinit();
+        const allocations = failing.alloc_index;
+        const frees = failing.deallocations;
+        // The first non-failing reservation must commit even with allocations
+        // and frees prohibited immediately after prepare.
+        failing.fail_index = failing.alloc_index;
+        try prepared.commit();
+        try std.testing.expectEqual(allocations, failing.alloc_index);
+        try std.testing.expectEqual(frees, failing.deallocations);
+        try expectPolicyBatch(&store, true);
+        try std.testing.expectEqual(next_seq + test_policy_batch.len, store.next_seq);
+        successes += 1;
+        break;
+    }
+    try std.testing.expect(failures > 0);
+    try std.testing.expectEqual(@as(usize, 1), successes);
+}
+
+test "STORE batch write ambiguity publishes nothing and reopen resolves the whole group" {
+    const faults = [_]PreparedIoFault{ .{ .write = .failed }, .{ .write = .short }, .{ .sync = true } };
+    for (faults, 0..) |fault, i| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var next_seq: u64 = undefined;
+        {
+            var store = try openTestStore(tmp, "batch-fault.wal");
+            defer store.deinit();
+            try seedPolicyBatch(&store);
+            next_seq = store.next_seq;
+            const change_count = store.changeCount();
+            var prepared = try store.prepareBatch(&test_policy_batch);
+            defer prepared.deinit();
+            store.setPreparedIoFault(fault);
+            try std.testing.expectError(StoreError.IoAmbiguous, prepared.commit());
+            try std.testing.expect(store.preparedWritesPoisoned());
+            try expectPolicyBatch(&store, false);
+            try std.testing.expectEqual(next_seq, store.next_seq);
+            try std.testing.expectEqual(change_count, store.changeCount());
+            try std.testing.expectError(StoreError.StorePoisoned, store.prepareBatch(&test_policy_batch));
+            try std.testing.expectError(StoreError.StorePoisoned, store.delete(.props, "tot\x00alice"));
+        }
+        var reopened = try openTestStore(tmp, "batch-fault.wal");
+        defer reopened.deinit();
+        try expectPolicyBatch(&reopened, i == 2);
+        try std.testing.expectEqual(next_seq + (if (i == 2) @as(u64, test_policy_batch.len) else @as(u64, 0)), reopened.next_seq);
+        if (i != 2) {
+            var retry = try reopened.prepareBatch(&test_policy_batch);
+            defer retry.deinit();
+            try retry.commit();
+            try expectPolicyBatch(&reopened, true);
+        }
+    }
+}
+
+test "STORE batch every torn append prefix reopens to whole prior policy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var append_offset: usize = undefined;
+    const bytes = block: {
+        var store = try openTestStore(tmp, "batch-complete.wal");
+        defer store.deinit();
+        try seedPolicyBatch(&store);
+        append_offset = @intCast(store.wal_offset);
+        var batch = try store.prepareBatch(&test_policy_batch);
+        defer batch.deinit();
+        try batch.commit();
+        break :block try readWalForTest(tmp, "batch-complete.wal");
+    };
+    defer std.testing.allocator.free(bytes);
+    for (append_offset..bytes.len) |cut| {
+        try rewriteTestFile(tmp, "batch-torn.wal", bytes[0..cut]);
+        var reopened = try openTestStore(tmp, "batch-torn.wal");
+        defer reopened.deinit();
+        try expectPolicyBatch(&reopened, false);
+        var retry = try reopened.prepareBatch(&test_policy_batch);
+        defer retry.deinit();
+        try retry.commit();
+        try expectPolicyBatch(&reopened, true);
+    }
+}
+
+test "STORE batch strict EOF decode rejects checksum-valid malformed components" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const original = block: {
+        var store = try openTestStore(tmp, "batch-valid.wal");
+        defer store.deinit();
+        try seedPolicyBatch(&store);
+        var prepared = try store.prepareBatch(&test_policy_batch);
+        defer prepared.deinit();
+        try prepared.commit();
+        break :block try readWalForTest(tmp, "batch-valid.wal");
+    };
+    defer std.testing.allocator.free(original);
+    const payload_start = findRecordPayloadByKind(original, meta_kind_batch).?;
+    const first_part = payload_start + 3 + 4;
+    const second_part = first_part + readU32(original[payload_start + 3 ..][0..4]) + 4;
+    const cases = [_]struct { offset: usize, value: u8, expected: StoreError }{
+        .{ .offset = payload_start + 1, .value = 2, .expected = StoreError.BadRecord },
+        .{ .offset = payload_start + 2, .value = 0, .expected = StoreError.BadRecord },
+        .{ .offset = payload_start + 2, .value = 4, .expected = StoreError.BadRecord },
+        .{ .offset = second_part, .value = 6, .expected = StoreError.UnknownRecordKind },
+        .{ .offset = second_part + 1, .value = 99, .expected = StoreError.UnknownFamily },
+        .{ .offset = second_part + 6, .value = 0, .expected = StoreError.BadRecord },
+    };
+    for (cases) |case| {
+        const damaged = try std.testing.allocator.dupe(u8, original);
+        defer std.testing.allocator.free(damaged);
+        damaged[case.offset] = case.value;
+        refreshRecordChecksum(damaged, payload_start);
+        try rewriteTestFile(tmp, "batch-bad.wal", damaged);
+        try std.testing.expectError(case.expected, openTestStore(tmp, "batch-bad.wal"));
+        const after = try readWalForTest(tmp, "batch-bad.wal");
+        defer std.testing.allocator.free(after);
+        try std.testing.expectEqualSlices(u8, damaged, after);
+    }
+}
+
+/// The pre-batch reader accepts ordinary mutations and metadata, tolerates an
+/// unknown WAL record only at exact EOF, and never tolerates snapshot errors.
+fn legacyBatchFormatRejected(bytes: []const u8, snapshot: bool) bool {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        if (bytes.len - offset < record_header_len) return false;
+        const len: usize = readU32(bytes[offset..][0..4]);
+        const end = offset + record_header_len + len;
+        if (end > bytes.len or len == 0) return false;
+        const kind = bytes[offset + record_header_len];
+        if (kind == meta_kind_batch_format or kind == meta_kind_batch)
+            return snapshot or end != bytes.len;
+        offset = end;
+    }
+    return false;
+}
+
+test "STORE batch mandatory format guard refuses downgrade before and after compaction" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "batch-guard.wal");
+    defer store.deinit();
+    try seedPolicyBatch(&store);
+    var prepared = try store.prepareBatch(&test_policy_batch);
+    defer prepared.deinit();
+    try prepared.commit();
+    const wal = try readWalForTest(tmp, "batch-guard.wal");
+    defer std.testing.allocator.free(wal);
+    try std.testing.expect(legacyBatchFormatRejected(wal, false));
+    try store.snapshotAndTruncate();
+    const snapshot = try readWalForTest(tmp, "batch-guard.wal.snap");
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(legacyBatchFormatRejected(snapshot, true));
+    var reopened = try openTestStore(tmp, "batch-guard.wal");
+    defer reopened.deinit();
+    try expectPolicyBatch(&reopened, true);
+    try std.testing.expect(reopened.batch_format_required);
+    try std.testing.expectEqual(store.next_seq, reopened.next_seq);
+}
+
+test "STORE batch rejects duplicate keys and capacity sequence exhaustion before I/O" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "batch-limits.wal");
+    defer store.deinit();
+    const duplicate = [_]BatchMutation{
+        .{ .family = .props, .kind = .put, .key = "same", .value = "a" },
+        .{ .family = .props, .kind = .delete, .key = "same" },
+    };
+    const before = try readWalForTest(tmp, "batch-limits.wal");
+    defer std.testing.allocator.free(before);
+    try std.testing.expectError(StoreError.BadRecord, store.prepareBatch(&duplicate));
+    store.cfg.max_record_bytes = 12;
+    try std.testing.expectError(StoreError.RecordTooLarge, store.prepareBatch(&test_policy_batch));
+    store.cfg.max_record_bytes = default_max_record_len;
+    store.next_seq = std.math.maxInt(u64) - 1;
+    try std.testing.expectError(StoreError.SequenceExhausted, store.prepareBatch(&test_policy_batch));
+    const after = try readWalForTest(tmp, "batch-limits.wal");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "STORE batch copied reservations abort without touching newer ownership" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "batch-copy.wal");
+    defer store.deinit();
+    try seedPolicyBatch(&store);
+    var first = try store.prepareBatch(&test_policy_batch);
+    var copied = first;
+    first.abort();
+    try expectPolicyBatch(&store, false);
+    var next = try store.prepareBatch(&test_policy_batch);
+    defer next.deinit();
+    copied.abort();
+    try std.testing.expectError(StoreError.PreparedAlreadyConsumed, copied.commit());
+    try std.testing.expectError(StoreError.PreparedMutationActive, store.preparePut(.props, "other", "v"));
+    try std.testing.expectError(StoreError.PreparedMutationActive, store.put(.props, "other", "v"));
+    try next.commit();
+    try expectPolicyBatch(&store, true);
+    try std.testing.expectError(StoreError.PreparedAlreadyConsumed, next.commit());
+}
+
+test "STORE batch four deletes retire bounded feed evictions without allocator work" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    var store = try OroStore.openWithConfig(failing.allocator(), std.testing.io, tmp.dir, "batch-retire.wal", .{ .changefeed_capacity = 1 });
+    defer store.deinit();
+    const operations = [_]BatchMutation{
+        .{ .family = .props, .kind = .delete, .key = "a" },
+        .{ .family = .props, .kind = .delete, .key = "b" },
+        .{ .family = .accounts, .kind = .delete, .key = "a" },
+        .{ .family = .accounts, .kind = .delete, .key = "b" },
+    };
+    for (operations) |operation| try store.put(operation.family, operation.key, "value");
+    const seq = store.next_seq;
+    var batch = try store.prepareBatch(&operations);
+    defer batch.deinit();
+    const allocation_count = failing.alloc_index;
+    const free_count = failing.deallocations;
+    failing.fail_index = allocation_count;
+    try batch.commit();
+    try std.testing.expectEqual(allocation_count, failing.alloc_index);
+    try std.testing.expectEqual(free_count, failing.deallocations);
+    try std.testing.expectEqual(@as(usize, 17), store.retirement_count);
+    try std.testing.expectEqual(seq + operations.len, store.next_seq);
+    try std.testing.expectEqual(seq + operations.len - 1, store.changeAt(0).?.seq);
+    try std.testing.expectEqual(MutationKind.delete, store.changeAt(0).?.kind);
+    for (operations) |operation| try std.testing.expect(store.get(operation.family, operation.key) == null);
+    failing.fail_index = std.math.maxInt(usize);
+    var retry = try store.preparePut(.props, "after-retirement", "safe");
+    defer retry.deinit();
+    try retry.commit();
+    try std.testing.expectEqualStrings("safe", store.get(.props, "after-retirement").?);
+}
+
+test "STORE batch read-only staged replay refuses mutation without WAL change" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openTestStore(tmp, "batch-readonly.wal");
+        defer store.deinit();
+        try seedPolicyBatch(&store);
+        var batch = try store.prepareBatch(&test_policy_batch);
+        defer batch.deinit();
+        try batch.commit();
+    }
+    const before = try readWalForTest(tmp, "batch-readonly.wal");
+    defer std.testing.allocator.free(before);
+    var staged = try OroStore.openReadOnlyWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "batch-readonly.wal", .{});
+    defer staged.deinit();
+    try expectPolicyBatch(&staged, true);
+    try std.testing.expectError(StoreError.ReadOnlyStore, staged.prepareBatch(&test_policy_batch));
+    const after = try readWalForTest(tmp, "batch-readonly.wal");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "STORE batch durable replay allocation failures clean up without rewriting WAL" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openTestStore(tmp, "batch-replay-oom.wal");
+        defer store.deinit();
+        try seedPolicyBatch(&store);
+        var batch = try store.prepareBatch(&test_policy_batch);
+        defer batch.deinit();
+        try batch.commit();
+    }
+    const before = try readWalForTest(tmp, "batch-replay-oom.wal");
+    defer std.testing.allocator.free(before);
+    const ReplaySweep = struct {
+        fn run(allocator: std.mem.Allocator, dir: std.testing.TmpDir) !void {
+            var store = try OroStore.open(allocator, std.testing.io, dir.dir, "batch-replay-oom.wal");
+            defer store.deinit();
+            try expectPolicyBatch(&store, true);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, ReplaySweep.run, .{tmp});
+    const after = try readWalForTest(tmp, "batch-replay-oom.wal");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "STORE batch owns caller bytes and publishes each component sequence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "batch-owned.wal");
+    defer store.deinit();
+    var key = [_]u8{ 'k', 'e', 'y' };
+    var value = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
+    const operations = [_]BatchMutation{
+        .{ .family = .props, .kind = .put, .key = &key, .value = &value },
+        .{ .family = .accounts, .kind = .put, .key = "account", .value = "raw-account-row" },
+        .{ .family = .props, .kind = .delete, .key = "absent" },
+    };
+    var batch = try store.prepareBatch(&operations);
+    defer batch.deinit();
+    @memset(&key, 'x');
+    @memset(&value, 'x');
+    try batch.commit();
+    try std.testing.expectEqualStrings("value", store.get(.props, "key").?);
+    for (0..operations.len) |i| {
+        const change = store.changeAt(i).?;
+        try std.testing.expectEqual(@as(u64, @intCast(i)) + 1, change.seq);
+        try std.testing.expectEqual(operations[i].family, change.family);
+        try std.testing.expectEqual(operations[i].kind, change.kind);
+    }
+    try std.testing.expectEqualStrings("key", store.changeAt(0).?.key);
+    try std.testing.expectEqualStrings("value", store.changeAt(0).?.value.?);
+    var reopened = try openTestStore(tmp, "batch-owned.wal");
+    defer reopened.deinit();
+    try std.testing.expectEqualStrings("value", reopened.get(.props, "key").?);
+    try std.testing.expectEqualStrings("raw-account-row", reopened.get(.accounts, "account").?);
+    try std.testing.expectEqual(@as(u64, 4), reopened.next_seq);
+}
+
+test "STORE batch replay rejects duplicate keys before applying a valid earlier component" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const operations = [_]BatchMutation{
+        .{ .family = .props, .kind = .put, .key = "one", .value = "replacement" },
+        .{ .family = .props, .kind = .delete, .key = "two" },
+    };
+    const bytes = block: {
+        var store = try openTestStore(tmp, "batch-duplicate.wal");
+        defer store.deinit();
+        var batch = try store.prepareBatch(&operations);
+        defer batch.deinit();
+        try batch.commit();
+        break :block try readWalForTest(tmp, "batch-duplicate.wal");
+    };
+    defer std.testing.allocator.free(bytes);
+    const start = findRecordPayloadByKind(bytes, meta_kind_batch).?;
+    const second = start + 3 + 4 + readU32(bytes[start + 3 ..][0..4]) + 4;
+    @memcpy(bytes[second + payload_header_len ..][0..3], "one");
+    refreshRecordChecksum(bytes, start);
+    try rewriteTestFile(tmp, "batch-duplicate.wal", bytes);
+    try std.testing.expectError(StoreError.BadRecord, openTestStore(tmp, "batch-duplicate.wal"));
+    const after = try readWalForTest(tmp, "batch-duplicate.wal");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, bytes, after);
+}
+
+fn expectMalformedBatchOuterFailsClosed(read_only: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = block: {
+        var store = try openTestStore(tmp, "batch-outer.wal");
+        defer store.deinit();
+        try seedPolicyBatch(&store);
+        var batch = try store.prepareBatch(&test_policy_batch);
+        defer batch.deinit();
+        try batch.commit();
+        break :block try readWalForTest(tmp, "batch-outer.wal");
+    };
+    defer std.testing.allocator.free(bytes);
+    const start = findRecordPayloadByKind(bytes, meta_kind_batch).?;
+    bytes[start] = 0xFF;
+    refreshRecordChecksum(bytes, start);
+    try rewriteTestFile(tmp, "batch-outer.wal", bytes);
+    const result = if (read_only)
+        OroStore.openReadOnlyWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "batch-outer.wal", .{})
+    else
+        openTestStore(tmp, "batch-outer.wal");
+    var opened = result catch |err| {
+        try std.testing.expectEqual(StoreError.UnknownRecordKind, err);
+        const after = try readWalForTest(tmp, "batch-outer.wal");
+        defer std.testing.allocator.free(after);
+        try std.testing.expectEqualSlices(u8, bytes, after);
+        return;
+    };
+    opened.deinit();
+    return error.TestUnexpectedResult;
+}
+
+test "STORE batch unknown outer kind fails ordinary reopen without rewriting WAL" {
+    try expectMalformedBatchOuterFailsClosed(false);
+}
+
+test "STORE batch unknown outer kind fails read-only reopen without rewriting WAL" {
+    try expectMalformedBatchOuterFailsClosed(true);
 }

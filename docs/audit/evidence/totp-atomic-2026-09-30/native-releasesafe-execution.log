@@ -1,0 +1,24 @@
+8192
+SHA256 (onyx-server-module-tests) = 69d18d6941f0fe5ea4ab713510717a59144449fea05131159165acf166653694
+SHA256 (onyx-server-daemon-tests) = 6d7b97f1f03accecc286e948eb9a6bb4f5207f7632e84c4e8444324a1e6bd2c1
+SHA256 (onyx-server-cli-tests) = 0bc22cd0a33e2d97b1a292bc279d9c4f74c839f79dca98caad3803aa6daab84f
+    0m33.09s real     0m27.33s user     0m05.33s system
+161/171 crypto.random.test_0...OK
+162/171 crypto.kx.test_0...OK
+163/171 crypto.xwing.test_0...OK
+164/171 crypto.tls_client.test_0...OK
+165/171 crypto.sct.test_0...OK
+166/171 crypto.aead.test_0...OK
+167/171 crypto.ecdsa_kat.test_0...OK
+168/171 crypto.ed25519_batch.test_0...OK
+169/171 crypto.sign_kat.test_0...OK
+170/171 crypto.tls_props.test_0...OK
+171/171 crypto.tls.test_0...OK
+170 passed; 1 skipped; 0 failed.
+MODULE_EXIT=0
+All 0 tests passed.
+DAEMON_EXIT=0
+1/2 armor_main.test_0...OK
+2/2 root.test_0...OK
+All 2 tests passed.
+CLI_EXIT=0
