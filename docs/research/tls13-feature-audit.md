@@ -57,7 +57,7 @@ hardening fixes landed with it — marked **[fixed here]**).
 | 0-RTT accept: early keys, byte cap, EndOfEarlyData required | IMPLEMENTED | `tls_server.zig:2435–2468` (cap vs `max_early_data_size`, EOED exact-match), gated on non-zero sealed limit `:1661` (test `:4620`) | §4.2.10 |
 | 0-RTT reject path: trial-skip of early records | IMPLEMENTED | `tls_server.zig:893–894` + `:944–947` (undecryptable records skipped only when early data was offered-and-rejected) | §4.2.10 |
 | 0-RTT anti-replay: single-use binder guard | IMPLEMENTED | `tls_resumption.zig:71–108` (bounded ring, shared, locked), wired `tls_server.zig:1656–1659`; replay test `:4528` | §8.1 |
-| 0-RTT anti-replay: obfuscated_ticket_age freshness window | IMPLEMENTED **[fixed here]** | sealed ticket bumped to **v3** carrying `ticket_age_add` (`tls_resumption.zig` `sealed_magic=3`, `OpenedTicket.ticket_age_add`, legacy v1/v2 decode arms + `sealLegacyV2` cross-version test); server un-obfuscates the client's `obfuscated_ticket_age` and enforces `|reported − measured| ≤ early_data_age_skew_ms` (`tls_server.zig` `ticketAgeWithinWindow` + `accepted_age_within_window`, gated in the 0-RTT accept before the binder ring). Fail-open only for legacy tickets / no clock. Tests: in-window accept, too-old/too-new reject, skew boundary ±1 ms, no-clock back-compat. The binder ring covers single-process; this window is the multi-node/global mitigation | §8.2–8.3 |
+| 0-RTT anti-replay: obfuscated_ticket_age freshness window | IMPLEMENTED | `tls_server.zig` (`ticketAgeWithinWindow`, `accepted_age_within_window`): reported age must fit `early_data_age_skew_ms`. As of 2026-09-30, missing clock, sealed issue time, age-add, or lifetime refuses 0-RTT before consuming a replay slot. Tests cover valid acceptance, skew boundaries, missing evidence, encrypted 1-RTT fallback, and a same-flight retry after restoring the clock. The binder ring covers one process; freshness alone does not stop replay across nodes. | §8.2–8.3 |
 | Rejected-early-data skip bound | PARTIAL | `skipRejectedEarlyRecords` `tls_server.zig:2470–2483` skips without a byte cap (memory stays bounded per feed; CPU/window unbounded). LOW-MEDIUM; daemon conn limits mitigate | §4.2.10 |
 | Client 0-RTT send + accept detection | IMPLEMENTED | `setEarlyData` `tls_client.zig:824`, EE `early_data` ack validated (only if offered AND PSK accepted) `:2016–2019`, `earlyDataAccepted` `:837` | §4.2.10 |
 
@@ -91,9 +91,11 @@ hardening fixes landed with it — marked **[fixed here]**).
 1. ~~**0-RTT obfuscated_ticket_age freshness window (§8.2–8.3)**~~ — **DONE (fixed here).**
    Sealed ticket bumped to v3 carrying `ticket_age_add` (v1/v2 legacy decode arms +
    cross-version test); `early_data` gated on |client_age − server_age| ≤
-   `early_data_age_skew_ms` (default 10 s) via `ticketAgeWithinWindow`. Fail-open only for
-   legacy tickets / no clock. The binder ring covers single-process; the age window is the
-   multi-node/global mitigation.
+   `early_data_age_skew_ms` (default 10 s) via `ticketAgeWithinWindow`. As of
+   2026-09-30, missing clock, issue time, age-add, or sealed lifetime refuses
+   early data without consuming a replay slot; eligible 1-RTT remains available.
+   The binder ring covers one process. Freshness alone does not stop replay
+   across nodes.
 2. ~~Client HRR→SH suite pinning (§4.1.4 MUST)~~ — **fixed here**.
 3. ~~Client SH key_share group ∈ offered shares (§4.2.8 MUST)~~ — **fixed here**.
 4. ~~Fail-open post-handshake message handling (both roles)~~ — **fixed here** (zero-length
@@ -140,15 +142,15 @@ hardening fixes landed with it — marked **[fixed here]**).
 - **0-RTT obfuscated_ticket_age freshness window (§8.2–8.3)** — the #1 gap.
   `tls_resumption.zig`: sealed-ticket format bumped to **v3** carrying `ticket_age_add`
   (`OpenedTicket.ticket_age_add: ?u32`); v1/v2 tickets still open via legacy decode arms
-  and simply skip the window (graceful degrade — proven by `sealLegacyV2` +
-  `legacy v2 ticket opens with a null ticket_age_add`). `tls_server.zig`:
+  for eligible 1-RTT resumption, but as of 2026-09-30 missing sealed freshness
+  evidence refuses 0-RTT. `tls_server.zig`:
   `ticketAgeWithinWindow` un-obfuscates the client's reported age with the sealed
   `ticket_age_add`, compares to the server-measured `now − issue_time`, and refuses
   `early_data` (still resuming at 1-RTT) when the delta exceeds `Config.early_data_age_skew_ms`
   (default 10 s); `accepted_age_within_window` gates 0-RTT acceptance BEFORE the binder ring
   so a stale attempt consumes no ring slot. NST now seals the SAME `ticket_age_add` it
   advertises. Tests: in-window accept, reported-far-below / far-above reject, exact-skew ±1 ms
-  boundary, and no-clock back-compat.
+  boundary, and no-clock rejection with encrypted 1-RTT fallback and retry.
 - **ECH retry_configs (draft-ietf-tls-esni §7.1)** — server emits its published ECHConfigList
   (`Config.ech_retry_config_list`) in EncryptedExtensions only when the client actually OFFERED
   ECH (`ech_offered` latched in `maybeOpenEch` from `locateOuterEch`) and ECH was NOT accepted;

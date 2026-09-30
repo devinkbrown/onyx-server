@@ -26,7 +26,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Family = enum { ringlane, iocp, kqueue };
 
-pub const Op = enum { accept, recv, send, poll, cancel, timeout };
+pub const Op = enum { accept, recv, send, poll, cancel, timeout, connect };
 
 pub const required_ops = [_]Op{ .accept, .recv, .send, .poll, .cancel, .timeout };
 
@@ -175,7 +175,7 @@ pub const IoBackend = struct {
                 const kq = self.kq orelse return false;
                 if (kq.fd < 0) return false;
                 return switch (op) {
-                    .accept, .recv, .send, .poll, .cancel, .timeout => true,
+                    .accept, .recv, .send, .poll, .cancel, .timeout, .connect => true,
                 };
             },
             .iocp => {
@@ -183,6 +183,7 @@ pub const IoBackend = struct {
                 if (iocp.port == 0) return false;
                 return switch (op) {
                     .accept, .recv, .send, .poll, .cancel, .timeout => true,
+                    .connect => false,
                 };
             },
         }
@@ -266,6 +267,30 @@ pub const IoBackend = struct {
                 if (comptime builtin.os.tag != .linux) return error.MissingOp;
                 const ring = self.ringPtr() orelse return error.MissingOp;
                 return ring.submitSend(token, fd, buffer);
+            },
+        }
+    }
+
+    /// Full daemon sockets use one operation per completion, like Ringlane.
+    /// The small PortableServer retains its existing persistent read watches.
+    pub fn useStreamCompletions(self: *IoBackend) !void {
+        const kq = try self.kqueuePtr();
+        if (kq.n != 0 or kq.regs.len != 0) return error.MissingOp;
+        kq.stream_completions = true;
+    }
+
+    pub fn queuedCount(self: *const IoBackend) u32 {
+        if (self.kq) |kq| return kq.n;
+        return 0;
+    }
+
+    pub fn connect(self: *IoBackend, token: ringlane.FdToken, fd: linux.fd_t, addr: *const std.posix.sockaddr, addrlen: std.posix.socklen_t) !void {
+        switch (self.family) {
+            .kqueue => return (try self.kqueuePtr()).enqueueConnect(token, fd, addr, addrlen),
+            .iocp => return error.MissingOp,
+            .ringlane => {
+                if (comptime builtin.os.tag != .linux) return error.MissingOp;
+                return (self.ringPtr() orelse return error.MissingOp).submitConnect(token, fd, addr, addrlen);
             },
         }
     }
@@ -357,7 +382,8 @@ pub const IoBackend = struct {
                     .send => |ev| .{ .op = .send, .token = ev.token, .result = ev.res },
                     .poll => |ev| .{ .op = .poll, .token = ev.token, .result = ev.res },
                     .timeout => .{ .op = .timeout, .token = .{ .slot = 0, .gen = 0 }, .result = 0 },
-                    .connect, .other => null,
+                    .connect => |ev| .{ .op = .connect, .token = ev.token, .result = ev.res },
+                    .other => null,
                 };
                 if (item) |got| {
                     sink.dest[sink.n] = got;
@@ -403,7 +429,8 @@ pub fn openLinuxRing(entries: u16, features: ringlane.RingFeatures) !ringlane.Ri
     };
 }
 
-pub fn submitAccept(ring: *ringlane.Ring, token: ringlane.FdToken, fd: linux.fd_t) !void {
+pub fn submitAccept(ring: anytype, token: ringlane.FdToken, fd: linux.fd_t) !void {
+    if (comptime builtin.os.tag != .linux) return ring.submitAccept(token, fd);
     var backend = IoBackend.borrow(ring);
     return backend.accept(token, fd) catch |err| switch (err) {
         error.MissingOp => unreachable,
@@ -411,7 +438,8 @@ pub fn submitAccept(ring: *ringlane.Ring, token: ringlane.FdToken, fd: linux.fd_
     };
 }
 
-pub fn submitRecv(ring: *ringlane.Ring, token: ringlane.FdToken, fd: linux.fd_t, buffer: []u8) !void {
+pub fn submitRecv(ring: anytype, token: ringlane.FdToken, fd: linux.fd_t, buffer: []u8) !void {
+    if (comptime builtin.os.tag != .linux) return ring.submitRecv(token, fd, buffer);
     var backend = IoBackend.borrow(ring);
     return backend.recv(token, fd, buffer) catch |err| switch (err) {
         error.MissingOp => unreachable,
@@ -419,7 +447,8 @@ pub fn submitRecv(ring: *ringlane.Ring, token: ringlane.FdToken, fd: linux.fd_t,
     };
 }
 
-pub fn submitSend(ring: *ringlane.Ring, token: ringlane.FdToken, fd: linux.fd_t, buffer: []const u8) !void {
+pub fn submitSend(ring: anytype, token: ringlane.FdToken, fd: linux.fd_t, buffer: []const u8) !void {
+    if (comptime builtin.os.tag != .linux) return ring.submitSend(token, fd, buffer);
     var backend = IoBackend.borrow(ring);
     return backend.send(token, fd, buffer) catch |err| switch (err) {
         error.MissingOp => unreachable,
@@ -427,7 +456,8 @@ pub fn submitSend(ring: *ringlane.Ring, token: ringlane.FdToken, fd: linux.fd_t,
     };
 }
 
-pub fn submitPoll(ring: *ringlane.Ring, token: ringlane.FdToken, fd: linux.fd_t, poll_mask: u32) !void {
+pub fn submitPoll(ring: anytype, token: ringlane.FdToken, fd: linux.fd_t, poll_mask: u32) !void {
+    if (comptime builtin.os.tag != .linux) return ring.submitPollAdd(token, fd, poll_mask);
     var backend = IoBackend.borrow(ring);
     return backend.poll(token, fd, poll_mask) catch |err| switch (err) {
         error.MissingOp => unreachable,
@@ -435,7 +465,8 @@ pub fn submitPoll(ring: *ringlane.Ring, token: ringlane.FdToken, fd: linux.fd_t,
     };
 }
 
-pub fn submitCancel(ring: *ringlane.Ring, kind: ringlane.OpKind, token: ringlane.FdToken) !void {
+pub fn submitCancel(ring: anytype, kind: ringlane.OpKind, token: ringlane.FdToken) !void {
+    if (comptime builtin.os.tag != .linux) return ring.submitExactCancel(kind, token);
     var backend = IoBackend.borrow(ring);
     return backend.cancel(kind, token) catch |err| switch (err) {
         error.MissingOp => unreachable,
@@ -443,7 +474,8 @@ pub fn submitCancel(ring: *ringlane.Ring, kind: ringlane.OpKind, token: ringlane
     };
 }
 
-pub fn submitTimeout(ring: *ringlane.Ring, token: ringlane.FdToken, ts: *const linux.kernel_timespec) !void {
+pub fn submitTimeout(ring: anytype, token: ringlane.FdToken, ts: *const linux.kernel_timespec) !void {
+    if (comptime builtin.os.tag != .linux) return ring.submitTimeout(token, ts);
     var backend = IoBackend.borrow(ring);
     return backend.timeout(token, ts) catch |err| switch (err) {
         error.MissingOp => unreachable,
@@ -478,22 +510,19 @@ fn kqueueOs() bool {
     };
 }
 
-/// kqueue on FreeBSD, OpenBSD, NetBSD, and Dragonfly. One `kevent` submit is
-/// at most `submit_batch` changes; that bound is the syscall batch, not a
-/// connection ceiling. Registrations grow. A closed queue, a full batch, an
-/// unknown cancel, or a `kevent` error returns `error.MissingOp`.
-///
-/// FreeBSD submit ORs `EV_RECEIPT` and requires one zero-error receipt per
-/// change. The other three apply the change list with `nevents == 0` and
-/// treat a zero return as success. `EV_RECEIPT` is not set there. libc calls
-/// sit in functions that are not analyzed unless `kqueueOs()` is true, so
-/// the Linux daemon does not link libc.
+/// BSD kqueue. Full-runtime operations own one original completion. Every
+/// changelist uses matched EV_RECEIPT acknowledgements; ambiguous failure
+/// closes the queue before returning BackendPoisoned and prevents publication.
 const Kqueue = struct {
+    allocator: Allocator = std.heap.page_allocator,
     fd: i32 = -1,
     cap: u16 = 0,
     n: u16 = 0,
     changes: [submit_batch]Change = @splat(.{}),
     regs: []Reg = &.{},
+    stream_completions: bool = false,
+    pending: [submit_batch]Reaped = undefined,
+    pending_n: usize = 0,
 
     pub const submit_batch = 256;
 
@@ -506,6 +535,7 @@ const Kqueue = struct {
     pub const ev_oneshot: u16 = 0x0010;
     pub const ev_receipt: u16 = 0x0040;
     pub const ev_error: u16 = 0x4000;
+    pub const ev_eof: u16 = 0x8000;
 
     pub const Change = struct {
         ident: usize = 0,
@@ -514,6 +544,9 @@ const Kqueue = struct {
         fflags: u32 = 0,
         data: i64 = 0,
         udata: usize = 0,
+        canceled: ?Reaped = null,
+        connect_addr: ?*const std.posix.sockaddr = null,
+        connect_len: std.posix.socklen_t = 0,
     };
 
     pub const Queued = struct {
@@ -548,48 +581,111 @@ const Kqueue = struct {
         self.fd = -1;
         self.n = 0;
         if (self.regs.len != 0) {
-            std.heap.page_allocator.free(self.regs);
+            self.allocator.free(self.regs);
             self.regs = &.{};
         }
     }
 
     pub fn enqueueAccept(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t) !void {
-        return self.enqueueFilter(token, fd, evfilt_read, ev_add | ev_enable, 0, false, .accept, "");
+        return self.enqueueFilter(token, fd, evfilt_read, ev_add | ev_enable | self.streamFlags(), 0, false, .accept, "");
     }
 
     pub fn enqueueRecv(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t, buffer: []u8) !void {
         if (buffer.len == 0) return error.MissingOp;
-        return self.enqueueFilter(token, fd, evfilt_read, ev_add | ev_enable, 0, false, .recv, buffer);
+        return self.enqueueFilter(token, fd, evfilt_read, ev_add | ev_enable | self.streamFlags(), 0, false, .recv, buffer);
     }
 
     pub fn enqueueSend(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t, buffer: []const u8) !void {
         if (buffer.len == 0) return error.MissingOp;
-        return self.enqueueFilter(token, fd, evfilt_write, ev_add | ev_enable, 0, false, .send, buffer);
+        return self.enqueueFilter(token, fd, evfilt_write, ev_add | ev_enable | self.streamFlags(), 0, false, .send, buffer);
+    }
+
+    fn streamFlags(self: *const Kqueue) u16 {
+        return if (self.stream_completions) ev_oneshot else 0;
+    }
+
+    fn reservedPending(self: *const Kqueue) usize {
+        var count = self.pending_n;
+        for (self.changes[0..self.n]) |change| {
+            if (change.canceled != null or change.connect_addr != null) count += 1;
+        }
+        return count;
+    }
+
+    pub fn enqueueConnect(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t, addr: *const std.posix.sockaddr, addrlen: std.posix.socklen_t) !void {
+        if (!self.stream_completions or addrlen == 0) return error.MissingOp;
+        if (self.reservedPending() >= self.pending.len) return error.SubmissionQueueFull;
+        try self.enqueueFilter(token, fd, evfilt_write, ev_add | ev_enable | ev_oneshot, 0, false, .connect, "");
+        self.changes[self.n - 1].connect_addr = addr;
+        self.changes[self.n - 1].connect_len = addrlen;
     }
 
     pub fn enqueuePoll(self: *Kqueue, token: ringlane.FdToken, fd: linux.fd_t, poll_mask: u32) !void {
-        if (poll_mask == 0) return error.MissingOp;
-        const filter: i16 = if ((poll_mask & linux.POLL.OUT) != 0) evfilt_write else evfilt_read;
-        return self.enqueueFilter(token, fd, filter, ev_add | ev_enable, 0, false, .poll, "");
+        const supported = linux.POLL.IN | linux.POLL.OUT;
+        if (fd < 0 or poll_mask == 0 or poll_mask & ~@as(u32, supported) != 0) return error.MissingOp;
+        const count: u16 = @as(u16, @intFromBool(poll_mask & linux.POLL.IN != 0)) + @as(u16, @intFromBool(poll_mask & linux.POLL.OUT != 0));
+        if (count > self.cap - self.n) return error.MissingOp;
+        if (self.fd >= 0) {
+            for (self.regs) |reg| {
+                if (reg.live and (reg.ident == @as(usize, @intCast(fd)) or reg.token == packToken(token)) and
+                    ((reg.filter == evfilt_read and poll_mask & linux.POLL.IN != 0) or
+                        (reg.filter == evfilt_write and poll_mask & linux.POLL.OUT != 0))) return error.MissingOp;
+            }
+        }
+        // Reserve both registrations before publishing either half of a dual
+        // read/write poll. An allocation failure leaves the pending batch intact.
+        try self.ensureFreeRegs(count);
+        if (poll_mask & linux.POLL.IN != 0) {
+            try self.enqueueFilter(token, fd, evfilt_read, ev_add | ev_enable | ev_oneshot, 0, false, .poll, "");
+        }
+        if (poll_mask & linux.POLL.OUT != 0) {
+            try self.enqueueFilter(token, fd, evfilt_write, ev_add | ev_enable | ev_oneshot, 0, false, .poll, "");
+        }
     }
 
     pub fn enqueueCancel(self: *Kqueue, kind: ringlane.OpKind, token: ringlane.FdToken) !void {
         const token_key = packToken(token);
+        // A completion already copied to the backend FIFO owns the original
+        // outcome. Do not manufacture a second original cancellation outcome.
+        if (self.stream_completions) {
+            for (self.pending[0..self.pending_n]) |done| {
+                if (done.op == opForKind(kind) and packToken(done.token) == token_key) return;
+            }
+            for (self.changes[0..self.n]) |change| {
+                if (change.canceled) |done| {
+                    if (done.op == opForKind(kind) and packToken(done.token) == token_key) return error.MissingOp;
+                }
+            }
+            if (self.reservedPending() >= self.pending.len) return error.SubmissionQueueFull;
+            const filter = switch (kind) {
+                .accept, .recv => evfilt_read,
+                .send, .connect => evfilt_write,
+                else => return error.MissingOp,
+            };
+            const reg = self.findReg(token_key, filter) orelse return error.MissingOp;
+            if (reg.kind != kind) return error.MissingOp;
+            try self.enqueueDelete(token_key, filter);
+            self.changes[self.n - 1].canceled = .{
+                .op = opForKind(kind),
+                .token = token,
+                .result = -@as(i32, @intFromEnum(std.posix.E.CANCELED)),
+            };
+            return;
+        }
         switch (kind) {
-            .poll, .other => return error.MissingOp,
-            .timeout => {
-                const before = self.n;
-                self.pushStored(.{
-                    .ident = token_key,
-                    .filter = evfilt_timer,
-                    .flags = ev_delete,
-                    .udata = token_key,
-                }) catch |err| {
-                    if (self.n != before) self.forget(token_key, evfilt_timer);
-                    return err;
-                };
-                self.forget(token_key, evfilt_timer);
+            .other => return error.MissingOp,
+            .poll => {
+                if (self.fd < 0) return error.MissingOp;
+                var count: u16 = 0;
+                for (self.regs) |reg| {
+                    if (reg.live and reg.token == token_key and reg.kind == .poll) count += 1;
+                }
+                if (count == 0 or count > self.cap - self.n) return error.MissingOp;
+                for (self.regs) |reg| {
+                    if (reg.live and reg.token == token_key and reg.kind == .poll) try self.enqueueDelete(token_key, reg.filter);
+                }
             },
+            .timeout => try self.enqueueDelete(token_key, evfilt_timer),
             .accept, .recv => try self.enqueueDelete(token_key, evfilt_read),
             .send, .connect => try self.enqueueDelete(token_key, evfilt_write),
         }
@@ -601,17 +697,35 @@ const Kqueue = struct {
     }
 
     pub fn submit(self: *Kqueue) !u32 {
-        if (self.fd < 0 or self.n == 0) return error.MissingOp;
-        if (comptime builtin.os.tag == .freebsd) return self.submitFreeBsd();
-        if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .netbsd or builtin.os.tag == .dragonfly) {
-            return self.submitAck();
+        if (self.fd < 0) return error.MissingOp;
+        if (self.n == 0) return 0;
+        const count = self.n;
+        const submitted = if (comptime kqueueOs()) try self.submitReceipts() else return error.MissingOp;
+        // Retire canceled ownership before starting any queued connects.
+        for (self.changes[0..count]) |change| {
+            if (change.flags & ev_delete != 0) self.forget(change.udata, change.filter);
         }
-        return error.MissingOp;
+        // A successful delete is the kernel ownership boundary. Only now may
+        // the full daemon observe the original canceled completion and reclaim.
+        for (self.changes[0..count]) |change| {
+            if (change.canceled) |done| self.appendPending(done);
+            if (change.connect_addr) |addr| {
+                if (comptime kqueueOs()) try self.startConnect(change, addr);
+            }
+        }
+        return submitted;
     }
 
     pub fn reap(self: *Kqueue, out: []Reaped, wait_ms: u32) !u32 {
         if (self.fd < 0) return error.MissingOp;
         if (comptime !kqueueOs()) return error.MissingOp;
+        if (self.pending_n != 0) {
+            const n = @min(out.len, self.pending_n);
+            @memcpy(out[0..n], self.pending[0..n]);
+            std.mem.copyForwards(Reaped, self.pending[0 .. self.pending_n - n], self.pending[n..self.pending_n]);
+            self.pending_n -= n;
+            return @intCast(n);
+        }
         return self.reapNative(out, wait_ms);
     }
 
@@ -626,6 +740,9 @@ const Kqueue = struct {
         kind: ringlane.OpKind,
         buf: []const u8,
     ) !void {
+        // Check before remember() changes a live buffer pointer or allocates a
+        // registration. A full batch must not alter the operation already armed.
+        if (self.n >= self.cap) return if (self.stream_completions) error.SubmissionQueueFull else error.MissingOp;
         const token_key = packToken(token);
         const ident: usize = if (timer) token_key else blk: {
             if (fd < 0) return error.MissingOp;
@@ -638,6 +755,16 @@ const Kqueue = struct {
             .data = data,
             .udata = token_key,
         };
+        if (self.fd >= 0) {
+            for (self.regs) |reg| {
+                // kqueue keys registrations by (descriptor, filter), not by
+                // user token. Never redirect another operation's readiness or
+                // cancellation to this token/buffer.
+                if (reg.live and reg.ident == ident and reg.filter == filter and
+                    (self.stream_completions or reg.token != token_key or reg.kind != kind)) return error.MissingOp;
+                if (reg.live and reg.token == token_key and reg.filter == filter and reg.ident != ident) return error.MissingOp;
+            }
+        }
         try self.remember(change, kind, if (buf.len == 0) 0 else @intFromPtr(buf.ptr), buf.len);
         return self.pushStored(change);
     }
@@ -654,11 +781,11 @@ const Kqueue = struct {
             if (self.n != before) self.forget(token_key, filter);
             return err;
         };
-        self.forget(token_key, filter);
+        if (!self.stream_completions) self.forget(token_key, filter);
     }
 
     fn pushStored(self: *Kqueue, change: Change) !void {
-        if (self.n >= self.cap) return error.MissingOp;
+        if (self.n >= self.cap) return if (self.stream_completions) error.SubmissionQueueFull else error.MissingOp;
         self.changes[self.n] = change;
         self.n += 1;
         if (self.fd < 0) return error.MissingOp;
@@ -690,24 +817,27 @@ const Kqueue = struct {
                 return;
             }
         }
+        try self.ensureFreeRegs(1);
+        return self.remember(change, kind, buf_ptr, len);
+    }
+
+    fn ensureFreeRegs(self: *Kqueue, needed: usize) !void {
+        var free: usize = 0;
+        for (self.regs) |reg| {
+            if (!reg.live) free += 1;
+        }
+        if (free >= needed) return;
         const old = self.regs;
-        const new_len = if (old.len == 0) @as(usize, 16) else std.math.mul(usize, old.len, 2) catch return error.OutOfMemory;
-        const grown = std.heap.page_allocator.alloc(Reg, new_len) catch return error.OutOfMemory;
+        const missing = needed - free;
+        const min_len = std.math.add(usize, old.len, missing) catch return error.OutOfMemory;
+        const doubled = if (old.len == 0) @as(usize, 16) else std.math.mul(usize, old.len, 2) catch return error.OutOfMemory;
+        const grown = self.allocator.alloc(Reg, @max(min_len, doubled)) catch return error.OutOfMemory;
         if (old.len != 0) {
             @memcpy(grown[0..old.len], old);
-            std.heap.page_allocator.free(old);
+            self.allocator.free(old);
         }
         var z: usize = old.len;
         while (z < grown.len) : (z += 1) grown[z] = .{};
-        grown[old.len] = .{
-            .token = change.udata,
-            .ident = change.ident,
-            .filter = change.filter,
-            .live = true,
-            .kind = kind,
-            .buf_ptr = buf_ptr,
-            .len = len,
-        };
         self.regs = grown;
     }
 
@@ -759,41 +889,32 @@ const Kqueue = struct {
         if (self.fd >= 0) _ = std.c.close(self.fd);
     }
 
-    fn submitFreeBsd(self: *Kqueue) !u32 {
-        const n_changes: usize = self.n;
-        if (n_changes == 0 or n_changes > submit_batch) return error.MissingOp;
+    fn poison(self: *Kqueue) error{BackendPoisoned} {
+        self.closeQueue();
+        self.fd = -1;
+        return error.BackendPoisoned;
+    }
+
+    fn submitReceipts(self: *Kqueue) !u32 {
+        const count: usize = self.n;
         var batch: [submit_batch]std.c.Kevent = undefined;
-        var i: usize = 0;
-        while (i < n_changes) : (i += 1) {
-            const change = self.changes[i];
-            batch[i] = .{
-                .ident = change.ident,
-                .filter = change.filter,
-                .flags = change.flags | ev_receipt,
-                .fflags = change.fflags,
-                .data = change.data,
-                .udata = change.udata,
-            };
+        for (self.changes[0..count], 0..) |change, i| {
+            batch[i] = fillKevent(change);
+            batch[i].flags |= ev_receipt;
+        }
+        var receipts: [submit_batch]std.c.Kevent = undefined;
+        const timeout = std.c.timespec{ .sec = 0, .nsec = 0 };
+        const rc = std.c.kevent(self.fd, &batch, @intCast(count), &receipts, @intCast(count), &timeout);
+        // Earlier changes may already have applied even when a later one fails.
+        // Queue closure resolves all kernel buffer/watch ownership atomically.
+        if (rc != @as(c_int, @intCast(count))) return self.poison();
+        for (receipts[0..count], batch[0..count]) |receipt, change| {
+            if (receipt.flags & ev_error == 0 or receipt.data != 0 or
+                receipt.ident != change.ident or receipt.filter != change.filter or
+                receipt.udata != change.udata) return self.poison();
         }
         self.n = 0;
-        var out: [submit_batch]std.c.Kevent = undefined;
-        const timeout = std.c.timespec{ .sec = 0, .nsec = 0 };
-        const rc = std.c.kevent(
-            self.fd,
-            &batch,
-            @intCast(n_changes),
-            &out,
-            @intCast(n_changes),
-            &timeout,
-        );
-        if (rc <= 0) return error.MissingOp;
-        const got: usize = @intCast(rc);
-        if (got != n_changes) return error.MissingOp;
-        var j: usize = 0;
-        while (j < got) : (j += 1) {
-            if ((out[j].flags & ev_error) == 0 or out[j].data != 0) return error.MissingOp;
-        }
-        return @intCast(n_changes);
+        return @intCast(count);
     }
 
     fn fillKevent(change: Change) std.c.Kevent {
@@ -807,18 +928,59 @@ const Kqueue = struct {
         return ev;
     }
 
-    fn submitAck(self: *Kqueue) !u32 {
-        const n_changes: usize = self.n;
-        if (n_changes == 0 or n_changes > submit_batch) return error.MissingOp;
-        var batch: [submit_batch]std.c.Kevent = undefined;
-        var i: usize = 0;
-        while (i < n_changes) : (i += 1) batch[i] = fillKevent(self.changes[i]);
-        self.n = 0;
-        var out: [1]std.c.Kevent = undefined;
-        const timeout = std.c.timespec{ .sec = 0, .nsec = 0 };
-        const rc = std.c.kevent(self.fd, &batch, @intCast(n_changes), &out, 0, &timeout);
-        if (rc != 0) return error.MissingOp;
-        return @intCast(n_changes);
+    fn appendPending(self: *Kqueue, done: Reaped) void {
+        std.debug.assert(self.pending_n < self.pending.len);
+        self.pending[self.pending_n] = done;
+        self.pending_n += 1;
+    }
+
+    fn startConnect(self: *Kqueue, change: Change, addr: *const std.posix.sockaddr) !void {
+        const reg = self.findReg(change.udata, evfilt_write) orelse return;
+        if (reg.kind != .connect or reg.ident != change.ident) return;
+        const fd: i32 = @intCast(change.ident);
+        var result: ?i32 = null;
+        if (!setNonBlock(fd) or !setCloseOnExec(fd)) {
+            result = -positiveErrno();
+        } else if (nativeConnect(fd, addr, change.connect_len) == 0) {
+            result = 0;
+        } else {
+            const err = positiveErrno();
+            if (err != @as(i32, @intFromEnum(std.posix.E.INPROGRESS)) and
+                err != @as(i32, @intFromEnum(std.posix.E.ALREADY))) result = -err;
+        }
+        if (result) |done| {
+            try self.deleteFilterChecked(change.ident, evfilt_write);
+            reg.live = false;
+            self.appendPending(.{ .op = .connect, .token = unpackToken(change.udata), .result = done });
+        }
+    }
+
+    fn nativeConnect(fd: i32, addr: *const std.posix.sockaddr, len: std.posix.socklen_t) c_int {
+        // Full Server stores canonical mapped IPv4 endpoints in sockaddr.in6,
+        // but opens AF_INET sockets for them on BSD. Translate only that exact
+        // representation; real IPv6 keeps its native scope and flow fields.
+        if (len == @sizeOf(std.posix.sockaddr.in6) and addr.family == std.c.AF.INET6) {
+            const v6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
+            const mapped = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+            if (std.mem.eql(u8, v6.addr[0..12], &mapped)) {
+                var v4 = std.mem.zeroes(std.c.sockaddr.in);
+                v4.len = @sizeOf(std.c.sockaddr.in);
+                v4.family = std.c.AF.INET;
+                v4.port = v6.port;
+                @memcpy(std.mem.asBytes(&v4.addr), v6.addr[12..16]);
+                return std.c.connect(fd, @ptrCast(&v4), @sizeOf(@TypeOf(v4)));
+            }
+        }
+        return std.c.connect(fd, @ptrCast(addr), len);
+    }
+
+    fn connectReady(ident: usize) i32 {
+        var result: c_int = 0;
+        var len: std.c.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(@intCast(ident), std.c.SOL.SOCKET, std.c.SO.ERROR, &result, &len) < 0)
+            return -positiveErrno();
+        if (len != @sizeOf(c_int)) return -@as(i32, @intFromEnum(std.posix.E.IO));
+        return -result;
     }
 
     fn reapNative(self: *Kqueue, out: []Reaped, wait_ms: u32) !u32 {
@@ -831,7 +993,12 @@ const Kqueue = struct {
             .nsec = @intCast(@as(u64, wait_ms % 1000) * 1_000_000),
         };
         const rc = std.c.kevent(self.fd, &none, 0, &evs, @intCast(max), &ts);
-        if (rc < 0) return error.MissingOp;
+        if (rc < 0) {
+            // Signals wake the reactor without retiring any armed operation.
+            // Return to its loop so stop/Helix state is observed promptly.
+            if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) return 0;
+            return error.MissingOp;
+        }
         const got: usize = @intCast(rc);
         var n: usize = 0;
         var i: usize = 0;
@@ -841,34 +1008,63 @@ const Kqueue = struct {
             const flags: u16 = @truncate(ev.flags);
             const data: i64 = @intCast(ev.data);
             const token = unpackToken(ev.udata);
+            const reg = self.findReg(ev.udata, filter) orelse continue;
+            // Kernel event batches can contain readiness for an operation that
+            // was cancelled or whose descriptor has since been reused.
+            if (reg.ident != ev.ident) continue;
             if ((flags & ev_error) != 0) {
                 const errno: i32 = if (data > 0 and data <= std.math.maxInt(i32)) @intCast(data) else 1;
-                out[n] = .{ .op = opForFilter(filter), .token = token, .result = -errno };
+                out[n] = .{ .op = opForKind(reg.kind), .token = token, .result = -errno };
+                if (self.stream_completions) {
+                    if (reg.kind == .poll) try self.finishPoll(ev.udata, filter, true) else reg.live = false;
+                } else if (reg.kind == .send or reg.kind == .connect) {
+                    self.deleteFilter(ev.ident, filter);
+                    reg.live = false;
+                } else if (reg.kind == .poll) {
+                    try self.finishPoll(ev.udata, filter, true);
+                } else if (reg.kind == .timeout) {
+                    reg.live = false;
+                }
+                n += 1;
+                continue;
+            }
+            if (reg.kind == .poll) {
+                var ready: u32 = if (filter == evfilt_write) linux.POLL.OUT else linux.POLL.IN;
+                if (flags & ev_eof != 0) ready |= linux.POLL.HUP;
+                out[n] = .{ .op = .poll, .token = token, .result = @intCast(ready) };
+                // Poll is a single completion, like the ring backend. The
+                // current filter is EV_ONESHOT; remove the other half before
+                // permitting another operation to reuse its identity.
+                try self.finishPoll(ev.udata, filter, true);
                 n += 1;
                 continue;
             }
             if (filter == evfilt_timer) {
+                reg.live = false;
                 out[n] = .{ .op = .timeout, .token = token, .result = 0 };
                 n += 1;
                 continue;
             }
-            const reg = self.findReg(ev.udata, filter);
             if (filter == evfilt_read) {
-                if (reg) |slot| {
-                    if (slot.kind == .accept) {
-                        out[n] = .{ .op = .accept, .token = token, .result = self.acceptReady(ev.ident) };
-                        n += 1;
-                        continue;
-                    }
+                if (reg.kind == .accept) {
+                    out[n] = .{ .op = .accept, .token = token, .result = self.acceptReady(ev.ident) };
+                    if (self.stream_completions) reg.live = false;
+                    n += 1;
+                    continue;
                 }
                 out[n] = .{ .op = .recv, .token = token, .result = transfer(.recv, ev.ident, reg) };
+                if (self.stream_completions) reg.live = false;
                 n += 1;
                 continue;
             }
             if (filter == evfilt_write) {
-                out[n] = .{ .op = .send, .token = token, .result = transfer(.send, ev.ident, reg) };
-                self.deleteFilter(ev.ident, filter);
-                if (reg) |slot| slot.live = false;
+                out[n] = .{
+                    .op = opForKind(reg.kind),
+                    .token = token,
+                    .result = if (reg.kind == .connect) connectReady(ev.ident) else transfer(.send, ev.ident, reg),
+                };
+                if (!self.stream_completions) self.deleteFilter(ev.ident, filter);
+                reg.live = false;
                 n += 1;
             }
         }
@@ -880,14 +1076,21 @@ const Kqueue = struct {
         const listened: i32 = @intCast(ident);
         const fd = std.c.accept(listened, null, null);
         if (fd < 0) return -positiveErrno();
-        if (!setNonBlock(fd)) {
+        // accept() does not inherit the listener's close-on-exec flag. Publish
+        // the new descriptor only after both ownership flags are installed.
+        if (!setCloseOnExec(fd) or !setNonBlock(fd)) {
+            const err = positiveErrno();
             _ = std.c.close(fd);
-            return -1;
+            return -err;
         }
         return fd;
     }
 
     fn deleteFilter(self: *Kqueue, ident: usize, filter: i16) void {
+        self.deleteFilterChecked(ident, filter) catch {};
+    }
+
+    fn deleteFilterChecked(self: *Kqueue, ident: usize, filter: i16) !void {
         var batch: [1]std.c.Kevent = .{fillKevent(.{
             .ident = ident,
             .filter = filter,
@@ -895,7 +1098,10 @@ const Kqueue = struct {
         })};
         var out: [1]std.c.Kevent = undefined;
         const timeout = std.c.timespec{ .sec = 0, .nsec = 0 };
-        _ = std.c.kevent(self.fd, &batch, 1, &out, 0, &timeout);
+        if (std.c.kevent(self.fd, &batch, 1, &out, 0, &timeout) != 0) {
+            if (positiveErrno() == @as(i32, @intFromEnum(std.posix.E.NOENT))) return;
+            return self.poison();
+        }
     }
 
     fn findReg(self: *Kqueue, token: usize, filter: i16) ?*Reg {
@@ -907,14 +1113,33 @@ const Kqueue = struct {
         return null;
     }
 
+    fn finishPoll(self: *Kqueue, token: usize, filter: i16, oneshot_removed: bool) !void {
+        for (self.regs) |*reg| {
+            if (reg.live and reg.token == token and reg.kind == .poll) {
+                if (reg.filter != filter or !oneshot_removed) {
+                    // The sibling may also be in this copied EV_ONESHOT batch.
+                    // ENOENT proves it is already retired; any other failure
+                    // closes the queue before a stale watch can be reused.
+                    self.deleteFilterChecked(reg.ident, reg.filter) catch |err| return err;
+                }
+                reg.live = false;
+            }
+        }
+    }
+
     fn unpackToken(key: usize) ringlane.FdToken {
         return .{ .slot = @truncate(key), .gen = @truncate(key >> 32) };
     }
 
-    fn opForFilter(filter: i16) Op {
-        if (filter == Kqueue.evfilt_write) return .send;
-        if (filter == Kqueue.evfilt_timer) return .timeout;
-        return .recv;
+    fn opForKind(kind: ringlane.OpKind) Op {
+        return switch (kind) {
+            .accept => .accept,
+            .recv, .other => .recv,
+            .send => .send,
+            .connect => .connect,
+            .poll => .poll,
+            .timeout => .timeout,
+        };
     }
 
     fn positiveErrno() i32 {
@@ -930,6 +1155,12 @@ const Kqueue = struct {
         return std.c.fcntl(fd, @as(i32, 4), flags | @as(@TypeOf(flags), 4)) >= 0;
     }
 
+    fn setCloseOnExec(fd: i32) bool {
+        const flags = std.c.fcntl(fd, std.c.F.GETFD, @as(c_int, 0));
+        if (flags < 0) return false;
+        return std.c.fcntl(fd, std.c.F.SETFD, flags | @as(@TypeOf(flags), std.c.FD_CLOEXEC)) >= 0;
+    }
+
     fn transfer(kind: ringlane.OpKind, ident: usize, reg: ?*Reg) i32 {
         const slot = reg orelse return -1;
         if (slot.buf_ptr == 0 or slot.len == 0) return -1;
@@ -940,7 +1171,9 @@ const Kqueue = struct {
             const n: isize = if (kind == .recv)
                 std.c.recv(fd, ptr, slot.len - done, 0)
             else
-                std.c.send(fd, ptr, slot.len - done, 0);
+                // A client closing its read side must yield EPIPE, not kill
+                // the process before the completion reaches the daemon.
+                std.c.send(fd, ptr, slot.len - done, std.c.MSG.NOSIGNAL);
             if (n < 0) {
                 const err = std.c._errno().*;
                 if (err == 4) continue;
@@ -968,10 +1201,17 @@ const Kqueue = struct {
     fn proveQueued(backend: *IoBackend, sock: linux.fd_t) !u32 {
         const token = ringlane.FdToken{ .slot = 1, .gen = 1 };
         var buf: [4]u8 = .{ 0, 0, 0, 0 };
+        // Queue registration/cancellation pairs. A native kqueue has only one
+        // registration per (fd, filter), so these different operation kinds
+        // cannot all remain armed on the same socket at once.
         try backend.accept(token, sock);
+        try backend.cancel(.accept, token);
         try backend.recv(token, sock, &buf);
+        try backend.cancel(.recv, token);
         try backend.send(token, sock, "x");
+        try backend.cancel(.send, token);
         try backend.poll(token, sock, linux.POLL.IN);
+        try backend.cancel(.poll, token);
         var ts = linux.kernel_timespec{ .sec = 1, .nsec = 0 };
         try backend.timeout(token, &ts);
         try backend.cancel(.timeout, token);
@@ -2465,6 +2705,7 @@ fn posixSocket() !linux.fd_t {
 }
 
 test "GAP-X1 IoBackend queues accept recv send poll cancel and timeout on the linux ring and iocp and kqueue fail closed" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const token = ringlane.FdToken{ .slot = 7, .gen = 3 };
     var live = try IoBackend.openOwned(.ringlane, 32, .{});
     defer live.deinit();
@@ -2529,7 +2770,7 @@ test "GAP-X1 IoBackend queues accept recv send poll cancel and timeout on the li
         .{ .filter = -1, .flags = 0x0005, .ident = fd_ident, .data = 0 },
         .{ .filter = -1, .flags = 0x0005, .ident = fd_ident, .data = 0 },
         .{ .filter = -2, .flags = 0x0005, .ident = fd_ident, .data = 0 },
-        .{ .filter = -1, .flags = 0x0005, .ident = fd_ident, .data = 0 },
+        .{ .filter = -1, .flags = 0x0015, .ident = fd_ident, .data = 0 },
         .{ .filter = -1, .flags = 0x0002, .ident = fd_ident, .data = 0 },
         .{ .filter = -7, .flags = 0x0011, .ident = token_key, .data = 60_000 },
     };
@@ -2632,6 +2873,324 @@ test "GAP-X1 IoBackend queues accept recv send poll cancel and timeout on the li
     std.debug.print("GAP-X1 branch=linux ring queued six ops; this host did not execute kqueue or IOCP; closed kqueue describes FreeBSD filters; closed IOCP describes AFD wait-for-listen and AFD poll and returns MissingOp; portable init opens the native backend and refuses a missing op; USR2 capsule refused\n", .{});
 }
 
+test "kqueue: full change batch preserves the armed buffer and permits retry" {
+    var queue = Kqueue.unopened(1);
+    defer queue.deinit();
+    const token = ringlane.FdToken{ .slot = 1, .gen = 3 };
+    var first: [1]u8 = undefined;
+    var second: [2]u8 = undefined;
+    try std.testing.expectError(error.MissingOp, queue.enqueueRecv(token, 7, &first));
+    const saved = queue.findReg(Kqueue.packToken(token), Kqueue.evfilt_read).?.*;
+    try std.testing.expectError(error.MissingOp, queue.enqueueRecv(token, 7, &second));
+    try std.testing.expectEqual(saved, queue.findReg(Kqueue.packToken(token), Kqueue.evfilt_read).?.*);
+    try std.testing.expectEqual(@as(u16, 1), queue.n);
+    queue.n = 0;
+    try std.testing.expectError(error.MissingOp, queue.enqueueRecv(token, 7, &second));
+    try std.testing.expectEqual(@intFromPtr(&second), queue.findReg(Kqueue.packToken(token), Kqueue.evfilt_read).?.buf_ptr);
+    // Two filters must fit before either half of a read/write poll is queued.
+    queue.n = 0;
+    try std.testing.expectError(error.MissingOp, queue.enqueuePoll(token, 7, linux.POLL.IN | linux.POLL.OUT));
+    try std.testing.expectEqual(@as(u16, 0), queue.n);
+    try std.testing.expectEqual(ringlane.OpKind.recv, queue.findReg(Kqueue.packToken(token), Kqueue.evfilt_read).?.kind);
+}
+
+fn checkKqueuePollAllocationFailure(allocator: Allocator) !void {
+    var queue = Kqueue.unopened(2);
+    queue.allocator = allocator;
+    // Enqueue only: no kernel call occurs, and cleanup never closes this
+    // sentinel. This exercises register publication on every host.
+    queue.fd = 99;
+    defer {
+        queue.fd = -1;
+        queue.deinit();
+    }
+    const token = ringlane.FdToken{ .slot = 1, .gen = 3 };
+    queue.enqueuePoll(token, 7, linux.POLL.IN | linux.POLL.OUT) catch |err| {
+        try std.testing.expectEqual(@as(u16, 0), queue.n);
+        try std.testing.expectEqual(@as(usize, 0), queue.regs.len);
+        return err;
+    };
+    try std.testing.expectEqual(@as(u16, 2), queue.n);
+    try std.testing.expectEqual(ringlane.OpKind.poll, queue.findReg(Kqueue.packToken(token), Kqueue.evfilt_read).?.kind);
+    try std.testing.expectEqual(ringlane.OpKind.poll, queue.findReg(Kqueue.packToken(token), Kqueue.evfilt_write).?.kind);
+}
+
+test "kqueue: dual poll allocation failure is atomic" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkKqueuePollAllocationFailure, .{});
+}
+
+test "kqueue: colliding poll token cannot replace or cancel the original registration" {
+    var queue = Kqueue.unopened(4);
+    queue.allocator = std.testing.allocator;
+    queue.fd = 99;
+    defer {
+        queue.fd = -1;
+        queue.deinit();
+    }
+    const first = ringlane.FdToken{ .slot = 1, .gen = 3 };
+    const second = ringlane.FdToken{ .slot = 2, .gen = 3 };
+    try queue.enqueuePoll(first, 7, linux.POLL.IN);
+    const saved = queue.findReg(Kqueue.packToken(first), Kqueue.evfilt_read).?.*;
+    try std.testing.expectError(error.MissingOp, queue.enqueuePoll(first, 8, linux.POLL.IN | linux.POLL.OUT));
+    try std.testing.expectError(error.MissingOp, queue.enqueueFilter(first, 8, Kqueue.evfilt_read, Kqueue.ev_add, 0, false, .poll, ""));
+    try std.testing.expectError(error.MissingOp, queue.enqueuePoll(second, 7, linux.POLL.IN | linux.POLL.OUT));
+    try std.testing.expectError(error.MissingOp, queue.enqueueCancel(.poll, second));
+    try std.testing.expectEqual(@as(u16, 1), queue.n);
+    try std.testing.expectEqual(saved, queue.findReg(Kqueue.packToken(first), Kqueue.evfilt_read).?.*);
+    try std.testing.expect(queue.findReg(Kqueue.packToken(second), Kqueue.evfilt_read) == null);
+    try std.testing.expect(queue.findReg(Kqueue.packToken(second), Kqueue.evfilt_write) == null);
+    // Independent write readiness has its own native filter and remains valid.
+    try queue.enqueuePoll(second, 7, linux.POLL.OUT);
+    try std.testing.expectEqual(@as(u16, 2), queue.n);
+    try queue.enqueueCancel(.poll, first);
+    try std.testing.expect(queue.findReg(Kqueue.packToken(first), Kqueue.evfilt_read) == null);
+    try std.testing.expect(queue.findReg(Kqueue.packToken(second), Kqueue.evfilt_write) != null);
+}
+
+fn awaitBsdEvent(backend: *IoBackend) !Reaped {
+    var attempts: usize = 0;
+    while (attempts < 10) : (attempts += 1) {
+        var events: [1]Reaped = undefined;
+        if (try backend.reap(&events, 100) == 1) return events[0];
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "BSD kqueue: poll recv cancel and timeout preserve operation identities" {
+    if (comptime !kqueueOs()) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.kqueue, 32, .{});
+    defer backend.deinit();
+    try backend.requireAll();
+    var pair: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &pair));
+    defer closeSocket(pair[0]);
+    defer closeSocket(pair[1]);
+    const token = ringlane.FdToken{ .slot = 1, .gen = 3 };
+    try backend.poll(token, pair[0], linux.POLL.IN | linux.POLL.OUT);
+    try std.testing.expectEqual(@as(u32, 2), try backend.submit());
+    const writable = try awaitBsdEvent(&backend);
+    try std.testing.expectEqual(Op.poll, writable.op);
+    try std.testing.expectEqual(token, writable.token);
+    try std.testing.expectEqual(@as(i32, linux.POLL.OUT), writable.result);
+    try std.testing.expectEqual(@as(isize, 1), std.c.send(pair[1], "x", 1, std.c.MSG.NOSIGNAL));
+    try backend.poll(token, pair[0], linux.POLL.IN);
+    const colliding = ringlane.FdToken{ .slot = 2, .gen = 3 };
+    try std.testing.expectError(error.MissingOp, backend.poll(colliding, pair[0], linux.POLL.IN | linux.POLL.OUT));
+    try std.testing.expectError(error.MissingOp, backend.cancel(.poll, colliding));
+    _ = try backend.submit();
+    const readable = try awaitBsdEvent(&backend);
+    try std.testing.expectEqual(Op.poll, readable.op);
+    try std.testing.expectEqual(token, readable.token);
+    try std.testing.expectEqual(@as(i32, linux.POLL.IN), readable.result);
+    // Readiness must not consume the byte or try to transfer a zero-length buffer.
+    var buf: [4]u8 = undefined;
+    try backend.recv(token, pair[0], &buf);
+    _ = try backend.submit();
+    const received = try awaitBsdEvent(&backend);
+    try std.testing.expectEqual(Op.recv, received.op);
+    try std.testing.expectEqual(@as(i32, 1), received.result);
+    try std.testing.expectEqual(@as(u8, 'x'), buf[0]);
+    try backend.cancel(.recv, token);
+    _ = try backend.submit();
+    try backend.poll(token, pair[0], linux.POLL.IN | linux.POLL.OUT);
+    _ = try backend.submit();
+    try backend.cancel(.poll, token);
+    try std.testing.expectEqual(@as(u32, 2), try backend.submit());
+    var no_events: [1]Reaped = undefined;
+    try std.testing.expectEqual(@as(u32, 0), try backend.reap(&no_events, 0));
+    try std.testing.expectError(error.MissingOp, backend.cancel(.poll, token));
+    var ts = linux.kernel_timespec{ .sec = 0, .nsec = 1_000_000 };
+    try backend.timeout(token, &ts);
+    _ = try backend.submit();
+    const expired = try awaitBsdEvent(&backend);
+    try std.testing.expectEqual(Op.timeout, expired.op);
+    try std.testing.expectEqual(token, expired.token);
+    try std.testing.expect(backend.kq.?.findReg(Kqueue.packToken(token), Kqueue.evfilt_timer) == null);
+    try std.testing.expectError(error.MissingOp, backend.cancel(.timeout, token));
+    ts.sec = 10;
+    try backend.timeout(token, &ts);
+    _ = try backend.submit();
+    try backend.cancel(.timeout, token);
+    _ = try backend.submit();
+    try std.testing.expectEqual(@as(u32, 0), try backend.reap(&no_events, 0));
+}
+
+const InterruptedWaitProbe = struct {
+    var signals = std.atomic.Value(u32).init(0);
+
+    fn onSignal(_: std.c.SIG) callconv(.c) void {
+        _ = signals.fetchAdd(1, .monotonic);
+    }
+
+    fn child(control_fd: i32, data_fd: i32) !void {
+        var action = std.mem.zeroes(std.c.Sigaction);
+        action.handler.handler = onSignal;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.sigaction(.USR1, &action, null));
+        const empty_mask = std.mem.zeroes(std.c.sigset_t);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.sigprocmask(std.c.SIG.SETMASK, &empty_mask, null));
+        var queue = try Kqueue.open(8);
+        defer queue.deinit();
+        queue.stream_completions = true;
+        const token = ringlane.FdToken{ .slot = 12, .gen = 31 };
+        var byte = [_]u8{'?'};
+        try queue.enqueueRecv(token, data_fd, &byte);
+        _ = try queue.submit();
+        try std.testing.expectEqual(@as(isize, 1), std.c.send(control_fd, "R", 1, std.c.MSG.NOSIGNAL));
+        var start: std.c.timespec = undefined;
+        var end: std.c.timespec = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.clock_gettime(.MONOTONIC, &start));
+        var events: [1]Reaped = undefined;
+        try std.testing.expectEqual(@as(u32, 0), try queue.reap(&events, 2000));
+        try std.testing.expectEqual(@as(c_int, 0), std.c.clock_gettime(.MONOTONIC, &end));
+        const elapsed = (end.sec - start.sec) * 1_000_000_000 + end.nsec - start.nsec;
+        // A normal timeout is not evidence of EINTR handling.
+        try std.testing.expect(signals.load(.monotonic) > 0 and elapsed < 1_000_000_000);
+        const reg = queue.findReg(Kqueue.packToken(token), Kqueue.evfilt_read) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@intFromPtr(&byte), reg.buf_ptr);
+        try std.testing.expectEqual(@as(u8, '?'), byte[0]);
+        try std.testing.expectEqual(@as(isize, 1), std.c.send(control_fd, "I", 1, std.c.MSG.NOSIGNAL));
+        var received = false;
+        for (0..20) |_| {
+            if (try queue.reap(&events, 100) == 0) continue;
+            try std.testing.expectEqual(Op.recv, events[0].op);
+            try std.testing.expectEqual(token, events[0].token);
+            try std.testing.expectEqual(@as(i32, 1), events[0].result);
+            try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
+            received = true;
+            break;
+        }
+        try std.testing.expect(received);
+        try std.testing.expect(queue.findReg(Kqueue.packToken(token), Kqueue.evfilt_read) == null);
+        try std.testing.expectEqual(@as(u32, 0), try queue.reap(&events, 0));
+    }
+};
+
+test "BSD kqueue: interrupted wait preserves armed buffer and original completion" {
+    if (comptime !kqueueOs()) return error.SkipZigTest;
+    var control_pair: [2]std.c.fd_t = undefined;
+    var data_pair: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &control_pair));
+    defer for (control_pair) |fd| closeSocket(fd);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &data_pair));
+    defer for (data_pair) |fd| closeSocket(fd);
+    const child = std.c.fork();
+    try std.testing.expect(child >= 0);
+    if (child == 0) {
+        closeSocket(control_pair[0]);
+        closeSocket(data_pair[0]);
+        InterruptedWaitProbe.child(control_pair[1], data_pair[1]) catch |err| {
+            std.debug.print("interrupted-wait child failed: {s}\n", .{@errorName(err)});
+            std.c._exit(101);
+        };
+        std.c._exit(0);
+    }
+    var reaped = false;
+    defer if (!reaped) {
+        _ = std.c.kill(child, .KILL);
+        var status: c_int = 0;
+        while (std.c.waitpid(child, &status, 0) < 0 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) {}
+    };
+    closeSocket(control_pair[1]);
+    control_pair[1] = -1;
+    closeSocket(data_pair[1]);
+    data_pair[1] = -1;
+    var poll = std.c.pollfd{ .fd = control_pair[0], .events = std.c.POLL.IN, .revents = 0 };
+    try std.testing.expectEqual(@as(c_int, 1), std.c.poll(@ptrCast(&poll), 1, 2000));
+    var marker: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 1), std.c.recv(control_pair[0], &marker, 1, 0));
+    try std.testing.expectEqual(@as(u8, 'R'), marker[0]);
+    var interrupted = false;
+    for (0..200) |_| {
+        poll.revents = 0;
+        const ready = std.c.poll(@ptrCast(&poll), 1, 5);
+        try std.testing.expect(ready >= 0);
+        if (ready != 0) {
+            try std.testing.expectEqual(@as(isize, 1), std.c.recv(control_pair[0], &marker, 1, 0));
+            try std.testing.expectEqual(@as(u8, 'I'), marker[0]);
+            interrupted = true;
+            break;
+        }
+        try std.testing.expectEqual(@as(c_int, 0), std.c.kill(child, .USR1));
+    }
+    try std.testing.expect(interrupted);
+    try std.testing.expectEqual(@as(isize, 1), std.c.send(data_pair[0], "x", 1, std.c.MSG.NOSIGNAL));
+    var status: c_int = 0;
+    while (std.c.waitpid(child, &status, 0) < 0) {
+        if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return error.TestUnexpectedResult;
+    }
+    reaped = true;
+    const bits: u32 = @bitCast(status);
+    try std.testing.expect(std.c.W.IFEXITED(bits));
+    try std.testing.expectEqual(@as(u8, 0), std.c.W.EXITSTATUS(bits));
+}
+
+test "BSD kqueue: broken-peer send survives default SIGPIPE disposition" {
+    if (comptime !kqueueOs()) return error.SkipZigTest;
+    var pair: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &pair));
+    defer _ = std.c.close(pair[0]);
+    // Close before fork so the child cannot accidentally retain a peer.
+    try std.testing.expectEqual(@as(c_int, 0), std.c.close(pair[1]));
+    const child = std.c.fork();
+    try std.testing.expect(child >= 0);
+    if (child == 0) {
+        var action = std.mem.zeroes(std.c.Sigaction);
+        action.handler.handler = std.c.SIG.DFL;
+        if (std.c.sigaction(.PIPE, &action, null) != 0) std.c._exit(2);
+        const empty_mask = std.mem.zeroes(std.c.sigset_t);
+        if (std.c.sigprocmask(std.c.SIG.SETMASK, &empty_mask, null) != 0) std.c._exit(2);
+        var byte = [_]u8{'x'};
+        var reg = Kqueue.Reg{ .buf_ptr = @intFromPtr(&byte), .len = byte.len };
+        const result = Kqueue.transfer(.send, @intCast(pair[0]), &reg);
+        std.c._exit(if (result == -@as(i32, @intFromEnum(std.c.E.PIPE))) 0 else 3);
+    }
+    var status: c_int = 0;
+    while (std.c.waitpid(child, &status, 0) < 0) {
+        if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return error.TestUnexpectedResult;
+    }
+    const bits: u32 = @bitCast(status);
+    try std.testing.expect(std.c.W.IFEXITED(bits));
+    try std.testing.expectEqual(@as(u8, 0), std.c.W.EXITSTATUS(bits));
+}
+
+test "BSD kqueue: accepted socket is nonblocking and close-on-exec" {
+    if (comptime !kqueueOs()) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.kqueue, 32, .{});
+    defer backend.deinit();
+    const listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(listener.fd);
+    const client = try Kqueue.bsdStreamSocket();
+    defer closeSocket(client);
+    var addr = std.c.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, listener.port),
+        .addr = try ipv4Bits("127.0.0.1"),
+    };
+    try std.testing.expectEqual(@as(c_int, 0), std.c.connect(client, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)));
+    const token = ringlane.FdToken{ .slot = 7, .gen = 3 };
+    try backend.accept(token, listener.fd);
+    try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+    var accepted: i32 = -1;
+    defer closeSocket(accepted);
+    var attempts: usize = 0;
+    while (attempts < 10 and accepted < 0) : (attempts += 1) {
+        var events: [1]Reaped = undefined;
+        const n = try backend.reap(&events, 100);
+        if (n == 0) continue;
+        try std.testing.expectEqual(Op.accept, events[0].op);
+        try std.testing.expectEqual(token, events[0].token);
+        try std.testing.expect(events[0].result >= 0);
+        accepted = events[0].result;
+    }
+    try std.testing.expect(accepted >= 0);
+    const descriptor_flags = std.c.fcntl(accepted, std.c.F.GETFD, @as(c_int, 0));
+    try std.testing.expect(descriptor_flags >= 0);
+    try std.testing.expect(descriptor_flags & std.c.FD_CLOEXEC != 0);
+    const file_flags = std.c.fcntl(accepted, std.c.F.GETFL, @as(c_int, 0));
+    try std.testing.expect(file_flags >= 0);
+    // O_NONBLOCK is 4 on every BSD served by this backend.
+    try std.testing.expect(file_flags & 4 != 0);
+}
+
 test "GAP-X3 Windows RIO fails closed off Windows" {
     const ioc_inout: u32 = 0x80000000 | 0x40000000;
     const ioc_ws2: u32 = 0x08000000;
@@ -2689,4 +3248,194 @@ test "GAP-X3 Windows RIO fails closed off Windows" {
     try std.testing.expectError(error.Unsupported, refusePortableReactor(.windows, 32));
 
     std.debug.print("GAP-X3 branch=windows RIO loads the function table with WSAIoctl SIO 0xC8000024 and GUID 8509e081-96dd-4005-b165-9e2ee8c79e3f on a WSA_FLAG_REGISTERED_IO socket during Iocp.open; dequeueRegistered calls that stored table; off Windows it returns stage off-windows before any pointer call; a null or short table is MissingOp and the port is closed; recv and send on the IOCP path are IOCTL_AFD_RECEIVE and IOCTL_AFD_SEND; this host did not execute WSAIoctl or RIODequeueCompletion; heading stays unmarked; whole-accept not claimed\n", .{});
+}
+
+test "kqueue: full-runtime canceled original is reserved before successful delete publication" {
+    var kq = Kqueue.unopened(2);
+    kq.fd = 123;
+    kq.stream_completions = true;
+    defer {
+        kq.fd = -1;
+        kq.deinit();
+    }
+    const token = ringlane.FdToken{ .slot = 7, .gen = 3 };
+    var bytes: [1]u8 = undefined;
+    try kq.enqueueRecv(token, 55, &bytes);
+    try std.testing.expectEqual(Kqueue.ev_add | Kqueue.ev_enable | Kqueue.ev_oneshot, kq.changes[0].flags);
+    try std.testing.expectError(error.MissingOp, kq.enqueueCancel(.send, token));
+    try std.testing.expectEqual(@as(u16, 1), kq.n);
+    try std.testing.expectError(error.MissingOp, kq.enqueueRecv(token, 55, &bytes));
+    try std.testing.expectEqual(@intFromPtr(&bytes), kq.findReg(Kqueue.packToken(token), Kqueue.evfilt_read).?.buf_ptr);
+    try kq.enqueueCancel(.recv, token);
+    try std.testing.expectError(error.MissingOp, kq.enqueueCancel(.recv, token));
+    try std.testing.expectEqual(@as(usize, 0), kq.pending_n);
+    try std.testing.expectEqual(token, kq.changes[1].canceled.?.token);
+    try std.testing.expectEqual(Op.recv, kq.changes[1].canceled.?.op);
+    try std.testing.expectError(error.SubmissionQueueFull, kq.enqueueRecv(token, 55, &bytes));
+    try std.testing.expect(kq.findReg(Kqueue.packToken(token), Kqueue.evfilt_read) != null);
+}
+
+test "BSD full reactor: connect accept exact cancel and refused connect preserve original outcomes" {
+    if (comptime !kqueueOs()) return error.SkipZigTest;
+    const reactor_backend = @import("reactor_backend.zig");
+    var ring = try reactor_backend.Ring.init(16, .{});
+    defer ring.deinit();
+    const listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(listener.fd);
+    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
+    try std.testing.expect(fd >= 0);
+    defer closeSocket(fd);
+    var addr = std.mem.zeroes(std.c.sockaddr.in);
+    addr.len = @sizeOf(std.c.sockaddr.in);
+    addr.family = std.c.AF.INET;
+    addr.port = std.mem.nativeToBig(u16, listener.port);
+    addr.addr = std.mem.nativeToBig(u32, 0x7f000001);
+    const accept_token = ringlane.FdToken{ .slot = 1, .gen = 1 };
+    const connect_token = ringlane.FdToken{ .slot = 2, .gen = 1 };
+    try ring.submitAccept(accept_token, listener.fd);
+    var mapped = std.mem.zeroes(std.posix.sockaddr.in6);
+    mapped.len = @sizeOf(@TypeOf(mapped));
+    mapped.family = std.c.AF.INET6;
+    mapped.port = addr.port;
+    mapped.addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 };
+    try ring.submitConnect(connect_token, fd, @ptrCast(&mapped), @sizeOf(@TypeOf(mapped)));
+    const Sink = struct {
+        rows: [16]ringlane.Completion = undefined,
+        n: usize = 0,
+        pub fn onCompletion(self: *@This(), row: ringlane.Completion) void {
+            std.debug.assert(self.n < self.rows.len);
+            self.rows[self.n] = row;
+            self.n += 1;
+        }
+    };
+    var sink = Sink{};
+    var scratch: [16]reactor_backend.CompletionBuffer = undefined;
+    _ = try ring.submit();
+    var accepted: i32 = -1;
+    defer closeSocket(accepted);
+    var connected = false;
+    for (0..100) |_| {
+        try ring.reapCompletions(&scratch, 0, &sink);
+        for (sink.rows[0..sink.n]) |row| switch (row) {
+            .accept => |ev| {
+                try std.testing.expectEqual(accept_token, ev.token);
+                try std.testing.expect(!ev.more);
+                try std.testing.expect(ev.res >= 0);
+                accepted = ev.res;
+            },
+            .connect => |ev| {
+                try std.testing.expectEqual(connect_token, ev.token);
+                try std.testing.expectEqual(@as(i32, 0), ev.res);
+                connected = true;
+            },
+            else => return error.TestUnexpectedResult,
+        };
+        sink.n = 0;
+        if (accepted >= 0 and connected) break;
+        const pause = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = std.c.nanosleep(&pause, null);
+    }
+    try std.testing.expect(accepted >= 0 and connected);
+    try std.testing.expect(std.c.fcntl(fd, @as(c_int, 1), @as(c_int, 0)) & 1 != 0);
+    try std.testing.expect(std.c.fcntl(fd, @as(c_int, 3), @as(c_int, 0)) & 4 != 0);
+
+    const recv_token = ringlane.FdToken{ .slot = 3, .gen = 7 };
+    var bytes: [2]u8 = undefined;
+    try ring.submitRecv(recv_token, accepted, &bytes);
+    try std.testing.expectError(error.MissingOp, ring.submitRecv(recv_token, accepted, &bytes));
+    _ = try ring.submit();
+    try std.testing.expectError(error.MissingOp, ring.submitRecv(recv_token, accepted, &bytes));
+    try std.testing.expectError(error.MissingOp, ring.submitExactCancel(.recv, .{ .slot = 3, .gen = 8 }));
+    try ring.submitExactCancel(.recv, recv_token);
+    try ring.reapCompletions(&scratch, 0, &sink);
+    try std.testing.expectEqual(@as(usize, 0), sink.n);
+    _ = try ring.submit();
+    try ring.reapCompletions(&scratch, 0, &sink);
+    try std.testing.expectEqual(@as(usize, 1), sink.n);
+    try std.testing.expectEqual(recv_token, sink.rows[0].recv.token);
+    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), sink.rows[0].recv.res);
+    sink.n = 0;
+    try ring.reapCompletions(&scratch, 0, &sink);
+    try std.testing.expectEqual(@as(usize, 0), sink.n);
+
+    // Canceling an accept publishes its original identity too; the listener
+    // remains usable for the next generation after the completion was consumed.
+    const next_accept = ringlane.FdToken{ .slot = 1, .gen = 2 };
+    try ring.submitAccept(next_accept, listener.fd);
+    try ring.submitExactCancel(.accept, next_accept);
+    _ = try ring.submitAndWait(1);
+    try ring.reapCompletions(&scratch, 0, &sink);
+    try std.testing.expectEqual(next_accept, sink.rows[0].accept.token);
+    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), sink.rows[0].accept.res);
+    sink.n = 0;
+
+    // A send is one-shot: after readiness consumes bytes, no checked delete
+    // can discard its original outcome or retransmit the same buffer.
+    const send_token = ringlane.FdToken{ .slot = 5, .gen = 1 };
+    try ring.submitSend(send_token, fd, "ok");
+    _ = try ring.submitAndWait(1);
+    try ring.reapCompletions(&scratch, 0, &sink);
+    try std.testing.expectEqual(@as(usize, 1), sink.n);
+    try std.testing.expectEqual(send_token, sink.rows[0].send.token);
+    try std.testing.expectEqual(@as(i32, 2), sink.rows[0].send.res);
+    sink.n = 0;
+    try ring.reapCompletions(&scratch, 0, &sink);
+    try std.testing.expectEqual(@as(usize, 0), sink.n);
+    var sent: [4]u8 = undefined;
+    // A send CQE proves bytes were accepted by the local TCP stack; peer
+    // delivery/read readiness can occur later, even for loopback TCP.
+    var received: usize = 0;
+    for (0..100) |_| {
+        const rc = std.c.recv(accepted, sent[received..].ptr, sent.len - received, 0);
+        if (rc > 0) {
+            received += @intCast(rc);
+            if (received >= 2) break;
+        } else {
+            try std.testing.expect(rc < 0);
+            try std.testing.expectEqual(@as(i32, @intFromEnum(std.posix.E.AGAIN)), Kqueue.positiveErrno());
+        }
+        const pause = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = std.c.nanosleep(&pause, null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), received);
+    try std.testing.expectEqualStrings("ok", sent[0..2]);
+    try std.testing.expectEqual(@as(isize, -1), std.c.recv(accepted, &sent, sent.len, 0));
+    try std.testing.expectEqual(@as(i32, @intFromEnum(std.posix.E.AGAIN)), Kqueue.positiveErrno());
+
+    const refused_listener = try listenTcp("127.0.0.1", 0);
+    closeSocket(refused_listener.fd);
+    const refused = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
+    try std.testing.expect(refused >= 0);
+    defer closeSocket(refused);
+    addr.port = std.mem.nativeToBig(u16, refused_listener.port);
+    try ring.submitConnect(.{ .slot = 4, .gen = 1 }, refused, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+    _ = try ring.submitAndWait(1);
+    try ring.reapCompletions(&scratch, 0, &sink);
+    try std.testing.expectEqual(@as(usize, 1), sink.n);
+    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CONNREFUSED)), sink.rows[0].connect.res);
+}
+
+test "BSD full reactor: mixed delete receipt failure closes queue before cancellation publication" {
+    if (comptime !kqueueOs()) return error.SkipZigTest;
+    var kq = try Kqueue.open(8);
+    defer kq.deinit();
+    kq.stream_completions = true;
+    var pair: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer closeSocket(pair[0]);
+    defer closeSocket(pair[1]);
+    var bytes: [1]u8 = undefined;
+    const token = ringlane.FdToken{ .slot = 9, .gen = 4 };
+    try kq.enqueueRecv(token, pair[0], &bytes);
+    _ = try kq.submit();
+    try kq.enqueueCancel(.recv, token);
+    try kq.pushStored(.{ .ident = @intCast(pair[0]), .filter = -127, .flags = Kqueue.ev_add, .udata = 1 });
+    try std.testing.expectError(error.BackendPoisoned, kq.submit());
+    try std.testing.expectEqual(@as(i32, -1), kq.fd);
+    try std.testing.expectEqual(@as(usize, 0), kq.pending_n);
+    // The caller retains the original buffer until backend teardown. No
+    // synthetic success escapes a partially applied kernel changelist.
+    try std.testing.expect(kq.findReg(Kqueue.packToken(token), Kqueue.evfilt_read) != null);
+    var rows: [4]Reaped = undefined;
+    try std.testing.expectError(error.MissingOp, kq.reap(&rows, 0));
 }

@@ -14,6 +14,14 @@ const delegated_credential_cli = @import("daemon/delegated_credential_cli.zig");
 const ResolverCtx = struct {
     environ_map: *std.process.Environ.Map,
     io: std.Io,
+    path_allocator: std.mem.Allocator,
+    file_paths: std.ArrayList([]u8) = .empty,
+    record_paths: bool = true,
+
+    fn deinit(self: *ResolverCtx) void {
+        for (self.file_paths.items) |path| self.path_allocator.free(path);
+        self.file_paths.deinit(self.path_allocator);
+    }
 };
 
 /// `env:NAME` resolver for the config parser — reads the process environment map
@@ -30,6 +38,13 @@ fn envLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) a
 /// blobs (e.g. `[motd] text = "@file:etc/motd.example.txt"`) can live on disk.
 fn fileLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8) anyerror![]const u8 {
     const rc: *ResolverCtx = @ptrCast(@alignCast(ctx orelse return error.FileNotFound));
+    if (comptime builtin.os.tag == .openbsd) {
+        if (rc.record_paths) {
+            const owned = try rc.path_allocator.dupe(u8, path);
+            errdefer rc.path_allocator.free(owned);
+            try rc.file_paths.append(rc.path_allocator, owned);
+        }
+    }
     return std.Io.Dir.cwd().readFileAlloc(rc.io, path, allocator, .limited(1 << 20));
 }
 
@@ -114,18 +129,72 @@ fn daemonPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 
 pub const panic = std.debug.FullPanic(daemonPanic);
 
+fn installOpenBsdSandbox(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime: onyx_server.daemon.server.Config,
+    parsed: ?*const onyx_server.daemon.config_format.Config,
+    resolver_ctx: *ResolverCtx,
+) !void {
+    var plan = onyx_server.daemon.openbsd_sandbox.Plan{ .allocator = allocator, .io = io };
+    defer plan.deinit();
+    try plan.addDirectory("/etc", "r");
+    try plan.addDirectory("/usr", "rx");
+    try plan.addDirectory("/tmp", "rwc");
+    try plan.addDirectory("/dev", "r");
+    try plan.addExecutable(runtime.exe_path orelse return error.MissingExecutablePath);
+    if (runtime.config_path) |path| try plan.addFile(path, true);
+    for (resolver_ctx.file_paths.items) |path| try plan.addFile(path, false);
+    if (parsed) |cfg| {
+        if (cfg.sasl.account_db) |path| try plan.addFile(path, true);
+        if (cfg.sasl.oauth_jwks_file) |path| try plan.addFile(path, false);
+        if (cfg.webhook.store_path) |path| try plan.addFile(path, true);
+        if (cfg.oper.grants_path) |path| try plan.addFile(path, true);
+        if (cfg.oper.event_history_path) |path| try plan.addFile(path, true);
+        if (cfg.trace.file) |path| try plan.addFile(path, true);
+        if (cfg.weather.source) |path| try plan.addFile(path, false);
+        if (cfg.news.source) |path| try plan.addFile(path, false);
+        if (cfg.geo.news_cache_dir) |path| try plan.addDirectory(path, "r");
+        if (cfg.wasm.plugin_dir) |path| try plan.addDirectory(path, "r");
+        try plan.addDirectory(cfg.stats.dir, "rwc");
+        try plan.addDirectory(cfg.stats.channel_dir, "rwc");
+        try plan.addDirectory(cfg.backup.dir, "rwc");
+        if (cfg.tls.cert_path) |path| try plan.addFile(path, cfg.acme.enabled);
+        if (cfg.tls.key_path) |path| try plan.addFile(path, cfg.acme.enabled);
+        for (cfg.tls.sni) |cert| {
+            try plan.addFile(cert.cert_path, false);
+            try plan.addFile(cert.key_path, false);
+        }
+        for (cfg.tls.ech_keys) |key| try plan.addFile(key.config_path, false);
+        try plan.addFile(cfg.geoip.database, false);
+        try plan.addFile(cfg.geoip.asn_database, false);
+        if (cfg.mail.trust_store_path) |path| try plan.addFile(path, false);
+        if (cfg.acme.enabled or cfg.ocsp.enabled or cfg.webpush.enabled)
+            try plan.addFile(cfg.acme.ca_bundle_path, false);
+        if (cfg.webpush.enabled) try plan.addFile(cfg.webpush.vapid_key_path, true);
+    }
+    try plan.install();
+    resolver_ctx.record_paths = false;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
     // Resolver context for `env:`/`@file:` config indirection. Lives on `main`'s
     // frame for the whole process, so the resolver stored on the live config
     // (used by REHASH) never dangles.
-    var resolver_ctx = ResolverCtx{ .environ_map = init.environ_map, .io = init.io };
+    var resolver_ctx = ResolverCtx{ .environ_map = init.environ_map, .io = init.io, .path_allocator = allocator };
+    defer resolver_ctx.deinit();
 
     // Default config (6680; 6667/6697 belong to the local eshmaki server). A
     // config file path may be passed as argv[1]: present values override the
     // defaults; a missing/invalid file keeps defaults (boot never fails on it).
     var srv_cfg = onyx_server.daemon.server.Config{ .port = 6680 };
+    var native_incoming: ?onyx_server.daemon.helix.native_bootstrap.Incoming = null;
+    defer if (native_incoming) |*incoming| incoming.deinit();
+    var native_driver = onyx_server.daemon.helix.native_bootstrap.Driver{ .allocator = allocator, .config_path = null, .environ = init.minimal.environ };
+    var native_executable: ?[:0]u8 = null;
+    defer if (native_executable) |path| allocator.free(path);
     var held: ?onyx_server.daemon.config_boot.Loaded = null;
     defer if (held) |*h| h.deinit(allocator);
     // Backing storage for the inherited per-shard listener fds (multi-shard
@@ -146,6 +215,11 @@ pub fn main(init: std.process.Init) !void {
     // which would re-run the old in-memory image), so a swapped-in new binary is
     // what actually boots across a hot upgrade.
     if (args.next()) |exe| srv_cfg.exe_path = exe;
+    if (comptime builtin.os.tag == .openbsd) {
+        try onyx_server.daemon.os_runtime.raiseOpenBsdFdAllowance();
+        native_executable = try std.process.executablePathAlloc(init.io, allocator);
+        srv_cfg.exe_path = native_executable.?;
+    }
     var config_path_arg: ?[]const u8 = null;
     const first_arg = args.next();
     if (first_arg == null or !std.mem.eql(u8, first_arg.?, "doctor")) {
@@ -162,7 +236,21 @@ pub fn main(init: std.process.Init) !void {
         // predecessor executes the exact already-open target image with this
         // flag and refuses a hot handoff unless the complete token matches.
         // This branch must stay ahead of all config, socket, and daemon setup.
-        if (std.mem.eql(u8, first, onyx_server.daemon.helix.live.upgrade_capability_arg)) {
+        if (std.mem.eql(u8, first, onyx_server.daemon.helix.native_process.candidate_arg)) {
+            if (comptime builtin.os.tag == .openbsd) {
+                const fd = try std.fmt.parseInt(i32, args.next() orelse return error.InvalidNativeCandidate, 10);
+                const parent_pid = try std.fmt.parseInt(i32, args.next() orelse return error.InvalidNativeCandidate, 10);
+                const generation = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidNativeCandidate, 10);
+                const id_text = args.next() orelse return error.InvalidNativeCandidate;
+                var identity: onyx_server.daemon.helix.native_exchange.Identity = .{ .generation = generation, .upgrade_id = undefined };
+                if (id_text.len != 32) return error.InvalidNativeCandidate;
+                _ = try std.fmt.hexToBytes(&identity.upgrade_id, id_text);
+                native_incoming = try onyx_server.daemon.helix.native_bootstrap.Incoming.receive(allocator, fd, parent_pid, identity);
+                if (args.next()) |path| if (path.len != 0) {
+                    config_path_arg = path;
+                };
+            } else return error.InvalidNativeCandidate;
+        } else if (std.mem.eql(u8, first, onyx_server.daemon.helix.live.upgrade_capability_arg)) {
             // Advertise the current contract plus the exact predecessor token.
             // The latter lets a deployed HSSN v3 writer upgrade into this v4
             // reader; current predecessors still require the current token and
@@ -281,6 +369,10 @@ pub fn main(init: std.process.Init) !void {
                 if (onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
                     var l = loaded;
                     defer l.deinit(allocator);
+                    if (onyx_server.daemon.config_boot.portableTransportError(builtin.os.tag, l.parsed)) |why| {
+                        std.debug.print("config ERROR in {s}: {s}\n", .{ path, why });
+                        std.process.exit(1);
+                    }
                     // A meshed node with no shared [cloak] secret is a
                     // misconfiguration, not merely a style nit: per-boot random
                     // cloak keys differ per node and change on restart, so
@@ -433,7 +525,7 @@ pub fn main(init: std.process.Init) !void {
         // Linux-only (raw socket syscalls); comptime-gated so non-linux targets
         // never analyze the linux-specific ACME path.
         if (std.mem.eql(u8, first, "acme-issue")) {
-            if (comptime builtin.os.tag == .linux) {
+            if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd)) {
                 var rest: std.ArrayList([]const u8) = .empty;
                 defer rest.deinit(allocator);
                 while (args.next()) |a| try rest.append(allocator, a);
@@ -447,7 +539,7 @@ pub fn main(init: std.process.Init) !void {
                 };
                 return;
             } else {
-                std.debug.print("acme-issue is only supported on Linux\n", .{});
+                std.debug.print("acme-issue is supported on Linux and OpenBSD\n", .{});
                 return;
             }
         } else
@@ -513,6 +605,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20))) |text| {
             defer allocator.free(text); // string fields are duped by the parser
             if (onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
+                if (onyx_server.daemon.config_boot.portableTransportError(builtin.os.tag, loaded.parsed)) |why| {
+                    std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
+                    std.process.exit(1);
+                }
                 if (onyx_server.daemon.config_boot.configCheckError(loaded.io, loaded.tls.ktls)) |why| {
                     std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
                     std.process.exit(1);
@@ -556,6 +652,19 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    if (comptime builtin.os.tag == .openbsd) {
+        native_driver.config_path = srv_cfg.config_path;
+        srv_cfg.native_upgrade_hooks = native_driver.hooks();
+        if (native_incoming) |*incoming| {
+            srv_cfg.native_listener_manifest = incoming.listeners;
+            srv_cfg.native_arena_bytes = incoming.plaintext;
+            srv_cfg.native_adopt_barrier = incoming.barrier();
+            srv_cfg.inherited_state_fds = incoming.state_fds;
+            srv_cfg.inherited_state_fd_manifest_present = true;
+            srv_cfg.inherited_state_fd_manifest_valid = true;
+        }
+    }
+
     // The platform CSPRNG is always available to the server (session reclaim
     // tokens, etc.); PQ-secured S2S below is the only feature gated on a key.
     srv_cfg.crypto_io = init.io;
@@ -570,11 +679,12 @@ pub fn main(init: std.process.Init) !void {
     var webpush_vapid: ?onyx_server.daemon.webpush.Vapid = null;
     var webpush_pub_buf: [onyx_server.daemon.webpush.vapid_pub_b64_len]u8 = undefined;
     if (held) |h| {
-        if (h.parsed.webpush.enabled and builtin.os.tag == .linux) {
-            if (onyx_server.daemon.webpush.Vapid.loadOrCreate(init.io, allocator, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path)) |v| {
+        if (h.parsed.webpush.enabled and (builtin.os.tag == .linux or builtin.os.tag == .openbsd)) {
+            if ((if (native_incoming != null) onyx_server.daemon.webpush.Vapid.loadExisting(init.io, allocator, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path) else onyx_server.daemon.webpush.Vapid.loadOrCreate(init.io, allocator, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path))) |v| {
                 webpush_vapid = v;
                 srv_cfg.webpush_vapid_pub = v.publicB64(&webpush_pub_buf);
             } else |err| {
+                if (native_incoming != null) return err;
                 std.debug.print("onyx-server: [webpush] VAPID key failed ({s}); web push disabled\n", .{@errorName(err)});
             }
         }
@@ -612,19 +722,22 @@ pub fn main(init: std.process.Init) !void {
             node_id_holder = ident;
             std.debug.print("onyx-server: PQ-secured S2S enabled (node identity configured)\n", .{});
         } else |err| {
-            if (ocg2_requested) {
-                std.debug.print("onyx-server: fatal — OCG2 configured node identity is invalid ({s})\n", .{@errorName(err)});
+            if (ocg2_requested or native_incoming != null) {
+                std.debug.print("onyx-server: fatal — configured node identity is invalid ({s})\n", .{@errorName(err)});
                 return err;
             }
             std.debug.print("onyx-server: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
         }
     } else auto: {
-        const key_path = onyx_server.daemon.node_keyfile.derivePath(allocator, srv_cfg.config_path) catch break :auto;
+        const key_path = onyx_server.daemon.node_keyfile.derivePath(allocator, srv_cfg.config_path) catch |err| {
+            if (native_incoming != null) return err;
+            break :auto;
+        };
         defer allocator.free(key_path);
         // OCG2 never creates identity material implicitly. Its authority/receiver
         // role must be checkable against an already-provisioned private node seed;
         // ordinary non-OCG2 boots retain historical load-or-create behavior.
-        const loaded_key = if (ocg2_requested)
+        const loaded_key = if (ocg2_requested or native_incoming != null)
             onyx_server.daemon.node_keyfile.LoadResult{
                 .seed = onyx_server.daemon.node_keyfile.loadExisting(
                     allocator,
@@ -649,6 +762,7 @@ pub fn main(init: std.process.Init) !void {
                 .generated => std.debug.print("onyx-server: node identity generated + persisted to {s}\n", .{key_path}),
             }
         } else |err| {
+            if (native_incoming != null) return err;
             std.debug.print("onyx-server: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
         }
     }
@@ -735,7 +849,7 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("onyx-server: SASL account store configured but [sasl].enabled=false; SASL disabled\n", .{});
             }
         } else if (h.parsed.sasl.account_db) |db| {
-            if (onyx_server.daemon.services.OroStore.openWithConfig(allocator, init.io, std.Io.Dir.cwd(), db, h.parsed.storage)) |store| {
+            if ((if (native_incoming != null) onyx_server.daemon.services.OroStore.openReadOnlyWithConfig(allocator, init.io, std.Io.Dir.cwd(), db, h.parsed.storage) else onyx_server.daemon.services.OroStore.openWithConfig(allocator, init.io, std.Io.Dir.cwd(), db, h.parsed.storage))) |store| {
                 account_store = store;
                 account_services = onyx_server.daemon.services.Services.initWithConfig(&account_store.?, null, .{
                     .pbkdf2_rounds = h.parsed.accounts.pbkdf2_rounds,
@@ -881,7 +995,7 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.account_services = &account_services;
                 std.debug.print("onyx-server: SASL account store opened ({s}); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL + SESSION-TOKEN live\n", .{db});
             } else |err| {
-                if (dprop_requested or ocg2_requested) {
+                if (dprop_requested or ocg2_requested or native_incoming != null) {
                     std.debug.print("onyx-server: fatal — configured account store required for durable authority state could not open ({s})\n", .{@errorName(err)});
                     return err;
                 }
@@ -895,16 +1009,19 @@ pub fn main(init: std.process.Init) !void {
                 .{ .hs256 = key }
             else if (h.parsed.sasl.oauth_jwks_file) |path| jwks: {
                 oauth_jwks_text = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20)) catch |err| {
+                    if (native_incoming != null) return err;
                     std.debug.print("onyx-server: OAuth JWKS read failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
                     break :jwks null;
                 };
                 oauth_key = onyx_server.daemon.oauth_jwt.OwnedKey.fromJwks(allocator, oauth_jwks_text.?) catch |err| {
+                    if (native_incoming != null) return err;
                     std.debug.print("onyx-server: OAuth JWKS parse failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
                     break :jwks null;
                 };
                 break :jwks oauth_key.?.key;
             } else if (h.parsed.sasl.oauth_pubkey) |pubkey| pubkey_blk: {
                 oauth_key = onyx_server.daemon.oauth_jwt.OwnedKey.fromPubkey(allocator, pubkey) catch |err| {
+                    if (native_incoming != null) return err;
                     std.debug.print("onyx-server: OAuth public key parse failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
                     break :pubkey_blk null;
                 };
@@ -1011,7 +1128,7 @@ pub fn main(init: std.process.Init) !void {
     var rdns_resolver = onyx_server.daemon.rdns.Resolver.init(allocator) catch null;
     defer if (rdns_resolver) |*r| r.deinit();
     if (rdns_resolver) |*r| {
-        r.start();
+        if (native_incoming == null) r.start();
         srv_cfg.rdns = r;
     }
 
@@ -1022,9 +1139,12 @@ pub fn main(init: std.process.Init) !void {
     defer if (dnsbl_res) |*r| r.deinit();
     if (held) |h| {
         if (h.parsed.dnsbl.enabled and h.parsed.dnsbl.zones.len != 0) {
-            dnsbl_res = onyx_server.daemon.dnsbl_resolver.Resolver.init(allocator, h.parsed.dnsbl.zones) catch null;
+            dnsbl_res = onyx_server.daemon.dnsbl_resolver.Resolver.init(allocator, h.parsed.dnsbl.zones) catch |err| blk: {
+                if (native_incoming != null) return err;
+                break :blk null;
+            };
             if (dnsbl_res) |*r| {
-                r.start();
+                if (native_incoming == null) r.start();
                 srv_cfg.dnsbl = r;
                 srv_cfg.dnsbl_ward = h.parsed.dnsbl.ward;
             }
@@ -1046,6 +1166,7 @@ pub fn main(init: std.process.Init) !void {
                 var anchors: []const []const u8 = &.{};
                 if (m.trust_store_path) |path| {
                     mail_trust = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20)) catch |err| blk: {
+                        if (native_incoming != null) return err;
                         std.debug.print("mail: cannot read trust store {s}: {s}\n", .{ path, @errorName(err) });
                         break :blk null;
                     };
@@ -1067,9 +1188,12 @@ pub fn main(init: std.process.Init) !void {
                     .failure_wal = "mail-failures.wal",
                     .failure_io = init.io,
                     .failure_dir = std.Io.Dir.cwd(),
-                }) catch null;
+                }) catch |err| blk: {
+                    if (native_incoming != null) return err;
+                    break :blk null;
+                };
                 if (mail_send) |*s| {
-                    s.start();
+                    if (native_incoming == null) s.start();
                     srv_cfg.mail_sender = s;
                 }
             };
@@ -1282,7 +1406,12 @@ pub fn main(init: std.process.Init) !void {
     // sampled that as 1<->2 oscillation). Fixed: servers come from a reactor-0
     // atomic, users from the shared world nick registry.
 
-    if (comptime builtin.os.tag == .linux or builtin.os.tag == .freebsd or builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
+    if (comptime builtin.os.tag == .openbsd) {
+        if (native_incoming != null) {
+            resolver_ctx.record_paths = false;
+            try onyx_server.daemon.kernel_other.pledgeInheritedRuntime();
+        } else try installOpenBsdSandbox(allocator, init.io, srv_cfg, if (held) |*h| &h.parsed else null, &resolver_ctx);
+    } else if (comptime builtin.os.tag == .linux or builtin.os.tag == .freebsd or builtin.os.tag == .windows) {
         onyx_server.daemon.server.installDaemonKernelSandbox(srv_cfg.config_path) catch |err| {
             std.debug.print("onyx-server: fatal — kernel sandbox: {s}\n", .{@errorName(err)});
             std.process.exit(1);
@@ -1312,20 +1441,9 @@ pub fn main(init: std.process.Init) !void {
     };
     defer srv.deinit();
 
-    // Helix successor adoption must finish before start() launches any
-    // off-reactor producer (webhook/media/metrics workers). Starting first left
-    // a window in which a new-process webhook could acknowledge and enqueue an
-    // event behind the still-unapplied inherited World/session boundary.
-    if (comptime builtin.os.tag == .linux) try srv.adoptInheritedSessions();
-
-    // Drive the SerpentRegistry module init→ready lifecycle now that the server
-    // is at its final address (init() returns by value, so `self` is not stable
-    // inside it). No-op until a module declares lifecycle fns.
-    srv.start();
-
-    const AcmeRenewalService = if (builtin.os.tag == .linux) onyx_server.daemon.acme_renewal.Service else void;
+    const AcmeRenewalService = if ((builtin.os.tag == .linux or builtin.os.tag == .openbsd)) onyx_server.daemon.acme_renewal.Service else void;
     var acme_renewal: ?*AcmeRenewalService = null;
-    defer if (comptime builtin.os.tag == .linux) {
+    defer if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd)) {
         if (acme_renewal) |s| {
             s.stop();
             allocator.destroy(s);
@@ -1336,12 +1454,11 @@ pub fn main(init: std.process.Init) !void {
     // payload rather than a block-local copy.
     if (held) |*h| {
         if (h.acme.enabled) {
-            if (comptime builtin.os.tag == .linux) {
+            if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd)) {
                 srv.setAcmeTlsReloadConfig(&h.parsed.tls);
                 const svc = try allocator.create(AcmeRenewalService);
                 svc.* = AcmeRenewalService.init(allocator, init.io, srv, h.parsed.acme, &h.parsed.tls);
                 acme_renewal = svc;
-                svc.start();
             } else {
                 std.debug.print("onyx-server: [acme] enabled but in-daemon renewal is Linux-only; renewal disabled\n", .{});
             }
@@ -1354,9 +1471,9 @@ pub fn main(init: std.process.Init) !void {
     // (1.3) / CertificateStatus (1.2) then carries it when a client offers
     // status_request. Needs a real cert file (self-signed bootstrap leaves have
     // no AIA responder URL, so the worker simply no-ops there).
-    const OcspStapleService = if (builtin.os.tag == .linux) onyx_server.daemon.ocsp_staple.Service else void;
+    const OcspStapleService = if ((builtin.os.tag == .linux or builtin.os.tag == .openbsd)) onyx_server.daemon.ocsp_staple.Service else void;
     var ocsp_staple: ?*OcspStapleService = null;
-    defer if (comptime builtin.os.tag == .linux) {
+    defer if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd)) {
         if (ocsp_staple) |s| {
             s.stop();
             allocator.destroy(s);
@@ -1367,9 +1484,10 @@ pub fn main(init: std.process.Init) !void {
     // block-local copy that dies at the end of this `if`.
     if (held) |*h| {
         if (h.parsed.ocsp.enabled and h.parsed.tls.enabled and h.parsed.tls.cert_path != null) {
-            if (comptime builtin.os.tag == .linux) {
+            if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd)) {
                 var trust_anchors: []const []const u8 = &.{};
                 const bundle_text: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(init.io, h.parsed.acme.ca_bundle_path, allocator, .limited(@intCast(h.parsed.acme.ca_bundle_max_bytes))) catch |err| blk: {
+                    if (native_incoming != null) return err;
                     std.debug.print("onyx-server: [ocsp] trust store {s} unreadable ({s}); HTTPS responder fetches fail closed\n", .{ h.parsed.acme.ca_bundle_path, @errorName(err) });
                     break :blk null;
                 };
@@ -1379,6 +1497,7 @@ pub fn main(init: std.process.Init) !void {
                         trust_anchors = anchors.items;
                         std.debug.print("onyx-server: [ocsp] using daemon trust store {s} ({d} anchors)\n", .{ h.parsed.acme.ca_bundle_path, anchors.items.len });
                     } else |err| {
+                        if (native_incoming != null) return err;
                         std.debug.print("onyx-server: [ocsp] trust store parse failed ({s}); HTTPS responder fetches fail closed\n", .{@errorName(err)});
                     }
                 }
@@ -1388,7 +1507,6 @@ pub fn main(init: std.process.Init) !void {
                 });
                 svc.trust_anchors = trust_anchors;
                 ocsp_staple = svc;
-                svc.start();
             } else {
                 std.debug.print("onyx-server: [ocsp] enabled but staple fetching is Linux-only; disabled\n", .{});
             }
@@ -1400,10 +1518,10 @@ pub fn main(init: std.process.Init) !void {
     // ── Web Push delivery worker ([webpush] enabled + account store) ────────
     // Offline DMs (memo) nudge the recipient's browser through their push
     // service — payloads are RFC 8291-encrypted end-to-end to the browser.
-    const WebpushWorker = if (builtin.os.tag == .linux) onyx_server.daemon.webpush.Worker else void;
+    const WebpushWorker = if ((builtin.os.tag == .linux or builtin.os.tag == .openbsd)) onyx_server.daemon.webpush.Worker else void;
     var webpush_worker: ?*WebpushWorker = null;
     var webpush_resolver: ?*onyx_server.daemon.acme_runner.SystemResolver = null;
-    defer if (comptime builtin.os.tag == .linux) {
+    defer if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd)) {
         if (webpush_worker) |w| {
             w.shutdown();
             allocator.destroy(w);
@@ -1412,18 +1530,20 @@ pub fn main(init: std.process.Init) !void {
     };
     if (held) |h| {
         if (h.parsed.webpush.enabled) {
-            if (comptime builtin.os.tag == .linux) webpush_blk: {
+            if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd)) webpush_blk: {
                 if (srv_cfg.account_services == null) {
                     std.debug.print("onyx-server: [webpush] enabled but no account store; web push disabled\n", .{});
                     break :webpush_blk;
                 }
                 // Trust anchors + resolver live for the process lifetime.
                 const bundle_text = std.Io.Dir.cwd().readFileAlloc(init.io, h.parsed.acme.ca_bundle_path, allocator, .limited(@intCast(h.parsed.acme.ca_bundle_max_bytes))) catch |err| {
+                    if (native_incoming != null) return err;
                     std.debug.print("onyx-server: [webpush] CA bundle read failed ({s}); web push disabled\n", .{@errorName(err)});
                     break :webpush_blk;
                 };
                 defer allocator.free(bundle_text);
                 const anchors = onyx_server.daemon.acme_cli.loadTrustAnchors(allocator, bundle_text) catch |err| {
+                    if (native_incoming != null) return err;
                     std.debug.print("onyx-server: [webpush] trust anchors failed ({s}); web push disabled\n", .{@errorName(err)});
                     break :webpush_blk;
                 };
@@ -1447,13 +1567,49 @@ pub fn main(init: std.process.Init) !void {
                     .resolver = resolver.resolver(),
                     .trust_anchors = anchors.items,
                 };
-                try w.spawn();
                 webpush_worker = w;
-                srv.webpush_worker = w;
                 std.debug.print("onyx-server: web push live ({d} trust anchors; VAPID {s})\n", .{ anchors.items.len, srv_cfg.webpush_vapid_pub });
             } else {
                 std.debug.print("onyx-server: [webpush] enabled but {s}\n", .{onyx_server.daemon.webpush.portable_disable_reason});
             }
+        }
+    }
+
+    // Helix successor adoption must finish before start() launches any
+    // off-reactor producer (webhook/media/metrics workers). Starting first left
+    // a window in which a new-process webhook could acknowledge and enqueue an
+    // event behind the still-unapplied inherited World/session boundary.
+    if (comptime builtin.os.tag == .openbsd) {
+        srv.adoptInheritedSessions() catch |err| {
+            std.debug.print("onyx-server: native Helix adoption failed ({s})\n", .{@errorName(err)});
+            if (native_incoming != null) std.posix.system._exit(125);
+            return err;
+        };
+    } else if (comptime builtin.os.tag == .linux) try srv.adoptInheritedSessions();
+
+    if (native_incoming != null) {
+        if (rdns_resolver) |*r| r.start();
+        if (dnsbl_res) |*r| r.start();
+        if (mail_send) |*sender| sender.start();
+    }
+
+    // Drive the SerpentRegistry module init→ready lifecycle now that the server
+    // is at its final address (init() returns by value, so `self` is not stable
+    // inside it). No-op until a module declares lifecycle fns.
+    srv.start();
+
+    // All fallible companion allocation/configuration is staged before READY.
+    // Launch only after adoption has transferred ownership. A worker thread
+    // failure must not tear down committed physical client attachments.
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
+        if (acme_renewal) |svc| svc.start();
+        if (ocsp_staple) |svc| svc.start();
+        if (webpush_worker) |w| {
+            w.spawn() catch |err| {
+                if (native_incoming == null) return err;
+                std.debug.print("onyx-server: [webpush] worker start failed ({s}); delivery unavailable\n", .{@errorName(err)});
+            };
+            if (w.thread != null) srv.webpush_worker = w;
         }
     }
 
@@ -1528,4 +1684,7 @@ pub fn main(init: std.process.Init) !void {
     // runThreaded transparently runs a single in-line reactor when num_shards==1.
     var run = std.atomic.Value(bool).init(true);
     srv.runThreaded(&run);
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
+        if (srv.runtimeFailure()) |err| return err;
+    }
 }

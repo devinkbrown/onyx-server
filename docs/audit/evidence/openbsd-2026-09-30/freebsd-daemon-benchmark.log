@@ -1,0 +1,22 @@
+GAP-X4 portable bench
+binary=/tmp/onyx-server-freebsd-final
+work=/tmp/x4-portable
+uname=FreeBSD 14.5-RELEASE-p1 amd64
+cpu=Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz
+load={ 0.12 0.16 0.18 }
+clients=4 privmsg_samples=16
+CELL sqpoll=false tls=off shards=1 register_ms=0.09 join_ms=0.03 privmsg_ms=0.03 rss_idle=5688 rss_loaded=5836 rss_per=37.0 note=kqueue one poller; ring_entries is not a queue depth; client and server TCP_NODELAY error=
+LOG   Onyx Server 0.7.0+15e09029-dirty
+LOG onyx-server: loaded config from /tmp/x4-portable/cell-s1.toml
+LOG onyx-server: listening on 127.0.0.1:12619 (kqueue) — PING + registration live
+CELL sqpoll=false tls=off shards=4 register_ms=0.09 join_ms=0.04 privmsg_ms=0.03 rss_idle=5672 rss_loaded=5824 rss_per=38.0 note=kqueue one poller; num_shards does not add a poller; ring_entries is not a queue depth; client and server TCP_NODELAY error=
+LOG   Onyx Server 0.7.0+15e09029-dirty
+LOG onyx-server: loaded config from /tmp/x4-portable/cell-s4.toml
+LOG onyx-server: listening on 127.0.0.1:25495 (kqueue) — PING + registration live
+CELL sqpoll=false tls=userspace shards=1 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=portable reactor does not serve a TLS listener
+CELL sqpoll=false tls=userspace shards=4 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=portable reactor does not serve a TLS listener
+CELL sqpoll=true tls=off shards=1 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=SQPOLL is Linux io_uring; this reactor is kqueue
+CELL sqpoll=true tls=off shards=4 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=SQPOLL is Linux io_uring; this reactor is kqueue
+CELL sqpoll=true tls=userspace shards=1 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=SQPOLL is Linux io_uring; this reactor is kqueue
+CELL sqpoll=true tls=userspace shards=4 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=SQPOLL is Linux io_uring; this reactor is kqueue
+GAP-X4 portable bench done

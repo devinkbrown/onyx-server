@@ -37,6 +37,7 @@ pub const ReusePortError = error{
 /// succeed — that is the point of `SO_REUSEPORT`. On any failure the partial fd
 /// is closed (no leak). Linux-only (the daemon targets Linux + io_uring).
 pub fn createReusePortListener(host: []const u8, port: u16, backlog: u31) ReusePortError!linux.fd_t {
+    if (comptime builtin.os.tag == .openbsd) return createOpenBsdListener(host, port, backlog, true);
     if (builtin.os.tag != .linux) return error.Unsupported;
 
     const fd = try socketTcp();
@@ -67,9 +68,88 @@ pub fn createReusePortListener(host: []const u8, port: u16, backlog: u31) ReuseP
 pub fn hasReusePort(fd: linux.fd_t) bool {
     var val: u32 = 0;
     var len: posix.socklen_t = @sizeOf(u32);
-    const rc = linux.getsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, @ptrCast(&val), &len);
+    const rc = posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, @ptrCast(&val), &len);
     if (posix.errno(rc) != .SUCCESS) return false;
     return val != 0;
+}
+
+/// OpenBSD sockets use their native address family and ABI. IPv6 sockets
+/// cannot accept IPv4-mapped peers: wildcard dual-family listeners must be
+/// created separately by the reactor owner. REUSEPORT permits duplicate
+/// binding; it does not promise Linux's per-shard load-balancing policy.
+pub fn createOpenBsdListener(host: []const u8, port: u16, backlog: u31, reuse_port: bool) ReusePortError!i32 {
+    if (comptime builtin.os.tag != .openbsd) return error.Unsupported;
+    const ipv6 = std.mem.indexOfScalar(u8, host, ':') != null;
+    const rc = posix.system.socket(if (ipv6) posix.AF.INET6 else posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
+    const fd: i32 = @intCast(rc);
+    errdefer _ = posix.system.close(fd);
+    const yes: u32 = 1;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes)) catch return error.SocketUnavailable;
+    if (reuse_port) posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&yes)) catch return error.SocketUnavailable;
+    const bind_rc = if (ipv6) blk: {
+        const ip = std.Io.net.Ip6Address.parse(host, port) catch return error.InvalidAddress;
+        const addr = posix.sockaddr.in6{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = ip.bytes, .scope_id = ip.interface.index };
+        break :blk posix.system.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+    } else blk: {
+        const ip = std.Io.net.Ip4Address.parse(if (host.len == 0) "0.0.0.0" else host, port) catch return error.InvalidAddress;
+        const addr = posix.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(ip.bytes) };
+        break :blk posix.system.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+    };
+    switch (posix.errno(bind_rc)) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        .ACCES, .PERM => return error.PermissionDenied,
+        else => return error.SocketUnavailable,
+    }
+    if (posix.errno(posix.system.listen(fd, @intCast(backlog))) != .SUCCESS) return error.SocketUnavailable;
+    return fd;
+}
+
+test "OpenBSD listeners bind native IPv4 and IPv6 addresses" {
+    if (comptime builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_][]const u8{ "127.0.0.1", "::1" }) |host| {
+        const listener = try createOpenBsdListener(host, 0, 8, true);
+        defer _ = posix.system.close(listener);
+        var address: posix.sockaddr.storage = undefined;
+        var len: posix.socklen_t = @sizeOf(@TypeOf(address));
+        try std.testing.expect(posix.errno(posix.system.getsockname(listener, @ptrCast(&address), &len)) == .SUCCESS);
+        const family: u32 = if (host[0] == ':') posix.AF.INET6 else posix.AF.INET;
+        try std.testing.expectEqual(family, @as(u32, address.family));
+        const bound_port = if (family == posix.AF.INET6)
+            @as(*const posix.sockaddr.in6, @ptrCast(&address)).port
+        else
+            @as(*const posix.sockaddr.in, @ptrCast(&address)).port;
+        try std.testing.expect(bound_port != 0);
+        try std.testing.expect(hasReusePort(listener));
+        const client = posix.system.socket(family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+        try std.testing.expect(posix.errno(client) == .SUCCESS);
+        defer _ = posix.system.close(client);
+        try std.testing.expect(posix.errno(posix.system.connect(client, @ptrCast(&address), len)) == .SUCCESS);
+        // Client connect completion can precede listener readiness, especially
+        // on IPv6. Bound the nonblocking accept retry to forty 50 ms polls.
+        const accepted: posix.socket_t = blk: {
+            for (0..40) |_| {
+                const rc = posix.system.accept4(listener, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+                const accept_errno = posix.errno(rc);
+                switch (accept_errno) {
+                    .SUCCESS => break :blk @intCast(rc),
+                    .AGAIN, .INTR => {},
+                    else => {
+                        std.debug.print("OpenBSD listener fixture host={s} accept errno={s}\n", .{ host, @tagName(accept_errno) });
+                        return error.TestUnexpectedResult;
+                    },
+                }
+                var ready = [_]posix.pollfd{.{ .fd = listener, .events = posix.POLL.IN, .revents = 0 }};
+                const polled = posix.system.poll(&ready, ready.len, 50);
+                if (polled < 0 and posix.errno(polled) == .INTR) continue;
+                try std.testing.expect(polled >= 0);
+            }
+            std.debug.print("OpenBSD listener fixture host={s} accept readiness timed out\n", .{host});
+            return error.TestUnexpectedResult;
+        };
+        defer _ = posix.system.close(accepted);
+    }
 }
 
 fn socketTcp() ReusePortError!linux.fd_t {

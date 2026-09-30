@@ -1,5 +1,11 @@
 # TLS Hardening Roadmap
 
+**2026-09-30 policy update:** GAP-K10 now refuses 0-RTT without a configured
+clock and a ticket carrying sealed issue time, age-add, and lifetime. Rejected
+freshness evidence consumes no replay slot; eligible 1-RTT resumption remains
+available under its separate lifetime policy. The historical execution-log
+entries below that describe a legacy binder-only downgrade are superseded.
+
 Derived from a gap analysis of the Onyx Server Zig-native TLS stack (`src/crypto/tls*.zig`,
 `x509*.zig`, `ocsp.zig`, `sct.zig`, `crl.zig`) against BoringSSL and WolfSSL.
 

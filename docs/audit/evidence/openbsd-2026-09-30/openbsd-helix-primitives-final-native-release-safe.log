@@ -1,0 +1,8 @@
+probe soft nofile 128 -> 512, hard 1024
+PASS 65 indexed descriptors across 3 batches, exact socket/state identity, CLOEXEC and deinit custody
+PASS interrupted: all accepted/failed-batch rights closed, parent descriptors intact
+PASS malformed_last: all accepted/failed-batch rights closed, parent descriptors intact
+PASS wrong_generation_last: all accepted/failed-batch rights closed, parent descriptors intact
+PASS fork-isolated 65-fd normalization: cycles, colliding control/arena targets, state fds, unchanged parent
+PASS actual failed exec before data handoff: candidate reaped, parent fds and stream usable
+PASS all 6 native Helix primitive scenarios

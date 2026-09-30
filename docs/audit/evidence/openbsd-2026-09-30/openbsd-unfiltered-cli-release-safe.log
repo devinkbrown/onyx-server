@@ -1,0 +1,18 @@
+38/53 ocsp_cmd.test.armorcli ocsp -text dumps a successful basic response...OK
+39/53 ocsp_cmd.test.armorcli ocsp -verify accepts the issuing CA and rejects a stranger...OK
+40/53 ocsp_cmd.test.armorcli ocsp -verify -serial is fail-closed on revoked, unknown, and stale...OK
+41/53 ocsp_cmd.test.armorcli ocsp parseArgs requires -CAfile for -verify and -verify for -serial...OK
+42/53 ocsp_cmd.test.armorcli ocsp rejects empty and truncated DER...OK
+43/53 crl_cmd.test.armorcli crl -text dumps issuer window and revoked count without verifying...OK
+44/53 crl_cmd.test.armorcli crl -serial without -verify is usage, never a verdict...OK
+45/53 crl_cmd.test.armorcli crl -verify accepts the issuing CA, rejects a stranger, and gates -serial...OK
+46/53 crl_cmd.test.armorcli crl parseArgs requires -CAfile for -verify...OK
+47/53 crl_cmd.test.armorcli crl rejects empty DER...OK
+48/53 s_client_cmd.test.armorcli s_client parseArgs accepts connect and SNI flags...OK
+49/53 s_client_cmd.test.armorcli s_client loopback handshake prints suite, SNI, and verify ok...OK
+50/53 s_client_cmd.test.GAP-K6 armor s_client -connect returns NotImplemented and opens no socket...OK
+51/53 s_client_cmd.test.armorcli s_client live path still requires -connect and -CAfile...OK
+52/53 stub_cmds.test.armorcli stubs answer deterministically...OK
+53/53 stub_cmds.test.GAP-C5 armor enc stays unimplemented...GAP-C5 branch=armor enc stays an AEAD-only stub
+OK
+51 passed; 2 skipped; 0 failed.

@@ -2511,6 +2511,17 @@ pub const Services = struct {
         var hash_hex = std.fmt.bytesToHex(digest, .lower);
         defer secureZero(hash_hex[0..]);
 
+        // A leftover token record after rotation or revocation is not authority.
+        // Require the account's current binding before accepting its credential.
+        var acct_key_buf: [session_token_account_key_max]u8 = undefined;
+        const acct_key = sessionTokenAccountKey(&acct_key_buf, key.asSlice()) orelse return null;
+        const current_hash = self.store.family(.props).get(acct_key) orelse return null;
+        if (current_hash.len != hash_hex_len) return null;
+        var bound_hash: [hash_hex_len]u8 = undefined;
+        @memcpy(&bound_hash, current_hash);
+        defer secureZero(bound_hash[0..]);
+        if (!std.crypto.timing_safe.eql([hash_hex_len]u8, bound_hash, hash_hex)) return null;
+
         var token_key_buf: [session_token_key_max]u8 = undefined;
         const token_key = sessionTokenKey(&token_key_buf, hash_hex[0..]) orelse return null;
         const encoded = self.store.family(.props).get(token_key) orelse return null;
@@ -5539,6 +5550,37 @@ test "session tokens issue, validate by hash, and expire" {
     try std.testing.expect(services.validateSessionToken("bob", issued.tokenSlice(), 1001, &account_out) == null);
     try std.testing.expect(services.validateSessionToken("alice", "sst_ffffffffffffffffffffffffffffffff", 1001, &account_out) == null);
     try std.testing.expect(services.validateSessionToken("alice", issued.tokenSlice(), issued.expires_unix, &account_out) == null);
+}
+
+test "session token validation refuses orphan records after rotation and revocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-session-token-orphan.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    const old = try services.issueSessionToken("alice", 1000);
+    var digest: [hash_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(old.tokenSlice(), &digest, .{});
+    const old_hash = std.fmt.bytesToHex(digest, .lower);
+    var old_key_buf: [session_token_key_max]u8 = undefined;
+    const old_key = sessionTokenKey(&old_key_buf, &old_hash) orelse return error.BufferTooSmall;
+    const old_record = try std.testing.allocator.dupe(u8, store.family(.props).get(old_key).?);
+    defer std.testing.allocator.free(old_record);
+    const current = try services.issueSessionToken("alice", 1001);
+    // Recreate exactly the row a failed physical deletion would leave behind.
+    try store.family(.props).put(old_key, old_record);
+    var account_out: [account_max]u8 = undefined;
+    try std.testing.expect(services.validateSessionToken("alice", old.tokenSlice(), 1002, &account_out) == null);
+    try std.testing.expect(services.validateSessionToken("alice", current.tokenSlice(), 1002, &account_out) != null);
+    var account_key_buf: [session_token_account_key_max]u8 = undefined;
+    const account_key = sessionTokenAccountKey(&account_key_buf, "alice") orelse return error.BufferTooSmall;
+    try store.family(.props).delete(account_key);
+    try std.testing.expect(services.validateSessionToken("alice", old.tokenSlice(), 1002, &account_out) == null);
+    try std.testing.expect(services.validateSessionToken("alice", current.tokenSlice(), 1002, &account_out) == null);
+    try store.family(.props).put(account_key, "malformed");
+    try std.testing.expect(services.validateSessionToken("alice", current.tokenSlice(), 1002, &account_out) == null);
 }
 
 test "corrupt account record is rejected" {

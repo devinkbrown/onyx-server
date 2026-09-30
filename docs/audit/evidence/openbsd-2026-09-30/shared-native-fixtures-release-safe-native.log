@@ -1,0 +1,548 @@
+1/545 root.test_0...OK
+2/545 crypto.root.test_0...OK
+3/545 daemon.root.test_0...OK
+4/545 proto.root.test_0...OK
+5/545 substrate.root.test_0...OK
+6/545 wasm.host.root.test_0...OK
+7/545 substrate.io.root.test_0...OK
+8/545 substrate.ripple_props.test_0...OK
+9/545 substrate.ripple.test_0...OK
+10/545 substrate.undertow.root.test_0...OK
+11/545 substrate.undertow.peer_link.test_0...OK
+12/545 substrate.undertow.s2s_peer.test.SESSION_MIGRATE frame is dispatched and staged for the daemon to drain...OK
+13/545 substrate.undertow.s2s_peer.test.SESSION_MIGRATE_CONSUMED is dispatched to its convergence queue...OK
+14/545 substrate.undertow.s2s_peer.test.SESSION_MIGRATE from an unknown origin is rejected, not staged...OK
+15/545 substrate.undertow.s2s_peer.test.session replica v3 negotiates one strict attachment schema per secured link...OK
+16/545 substrate.undertow.s2s_peer.test.session replica v3 probe leaves a rolling v2 peer on v2...OK
+17/545 substrate.undertow.s2s_peer.test.session replica v2 inner peer transports offers acks revokes and attachment leases...OK
+18/545 substrate.undertow.s2s_peer.test.session replica v2 rolling old and plaintext peers stay inert...OK
+19/545 substrate.undertow.s2s_peer.test.session replica v2 hot resume preserves negotiated capability...OK
+20/545 substrate.undertow.s2s_peer.test.session replica v2 malformed cross-tag and bounded queue input fail closed...OK
+21/545 crypto.sign.test_0...OK
+22/545 proto.s2s_frame.test.session replica v2 frames are secured and capability gated...OK
+23/545 proto.session_replica_frame.test.session replica transport OFFER ACK REVOKE and attachment lease round-trip...OK
+24/545 proto.session_replica_frame.test.attachment session replica transport round-trips every v3 object kind...OK
+25/545 proto.session_replica_frame.test.session replica transport never guesses or falls back across v2 and v3...OK
+26/545 proto.session_replica_frame.test.attachment session replica transport binds distinct inner objects to outer kind...OK
+27/545 proto.session_replica_frame.test.attachment session replica transport rejects all truncation and trailing bytes...OK
+28/545 proto.session_replica_frame.test.attachment session replica transport rejects malformed identity status and lengths...OK
+29/545 proto.session_replica_frame.test.session replica transport binds inner object to outer kind...OK
+30/545 proto.session_replica_frame.test.session replica transport rejects every truncation and trailing bytes...OK
+31/545 proto.session_replica_frame.test.session replica transport rejects malformed headers lengths and payloads...OK
+32/545 proto.session_replica_frame.test.session replica transport enforces frame-size bound before allocation or parse...OK
+33/545 proto.session_replica_frame.test.session replica transport OFFER declared fields are strict and bounded...OK
+34/545 substrate.io.buf_ring.test_0...OK
+35/545 substrate.io.ring.test_0...OK
+36/545 proto.asn1_time.test_0...OK
+37/545 proto.certfp.test_0...OK
+38/545 proto.cloak.test_0...OK
+39/545 proto.ircx_modex.test_0...OK
+40/545 proto.ircx_saccess.test_0...OK
+41/545 proto.listx.test_0...OK
+42/545 proto.mooring.test_0...OK
+43/545 proto.mooring_props.test_0...OK
+44/545 proto.quic_handshake.test_0...OK
+45/545 proto.quic_transport_params.test_0...OK
+46/545 proto.sasl_external_verify.test_0...OK
+47/545 proto.sasl_mechrouter.test.SESSION-TOKEN accepts and rejects through router callback...OK
+48/545 proto.sasl_mechrouter.test_0...OK
+49/545 proto.sasl_oauthbearer.test_0...OK
+50/545 proto.sasl.test_0...OK
+51/545 proto.sasl_scram512_server.test_0...OK
+52/545 proto.sasl_scram.test_0...OK
+53/545 proto.sasl_scram_server.test_0...OK
+54/545 proto.signed_delta.test_0...OK
+55/545 proto.toml.test_0...OK
+56/545 proto.x509.test_0...OK
+57/545 daemon.modules.manifest.test_0...OK
+58/545 daemon.key_transparency.test_0...OK
+59/545 daemon.durable_credential_props.test.DPROP1 empty image has deterministic framing and KAT...OK
+60/545 daemon.durable_credential_props.test.DPROP1 empty state exposes exact immutable local origin...OK
+61/545 daemon.durable_credential_props.test.DPROP1 integration API exposes exact store bounds and bounded factAt...OK
+62/545 daemon.durable_credential_props.test.DPROP1 signed facts round-trip sorted and restore max HLC...OK
+63/545 daemon.durable_credential_props.test.DPROP1 validates legacy and folded stored-key ODD1 device material...OK
+64/545 daemon.durable_credential_props.test.DPROP1 LWW stale replay and equivocation outcomes...OK
+65/545 daemon.durable_credential_props.test.DPROP1 tombstone replaces and rejects nonempty delete...OK
+66/545 daemon.durable_credential_props.test.DPROP1 malformed prefix trailing checksum and canonical inputs fail closed...OK
+67/545 daemon.durable_credential_props.test.DPROP1 rejects noncredential namespace and unsigned event...OK
+68/545 daemon.durable_credential_props.test.DPROP1 prepared update is invisible until commit and abort is exact...OK
+69/545 daemon.durable_credential_props.test.DPROP1 decoder rejects duplicate, unsorted, proper-prefix, and trailing records...OK
+70/545 daemon.durable_credential_props.test.DPROP1 decoder enforces count bound before body allocation...OK
+71/545 daemon.durable_credential_props.test.DPROP1 enforces the per-account cap but permits replacement at cap...OK
+72/545 daemon.durable_credential_props.test.DPROP1 rejects zero local-origin configuration...OK
+73/545 daemon.durable_credential_props.test.DPROP1 tombstones prevent stale resurrection and reject foreign origin...OK
+74/545 daemon.durable_credential_props.test.DPROP1 signed fact validation is fail-closed for clock account owner origin and tamper...OK
+75/545 daemon.durable_credential_props.test.DPROP1 decode is allocation-failure atomic...OK
+76/545 daemon.durable_credential_props.test.DPROP1 prepare is allocation-failure atomic...OK
+77/545 daemon.oper_session_provenance.test.OCG2PROV mint permit rejects stale REHASH binding...OK
+78/545 daemon.ocg2_authority_issuer.test.OCG2ISSUER executeAuthorized stale REHASH permit allocates nothing...OK
+79/545 daemon.ocg2_authority_issuer.test.OCG2ISSUER executeAuthorized survives REHASH of identical bindings on the bound registry...OK
+80/545 daemon.acme_cli.test_0...OK
+81/545 daemon.acme_http01_listener.test_0...OK
+82/545 daemon.acme_renewal.test_0...OK
+83/545 daemon.acme_runner.test_0...OK
+84/545 daemon.config_boot.test.MESSAGE_V2 activation fields map without reparsing deployment identities...OK
+85/545 daemon.config_boot.test.MESSAGE_V2 empty projection cannot downgrade a base plan...OK
+86/545 daemon.config_format.test.parseToml: MESSAGE_V2 activation plan is explicit complete and type-strict...OK
+87/545 daemon.config_format.test.parseToml: MESSAGE_V2 activation plan survives every allocation failure...OK
+88/545 daemon.config_format.test_0...OK
+89/545 daemon.dispatch.test.sasl CAP and 908 gate SESSION-TOKEN OAUTHBEARER ANONYMOUS and SCRAM-SHA-512-PLUS...OK
+90/545 daemon.helix.root.test_0...OK
+91/545 daemon.metrics_http.test_0...OK
+92/545 daemon.webhook.test_0...OK
+93/545 daemon.webhook_render.test_0...OK
+94/545 daemon.webhook_http.test_0...OK
+95/545 daemon.module_harness.test.harness: a failed on_init marks only that module degraded and is excluded from REHASH...OK
+96/545 daemon.module_harness.test.harness: a clean REHASH reloads every module in load order...OK
+97/545 daemon.module_harness.test.harness: a mid-sweep REHASH failure restores config then rewinds LIFO...OK
+98/545 daemon.module_harness.test.harness: REHASH without a restore hook reports restore_invoked=false...OK
+99/545 daemon.oauth_jwt.test_0...OK
+100/545 daemon.ocsp_staple.test_0...OK
+101/545 daemon.reactor_pool.test_0...OK
+102/545 daemon.s2s_link.test.session replica v2 signed plaintext S2sLink remains disabled...OK
+103/545 daemon.sasl_bridge.test_0...OK
+104/545 daemon.scram_store.test_0...OK
+105/545 daemon.secured_s2s_link.test.session replica v2 activates only inside established Mooring SecuredLink...OK
+106/545 daemon.server.test.GAP-O5 REHASH DRY prints diffs and applies none...GAP-O5 branch=REHASH DRY named ward class limit and listener diffs, applied none, then a real REHASH applied the limit without moving the listener
+OK
+107/545 daemon.server.test.session replica live publication pairs a newer lease and detached publication invalidates it...OK
+108/545 daemon.server.test.session replica orphaned final revoke survives encode Store OOM and checkpoint...OK
+109/545 daemon.server.test.session replica sweep retains expired orphan until local revoke retry succeeds...OK
+110/545 daemon.server.test.session replica replay skips attachment leases for rolling-old peers without pinning burst...OK
+111/545 daemon.server.test.session replica mid-flight RESYNC restarts canonical Store without revision churn...OK
+112/545 daemon.server.test.session replica value replay completes 140 objects under continuous behind-cursor renewal...OK
+113/545 daemon.server.test.session replica conflicted lease replays both witnesses back to ingress peer...OK
+114/545 daemon.server.test.session replica replay preflights SendQ before AEAD advance and resumes at eight frames...SKIP
+115/545 daemon.server.test.session replica gates establishment and RESYNC membership behind every retained authority page...SKIP
+116/545 daemon.server.test.session replica burst retains whole-record ciphertext across SendQ backpressure...SKIP
+117/545 daemon.server.test.session replica live fanout preserves retained ciphertext on a full peer SendQ...SKIP
+118/545 daemon.server.test.session replica secured receipt retry does not duplicate retained ciphertext...OK
+119/545 daemon.server.test.session replica deferred sidecar retry bounds retained ciphertext...SKIP
+120/545 daemon.server.test.session replica burst retries incomplete family after secured record allocation failure...SKIP
+121/545 daemon.server.test.session replica replay leaves no inner residue after outer record allocation failure...OK
+122/545 daemon.server.test.session replica burst sends every legal mesh ward beyond legacy scratch cap...OK
+123/545 daemon.server.test.session replica replay budgets actual ciphertext with one-frame progress exception...OK
+124/545 daemon.server.test.maximum legal session replica fits the clamped server-link SendQ and progresses...OK
+125/545 daemon.server.test.threaded server: bouncer rewind is suppressed for a non-oper member on a history-policy=opers channel...OK
+126/545 daemon.server.test.threaded server: bouncer rewind still replays for an oper member on a history-policy=opers channel...OK
+127/545 daemon.server.test.threaded server: bouncer rewind replays normally for a non-oper member on a default-policy channel...OK
+128/545 daemon.server.test.MESSAGE_V2 replay and Lotus publish transactionally with one accepted identity...OK
+129/545 daemon.server.test.MESSAGE_V2 durable admission fails closed without explicit direct-neighbor pins...OK
+130/545 daemon.server.test.MESSAGE_V2 authoring activation requires a staged canonical full-mesh roster...OK
+131/545 daemon.server.test.MESSAGE_V2 Helix legacy egress seam suppresses a twin after durable admission...OK
+132/545 daemon.server.test.MESSAGE_V2 Helix authored row waits for rolling-old peer then replays once and retires...OK
+133/545 daemon.server.test.MESSAGE_V2 RVL2 duplicate ingress and ACK handshake retire every direct-neighbor obligation...OK
+134/545 daemon.server.test.MESSAGE_V2 custody ACK and ACK_CONFIRM fail closed for off-mesh and unsolicited peers...OK
+135/545 daemon.server.test.MESSAGE_V2 RVL2 retry sweep cannot starve a later direct neighbor...OK
+136/545 daemon.server.test.MESSAGE_V2 egress emits a >64 same-origin backlog old-HLC-before-new per neighbor...OK
+137/545 daemon.server.test.MESSAGE_V2 egress retains a partitioned neighbor's obligation and retires it once on heal...OK
+138/545 daemon.server.test.MESSAGE_V2 Helix restore relation rejects individually valid torn authorities...OK
+139/545 daemon.server.test.UPGRADE rejects torn MESSAGE_V2 authority checkpoints before publication...SKIP
+140/545 daemon.server.test.MESSAGE_V2 retained RVL2 row re-acks every direct neighbor after RVG2 window eviction...OK
+141/545 daemon.server.test.MESSAGE_V2 Helix activation is staged exact and monotonic across current handoff...SKIP
+142/545 daemon.server.test.REHASH oper binding builder preserves configured group privileges...OK
+143/545 daemon.server.test.REHASH oper binding builder skips unknown or empty classes...OK
+144/545 daemon.server.test.threaded server: a labeled WHOIS is reframed under the @label via SerpentRegistry...OK
+145/545 daemon.server.test.threaded server: multi-reactor (num_shards=4) survives concurrent clients...OK
+146/545 daemon.server.test.TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABLE...SKIP
+147/545 daemon.server.test.TOTP enforcement: IDENTIFY + SASL gated for a 2FA account; tokens revoked on enable...SKIP
+148/545 daemon.server.test.TOTP CONFIRM revokes an existing session token (no 2FA-free re-entry)...OK
+149/545 daemon.server.test.DPROP1 startup authority union rejects partial and mismatched configurations...OK
+150/545 daemon.server.test.DPROP1 shared cold-hot candidate is purge-first idempotent allocation-failure atomic...OK
+151/545 daemon.server.test.DPROP1 cold activation publishes exact authority and stays observationally silent...OK
+152/545 daemon.server.test.DPROP1 hot activation without PRPC restores authority and is observationally silent...SKIP
+153/545 daemon.server.test.DPROP1 hot carried conflict is purge-first authority-wins and final edge allocates nothing...SKIP
+154/545 daemon.server.test.DPROP1 hot unrelated future PRPC clock is fatal and leaves causal triplet exact...SKIP
+155/545 daemon.server.test.DPROP1 cold startup without mandatory signer rejects local device writes...SKIP
+156/545 daemon.server.test.DPROP1 remote user device ENTITY_PROP is quarantined before all admission side effects...OK
+157/545 daemon.server.test.DPROP1 remote device quarantine persists as policy across restart...OK
+158/545 daemon.server.test.DPROP1 remote device origin cannot bypass quarantine after cold restart...OK
+159/545 daemon.server.test.DPROP1 local device write converges exact signed durable live clock and transparency fact...SKIP
+160/545 daemon.server.test.DPROP1 missing-row delete commits exact signed tombstone without creating live PROP...SKIP
+161/545 daemon.server.test.DPROP1 channel and member device-looking properties retain generic PROP behavior...SKIP
+162/545 daemon.server.test.DPROP1 ambiguous durable cut is sticky requests stop and publishes no live state...SKIP
+163/545 daemon.server.test.DPROP1 transaction preparation signing clock and Services failures publish nothing...SKIP
+164/545 daemon.server.test.DPROP1 PROP CLEAR scans beyond sixty four rows and preserves reserved device facts...SKIP
+165/545 daemon.server.test.DPROP1 user PROP and E2EEKEY enumerate all one hundred twenty eight capacity rows...SKIP
+166/545 daemon.server.test.DPROP1 reserved local PROP numerics and oper override remain fail closed...SKIP
+167/545 daemon.server.test.DPROP1 stale durable admission maps generic PROP to ERR_SECURITY 908...SKIP
+168/545 daemon.server.test.DPROP1 E2EEKEY mixed-case ODD1 commits folded PROP lists and restores...SKIP
+169/545 daemon.server.test.session replica lifecycle LOGOUT revokes the final local portable token...SKIP
+170/545 daemon.server.test.session replica lifecycle account switch revokes the abandoned portable token...SKIP
+171/545 daemon.server.test.session replica lifecycle IRCX AUTH guest rebind revokes the abandoned portable token...SKIP
+172/545 daemon.server.test.session replica lifecycle REGISTER rebind revokes the abandoned portable token...SKIP
+173/545 daemon.server.test.session replica lifecycle DROP revokes every distinct local token...SKIP
+174/545 daemon.server.test.session replica lifecycle keeps one-of-N authority and last nonportable sibling revokes...SKIP
+175/545 daemon.server.test.session replica lifecycle revokes portable authority replaced on same-client attach...SKIP
+176/545 daemon.server.test.session replica nick index is case-folded bounded and ambiguity-safe...OK
+177/545 daemon.server.test.threaded server: auxiliary direct events fan out exact-token attachments once with stable identity...SKIP
+178/545 daemon.server.test.threaded server: inactive OCG1 never authorizes remote DATA reserved tags...OK
+179/545 daemon.server.test.threaded server: PINS command uses channel prop storage and op gate...OK
+180/545 daemon.server.test.threaded server: +onyx/topic tag rides fanout + echo; untagged is unchanged...OK
+181/545 daemon.server.test.threaded server: onyx/topics receives topic tags without generic message-tags...OK
+182/545 daemon.server.test.E5E1 session replica residence rejects downgrade without widening exact token authority...SKIP
+183/545 daemon.server.test.signed session replica projects JOIN PART only to the exact token and never republishes...SKIP
+184/545 daemon.server.test.rowless signed session replica retries Pending staging after capacity clears...OK
+185/545 daemon.server.test.MESSAGE_V2 unknown home retries then converges and delivers once...SKIP
+186/545 daemon.server.test.MESSAGE_V2 unknown home convergence to different node drops permanently...SKIP
+187/545 daemon.server.test.MESSAGE_V2 deferred unknown-home expires without delivery...SKIP
+188/545 daemon.server.test.MESSAGE_V2 signed member modes bypass unknown-home retry...SKIP
+189/545 daemon.server.test.MESSAGE_V2 known-home mismatch with signed member modes still drops permanently...SKIP
+190/545 daemon.server.test.channel prop: a locally-authored fact is signed and verifies against its origin...OK
+191/545 daemon.server.test.channel prop: an inbound signed fact verifies, applies, and is stored for re-broadcast...SKIP
+192/545 daemon.server.test.channel prop: a forged inbound fact is rejected, counted, and not applied...SKIP
+193/545 daemon.server.test.channel prop: a re-broadcast preserves the ORIGINAL author's signature (multi-hop)...SKIP
+194/545 daemon.server.test.channel prop: a legacy unsigned inbound fact still applies (backward compat)...SKIP
+195/545 daemon.server.test.entity prop: a local user prop and member prop are signed and verify against their origin...OK
+196/545 daemon.server.test.entity prop: an inbound signed user fact verifies, applies, and is stored for re-broadcast...OK
+197/545 daemon.server.test.entity prop: an inbound signed member fact verifies and applies...OK
+198/545 daemon.server.test.entity prop: a forged inbound fact is rejected, counted, and not applied...OK
+199/545 daemon.server.test.entity prop: a re-broadcast preserves the ORIGINAL author's signature (multi-hop)...OK
+200/545 daemon.server.test.entity prop: a legacy unsigned inbound fact still applies (backward compat)...OK
+201/545 daemon.server.test.entity prop: newer hlc wins, older is ignored (LWW for user and member)...OK
+202/545 daemon.server.test.threaded server: malformed pre-auth lines never kill the reactor...OK
+203/545 daemon.server.test.threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)...OK
+204/545 daemon.server.test.threaded server: CERTLIST and CERTDEL use authenticated account bindings...OK
+205/545 daemon.server.test.threaded server: SASLINFO advertises EXTERNAL when configured...OK
+206/545 daemon.server.test.SESSIONTOKEN live dispatch issues Unix expiry and survives durable cold reopen...OK
+207/545 daemon.server.test.threaded server: SESSIONTOKEN refuses non-TLS transport...OK
+208/545 daemon.server.test.threaded server: login defers autojoin and restores only after exact SESSION RESUME token...OK
+209/545 daemon.server.test.threaded server: session-sync fresh login defers autojoin until SESSION TOKEN...OK
+210/545 daemon.server.test.threaded server: SASL-opered login keeps privileges across explicit detached-session restore...OK
+211/545 daemon.server.test.threaded server: mesh-token local resume restores detached snapshot...OK
+212/545 daemon.server.test.threaded server: one mesh credential attaches multiple live clients without nonce races...SKIP
+213/545 daemon.server.test.threaded server: session reclaim local restore failure leaves the ghost reclaimable...SKIP
+214/545 daemon.server.test.SESSION RESUME retry latch clears on terminal and already-attached attempts...SKIP
+215/545 daemon.server.test.SESSION RESUME composite rejects malformed terminal and forged exact authority without downgrade...SKIP
+216/545 daemon.server.test.SESSION RESUME exact selector moves only its sibling and durable spool...SKIP
+217/545 daemon.server.test.ReleaseSafe SESSION TOKEN reader-first issuance gate defaults legacy and explicitly enables SRM2...SKIP
+218/545 daemon.server.test.SESSION RESUME legacy local and SRM1 create new without stripping ghost spool...SKIP
+219/545 daemon.server.test.expired SESSION RESUME retry hold clears TOKEN latch and restores UPGRADE readiness...SKIP
+220/545 daemon.server.test.manual SESSION RESUME retry preservation expires without autojoin deferral and restores UPGRADE readiness...SKIP
+221/545 daemon.server.test.threaded server: explicit detached session resume spool conflict aborts before identity commit...SKIP
+222/545 daemon.server.test.SESSION DROP removes a sibling attachment by LIST index...SKIP
+223/545 daemon.server.test.SESSION DROP #n cannot retarget after list snapshot mutation...SKIP
+224/545 daemon.server.test.SESSION DROP sid revokes exactly one physical attachment and leaves shared-token siblings live...SKIP
+225/545 daemon.server.test.SESSION DROP crosses two live reactors and preserves an exact-token sibling identity...SKIP
+226/545 daemon.server.test.SESSION DROP fails closed on absent, stale, and account-switched ids...SKIP
+227/545 daemon.server.test.SESSION DROP leaves an attached foreign-shard row untouched until the reserved handoff protocol exists...SKIP
+228/545 daemon.server.test.SESSION DROP never treats a local target with an unattested foreign token sibling as final...SKIP
+229/545 daemon.server.test.SESSION DROP prefers the current nick-owning sibling among three local token attachments...SKIP
+230/545 daemon.server.test.threaded server: EXTERNAL auto-resume latch excludes certificates and PLAIN...OK
+231/545 daemon.server.test.threaded server: EXTERNAL exact account nick auto-attaches one local token and picks canonical among many...SKIP
+232/545 daemon.server.test.threaded server: EXTERNAL prefers live local over competing mesh replicas...SKIP
+233/545 daemon.server.test.threaded server: EXTERNAL picks highest-revision staged mesh replica among many...SKIP
+234/545 daemon.server.test.threaded server: secured replica permits tokenless EXTERNAL exact account nick resume...SKIP
+235/545 daemon.server.test.threaded server: first EXTERNAL login proactively publishes its portable session...SKIP
+236/545 daemon.server.test.threaded server: detached EXTERNAL proof uses bootstrap source tie break...SKIP
+237/545 daemon.server.test.threaded server: fresh EXTERNAL publication failure preserves cap ghost byte exact...SKIP
+238/545 daemon.server.test.threaded server: registration EXTERNAL resumes before oper prefix and applies vhost to siblings...SKIP
+239/545 daemon.server.test.threaded server: approved account vhost reaches attachments on every reactor...SKIP
+240/545 daemon.server.test.threaded server: cap-bound detached EXTERNAL registration preserves and restores exact token...SKIP
+241/545 daemon.server.test.threaded server: EXTERNAL registration blocks on missing stale or mismatched mesh projection...OK
+242/545 daemon.server.test.threaded server: local resume joins an attached reusable session...SKIP
+243/545 daemon.server.test.threaded server: resume roster pressure aborts before World or token commit...SKIP
+244/545 daemon.server.test.threaded server: already-seated no-implicit resume emits no bootstrap bytes...SKIP
+245/545 daemon.server.test.threaded server: resume reuses exact server-time tags for claimant and peers...SKIP
+246/545 daemon.server.test.threaded server: legacy consumed notice cannot delete a reusable session replica...SKIP
+247/545 daemon.server.test.threaded server: migration staging isolates equal nonces from different peer signers...OK
+248/545 daemon.server.test.threaded server: session migration restore cannot switch the authenticated account...SKIP
+249/545 daemon.server.test.threaded server: session reclaim crypto_io-null disables reclaim not constant zero tokens...SKIP
+250/545 daemon.server.test.threaded server: MTOKEN is withheld when portable snapshot preflight cannot complete...SKIP
+251/545 daemon.server.test.threaded server: mesh reclaim credentials use portable wall-clock expiry...OK
+252/545 daemon.server.test.threaded server: session tracking at cap with all slots attached is surfaced not fatal...SKIP
+253/545 daemon.server.test.threaded server: OAUTHBEARER login does not auto-elevate oper...OK
+254/545 daemon.server.test.threaded server: CHANNEL ACCESS grants, denies non-founder, and queries...OK
+255/545 daemon.server.test.threaded server: CHANNEL AKICK add mirrors to live join gate and kicks current members...OK
+256/545 daemon.server.test.threaded server: JOIN 0 parts the client from all channels...OK
+257/545 daemon.server.test.threaded server: CHANNEL SET TOPICLOCK DESC URL PRIVATE persist and take effect...OK
+258/545 daemon.server.test.threaded server: STATS m reports per-command usage to an oper...OK
+259/545 daemon.server.test.threaded server: OROWASM reports ABI budgets and plugin registrations to opers...OK
+260/545 daemon.server.test.threaded server: SASL oper elevation persists inactive OCG1 compatibility record...OK
+261/545 daemon.server.test.threaded server: a joining network operator announces the derived +Y prefix to existing members...OK
+262/545 daemon.server.test.server services replay restores registered channels mlocks akicks and wards...OK
+263/545 daemon.server.test.server services replay restores persisted SACCESS entries...OK
+264/545 daemon.server.test.server services replay honors persisted SACCESS clear...OK
+265/545 daemon.server.test.threaded server: ACCOUNT oper lifecycle command controls account auth...OK
+266/545 daemon.server.test.threaded server: SACCESS GRANT overrides DENY at registration...OK
+267/545 daemon.server.test.threaded server: SACCESS HOLDNICK reserves a nick glob; opers bypass...OK
+268/545 daemon.server.test.threaded server: REGISTER star uses current nick and ACCOUNTSET rejects lifecycle flags...OK
+269/545 daemon.server.test.threaded server: pre-registration REGISTER fails and CAP LS 302 advertises custom-account-name...OK
+270/545 daemon.server.test.threaded server: registered nick requires owner authentication before use...OK
+271/545 daemon.server.test.threaded server: VERIFY accepts account argument and legacy code form...OK
+272/545 daemon.server.test.threaded server: GHOST rejects caller account for non-account nick...OK
+273/545 daemon.server.test.threaded server: cross-shard PRIVMSG delivery (num_shards=2)...OK
+274/545 daemon.server.test.threaded server: oper EVENT delivery + cross-shard fan-out under num_shards=2...OK
+275/545 daemon.server.test.threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to-end...OK
+276/545 daemon.server.test.threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-end...OK
+277/545 daemon.server.test.threaded server: SETNAME self echo requires setname cap...OK
+278/545 daemon.server.test.threaded server: channel-mode enforcement +k/+l/+b/+i end-to-end...OK
+279/545 daemon.server.test.threaded server: MODE +k enforces configured KEYLEN (reject over-long, accept at boundary)...OK
+280/545 daemon.server.test.threaded server: JOIN INVITE NAMES MODE and TOPIC RFC parity regressions...OK
+281/545 daemon.server.test.threaded server: IRCv3 server-time tag on PRIVMSG for cap holders...OK
+282/545 daemon.server.test.threaded server: server stamps @msgid on relayed PRIVMSG for message-tags holders...OK
+283/545 daemon.server.test.threaded server: bot tag is delivered only to message-tags recipients...OK
+284/545 daemon.server.test.threaded server: TAGMSG relays client tags to message-tags peers...OK
+285/545 daemon.server.test.threaded server: TAGMSG typing reaches draft-typing recipients without message-tags...OK
+286/545 daemon.server.test.threaded server: CHATHISTORY replays TAGMSG without BATCH when batch cap is absent...OK
+287/545 daemon.server.test.threaded server: TAGMSG strips invalid onyx topic tag before live delivery and replay...OK
+288/545 daemon.server.test.threaded server: TAGMSG strips forged server tags and duplicate client tags...OK
+289/545 daemon.server.test.threaded server: malformed and oversized message tags close only sender...OK
+290/545 daemon.server.test.threaded server: TAGMSG requires message-tags and channel speech permission...OK
+291/545 daemon.server.test.threaded server: +e/+I list queries + +I join bypass...OK
+292/545 daemon.server.test.threaded server: IRCv3 invite-notify to cap holders...OK
+293/545 daemon.server.test.threaded server: STATUSMSG @#chan rank filter + sender gate...OK
+294/545 daemon.server.test.threaded server: PRIVMSG multi-target delivery...OK
+295/545 daemon.server.test.threaded server: ctcp VERSION direct PRIVMSG gets NOTICE reply...OK
+296/545 daemon.server.test.threaded server: user +C blocks direct CTCP except ACTION...OK
+297/545 daemon.server.test.threaded server: channel +C blocks embedded CTCP except exact ACTION...OK
+298/545 daemon.server.test.threaded server: session-sync fans out inbound direct messages to account siblings...OK
+299/545 daemon.server.test.threaded server: session-sync does not fan out to sibling without cap...OK
+300/545 daemon.server.test.threaded server: session-sync mirrors outgoing direct messages to sender siblings...OK
+301/545 daemon.server.test.threaded server: session-sync single-session account keeps direct message single...OK
+302/545 daemon.server.test.threaded server: pipelined bytes after QUIT are never dispatched...OK
+303/545 daemon.server.test.threaded server: same-account same-nick second client attaches, not 433-dropped...OK
+304/545 daemon.server.test.threaded server: reusable session keeps all local clients live, synchronized, and participating...OK
+305/545 daemon.server.test.threaded server: draft/multiline batch reassembles + splits to recipient...OK
+306/545 daemon.server.test.threaded server: draft/multiline CAP value follows runtime config...OK
+307/545 daemon.server.test.threaded server: draft/multiline enforces runtime line limit...OK
+308/545 daemon.server.test.threaded server: external wakeReactor drives the running reactor loop...OK
+309/545 daemon.server.test.threaded server: implicit-TLS client handshakes + registers over the wire...OK
+310/545 daemon.server.test.threaded server: tagged PRIVMSG to a userspace-TLS member seals one TLS record; plaintext unaffected...OK
+311/545 daemon.server.test.threaded server: implicit-TLS raw public key negotiates and registers...OK
+312/545 daemon.server.test.threaded server: mTLS client cert binds CertFP for SASL EXTERNAL (WHOIS 276)...OK
+313/545 daemon.server.test.threaded server: ws upgrade + framed registration (plain testing mode)...OK
+314/545 daemon.server.test.threaded server: wss listener — TLS handshake, upgrade, framed welcome...OK
+315/545 daemon.server.test.threaded server: ws listener rejects a non-upgrade HTTP request...OK
+316/545 daemon.server.test.threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS...OK
+317/545 daemon.server.test.threaded server: control byte reflected into a reply closes only that client...OK
+318/545 daemon.server.test.threaded server: utf8only advertised and invalid PRIVMSG rejected...OK
+319/545 daemon.server.test.exploit: channel PRIVMSG with mIRC colour admits under active MESSAGE_V2 authoring...SKIP
+320/545 daemon.server.test.threaded server: malformed CHATHISTORY yields a FAIL standard reply...OK
+321/545 daemon.server.test.threaded server: CHATHISTORY requires negotiated capability...OK
+322/545 daemon.server.test.threaded server: PRIVMSG beyond MAXTARGETS yields ERR_TOOMANYTARGETS...OK
+323/545 daemon.server.test.threaded server: USERHOST reflects live away state...OK
+324/545 daemon.server.test.threaded server: LUSERS counts one registered user...OK
+325/545 daemon.server.test.threaded server: NAMES honors multi-prefix cap...OK
+326/545 daemon.server.test.threaded server: IRCX NAMESX includes derived oper prefix in NAMES...OK
+327/545 daemon.server.test.threaded server: SUMMON force-joins the target (oper-gated)...OK
+328/545 daemon.server.test.threaded server: WHISPER delivers to channel co-member only...OK
+329/545 daemon.server.test.threaded server: +x auditorium hides regular members in NAMES...OK
+330/545 daemon.server.test.threaded server: MODEX NOFORMAT does not collide with channel forward +f...OK
+331/545 daemon.server.test.threaded server: country extban uses session country metadata...OK
+332/545 daemon.server.test.threaded server: oper-only and admin-only channel join gates...OK
+333/545 daemon.server.test.threaded server: media user modes block transmit and hide automatic presence...OK
+334/545 daemon.server.test.threaded server: re-handshake detaches superseded attachment and same-nick leave preserves sibling...OK
+335/545 daemon.server.test.threaded server: same-nick disconnect detaches crypto attachment before final leave...OK
+336/545 daemon.server.test.threaded server: PART and KICK retire physical media before channel membership...OK
+337/545 daemon.server.test.threaded server: mid-call NICK retires old media authority before identity mutation...OK
+338/545 daemon.server.test.threaded server: account logout and replacement retire old physical media authority...OK
+339/545 daemon.server.test.threaded server: authenticated call participants relay bounded opaque E2EE signaling...OK
+340/545 daemon.server.test.threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs legacy srtp)...OK
+341/545 daemon.server.test.threaded server: MEDIA OFFER with DTLS off is byte-identical + fails closed on a fingerprint request...OK
+342/545 daemon.server.test.threaded server: MEDIA ANSWER provisions transport and native leg...OK
+343/545 daemon.server.test.threaded server: oper DEBUG dumps the flight recorder...OK
+344/545 daemon.server.test.threaded server: USERIP is oper-only and reports real peer IP...OK
+345/545 daemon.server.test.threaded server: sensitive oper commands require named privileges...OK
+346/545 daemon.server.test.threaded server: IRCX/ISIRCX discovery emits RPL_IRCX 800...OK
+347/545 daemon.server.test.threaded server: IRCX opt-in gates DATA then permits typed channel delivery...OK
+348/545 daemon.server.test.threaded server: DATA respects moderated channel speech gate...OK
+349/545 daemon.server.test.threaded server: +V NOCOMICDATA refuses non-op DATA with 531...OK
+350/545 daemon.server.test.threaded server: +U OPMODERATE routes a muted member's message to ops only...OK
+351/545 daemon.server.test.threaded server: +U OPMODERATE held message surfaces a POLICY event to opers...OK
+352/545 daemon.server.test.authored MESSAGE_V2 ADS1 capacity soft-fail preserves spool while mesh authorities publish...SKIP
+353/545 daemon.server.test.threaded server: PRIVMSG NOTICE ADS1 soft-fail after durable admission still delivers locally...SKIP
+354/545 daemon.server.test.threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admission reaches foreign member...SKIP
+355/545 daemon.server.test.threaded server: DATA STATUSMSG target reaches ops only...OK
+356/545 daemon.server.test.threaded server: LISTX filters on real channel SUBJECT from the PROP store...OK
+357/545 daemon.server.test.threaded server: LISTX inclusive >=N member-count threshold includes the boundary...OK
+358/545 daemon.server.test.threaded server: LISTX emits PICS 813 after channel entries...OK
+359/545 daemon.server.test.threaded server: PROP set/get gated by channel-op...OK
+360/545 daemon.server.test.threaded server: PROP notify is IRCX-gated and per-tier secret...OK
+361/545 daemon.server.test.threaded server: PROP GET/LIST returns secret tier keys gated by rank (founder/owner/member), incl FOUNDERKEY + MEMBERKEY<->+k...OK
+362/545 daemon.server.test.threaded server: JUPE command is oper-gated and manages the server-jupe list...OK
+363/545 daemon.server.test.threaded server: local KILL disconnects the victim; unknown nick is 401...OK
+364/545 daemon.server.test.threaded server: warden ward reaps a matching connected client (expel)...OK
+365/545 daemon.server.test.threaded server: warden ward quarantines a connected client (restrict, no close)...OK
+366/545 daemon.server.test.threaded server: warden ward does not reap a matching oper...OK
+367/545 daemon.server.test.threaded server: AUDIT logs privileged actions (KILL, JUPE)...OK
+368/545 daemon.server.test.threaded server: FORCE actions produce ProofMark audit events...OK
+369/545 daemon.server.test.threaded server: clone-limit admission refusals publish security events...OK
+370/545 daemon.server.test.threaded server: IDENTIFY brute-force throttle locks after repeated failures...OK
+371/545 daemon.server.test.threaded server: SETPASS changes an account password (verified by re-login)...OK
+372/545 daemon.server.test.threaded server: SUCCESSOR hands a dropped founder's channel to its successor...OK
+373/545 daemon.server.test.threaded server: SESSIONS lists connections and filters (oper)...OK
+374/545 daemon.server.test.threaded server: MEMO FORWARD redirects an account's memos and rejects a self-cycle...OK
+375/545 daemon.server.test.threaded server: MEMO IGNORE silently drops a blocked sender's memo...OK
+376/545 daemon.server.test.threaded server: oper SASL login auto-enables IRCX...OK
+377/545 daemon.server.test.threaded server: WHOIS shows the target's registered case + nick re-case allowed...OK
+378/545 daemon.server.test.threaded server: PROP user profile extended keys round-trip and enforce access...OK
+379/545 daemon.server.test.threaded server: PROP user MEMBER_OF lists visible channels (WHOIS filter)...OK
+380/545 daemon.server.test.threaded server: PROP user ACCOUNT provider returns the target's login...OK
+381/545 daemon.server.test.threaded server: PROP user geo fields are self-or-oper only...OK
+382/545 daemon.server.test.threaded server: HOSTKEY grants op on keyed join (not disclosed at join; op may read it per-tier)...OK
+383/545 daemon.server.test.threaded server: ACCESS add/list/delete gated by channel-op...OK
+384/545 daemon.server.test.threaded server: IRCX ACCESS DENY blocks the matching join...OK
+385/545 daemon.server.test.threaded server: IRCX ACCESS GRANT auto-applies member status on join...OK
+386/545 daemon.server.test.threaded server: override user mode gates and audits channel bypasses...OK
+387/545 daemon.server.test.threaded server: legacy GRANT remains inactive and cannot arm override...OK
+388/545 daemon.server.test.threaded server: legacy GRANT and REVOKE never announce oper prefix transitions...OK
+389/545 daemon.server.test.threaded server: IRCX EVENT subscription numerics...OK
+390/545 daemon.server.test.threaded server: EVENT LIST shows IRCX per-type subject mask...OK
+391/545 daemon.server.test.threaded server: IRCX EVENT CHANNEL mask is additive over oper announce feed...OK
+392/545 daemon.server.test.threaded server: IRCX EVENT hostmask mask is additive over oper announce feed...OK
+393/545 daemon.server.test.threaded server: IRCX EVENT CHANNEL receives real channel event...OK
+394/545 daemon.server.test.threaded server: IRCX EVENT MEMBER receives real membership event...OK
+395/545 daemon.server.test.threaded server: IRCX EVENT USER receives real user lifecycle event...OK
+396/545 daemon.server.test.threaded server: oper EVENT notes are tag-free chatsvc EVENT lines even with message-tags cap...OK
+397/545 daemon.server.test.threaded server: EVENT requires event_subscribe privilege...OK
+398/545 daemon.server.test.threaded server: REDACT broadcast + WARD alias oper events...OK
+399/545 daemon.server.test.threaded server: EDIT updates own message history and rejects others...OK
+400/545 daemon.server.test.threaded server: EDIT and REDACT notify only matching draft-cap recipients...OK
+401/545 daemon.server.test.threaded server: ACCEPT add + list...OK
+402/545 daemon.server.test.threaded server: +g callerid gates DM until sender is accepted...OK
+403/545 daemon.server.test.threaded server: METADATA set then get...OK
+404/545 daemon.server.test.threaded server: METADATA read visibility filters get and list...OK
+405/545 daemon.server.test.threaded server: METADATA requires draft metadata cap...OK
+406/545 daemon.server.test.threaded server: METADATA clear removes writable keys...OK
+407/545 daemon.server.test.threaded server: METADATA changes notify extended-monitor watchers...OK
+408/545 daemon.server.test.threaded server: WHOX field-selected reply...OK
+409/545 daemon.server.test.threaded server: WHO and WHOX emit no blank lines...OK
+410/545 daemon.server.test.threaded server: invisible users are hidden from WHO and ISON without common channel...OK
+411/545 daemon.server.test.threaded server: WHOIS hides secret and private channels from non-members...OK
+412/545 daemon.server.test.threaded server: WHOWAS count parameter bounds returned history...OK
+413/545 daemon.server.test.threaded server: MODE multi-flag batching in one command...OK
+414/545 daemon.server.test.threaded server: +p private + +h hidden channel flags...OK
+415/545 daemon.server.test.threaded server: CREATE makes founder channel...OK
+416/545 daemon.server.test.threaded server: CREATE clones template modes and rejects bad sources...OK
+417/545 daemon.server.test.threaded server: cloneable full channel auto-clones portable public room state...OK
+418/545 daemon.server.test.threaded server: HELP topic + unknown...OK
+419/545 daemon.server.test.threaded server: SILENCE add/list/remove...OK
+420/545 daemon.server.test.threaded server: CHATHISTORY records + replays channel messages...OK
+421/545 daemon.server.test.threaded server: SEARCH returns matching channel messages in a chathistory BATCH...OK
+422/545 daemon.server.test.threaded server: SEARCH delivers plain lines without the batch cap...OK
+423/545 daemon.server.test.threaded server: SEARCH multi-word AND narrows results...OK
+424/545 daemon.server.test.GAP-X2 threaded server: SEARCH rejects a non-member channel search...OK
+425/545 daemon.server.test.threaded server: SEARCH returns the requester's own DM history...OK
+426/545 daemon.server.test.GAP-X2 threaded server: SEARCH rate limit blocks a too-fast second search...OK
+427/545 daemon.server.test.threaded server: SEARCH omits a redacted message from results...SKIP
+428/545 daemon.server.test.GAP-X2 threaded server: SEARCH caps results at the maximum...GAP-X2 step3 branch=SEARCH command family moved behind the messaging thunk and the membership rate-limit and result cap still hold
+OK
+429/545 daemon.server.test.threaded server: CAP LS advertises draft/search...OK
+430/545 daemon.server.test.threaded server: history-policy prop gates CHATHISTORY for non-members...OK
+431/545 daemon.server.test.threaded server: history-policy denial emits POLICY event...OK
+432/545 daemon.server.test.threaded server: draft/event-playback replays TOPIC events only to capable clients...OK
+433/545 daemon.server.test.threaded server: event-playback replays JOIN, MODE, and KICK events...OK
+434/545 daemon.server.test.threaded server: event-playback replays NICK and QUIT events...OK
+435/545 daemon.server.test.threaded server: CHATHISTORY DM history follows accounts over reused nicks...OK
+436/545 daemon.server.test.threaded server: CHATHISTORY TARGETS lists active channels and DMs...OK
+437/545 daemon.server.test.threaded server: MARKREAD set then get...OK
+438/545 daemon.server.test.threaded server: JOIN pushes stored MARKREAD marker...OK
+439/545 daemon.server.test.threaded server: JOIN/PART comma-lists...OK
+440/545 daemon.server.test.threaded server: registered NICK change broadcasts + collision...OK
+441/545 daemon.server.test.threaded server: IRCv3 extended-join per-recipient format...OK
+442/545 daemon.server.test.threaded server: MONITOR online/offline/list end-to-end...OK
+443/545 daemon.server.test.threaded server: extended-monitor requires event-specific capability...OK
+444/545 daemon.server.test.threaded server: MONITOR online fanout flushes beyond fixed sink size...SKIP
+445/545 daemon.server.test.threaded server: live S2S listener completes a peer handshake...SKIP
+446/545 daemon.server.test.threaded server: oper CONNECT opens an outbound S2S link...OK
+447/545 daemon.server.test.threaded server: [mesh].connect auto-links two nodes without an oper...SKIP
+448/545 daemon.server.test.threaded server: LUSERS counts are consistent across shards...SKIP
+449/545 daemon.server.test.threaded server: reciprocal [mesh].connect survives redial sweeps...SKIP
+450/545 daemon.server.test.threaded server: an UNPROVEN cross-node same-account claim grants no coexistence relay (F1 fail-closed)...OK
+451/545 daemon.server.test.threaded server: one reusable session stays live and participatory across a secured mesh...OK
+452/545 daemon.server.test.threaded server: four-client reusable session survives sequential Helix upgrades across secured mesh...SKIP
+453/545 daemon.server.test.threaded server: reusable session stays exact-once across a three-node secured line...SKIP
+454/545 daemon.server.test.threaded server: inbound relay re-enforces local +n / +t against a remote actor...OK
+455/545 daemon.server.test.threaded server: WHISPER and DATA relay to a remote-shard channel co-member...OK
+456/545 daemon.server.test.threaded server: UPGRADE resume arena re-attaches a live TLS client...SKIP
+457/545 daemon.server.test.DPROP1 UPGRADE late malformed sessions failure preserves causal triplet and MeshClock...SKIP
+458/545 daemon.server.test.UPGRADE rejects SESSION_REPLICA Store from pre-manifest v1 predecessor...SKIP
+459/545 daemon.server.test.threaded server: UPGRADE resume arena re-dials a carried mesh peer...SKIP
+460/545 daemon.server.test.REHASH cert hot-reload: swaps live chain to rotated cert, frees prior reload gen, keeps boot certs...OK
+461/545 daemon.server.test.REHASH cert hot-reload: invalid cert path keeps current certs and errors...OK
+462/545 daemon.server.test.REHASH cert hot-reload: not configured when TLS is absent...OK
+463/545 daemon.server.test.REHASH applyReloadedLimits: swaps class registry + throttle without double-free...OK
+464/545 daemon.server.test.OCG2 REHASH reports every restart-only authority intent...OK
+465/545 daemon.server.test_0...OK
+466/545 daemon.services.test.account TOTP secret: put/get/delete persist across reopen; case-insensitive...OK
+467/545 daemon.sessions.test_0...OK
+468/545 daemon.svc_sessionview.test.formatter renders SESSION terminator as numeric...OK
+469/545 daemon.tls_certs.test_0...OK
+470/545 daemon.tls_conn.test_0...OK
+471/545 daemon.tls_sni_load.test_0...OK
+472/545 crypto.tls_server.test_0...OK
+473/545 crypto.tls_record.test_0...OK
+474/545 crypto.hkdf_tls13.test_0...OK
+475/545 crypto.hash.test_0...OK
+476/545 crypto.random.test_0...OK
+477/545 daemon.helix.session_replica.test.session replica revision comparison is a deterministic total order...OK
+478/545 daemon.helix.session_replica.test.session replica attachment lease round-trips and tampering fails closed...OK
+479/545 daemon.helix.session_replica.test.session replica attachment lease makes retained OFFER liveness explicit and ordered...OK
+480/545 daemon.helix.session_replica.test.session replica attachment lease conflict and allocation failure stay fail closed...OK
+481/545 daemon.helix.session_replica.test.session replica attachment lease replay floor rejects older live lease after newer expiry...OK
+482/545 daemon.helix.session_replica.test.session replica attachment lease conflict floor survives unequal expiry replay...OK
+483/545 daemon.helix.session_replica.test.session replica attachment lease conflict witnesses replay fail closed to a fresh store...OK
+484/545 daemon.helix.session_replica.test.session replica attachment lease conflict OOM checkpoint remains denied and recovers witness...OK
+485/545 daemon.helix.session_replica.test.session replica signed OFFER upsert round-trips and verifies...OK
+486/545 daemon.helix.session_replica.test.session replica OFFER rejects non-canonical mesh-clock revisions...OK
+487/545 daemon.helix.session_replica.test.session replica portable snapshot fits transport and boundary plus one rejects...OK
+488/545 daemon.helix.session_replica.test.session replica signed OFFER remove round-trips and canonical shape is enforced...OK
+489/545 daemon.helix.session_replica.test.session replica OFFER rejects signer-origin mismatch tampering truncation and trailing bytes...OK
+490/545 daemon.helix.session_replica.test.session replica OFFER decode rejects invalid operation and oversized declared fields...OK
+491/545 daemon.helix.session_replica.test.session replica signed ACK round-trips verifies and rejects tampering...OK
+492/545 daemon.helix.session_replica.test.session replica ACK rejects non-canonical offered and observed revisions...OK
+493/545 daemon.helix.session_replica.test.session replica ACK signer must self-certify ack node and wire has no trailing tolerance...OK
+494/545 daemon.helix.session_replica.test.session replica every single-byte OFFER and ACK corruption fails closed...OK
+495/545 daemon.helix.session_replica.test.session replica store distinguishes duplicate conflict stale and supersede without mutation leaks...OK
+496/545 daemon.helix.session_replica.test.session replica cross-node equal-clock origins coexist and best identity is deterministic...OK
+497/545 daemon.helix.session_replica.test.session replica A B C attachments preserve independent origins paths and removal...OK
+498/545 daemon.helix.session_replica.test.session replica retained canonical wire replays OFFER and REVOKE after origin loss...OK
+499/545 daemon.helix.session_replica.test.session replica retained enumeration is bounded across concurrent origins...OK
+500/545 daemon.helix.session_replica.test.session replica retained value cursor survives 182 objects replacement and rehash...OK
+501/545 daemon.helix.session_replica.test.session replica retained value cursor orders all kinds and conflict witnesses...OK
+502/545 daemon.helix.session_replica.test.session replica live token pages are unique stable and fair after cursor disappearance...OK
+503/545 daemon.helix.session_replica.test.session replica stored token and live origin pages preserve expiry cleanup keys...OK
+504/545 daemon.helix.session_replica.test.session replica authority token pages include revoke and quarantine retry keys...OK
+505/545 daemon.helix.session_replica.test.session replica nick revisions evolve until account conflict quarantines the token...OK
+506/545 daemon.helix.session_replica.test.session replica cross-origin account permutations converge on portable quarantine evidence...OK
+507/545 daemon.helix.session_replica.test.session replica all lifecycle arrival permutations converge after a higher revision...OK
+508/545 daemon.helix.session_replica.test.session replica all A B C authority permutations converge independently...OK
+509/545 daemon.helix.session_replica.test.session replica remove creates a bounded tombstone blocks replay and yields to a newer upsert...OK
+510/545 daemon.helix.session_replica.test.session replica same revision remove versus upsert picks deterministic digest...OK
+511/545 daemon.helix.session_replica.test.session replica equivocation permutations retain the same canonical winner...OK
+512/545 daemon.helix.session_replica.test.session replica entry route and tombstone bounds fail closed...OK
+513/545 daemon.helix.session_replica.test.session replica store rejects expired overlong and far-future offers without mutation...OK
+514/545 daemon.helix.session_replica.test.session replica signed ACK is authenticated receipt metadata and never a route...OK
+515/545 daemon.helix.session_replica.test.session replica ACK ignores route capacity and rejects expiry and revision mismatch...OK
+516/545 daemon.helix.session_replica.test.session replica line and triangle reflections never create OFFER or ACK route loops...OK
+517/545 daemon.helix.session_replica.test.session replica peer loss drops the pinned route and old revision cannot reparent...OK
+518/545 daemon.helix.session_replica.test.session replica sweep expires entries routes and tombstones at their exact boundaries...OK
+519/545 daemon.helix.session_replica.test.session replica sweep removes only the expired origin and its paths...OK
+520/545 daemon.helix.session_replica.test.session replica routesInto reports bounded route values...OK
+521/545 daemon.helix.session_replica.test.session replica insertion is leak-clean at every allocation failure...OK
+522/545 daemon.helix.session_replica.test.session replica concurrent origin insertion is transactional at every allocation failure...OK
+523/545 daemon.helix.session_replica.test.session replica hot lookups cover max origins without allocation and filter expiry...OK
+524/545 daemon.helix.session_replica.test.session replica unique origin nick lookup is live ambiguity and quarantine safe...OK
+525/545 daemon.helix.session_replica.test.session replica retained REVOKE replacement is transactional at every allocation failure...OK
+526/545 daemon.helix.session_replica.test.session replica deterministic equivocation replacement is transactional at every allocation failure...OK
+527/545 daemon.helix.session_replica.test.session replica account quarantine is fail-closed at every allocation failure...OK
+528/545 daemon.helix.session_replica.test.session replica upgrade checkpoint preserves exact authority and deny state without routes...OK
+529/545 daemon.helix.session_replica.test.session replica upgrade checkpoint v2 preserves attachment leases and accepts v1...OK
+530/545 daemon.helix.session_replica.test.session replica upgrade checkpoint strictly rejects truncation corruption duplicates and excess capacity...OK
+531/545 daemon.helix.session_replica.test.session replica upgrade checkpoint replacement is atomic under capacity corruption and OOM...OK
+532/545 daemon.helix.session_replica.test.session replica upgrade checkpoint sweeps at restore time and tolerates wall rollback...OK
+533/545 daemon.helix.session_replica.test.session replica upgrade checkpoint restore is leak-free at every allocation failure...OK
+534/545 daemon.helix.session_replica.test.session replica max authority revision scans entries tombstones quarantine and fallback rows...OK
+535/545 crypto.kx.test_0...OK
+536/545 crypto.totp.test.RFC 6238 TOTP SHA1 SHA256 SHA512 test vectors...OK
+537/545 crypto.xwing.test_0...OK
+538/545 crypto.tls_client.test_0...OK
+539/545 crypto.sct.test_0...OK
+540/545 crypto.aead.test_0...OK
+541/545 crypto.ecdsa_kat.test_0...OK
+542/545 crypto.ed25519_batch.test_0...OK
+543/545 crypto.sign_kat.test_0...OK
+544/545 crypto.tls_props.test_0...OK
+545/545 crypto.tls.test_0...OK
+449 passed; 96 skipped; 0 failed.

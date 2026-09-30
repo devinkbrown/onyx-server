@@ -32,12 +32,14 @@
 //! reactor thread and `drain()` runs on the io_uring loop, neither of which may
 //! stall. (Semaphore mode would force one read per write and is the wrong fit.)
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 
 /// Single-owner cross-reactor wakeup handle wrapping one `eventfd`.
 pub const ReactorWake = struct {
     /// The eventfd. Owned by this `ReactorWake`; closed in `deinit`.
     handle: linux.fd_t,
+    write_handle: linux.fd_t = -1,
 
     /// The 8-byte payload `wake()` writes. Any non-zero value works; `1` keeps
     /// the counter from overflowing in practice (`UINT64_MAX - 1` writes would
@@ -46,6 +48,24 @@ pub const ReactorWake = struct {
 
     /// Create a nonblocking, non-semaphore eventfd with the counter at zero.
     pub fn init() error{ReactorWakeUnsupported}!ReactorWake {
+        if (comptime builtin.os.tag != .linux) {
+            if (comptime builtin.os.tag != .openbsd and builtin.os.tag != .freebsd and
+                builtin.os.tag != .netbsd and builtin.os.tag != .dragonfly) return error.ReactorWakeUnsupported;
+            var sockets: [2]std.c.fd_t = undefined;
+            if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0) return error.ReactorWakeUnsupported;
+            errdefer {
+                for (sockets) |sock| _ = std.c.close(sock);
+            }
+            for (sockets) |sock| {
+                const flags = std.c.fcntl(sock, @as(c_int, 3), @as(c_int, 0));
+                if (flags < 0 or std.c.fcntl(sock, @as(c_int, 4), flags | @as(c_int, 4)) < 0)
+                    return error.ReactorWakeUnsupported;
+                const fdflags = std.c.fcntl(sock, @as(c_int, 1), @as(c_int, 0));
+                if (fdflags < 0 or std.c.fcntl(sock, @as(c_int, 2), fdflags | @as(c_int, 1)) < 0)
+                    return error.ReactorWakeUnsupported;
+            }
+            return .{ .handle = sockets[0], .write_handle = sockets[1] };
+        }
         const rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
         switch (linux.errno(rc)) {
             .SUCCESS => return .{ .handle = @intCast(rc) },
@@ -57,6 +77,13 @@ pub const ReactorWake = struct {
 
     /// Close the underlying eventfd. Idempotent only if not called twice.
     pub fn deinit(self: *ReactorWake) void {
+        if (comptime builtin.os.tag != .linux) {
+            _ = std.c.close(self.handle);
+            _ = std.c.close(self.write_handle);
+            self.handle = -1;
+            self.write_handle = -1;
+            return;
+        }
         _ = linux.close(self.handle);
         self.handle = -1;
     }
@@ -73,6 +100,13 @@ pub const ReactorWake = struct {
     /// dropped increment changes nothing. All other errnos are ignored too: a
     /// failed wake must never propagate up the foreign reactor's hot path.
     pub fn wake(self: ReactorWake) void {
+        if (comptime builtin.os.tag != .linux) {
+            const byte = [_]u8{1};
+            while (std.c.send(self.write_handle, &byte, 1, std.c.MSG.NOSIGNAL) < 0) {
+                if (std.c._errno().* != @as(c_int, @intFromEnum(std.posix.E.INTR))) break;
+            }
+            return;
+        }
         const bytes = std.mem.asBytes(&wake_token);
         const rc = linux.write(self.handle, bytes.ptr, bytes.len);
         switch (linux.errno(rc)) {
@@ -88,6 +122,18 @@ pub const ReactorWake = struct {
     /// read drains the whole accumulated counter to zero (non-semaphore mode).
     /// `EAGAIN` is tolerated — a spurious drain (counter already zero) is benign.
     pub fn drain(self: ReactorWake) void {
+        if (comptime builtin.os.tag != .linux) {
+            var bytes: [512]u8 = undefined;
+            // Bound work under continuous producers; remaining bytes preserve
+            // level readiness when the owning reactor rearms its poll.
+            for (0..64) |_| {
+                const rc = std.c.recv(self.handle, &bytes, bytes.len, 0);
+                if (rc > 0) continue;
+                if (rc < 0 and std.c._errno().* == @as(c_int, @intFromEnum(std.posix.E.INTR))) continue;
+                break;
+            }
+            return;
+        }
         var scratch: u64 = 0;
         const bytes = std.mem.asBytes(&scratch);
         const rc = linux.read(self.handle, bytes.ptr, bytes.len);
@@ -147,6 +193,7 @@ pub fn WakeSet(comptime num_shards: usize) type {
 const testing = std.testing;
 
 test "wake increments the eventfd counter and drain clears it" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var w = ReactorWake.init() catch return error.SkipZigTest;
     defer w.deinit();
 
@@ -161,6 +208,7 @@ test "wake increments the eventfd counter and drain clears it" {
 }
 
 test "multiple wakes coalesce into a single drainable counter" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var w = ReactorWake.init() catch return error.SkipZigTest;
     defer w.deinit();
 
@@ -187,6 +235,7 @@ test "drain on an empty eventfd is a tolerated no-op" {
 }
 
 test "wake from another thread is observed by the owning reactor" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var w = ReactorWake.init() catch return error.SkipZigTest;
     defer w.deinit();
 
@@ -212,6 +261,7 @@ test "wake from another thread is observed by the owning reactor" {
 }
 
 test "WakeSet routes wake and drain per shard" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const num_shards = 4;
     var set = WakeSet(num_shards).init() catch return error.SkipZigTest;
     defer set.deinit();
@@ -247,4 +297,29 @@ test "WakeSet exposes one distinct fd per shard" {
             try testing.expect(seen[i] != seen[j]);
         }
     }
+}
+
+test "BSD reactor wake: thread wake readiness coalesces without blocking or fd leaks" {
+    if (comptime builtin.os.tag != .openbsd and builtin.os.tag != .freebsd and
+        builtin.os.tag != .netbsd and builtin.os.tag != .dragonfly) return error.SkipZigTest;
+    var wake = try ReactorWake.init();
+    defer wake.deinit();
+    for ([_]i32{ wake.handle, wake.write_handle }) |fd| {
+        try testing.expect(std.c.fcntl(fd, @as(c_int, 1), @as(c_int, 0)) & 1 != 0);
+        try testing.expect(std.c.fcntl(fd, @as(c_int, 3), @as(c_int, 0)) & 4 != 0);
+    }
+    const Worker = struct {
+        fn run(target: *ReactorWake) void {
+            for (0..32768) |_| target.wake();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&wake});
+    thread.join();
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(@as(isize, 1), std.c.recv(wake.fd(), &byte, 1, 0));
+    wake.drain();
+    try testing.expectEqual(@as(isize, -1), std.c.recv(wake.fd(), &byte, 1, 0));
+    try testing.expectEqual(@as(c_int, @intFromEnum(std.posix.E.AGAIN)), std.c._errno().*);
+    wake.wake();
+    try testing.expectEqual(@as(isize, 1), std.c.recv(wake.fd(), &byte, 1, 0));
 }

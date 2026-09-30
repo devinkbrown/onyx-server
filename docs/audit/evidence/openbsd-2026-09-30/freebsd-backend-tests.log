@@ -1,0 +1,79 @@
+FreeBSD onyx-fbsd 14.5-RELEASE-p1 FreeBSD 14.5-RELEASE-p1 releng/14.5-n274884-231eee334c09 GENERIC amd64
+1/77 root.test_0...OK
+2/77 crypto.root.test_0...OK
+3/77 daemon.root.test_0...OK
+4/77 proto.root.test_0...OK
+5/77 substrate.root.test_0...OK
+6/77 wasm.host.root.test_0...OK
+7/77 substrate.io.root.test_0...OK
+8/77 substrate.ripple_props.test_0...OK
+9/77 substrate.ripple.test_0...OK
+10/77 substrate.undertow.root.test_0...OK
+11/77 substrate.undertow.peer_link.test_0...OK
+12/77 substrate.io.buf_ring.test_0...OK
+13/77 substrate.io.ring.test_0...OK
+14/77 proto.asn1_time.test_0...OK
+15/77 proto.certfp.test_0...OK
+16/77 proto.cloak.test_0...OK
+17/77 proto.ircx_modex.test_0...OK
+18/77 proto.ircx_saccess.test_0...OK
+19/77 proto.listx.test_0...OK
+20/77 proto.mooring.test_0...OK
+21/77 proto.mooring_props.test_0...OK
+22/77 proto.quic_handshake.test_0...OK
+23/77 proto.quic_transport_params.test_0...OK
+24/77 proto.sasl_external_verify.test_0...OK
+25/77 proto.sasl_mechrouter.test_0...OK
+26/77 proto.sasl_oauthbearer.test_0...OK
+27/77 proto.sasl.test_0...OK
+28/77 proto.sasl_scram512_server.test_0...OK
+29/77 proto.sasl_scram.test_0...OK
+30/77 proto.sasl_scram_server.test_0...OK
+31/77 proto.signed_delta.test_0...OK
+32/77 proto.toml.test_0...OK
+33/77 proto.x509.test_0...OK
+34/77 daemon.io_backend.test.kqueue: full change batch preserves the armed buffer and permits retry...OK
+35/77 daemon.io_backend.test.kqueue: dual poll allocation failure is atomic...OK
+36/77 daemon.io_backend.test.kqueue: colliding poll token cannot replace or cancel the original registration...OK
+37/77 daemon.io_backend.test.BSD kqueue: poll recv cancel and timeout preserve operation identities...OK
+38/77 daemon.io_backend.test.BSD kqueue: broken-peer send survives default SIGPIPE disposition...OK
+39/77 daemon.io_backend.test.BSD kqueue: accepted socket is nonblocking and close-on-exec...OK
+40/77 daemon.modules.manifest.test_0...OK
+41/77 daemon.key_transparency.test_0...OK
+42/77 daemon.acme_cli.test_0...OK
+43/77 daemon.acme_http01_listener.test_0...OK
+44/77 daemon.acme_renewal.test_0...OK
+45/77 daemon.acme_runner.test_0...OK
+46/77 daemon.config_format.test_0...OK
+47/77 daemon.helix.root.test_0...OK
+48/77 daemon.metrics_http.test_0...OK
+49/77 daemon.webhook.test_0...OK
+50/77 daemon.webhook_render.test_0...OK
+51/77 daemon.webhook_http.test_0...OK
+52/77 daemon.oauth_jwt.test_0...OK
+53/77 daemon.ocsp_staple.test_0...OK
+54/77 daemon.reactor_pool.test_0...OK
+55/77 daemon.sasl_bridge.test_0...OK
+56/77 daemon.scram_store.test_0...OK
+57/77 daemon.server.test_0...OK
+58/77 daemon.sessions.test_0...OK
+59/77 daemon.tls_certs.test_0...OK
+60/77 daemon.tls_conn.test_0...OK
+61/77 daemon.tls_sni_load.test_0...OK
+62/77 crypto.tls_server.test_0...OK
+63/77 crypto.tls_record.test_0...OK
+64/77 crypto.hkdf_tls13.test_0...OK
+65/77 crypto.hash.test_0...OK
+66/77 crypto.random.test_0...OK
+67/77 crypto.kx.test_0...OK
+68/77 crypto.sign.test_0...OK
+69/77 crypto.xwing.test_0...OK
+70/77 crypto.sct.test_0...OK
+71/77 crypto.tls_client.test_0...OK
+72/77 crypto.aead.test_0...OK
+73/77 crypto.ecdsa_kat.test_0...OK
+74/77 crypto.ed25519_batch.test_0...OK
+75/77 crypto.sign_kat.test_0...OK
+76/77 crypto.tls_props.test_0...OK
+77/77 crypto.tls.test_0...OK
+All 77 tests passed.

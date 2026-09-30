@@ -1,0 +1,8 @@
+CONSOLIDATED ReleaseSafe pinned SHA256=9e083f445abc3b5d97036e58a121270a914db5ecbfbdced3ee1e79a1eb38d975
+Pinned native daemon SHA256=9e083f445abc3b5d97036e58a121270a914db5ecbfbdced3ee1e79a1eb38d975
+PASS 40 original IPv4/IPv6 all transport attachments
+PASS rejected candidate: same predecessor and 40 original sockets alive
+PASS upgrade 1: PID 31183->80481; all original sockets retained; 39 single deliveries observed through the drain window
+PASS upgrade 2: PID 80481->56288; all original sockets retained; 39 single deliveries observed through the drain window
+PROBE_EXIT=0
+CLEANUP owned primary stopped; forwards absent; identity restored; artifact pin retained

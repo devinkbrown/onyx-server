@@ -1,0 +1,178 @@
+1/88 root.test_0...OK
+2/88 crypto.root.test_0...OK
+3/88 daemon.root.test_0...OK
+4/88 proto.root.test_0...OK
+5/88 substrate.root.test_0...OK
+6/88 wasm.host.root.test_0...OK
+7/88 substrate.io.root.test_0...OK
+8/88 substrate.ripple_props.test_0...OK
+9/88 substrate.ripple.test_0...OK
+10/88 substrate.undertow.root.test_0...OK
+11/88 substrate.undertow.peer_link.test_0...OK
+12/88 substrate.io.buf_ring.test_0...OK
+13/88 substrate.io.ring.test_0...OK
+14/88 proto.asn1_time.test_0...OK
+15/88 proto.certfp.test_0...OK
+16/88 proto.cloak.test_0...OK
+17/88 proto.dns.test.DNS CNAME answer ownership follows canonical target and rejects unrelated cycles...OK
+18/88 proto.dns.test.DNS native resolver forward reverse and confirmation use IPv4 and IPv6 UDP...OK
+19/88 proto.ircx_modex.test_0...OK
+20/88 proto.ircx_saccess.test_0...OK
+21/88 proto.listx.test_0...OK
+22/88 proto.mooring.test_0...OK
+23/88 proto.mooring_props.test_0...OK
+24/88 proto.quic_handshake.test_0...OK
+25/88 proto.quic_transport_params.test_0...OK
+26/88 proto.sasl_external_verify.test_0...OK
+27/88 proto.sasl_mechrouter.test_0...OK
+28/88 proto.sasl_oauthbearer.test_0...OK
+29/88 proto.sasl.test_0...OK
+30/88 proto.sasl_scram512_server.test_0...OK
+31/88 proto.sasl_scram.test_0...OK
+32/88 proto.sasl_scram_server.test_0...OK
+33/88 proto.signed_delta.test_0...OK
+34/88 proto.toml.test_0...OK
+35/88 proto.x509.test_0...OK
+36/88 daemon.modules.manifest.test_0...OK
+37/88 daemon.key_transparency.test_0...OK
+38/88 daemon.acme_cli.test_0...OK
+39/88 daemon.acme_http01_listener.test.ChallengeServer serves a stored token over loopback...OK
+40/88 daemon.acme_http01_listener.test.ChallengeServer returns 404 for unknown token...OK
+41/88 daemon.acme_http01_listener.test_0...OK
+42/88 daemon.acme_renewal.test_0...OK
+43/88 daemon.acme_runner.test_0...OK
+44/88 daemon.config_format.test_0...OK
+45/88 daemon.helix.root.test_0...OK
+46/88 daemon.http_fetch.test.parseUrl splits scheme/host/port/path with defaults...OK
+47/88 daemon.http_fetch.test.http_fetch Options default CT and CRL policy is fail-open...OK
+48/88 daemon.http_fetch.test.GAP-K6 CRL and CT callers pass DER and the fetch defaults stay fail-open...OK
+49/88 daemon.http_fetch.test.http_fetch native loopback request timeout entropy and descriptor failure...OK
+50/88 daemon.http_fetch.test.http_fetch native DNS UDP transport binds replies to query identity...OK
+51/88 daemon.metrics_http.test.MetricsServer serves the snapshot over loopback...OK
+52/88 daemon.metrics_http.test_0...OK
+53/88 daemon.webhook.test_0...OK
+54/88 daemon.webhook_render.test_0...OK
+55/88 daemon.webhook_http.test.WebhookServer installs finite lifecycle timeouts even when configured zero...OK
+56/88 daemon.webhook_http.test.WebhookServer transient accept errors use bounded exponential backoff...OK
+57/88 daemon.webhook_http.test.WebhookServer serves a POST over loopback and enqueues a post...OK
+58/88 daemon.webhook_http.test.WebhookServer pause and resume retain the port and handle each POST once...OK
+59/88 daemon.webhook_http.test.WebhookServer concurrent pause and resume never leave a duplicate producer...OK
+60/88 daemon.webhook_http.test.WebhookServer answers 411 promptly for a length-less POST body over loopback...OK
+61/88 daemon.webhook_http.test_0...OK
+62/88 daemon.webhook_http.test.WebhookServer pause and whole request deadline stop an active dribble before publication...OK
+63/88 daemon.oauth_jwt.test_0...OK
+64/88 daemon.ocsp_staple.test_0...OK
+65/88 daemon.reactor_pool.test_0...OK
+66/88 daemon.sasl_bridge.test_0...OK
+67/88 daemon.scram_store.test_0...OK
+68/88 daemon.server.test_0...OK
+69/88 daemon.sessions.test_0...OK
+70/88 daemon.tls_certs.test_0...OK
+71/88 daemon.tls_conn.test_0...OK
+72/88 daemon.tls_sni_load.test_0...OK
+73/88 crypto.tls_server.test_0...OK
+74/88 crypto.tls_record.test_0...OK
+75/88 crypto.hkdf_tls13.test_0...OK
+76/88 crypto.hash.test_0...OK
+77/88 crypto.random.test_0...OK
+78/88 crypto.kx.test_0...OK
+79/88 crypto.sign.test_0...OK
+80/88 crypto.xwing.test_0...OK
+81/88 crypto.sct.test_0...OK
+82/88 crypto.tls_client.test_0...OK
+83/88 crypto.aead.test_0...OK
+84/88 crypto.ecdsa_kat.test_0...OK
+85/88 crypto.ed25519_batch.test_0...OK
+86/88 crypto.sign_kat.test_0...OK
+87/88 crypto.tls_props.test_0...OK
+88/88 crypto.tls.test_0...OK
+All 88 tests passed.
+1/88 root.test_0...OK
+2/88 crypto.root.test_0...OK
+3/88 daemon.root.test_0...OK
+4/88 proto.root.test_0...OK
+5/88 substrate.root.test_0...OK
+6/88 wasm.host.root.test_0...OK
+7/88 substrate.io.root.test_0...OK
+8/88 substrate.ripple_props.test_0...OK
+9/88 substrate.ripple.test_0...OK
+10/88 substrate.undertow.root.test_0...OK
+11/88 substrate.undertow.peer_link.test_0...OK
+12/88 substrate.io.buf_ring.test_0...OK
+13/88 substrate.io.ring.test_0...OK
+14/88 proto.asn1_time.test_0...OK
+15/88 proto.certfp.test_0...OK
+16/88 proto.cloak.test_0...OK
+17/88 proto.dns.test.DNS CNAME answer ownership follows canonical target and rejects unrelated cycles...OK
+18/88 proto.dns.test.DNS native resolver forward reverse and confirmation use IPv4 and IPv6 UDP...OK
+19/88 proto.ircx_modex.test_0...OK
+20/88 proto.ircx_saccess.test_0...OK
+21/88 proto.listx.test_0...OK
+22/88 proto.mooring.test_0...OK
+23/88 proto.mooring_props.test_0...OK
+24/88 proto.quic_handshake.test_0...OK
+25/88 proto.quic_transport_params.test_0...OK
+26/88 proto.sasl_external_verify.test_0...OK
+27/88 proto.sasl_mechrouter.test_0...OK
+28/88 proto.sasl_oauthbearer.test_0...OK
+29/88 proto.sasl.test_0...OK
+30/88 proto.sasl_scram512_server.test_0...OK
+31/88 proto.sasl_scram.test_0...OK
+32/88 proto.sasl_scram_server.test_0...OK
+33/88 proto.signed_delta.test_0...OK
+34/88 proto.toml.test_0...OK
+35/88 proto.x509.test_0...OK
+36/88 daemon.modules.manifest.test_0...OK
+37/88 daemon.key_transparency.test_0...OK
+38/88 daemon.acme_cli.test_0...OK
+39/88 daemon.acme_http01_listener.test.ChallengeServer serves a stored token over loopback...OK
+40/88 daemon.acme_http01_listener.test.ChallengeServer returns 404 for unknown token...OK
+41/88 daemon.acme_http01_listener.test_0...OK
+42/88 daemon.acme_renewal.test_0...OK
+43/88 daemon.acme_runner.test_0...OK
+44/88 daemon.config_format.test_0...OK
+45/88 daemon.helix.root.test_0...OK
+46/88 daemon.http_fetch.test.parseUrl splits scheme/host/port/path with defaults...OK
+47/88 daemon.http_fetch.test.http_fetch Options default CT and CRL policy is fail-open...OK
+48/88 daemon.http_fetch.test.GAP-K6 CRL and CT callers pass DER and the fetch defaults stay fail-open...OK
+49/88 daemon.http_fetch.test.http_fetch native loopback request timeout entropy and descriptor failure...OK
+50/88 daemon.http_fetch.test.http_fetch native DNS UDP transport binds replies to query identity...OK
+51/88 daemon.metrics_http.test.MetricsServer serves the snapshot over loopback...OK
+52/88 daemon.metrics_http.test_0...OK
+53/88 daemon.webhook.test_0...OK
+54/88 daemon.webhook_render.test_0...OK
+55/88 daemon.webhook_http.test.WebhookServer installs finite lifecycle timeouts even when configured zero...OK
+56/88 daemon.webhook_http.test.WebhookServer transient accept errors use bounded exponential backoff...OK
+57/88 daemon.webhook_http.test.WebhookServer serves a POST over loopback and enqueues a post...OK
+58/88 daemon.webhook_http.test.WebhookServer pause and resume retain the port and handle each POST once...OK
+59/88 daemon.webhook_http.test.WebhookServer concurrent pause and resume never leave a duplicate producer...OK
+60/88 daemon.webhook_http.test.WebhookServer answers 411 promptly for a length-less POST body over loopback...OK
+61/88 daemon.webhook_http.test_0...OK
+62/88 daemon.webhook_http.test.WebhookServer pause and whole request deadline stop an active dribble before publication...OK
+63/88 daemon.oauth_jwt.test_0...OK
+64/88 daemon.ocsp_staple.test_0...OK
+65/88 daemon.reactor_pool.test_0...OK
+66/88 daemon.sasl_bridge.test_0...OK
+67/88 daemon.scram_store.test_0...OK
+68/88 daemon.server.test_0...OK
+69/88 daemon.sessions.test_0...OK
+70/88 daemon.tls_certs.test_0...OK
+71/88 daemon.tls_conn.test_0...OK
+72/88 daemon.tls_sni_load.test_0...OK
+73/88 crypto.tls_server.test_0...OK
+74/88 crypto.tls_record.test_0...OK
+75/88 crypto.hkdf_tls13.test_0...OK
+76/88 crypto.hash.test_0...OK
+77/88 crypto.random.test_0...OK
+78/88 crypto.kx.test_0...OK
+79/88 crypto.sign.test_0...OK
+80/88 crypto.xwing.test_0...OK
+81/88 crypto.sct.test_0...OK
+82/88 crypto.tls_client.test_0...OK
+83/88 crypto.aead.test_0...OK
+84/88 crypto.ecdsa_kat.test_0...OK
+85/88 crypto.ed25519_batch.test_0...OK
+86/88 crypto.sign_kat.test_0...OK
+87/88 crypto.tls_props.test_0...OK
+88/88 crypto.tls.test_0...OK
+All 88 tests passed.

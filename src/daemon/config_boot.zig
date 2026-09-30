@@ -581,6 +581,61 @@ pub fn configCheckError(io: IoBootConfig, ktls: config_format.Config.KtlsMode) ?
     return null;
 }
 
+/// PortableServer currently opens only the plaintext IRC listener. Refuse
+/// configured transports before certificate loading or listener advertising.
+/// This predicate is shared by preflight and normal boot.
+pub fn portableTransportError(os: std.Target.Os.Tag, cfg: config_format.Config) ?[]const u8 {
+    if (os == .linux or os == .openbsd) return null;
+    if (cfg.tls.enabled) return "the portable reactor does not support a TLS listener yet";
+    if (cfg.listen.ws != 0) return "the portable reactor does not support a WebSocket listener yet";
+    if (cfg.sts.enabled) return "the portable reactor cannot advertise STS without a supported TLS listener";
+    if (cfg.listen.s2s != 0 or cfg.mesh.connect.len != 0)
+        return "the portable reactor does not support mesh listeners or dialing yet";
+    if (cfg.listen.webtransport != 0) return "the portable reactor does not support a WebTransport listener yet";
+    if (cfg.listen.media != 0 or cfg.listen.native_media != 0)
+        return "the portable reactor does not support media listeners yet";
+    if (cfg.metrics.listen != 0) return "the portable reactor does not support a metrics listener yet";
+    if (cfg.listen.proxy_protocol) return "the portable reactor does not support PROXY protocol headers yet";
+    return null;
+}
+
+test "GAP-X1 portable preflight refuses unsupported listener intent" {
+    var cfg: config_format.Config = .{};
+    try std.testing.expect(portableTransportError(.openbsd, cfg) == null);
+    cfg.tls.enabled = true;
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    try std.testing.expect(portableTransportError(.linux, cfg) == null);
+    cfg.tls.enabled = false;
+    cfg.listen.ws = 443;
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    cfg.listen.ws = 0;
+    cfg.sts.enabled = true;
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    cfg.sts.enabled = false;
+    cfg.listen.s2s = 6900;
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    cfg.listen.s2s = 0;
+    cfg.mesh.connect = &.{"peer.example:6900"};
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    cfg.mesh.connect = &.{};
+    cfg.listen.webtransport = 4433;
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    cfg.listen.webtransport = 0;
+    cfg.listen.media = 5000;
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    cfg.listen.media = 0;
+    cfg.listen.native_media = 5001;
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    cfg.listen.native_media = 0;
+    cfg.metrics.listen = 9130;
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    cfg.metrics.listen = 0;
+    cfg.listen.proxy_protocol = true;
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    try std.testing.expect(portableTransportError(.linux, cfg) == null);
+    try std.testing.expect(portableTransportError(.openbsd, cfg) == null);
+}
+
 /// A configured `[mesh].connect` peer is a mesh neighbor. v2 authoring, oper
 /// grants, and Event Spine v2 run on a Mooring SecuredLink, so `--check-config`
 /// and boot refuse a dial list left with `require_secured` false. An empty

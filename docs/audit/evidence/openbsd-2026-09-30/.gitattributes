@@ -1,0 +1,2 @@
+# Preserve exact command stdout/stderr, including terminal CR and final blank lines.
+*.log -whitespace

@@ -373,6 +373,7 @@ fn sleepInterruptible(total_ms: u64, stop_flag: *std.atomic.Value(bool)) bool {
 }
 
 fn sleepMs(ms: u32) void {
+    if (comptime @import("builtin").os.tag != .linux) return @import("os_runtime.zig").sleepMillis(ms);
     var req = linux.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
     _ = linux.nanosleep(&req, null);
 }
@@ -442,6 +443,10 @@ const OcspStub = struct {
 };
 
 fn ocspWriteAll(fd: linux.fd_t, bytes: []const u8) void {
+    if (comptime @import("builtin").os.tag == .openbsd) {
+        @import("native_network.zig").writeAll(fd, bytes) catch {};
+        return;
+    }
     var off: usize = 0;
     while (off < bytes.len) {
         const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
@@ -453,6 +458,10 @@ fn ocspWriteAll(fd: linux.fd_t, bytes: []const u8) void {
 }
 
 fn ocspListenLoopback() !struct { fd: linux.fd_t, port: u16 } {
+    if (comptime @import("builtin").os.tag == .openbsd) {
+        const opened = try @import("io_backend.zig").listenTcp("127.0.0.1", 0);
+        return .{ .fd = opened.fd, .port = opened.port };
+    }
     const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
     if (posix.errno(rc) != .SUCCESS) return error.Socket;
     const fd: linux.fd_t = @intCast(rc);
@@ -473,16 +482,24 @@ fn ocspListenLoopback() !struct { fd: linux.fd_t, port: u16 } {
 }
 
 fn ocspStubServe(alloc: std.mem.Allocator, fd: linux.fd_t, stub: *OcspStub) void {
-    defer _ = linux.close(fd);
-    const rtv = linux.timeval{ .sec = 2, .usec = 0 };
-    _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&rtv), @sizeOf(linux.timeval));
+    defer @import("io_backend.zig").closeSocket(fd);
+    if (comptime @import("builtin").os.tag == .openbsd) {
+        @import("native_network.zig").setBlocking(fd) catch return;
+        @import("native_network.zig").setTimeout(fd, 2000) catch return;
+    } else {
+        const rtv = linux.timeval{ .sec = 2, .usec = 0 };
+        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&rtv), @sizeOf(linux.timeval));
+    }
     var conn = tls_conn.TlsConn.init(alloc, .{ .cert_chain = &.{stub.der}, .signing_key = stub.kp }) catch return;
     defer conn.deinit();
     var buf: [16 * 1024]u8 = undefined;
     var plain_acc: [4096]u8 = undefined;
     var plain_len: usize = 0;
     while (!stub.stop.load(.acquire)) {
-        const rc = linux.read(fd, &buf, buf.len);
+        const rc = if (comptime @import("builtin").os.tag == .openbsd)
+            std.c.read(fd, &buf, buf.len)
+        else
+            linux.read(fd, &buf, buf.len);
         if (posix.errno(rc) != .SUCCESS) return;
         const n: usize = @intCast(rc);
         if (n == 0) return;
@@ -521,6 +538,24 @@ fn ocspStubAccept(stub: *OcspStub) void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
+    if (comptime @import("builtin").os.tag == .openbsd) {
+        while (!stub.stop.load(.acquire)) {
+            var ready = [_]posix.pollfd{.{ .fd = stub.listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+            const polled = std.c.poll(&ready, 1, 50);
+            if (polled < 0) {
+                if (posix.errno(polled) == .INTR) continue;
+                return;
+            }
+            if (polled == 0) continue;
+            const fd = std.c.accept(stub.listen_fd, null, null);
+            switch (posix.errno(fd)) {
+                .SUCCESS => ocspStubServe(alloc, fd, stub),
+                .AGAIN, .INTR, .CONNABORTED => continue,
+                else => return,
+            }
+        }
+        return;
+    }
     const tv = linux.timeval{ .sec = 0, .usec = 200_000 };
     _ = linux.setsockopt(stub.listen_fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
     while (!stub.stop.load(.acquire)) {
@@ -534,7 +569,7 @@ fn ocspStubAccept(stub: *OcspStub) void {
 }
 
 test "tls ocsp fetch uses the daemon trust store and a bad certificate keeps the previous staple" {
-    if (comptime @import("builtin").os.tag != .linux) return;
+    if (comptime @import("builtin").os.tag != .linux and @import("builtin").os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     const good_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x41)));
@@ -547,7 +582,7 @@ test "tls ocsp fetch uses the daemon trust store and a bad certificate keeps the
         .not_after = 4_102_444_800,
         .serial = &.{ 0x01, 0x02 },
         .key_pair = good_kp,
-        .dns_names = &.{"127.0.0.1"},
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
         .is_ca = true,
     });
     const bad_der = try x509_selfsign.buildSelfSigned(&bad_buf, .{
@@ -556,7 +591,7 @@ test "tls ocsp fetch uses the daemon trust store and a bad certificate keeps the
         .not_after = 4_102_444_800,
         .serial = &.{ 0x03, 0x04 },
         .key_pair = bad_kp,
-        .dns_names = &.{"127.0.0.1"},
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
         .is_ca = true,
     });
 
@@ -573,8 +608,8 @@ test "tls ocsp fetch uses the daemon trust store and a bad certificate keeps the
     const thread = try std.Thread.spawn(.{}, ocspStubAccept, .{&stub});
     defer {
         stop.store(true, .release);
-        _ = linux.close(listener.fd);
         thread.join();
+        @import("io_backend.zig").closeSocket(listener.fd);
     }
 
     const url_text = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/ocsp", .{listener.port});

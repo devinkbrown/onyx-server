@@ -1,0 +1,92 @@
+[1/73] root.test_0 ... OK (1us)
+[2/73] crypto.root.test_0 ... OK (1us)
+[3/73] daemon.root.test_0 ... OK (1us)
+[4/73] proto.root.test_0 ... OK (1us)
+[5/73] substrate.root.test_0 ... OK (1us)
+[6/73] wasm.host.root.test_0 ... OK (1us)
+[7/73] substrate.io.root.test_0 ... OK (1us)
+[8/73] substrate.ripple_props.test_0 ... OK (1us)
+[9/73] substrate.ripple.test_0 ... OK (1us)
+[10/73] substrate.undertow.root.test_0 ... OK (1us)
+[11/73] substrate.undertow.peer_link.test_0 ... OK (1us)
+[12/73] substrate.io.buf_ring.test_0 ... OK (1us)
+[13/73] substrate.io.ring.test_0 ... OK (1us)
+[14/73] proto.asn1_time.test_0 ... OK (1us)
+[15/73] proto.certfp.test_0 ... OK (1us)
+[16/73] proto.cloak.test_0 ... OK (10us)
+[17/73] proto.ircx_modex.test_0 ... OK (1us)
+[18/73] proto.ircx_saccess.test_0 ... OK (1us)
+[19/73] proto.listx.test_0 ... OK (1us)
+[20/73] proto.mooring.test_0 ... OK (1us)
+[21/73] proto.mooring_props.test_0 ... OK (1us)
+[22/73] proto.quic_handshake.test_0 ... OK (7us)
+[23/73] proto.quic_transport_params.test_0 ... OK (3us)
+[24/73] proto.sasl_external_verify.test_0 ... OK (1us)
+[25/73] proto.sasl_mechrouter.test_0 ... OK (1us)
+[26/73] proto.sasl_oauthbearer.test_0 ... OK (3us)
+[27/73] proto.sasl.test_0 ... OK (1us)
+[28/73] proto.sasl_scram512_server.test_0 ... OK (1us)
+[29/73] proto.sasl_scram.test_0 ... OK (1us)
+[30/73] proto.sasl_scram_server.test_0 ... OK (3us)
+[31/73] proto.signed_delta.test_0 ... OK (1us)
+[32/73] proto.toml.test_0 ... OK (1us)
+[33/73] proto.x509.test_0 ... OK (1us)
+[34/73] daemon.kernel_other.test.GAP-X3 FreeBSD Capsicum and SO_REUSEPORT_LB, OpenBSD pledge, and a Windows job fail closed ... GAP-X3 branch=freebsd capsicum and SO_REUSEPORT_LB, openbsd pledge and unveil, windows job kill-on-close; this host did not execute them; windows RIO stays unmet
+OK (29us)
+[35/73] daemon.foreign_kernel_exec.test.GAP-X3 OpenBSD pledge executes on this kernel ... SKIP (1us)
+[36/73] daemon.modules.manifest.test_0 ... OK (1us)
+[37/73] daemon.key_transparency.test_0 ... OK (1us)
+[38/73] daemon.acme_cli.test_0 ... OK (1us)
+[39/73] daemon.acme_http01_listener.test_0 ... OK (1us)
+[40/73] daemon.acme_renewal.test_0 ... OK (1us)
+[41/73] daemon.acme_runner.test_0 ... OK (4us)
+[42/73] daemon.config_format.test_0 ... OK (3us)
+[43/73] daemon.helix.root.test_0 ... OK (1us)
+[44/73] daemon.metrics_http.test_0 ... OK (1us)
+[45/73] daemon.webhook.test_0 ... OK (1us)
+[46/73] daemon.webhook_render.test_0 ... OK (1us)
+[47/73] daemon.webhook_http.test_0 ... OK (1us)
+[48/73] daemon.oauth_jwt.test_0 ... OK (1us)
+[49/73] daemon.ocsp_staple.test_0 ... OK (4us)
+[50/73] daemon.reactor_pool.test_0 ... OK (1us)
+[51/73] daemon.sasl_bridge.test_0 ... OK (1us)
+[52/73] daemon.scram_store.test_0 ... OK (1us)
+[53/73] daemon.server.test_0 ... OK (3us)
+[54/73] daemon.sessions.test_0 ... OK (3us)
+[55/73] daemon.tls_certs.test_0 ... OK (3us)
+[56/73] daemon.tls_conn.test_0 ... OK (3us)
+[57/73] daemon.tls_sni_load.test_0 ... OK (1us)
+[58/73] crypto.tls_server.test_0 ... OK (1us)
+[59/73] crypto.tls_record.test_0 ... OK (1us)
+[60/73] crypto.hkdf_tls13.test_0 ... OK (1us)
+[61/73] crypto.hash.test_0 ... OK (1us)
+[62/73] crypto.random.test_0 ... OK (1us)
+[63/73] crypto.kx.test_0 ... OK (1us)
+[64/73] crypto.sign.test_0 ... OK (1us)
+[65/73] crypto.xwing.test_0 ... OK (3us)
+[66/73] crypto.sct.test_0 ... OK (1us)
+[67/73] crypto.tls_client.test_0 ... OK (1us)
+[68/73] crypto.aead.test_0 ... OK (1us)
+[69/73] crypto.ecdsa_kat.test_0 ... OK (1us)
+[70/73] crypto.ed25519_batch.test_0 ... OK (1us)
+[71/73] crypto.sign_kat.test_0 ... OK (1us)
+[72/73] crypto.tls_props.test_0 ... OK (1us)
+[73/73] crypto.tls.test_0 ... OK (1us)
+verbose test summary: 72 passed; 1 skipped; 0 failed; 0 leaked; 0 log errors; elapsed 89us
+slowest tests:
+  29us  daemon.kernel_other.test.GAP-X3 FreeBSD Capsicum and SO_REUSEPORT_LB, OpenBSD pledge, and a Windows job fail closed
+  10us  proto.cloak.test_0
+  7us  proto.quic_handshake.test_0
+  4us  daemon.ocsp_staple.test_0
+  4us  daemon.acme_runner.test_0
+  3us  proto.sasl_scram_server.test_0
+  3us  daemon.config_format.test_0
+  3us  daemon.server.test_0
+  3us  crypto.xwing.test_0
+  3us  proto.sasl_oauthbearer.test_0
+Build Summary: 4/4 steps succeeded
+test-mod-verbose success
++- run test success 1ms
+   +- compile test Debug native success 4s MaxRSS:352M
+      +- options cached
+

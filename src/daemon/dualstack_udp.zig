@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Dual-stack (IPv6 + IPv4-mapped) UDP socket for the WebTransport listener.
+//! IPv4/IPv6 UDP sockets for the WebTransport listener.
 //!
-//! A blocking `SOCK_DGRAM` socket opened on `AF_INET6` with `IPV6_V6ONLY=0`, so
-//! ONE socket serves both native IPv6 peers and IPv4 peers (the latter arrive as
-//! IPv4-mapped addresses `::ffff:a.b.c.d`, RFC 4291 §2.5.5.2). This mirrors the
+//! Linux uses one blocking `AF_INET6` socket with `IPV6_V6ONLY=0`; IPv4
+//! peers arrive as mapped addresses. OpenBSD uses native IPv4 and IPv6 sockets
+//! sharing one port, with finite readiness polls and fair dispatch. This mirrors the
 //! shape of `MediaSocket` (`bind` / `deinit` / `localPort` / `setRecvTimeoutMs` /
 //! `recvFrom` / `sendTo`) so the listener can swap one for the other, but it is a
 //! SEPARATE socket: the media plane keeps its proven IPv4-only `MediaSocket`.
@@ -26,7 +26,8 @@
 //! read to `buf.len` and only ever returns the actually-received prefix; the
 //! address conversion is fixed-width and total over any 16-byte input.
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
+const sys = if (builtin.os.tag == .windows) std.os.linux else std.posix.system;
 const posix = std.posix;
 const ice = @import("../proto/ice.zig");
 
@@ -39,7 +40,11 @@ const v4mapped_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
 pub const Error = error{ SocketUnavailable, BindFailed, AddrLookupFailed };
 
 pub const DualStackUdpSocket = struct {
-    fd: linux.fd_t,
+    fd: sys.fd_t,
+    ipv4_fd: sys.fd_t = -1,
+    primary_ipv4: bool = false,
+    recv_timeout_ms: u32 = 250,
+    prefer_ipv4: bool = false,
 
     /// Open a dual-stack UDP socket and bind it. `bind_addr` selects the local
     /// address to bind:
@@ -47,33 +52,70 @@ pub const DualStackUdpSocket = struct {
     ///   * `.loopback_v6` → `[::1]` (IPv6 loopback only) — for tests.
     ///   * `.v4_mapped` → bind a configured IPv4 address as `::ffff:a.b.c.d` so a
     ///     v4-only operator config still works over the dual-stack socket.
-    /// `port` 0 = ephemeral. The socket has `IPV6_V6ONLY=0`, so even an `[::]`
-    /// bind also accepts IPv4 peers as IPv4-mapped sources.
+    /// `port` 0 = ephemeral. Linux receives mapped IPv4 on the IPv6 socket;
+    /// OpenBSD publishes a socket pair transactionally for `.any`.
     pub fn bind(bind_addr: BindAddr, port: u16) Error!DualStackUdpSocket {
-        const rc = linux.socket(posix.AF.INET6, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+        if (comptime builtin.os.tag == .windows) return error.SocketUnavailable;
+        if (comptime builtin.os.tag != .linux) return bindNative(bind_addr, port);
+        const rc = sys.socket(posix.AF.INET6, sys.SOCK.DGRAM | sys.SOCK.CLOEXEC, sys.IPPROTO.UDP);
         if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
-        const fd: linux.fd_t = @intCast(rc);
-        errdefer _ = linux.close(fd);
+        const fd: sys.fd_t = @intCast(rc);
+        errdefer _ = sys.close(fd);
 
         // IPV6_V6ONLY=0: one socket serves both IPv6 and IPv4 (mapped) peers.
         const v6only: c_int = 0;
-        if (posix.errno(linux.setsockopt(
+        if (posix.errno(sys.setsockopt(
             fd,
-            linux.SOL.IPV6,
-            linux.IPV6.V6ONLY,
+            sys.SOL.IPV6,
+            sys.IPV6.V6ONLY,
             std.mem.asBytes(&v6only),
             @sizeOf(c_int),
         )) != .SUCCESS) return error.BindFailed;
 
-        var addr = linux.sockaddr.in6{
+        var addr = sys.sockaddr.in6{
             .port = std.mem.nativeToBig(u16, port),
             .flowinfo = 0,
             .addr = bind_addr.toBytes(),
             .scope_id = 0,
         };
-        if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)
+        if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in6))) != .SUCCESS)
             return error.BindFailed;
         return .{ .fd = fd };
+    }
+
+    fn bindNative(bind_addr: BindAddr, port: u16) Error!DualStackUdpSocket {
+        const flags = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+        if (bind_addr == .v4_mapped) {
+            const fd = sys.socket(posix.AF.INET, flags, posix.IPPROTO.UDP);
+            if (posix.errno(fd) != .SUCCESS) return error.SocketUnavailable;
+            errdefer _ = sys.close(fd);
+            var addr = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(bind_addr.v4_mapped) };
+            if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)))) != .SUCCESS) return error.BindFailed;
+            return .{ .fd = fd, .primary_ipv4 = true };
+        }
+        // OpenBSD deliberately has no IPv4-mapped IPv6 sockets. Bind a native
+        // socket per family at one port; each attempt publishes both or neither.
+        for (0..16) |_| {
+            const fd = sys.socket(posix.AF.INET6, flags, posix.IPPROTO.UDP);
+            if (posix.errno(fd) != .SUCCESS) return error.SocketUnavailable;
+            var owner = DualStackUdpSocket{ .fd = fd };
+            errdefer owner.deinit();
+            const one: c_int = 1;
+            if (posix.errno(sys.setsockopt(fd, posix.IPPROTO.IPV6, sys.IPV6.V6ONLY, std.mem.asBytes(&one), @sizeOf(c_int))) != .SUCCESS) return error.BindFailed;
+            var addr = sys.sockaddr.in6{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = bind_addr.toBytes(), .scope_id = 0 };
+            if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)))) != .SUCCESS) return error.BindFailed;
+            if (bind_addr == .loopback_v6) return owner;
+            const chosen = try owner.localPort();
+            const fd4 = sys.socket(posix.AF.INET, flags, posix.IPPROTO.UDP);
+            if (posix.errno(fd4) != .SUCCESS) return error.SocketUnavailable;
+            owner.ipv4_fd = fd4;
+            var addr4 = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, chosen), .addr = 0 };
+            const bound = sys.bind(fd4, @ptrCast(&addr4), @sizeOf(@TypeOf(addr4)));
+            if (posix.errno(bound) == .SUCCESS) return owner;
+            if (port != 0 or posix.errno(bound) != .ADDRINUSE) return error.BindFailed;
+            owner.deinit();
+        }
+        return error.BindFailed;
     }
 
     /// Which local address to bind the dual-stack socket to.
@@ -105,32 +147,62 @@ pub const DualStackUdpSocket = struct {
     };
 
     pub fn deinit(self: *DualStackUdpSocket) void {
-        _ = linux.close(self.fd);
+        if (comptime builtin.os.tag == .windows) {
+            self.* = undefined;
+            return;
+        }
+        _ = sys.close(self.fd);
+        if (self.ipv4_fd >= 0) _ = sys.close(self.ipv4_fd);
         self.* = undefined;
     }
 
     /// The bound local UDP port (host byte order).
     pub fn localPort(self: *const DualStackUdpSocket) Error!u16 {
-        var sa: linux.sockaddr.in6 = undefined;
-        var len: posix.socklen_t = @sizeOf(linux.sockaddr.in6);
-        if (posix.errno(linux.getsockname(self.fd, @ptrCast(&sa), &len)) != .SUCCESS)
+        if (comptime builtin.os.tag == .windows) return error.AddrLookupFailed;
+        if (self.primary_ipv4) {
+            var sa4: sys.sockaddr.in = undefined;
+            var len4: posix.socklen_t = @sizeOf(@TypeOf(sa4));
+            if (posix.errno(sys.getsockname(self.fd, @ptrCast(&sa4), &len4)) != .SUCCESS) return error.AddrLookupFailed;
+            if (len4 != @sizeOf(@TypeOf(sa4)) or sa4.family != posix.AF.INET) return error.AddrLookupFailed;
+            return std.mem.bigToNative(u16, sa4.port);
+        }
+        var sa: sys.sockaddr.in6 = undefined;
+        var len: posix.socklen_t = @sizeOf(sys.sockaddr.in6);
+        if (posix.errno(sys.getsockname(self.fd, @ptrCast(&sa), &len)) != .SUCCESS)
             return error.AddrLookupFailed;
+        if (len != @sizeOf(@TypeOf(sa)) or sa.family != posix.AF.INET6) return error.AddrLookupFailed;
         return std.mem.bigToNative(u16, sa.port);
     }
 
     /// Bound a blocking recv with a timeout so the pump loop can re-check a stop
     /// flag (and tests never hang).
     pub fn setRecvTimeoutMs(self: *DualStackUdpSocket, ms: u32) void {
-        const tv = linux.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
-        _ = linux.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        if (comptime builtin.os.tag == .windows) return;
+        if (comptime builtin.os.tag != .linux) {
+            self.recv_timeout_ms = @max(ms, 1);
+            return;
+        }
+        const tv = sys.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
+        _ = sys.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
     }
 
     /// Send `bytes` to `dest`. A v4 `TransportAddress` is re-wrapped as a
     /// v4-mapped `::ffff:a.b.c.d`; a v6 one is copied verbatim. A `TransportAddress`
     /// with an unexpected `ip_len` (neither 4 nor 16) is dropped.
     pub fn sendTo(self: *DualStackUdpSocket, dest: TransportAddress, bytes: []const u8) void {
+        if (comptime builtin.os.tag == .windows) return;
+        if (comptime builtin.os.tag != .linux) {
+            if (dest.ip_len == 4) {
+                const fd = if (self.primary_ipv4) self.fd else self.ipv4_fd;
+                if (fd < 0) return;
+                const sa4 = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, dest.port), .addr = @bitCast(dest.ip[0..4].*) };
+                _ = sys.sendto(fd, bytes.ptr, bytes.len, 0, @ptrCast(&sa4), @sizeOf(@TypeOf(sa4)));
+                return;
+            }
+            if (self.primary_ipv4 or dest.ip_len != 16) return;
+        }
         const sa = toSockaddrIn6(dest) orelse return;
-        _ = linux.sendto(self.fd, bytes.ptr, bytes.len, 0, @ptrCast(&sa), @sizeOf(linux.sockaddr.in6));
+        _ = sys.sendto(self.fd, bytes.ptr, bytes.len, 0, @ptrCast(&sa), @sizeOf(sys.sockaddr.in6));
     }
 
     pub const Received = struct { data: []u8, from: TransportAddress };
@@ -139,13 +211,44 @@ pub const DualStackUdpSocket = struct {
     /// `sockaddr_in6` is converted to a `TransportAddress`: an IPv4-mapped source
     /// becomes a 4-byte ipv4 address, anything else a 16-byte ipv6 address.
     pub fn recvFrom(self: *DualStackUdpSocket, buf: []u8) ?Received {
-        var sa: linux.sockaddr.in6 = undefined;
-        var slen: posix.socklen_t = @sizeOf(linux.sockaddr.in6);
-        const rc = linux.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&sa), &slen);
+        if (comptime builtin.os.tag == .windows) return null;
+        if (comptime builtin.os.tag != .linux) return self.recvNative(buf);
+        var sa: sys.sockaddr.in6 = undefined;
+        var slen: posix.socklen_t = @sizeOf(sys.sockaddr.in6);
+        const rc = sys.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&sa), &slen);
         if (posix.errno(rc) != .SUCCESS) return null;
         const n: usize = @intCast(rc);
         const from = fromSockaddrIn6(&sa) catch return null;
         return .{ .data = buf[0..n], .from = from };
+    }
+    fn recvNative(self: *DualStackUdpSocket, buf: []u8) ?Received {
+        var fds = [_]posix.pollfd{
+            .{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = self.ipv4_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = sys.poll(&fds, fds.len, @intCast(@min(self.recv_timeout_ms, std.math.maxInt(c_int))));
+        if (ready <= 0) return null;
+        for (0..2) |offset| {
+            const idx = (offset + @as(usize, @intFromBool(self.prefer_ipv4))) % 2;
+            if (fds[idx].fd < 0 or fds[idx].revents & posix.POLL.IN == 0) continue;
+            var sa: posix.sockaddr.storage = undefined;
+            var len: posix.socklen_t = @sizeOf(@TypeOf(sa));
+            const rc = sys.recvfrom(fds[idx].fd, buf.ptr, buf.len, 0, @ptrCast(&sa), &len);
+            if (posix.errno(rc) != .SUCCESS) continue;
+            const n: usize = @intCast(rc);
+            if (n > buf.len) return null;
+            const from = if (sa.family == posix.AF.INET and len == @sizeOf(sys.sockaddr.in)) blk: {
+                const v4: *const sys.sockaddr.in = @ptrCast(@alignCast(&sa));
+                const bytes: [4]u8 = @bitCast(v4.addr);
+                break :blk TransportAddress.fromBytes(&bytes, std.mem.bigToNative(u16, v4.port)) catch return null;
+            } else if (sa.family == posix.AF.INET6 and len == @sizeOf(sys.sockaddr.in6))
+                fromSockaddrIn6(@ptrCast(@alignCast(&sa))) catch return null
+            else
+                return null;
+            self.prefer_ipv4 = idx == 0;
+            return .{ .data = buf[0..n], .from = from };
+        }
+        return null;
     }
 };
 
@@ -162,7 +265,7 @@ pub fn isV4Mapped(addr16: [16]u8) bool {
 /// source is surfaced as a 4-byte ipv4 address (so the REAL v4 address reaches
 /// PROXY-protocol + logging); otherwise a 16-byte ipv6 address. Total over any
 /// 16-byte address (the only failure path is the unreachable >16-byte case).
-pub fn fromSockaddrIn6(sa: *const linux.sockaddr.in6) ice.IceError!TransportAddress {
+pub fn fromSockaddrIn6(sa: *const sys.sockaddr.in6) ice.IceError!TransportAddress {
     const port = std.mem.bigToNative(u16, sa.port);
     if (isV4Mapped(sa.addr)) {
         return TransportAddress.fromBytes(sa.addr[12..16], port);
@@ -175,8 +278,8 @@ pub fn fromSockaddrIn6(sa: *const linux.sockaddr.in6) ice.IceError!TransportAddr
 /// `::ffff:a.b.c.d`; a v6 address (`ip_len == 16`) is copied verbatim. Returns
 /// null for an unexpected `ip_len` (neither 4 nor 16) so a malformed address is
 /// dropped rather than sent to a garbage destination.
-pub fn toSockaddrIn6(addr: TransportAddress) ?linux.sockaddr.in6 {
-    var out = linux.sockaddr.in6{
+pub fn toSockaddrIn6(addr: TransportAddress) ?sys.sockaddr.in6 {
+    var out = sys.sockaddr.in6{
         .port = std.mem.nativeToBig(u16, addr.port),
         .flowinfo = 0,
         .addr = @as([16]u8, @splat(0)),
@@ -217,7 +320,7 @@ test "isV4Mapped recognises ::ffff:0:0/96 and rejects native v6" {
 
 test "round-trip: a v4-mapped sockaddr_in6 surfaces as an ipv4 TransportAddress and back" {
     // Build a v4-mapped sockaddr_in6 for 203.0.113.9:4433.
-    var sa = linux.sockaddr.in6{
+    var sa = sys.sockaddr.in6{
         .port = std.mem.nativeToBig(u16, 4433),
         .flowinfo = 0,
         .addr = @as([16]u8, @splat(0)),
@@ -243,7 +346,7 @@ test "round-trip: a v4-mapped sockaddr_in6 surfaces as an ipv4 TransportAddress 
 
 test "round-trip: a native v6 sockaddr_in6 surfaces as an ipv6 TransportAddress and back" {
     const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 };
-    var sa = linux.sockaddr.in6{
+    var sa = sys.sockaddr.in6{
         .port = std.mem.nativeToBig(u16, 51820),
         .flowinfo = 0,
         .addr = v6,
@@ -264,7 +367,7 @@ test "round-trip: a native v6 sockaddr_in6 surfaces as an ipv6 TransportAddress 
 test "round-trip: ::1 loopback surfaces as a 16-byte ipv6 TransportAddress" {
     var v6 = @as([16]u8, @splat(0));
     v6[15] = 1;
-    var sa = linux.sockaddr.in6{
+    var sa = sys.sockaddr.in6{
         .port = std.mem.nativeToBig(u16, 9000),
         .flowinfo = 0,
         .addr = v6,
@@ -293,24 +396,24 @@ test "dualstack socket: bind on [::], ephemeral port, clean shutdown, v4 receive
     try testing.expect(sport != 0);
 
     // --- IPv4 leg: send from a real 127.0.0.1 UDP socket. ---
-    const c4_rc = linux.socket(posix.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+    const c4_rc = sys.socket(posix.AF.INET, sys.SOCK.DGRAM | sys.SOCK.CLOEXEC, sys.IPPROTO.UDP);
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(c4_rc));
-    const c4: linux.fd_t = @intCast(c4_rc);
-    defer _ = linux.close(c4);
-    var c4_addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
-    try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.bind(c4, @ptrCast(&c4_addr), @sizeOf(linux.sockaddr.in))));
-    var c4_sa: linux.sockaddr.in = undefined;
-    var c4_slen: posix.socklen_t = @sizeOf(linux.sockaddr.in);
-    _ = linux.getsockname(c4, @ptrCast(&c4_sa), &c4_slen);
+    const c4: sys.fd_t = @intCast(c4_rc);
+    defer _ = sys.close(c4);
+    var c4_addr = sys.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.bind(c4, @ptrCast(&c4_addr), @sizeOf(sys.sockaddr.in))));
+    var c4_sa: sys.sockaddr.in = undefined;
+    var c4_slen: posix.socklen_t = @sizeOf(sys.sockaddr.in);
+    _ = sys.getsockname(c4, @ptrCast(&c4_sa), &c4_slen);
     const c4_port = std.mem.bigToNative(u16, c4_sa.port);
 
     // 127.0.0.1:sport as a sockaddr_in (the v4 client addresses the v4 world).
-    var dst4 = linux.sockaddr.in{
+    var dst4 = sys.sockaddr.in{
         .port = std.mem.nativeToBig(u16, sport),
         .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
     };
     const payload4 = "v4-hello";
-    _ = linux.sendto(c4, payload4, payload4.len, 0, @ptrCast(&dst4), @sizeOf(linux.sockaddr.in));
+    _ = sys.sendto(c4, payload4, payload4.len, 0, @ptrCast(&dst4), @sizeOf(sys.sockaddr.in));
 
     var buf: [64]u8 = undefined;
     const got4 = server.recvFrom(&buf) orelse return error.TestUnexpectedResult;
@@ -324,9 +427,9 @@ test "dualstack socket: bind on [::], ephemeral port, clean shutdown, v4 receive
     server.sendTo(got4.from, "v4-reply");
     var rbuf: [64]u8 = undefined;
     // Bound the client recv so the test can't hang.
-    const tv = linux.timeval{ .sec = 2, .usec = 0 };
-    _ = linux.setsockopt(c4, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
-    const rn4 = linux.recvfrom(c4, &rbuf, rbuf.len, 0, null, null);
+    const tv = sys.timeval{ .sec = 2, .usec = 0 };
+    _ = sys.setsockopt(c4, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+    const rn4 = sys.recvfrom(c4, &rbuf, rbuf.len, 0, null, null);
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(rn4));
     try testing.expectEqualStrings("v4-reply", rbuf[0..@intCast(rn4)]);
 }
@@ -340,24 +443,24 @@ test "dualstack socket: IPv6 loopback receive (skips if no v6 loopback)" {
     // --- IPv6 leg: send from a real ::1 UDP socket. If the sandbox lacks IPv6
     // loopback, gracefully skip THIS leg only (the v4-over-v6-socket leg above
     // and the pure mapping tests still hold coverage). ---
-    const c6_rc = linux.socket(posix.AF.INET6, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+    const c6_rc = sys.socket(posix.AF.INET6, sys.SOCK.DGRAM | sys.SOCK.CLOEXEC, sys.IPPROTO.UDP);
     if (posix.errno(c6_rc) != .SUCCESS) return error.SkipZigTest;
-    const c6: linux.fd_t = @intCast(c6_rc);
-    defer _ = linux.close(c6);
+    const c6: sys.fd_t = @intCast(c6_rc);
+    defer _ = sys.close(c6);
     var lo6 = @as([16]u8, @splat(0));
     lo6[15] = 1; // ::1
-    var c6_bind = linux.sockaddr.in6{ .port = 0, .flowinfo = 0, .addr = lo6, .scope_id = 0 };
-    if (posix.errno(linux.bind(c6, @ptrCast(&c6_bind), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)
+    var c6_bind = sys.sockaddr.in6{ .port = 0, .flowinfo = 0, .addr = lo6, .scope_id = 0 };
+    if (posix.errno(sys.bind(c6, @ptrCast(&c6_bind), @sizeOf(sys.sockaddr.in6))) != .SUCCESS)
         return error.SkipZigTest;
 
-    var dst6 = linux.sockaddr.in6{
+    var dst6 = sys.sockaddr.in6{
         .port = std.mem.nativeToBig(u16, sport),
         .flowinfo = 0,
         .addr = lo6,
         .scope_id = 0,
     };
     const payload6 = "v6-hello";
-    const sn = linux.sendto(c6, payload6, payload6.len, 0, @ptrCast(&dst6), @sizeOf(linux.sockaddr.in6));
+    const sn = sys.sendto(c6, payload6, payload6.len, 0, @ptrCast(&dst6), @sizeOf(sys.sockaddr.in6));
     if (posix.errno(sn) != .SUCCESS) return error.SkipZigTest;
 
     var buf: [64]u8 = undefined;
@@ -369,10 +472,69 @@ test "dualstack socket: IPv6 loopback receive (skips if no v6 loopback)" {
 
     // Reply via sendTo (ipv6 dest copied verbatim).
     server.sendTo(got6.from, "v6-reply");
-    const tv = linux.timeval{ .sec = 2, .usec = 0 };
-    _ = linux.setsockopt(c6, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+    const tv = sys.timeval{ .sec = 2, .usec = 0 };
+    _ = sys.setsockopt(c6, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
     var rbuf: [64]u8 = undefined;
-    const rn6 = linux.recvfrom(c6, &rbuf, rbuf.len, 0, null, null);
+    const rn6 = sys.recvfrom(c6, &rbuf, rbuf.len, 0, null, null);
     if (posix.errno(rn6) != .SUCCESS) return error.SkipZigTest;
     try testing.expectEqualStrings("v6-reply", rbuf[0..@intCast(rn6)]);
+}
+
+test "dualstack socket: native paired families share a port and preserve both queued datagrams" {
+    if (comptime builtin.os.tag != .openbsd) return;
+    var server = try DualStackUdpSocket.bind(.any, 0);
+    defer server.deinit();
+    server.setRecvTimeoutMs(100);
+    try testing.expect(server.ipv4_fd >= 0);
+    var bound4: sys.sockaddr.in = undefined;
+    var length: posix.socklen_t = @sizeOf(@TypeOf(bound4));
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.getsockname(server.ipv4_fd, @ptrCast(&bound4), &length)));
+    const port = try server.localPort();
+    try testing.expectEqual(port, std.mem.bigToNative(u16, bound4.port));
+    for ([_]sys.fd_t{ server.fd, server.ipv4_fd }) |fd| {
+        const descriptor_flags = sys.fcntl(fd, posix.F.GETFD, @as(c_int, 0));
+        try testing.expectEqual(posix.E.SUCCESS, posix.errno(descriptor_flags));
+        try testing.expect(descriptor_flags & posix.FD_CLOEXEC != 0);
+        const status = sys.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+        try testing.expectEqual(posix.E.SUCCESS, posix.errno(status));
+        const options: posix.O = @bitCast(@as(u32, @intCast(status)));
+        try testing.expect(options.NONBLOCK);
+    }
+    var client4 = try DualStackUdpSocket.bind(.{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
+    defer client4.deinit();
+    client4.setRecvTimeoutMs(100);
+    var client6 = try DualStackUdpSocket.bind(.loopback_v6, 0);
+    defer client6.deinit();
+    client6.setRecvTimeoutMs(100);
+    var loopback6: [16]u8 = @splat(0);
+    loopback6[15] = 1;
+    client4.sendTo(try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, port), "four");
+    client6.sendTo(try TransportAddress.fromBytes(&loopback6, port), "six");
+    var buf: [32]u8 = undefined;
+    var seen4 = false;
+    var seen6 = false;
+    for (0..2) |_| {
+        const got = server.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+        switch (got.from.ip_len) {
+            4 => {
+                try testing.expect(!seen4);
+                try testing.expectEqualStrings("four", got.data);
+                seen4 = true;
+            },
+            16 => {
+                try testing.expect(!seen6);
+                try testing.expectEqualStrings("six", got.data);
+                seen6 = true;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+        server.sendTo(got.from, got.data);
+    }
+    try testing.expect(seen4 and seen6);
+    try testing.expectEqualStrings("four", (client4.recvFrom(&buf) orelse return error.TestUnexpectedResult).data);
+    try testing.expectEqualStrings("six", (client6.recvFrom(&buf) orelse return error.TestUnexpectedResult).data);
+    const before = @import("../substrate/platform.zig").monotonicMillis();
+    try testing.expect(server.recvFrom(&buf) == null);
+    const elapsed = @import("../substrate/platform.zig").monotonicMillis() - before;
+    try testing.expect(elapsed >= 50 and elapsed < 1000);
 }

@@ -1,0 +1,4 @@
+a4016f169ad7d0fa7564c679b7f6a3cede665c8f1ad9eeda55036dd0b7c29272  .zig-cache/codex-resume/native-unit-source-fixture-consolidated.tar.gz
+063206384e104ae256b0816c1d807c9918bff348539f4941770dc261a9d97849  src/daemon/server.zig
+672515b3c0fcb127348d148b26ce0b4cf65828647301b8c70e9418215972f121  src/daemon/svc_memo_forward.zig
+1a2d20fed0c35d6c3c63ceaa742de227619505c2cfc0cef33bfe5c8263b7a55e  src/daemon/history_http.zig

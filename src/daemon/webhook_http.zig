@@ -21,8 +21,9 @@
 //! port, exactly as an operator already does for the `/metrics` endpoint.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
-const linux = std.os.linux;
+const sys = std.posix.system;
 const posix = std.posix;
 
 const webhook = @import("webhook.zig");
@@ -205,7 +206,7 @@ pub const WebhookServer = struct {
     store: *webhook.WebhookStore,
     sink: webhook.PostSink,
     handler: HandlerConfig,
-    listen_fd: linux.fd_t,
+    listen_fd: sys.fd_t,
     port: u16,
     /// Serializes the control-plane lifecycle. The accept thread never takes
     /// this mutex; it observes only stop_flag and the listener fd, whose final
@@ -228,16 +229,19 @@ pub const WebhookServer = struct {
         errdefer closeFd(fd);
 
         var yes: u32 = 1;
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
+        _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
 
-        var addr = linux.sockaddr.in{
+        var addr = sys.sockaddr.in{
             .port = std.mem.nativeToBig(u16, port),
             .addr = std.mem.nativeToBig(u32, config.bind_addr),
         };
-        if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))) != .SUCCESS)
             return error.BindFailed;
-        if (posix.errno(linux.listen(fd, config.listen_backlog)) != .SUCCESS)
+        if (posix.errno(sys.listen(fd, config.listen_backlog)) != .SUCCESS)
             return error.ListenFailed;
+        if (comptime builtin.os.tag != .linux) {
+            @import("os_runtime.zig").setNonblocking(fd) catch return error.ListenFailed;
+        }
 
         // A finite accept timeout is also the pause barrier's wake-up clock.
         // Clamp a configured zero to one millisecond: on Linux a zero timeval
@@ -307,18 +311,21 @@ pub const WebhookServer = struct {
         lockLifecycle(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
         self.stop_flag.store(true, .release);
-        if (self.listen_fd >= 0) closeFd(self.listen_fd);
+        if (comptime builtin.os.tag == .linux) {
+            if (self.listen_fd >= 0) closeFd(self.listen_fd);
+        }
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
+        if (comptime builtin.os.tag != .linux) closeFd(self.listen_fd);
         self.listen_fd = -1;
     }
 
     fn acceptLoop(self: *WebhookServer) void {
         var retry_ms: u32 = accept_retry_initial_ms;
         while (!self.stop_flag.load(.acquire)) {
-            const rc = linux.accept4(self.listen_fd, null, null, posix.SOCK.CLOEXEC);
+            const rc = acceptSocket(self.listen_fd);
             const err = posix.errno(rc);
             switch (err) {
                 .SUCCESS => {
@@ -341,12 +348,12 @@ pub const WebhookServer = struct {
     fn waitAcceptRetry(self: *WebhookServer, delay_ms: u32) void {
         var elapsed: u32 = 0;
         while (elapsed < delay_ms and !self.stop_flag.load(.acquire)) : (elapsed += 1) {
-            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            _ = linux.nanosleep(&req, null);
+            var req = sys.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = sys.nanosleep(&req, null);
         }
     }
 
-    fn serveConn(self: *WebhookServer, fd: linux.fd_t) void {
+    fn serveConn(self: *WebhookServer, fd: sys.fd_t) void {
         defer closeFd(fd);
         // Never enter the blocking request reader without a verified finite
         // timeout: pause() joins this thread and must not be hostage to a peer
@@ -356,7 +363,7 @@ pub const WebhookServer = struct {
         // Read request headers + body (bounded). The read loop stops once the
         // full declared body is present, the buffer fills, or the socket idles.
         var req_buf: [max_header + max_body_hard]u8 = undefined;
-        const n = readRequest(fd, &req_buf, self.handler.max_body) orelse return;
+        const n = readRequest(fd, &req_buf, self.handler.max_body, &self.stop_flag, self.conn_read_timeout_sec) orelse return;
         if (n == 0) return;
 
         var scratch: [json_scratch]u8 = undefined;
@@ -373,7 +380,7 @@ pub const WebhookServer = struct {
             now_ms,
             &resp_buf,
         ) catch return;
-        writeAll(fd, resp);
+        if (!self.stop_flag.load(.acquire)) writeAll(fd, resp);
     }
 };
 
@@ -384,15 +391,30 @@ pub const WebhookServer = struct {
 /// A request with no `Content-Length` completes at the header boundary (its
 /// body, if any, is never awaited — `handleRequest` answers such a POST 411),
 /// which is what keeps a length-less slow body from pinning the accept loop.
-fn readRequest(fd: linux.fd_t, buf: []u8, max_body: usize) ?usize {
+fn readRequest(fd: sys.fd_t, buf: []u8, max_body: usize, stop: *const std.atomic.Value(bool), timeout_sec: u32) ?usize {
+    const clock = @import("../substrate/platform.zig");
+    const deadline = clock.monotonicMillis() + @as(i64, @intCast(@max(timeout_sec, 1))) * 1000;
     var total: usize = 0;
     var header_end: ?usize = null;
     var need: ?usize = null; // total bytes required once headers are parsed
     while (total < buf.len) {
-        const rc = linux.read(fd, buf[total..].ptr, buf.len - total);
-        switch (posix.errno(rc)) {
+        if (stop.load(.acquire)) return null;
+        const remaining = deadline - clock.monotonicMillis();
+        if (remaining <= 0) return null;
+        var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = sys.poll(&pollfds, 1, @intCast(@min(remaining, 50)));
+        switch (posix.errno(ready)) {
             .SUCCESS => {},
             .INTR => continue,
+            else => return null,
+        }
+        if (ready == 0) continue;
+        // Never block after a readiness snapshot; re-check stop/deadline on
+        // every idle wake and every fragment, even under a continuously active peer.
+        const rc = sys.recvfrom(fd, buf[total..].ptr, buf.len - total, posix.MSG.DONTWAIT, null, null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            .INTR, .AGAIN => continue,
             else => return if (total == 0) null else total,
         }
         const got: usize = @intCast(rc);
@@ -425,17 +447,13 @@ fn lockLifecycle(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.Thread.yield() catch {};
 }
 
-fn installReceiveTimeout(fd: linux.fd_t, tv: linux.timeval) bool {
-    return posix.errno(linux.setsockopt(
-        fd,
-        posix.SOL.SOCKET,
-        posix.SO.RCVTIMEO,
-        std.mem.asBytes(&tv),
-        @sizeOf(linux.timeval),
-    )) == .SUCCESS;
+fn installReceiveTimeout(fd: sys.fd_t, tv: sys.timeval) bool {
+    if (posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval))) != .SUCCESS) return false;
+    if (posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval))) != .SUCCESS) return false;
+    return true;
 }
 
-fn installReceiveTimeoutMs(fd: linux.fd_t, timeout_ms: u32) bool {
+fn installReceiveTimeoutMs(fd: sys.fd_t, timeout_ms: u32) bool {
     const finite_ms = @max(timeout_ms, 1);
     return installReceiveTimeout(fd, .{
         .sec = @intCast(finite_ms / 1000),
@@ -443,7 +461,7 @@ fn installReceiveTimeoutMs(fd: linux.fd_t, timeout_ms: u32) bool {
     });
 }
 
-fn installReceiveTimeoutSec(fd: linux.fd_t, timeout_sec: u32) bool {
+fn installReceiveTimeoutSec(fd: sys.fd_t, timeout_sec: u32) bool {
     return installReceiveTimeout(fd, .{
         .sec = @intCast(@max(timeout_sec, 1)),
         .usec = 0,
@@ -462,32 +480,64 @@ fn nextAcceptRetryMs(current_ms: u32) u32 {
     return @min(current_ms * 2, accept_retry_max_ms);
 }
 
-fn socketTcp() ListenerError!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+// BSD accept timeout is explicit: listener SO_RCVTIMEO is configuration,
+// poll bounds the wait, and nonblocking accept cannot hang after stale readiness.
+fn acceptSocket(fd: posix.fd_t) if (builtin.os.tag == .linux) usize else c_int {
+    if (comptime builtin.os.tag == .linux) return sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
+    var tv: sys.timeval = undefined;
+    var len: posix.socklen_t = @sizeOf(@TypeOf(tv));
+    if (sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), &len) != 0) return -1;
+    const millis = @max(@as(i64, 1), tv.sec * 1000 + @divTrunc(tv.usec, 1000));
+    var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    const rc = sys.poll(&pollfds, 1, @intCast(@min(millis, std.math.maxInt(c_int))));
+    if (rc < 0) return -1;
+    if (rc == 0) {
+        sys._errno().* = @intFromEnum(posix.E.AGAIN);
+        return -1;
+    }
+    const accepted = sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
+    if (accepted < 0) return -1;
+    // BSD may inherit listener nonblocking state. Request readers use a
+    // verified SO_RCVTIMEO on a blocking accepted socket.
+    const old = sys.fcntl(accepted, posix.F.GETFL, @as(c_int, 0));
+    if (old >= 0) {
+        var flags: posix.O = @bitCast(@as(u32, @intCast(old)));
+        flags.NONBLOCK = false;
+        if (sys.fcntl(accepted, posix.F.SETFL, @as(usize, @as(u32, @bitCast(flags)))) == 0) return accepted;
+    }
+    const saved = sys._errno().*;
+    _ = sys.close(accepted);
+    sys._errno().* = saved;
+    return -1;
+}
+
+fn socketTcp() ListenerError!sys.fd_t {
+    const rc = sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
     return switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         else => error.SocketUnavailable,
     };
 }
 
-fn boundPort(fd: linux.fd_t) ListenerError!u16 {
+fn boundPort(fd: sys.fd_t) ListenerError!u16 {
     var storage: posix.sockaddr.storage = undefined;
     var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    if (posix.errno(linux.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS)
+    if (posix.errno(sys.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS)
         return error.AddrLookupFailed;
-    const a: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
+    const a: *const sys.sockaddr.in = @ptrCast(@alignCast(&storage));
     return std.mem.bigToNative(u16, a.port);
 }
 
-fn closeFd(fd: linux.fd_t) void {
-    _ = linux.close(fd);
+fn closeFd(fd: sys.fd_t) void {
+    _ = sys.close(fd);
 }
 
-fn writeAll(fd: linux.fd_t, bytes: []const u8) void {
+fn writeAll(fd: sys.fd_t, bytes: []const u8) void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        const rc = if (comptime builtin.os.tag == .linux) sys.write(fd, bytes[off..].ptr, bytes.len - off) else sys.send(fd, bytes[off..].ptr, bytes.len - off, posix.MSG.NOSIGNAL);
         if (posix.errno(rc) != .SUCCESS) return;
+        if (rc == 0) return;
         off += @intCast(rc);
     }
 }
@@ -576,36 +626,36 @@ fn buildRequestNoLen(buf: []u8, id: []const u8, token: []const u8, body: []const
     ) catch unreachable;
 }
 
-fn connectLoopback(port: u16) !linux.fd_t {
+fn connectLoopback(port: u16) !sys.fd_t {
     const fd = try socketTcp();
     errdefer closeFd(fd);
-    var addr = linux.sockaddr.in{
+    var addr = sys.sockaddr.in{
         .port = std.mem.nativeToBig(u16, port),
         .addr = std.mem.nativeToBig(u32, loopback_addr),
     };
-    if (posix.errno(linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+    if (posix.errno(sys.connect(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))) != .SUCCESS)
         return error.ConnectFailed;
     // Bound a broken lifecycle test rather than leaving the test runner blocked
     // forever waiting for a listener thread that did not resume.
-    const tv = linux.timeval{ .sec = 2, .usec = 0 };
-    _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+    const tv = sys.timeval{ .sec = 2, .usec = 0 };
+    _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
     return fd;
 }
 
-fn expectNoContent(fd: linux.fd_t) !void {
+fn expectNoContent(fd: sys.fd_t) !void {
     var buf: [512]u8 = undefined;
-    const rc = linux.read(fd, &buf, buf.len);
+    const rc = sys.read(fd, &buf, buf.len);
     if (posix.errno(rc) != .SUCCESS) return error.ResponseReadFailed;
     const got = buf[0..@intCast(rc)];
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 204 No Content\r\n"));
 }
 
 fn testSleepMs(ms: u64) void {
-    var req = linux.timespec{
+    var req = sys.timespec{
         .sec = @intCast(ms / 1000),
         .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
     };
-    _ = linux.nanosleep(&req, null);
+    _ = sys.nanosleep(&req, null);
 }
 
 test "handleRequest returns 204 and enqueues a post on a valid request" {
@@ -777,19 +827,19 @@ test "contentLength parses case-insensitively" {
 }
 
 test "WebhookServer installs finite lifecycle timeouts even when configured zero" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var store = webhook.WebhookStore.init();
     var rec = RecordingSink{};
-    var server = WebhookServer.init(&store, rec.sink(), 0, .{
+    var server = try WebhookServer.init(&store, rec.sink(), 0, .{
         .accept_poll_ms = 0,
         .conn_read_timeout_sec = 0,
-    }) catch return error.SkipZigTest;
+    });
     defer server.shutdown();
 
     try testing.expectEqual(@as(u32, 1), server.conn_read_timeout_sec);
-    var tv: linux.timeval = undefined;
-    var tv_len: posix.socklen_t = @sizeOf(linux.timeval);
-    const rc = linux.getsockopt(
+    var tv: sys.timeval = undefined;
+    var tv_len: posix.socklen_t = @sizeOf(sys.timeval);
+    const rc = sys.getsockopt(
         server.listen_fd,
         posix.SOL.SOCKET,
         posix.SO.RCVTIMEO,
@@ -820,29 +870,29 @@ test "WebhookServer transient accept errors use bounded exponential backoff" {
 }
 
 test "WebhookServer serves a POST over loopback and enqueues a post" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var store = webhook.WebhookStore.init();
     const creds = seed(&store);
     var rec = RecordingSink{};
 
-    var server = WebhookServer.init(&store, rec.sink(), 0, .{}) catch return error.SkipZigTest;
+    var server = try WebhookServer.init(&store, rec.sink(), 0, .{});
     try server.spawn();
     defer server.shutdown();
 
     const cfd = try socketTcp();
     defer closeFd(cfd);
-    var addr = linux.sockaddr.in{
+    var addr = sys.sockaddr.in{
         .port = std.mem.nativeToBig(u16, server.port),
         .addr = std.mem.nativeToBig(u32, loopback_addr),
     };
-    try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.connect(cfd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))));
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.connect(cfd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))));
 
     var reqbuf: [512]u8 = undefined;
     const req = buildRequest(&reqbuf, &creds.id, &creds.token, "{\"content\":\"loop\"}");
     writeAll(cfd, req);
 
     var buf: [512]u8 = undefined;
-    const rc = linux.read(cfd, &buf, buf.len);
+    const rc = sys.read(cfd, &buf, buf.len);
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
     const got = buf[0..@intCast(rc)];
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 204 No Content\r\n"));
@@ -855,15 +905,15 @@ test "WebhookServer serves a POST over loopback and enqueues a post" {
 }
 
 test "WebhookServer pause and resume retain the port and handle each POST once" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var store = webhook.WebhookStore.init();
     const creds = seed(&store);
     var counted = CountingSink{};
 
-    var server = WebhookServer.init(&store, counted.sink(), 0, .{
+    var server = try WebhookServer.init(&store, counted.sink(), 0, .{
         .accept_poll_ms = 10,
         .conn_read_timeout_sec = 1,
-    }) catch return error.SkipZigTest;
+    });
     try server.spawn();
     defer server.shutdown();
 
@@ -917,21 +967,21 @@ test "WebhookServer pause and resume retain the port and handle each POST once" 
     // deliberately not resumable.
     server.shutdown();
     server.shutdown();
-    try testing.expectEqual(@as(linux.fd_t, -1), server.listen_fd);
+    try testing.expectEqual(@as(sys.fd_t, -1), server.listen_fd);
     try testing.expectError(error.ListenerClosed, server.resumeServing());
 }
 
 test "WebhookServer concurrent pause and resume never leave a duplicate producer" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var store = webhook.WebhookStore.init();
     const creds = seed(&store);
     var counted = CountingSink{};
 
-    var server = WebhookServer.init(&store, counted.sink(), 0, .{
+    var server = try WebhookServer.init(&store, counted.sink(), 0, .{
         .accept_poll_ms = 5,
         .conn_read_timeout_sec = 1,
         .handler = .{ .rate = .{ .per_min = 60_000, .burst = 100 } },
-    }) catch return error.SkipZigTest;
+    });
     try server.spawn();
     defer server.shutdown();
     const original_fd = server.listen_fd;
@@ -981,22 +1031,22 @@ test "WebhookServer concurrent pause and resume never leave a duplicate producer
 }
 
 test "WebhookServer answers 411 promptly for a length-less POST body over loopback" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var store = webhook.WebhookStore.init();
     const creds = seed(&store);
     var rec = RecordingSink{};
 
-    var server = WebhookServer.init(&store, rec.sink(), 0, .{}) catch return error.SkipZigTest;
+    var server = try WebhookServer.init(&store, rec.sink(), 0, .{});
     try server.spawn();
     defer server.shutdown();
 
     const cfd = try socketTcp();
     defer closeFd(cfd);
-    var addr = linux.sockaddr.in{
+    var addr = sys.sockaddr.in{
         .port = std.mem.nativeToBig(u16, server.port),
         .addr = std.mem.nativeToBig(u32, loopback_addr),
     };
-    try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.connect(cfd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))));
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.connect(cfd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))));
 
     // A complete header block, a JSON body, and NO Content-Length. Pre-fix the
     // server would honour the fallback body (204); it now short-circuits 411
@@ -1006,7 +1056,7 @@ test "WebhookServer answers 411 promptly for a length-less POST body over loopba
     writeAll(cfd, req);
 
     var buf: [512]u8 = undefined;
-    const rc = linux.read(cfd, &buf, buf.len);
+    const rc = sys.read(cfd, &buf, buf.len);
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
     const got = buf[0..@intCast(rc)];
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 411 Length Required\r\n"));
@@ -1017,4 +1067,57 @@ test "WebhookServer answers 411 promptly for a length-less POST body over loopba
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "WebhookServer pause and whole request deadline stop an active dribble before publication" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_]bool{ true, false }) |pause_now| {
+        var store = webhook.WebhookStore.init();
+        var counted = CountingSink{};
+        var server = try WebhookServer.init(&store, counted.sink(), 0, .{ .accept_poll_ms = 10, .conn_read_timeout_sec = 1 });
+        try server.spawn();
+        defer server.shutdown();
+        const fd = try connectLoopback(server.port);
+        defer closeFd(fd);
+        writeAll(fd, "POST /webhook/incomplete HTTP/1.1\r\nContent-Length: 65536\r\n\r\n");
+        const Dribble = struct {
+            fd: posix.fd_t,
+            stop: std.atomic.Value(bool) = .init(false),
+            writes: std.atomic.Value(u32) = .init(0),
+            fn run(self: *@This()) void {
+                while (!self.stop.load(.acquire)) {
+                    const rc = sys.sendto(self.fd, "x", 1, posix.MSG.NOSIGNAL | posix.MSG.DONTWAIT, null, 0);
+                    if (posix.errno(rc) != .SUCCESS) return;
+                    _ = self.writes.fetchAdd(1, .release);
+                    testSleepMs(10);
+                }
+            }
+        };
+        var dribble = Dribble{ .fd = fd };
+        const thread = try std.Thread.spawn(.{}, Dribble.run, .{&dribble});
+        defer {
+            dribble.stop.store(true, .release);
+            thread.join();
+        }
+        for (0..100) |_| {
+            if (dribble.writes.load(.acquire) >= 5) break;
+            testSleepMs(10);
+        }
+        try testing.expect(dribble.writes.load(.acquire) >= 5);
+        const clock = @import("../substrate/platform.zig");
+        const before = clock.monotonicMillis();
+        if (pause_now) server.pause();
+        if (pause_now) try testing.expect(clock.monotonicMillis() - before < 1000);
+        try testing.expectEqual(@as(u32, 0), counted.count.load(.acquire));
+        // EOF or reset proves this was an accepted request, not a vacuous backlog
+        // connection. The listener remains bound for a later resume.
+        var byte: [1]u8 = undefined;
+        const ended = sys.recvfrom(fd, &byte, byte.len, 0, null, null);
+        try testing.expect(ended == 0 or posix.errno(ended) == .CONNRESET);
+        try testing.expect(clock.monotonicMillis() - before < 1500);
+        if (!pause_now) server.pause();
+        try testing.expect(server.thread == null);
+        try testing.expectEqual(@as(u32, 0), counted.count.load(.acquire));
+        try testing.expect(server.listen_fd >= 0);
+    }
 }

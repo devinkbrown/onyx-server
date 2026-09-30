@@ -18,7 +18,7 @@ const builtin = @import("builtin");
 const http01 = @import("acme_http01_server.zig");
 const toml = @import("../proto/toml.zig");
 
-const linux = std.os.linux;
+const sys = std.posix.system;
 const posix = std.posix;
 
 comptime {
@@ -30,6 +30,7 @@ pub const ListenerError = error{
     BindFailed,
     ListenFailed,
     AddrLookupFailed,
+    TimeoutSetupFailed,
 };
 
 /// Max request bytes read per connection (a challenge GET is tiny).
@@ -77,7 +78,7 @@ pub const Config = struct {
 
 pub const ChallengeServer = struct {
     store: *http01.TokenStore,
-    listen_fd: linux.fd_t,
+    listen_fd: sys.fd_t,
     port: u16,
     thread: ?std.Thread = null,
     stop_flag: std.atomic.Value(bool) = .{ .raw = false },
@@ -98,31 +99,38 @@ pub const ChallengeServer = struct {
         errdefer closeFd(fd);
 
         var yes: u32 = 1;
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
+        _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
 
-        var addr = linux.sockaddr.in{
+        var addr = sys.sockaddr.in{
             .port = std.mem.nativeToBig(u16, port),
             .addr = std.mem.nativeToBig(u32, 0x7f00_0001), // 127.0.0.1 (invariant)
         };
-        if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))) != .SUCCESS)
             return error.BindFailed;
-        if (posix.errno(linux.listen(fd, config.listen_backlog)) != .SUCCESS)
+        if (posix.errno(sys.listen(fd, config.listen_backlog)) != .SUCCESS)
             return error.ListenFailed;
+        if (comptime builtin.os.tag != .linux) {
+            @import("os_runtime.zig").setNonblocking(fd) catch return error.ListenFailed;
+        }
 
         // Receive timeout so a blocked accept4 wakes periodically to re-check the
         // stop flag. Closing the listener from another thread does NOT reliably
         // wake accept4, so this poll is how shutdown actually terminates.
-        const tv = linux.timeval{
-            .sec = @intCast(config.accept_poll_ms / 1000),
-            .usec = @intCast((config.accept_poll_ms % 1000) * 1000),
+        const poll_ms = if (builtin.os.tag == .linux) config.accept_poll_ms else @max(config.accept_poll_ms, 1);
+        const tv = sys.timeval{
+            .sec = @intCast(poll_ms / 1000),
+            .usec = @intCast((poll_ms % 1000) * 1000),
         };
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        const timeout_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+        if (comptime builtin.os.tag != .linux) {
+            if (posix.errno(timeout_rc) != .SUCCESS) return error.TimeoutSetupFailed;
+        }
 
         return .{
             .store = store,
             .listen_fd = fd,
             .port = try boundPort(fd),
-            .conn_read_timeout_sec = config.conn_read_timeout_sec,
+            .conn_read_timeout_sec = if (builtin.os.tag == .linux) config.conn_read_timeout_sec else @max(config.conn_read_timeout_sec, 1),
         };
     }
 
@@ -134,19 +142,21 @@ pub const ChallengeServer = struct {
     /// Signal stop, unblock the accept loop by closing the listener, and join.
     pub fn shutdown(self: *ChallengeServer) void {
         self.stop_flag.store(true, .release);
-        closeFd(self.listen_fd); // unblocks a blocking accept4 with EBADF
+        if (comptime builtin.os.tag == .linux) closeFd(self.listen_fd);
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
+        if (comptime builtin.os.tag != .linux) closeFd(self.listen_fd);
+        self.listen_fd = -1;
     }
 
     fn acceptLoop(self: *ChallengeServer) void {
         // Linux-only accept loop (`accept4`/`SOCK_CLOEXEC`). Gate at comptime so
         // foreign-target test builds compile; byte-identical on Linux.
-        if (comptime builtin.os.tag == .linux) {
+        if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
             while (!self.stop_flag.load(.acquire)) {
-                const rc = linux.accept4(self.listen_fd, null, null, posix.SOCK.CLOEXEC);
+                const rc = acceptSocket(self.listen_fd);
                 switch (posix.errno(rc)) {
                     .SUCCESS => self.serveConn(@intCast(rc)),
                     .AGAIN, .INTR, .CONNABORTED => continue, // timeout/interrupt: re-check stop flag
@@ -156,14 +166,17 @@ pub const ChallengeServer = struct {
         }
     }
 
-    fn serveConn(self: *ChallengeServer, fd: linux.fd_t) void {
+    fn serveConn(self: *ChallengeServer, fd: sys.fd_t) void {
         defer closeFd(fd);
         // Accepted sockets do not inherit the listener's timeout; cap the read so a
         // silent/slow client cannot stall the single-threaded accept loop.
-        const tv = linux.timeval{ .sec = @intCast(self.conn_read_timeout_sec), .usec = 0 };
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        const tv = sys.timeval{ .sec = @intCast(self.conn_read_timeout_sec), .usec = 0 };
+        const timeout_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+        if (comptime builtin.os.tag != .linux) {
+            if (posix.errno(timeout_rc) != .SUCCESS or posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval))) != .SUCCESS) return;
+        }
         var req_buf: [max_request]u8 = undefined;
-        const rc = linux.read(fd, &req_buf, req_buf.len);
+        const rc = sys.read(fd, &req_buf, req_buf.len);
         if (posix.errno(rc) != .SUCCESS) return;
         const n: usize = @intCast(rc);
         if (n == 0) return;
@@ -178,11 +191,42 @@ pub const ChallengeServer = struct {
 // Low-level helpers (raw linux syscalls)
 // ---------------------------------------------------------------------------
 
-fn socketTcp() ListenerError!linux.fd_t {
+// BSD accept timeout is explicit: listener SO_RCVTIMEO is configuration,
+// poll bounds the wait, and nonblocking accept cannot hang after stale readiness.
+fn acceptSocket(fd: posix.fd_t) if (builtin.os.tag == .linux) usize else c_int {
+    if (comptime builtin.os.tag == .linux) return sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
+    var tv: sys.timeval = undefined;
+    var len: posix.socklen_t = @sizeOf(@TypeOf(tv));
+    if (sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), &len) != 0) return -1;
+    const millis = @max(@as(i64, 1), tv.sec * 1000 + @divTrunc(tv.usec, 1000));
+    var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    const rc = sys.poll(&pollfds, 1, @intCast(@min(millis, std.math.maxInt(c_int))));
+    if (rc < 0) return -1;
+    if (rc == 0) {
+        sys._errno().* = @intFromEnum(posix.E.AGAIN);
+        return -1;
+    }
+    const accepted = sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
+    if (accepted < 0) return -1;
+    // BSD may inherit listener nonblocking state. Request readers use a
+    // verified SO_RCVTIMEO on a blocking accepted socket.
+    const old = sys.fcntl(accepted, posix.F.GETFL, @as(c_int, 0));
+    if (old >= 0) {
+        var flags: posix.O = @bitCast(@as(u32, @intCast(old)));
+        flags.NONBLOCK = false;
+        if (sys.fcntl(accepted, posix.F.SETFL, @as(usize, @as(u32, @bitCast(flags)))) == 0) return accepted;
+    }
+    const saved = sys._errno().*;
+    _ = sys.close(accepted);
+    sys._errno().* = saved;
+    return -1;
+}
+
+fn socketTcp() ListenerError!sys.fd_t {
     // Linux-only (`SOCK_CLOEXEC`); force-referenced by `refAllDecls` in the test
     // build, so gate the body at comptime. Byte-identical on Linux.
-    if (comptime builtin.os.tag == .linux) {
-        const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
+        const rc = sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
         return switch (posix.errno(rc)) {
             .SUCCESS => @intCast(rc),
             else => error.SocketUnavailable,
@@ -190,24 +234,25 @@ fn socketTcp() ListenerError!linux.fd_t {
     } else return error.SocketUnavailable;
 }
 
-fn boundPort(fd: linux.fd_t) ListenerError!u16 {
+fn boundPort(fd: sys.fd_t) ListenerError!u16 {
     var storage: posix.sockaddr.storage = undefined;
     var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    if (posix.errno(linux.getsockname(fd, @ptrCast(&storage), &len)) != .SUCCESS)
+    if (posix.errno(sys.getsockname(fd, @ptrCast(&storage), &len)) != .SUCCESS)
         return error.AddrLookupFailed;
-    const a: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
+    const a: *const sys.sockaddr.in = @ptrCast(@alignCast(&storage));
     return std.mem.bigToNative(u16, a.port);
 }
 
-fn closeFd(fd: linux.fd_t) void {
-    _ = linux.close(fd);
+fn closeFd(fd: sys.fd_t) void {
+    _ = sys.close(fd);
 }
 
-fn writeAll(fd: linux.fd_t, bytes: []const u8) void {
+fn writeAll(fd: sys.fd_t, bytes: []const u8) void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        const rc = if (comptime builtin.os.tag == .linux) sys.write(fd, bytes[off..].ptr, bytes.len - off) else sys.send(fd, bytes[off..].ptr, bytes.len - off, posix.MSG.NOSIGNAL);
         if (posix.errno(rc) != .SUCCESS) return;
+        if (rc == 0) return;
         off += @intCast(rc);
     }
 }
@@ -246,17 +291,17 @@ test "ChallengeServer serves a stored token over loopback" {
     // Connect a client to the ephemeral loopback port and request the token.
     const cfd = try socketTcp();
     defer closeFd(cfd);
-    var addr = linux.sockaddr.in{
+    var addr = sys.sockaddr.in{
         .port = std.mem.nativeToBig(u16, server.port),
         .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
     };
-    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.connect(cfd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))));
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.connect(cfd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))));
 
     const req = "GET /.well-known/acme-challenge/tok_AZ09-test HTTP/1.1\r\nHost: x\r\n\r\n";
     writeAll(cfd, req);
 
     var buf: [512]u8 = undefined;
-    const rc = linux.read(cfd, &buf, buf.len);
+    const rc = sys.read(cfd, &buf, buf.len);
     try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
     const got = buf[0..@intCast(rc)];
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
@@ -274,15 +319,15 @@ test "ChallengeServer returns 404 for unknown token" {
 
     const cfd = try socketTcp();
     defer closeFd(cfd);
-    var addr = linux.sockaddr.in{
+    var addr = sys.sockaddr.in{
         .port = std.mem.nativeToBig(u16, server.port),
         .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
     };
-    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.connect(cfd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))));
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.connect(cfd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))));
 
     writeAll(cfd, "GET /.well-known/acme-challenge/nope HTTP/1.1\r\n\r\n");
     var buf: [512]u8 = undefined;
-    const rc = linux.read(cfd, &buf, buf.len);
+    const rc = sys.read(cfd, &buf, buf.len);
     try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
     try std.testing.expect(std.mem.startsWith(u8, buf[0..@intCast(rc)], "HTTP/1.1 404 Not Found\r\n"));
 }

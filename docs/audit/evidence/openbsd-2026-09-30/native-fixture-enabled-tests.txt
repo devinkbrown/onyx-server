@@ -1,0 +1,346 @@
+server start gates media transports on media_enabled
+Server.init threads content filter and memo configs
+GAP-O5 REHASH DRY prints diffs and applies none
+GAP-V3 MEDIA ABR stores independent spatial ceilings from the hint
+GAP-V4 recording waits for every member and stops when one joins
+GAP-V5 a participant or oper reads loss rtt and layer without key material
+GAP-V6 the room reads the speaking queue and the server forwards positions
+GAP-O3 a fault writes the tracelog to the named file
+secured establishment immediately publishes authenticated trust route
+mesh peer-count publish and RTT probe refuse a sibling (non-reactor-0) caller
+published mesh peers grow past the old 32 by 64 ceiling
+stats_peak_clients counts registered clients across shards
+DST GAP-A11 maintenance reactor re-bursts the local roster on the membership interval
+isMaintenanceReactor is false off reactor 0 and onTimerTick leaves shared last_*_ms still
+secured establish collision winner teardown trust lifecycle
+secured mesh probe deadline actively tears down a silent established socket
+secured mesh probe deadline starts only after whole record reaches SendQ
+secured collision scan passes stale loser before resolving viable route
+non-dedup S2S close immediately removes published peer
+session replica live publication pairs a newer lease and detached publication invalidates it
+DST GAP-A10 late lease refresh does not emit QUIT while the session is live
+DST GAP-A3 replica residence keeps two honest nicks and UID-renames a forged account
+session attachment lease encode OOM retains exact dirty token until full retry succeeds
+session replica orphaned final revoke survives encode Store OOM and checkpoint
+session replica sweep retains expired orphan until local revoke retry succeeds
+session replica replay skips attachment leases for rolling-old peers without pinning burst
+session replica mid-flight RESYNC restarts canonical Store without revision churn
+session replica value replay completes 140 objects under continuous behind-cursor renewal
+session replica conflicted lease replays both witnesses back to ingress peer
+session replica burst retains whole-record ciphertext across SendQ backpressure
+session replica live fanout preserves retained ciphertext on a full peer SendQ
+session replica secured receipt retry does not duplicate retained ciphertext
+session replica deferred sidecar retry bounds retained ciphertext
+session replica burst retries incomplete family after secured record allocation failure
+session replica replay leaves no inner residue after outer record allocation failure
+session replica burst sends every legal mesh ward beyond legacy scratch cap
+session replica replay budgets actual ciphertext with one-frame progress exception
+maximum legal session replica fits the clamped server-link SendQ and progresses
+secured roster repair follows inbound membership generations across asymmetric replay
+UPGRADE GAP-D2 offline memo survives the dropped process image
+UPGRADE GAP-D2 restored memo is delivered when the account attaches
+UPGRADE GAP-P16 MARKREAD survives the dropped process image and rewind stays bounded
+UPGRADE GAP-D3 gag and granted vhost survive the dropped process image
+DST GAP-D4 oper ABUSE explains live throttle and abuse rows survive the dropped image
+UPGRADE GAP-D5 restart keeps SCRAM and CertFP and invalidates recovery tokens
+GAP-D6 daemon backup set verifies and restores into a scratch directory
+UPGRADE GAP-D1 cold restart restores history msgids and skips ciphertext search
+GAP-D1 kill-restart restores channel and DM msgids
+MESSAGE_V2 replay and Lotus publish transactionally with one accepted identity
+MESSAGE_V2 durable admission fails closed without explicit direct-neighbor pins
+MESSAGE_V2 authoring activation requires a staged canonical full-mesh roster
+MESSAGE_V2 Helix legacy egress seam suppresses a twin after durable admission
+MESSAGE_V2 Helix authored row waits for rolling-old peer then replays once and retires
+MESSAGE_V2 custody ACK and ACK_CONFIRM fail closed for off-mesh and unsolicited peers
+MESSAGE_V2 RVL2 retry sweep cannot starve a later direct neighbor
+MESSAGE_V2 egress emits a >64 same-origin backlog old-HLC-before-new per neighbor
+MESSAGE_V2 egress retains a partitioned neighbor's obligation and retires it once on heal
+MESSAGE_V2 retained RVL2 row re-acks every direct neighbor after RVG2 window eviction
+Event Spine v2 history conflict rolls back staged replay authority byte-exact
+Event Spine v2 undefined severity fails closed without authority mutation
+Event Spine v2 binds local and remote origins before authority mutation
+Event Spine v2 guard allocation failures leave replay and history byte-exact
+UPGRADE continuity gate accepts idle state and refuses every media or companion owner
+DST GAP-A7 listener add or remove refuses UPGRADE with cold restart required
+DST GAP-P4 channel retention TTL deletes history search ids and memo copies
+DST GAP-O6 raid shield correlates peers and relaxes slowmode
+UPGRADE mandatory restored EventHistory and webhook store skip stale disk reload at start
+verified webhook residence bypass is restricted to server-authored channel PRIVMSG
+remote QUIT marked mesh departures render once per local recipient across shared channels
+UPGRADE resume: peer RESYNC re-burst of unchanged remote state emits zero client-visible lines
+UPGRADE resume: first override grant after missing registry projects +Y once
+UPGRADE canceled CONNECT survives SQ-full and retries through fair activation
+UPGRADE quiesce generation CAS and RESUMING completion are exact
+webhook Helix unwind stays paused until every owner reaches IDLE
+webhook Helix resume failure remains on bounded timer retry lane
+webhook: a Discord POST is delivered to the bound channel as a bot integration
+webhook: Block-Kit-lite actions are delivered as IRCv3 client tags
+webhook: CREATE/LIST/DELETE gate on channel operator status
+webhook disabled: WEBHOOK returns 421 and no listener binds (byte-identical off)
+GAP-P0b IRCX OAUTHBEARER refuses an unregistered account unless oauth_auto_provision
+WEBAUTHN inert until [webauthn] configured
+KEYTRANS exposes credential transparency root and inclusion proof
+GAP-K2 a stored signed head shows a revocation and a missing log fails closed only when required
+GAP-K2 a revocation is visible on the other node after anti-entropy
+GAP-K3 a node public key verifies a ban or kick after restart and a removed entry breaks the chain
+KEYTRANS DEVICE and EVENT survive store restart
+KEYTRANS DEVICE reports bound then deleted and rejects a bad account
+KEYTRANS corrupt store is fail-closed and restore is idempotent
+DPROP1 cold activation publishes exact authority and stays observationally silent
+DPROP1 cold startup without mandatory signer rejects local device writes
+KEYTRANS local mutation does not rollback or false-fail when observation is unavailable
+DPROP1 remote user device ENTITY_PROP is quarantined before all admission side effects
+DPROP1 remote device quarantine persists as policy across restart
+KEYTRANS generic local PROP observes exact user credential keys
+KEYTRANS generic local PROP identity.key is observed and residence is not
+KEYTRANS generic local PROP rejects and member entities do not observe
+KEYTRANS generic local PROP missing delete does not observe
+DPROP1 remote device origin cannot bypass quarantine after cold restart
+DPROP1 local device write converges exact signed durable live clock and transparency fact
+DPROP1 missing-row delete commits exact signed tombstone without creating live PROP
+DPROP1 channel and member device-looking properties retain generic PROP behavior
+DPROP1 ambiguous durable cut is sticky requests stop and publishes no live state
+DPROP1 transaction preparation signing clock and Services failures publish nothing
+DPROP1 PROP CLEAR scans beyond sixty four rows and preserves reserved device facts
+DPROP1 user PROP and E2EEKEY enumerate all one hundred twenty eight capacity rows
+DPROP1 reserved local PROP numerics and oper override remain fail closed
+DPROP1 stale durable admission maps generic PROP to ERR_SECURITY 908
+KEYTRANS remote apply allocation failure leaves props clocks and log unchanged
+KEYTRANS remote apply fresh server allocator is atomic for every prop mutation shape
+KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure creating a brand-new entity leaves no stranded entity, props, clock, HLC, or log growth
+KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure inserting a new key into an existing entity leaves its existing prop, clock, HLC, and log unchanged
+KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure replacing an existing value leaves the old value, clock, HLC, and log unchanged
+KEYTRANS remote ENTITY_PROP apply: clock-stage allocation failure on a delete fact leaves the prop, clock, HLC, and log unchanged
+E2EEKEY advertises account device keys through user props
+E2EEKEY ADD accepts onyx-ogc1-v1 only with the derived device id
+DPROP1 E2EEKEY mixed-case ODD1 commits folded PROP lists and restores
+E2EEKEY and IDENTITY live mutations append verifiable key transparency events
+E2EEGROUP cap-exhausted login and late negotiation fail explicitly before membership
+E2EEGROUP guest CAP REQ onyx/e2ee after registration stays open
+E2EEGROUP local handler renders exact capable-member and targeted Welcome lines
+E2EEGROUP local handler fails closed and accepts the full payload bound
+E2EEGROUP live operator quiesce is privileged observable non-mutating and reversible
+E2EEGROUP mesh live path accepts once refloods exact wire retries and retires exact peer ACK
+E2EEGROUP configured disconnected peer remains in event-time custody
+E2EEGROUP Helix seal refuses outstanding opaque custody without mutation
+IDENTITY advertises self-signed portable account keys through user props
+IDENTITY RESIDENCE publishes an account residence proof as a replicated user prop (fail-closed)
+secured Server canonicalizes configured node id to the identity short id
+P1: identity.key ENTITY_PROP ingest rejects a REMOTE write for a LOCALLY-homed account (local SASL anchor)
+E5E1 identity ENTITY_PROP ingest rejects every remote origin before LWW
+P1: a NON-identity user prop is NOT origin-bound (regression: ordinary ENTITY_PROP LWW is unchanged)
+WEBAUTHN register + passwordless auth (ES256), with tamper/challenge/regression rejects
+WEBAUTHN LIST/RENAME ride the EVENT plane; CRED carries created_unix; RENAME round-trips
+WEBAUTHN malformed base64 rejected without panic
+exploit: WEBAUTHN RENAME rejects a CRLF-smuggled label (no poison stored, no wire injection)
+exploit: WEBAUTHN REGISTER rejects a control-byte label before arming a challenge
+exploit: WEBAUTHN RENAME cannot relabel another account's passkey (ownership gate)
+exploit: webauthnReply drops a CRLF-bearing body (Event-Spine render firewall, last line of defence)
+portable local NICK publishes exact Store authority before v2 authorization
+exact-token NICK enforces no-nick across sibling membership union
+MONITOR rename prepares unbounded watcher output before identity commit
+repeated JOIN repairs exact siblings without emitting a duplicate logical event
+clone CREATE bootstraps every exact attachment with one JOIN view
+UPGRADE preflight flushes deferred resume sidecars only after exact authority is publishable
+UPGRADE preflight converges a live local channel projection journal
+UPGRADE preflight retains and refuses a detached local channel projection journal
+deferred resume sidecar flush preserves old nick across peer queue allocation failure
+UPGRADE preflight refuses an unbound deferred resume without erasing its old nick
+UPGRADE preflight refuses an unpublished portable mutation without clearing it
+UPGRADE seal restores signed replica authority and revoke replay protection
+session replica lifecycle LOGOUT revokes the final local portable token
+session replica lifecycle account switch revokes the abandoned portable token
+session replica lifecycle IRCX AUTH guest rebind revokes the abandoned portable token
+session replica lifecycle REGISTER rebind revokes the abandoned portable token
+session replica lifecycle DROP revokes every distinct local token
+multi-reactor DROP poison wins a raced authenticated recv before owner close
+session replica lifecycle keeps one-of-N authority and last nonportable sibling revokes
+session tracking at cap preserves detached portable authority for exact resume
+session replica lifecycle revokes portable authority replaced on same-client attach
+session replica nick index is case-folded bounded and ambiguity-safe
+SILENCE ACCESS control is case-insensitive: nick-case cannot bypass the ignore
+session-sync: sender same-account same-nick sibling gets the DM sent-copy without the cap
+session-sync exact-once matrix: local same-account distinct tokens dedupe mandatory and optional copies
+threaded server: auxiliary direct events fan out exact-token attachments once with stable identity
+threaded server: inactive OCG1 never authorizes remote DATA reserved tags
+session-sync exact-once matrix: authenticated inbound relay dedupes exact tokens and account mirror
+relay DM rejects an unproven same-account sender-copy claim
+relay +n accepts a verified multi-hop origin membership attestation
+relay +n denies a verified direct-origin nonmember
+relay +n denies an unsigned multi-hop nonmember
+E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh
+E2EEPOLICYBODY optional rooms still accept untagged plaintext
+E2EEPOLICYBODY off rooms still accept untagged plaintext
+E2EEPOLICYBODY TAGMSG stays tag-only in required rooms
+GAP-O1 merges reactor latency samples once into the metrics snapshot
+GAP-O2 MESH and metrics expose peer rtt backlog anti-entropy and partitioned versus down
+cloak auth-split: anonymous gets epoch opaque, logged-in keeps the stable account cloak
+cloak auth-split: anon_epoch_secs=0 keeps the stable hierarchical cloak (back-compat)
+E5E1 session replica residence rejects downgrade without widening exact token authority
+signed peer ingest uses Store residence decisions for downgrade and v2 rowless sidecars
+Helix silent session projection is complete without derived output and rejects invalid profile
+signed session replica projects JOIN PART only to the exact token and never republishes
+rowless signed session replica retries Pending staging after capacity clears
+pending v2 reconnect projection cannot outlive signed Store authority
+deliverRelay rejects unsafe direct callers before delivery and dedup observation
+deliverRelay binds sender nick to home: legit delivers, mismatch and unknown drop
+MESSAGE_V2 unknown home retries then converges and delivers once
+MESSAGE_V2 unknown home convergence to different node drops permanently
+MESSAGE_V2 deferred unknown-home expires without delivery
+MESSAGE_V2 signed member modes bypass unknown-home retry
+MESSAGE_V2 known-home mismatch with signed member modes still drops permanently
+E5E1 remote identity namespace quarantine precedes signatures clocks stores and authority
+E5E1 local identity add residence and delete never export to plaintext or secured links
+remote property admission advances HLC only for accepted channel and entity facts
+S2S identity transition renders PART before NICK before JOIN
+secured S2S v2 identity transition renders PART before NICK before JOIN
+mesh LIST: remote-only channels join the union with the global count, secret hidden, deduped
+GAP-P0c remote LISTX carries the peer topic
+threaded server: one mesh credential attaches multiple live clients without nonce races
+threaded server: session reclaim local restore failure leaves the ghost reclaimable
+SESSION RESUME retry latch clears on terminal and already-attached attempts
+SESSION RESUME composite rejects malformed terminal and forged exact authority without downgrade
+SESSION RESUME exact selector moves only its sibling and durable spool
+ReleaseSafe SESSION TOKEN reader-first issuance gate defaults legacy and explicitly enables SRM2
+E2EE at-cap exact resume hold isolates succeeds on proof and closes on expiry
+SESSION RESUME legacy local and SRM1 create new without stripping ghost spool
+expired SESSION RESUME retry hold clears TOKEN latch and restores UPGRADE readiness
+manual SESSION RESUME retry preservation expires without autojoin deferral and restores UPGRADE readiness
+threaded server: explicit detached session resume spool conflict aborts before identity commit
+SESSION DROP removes a sibling attachment by LIST index
+SESSION DROP #n cannot retarget after list snapshot mutation
+SESSION DROP sid revokes exactly one physical attachment and leaves shared-token siblings live
+SESSION DROP crosses two live reactors and preserves an exact-token sibling identity
+SESSION DROP fails closed on absent, stale, and account-switched ids
+SESSION DROP leaves an attached foreign-shard row untouched until the reserved handoff protocol exists
+closing a token sibling cancels reserved DROP before detaching its row
+SESSION DROP never treats a local target with an unattested foreign token sibling as final
+SESSION DROP prefers the current nick-owning sibling among three local token attachments
+threaded server: EXTERNAL auto-resume latch excludes certificates and PLAIN
+threaded server: EXTERNAL exact account nick auto-attaches one local token and picks canonical among many
+threaded server: EXTERNAL prefers live local over competing mesh replicas
+threaded server: EXTERNAL picks highest-revision staged mesh replica among many
+threaded server: secured replica permits tokenless EXTERNAL exact account nick resume
+threaded server: first EXTERNAL login proactively publishes its portable session
+threaded server: detached EXTERNAL proof uses bootstrap source tie break
+threaded server: fresh EXTERNAL publication failure preserves cap ghost byte exact
+threaded server: registration EXTERNAL resumes before oper prefix and applies vhost to siblings
+threaded server: approved account vhost reaches attachments on every reactor
+threaded server: cap-bound detached EXTERNAL registration preserves and restores exact token
+threaded server: EXTERNAL registration blocks on missing stale or mismatched mesh projection
+threaded server: local resume joins an attached reusable session
+threaded server: resume roster pressure aborts before World or token commit
+threaded server: already-seated no-implicit resume emits no bootstrap bytes
+threaded server: resume reuses exact server-time tags for claimant and peers
+live session identity handoff requires the exact reusable token
+live session identity handoff never transfers nick after allocation failure
+close retries exact-session handoff before teardown after allocation failure
+portable teardown requires exact remote authority and retains clean QUIT channels
+threaded server: legacy consumed notice cannot delete a reusable session replica
+threaded server: migration staging isolates equal nonces from different peer signers
+threaded server: session migration restore cannot switch the authenticated account
+atomic RESUME staged capsule adopts a rowless verified token
+atomic legacy SRM1 staged capsule joins without consuming an existing ghost
+atomic RESUME refuses pending token A and an attached old token group
+atomic RESUME rendered PART preserves target and old-identity siblings
+threaded server: session reclaim crypto_io-null disables reclaim not constant zero tokens
+threaded server: MTOKEN is withheld when portable snapshot preflight cannot complete
+threaded server: mesh reclaim credentials use portable wall-clock expiry
+threaded server: session tracking at cap with all slots attached is surfaced not fatal
+text.ircv3.net binary application frame closes 1002 before media routing
+fragmented binary aggregate over 4 MiB closes 1009 without routing
+single binary frame declaring over 4 MiB closes 1009 from its header
+coalesced Deframer buffer overflow closes 1009 instead of abnormally
+malformed WebSocket frame closes 1002 instead of abnormally
+custom and legacy empty binary opening fragments begin reassembly
+coalesced feed preserves pending binary opening-frame identity
+coalesced feed preserves pending final-continuation identity
+text.ircv3.net rejects CRLF batched text before routing a line
+exploit: failReply rejects CRLF-smuggled command (notice branch, fail-closed)
+exploit: failReply rejects CRLF-smuggled fields (standard-replies branch)
+exploit: noticeTo rejects CRLF-smuggled text (fail-closed)
+exploit: control-byte-free FAIL reply is still emitted byte-for-byte
+exploit: emitReplyLine drops CRLF-smuggled reflected fields (all sinks, fail-closed)
+exploit: emitReplyLine emits control-byte-free reply lines byte-for-byte
+exploit: SHUN list drops a CRLF-smuggled stored reason (oper handler, end-to-end)
+exploit: fantasyReply drops CRLF-smuggled external-feed content (broadcast + relay sink)
+exploit: OPER command grants no operator status (SASL-only elevation, fail-closed)
+exploit: channel PRIVMSG with mIRC colour admits under active MESSAGE_V2 authoring
+exploit: channel PRIVMSG #root durably admits with mesh peer configured but unconnected
+exploit: channel PRIVMSG ADS1 soft-fail after durable admit still delivers and recovers
+exploit: channel PRIVMSG durable admit capacity fails closed with TEMPORARILY_UNAVAILABLE
+exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without authority drift
+exploit: oversized color-formatted PRIVMSG does not brick channel chat
+exploit: PRIVMSG flood does not permanently brick channel chat
+session resume projection: large channel NAMES is complete and chunked past 512 members
+NAMES rejects an admitted malformed remote member without partial 353 or 366
+JOIN auto-NAMES rejects malformed remote roster without empty nicklist
+labeled NAMES capture follows remaining SendQ beyond legacy 65 arenas
+WS media admission binds a valid participant MAC to its own stream and active kind
+GAP-V2 a node identity still delivers the signed media handshake
+GAP-V2 a rejected browser media frame returns numeric 404
+GAP-V2 TURN is cut and allocates no relay
+MEDIA WS OFFER suppresses unroutable NATIVE/TRANSPORT; non-WS still gets UDP candidates
+delivery fanout continues past stale and poisoned members to a later healthy member
+tagged near-max line fails atomically without retaining its prefix
+detached reusable attachment transfers retained event to resumed physical id
+authored MESSAGE_V2 ADS1 capacity soft-fail preserves spool while mesh authorities publish
+threaded server: PRIVMSG NOTICE ADS1 soft-fail after durable admission still delivers locally
+threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admission reaches foreign member
+tracking at cap preserves detached spool and leaves newcomer untracked
+logout retires pending attachment rows before socket close and later token reuse
+account rebind retires pending attachment rows before socket close and old-account reuse
+cross-shard deliver: pool-exhaustion drops are counted, never silent
+cross-shard delivery poison: saturated special broadcasts poison only matching subscribers
+cross-shard delivery poison: stale generation never aborts reused slot
+cross-shard delivery poison: partial chunk pool exhaustion aborts exact target
+cross-shard delivery poison: target SendQ overflow isolates later recipient
+cross-shard delivery poison: recv executes no later command
+cross-shard delivery poison: send CQE discards inline and overflow tails before retryable close
+account-switch ratchet standard SASL then post-auth replacement never unions oper authority
+account-switch ratchet IRCX AUTH guest and logout clear exact oper authority
+mesh OCG1 GRANT converges records but never authorizes sessions or prefixes
+remote WHOIS projects a live mesh grant as display-only oper status
+GAP-P0c remote WHOIS copies roster identity and leaves idle away and secure unreplicated
+GAP-P0c remote SYS and ADM DATA tags stay closed for an operator account
+GAP-P0c an operator session still gets no oper message-tag
+configured boot dial cursor reaches three peers behind a fast failure
+GAP-O7 handshake and anti-entropy stalls open a breaker and an unsigned frame stays refused
+GAP-O8 mesh ban filter is exchanged before the authoritative list
+threaded server: an UNPROVEN cross-node same-account claim grants no coexistence relay (F1 fail-closed)
+threaded server: one reusable session stays live and participatory across a secured mesh
+UPGRADE property clock boundary prepares successor HLC without mutating predecessor
+GAP-P0c KNOCK sends 711 only after local operator notification
+GAP-P0c WHOWAS reply includes the account and the real host
+same-nick atomic restore sends only safe deferred mesh departures
+same-nick exact sibling close keeps restored mesh membership live
+atomic session restore and token bind preserve every component on allocation failure
+session-foundation adversarial: rejected ordinary JOIN OOM restores the exact prior local projection
+session-foundation adversarial: rejected auto-clone prepare and seated commit OOM restore the prior projection
+session-foundation adversarial: rejected clone CREATE seated commit OOM restores the prior projection
+session-foundation adversarial: detached RESUME overlays absent present and status journals before any output
+session-foundation adversarial: detached RESUME overlays the full journal capacity with case-insensitive collisions
+session-foundation adversarial: KICK privately reaches every exact attachment while a same-nick token survives
+session-foundation adversarial: absent projector converges live exact rows but retains work for a detached sibling
+session-foundation locked rows: folded exact owner survives while a current detached sibling is excluded
+session-foundation locked rows: duplicate client across folded accounts fails closed and clean retry succeeds
+session-foundation locked rows: retained ticket blocks detach drift until abort
+session-foundation locked rows: capture OOM is failure-atomic and retryable through RESUME
+OCG2 server runtime requires an exact paired monotonic origin
+OCG2 server runtime is inert by default and reactor zero owns terminal cadence
+GAP-P0c reaction tally is readable after a late subscribe
+GAP-O9 DIE, RESTART, and mesh bans wait for a second operator
+GAP-O10 policy rollback restores the last ward, filter, class, and ban generation
+GAP-P1 cold start rebuilds the thread from durable history
+GAP-P3 a cron fire is delivered once by reactor 0
+GAP-P5 a search on one node returns an authorized hit from another node
+GAP-P5 merged search stays inside the hard cap
+GAP-P5 a mesh link returns an authorized hit from the other node
+GAP-P5 a mesh link keeps the hard cap across both nodes
+GAP-P6 unfurl is opt-in, bounded, and refuses private addresses
+GAP-P7 a banned connection files one appeal and the oper answer is audited
+GAP-P8 a tripped connection answers a challenge before 001
+GAP-P9 a channel prop holds first messages and quarantine is audited
+GAP-P10 a speak grant registers a command and a run is not an oper bit
+GAP-P11 IRCX screens name a handler or a divergence
+GAP-K4 a sealed room refuses the clear roster and an ordinary room still lists it

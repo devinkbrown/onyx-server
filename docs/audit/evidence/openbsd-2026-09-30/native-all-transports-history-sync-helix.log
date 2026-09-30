@@ -1,0 +1,3 @@
+PASS 40 original IPv4/IPv6 all transport attachments
+PASS upgrade 1: PID 3347->23755; all original sockets retained; 39 single deliveries observed through the drain window
+PASS upgrade 2: PID 23755->85513; all original sockets retained; 39 single deliveries observed through the drain window

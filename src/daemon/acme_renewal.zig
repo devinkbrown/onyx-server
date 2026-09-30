@@ -193,6 +193,7 @@ fn sleepInterruptible(total_ms: u64, stop_flag: *std.atomic.Value(bool)) bool {
 }
 
 fn sleepMs(ms: u32) void {
+    if (comptime @import("builtin").os.tag != .linux) return @import("os_runtime.zig").sleepMillis(ms);
     var req = linux.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
     _ = linux.nanosleep(&req, null);
 }

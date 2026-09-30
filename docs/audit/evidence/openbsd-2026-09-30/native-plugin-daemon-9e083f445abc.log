@@ -1,0 +1,13 @@
+Onyx Server 0.7.0+15e09029-dirty
+  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+
+onyx-server: loaded config from /tmp/onyx-plugin-native/run-2121de96114c/config.toml
+onyx-server: node identity generated + persisted to /tmp/onyx-plugin-native/run-2121de96114c/onyx-server-node.key
+onyx-server: SASL account store opened (/tmp/onyx-plugin-native/run-2121de96114c/accounts.wal); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL + SESSION-TOKEN live
+onyx-server: cloak key generated (per-boot; set [cloak] secret to persist)
+onyx-server: TLS listener enabled on port 33671
+onyx-server: kTLS unavailable on this kernel (no TLS ULP); TLS stays in userspace
+onyx-server: MESSAGE_V2 durable membership disabled: require a non-empty, fully valid, bounded direct-neighbor trust-root set
+onyx-server: loaded 1 OroWasm plugin(s) from /tmp/onyx-plugin-native/run-2121de96114c/plugins
+onyx-server: listening on 127.0.0.1:33670 (kqueue) — PING + registration live
+onyx-server: loaded 1 OroWasm plugin(s) from /tmp/onyx-plugin-native/run-2121de96114c/plugins

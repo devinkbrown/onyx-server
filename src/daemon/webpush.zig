@@ -249,6 +249,22 @@ pub const Vapid = struct {
         return .{ .key_pair = kp };
     }
 
+    /// Native Helix staging may read identity material but never create it.
+    pub fn loadExisting(io: std.Io, allocator: Allocator, dir: std.Io.Dir, sub_path: []const u8) !Vapid {
+        const text = try dir.readFileAlloc(io, sub_path, allocator, .limited(256));
+        defer {
+            std.crypto.secureZero(u8, text);
+            allocator.free(text);
+        }
+        const trimmed = std.mem.trim(u8, text, " \r\n\t");
+        if (trimmed.len != 64) return error.InvalidVapidKey;
+        var secret: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &secret);
+        _ = std.fmt.hexToBytes(&secret, trimmed) catch return error.InvalidVapidKey;
+        const sk = ecdsa.SecretKey.fromBytes(secret) catch return error.InvalidVapidKey;
+        return .{ .key_pair = ecdsa.KeyPair.fromSecretKey(sk) catch return error.InvalidVapidKey };
+    }
+
     /// The base64url public key clients pass to `pushManager.subscribe`.
     /// Buffer must hold 87 bytes.
     pub fn publicB64(self: *const Vapid, out: *[b64url.Encoder.calcSize(65)]u8) []const u8 {
@@ -298,7 +314,9 @@ pub const Worker = struct {
     overflow_events: usize = 0,
 
     pub fn spawn(self: *Worker) !void {
-        self.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, run, .{self});
+        // The HTTPS client and hybrid key exchange have nested Debug frames
+        // larger than 512 KiB. Reserve enough stack for real push delivery.
+        self.thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, run, .{self});
     }
 
     pub fn shutdown(self: *Worker) void {
@@ -470,6 +488,7 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 }
 
 fn sleepMs(ms: u32) void {
+    if (comptime @import("builtin").os.tag != .linux) return @import("os_runtime.zig").sleepMillis(ms);
     const linux = std.os.linux;
     var req = linux.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
     _ = linux.nanosleep(&req, null);

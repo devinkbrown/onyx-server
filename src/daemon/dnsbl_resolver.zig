@@ -91,6 +91,7 @@ pub const Resolver = struct {
     /// configured or no zones are set; requests then simply never become ready
     /// and callers treat every client as not-listed.
     pub fn start(self: *Resolver) void {
+        if (comptime @import("builtin").os.tag == .windows) return;
         if (self.thread != null) return;
         if (self.cfg.nameserver_count == 0 or self.zone_count == 0) return;
         self.stop_flag.store(false, .release);
@@ -263,6 +264,11 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 }
 
 fn sleepMs(ms: u32) void {
+    if (comptime @import("builtin").os.tag == .windows) return;
+    if (comptime @import("builtin").os.tag != .linux) {
+        @import("os_runtime.zig").sleepMillis(ms);
+        return;
+    }
     const linux = std.os.linux;
     var req = linux.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
     _ = linux.nanosleep(&req, null);

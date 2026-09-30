@@ -7437,11 +7437,14 @@ test "GAP-K9 accepted 0-RTT puts EndOfEarlyData on both transcripts" {
         .is_ca = true,
     });
 
+    const now: i64 = 1_704_067_200;
+    var guard = tls_resumption.ReplayGuard{};
     var server = try tls_server.Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
         .enable_session_tickets = true,
         .max_early_data_size = 4096,
+        .now_unix_seconds = now,
     });
     defer server.deinit();
     var client = try Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
@@ -7472,6 +7475,9 @@ test "GAP-K9 accepted 0-RTT puts EndOfEarlyData on both transcripts" {
         .cert_chain = &.{der},
         .signing_key = kp,
         .ticket_key = ticket_key,
+        .max_early_data_size = 4096,
+        .now_unix_seconds = now,
+        .replay_guard = &guard,
         .enable_session_tickets = true,
     });
     defer early_server.deinit();

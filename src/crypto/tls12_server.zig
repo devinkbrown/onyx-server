@@ -1329,6 +1329,7 @@ fn osEntropy(buf: []u8) Error!void {
                 filled += rc;
             }
         },
+        .openbsd => @import("random.zig").fillOsEntropy(buf) catch return error.EntropyUnavailable,
         else => return error.EntropyUnavailable,
     }
 }

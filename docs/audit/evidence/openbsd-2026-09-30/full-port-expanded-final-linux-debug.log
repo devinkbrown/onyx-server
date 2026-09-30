@@ -1,0 +1,157 @@
+test
++- run test w
+GAP-C5 branch=armor enc stays an AEAD-only stub
+failed command: ./.zig-cache/o/76359deff9c6f773cf46bb11cb7d80fe/test --cache-dir=./.zig-cache --seed=0xe83aef08 --listen=-
+
+test
++- run test w
+GAP-V3 branch=rtp per-receiver spatial ceiling from the packet layer; rtx cache 512 is the product, no separate RTX SSRC
+GAP-P0c branch=WHOIS 335 follows bot mode; BOTGRANT marks isBot; announce board stays uncalled; in-channel commands stay weather and news
+GAP-P0c branch=ANON GateKeeper and GateKeeperPassport reply 912 and stay off the SASL list
+GAP-P0c branch=inbound multiline reassembles to one value and a server reply stays one line
+GAP-K14 branch=a critical CRL distribution point or SCT list is rejected
+GAP-M2 branch=raised ceilings store the 65th node and still evict only when full
+GAP-M1 branch=65 replicas merge and round-trip member_compact
+GAP-M2 branch=raised ceilings store the 65th node and still evict only when full
+GAP-M2 branch=raised ceilings store the 65th node and still evict only when full
+GAP-X3 branch=freebsd capsicum and SO_REUSEPORT_LB, openbsd pledge and unveil, windows job kill-on-close; this host did not execute them; windows RIO stays unmet
+GAP-X3 branch=freebsd kernel TLS uses TCP_TXTLS_ENABLE and struct tls_enable; this host did not execute setsockopt; windows RIO stays unmet
+GAP-X1 branch=linux ring queued six ops; this host did not execute kqueue or IOCP; closed kqueue describes FreeBSD filters; closed IOCP describes AFD wait-for-listen and AFD poll and returns MissingOp; portable init opens the native backend and refuses a missing op; USR2 capsule refused
+GAP-X3 branch=windows RIO loads the function table with WSAIoctl SIO 0xC8000024 and GUID 8509e081-96dd-4005-b165-9e2ee8c79e3f on a WSA_FLAG_REGISTERED_IO socket during Iocp.open; dequeueRegistered calls that stored table; off Windows it returns stage off-windows before any pointer call; a null or short table is MissingOp and the port is closed; recv and send on the IOCP path are IOCTL_AFD_RECEIVE and IOCTL_AFD_SEND; this host did not execute WSAIoctl or RIODequeueCompletion; heading stays unmarked; whole-accept not claimed
+GAP-A5 branch=refuse io.sqpoll + io.defer_taskrun rejected: kernel returns EINVAL for IORING_SETUP_SQPOLL|IORING_SETUP_DEFER_TASKRUN|IORING_SETUP_SINGLE_ISSUER
+GAP-A6 branch=footgun rx=off ktls-stays-tx
+GAP-A2 branch=check-config refuse unsecured mesh.connect; compat default
+GAP-A7 branch=check-config refuse listener add/remove; cold boot of webtransport stays valid
+GAP-V1 branch=hold-off dtls13=off caveat=kept
+GAP-A1 branch=mint authority only and toml private key refused
+GAP-P0b branch=cap onyx/2fa=IDENTIFY before AUTHENTICATE
+GAP-P0c branch=cap-notify is advertised from a static set and CAP NEW DEL whoami file-upload and oper stay off
+GAP-P0b branch=oauth refuses unknown account unless oauth_auto_provision
+section 10 branch=stop maintaining memo_capsule away_capsule and ratelimit_capsule; CapsuleKind stays 1 through 17; ban_capsule stays
+GAP-O2 branch=peer rtt backlog anti-entropy partitioned-vs-down; hlc does not gate liveness
+GAP-D7 branch=configured relay with a non-empty trust store records a durable delivery failure; empty trust still refuses remote AUTH; live mail stays off
+GAP-V1 branch=hold-off dtls13=off caveat=kept dtls12=HelloVerifyRequest
+GAP-A8 branch=trust-store bad-cert=keep signature-fail=keep previous=previous-staple
+GAP-K7 branch=written threat boundary; history rekey is not a daemon mode because the daemon holds no epoch key; metadata-min is refused because NAMES search and abuse require server-visible membership; implementation does not follow
+GAP-X1 branch=PortableServer answered PING lane two third with PONG through processLine on ringlane
+GAP-X4 branch=PortableServer registered three clients, answered 366, fanned out PRIVMSG, and set TCP_NODELAY on ringlane
+GAP-X3 branch=linux listener sets TCP_FASTOPEN TCP_USER_TIMEOUT and SO_INCOMING_CPU and stores a pidfd
+GAP-X3 branch=node identity Ed25519 secret page has MADV_DONTDUMP and MADV_WIPEONFORK; the X-Wing KEM seed stays inline
+GAP-X3 branch=openat2 RESOLVE_BENEATH and RESOLVE_NO_MAGICLINKS read certificate paths
+GAP-X3 branch=close_range drops surplus listeners and IORING_OP_MSG_RING boots a second reactor
+GAP-X3 branch=landlock confines a directory and seccomp denies ptrace
+GAP-X2 step2 branch=SendQ append reserve refill and backlog moved out of server.zig and the inline overflow cap and armed-buffer rules still hold
+GAP-X5 branch=plaintext fan-out line queued on the inline SendQ; ConnState bytes=38128
+GAP-O5 branch=REHASH DRY named ward class limit and listener diffs, applied none, then a real REHASH applied the limit without moving the listener
+GAP-V3 branch=MEDIA ABR applies each receiver's abrHint to its own spatial ceiling
+GAP-V4 branch=recording starts only after every member consents, is announced, and stops when a member joins without consent
+GAP-V5 branch=participant and oper read loss rtt spatial bitrate; key material is absent
+GAP-V6 branch=queue is listed in raise order; a non-head still speaks; positions are forwarded unchanged
+GAP-O3 branch=tracelog file on panic, reactor give-up, and mooring death
+GAP-A3 branch=rowless session replica proof; forged account is UID-renamed
+GAP-D2 branch=kill-restart plus same-image USR2 delivered usr2 offline and fired MEMO_PUSH
+GAP-D3 branch=same-image USR2 kept gag 192.0.2.11 and granted vhost staff
+GAP-D4 branch=oper ABUSE explains throttle shun dnsbl reputation from RAM; shun spamtrap koshi reputation and account score reload after the process image is dropped; account score survives reconnect and the new connection guard starts full
+GAP-D4 branch=same-image USR2 kept shun spamtrap Koshi reputation and account score; the new connection guard started full
+GAP-D5 branch=same-image USR2 invalidated the pre-crash verify and reset tokens, then SCRAM and CertFP still resolved and a new token confirmed
+GAP-D6 branch=daemon writeBackupSet listed the included and excluded families and restoreDrill reopened every family in a scratch directory
+GAP-D1 branch=kill-restart restored chan-kill and dm-kill
+GAP-D1 branch=same-image USR2 restored chan-usr2 and dm-usr2
+GAP-A2 branch=dst active partition+usr2 no-duplicate no-legacy-twin
+GAP-A4 branch=reference event history path; boot reload; USR2 keeps the signed id; heal does not duplicate
+GAP-A7 branch=refuse cold restart required before UPGRADE; unchanged listeners still queue
+GAP-P2 branch=PROP SLOWMODE gap; oper exempt; SLOWVOICE gates voice; raid set and clear; configured gap restored by property checkpoint; in-window timer starts empty after adopt
+GAP-P4 branch=PROP RETAIN ttl; expiry deletes the lotus row, search id, and memo copies; ciphertext expires without plaintext
+GAP-O6 branch=reactor 0 correlates peer joins; one signed flood verdict; slowmode engages and relaxes; one origin does not trip
+GAP-P0b branch=oauth refuses unknown account unless oauth_auto_provision
+GAP-K2 branch=each node stores the other signed head and a missing log fails closed only when required
+GAP-K2 branch=a revocation is visible on the other node after anti-entropy and a stale head does not replace it
+GAP-K3 branch=a node public key verifies a ban or kick after restart and a removed entry breaks the chain
+GAP-O2 branch=peer rtt backlog anti-entropy partitioned-vs-down; hlc does not gate liveness
+GAP-P0c branch=listx remote topic
+GAP-V2 branch=node identity delivers the signed media handshake
+GAP-V2 branch=a rejected browser frame returns numeric 404 and is not relayed
+GAP-V2 branch=TURN is cut and MEDIA TURN allocates nothing
+GAP-P0c branch=remote WHOIS copies roster identity and leaves idle away and TLS-secure unreplicated
+GAP-P0c branch=remote SYS and ADM DATA tags stay closed even for an operator account
+GAP-P0c branch=the live tag prefix leaves the oper message-tag off
+GAP-X2 step3 branch=SEARCH command family moved behind the messaging thunk and the membership rate-limit and result cap still hold
+GAP-O7 branch=breaker open on handshake and anti-entropy stall, backoff retry, unsigned frame refused
+GAP-O8 branch=filter exchanged before the ward list; a hit is re-checked and is not the authority
+GAP-P0c branch=knock 711 only after a local op is notified
+GAP-P0c branch=whowas account and real host
+GAP-P0c branch=reaction tally a late subscriber can read
+GAP-O9 branch=two-person rule waits for a second distinct operator; flag off is unchanged
+GAP-O10 branch=policy rollback restores the last numbered generation and the proof version matches it
+GAP-O11 branch=outbound webhooks sign and retry with a cap; link-local and loopback stay refused unless config allows them
+GAP-O12 branch=scoped expiring bot grants survive USR2 and are not an oper bit
+GAP-O12 branch=a predecessor arena without BGNT adopts an empty bot-grant table
+GAP-O12 branch=a malformed BGNT image rejects the whole handoff
+GAP-P1 branch=stable thread id, bounded replies, and the reply tag survive USR2
+GAP-P1 branch=cold start rebuilds the thread from durable history
+GAP-P1 branch=a predecessor arena without THRD adopts an empty thread table
+GAP-P1 branch=a malformed THRD image rejects the whole handoff
+GAP-P3 branch=reactor 0 fires a deferred channel message and oper mode once; USR2 does not send either again
+GAP-P3 branch=a cron expression fires once on reactor 0
+GAP-P3 branch=a predecessor arena without SCHD adopts an empty schedule table
+GAP-P3 branch=a malformed SCHD image rejects the whole handoff
+GAP-P5 branch=a search on one node returns an authorized peer hit and skips ciphertext
+GAP-P5 branch=local and peer hits share one hard cap and each hit stays authorized
+GAP-P5 branch=mesh link returns one authorized hit and skips ciphertext
+GAP-P5 branch=mesh link local batch plus peer hits stay inside the hard cap
+GAP-P6 branch=unfurl defaults off, the client can refuse, and private addresses are not fetched
+GAP-P7 branch=a network-banned new connection files one appeal per window without joining
+GAP-P8 branch=reputation or raid shield holds 001 until a pluggable challenge admits and success is not an account
+GAP-P9 branch=a channel HOLD prop keeps the first messages for release or drop and quarantine audits the reason
+GAP-P10 branch=a speak grant registers a bounded command and running it is not an oper bit
+GAP-P11 row=LISTX handler=src/daemon/server.zig:21750 test=GAP-P0c remote LISTX carries the peer topic
+GAP-P11 row=NAMES +x handler=src/daemon/server.zig:54227 test=threaded server: +x auditorium hides regular members in NAMES
+GAP-P11 row=NAMES +h handler=src/daemon/server.zig:20474 test=GAP-P11 IRCX screens name a handler or a divergence
+GAP-P11 row=EVENT CHANNEL handler=src/daemon/server.zig:31883 test=GAP-P11 IRCX screens name a handler or a divergence
+GAP-P11 row=DATA handler=src/daemon/server.zig:35943 test=threaded server: +V NOCOMICDATA refuses non-op DATA with 531
+GAP-P11 divergence=USER events stay operator-only because a connect line names every user
+GAP-P11 divergence=remote LISTX creation time stays 0 when the peer did not replicate created_unix handler=src/daemon/server.zig:21776
+GAP-P11 divergence=TACCESS, BTPROP, OPFORCE, and Comic Chat avatar payloads stay unwired
+GAP-P11 branch=handlers at file:line or an explicit divergence and the client stays in the Onyx repo
+GAP-P12 branch=loopback HTTPS GET /history returns the lines CHATHISTORY would and a public bind is refused
+GAP-K4 branch=sealed room refuses NAMES WHO and WHOX; ordinary room still lists members; routing and KICK keep their targets
+GAP-D7 branch=a failed pending-address write issues no verification token; live mail stays off
+GAP-D8 branch=full webpush queue increments onyx_webpush_dropped and emits an oper event; subscription rows in props stay; live mail stays off; non-Linux keeps the explicit disable
+
+[perf] tagged TLS delivery: records 2 -> 1, wire bytes 171 -> 149 (saved 22/msg)
+GAP-O4 branch=doctor read-only fixed checks
+GAP-D6 branch=backup set lists every orostore family and excludes search webhooks event_history and mail; chanstats is excluded when that snapshot is absent; restore drill reopens the snap in a scratch directory
+GAP-C5 branch=FEC modules stay unwired until a measured GAP-V3 signal; section 12 symbols stay absent
+section 13 remainder branch=no further in-repo witnessable Accept; live IDENTIFY and live relay_v2_authoring=active stay unmet; FreeBSD kqueue, Windows IOCP, FreeBSD kernel TLS, OpenBSD pledge, and Windows RIO were not executed; commit 838ee337 does not close GAP-X3; GAP-K1 stays in the client repo; GAP-V7 stays a hold; section 12 and GAP-N stay unbuilt; headings stay unmarked; roadmap not closed
+section 13 waiver branch=live IDENTIFY, live relay_v2_authoring=active, executed FreeBSD kqueue, Windows IOCP, FreeBSD kernel TLS, OpenBSD pledge, and Windows RIO are waived as unverifiable on this host; the shipped paths still return MissingOp or Unsupported; commit 838ee337 does not close GAP-X3; headings stay unmarked; Accepts stay unmet; roadmap not closed
+GAP-X2 branch=ringlane submission and completion moved out of server.zig and the codec still round-trips
+GAP-K17 branch=a ticket dies with the lifetime sealed at mint
+GAP-K18 branch=turning 0-RTT off binds tickets already sealed with a limit
+GAP-K10 branch=a second 0-RTT flight is rejected without a ReplayGuard
+GAP-K13 branch=an application record after the last sequence fails closed
+GAP-K13 branch=an application record after the last sequence fails closed
+GAP-K11 branch=a trust anchor's name constraints and path length bind a chain that omits it
+GAP-K12 branch=a leaf keyUsage without digitalSignature is rejected before CertificateVerify
+GAP-K15 branch=an IP literal matches an iPAddress SAN only
+GAP-K16 branch=a ticket older than its lifetime or seven days is not offered
+GAP-K8 branch=an HRR resumption binder covers ClientHello1 and the HelloRetryRequest
+GAP-K9 branch=accepted 0-RTT puts EndOfEarlyData on both transcripts
+GAP-K11 branch=a trust anchor's name constraints and path length bind a chain that omits it
+GAP-K12 branch=a leaf keyUsage without digitalSignature is rejected before CertificateVerify
+GAP-K15 branch=an IP literal matches an iPAddress SAN only
+GAP-A1 branch=project across restart with rollback audit and mesh revoke
+GAP-K6 branch=unfinished TLS interop stays refused and [[tls.sni]] selects a certificate
+failed command: ./.zig-cache/o/a72119f42c3ff5ab06014f3d01050364/test --cache-dir=./.zig-cache --seed=0xe83aef08 --listen=-
+
+Build Summary: 8/8 steps succeeded; 8759/8783 tests passed (24 skipped)
+test success
++- run test 8706 pass, 24 skip (8730 total) 23m MaxRSS:648M
+|  +- compile test Debug native success 58s MaxRSS:1G
+|     +- options cached
++- run test success 25ms MaxRSS:4M
+|  +- compile test Debug native success 3s MaxRSS:224M
+|     +- options (reused)
++- run test 53 pass (53 total) 5s MaxRSS:9M
+   +- compile test Debug native success 11s MaxRSS:299M
+      +- options (reused)
+

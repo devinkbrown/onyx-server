@@ -1,0 +1,2 @@
+8f45073cda5e75a8589e09d7c3590df0b2e667bdb4e91e4e678cc6b3d182269a  .zig-cache/codex-resume/openbsd-daemon-consolidated-debug/bin/onyx-server
+9e083f445abc3b5d97036e58a121270a914db5ecbfbdced3ee1e79a1eb38d975  .zig-cache/codex-resume/openbsd-daemon-consolidated-rs/bin/onyx-server

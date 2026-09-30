@@ -1,0 +1,19 @@
+ARTIFACT native daemon sha256=99068c8314f72b54698f6e405422b544cde9a083874d55c187280feddf64353b
+PASS OpenBSD three distinct pinned nodes: secured A-B-C line, degrees 1/2/1
+PASS REGISTER: separate durable account stores on all three native nodes
+WAIT MiddleAttachment: SESSION REDIRECT while the signed replica converges
+PASS PLAIN SASL before NICK + SESSIONTOKEN + four reusable same-token physical attachments across all nodes
+PASS before-upgrade: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS actual B-C partition: secured degrees 1/1/0, all original client sockets answer PING; channel/direct events retained on both sides
+PASS cumulative delivery oracle: 13 accepted events, 59 exact recipient deliveries through final finite drain
+PASS B-C rejoin: secured degrees 1/2/1; retained channel/direct deliveries converge exactly once with equal msgid/time and original tokens
+PASS native fork/exec COMMIT on node 1: predecessor exited, secured line recovered
+PASS after-node-1: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS native fork/exec COMMIT on node 2: predecessor exited, secured line recovered
+PASS after-node-2: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS native fork/exec COMMIT on node 3: predecessor exited, secured line recovered
+PASS after-node-3: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS fifth-far-resume: 5 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS cumulative delivery oracle: 51 accepted events, 243 exact recipient deliveries through final finite drain
+PASS cold restart: stored account/password and issued opaque SESSION-TOKEN authenticate from durable WAL
+CLEANUP fixture PIDs: zero; loopback/PF baseline restored; private configs/WAL/logs retained at /tmp/onyx-session-native/f0d00a1179bbde5b

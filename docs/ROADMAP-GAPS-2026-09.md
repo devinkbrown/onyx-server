@@ -3,8 +3,47 @@
 
 # Onyx Server — gap roadmap (2026-09-29)
 
+**Continuation note (2026-09-30):** the baseline audit below predates the
+implementation commits through `15e09029`. Its defect descriptions and
+unmarked headings must be checked against current source; they are not a
+current completion ledger. Recent commits add cold-restart and same-image
+USR2 tests for GAP-D1 through GAP-D5 and a scratch restore drill for GAP-D6.
+GAP-K17, GAP-K18, and GAP-M1 also have newer implementation and regression
+tests. Those tests do not establish deployed acceptance. The latest GAP-X4
+OpenBSD installer attempt and successful full-kernel measurement are recorded
+in `docs/audit/bench-gap-x4.md`; Windows and unsupported transport cells keep
+that gap open. Portable runtime fixes add nick ownership, bounded connection
+and empty-channel retirement, QUIT, slow-peer disconnection, client/channel
+limits, and kqueue poll/cancellation safety. Native OpenBSD Debug/ReleaseSafe
+backend tests and real daemon chat/churn pass. Unsupported listener settings
+now fail preflight and boot in that initial minimal slice. The subsequent full
+OpenBSD port uses the shared complete daemon. Actual native Debug/ReleaseSafe
+gates cover TLS 1.2/1.3, WSS, IPv4/IPv6, services/WAL authentication, secured
+three-host partition/rejoin, stable reusable sessions and all three Helix
+upgrades (51 events / 243 bounded deliveries). Full Linux suites each pass
+8759/8783 with 24 skips and zero failures. Native evidence and the existing
+far-nickname and same-IP mesh limitations are recorded in
+[the full-port record](dev/openbsd-full-port.md).
+The live account-directory
+acceptance and MESSAGE_V2 authoring activation remain unverified here.
+Fresh bounded review also found a remaining GAP-P16 seam: MARKREAD GET/SET
+and `rememberReadMarker` use the local store, while the cold-restore test's
+second attachment reads that same store. No read-marker mesh relay was found;
+that test does not prove migration to another node keeps the read position.
+The next local slice should reconcile authenticated account-scoped markers
+between distinct nodes and prove monotonic convergence after partition heal.
+The continuation also closes GAP-K10's missing-freshness branch: a clock and
+sealed ticket issue time, age-add, and lifetime are required before early-data
+acceptance can consume a replay slot. Eligible 1-RTT fallback remains available.
+Identical canonical history snapshots now avoid allocations and store writes;
+divergent snapshots still require reconciliation. The shared predecessor now
+synchronizes durable history before checkpoint encoding; the native candidate
+remains read-only through READY and ABORT, as verified in both native modes.
+Commands, native acceptance, and outstanding gates are recorded in
+[the continuation evidence](audit/gap-continuation-2026-09-30.md).
+
 **Audience:** the person deciding what the daemon builds next.
-**Source of truth:** the tree at `99974787`, whose Zig sources are byte-identical
+**Baseline source audit:** the tree at `99974787`, whose Zig sources are byte-identical
 to `ae78d490` (`0.7.0`). The four commits after that baseline are documentation
 only. Live fleet record: both nodes run `0.7.0+ae78d490`
 (`docs/ops/release-v0.7.0-feature-activation.md`).
@@ -12,10 +51,10 @@ only. Live fleet record: both nodes run `0.7.0+ae78d490`
 This file is the missing-feature map. It does not replace
 `docs/ROADMAP-2026-Q4.md`, `docs/FEATURE-ROADMAP.md`, or
 `docs/releases/0.7-MAJOR-ROADMAP.md`. Those remain the historical 0.7 plans.
-Where they disagree with this file about *what is already in the tree*, this
-file wins, because it was checked against current source. Where they name a
-track this file still lists (PX, KX, IX, HX), that track is still open: no Zig
-file has changed since those plans were left unmarked.
+The baseline below describes that audited tree. Use the continuation note and
+current source/tests for subsequent changes; unmarked historical headings are
+not proof that a newer implementation is absent. Tracks still listed here
+(PX, KX, IX, HX) need their acceptance evidence checked before closing them.
 
 Measured this pass: **851** Zig files, **598,630** lines, `src/daemon/server.zig`
 **102,407** lines. Same figures the 2026-09-06 reconciliation published.

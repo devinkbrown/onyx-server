@@ -1,0 +1,1 @@
+PASS: native OpenBSD IRC chat, prereg and rename nick collisions, 64 unique JOIN/QUIT cycles, persistent PING, and released nick reuse

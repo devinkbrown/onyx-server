@@ -167,6 +167,27 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // Build-only: these probes must execute on an isolated OpenBSD machine.
+    const openbsd_probes = b.step("openbsd-probes", "Build native OpenBSD Helix and worker acceptance probes");
+    const probe_names = [_][]const u8{
+        "openbsd_helix_primitives_probe",
+        "openbsd_helix_sandbox_probe",
+        "openbsd_worker_protocol_probe",
+    };
+    for (probe_names) |name| {
+        const probe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("tools/{s}.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = needs_libc,
+                .imports = &.{.{ .name = "onyx_server", .module = mod }},
+            }),
+        });
+        openbsd_probes.dependOn(&b.addInstallArtifact(probe, .{}).step);
+    }
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
@@ -582,6 +603,12 @@ pub fn build(b: *std.Build) void {
     const run_cli_tests_verbose = b.addRunArtifact(cli_tests_verbose);
     const test_cli_verbose_step = b.step("test-cli-verbose", "Run armor CLI tests with per-test progress output");
     test_cli_verbose_step.dependOn(&run_cli_tests_verbose.step);
+
+    // Cross-compiled test runners are copied to the target machine explicitly.
+    const test_artifacts = b.step("test-artifacts", "Build and install module, daemon, and CLI test runners without executing them");
+    test_artifacts.dependOn(&b.addInstallFile(mod_tests.getEmittedBin(), "bin/onyx-server-module-tests").step);
+    test_artifacts.dependOn(&b.addInstallFile(exe_tests.getEmittedBin(), "bin/onyx-server-daemon-tests").step);
+    test_artifacts.dependOn(&b.addInstallFile(cli_tests.getEmittedBin(), "bin/onyx-server-cli-tests").step);
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will

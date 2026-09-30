@@ -329,6 +329,9 @@ test "GAP-X2 ringlane submission identity round-trips and completions keep their
     const Other = error{Unexpected};
     try std.testing.expect(!isUnsupportedInitError(Other.Unexpected));
 
+    // The codec and feature-bit assertions above are platform-independent.
+    // Opening a physical io_uring is a Linux-only fixture.
+    if (comptime @import("builtin").os.tag != .linux) return;
     var ring = Ring.init(32, .{}) catch |err| {
         if (isUnsupportedInitError(err)) {
             std.debug.print("GAP-X2 branch=ringlane submission and completion moved; baseline ring init refused with a listed error\n", .{});

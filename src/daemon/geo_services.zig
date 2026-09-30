@@ -396,6 +396,21 @@ fn fileKey(k: []const u8, buf: []u8) []const u8 {
 
 /// Blocking read of a small file via raw syscalls (fetcher-thread safe), or null.
 fn readFileZ(path: [*:0]const u8, buf: []u8) ?[]u8 {
+    if (comptime @import("builtin").os.tag != .linux) {
+        const native = @import("os_runtime.zig");
+        const fd = native.openReadZ(path) catch return null;
+        defer native.close(fd);
+        var total: usize = 0;
+        while (total < buf.len) {
+            const count = native.read(fd, buf[total..]) catch |err| switch (err) {
+                error.Interrupted => continue,
+                else => return null,
+            };
+            if (count == 0) break;
+            total += count;
+        }
+        return buf[0..total];
+    }
     const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
     if (posix.errno(rc) != .SUCCESS) return null;
     const fd: linux.fd_t = @intCast(rc);
@@ -423,6 +438,10 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 }
 
 fn sleepMs(ms: u32) void {
+    if (comptime @import("builtin").os.tag != .linux) {
+        @import("os_runtime.zig").sleepMillis(ms);
+        return;
+    }
     var req = linux.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
     _ = linux.nanosleep(&req, null);
 }

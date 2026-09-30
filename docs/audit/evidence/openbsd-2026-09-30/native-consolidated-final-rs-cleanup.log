@@ -1,0 +1,6 @@
+PASS zero exact-owned primary/plugin PIDs
+PASS no owned native33370-74/33670-71 listeners
+PASS all owned host43370-74/43380-82/43671 forwards absent
+PASS primary node key present and wrapper verified byte-identical restoration
+PASS unique plugin directory removed
+PASS final native RS artifact pin retained 9e083f445abc3b5d97036e58a121270a914db5ecbfbdced3ee1e79a1eb38d975

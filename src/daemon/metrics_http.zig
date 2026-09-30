@@ -23,8 +23,9 @@
 //! fd migration is needed for a stateless scrape endpoint.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
-const linux = std.os.linux;
+const sys = std.posix.system;
 const posix = std.posix;
 
 comptime {
@@ -54,6 +55,7 @@ pub const ListenerError = error{
     BindFailed,
     ListenFailed,
     AddrLookupFailed,
+    TimeoutSetupFailed,
 };
 
 // ---------------------------------------------------------------------------
@@ -214,7 +216,7 @@ pub const Config = struct {
 
 pub const MetricsServer = struct {
     snapshot: *MetricsSnapshot,
-    listen_fd: linux.fd_t,
+    listen_fd: sys.fd_t,
     port: u16,
     thread: ?std.Thread = null,
     stop_flag: std.atomic.Value(bool) = .{ .raw = false },
@@ -234,31 +236,38 @@ pub const MetricsServer = struct {
         errdefer closeFd(fd);
 
         var yes: u32 = 1;
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
+        _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
 
-        var addr = linux.sockaddr.in{
+        var addr = sys.sockaddr.in{
             .port = std.mem.nativeToBig(u16, port),
             .addr = std.mem.nativeToBig(u32, config.bind_addr),
         };
-        if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))) != .SUCCESS)
             return error.BindFailed;
-        if (posix.errno(linux.listen(fd, config.listen_backlog)) != .SUCCESS)
+        if (posix.errno(sys.listen(fd, config.listen_backlog)) != .SUCCESS)
             return error.ListenFailed;
+        if (comptime builtin.os.tag != .linux) {
+            @import("os_runtime.zig").setNonblocking(fd) catch return error.ListenFailed;
+        }
 
         // Receive timeout so a blocked accept4 wakes periodically to re-check the
         // stop flag (closing the listener from another thread does NOT reliably
         // wake accept4).
-        const tv = linux.timeval{
-            .sec = @intCast(config.accept_poll_ms / 1000),
-            .usec = @intCast((config.accept_poll_ms % 1000) * 1000),
+        const poll_ms = if (builtin.os.tag == .linux) config.accept_poll_ms else @max(config.accept_poll_ms, 1);
+        const tv = sys.timeval{
+            .sec = @intCast(poll_ms / 1000),
+            .usec = @intCast((poll_ms % 1000) * 1000),
         };
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        const timeout_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+        if (comptime builtin.os.tag != .linux) {
+            if (posix.errno(timeout_rc) != .SUCCESS) return error.TimeoutSetupFailed;
+        }
 
         return .{
             .snapshot = snapshot,
             .listen_fd = fd,
             .port = try boundPort(fd),
-            .conn_read_timeout_sec = config.conn_read_timeout_sec,
+            .conn_read_timeout_sec = if (builtin.os.tag == .linux) config.conn_read_timeout_sec else @max(config.conn_read_timeout_sec, 1),
         };
     }
 
@@ -270,16 +279,18 @@ pub const MetricsServer = struct {
     /// Signal stop, unblock the accept loop by closing the listener, and join.
     pub fn shutdown(self: *MetricsServer) void {
         self.stop_flag.store(true, .release);
-        closeFd(self.listen_fd); // unblocks a blocking accept4 with EBADF
+        if (comptime builtin.os.tag == .linux) closeFd(self.listen_fd);
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
+        if (comptime builtin.os.tag != .linux) closeFd(self.listen_fd);
+        self.listen_fd = -1;
     }
 
     fn acceptLoop(self: *MetricsServer) void {
         while (!self.stop_flag.load(.acquire)) {
-            const rc = linux.accept4(self.listen_fd, null, null, posix.SOCK.CLOEXEC);
+            const rc = acceptSocket(self.listen_fd);
             switch (posix.errno(rc)) {
                 .SUCCESS => self.serveConn(@intCast(rc)),
                 .AGAIN, .INTR, .CONNABORTED => continue, // timeout/interrupt: re-check stop flag
@@ -288,15 +299,18 @@ pub const MetricsServer = struct {
         }
     }
 
-    fn serveConn(self: *MetricsServer, fd: linux.fd_t) void {
+    fn serveConn(self: *MetricsServer, fd: sys.fd_t) void {
         defer closeFd(fd);
         // Accepted sockets do not inherit the listener's timeout; cap the read so
         // a silent/slow client cannot stall the single-threaded accept loop.
-        const tv = linux.timeval{ .sec = @intCast(self.conn_read_timeout_sec), .usec = 0 };
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        const tv = sys.timeval{ .sec = @intCast(self.conn_read_timeout_sec), .usec = 0 };
+        const timeout_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+        if (comptime builtin.os.tag != .linux) {
+            if (posix.errno(timeout_rc) != .SUCCESS or posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval))) != .SUCCESS) return;
+        }
 
         var req_buf: [max_request]u8 = undefined;
-        const rc = linux.read(fd, &req_buf, req_buf.len);
+        const rc = sys.read(fd, &req_buf, req_buf.len);
         if (posix.errno(rc) != .SUCCESS) return;
         const n: usize = @intCast(rc);
         if (n == 0) return;
@@ -321,32 +335,64 @@ fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.Thread.yield() catch {};
 }
 
-fn socketTcp() ListenerError!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+// BSD accept timeout is explicit: listener SO_RCVTIMEO is configuration,
+// poll bounds the wait, and nonblocking accept cannot hang after stale readiness.
+fn acceptSocket(fd: posix.fd_t) if (builtin.os.tag == .linux) usize else c_int {
+    if (comptime builtin.os.tag == .linux) return sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
+    var tv: sys.timeval = undefined;
+    var len: posix.socklen_t = @sizeOf(@TypeOf(tv));
+    if (sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), &len) != 0) return -1;
+    const millis = @max(@as(i64, 1), tv.sec * 1000 + @divTrunc(tv.usec, 1000));
+    var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    const rc = sys.poll(&pollfds, 1, @intCast(@min(millis, std.math.maxInt(c_int))));
+    if (rc < 0) return -1;
+    if (rc == 0) {
+        sys._errno().* = @intFromEnum(posix.E.AGAIN);
+        return -1;
+    }
+    const accepted = sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
+    if (accepted < 0) return -1;
+    // BSD may inherit listener nonblocking state. Request readers use a
+    // verified SO_RCVTIMEO on a blocking accepted socket.
+    const old = sys.fcntl(accepted, posix.F.GETFL, @as(c_int, 0));
+    if (old >= 0) {
+        var flags: posix.O = @bitCast(@as(u32, @intCast(old)));
+        flags.NONBLOCK = false;
+        if (sys.fcntl(accepted, posix.F.SETFL, @as(usize, @as(u32, @bitCast(flags)))) == 0) return accepted;
+    }
+    const saved = sys._errno().*;
+    _ = sys.close(accepted);
+    sys._errno().* = saved;
+    return -1;
+}
+
+fn socketTcp() ListenerError!sys.fd_t {
+    const rc = sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
     return switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         else => error.SocketUnavailable,
     };
 }
 
-fn boundPort(fd: linux.fd_t) ListenerError!u16 {
+fn boundPort(fd: sys.fd_t) ListenerError!u16 {
     var storage: posix.sockaddr.storage = undefined;
     var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    if (posix.errno(linux.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS)
+    if (posix.errno(sys.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS)
         return error.AddrLookupFailed;
-    const a: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
+    const a: *const sys.sockaddr.in = @ptrCast(@alignCast(&storage));
     return std.mem.bigToNative(u16, a.port);
 }
 
-fn closeFd(fd: linux.fd_t) void {
-    _ = linux.close(fd);
+fn closeFd(fd: sys.fd_t) void {
+    _ = sys.close(fd);
 }
 
-fn writeAll(fd: linux.fd_t, bytes: []const u8) void {
+fn writeAll(fd: sys.fd_t, bytes: []const u8) void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        const rc = if (comptime builtin.os.tag == .linux) sys.write(fd, bytes[off..].ptr, bytes.len - off) else sys.send(fd, bytes[off..].ptr, bytes.len - off, posix.MSG.NOSIGNAL);
         if (posix.errno(rc) != .SUCCESS) return;
+        if (rc == 0) return;
         off += @intCast(rc);
     }
 }
@@ -451,28 +497,28 @@ test "handleRequest serves a never-refreshed (empty) snapshot as a 200 with zero
 }
 
 test "MetricsServer serves the snapshot over loopback" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = testing.allocator;
     var snap = MetricsSnapshot.init(allocator);
     defer snap.deinit();
     try snap.set("onyx_metrics_probe 1\n");
 
-    var server = MetricsServer.init(&snap, 0) catch return error.SkipZigTest;
+    var server = try MetricsServer.init(&snap, 0);
     try server.spawn();
     defer server.shutdown();
 
     const cfd = try socketTcp();
     defer closeFd(cfd);
-    var addr = linux.sockaddr.in{
+    var addr = sys.sockaddr.in{
         .port = std.mem.nativeToBig(u16, server.port),
         .addr = std.mem.nativeToBig(u32, loopback_addr),
     };
-    try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.connect(cfd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))));
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.connect(cfd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))));
 
     writeAll(cfd, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
 
     var buf: [1024]u8 = undefined;
-    const rc = linux.read(cfd, &buf, buf.len);
+    const rc = sys.read(cfd, &buf, buf.len);
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
     const got = buf[0..@intCast(rc)];
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
@@ -481,15 +527,15 @@ test "MetricsServer serves the snapshot over loopback" {
 }
 
 test "initWithConfig honors a custom backlog and read timeout" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var snap = MetricsSnapshot.init(testing.allocator);
     defer snap.deinit();
 
-    var server = MetricsServer.initWithConfig(&snap, 0, .{
+    var server = try MetricsServer.initWithConfig(&snap, 0, .{
         .listen_backlog = 32,
         .accept_poll_ms = 100,
         .conn_read_timeout_sec = 3,
-    }) catch return error.SkipZigTest;
+    });
     defer server.shutdown();
     try server.spawn();
 

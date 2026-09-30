@@ -1,0 +1,94 @@
+[1/74] root.test_0 ... OK (5us)
+[2/74] crypto.root.test_0 ... OK (1us)
+[3/74] daemon.root.test_0 ... OK (1us)
+[4/74] proto.root.test_0 ... OK (1us)
+[5/74] substrate.root.test_0 ... OK (1us)
+[6/74] wasm.host.root.test_0 ... OK (1us)
+[7/74] substrate.io.root.test_0 ... OK (1us)
+[8/74] substrate.ripple_props.test_0 ... OK (1us)
+[9/74] substrate.ripple.test_0 ... OK (1us)
+[10/74] substrate.undertow.root.test_0 ... OK (1us)
+[11/74] substrate.undertow.peer_link.test_0 ... OK (1us)
+[12/74] substrate.io.buf_ring.test_0 ... OK (1us)
+[13/74] substrate.io.ring.test_0 ... OK (1us)
+[14/74] proto.asn1_time.test_0 ... OK (1us)
+[15/74] proto.certfp.test_0 ... OK (1us)
+[16/74] proto.cloak.test_0 ... OK (1us)
+[17/74] proto.ircx_modex.test_0 ... OK (1us)
+[18/74] proto.ircx_saccess.test_0 ... OK (1us)
+[19/74] proto.listx.test_0 ... OK (1us)
+[20/74] proto.mooring.test_0 ... OK (1us)
+[21/74] proto.mooring_props.test_0 ... OK (1us)
+[22/74] proto.quic_handshake.test_0 ... OK (1us)
+[23/74] proto.quic_transport_params.test_0 ... OK (1us)
+[24/74] proto.sasl_external_verify.test_0 ... OK (1us)
+[25/74] proto.sasl_mechrouter.test_0 ... OK (1us)
+[26/74] proto.sasl_oauthbearer.test_0 ... OK (1us)
+[27/74] proto.sasl.test_0 ... OK (1us)
+[28/74] proto.sasl_scram512_server.test_0 ... OK (1us)
+[29/74] proto.sasl_scram.test_0 ... OK (1us)
+[30/74] proto.sasl_scram_server.test_0 ... OK (1us)
+[31/74] proto.signed_delta.test_0 ... OK (1us)
+[32/74] proto.toml.test_0 ... OK (1us)
+[33/74] proto.x509.test_0 ... OK (1us)
+[34/74] daemon.modules.manifest.test_0 ... OK (1us)
+[35/74] daemon.key_transparency.test_0 ... OK (1us)
+[36/74] daemon.acme_cli.test_0 ... OK (1us)
+[37/74] daemon.acme_http01_listener.test_0 ... OK (1us)
+[38/74] daemon.acme_renewal.test_0 ... OK (1us)
+[39/74] daemon.acme_runner.test_0 ... OK (1us)
+[40/74] daemon.config_format.test_0 ... OK (1us)
+[41/74] daemon.helix.root.test_0 ... OK (1us)
+[42/74] daemon.metrics_http.test_0 ... OK (1us)
+[43/74] daemon.webhook.test_0 ... OK (1us)
+[44/74] daemon.webhook_render.test_0 ... OK (1us)
+[45/74] daemon.webhook_http.test_0 ... OK (1us)
+[46/74] daemon.oauth_jwt.test_0 ... OK (1us)
+[47/74] daemon.ocsp_staple.test_0 ... OK (1us)
+[48/74] daemon.reactor_pool.test_0 ... OK (1us)
+[49/74] daemon.sasl_bridge.test_0 ... OK (1us)
+[50/74] daemon.scram_store.test_0 ... OK (1us)
+[51/74] daemon.server.test.GAP-X1 PortableServer answers PING through processLine ... GAP-X1 branch=PortableServer answered PING lane two third with PONG through processLine on ringlane
+OK (12.009s)
+[52/74] daemon.server.test.GAP-X4 PortableServer joins and fans out PRIVMSG ... GAP-X4 branch=PortableServer registered three clients, answered 366, fanned out PRIVMSG, and set TCP_NODELAY on ringlane
+OK (4.602s)
+[53/74] daemon.server.test.PortableServer churn preserves nick ownership and ignores retired completion tokens ... OK (4.601s)
+[54/74] daemon.server.test_0 ... OK (1us)
+[55/74] daemon.sessions.test_0 ... OK (1us)
+[56/74] daemon.tls_certs.test_0 ... OK (1us)
+[57/74] daemon.tls_conn.test_0 ... OK (1us)
+[58/74] daemon.tls_sni_load.test_0 ... OK (1us)
+[59/74] crypto.tls_server.test_0 ... OK (1us)
+[60/74] crypto.tls_record.test_0 ... OK (1us)
+[61/74] crypto.hkdf_tls13.test_0 ... OK (1us)
+[62/74] crypto.hash.test_0 ... OK (1us)
+[63/74] crypto.random.test_0 ... OK (1us)
+[64/74] crypto.kx.test_0 ... OK (1us)
+[65/74] crypto.sign.test_0 ... OK (1us)
+[66/74] crypto.xwing.test_0 ... OK (1us)
+[67/74] crypto.sct.test_0 ... OK (1us)
+[68/74] crypto.tls_client.test_0 ... OK (1us)
+[69/74] crypto.aead.test_0 ... OK (1us)
+[70/74] crypto.ecdsa_kat.test_0 ... OK (1us)
+[71/74] crypto.ed25519_batch.test_0 ... OK (1us)
+[72/74] crypto.sign_kat.test_0 ... OK (1us)
+[73/74] crypto.tls_props.test_0 ... OK (1us)
+[74/74] crypto.tls.test_0 ... OK (1us)
+verbose test summary: 74 passed; 0 skipped; 0 failed; 0 leaked; 0 log errors; elapsed 21.214s
+slowest tests:
+  12.009s  daemon.server.test.GAP-X1 PortableServer answers PING through processLine
+  4.602s  daemon.server.test.GAP-X4 PortableServer joins and fans out PRIVMSG
+  4.601s  daemon.server.test.PortableServer churn preserves nick ownership and ignores retired completion tokens
+  5us  root.test_0
+  1us  daemon.server.test_0
+  1us  crypto.root.test_0
+  1us  crypto.ed25519_batch.test_0
+  1us  crypto.tls_client.test_0
+  1us  daemon.config_format.test_0
+  1us  crypto.random.test_0
+Build Summary: 4/4 steps succeeded
+test-mod-verbose success
++- run test success 21s
+   +- compile test ReleaseSafe native success 47s MaxRSS:599M
+      +- options cached
+

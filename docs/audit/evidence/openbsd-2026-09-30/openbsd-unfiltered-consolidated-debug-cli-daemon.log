@@ -1,0 +1,56 @@
+All 0 tests passed.
+1/53 armor_main.test_0...OK
+2/53 armor_main.test.GAP-K6 armor enc and s_server stay unimplemented...OK
+3/53 armor_main.test.armor dispatch routes ciphers and rejects unknown commands...OK
+4/53 armor_main.test.armor per-command --help renders without touching inputs...OK
+5/53 root.test_0...OK
+6/53 common.test.armorcli loadDer decodes a PEM block and passes DER through...OK
+7/53 common.test.armorcli loadDer fails closed on a PEM block with the wrong label...OK
+8/53 common.test.armorcli oid helpers render known and unknown OIDs...OK
+9/53 common.test.armorcli parseHexSerial accepts 0x, colon, and bare hex...OK
+10/53 common.test.armorcli writeKeyFile writes the private key owner-only (0o600)...SKIP
+11/53 x509_cmd.test.armorcli x509 -text dumps subject, SAN, validity, and key type...OK
+12/53 x509_cmd.test.armorcli x509 -fingerprint matches the substrate certfp...OK
+13/53 x509_cmd.test.armorcli x509 PEM<->DER round-trips byte-identically...OK
+14/53 x509_cmd.test.armorcli x509 rejects truncated DER with a typed error, no crash...OK
+15/53 x509_cmd.test.armorcli x509 parseArgs rejects unknown flags and missing values...OK
+16/53 pkey_cmd.test.armorcli genpkey ec emits a SEC1 PEM the substrate parses back...OK
+17/53 pkey_cmd.test.armorcli genpkey ed25519 emits PKCS#8 that fromSeed accepts...OK
+18/53 pkey_cmd.test.armorcli pkey inspection fails closed on malformed and truncated keys...OK
+19/53 pkey_cmd.test.armorcli genpkey writes the key file 0o600...SKIP
+20/53 pkey_cmd.test.armorcli genpkey arg parsing: rsa/p384/passin are rejected explicitly...OK
+21/53 req_cmd.test.armorcli req builds a verifiable ECDSA P-256 CSR...OK
+22/53 req_cmd.test.armorcli req builds a verifiable Ed25519 CSR...OK
+23/53 req_cmd.test.armorcli req fails closed on a non-key input and bad args...OK
+24/53 dgst_cmd.test.armorcli dgst matches the FIPS 180-2 'abc' vectors...OK
+25/53 dgst_cmd.test.armorcli dgst HMAC matches RFC 4231 test case 2...OK
+26/53 dgst_cmd.test.armorcli dgst refuses -hmac (key on argv)...OK
+27/53 verify_cmd.test.armorcli verify accepts a root-issued leaf and rejects a stranger...OK
+28/53 verify_cmd.test.GAP-K15 armorcli verify matches an IP literal against iPAddress only...OK
+29/53 verify_cmd.test.armorcli verify dnsPatternMatches is single-label only...OK
+30/53 verify_cmd.test.armorcli verify decodeChain handles multi-block PEM and garbage...OK
+31/53 verify_cmd.test.armorcli verify arg parsing requires -CAfile...OK
+32/53 rand_cmd.test.armorcli rand emits the requested length in each encoding...OK
+33/53 rand_cmd.test.armorcli rand two draws differ (DRBG is live, not a constant)...OK
+34/53 rand_cmd.test.armorcli rand arg validation...OK
+35/53 ciphers_cmd.test.armorcli ciphers reflects the hardened allow-list, no legacy suites...OK
+36/53 asn1parse_cmd.test.armorcli asn1parse dumps a nested structure with offsets and OIDs...OK
+37/53 asn1parse_cmd.test.armorcli asn1parse fails closed on malformed DER...OK
+38/53 ocsp_cmd.test.armorcli ocsp -text dumps a successful basic response...OK
+39/53 ocsp_cmd.test.armorcli ocsp -verify accepts the issuing CA and rejects a stranger...OK
+40/53 ocsp_cmd.test.armorcli ocsp -verify -serial is fail-closed on revoked, unknown, and stale...OK
+41/53 ocsp_cmd.test.armorcli ocsp parseArgs requires -CAfile for -verify and -verify for -serial...OK
+42/53 ocsp_cmd.test.armorcli ocsp rejects empty and truncated DER...OK
+43/53 crl_cmd.test.armorcli crl -text dumps issuer window and revoked count without verifying...OK
+44/53 crl_cmd.test.armorcli crl -serial without -verify is usage, never a verdict...OK
+45/53 crl_cmd.test.armorcli crl -verify accepts the issuing CA, rejects a stranger, and gates -serial...OK
+46/53 crl_cmd.test.armorcli crl parseArgs requires -CAfile for -verify...OK
+47/53 crl_cmd.test.armorcli crl rejects empty DER...OK
+48/53 s_client_cmd.test.armorcli s_client parseArgs accepts connect and SNI flags...OK
+49/53 s_client_cmd.test.armorcli s_client loopback handshake prints suite, SNI, and verify ok...OK
+50/53 s_client_cmd.test.GAP-K6 armor s_client -connect returns NotImplemented and opens no socket...OK
+51/53 s_client_cmd.test.armorcli s_client live path still requires -connect and -CAfile...OK
+52/53 stub_cmds.test.armorcli stubs answer deterministically...OK
+53/53 stub_cmds.test.GAP-C5 armor enc stays unimplemented...GAP-C5 branch=armor enc stays an AEAD-only stub
+OK
+51 passed; 2 skipped; 0 failed.

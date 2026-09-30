@@ -68,9 +68,9 @@
 //!     feeds it the per-datagram source and routes probes to the candidate path.
 //!   * One WebTransport session per QUIC connection, one IRC bridge per
 //!     session (the common deployment shape; `http3_conn` rejects a 2nd CONNECT).
-//!   * Dual-stack UDP socket (`DualStackUdpSocket`, `AF_INET6` + `IPV6_V6ONLY=0`,
-//!     bound `[::]`): ONE socket serves both native IPv6 peers and IPv4 peers
-//!     (the latter arrive as IPv4-mapped `::ffff:a.b.c.d`, surfaced back as real
+//!   * Dual-stack UDP (`DualStackUdpSocket`): Linux uses one mapped socket;
+//!     OpenBSD uses native sockets per family at the same port. Both serve peers
+//!     (Linux IPv4 sources arrive mapped, surfaced back as real
 //!     ipv4 `TransportAddress` for PROXY-protocol + logging). The per-connection
 //!     peer address + reply path are family-agnostic — they already use
 //!     `TransportAddress`. The media plane keeps its own IPv4-only `MediaSocket`.
@@ -81,7 +81,10 @@
 
 const std = @import("std");
 const dlog = @import("dlog.zig");
-const linux = std.os.linux;
+const builtin = @import("builtin");
+const sys = if (builtin.os.tag == .windows) std.os.linux else std.posix.system;
+const os_runtime = @import("os_runtime.zig");
+const native_network = @import("native_network.zig");
 const posix = std.posix;
 
 const quic_conn = @import("../proto/quic_conn.zig");
@@ -183,7 +186,7 @@ const Connection = struct {
     conn: *quic_conn.Conn,
     h3: *http3_conn.Http3Conn,
     /// Loopback TCP fd to the daemon's IRC listener, once a session establishes.
-    irc_fd: ?linux.fd_t = null,
+    irc_fd: ?sys.fd_t = null,
     /// Whether we already opened a server→client WT bidi stream for IRC output.
     /// We instead reuse the client's first WT bidi data stream; this records it.
     wt_stream_id: ?u64 = null,
@@ -291,10 +294,17 @@ pub const WebTransportListener = struct {
     ///   * `loopback_be` (127.0.0.1) → bind `::ffff:127.0.0.1` (v4-mapped loopback).
     ///   * any other configured v4 address → bind it v4-mapped.
     pub fn start(self: *WebTransportListener, bind_be: u32, port: u16) Error!void {
+        return self.startAddress(bindAddrFromBe(bind_be), port);
+    }
+
+    fn startAddress(self: *WebTransportListener, address: DualStackUdpSocket.BindAddr, port: u16) Error!void {
+        if (comptime builtin.os.tag == .windows) return error.BindFailed;
         if (self.socket != null) return error.AlreadyStarted;
-        var sock = DualStackUdpSocket.bind(bindAddrFromBe(bind_be), port) catch return error.BindFailed;
-        errdefer sock.deinit();
-        self.port = sock.localPort() catch return error.BindFailed;
+        var sock = DualStackUdpSocket.bind(address, port) catch return error.BindFailed;
+        self.port = sock.localPort() catch {
+            sock.deinit();
+            return error.BindFailed;
+        };
         sock.setRecvTimeoutMs(recv_timeout_ms);
         self.socket = sock;
 
@@ -657,15 +667,17 @@ pub const WebTransportListener = struct {
         if (conn.irc_fd != null) return; // already bridged (one session per conn)
         const fd = connectLoopbackTcp(self.irc_port) orelse return;
         // Non-blocking so the single pump thread never stalls on a slow read.
-        setNonBlocking(fd);
+        if (!setNonBlocking(fd) or (self.send_proxy_header and !self.writeProxyHeader(conn, fd))) {
+            _ = sys.close(fd);
+            return;
+        }
         conn.irc_fd = fd;
-        if (self.send_proxy_header) self.writeProxyHeader(conn, fd);
     }
 
     fn closeBridge(self: *WebTransportListener, conn: *Connection) void {
         _ = self;
         if (conn.irc_fd) |fd| {
-            _ = linux.close(fd);
+            _ = sys.close(fd);
             conn.irc_fd = null;
         }
         conn.have_wt_stream = false;
@@ -696,7 +708,7 @@ pub const WebTransportListener = struct {
 
         // TCP → WT stream (IRC daemon → browser).
         while (true) {
-            const rc = linux.read(fd, &buf, buf.len);
+            const rc = sys.read(fd, &buf, buf.len);
             switch (posix.errno(rc)) {
                 .SUCCESS => {
                     const n: usize = @intCast(rc);
@@ -743,7 +755,7 @@ pub const WebTransportListener = struct {
     /// 4-byte address) → TCP4 with a 127.0.0.1 destination; a native IPv6 peer →
     /// TCP6 with a ::1 destination. The peer address is already a
     /// `TransportAddress`, so the family is just its `ip_len`.
-    fn writeProxyHeader(self: *WebTransportListener, conn: *Connection, fd: linux.fd_t) void {
+    fn writeProxyHeader(self: *WebTransportListener, conn: *Connection, fd: sys.fd_t) bool {
         _ = self;
         var out: [proxy_protocol.v1_max_line_len]u8 = undefined;
         const peer = conn.peer;
@@ -757,7 +769,7 @@ pub const WebTransportListener = struct {
                 dst_ip[15] = 1; // ::1
                 break :blk .tcp6;
             },
-            else => return, // malformed peer address: skip the header
+            else => return false, // never publish a bridge without its mandatory header
         };
         const hdr = proxy_protocol.Header{
             .family = family,
@@ -766,8 +778,8 @@ pub const WebTransportListener = struct {
             .src_port = peer.port,
             .dst_port = 0,
         };
-        const line = proxy_protocol.buildV1(&out, hdr) catch return;
-        _ = writeAllFd(fd, line);
+        const line = proxy_protocol.buildV1(&out, hdr) catch return false;
+        return writeAllFd(fd, line);
     }
 
     /// Flush all datagrams the QUIC engine owes. Most go to the connection's
@@ -965,7 +977,7 @@ pub const WebTransportListener = struct {
     }
 
     fn destroyConnection(self: *WebTransportListener, conn: *Connection) void {
-        if (conn.irc_fd) |fd| _ = linux.close(fd);
+        if (conn.irc_fd) |fd| _ = sys.close(fd);
         conn.h3.deinit();
         self.allocator.destroy(conn.h3);
         conn.conn.deinit();
@@ -1163,8 +1175,9 @@ fn bindAddrFromBe(bind_be: u32) DualStackUdpSocket.BindAddr {
 }
 
 fn nowNs() u64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    if (comptime builtin.os.tag == .windows) return @as(u64, @intCast(@max(@import("../substrate/platform.zig").monotonicMillis(), 0))) * std.time.ns_per_ms;
+    var ts: sys.timespec = undefined;
+    if (posix.errno(sys.clock_gettime(posix.CLOCK.MONOTONIC, &ts)) != .SUCCESS) @panic("WebTransport monotonic clock unavailable");
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
@@ -1189,19 +1202,28 @@ fn dbg(comptime fmt: []const u8, args: anytype) void {
 /// Zig 0.16 dropped `std.posix.getenv`/`std.os.environ` on a no-libc Linux
 /// target, and this layer has no `std.process.Init.environ_map` handle.
 fn envIsSet(name: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) return false;
+    if (comptime builtin.os.tag != .linux) {
+        var key: [128:0]u8 = undefined;
+        if (name.len >= key.len or std.mem.indexOfScalar(u8, name, 0) != null) return false;
+        @memcpy(key[0..name.len], name);
+        key[name.len] = 0;
+        const value = std.c.getenv(key[0..name.len :0]) orelse return false;
+        return value[0] != 0;
+    }
     const path = "/proc/self/environ";
     const O_RDONLY = 0;
-    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    const rc = sys.open(path, .{ .ACCMODE = .RDONLY }, 0);
     _ = O_RDONLY;
     const signed_fd: isize = @bitCast(rc);
     if (signed_fd < 0) return false;
-    const fd: linux.fd_t = @intCast(rc);
-    defer _ = linux.close(fd);
+    const fd: sys.fd_t = @intCast(rc);
+    defer _ = sys.close(fd);
 
     var buf: [16384]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = linux.read(fd, buf[total..].ptr, buf.len - total);
+        const n = sys.read(fd, buf[total..].ptr, buf.len - total);
         const sn: isize = @bitCast(n);
         if (sn <= 0) break;
         total += n;
@@ -1215,34 +1237,68 @@ fn envIsSet(name: []const u8) bool {
 }
 
 fn sleepMs(ms: u32) void {
-    var req = linux.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
-    _ = linux.nanosleep(&req, null);
+    if (comptime builtin.os.tag == .windows) return;
+    if (comptime builtin.os.tag != .linux) return os_runtime.sleepMillis(ms);
+    var req = sys.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
+    _ = sys.nanosleep(&req, null);
 }
 
-fn connectLoopbackTcp(port: u16) ?linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+fn connectLoopbackTcp(port: u16) ?sys.fd_t {
+    if (comptime builtin.os.tag == .windows) return null;
+    if (comptime builtin.os.tag != .linux) return native_network.connect(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } }, 1000) catch null;
+    const rc = sys.socket(posix.AF.INET, sys.SOCK.STREAM | sys.SOCK.CLOEXEC, sys.IPPROTO.TCP);
     if (posix.errno(rc) != .SUCCESS) return null;
-    const fd: linux.fd_t = @intCast(rc);
-    var addr = linux.sockaddr.in{
+    const fd: sys.fd_t = @intCast(rc);
+    var addr = sys.sockaddr.in{
         .port = std.mem.nativeToBig(u16, port),
         .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
     };
-    if (posix.errno(linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
-        _ = linux.close(fd);
+    if (posix.errno(sys.connect(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))) != .SUCCESS) {
+        _ = sys.close(fd);
         return null;
     }
     return fd;
 }
 
-fn setNonBlocking(fd: linux.fd_t) void {
-    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
-    _ = linux.fcntl(fd, linux.F.SETFL, flags | @as(usize, 0o4000)); // O_NONBLOCK
+fn setNonBlocking(fd: sys.fd_t) bool {
+    if (comptime builtin.os.tag == .windows) return false;
+    os_runtime.setNonblocking(fd) catch return false;
+    return true;
 }
 
-fn writeAllFd(fd: linux.fd_t, bytes: []const u8) bool {
+fn writeAllFd(fd: sys.fd_t, bytes: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) return false;
+    if (comptime builtin.os.tag != .linux) {
+        // A slow IRC peer cannot pin this single UDP pump indefinitely. Never
+        // replay already-sent bytes: failure tears down this bridge.
+        const deadline = nowNs() + std.time.ns_per_s;
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            if (nowNs() >= deadline) return false;
+            const rc = sys.send(fd, bytes[sent..].ptr, bytes.len - sent, posix.MSG.NOSIGNAL | posix.MSG.DONTWAIT);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc <= 0) return false;
+                    sent += @intCast(rc);
+                },
+                .INTR => continue,
+                .AGAIN => {
+                    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                    const now = nowNs();
+                    if (now >= deadline) return false;
+                    const remaining = @min((deadline - now) / std.time.ns_per_ms, 50);
+                    const ready = sys.poll(&fds, 1, @intCast(remaining));
+                    if (ready < 0 and posix.errno(ready) != .INTR) return false;
+                    if (fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return false;
+                },
+                else => return false,
+            }
+        }
+        return true;
+    }
     var sent: usize = 0;
     while (sent < bytes.len) {
-        const rc = linux.write(fd, bytes[sent..].ptr, bytes.len - sent);
+        const rc = sys.write(fd, bytes[sent..].ptr, bytes.len - sent);
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 const n: usize = @intCast(rc);
@@ -1325,7 +1381,9 @@ test "WebTransportListener: bind, port, and clean re-startable shutdown" {
 
     try lst.start(loopback_be, 0);
     try testing.expect(lst.port != 0);
+    const before_stop = nowNs();
     lst.shutdown();
+    try testing.expect(nowNs() - before_stop < std.time.ns_per_s);
     // Re-start cleanly on a fresh ephemeral port.
     try lst.start(loopback_be, 0);
     try testing.expect(lst.port != 0);
@@ -1338,55 +1396,72 @@ test "WebTransportListener: bind, port, and clean re-startable shutdown" {
 /// records what it saw. Stands in for the daemon's IRC listener so the test can
 /// assert the WT→TCP→WT loopback proxy round-trips real bytes.
 const FakeIrcServer = struct {
-    listen_fd: linux.fd_t,
+    listen_fd: sys.fd_t,
     port: u16,
     thread: ?std.Thread = null,
     got: [256]u8 = undefined,
-    got_len: usize = 0,
+    got_len: std.atomic.Value(usize) = .init(0),
     reply: []const u8,
 
     fn start(reply: []const u8) !*FakeIrcServer {
         const self = try testing.allocator.create(FakeIrcServer);
         errdefer testing.allocator.destroy(self);
-        const rc = linux.socket(posix.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+        const rc = sys.socket(posix.AF.INET, sys.SOCK.STREAM | sys.SOCK.CLOEXEC, sys.IPPROTO.TCP);
         if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
         self.listen_fd = @intCast(rc);
-        var addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
-        if (posix.errno(linux.bind(self.listen_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        errdefer _ = sys.close(self.listen_fd);
+        var addr = sys.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+        if (posix.errno(sys.bind(self.listen_fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))) != .SUCCESS)
             return error.BindFailed;
-        if (posix.errno(linux.listen(self.listen_fd, 4)) != .SUCCESS) return error.ListenFailed;
-        var sa: linux.sockaddr.in = undefined;
-        var slen: posix.socklen_t = @sizeOf(linux.sockaddr.in);
-        _ = linux.getsockname(self.listen_fd, @ptrCast(&sa), &slen);
+        if (posix.errno(sys.listen(self.listen_fd, 4)) != .SUCCESS) return error.ListenFailed;
+        var sa: sys.sockaddr.in = undefined;
+        var slen: posix.socklen_t = @sizeOf(sys.sockaddr.in);
+        _ = sys.getsockname(self.listen_fd, @ptrCast(&sa), &slen);
         self.port = std.mem.bigToNative(u16, sa.port);
-        self.got_len = 0;
+        self.got_len = .init(0);
         self.reply = reply;
         self.thread = try std.Thread.spawn(.{}, accept, .{self});
         return self;
     }
 
     fn accept(self: *FakeIrcServer) void {
-        const cfd_rc = linux.accept(self.listen_fd, null, null);
+        var polls = [_]posix.pollfd{.{ .fd = self.listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (sys.poll(&polls, 1, 5000) <= 0) return;
+        const cfd_rc = sys.accept(self.listen_fd, null, null);
         if (posix.errno(cfd_rc) != .SUCCESS) return;
-        const cfd: linux.fd_t = @intCast(cfd_rc);
-        defer _ = linux.close(cfd);
-        // Read one chunk of forwarded IRC bytes.
-        const rc = linux.read(cfd, &self.got, self.got.len);
-        if (posix.errno(rc) == .SUCCESS) self.got_len = @intCast(rc);
-        // Echo a reply back so the bridge proxies it WT-bound.
-        _ = linux.write(cfd, self.reply.ptr, self.reply.len);
+        const cfd: sys.fd_t = @intCast(cfd_rc);
+        defer _ = sys.close(cfd);
+        const timeout = sys.timeval{ .sec = 2, .usec = 0 };
+        if (posix.errno(sys.setsockopt(cfd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout), @sizeOf(@TypeOf(timeout)))) != .SUCCESS) return;
+        var total: usize = 0;
+        while (total < self.got.len) {
+            const rc = sys.read(cfd, self.got[total..].ptr, self.got.len - total);
+            if (posix.errno(rc) != .SUCCESS or rc == 0) return;
+            total += @intCast(rc);
+            if (std.mem.endsWith(u8, self.got[0..total], "NICK wtuser\r\n")) break;
+        }
+        self.got_len.store(total, .release);
+        _ = writeAllFd(cfd, self.reply);
         // Hold the connection open briefly so the reply is flushed.
         sleepMs(50);
     }
 
     fn join(self: *FakeIrcServer) void {
         if (self.thread) |t| t.join();
-        _ = linux.close(self.listen_fd);
+        _ = sys.close(self.listen_fd);
         testing.allocator.destroy(self);
     }
 };
 
 test "WebTransportListener: live UDP QUIC/H3/WT session bridges IRC bytes both ways" {
+    try exerciseLiveBridge(false, false);
+}
+
+test "WebTransportListener: native IPv6 QUIC/H3/WT bridges IRC with mandatory PROXY header" {
+    try exerciseLiveBridge(true, true);
+}
+
+fn exerciseLiveBridge(ipv6: bool, proxy: bool) !void {
     // End-to-end over the DUAL-STACK socket: `lst.start` now binds an AF_INET6
     // socket with IPV6_V6ONLY=0, and the client below is a plain IPv4 loopback
     // `MediaSocket`. So this also proves the full QUIC/H3/WT handshake + IRC
@@ -1405,16 +1480,19 @@ test "WebTransportListener: live UDP QUIC/H3/WT session bridges IRC bytes both w
         .signing_key = .{ .ed25519 = keys.kp },
     }, irc.port);
     defer lst.deinit();
-    try lst.start(loopback_be, 0);
+    lst.send_proxy_header = proxy;
+    try lst.startAddress(if (ipv6) .loopback_v6 else .{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
     const server_port = lst.port;
 
     // A real IPv4 UDP socket acting as the QUIC/WT client. It addresses the
     // dual-stack server at 127.0.0.1:server_port; the server sees it as a
     // v4-mapped source and replies via the same dual-stack socket.
-    var cli_sock = try MediaSocket.bind(loopback_be, 0);
+    var cli_sock = try DualStackUdpSocket.bind(if (ipv6) .loopback_v6 else .{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
     defer cli_sock.deinit();
-    cli_sock.setRecvTimeoutMs(400);
-    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, server_port);
+    cli_sock.setRecvTimeoutMs(100);
+    var loopback6: [16]u8 = @splat(0);
+    loopback6[15] = 1;
+    const server_addr = try TransportAddress.fromBytes(if (ipv6) &loopback6 else &[_]u8{ 127, 0, 0, 1 }, server_port);
 
     // Build the client QUIC connection. Its Initial DCID is what the server's
     // listener will demux + mint a connection for.
@@ -1481,20 +1559,28 @@ test "WebTransportListener: live UDP QUIC/H3/WT session bridges IRC bytes both w
         try recvQuicAll(&client, &cli_sock);
         // Read any WT-stream bytes the server proxied from the IRC reply.
         reply_total += readWtBidi(&client, data_stream, reply_buf[reply_total..], session_id);
-        if (irc.got_len > 0 and reply_total >= irc.reply.len) break;
+        if (irc.got_len.load(.acquire) > 0 and reply_total >= irc.reply.len) break;
         sleepMs(5);
     }
 
     // The fake IRC server received the IRC line forwarded by the bridge.
-    try testing.expect(irc.got_len > 0);
-    try testing.expectEqualStrings(irc_line, irc.got[0..irc.got_len]);
+    const received = irc.got[0..irc.got_len.load(.acquire)];
+    if (proxy) {
+        const header = try proxy_protocol.parseV1(received);
+        try testing.expectEqual(proxy_protocol.Family.tcp6, header.header.family);
+        try testing.expectEqualSlices(u8, &loopback6, header.header.srcBytes());
+        try testing.expectEqualSlices(u8, &loopback6, header.header.dstBytes());
+        try testing.expectEqual(try cli_sock.localPort(), header.header.src_port);
+        try testing.expectEqual(@as(u16, 0), header.header.dst_port);
+        try testing.expectEqualStrings(irc_line, received[header.consumed..]);
+    } else try testing.expectEqualStrings(irc_line, received);
     // The client received the IRC server's reply, proxied back over the WT stream.
     try testing.expectEqualStrings(irc.reply, reply_buf[0..reply_total]);
 }
 
 // -- test-only QUIC/WT client glue over a real UDP socket -------------------
 
-fn sendQuic(alloc: std.mem.Allocator, conn: *quic_conn.Conn, sock: *MediaSocket, dst: TransportAddress) !void {
+fn sendQuic(alloc: std.mem.Allocator, conn: *quic_conn.Conn, sock: anytype, dst: TransportAddress) !void {
     var out: std.ArrayList(quic_conn.OutDatagram) = .empty;
     defer {
         for (out.items) |d| alloc.free(d.bytes);
@@ -1504,7 +1590,7 @@ fn sendQuic(alloc: std.mem.Allocator, conn: *quic_conn.Conn, sock: *MediaSocket,
     for (out.items) |d| sock.sendTo(dst, d.bytes);
 }
 
-fn recvQuicAll(conn: *quic_conn.Conn, sock: *MediaSocket) !void {
+fn recvQuicAll(conn: *quic_conn.Conn, sock: anytype) !void {
     var buf: [recv_buf_len]u8 = undefined;
     var tries: usize = 0;
     while (tries < 8) : (tries += 1) {
@@ -2138,4 +2224,15 @@ test "interop: curl --http3 large transfer + multi-request + Retry round-trip (d
 
         lst.shutdown();
     }
+}
+
+test "WebTransportListener: native bridge write failure retires a broken peer without SIGPIPE" {
+    if (comptime builtin.os.tag != .openbsd) return;
+    var pair: [2]sys.fd_t = undefined;
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0, &pair)));
+    defer _ = sys.close(pair[0]);
+    _ = sys.close(pair[1]);
+    try testing.expect(!writeAllFd(pair[0], "retired-peer"));
+    try testing.expect(!setNonBlocking(-1));
+    try testing.expect(!writeAllFd(-1, "invalid-peer"));
 }

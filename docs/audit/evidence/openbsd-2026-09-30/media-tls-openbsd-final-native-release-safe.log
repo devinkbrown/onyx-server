@@ -1,0 +1,105 @@
+1/104 root.test_0...OK
+2/104 crypto.root.test_0...OK
+3/104 daemon.root.test_0...OK
+4/104 proto.root.test_0...OK
+5/104 substrate.root.test_0...OK
+6/104 wasm.host.root.test_0...OK
+7/104 substrate.io.root.test_0...OK
+8/104 substrate.media_socket.test.loopback STUN binding round-trip binds the peer and answers...OK
+9/104 substrate.media_socket.test.queryReflexive learns the reflexive address from a STUN server...OK
+10/104 substrate.ripple_props.test_0...OK
+11/104 substrate.ripple.test_0...OK
+12/104 substrate.undertow.root.test_0...OK
+13/104 substrate.undertow.peer_link.test_0...OK
+14/104 substrate.io.buf_ring.test_0...OK
+15/104 substrate.io.ring.test_0...OK
+16/104 proto.asn1_time.test_0...OK
+17/104 proto.certfp.test_0...OK
+18/104 proto.cloak.test_0...OK
+19/104 proto.ircx_modex.test_0...OK
+20/104 proto.ircx_saccess.test_0...OK
+21/104 proto.listx.test_0...OK
+22/104 proto.mooring.test_0...OK
+23/104 proto.mooring_props.test_0...OK
+24/104 proto.quic_handshake.test_0...OK
+25/104 proto.quic_transport_params.test_0...OK
+26/104 proto.sasl_external_verify.test_0...OK
+27/104 proto.sasl_mechrouter.test_0...OK
+28/104 proto.sasl_oauthbearer.test_0...OK
+29/104 proto.sasl.test_0...OK
+30/104 proto.sasl_scram512_server.test_0...OK
+31/104 proto.sasl_scram.test_0...OK
+32/104 proto.sasl_scram_server.test_0...OK
+33/104 proto.signed_delta.test_0...OK
+34/104 proto.toml.test_0...OK
+35/104 proto.x509.test_0...OK
+36/104 daemon.modules.manifest.test_0...OK
+37/104 daemon.key_transparency.test_0...OK
+38/104 daemon.acme_cli.test_0...OK
+39/104 daemon.acme_http01_listener.test_0...OK
+40/104 daemon.acme_renewal.test_0...OK
+41/104 daemon.acme_runner.test_0...OK
+42/104 daemon.config_format.test_0...OK
+43/104 daemon.dualstack_udp.test.dualstack socket: bind on [::], ephemeral port, clean shutdown, v4 receive...OK
+44/104 daemon.dualstack_udp.test.dualstack socket: IPv6 loopback receive (skips if no v6 loopback)...OK
+45/104 daemon.dualstack_udp.test.dualstack socket: native paired families share a port and preserve both queued datagrams...OK
+46/104 daemon.helix.root.test_0...OK
+47/104 daemon.metrics_http.test_0...OK
+48/104 daemon.webhook.test_0...OK
+49/104 daemon.webhook_render.test_0...OK
+50/104 daemon.webhook_http.test_0...OK
+51/104 daemon.native_media_transport.test.NativeMediaTransport: pump learns sender + forwards an cadence frame to the receiver...OK
+52/104 daemon.native_media_transport.test.NativeMediaTransport: required MAC drops untagged and accepts valid tagged datagrams...OK
+53/104 daemon.native_media_transport.test.NativeMediaTransport: MAC flag off preserves untagged datagram behavior...OK
+54/104 daemon.native_media_transport.test.NativeMediaTransport: media never crosses channels...OK
+55/104 daemon.native_media_transport.test.NativeMediaTransport: setSelection drops higher layers over the wire...OK
+56/104 daemon.native_media_transport.test.NativeMediaTransport: unregister drops the channel and frees its index...OK
+57/104 daemon.native_media_transport.test.NativeMediaTransport: register enforces runtime participant cap...OK
+58/104 daemon.native_media_transport.test.NativeMediaTransport: pump bridges a native frame to a WebRTC member as RTP...OK
+59/104 daemon.native_media_transport.test.NativeMediaTransport: pump accepts authenticated native feedback envelope...OK
+60/104 daemon.native_media_transport.test.NativeMediaTransport: pump rejects native feedback with a bad tag...OK
+61/104 daemon.native_media_transport.test.NativeMediaTransport: forged feedback with a bad tag does not rebind the victim address...OK
+62/104 daemon.native_media_transport.test.NativeMediaTransport: valid feedback from the correct source still binds and is processed...OK
+63/104 daemon.native_media_transport.test.NativeMediaTransport: start/shutdown is clean and re-startable...OK
+64/104 daemon.oauth_jwt.test_0...OK
+65/104 daemon.ocsp_staple.test_0...OK
+66/104 daemon.reactor_pool.test_0...OK
+67/104 daemon.sasl_bridge.test_0...OK
+68/104 daemon.scram_store.test_0...OK
+69/104 daemon.server.test_0...OK
+70/104 daemon.sessions.test_0...OK
+71/104 daemon.tls_certs.test_0...OK
+72/104 daemon.tls_conn.test_0...OK
+73/104 daemon.tls_sni_load.test_0...OK
+74/104 daemon.webtransport_listener.test.WebTransportListener: bind, port, and clean re-startable shutdown...OK
+75/104 daemon.webtransport_listener.test.WebTransportListener: live UDP QUIC/H3/WT session bridges IRC bytes both ways...OK
+76/104 daemon.webtransport_listener.test.WebTransportListener: native IPv6 QUIC/H3/WT bridges IRC with mandatory PROXY header...OK
+77/104 daemon.webtransport_listener.test.WebTransportListener: native bridge write failure retires a broken peer without SIGPIPE...OK
+78/104 crypto.kx.test_0...OK
+79/104 crypto.hkdf_tls13.test_0...OK
+80/104 crypto.hash.test_0...OK
+81/104 crypto.random.test_0...OK
+82/104 crypto.tls_server.test.loopback: tls_client completes a handshake against tls_server + app data both ways...OK
+83/104 crypto.tls_server.test.loopback: TLS 1.3 PSK-DHE session resumption and binder tamper fallback...OK
+84/104 crypto.tls_server.test.loopback: TLS 1.3 PSK-DHE resumption accepts 0-RTT early data...OK
+85/104 crypto.tls_server.test.0-RTT freshness window: in-window age is accepted...OK
+86/104 crypto.tls_server.test.0-RTT freshness window: a reported age far below the measured elapsed is refused...OK
+87/104 crypto.tls_server.test.0-RTT freshness window: a reported age far above the measured elapsed is refused...OK
+88/104 crypto.tls_server.test.0-RTT freshness window: exactly at the skew boundary is accepted, one ms past is refused...OK
+89/104 crypto.tls_server.test.0-RTT freshness window: no server clock refuses early data and completes 1-RTT...OK
+90/104 crypto.tls_server.test.loopback: TLS 1.3 PSK-DHE resumption rejects 0-RTT when sealed ticket limit is zero...OK
+91/104 crypto.tls_server.test.loopback: tls_client completes a handshake against tls_server with ECDSA-P256 leaf...OK
+92/104 crypto.tls_server.test.loopback: tls_client completes a handshake against tls_server with RSA leaf...OK
+93/104 crypto.tls_server.test_0...OK
+94/104 crypto.tls_record.test_0...OK
+95/104 crypto.tls_client.test_0...OK
+96/104 crypto.sign.test_0...OK
+97/104 crypto.sct.test_0...OK
+98/104 crypto.xwing.test_0...OK
+99/104 crypto.aead.test_0...OK
+100/104 crypto.ecdsa_kat.test_0...OK
+101/104 crypto.ed25519_batch.test_0...OK
+102/104 crypto.sign_kat.test_0...OK
+103/104 crypto.tls_props.test_0...OK
+104/104 crypto.tls.test_0...OK
+All 104 tests passed.

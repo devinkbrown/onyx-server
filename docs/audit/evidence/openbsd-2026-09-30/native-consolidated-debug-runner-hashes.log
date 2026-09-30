@@ -1,0 +1,3 @@
+5f4604c59c35a566eac983cf56af09e6ff2f18a5ccb558cc5a221d536681cc16  .zig-cache/codex-resume/openbsd-unfiltered-consolidated-debug/bin/onyx-server-cli-tests
+cb6493f8a436cad6ec1bc6938c248a1c66e69ff8e93fa062eaa5ba622212970c  .zig-cache/codex-resume/openbsd-unfiltered-consolidated-debug/bin/onyx-server-daemon-tests
+48c9e34080e35d402235707e82a11df2abf08e9b2eaf776b7b31fa243030df13  .zig-cache/codex-resume/openbsd-unfiltered-consolidated-debug/bin/onyx-server-module-tests

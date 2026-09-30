@@ -14,7 +14,7 @@
 //! news feeds over HTTPS verify against caller-supplied trust anchors.
 const std = @import("std");
 const builtin = @import("builtin");
-const linux = std.os.linux;
+const sys = if (builtin.os.tag == .windows) std.os.linux else std.posix.system;
 const posix = std.posix;
 const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
@@ -110,12 +110,13 @@ pub fn get(
     request_bytes: []const u8,
     opts: Options,
 ) Error![]u8 {
+    if (comptime builtin.os.tag == .windows) return error.SocketUnavailable;
     const addr = try resolveHostA(host, port, opts.recv_timeout_ms);
 
     if (!tls) {
         const fd = try connectAddr(addr, opts.connect_timeout_ms);
         defer closeFd(fd);
-        setRecvTimeout(fd, opts.recv_timeout_ms);
+        try setRecvTimeout(fd, opts.recv_timeout_ms);
         try writeAll(fd, request_bytes);
         return try readHttp(allocator, fd, opts.max_response_bytes);
     }
@@ -128,7 +129,7 @@ pub fn get(
     {
         const fd = try connectAddr(addr, opts.connect_timeout_ms);
         defer closeFd(fd);
-        setRecvTimeout(fd, opts.recv_timeout_ms);
+        try setRecvTimeout(fd, opts.recv_timeout_ms);
         if (getTls(allocator, fd, host, request_bytes, opts)) |resp| {
             return resp;
         } else |err| switch (err) {
@@ -138,7 +139,7 @@ pub fn get(
     }
     const fd2 = try connectAddr(addr, opts.connect_timeout_ms);
     defer closeFd(fd2);
-    setRecvTimeout(fd2, opts.recv_timeout_ms);
+    try setRecvTimeout(fd2, opts.recv_timeout_ms);
     return try getTls12(allocator, fd2, host, request_bytes, opts);
 }
 
@@ -205,7 +206,7 @@ fn postWithHeaders(
 /// hosts. Mirrors `getTls` but uses the 1.2 client's `decrypt` (no KeyUpdate).
 fn getTls12(
     allocator: std.mem.Allocator,
-    fd: linux.fd_t,
+    fd: sys.fd_t,
     host: []const u8,
     request_bytes: []const u8,
     opts: Options,
@@ -275,7 +276,7 @@ fn getTls12(
 
 fn getTls(
     allocator: std.mem.Allocator,
-    fd: linux.fd_t,
+    fd: sys.fd_t,
     host: []const u8,
     request_bytes: []const u8,
     opts: Options,
@@ -357,7 +358,7 @@ fn getTls(
     return plaintext.toOwnedSlice(allocator);
 }
 
-fn readHttp(allocator: std.mem.Allocator, fd: linux.fd_t, max_bytes: usize) Error![]u8 {
+fn readHttp(allocator: std.mem.Allocator, fd: sys.fd_t, max_bytes: usize) Error![]u8 {
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(allocator);
     var buf: [16 * 1024]u8 = undefined;
@@ -376,8 +377,8 @@ fn readHttp(allocator: std.mem.Allocator, fd: linux.fd_t, max_bytes: usize) Erro
 
 /// Wall-clock time in Unix seconds, used to reject expired server certificates.
 fn wallClockSeconds() i64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
+    var ts: sys.timespec = undefined;
+    if (posix.errno(sys.clock_gettime(posix.CLOCK.REALTIME, &ts)) != .SUCCESS) return 0;
     return @intCast(ts.sec);
 }
 
@@ -405,6 +406,7 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
 /// dial configured "host:port" peers by name (same blocking-DNS contract).
 pub fn resolveHostA(host: []const u8, port: u16, timeout_ms: u31) Error!net.IpAddress {
     if (net.IpAddress.parse(host, port)) |addr| return addr else |_| {}
+    if (comptime builtin.os.tag == .windows) return error.NoNameservers;
 
     var conf_buf: [4096]u8 = undefined;
     const text = readSmallFile("/etc/resolv.conf", &conf_buf) catch return error.NoNameservers;
@@ -431,23 +433,33 @@ pub fn resolveHostA(host: []const u8, port: u16, timeout_ms: u31) Error!net.IpAd
 }
 
 fn queryOneServer(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![4]u8 {
-    const fd = try udpSocket();
-    defer closeFd(fd);
-    setRecvTimeout(fd, timeout_ms);
-    var sa = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, 53), .addr = @bitCast(ns_v4) };
-    if (posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
-    if (posix.errno(linux.write(fd, query.ptr, query.len)) != .SUCCESS) return error.ConnectFailed;
-
-    var resp: [dns.max_message_len]u8 = undefined;
-    const rc = linux.read(fd, &resp, resp.len);
-    if (posix.errno(rc) != .SUCCESS) return error.HostNotFound;
-    const n: usize = @intCast(rc);
-    const msg = dns.parseMessage(1, dns.max_cache_addrs, resp[0..n]) catch return error.HostNotFound;
+    const msg = try queryServerPort(ns_v4, 53, query, timeout_ms);
     for (msg.answerSlice()) |rr| switch (rr.data) {
         .a => |ipv4| return ipv4,
         else => {},
     };
     return error.HostNotFound;
+}
+
+fn queryServerPort(ns_v4: [4]u8, port: u16, query: []const u8, timeout_ms: u31) Error!dns.Message(1, dns.max_cache_addrs) {
+    const question = dns.parseMessage(1, 0, query) catch return error.HostNotFound;
+    if (question.question_count != 1) return error.HostNotFound;
+    const fd = try udpSocket();
+    defer closeFd(fd);
+    try setRecvTimeout(fd, timeout_ms);
+    var sa = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(ns_v4) };
+    if (posix.errno(sys.connect(fd, @ptrCast(&sa), @sizeOf(sys.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
+    try writeAll(fd, query);
+    var resp: [dns.max_message_len]u8 = undefined;
+    const rc = sys.read(fd, &resp, resp.len);
+    if (posix.errno(rc) != .SUCCESS) return error.HostNotFound;
+    const msg = dns.parseMessage(1, dns.max_cache_addrs, resp[0..@intCast(rc)]) catch return error.HostNotFound;
+    const q = question.questions[0];
+    if (msg.header.id != question.header.id or msg.header.rcode() != 0 or
+        msg.header.flags & 0x7a00 != 0 or
+        !dns.responseMatchesQuestion(1, dns.max_cache_addrs, &msg, q.name.slice(), q.qtype)) return error.HostNotFound;
+    if (!dns.responseAnswersFollowCnames(dns.max_cache_addrs, resp[0..@intCast(rc)], q.name.slice(), q.qtype)) return error.HostNotFound;
+    return msg;
 }
 
 /// Like `resolveHostA` but queries AAAA records, returning an IPv6 address.
@@ -458,6 +470,7 @@ pub fn resolveHostAAAA(host: []const u8, port: u16, timeout_ms: u31) Error!net.I
         .ip6 => return addr,
         .ip4 => {}, // an IPv4 literal is not an AAAA answer — fall through to DNS
     } else |_| {}
+    if (comptime builtin.os.tag == .windows) return error.NoNameservers;
 
     var conf_buf: [4096]u8 = undefined;
     const text = readSmallFile("/etc/resolv.conf", &conf_buf) catch return error.NoNameservers;
@@ -484,18 +497,7 @@ pub fn resolveHostAAAA(host: []const u8, port: u16, timeout_ms: u31) Error!net.I
 }
 
 fn queryOneServer6(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![16]u8 {
-    const fd = try udpSocket();
-    defer closeFd(fd);
-    setRecvTimeout(fd, timeout_ms);
-    var sa = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, 53), .addr = @bitCast(ns_v4) };
-    if (posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
-    if (posix.errno(linux.write(fd, query.ptr, query.len)) != .SUCCESS) return error.ConnectFailed;
-
-    var resp: [dns.max_message_len]u8 = undefined;
-    const rc = linux.read(fd, &resp, resp.len);
-    if (posix.errno(rc) != .SUCCESS) return error.HostNotFound;
-    const n: usize = @intCast(rc);
-    const msg = dns.parseMessage(1, dns.max_cache_addrs, resp[0..n]) catch return error.HostNotFound;
+    const msg = try queryServerPort(ns_v4, 53, query, timeout_ms);
     for (msg.answerSlice()) |rr| switch (rr.data) {
         .aaaa => |ipv6| return ipv6,
         else => {},
@@ -505,15 +507,15 @@ fn queryOneServer6(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![16]u
 
 // ---- raw socket helpers (mirror acme_runner / server idiom) ------------------
 
-fn connectAddr(addr: net.IpAddress, timeout_ms: u31) Error!linux.fd_t {
+fn connectAddr(addr: net.IpAddress, timeout_ms: u31) Error!sys.fd_t {
     const a4 = switch (addr) {
         .ip4 => |x| x,
         .ip6 => return error.ConnectFailed,
     };
     const fd = try socketTcpNonblock();
     errdefer closeFd(fd);
-    var sa = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, a4.port), .addr = @bitCast(a4.bytes) };
-    const rc = linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
+    var sa = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, a4.port), .addr = @bitCast(a4.bytes) };
+    const rc = sys.connect(fd, @ptrCast(&sa), @sizeOf(sys.sockaddr.in));
     switch (posix.errno(rc)) {
         .SUCCESS => {},
         .INPROGRESS, .INTR => try waitWritable(fd, timeout_ms),
@@ -521,62 +523,74 @@ fn connectAddr(addr: net.IpAddress, timeout_ms: u31) Error!linux.fd_t {
     }
     // Confirm the connect succeeded (SO_ERROR == 0).
     var err_val: i32 = 0;
-    var err_len: linux.socklen_t = @sizeOf(i32);
-    if (posix.errno(linux.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err_val), &err_len)) != .SUCCESS)
+    var err_len: sys.socklen_t = @sizeOf(i32);
+    if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err_val), &err_len)) != .SUCCESS)
         return error.ConnectFailed;
     if (err_val != 0) return error.ConnectFailed;
-    setBlocking(fd);
+    try setBlocking(fd);
     return fd;
 }
 
-fn waitWritable(fd: linux.fd_t, timeout_ms: u31) Error!void {
-    // linux.pollfd/POLL/SOCK.* (not posix.*): these pair with the raw linux
+fn waitWritable(fd: sys.fd_t, timeout_ms: u31) Error!void {
+    // sys.pollfd/POLL/SOCK.* (not posix.*): these pair with the raw linux
     // syscalls; posix.* resolves to libc/ws2_32 on non-Linux (build-time only).
-    var pfd = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
-    const rc = linux.poll(&pfd, 1, timeout_ms);
+    var pfd = [_]sys.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+    const rc = sys.poll(&pfd, 1, timeout_ms);
     switch (posix.errno(rc)) {
         .SUCCESS => {},
         else => return error.ConnectFailed,
     }
     if (rc == 0) return error.ConnectTimeout;
-    if (pfd[0].revents & (linux.POLL.ERR | linux.POLL.HUP) != 0) return error.ConnectFailed;
+    if (pfd[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) return error.ConnectFailed;
 }
 
-fn socketTcpNonblock() Error!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+fn socketTcpNonblock() Error!sys.fd_t {
+    const rc = sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
     return switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         else => error.SocketUnavailable,
     };
 }
 
-fn udpSocket() Error!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+fn udpSocket() Error!sys.fd_t {
+    const rc = sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);
     return switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         else => error.SocketUnavailable,
     };
 }
 
-fn setBlocking(fd: linux.fd_t) void {
-    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
-    _ = linux.fcntl(fd, linux.F.SETFL, flags & ~@as(usize, linux.SOCK.NONBLOCK));
+fn setBlocking(fd: sys.fd_t) Error!void {
+    if (comptime builtin.os.tag != .linux) {
+        const old = sys.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+        if (posix.errno(old) != .SUCCESS) return error.ConnectFailed;
+        var flags: posix.O = @bitCast(@as(u32, @intCast(old)));
+        flags.NONBLOCK = false;
+        if (posix.errno(sys.fcntl(fd, posix.F.SETFL, @as(usize, @as(u32, @bitCast(flags))))) != .SUCCESS) return error.ConnectFailed;
+        return;
+    }
+    const flags = sys.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+    _ = sys.fcntl(fd, posix.F.SETFL, flags & ~@as(usize, posix.SOCK.NONBLOCK));
 }
 
-fn setRecvTimeout(fd: linux.fd_t, timeout_ms: u31) void {
-    const tv = linux.timeval{ .sec = @divTrunc(timeout_ms, 1000), .usec = @as(i64, @intCast(timeout_ms % 1000)) * 1000 };
-    _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
-    _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
+fn setRecvTimeout(fd: sys.fd_t, timeout_ms: u31) Error!void {
+    const finite_ms = if (builtin.os.tag == .linux) timeout_ms else @max(timeout_ms, 1);
+    const tv = sys.timeval{ .sec = @intCast(finite_ms / 1000), .usec = @intCast((finite_ms % 1000) * 1000) };
+    const recv_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(sys.timeval));
+    const send_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, @ptrCast(&tv), @sizeOf(sys.timeval));
+    if (comptime builtin.os.tag != .linux) {
+        if (posix.errno(recv_rc) != .SUCCESS or posix.errno(send_rc) != .SUCCESS) return error.RecvTimeout;
+    }
 }
 
-fn closeFd(fd: linux.fd_t) void {
-    _ = linux.close(fd);
+fn closeFd(fd: sys.fd_t) void {
+    _ = sys.close(fd);
 }
 
-fn writeAll(fd: linux.fd_t, bytes: []const u8) Error!void {
+fn writeAll(fd: sys.fd_t, bytes: []const u8) Error!void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        const rc = if (comptime builtin.os.tag == .linux) sys.write(fd, bytes[off..].ptr, bytes.len - off) else sys.send(fd, bytes[off..].ptr, bytes.len - off, posix.MSG.NOSIGNAL);
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 const n: usize = @intCast(rc);
@@ -590,9 +604,9 @@ fn writeAll(fd: linux.fd_t, bytes: []const u8) Error!void {
     }
 }
 
-fn readSome(fd: linux.fd_t, buf: []u8) Error!usize {
+fn readSome(fd: sys.fd_t, buf: []u8) Error!usize {
     while (true) {
-        const rc = linux.read(fd, buf.ptr, buf.len);
+        const rc = sys.read(fd, buf.ptr, buf.len);
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 const n: usize = @intCast(rc);
@@ -611,13 +625,13 @@ fn readSome(fd: linux.fd_t, buf: []u8) Error!usize {
 }
 
 fn readSmallFile(path: [*:0]const u8, buf: []u8) ![]u8 {
-    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    const rc = sys.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = builtin.os.tag != .linux }, @as(posix.mode_t, 0));
     if (posix.errno(rc) != .SUCCESS) return error.NoNameservers;
-    const fd: linux.fd_t = @intCast(rc);
+    const fd: sys.fd_t = @intCast(rc);
     defer closeFd(fd);
     var total: usize = 0;
     while (total < buf.len) {
-        const r = linux.read(fd, buf[total..].ptr, buf.len - total);
+        const r = sys.read(fd, buf[total..].ptr, buf.len - total);
         switch (posix.errno(r)) {
             .SUCCESS => {
                 const n: usize = @intCast(r);
@@ -632,9 +646,13 @@ fn readSmallFile(path: [*:0]const u8, buf: []u8) ![]u8 {
 }
 
 fn osEntropy(buf: []u8) void {
+    if (comptime builtin.os.tag != .linux) {
+        sys.arc4random_buf(buf.ptr, buf.len);
+        return;
+    }
     var filled: usize = 0;
     while (filled < buf.len) {
-        const rc = linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
+        const rc = sys.getrandom(buf.ptr + filled, buf.len - filled, 0);
         if (posix.errno(rc) != .SUCCESS) {
             for (buf[filled..]) |*b| b.* = 0x55; // query IDs are not security-critical
             return;
@@ -682,4 +700,100 @@ test "GAP-K6 CRL and CT callers pass DER and the fetch defaults stay fail-open" 
     const url = try parseUrl("http://crl.example/leaf.crl");
     try std.testing.expectEqualStrings("crl.example", url.host);
     try std.testing.expectEqualStrings("/leaf.crl", url.path);
+}
+
+test "http_fetch native loopback request timeout entropy and descriptor failure" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const metrics = @import("metrics_http.zig");
+    var snapshot = metrics.MetricsSnapshot.init(std.testing.allocator);
+    defer snapshot.deinit();
+    try snapshot.set("native_worker_probe 1\n");
+    var server = try metrics.MetricsServer.init(&snapshot, 0);
+    defer server.shutdown();
+    const request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    // An open TCP backlog with no HTTP worker must fail within receive timeout.
+    try std.testing.expectError(error.RecvTimeout, get(std.testing.allocator, "127.0.0.1", server.port, false, request, .{ .recv_timeout_ms = 40 }));
+    try server.spawn();
+    const response = try get(std.testing.allocator, "127.0.0.1", server.port, false, request, .{});
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, response, "native_worker_probe 1\n"));
+    var random: [32]u8 = @splat(0);
+    osEntropy(&random);
+    try std.testing.expect(!std.mem.allEqual(u8, &random, 0));
+    try std.testing.expect(wallClockSeconds() > 1_700_000_000);
+    var empty: [1]u8 = undefined;
+    try std.testing.expectError(error.NoNameservers, readSmallFile("/definitely-missing-onyx-resolver", &empty));
+    if (comptime builtin.os.tag != .linux) {
+        try std.testing.expectError(error.RecvTimeout, setRecvTimeout(-1, 1));
+        try std.testing.expectError(error.ConnectFailed, setBlocking(-1));
+    }
+}
+
+test "http_fetch native DNS UDP transport binds replies to query identity" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const Worker = struct {
+        fd: posix.fd_t,
+        response: []const u8,
+        ok: bool = false,
+        fn run(self: *@This()) void {
+            var bytes: [512]u8 = undefined;
+            var addr: posix.sockaddr.storage = undefined;
+            var len: posix.socklen_t = @sizeOf(@TypeOf(addr));
+            const got = sys.recvfrom(self.fd, &bytes, bytes.len, 0, @ptrCast(&addr), &len);
+            if (posix.errno(got) != .SUCCESS) return;
+            const sent = sys.sendto(self.fd, self.response.ptr, self.response.len, 0, @ptrCast(&addr), len);
+            self.ok = posix.errno(sent) == .SUCCESS and sent == self.response.len;
+        }
+    };
+    const q = dns.Query{ .name = "native-worker.test", .qtype = .a };
+    const answer = dns.Answer{ .name = "canonical-worker.test", .rr_type = .a, .ttl = 5, .data = .{ .a = .{ 127, 0, 0, 7 } } };
+    var query_buf: [512]u8 = undefined;
+    const query = try dns.encodeQuery(&query_buf, 0x8712, q.name, .a);
+    for (0..4) |mode| {
+        const wrong_id = mode == 1;
+        const canonical = mode >= 2;
+        const fd = try udpSocket();
+        defer closeFd(fd);
+        try setRecvTimeout(fd, 1000);
+        var addr = sys.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)))));
+        var len: posix.socklen_t = @sizeOf(@TypeOf(addr));
+        try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.getsockname(fd, @ptrCast(&addr), &len)));
+        var response_buf: [512]u8 = undefined;
+        var selected = answer;
+        if (!canonical) selected.name = q.name;
+        const encoded = try dns.encodeMessage(&response_buf, .{ .id = if (wrong_id) 0x8713 else 0x8712, .response = true, .questions = &.{q}, .answers = &.{selected} });
+        var response_len = encoded.len;
+        if (mode == 2) {
+            var target_buf: [128]u8 = undefined;
+            const target = try dns.encodeQuery(&target_buf, 0, answer.name, .a);
+            const owner_wire = query[12 .. query.len - 4];
+            const target_wire = target[12 .. target.len - 4];
+            @memcpy(response_buf[response_len..][0..owner_wire.len], owner_wire);
+            response_len += owner_wire.len;
+            const header = response_buf[response_len..][0..10];
+            std.mem.writeInt(u16, header[0..2], 5, .big);
+            std.mem.writeInt(u16, header[2..4], dns.class_in, .big);
+            std.mem.writeInt(u32, header[4..8], 5, .big);
+            std.mem.writeInt(u16, header[8..10], @intCast(target_wire.len), .big);
+            response_len += 10;
+            @memcpy(response_buf[response_len..][0..target_wire.len], target_wire);
+            response_len += target_wire.len;
+            std.mem.writeInt(u16, response_buf[6..8], 2, .big);
+        }
+        var worker = Worker{ .fd = fd, .response = response_buf[0..response_len] };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        var joined = false;
+        defer if (!joined) thread.join();
+        if (wrong_id or mode == 3) {
+            try std.testing.expectError(error.HostNotFound, queryServerPort(.{ 127, 0, 0, 1 }, std.mem.bigToNative(u16, addr.port), query, 100));
+        } else {
+            const msg = try queryServerPort(.{ 127, 0, 0, 1 }, std.mem.bigToNative(u16, addr.port), query, 100);
+            try std.testing.expectEqual([4]u8{ 127, 0, 0, 7 }, msg.answers[0].data.a);
+        }
+        thread.join();
+        joined = true;
+        try std.testing.expect(worker.ok);
+    }
 }

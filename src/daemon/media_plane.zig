@@ -55,6 +55,9 @@ fn isRtcp(b1: u8) bool {
 
 /// Fill `buf` with OS entropy (getrandom).
 fn osEntropy(buf: []u8) !void {
+    if (comptime @import("builtin").os.tag != .linux) {
+        return platform.fillOsEntropy(buf) catch return error.EntropyUnavailable;
+    }
     var filled: usize = 0;
     while (filled < buf.len) {
         const rc = linux.getrandom(buf.ptr + filled, buf.len - filled, 0);

@@ -1,0 +1,4 @@
+PASS 40 original IPv4/IPv6 all transport attachments
+PASS rejected candidate: same predecessor and 40 original sockets alive
+PASS upgrade 1: PID 85513->41344; all original sockets retained; 39 single deliveries observed through the drain window
+PASS upgrade 2: PID 41344->75462; all original sockets retained; 39 single deliveries observed through the drain window

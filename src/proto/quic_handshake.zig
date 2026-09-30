@@ -921,6 +921,7 @@ fn osEntropy(buf: []u8) Error!void {
                 filled += rc;
             }
         },
+        .openbsd => @import("../crypto/random.zig").fillOsEntropy(buf) catch return error.Entropy,
         else => return error.Entropy,
     }
 }

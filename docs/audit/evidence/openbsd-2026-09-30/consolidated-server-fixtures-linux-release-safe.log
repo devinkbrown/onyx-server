@@ -1,0 +1,103 @@
+[1/76] root.test_0 ... OK (4us)
+[2/76] crypto.root.test_0 ... OK (1us)
+[3/76] daemon.root.test_0 ... OK (1us)
+[4/76] proto.root.test_0 ... OK (1us)
+[5/76] substrate.root.test_0 ... OK (1us)
+[6/76] wasm.host.root.test_0 ... OK (1us)
+[7/76] substrate.io.root.test_0 ... OK (1us)
+[8/76] substrate.ripple_props.test_0 ... OK (1us)
+[9/76] substrate.ripple.test_0 ... OK (1us)
+[10/76] substrate.undertow.root.test_0 ... OK (1us)
+[11/76] substrate.undertow.peer_link.test_0 ... OK (1us)
+[12/76] substrate.io.buf_ring.test_0 ... OK (1us)
+[13/76] substrate.io.ring.test_0 ... OK (1us)
+[14/76] proto.asn1_time.test_0 ... OK (1us)
+[15/76] proto.certfp.test_0 ... OK (1us)
+[16/76] proto.cloak.test_0 ... OK (1us)
+[17/76] proto.ircx_modex.test_0 ... OK (1us)
+[18/76] proto.ircx_saccess.test_0 ... OK (1us)
+[19/76] proto.listx.test_0 ... OK (1us)
+[20/76] proto.mooring.test_0 ... OK (1us)
+[21/76] proto.mooring_props.test_0 ... OK (1us)
+[22/76] proto.quic_handshake.test_0 ... OK (1us)
+[23/76] proto.quic_transport_params.test_0 ... OK (1us)
+[24/76] proto.sasl_external_verify.test_0 ... OK (1us)
+[25/76] proto.sasl_mechrouter.test_0 ... OK (1us)
+[26/76] proto.sasl_oauthbearer.test_0 ... OK (1us)
+[27/76] proto.sasl.test_0 ... OK (1us)
+[28/76] proto.sasl_scram512_server.test_0 ... OK (1us)
+[29/76] proto.sasl_scram.test_0 ... OK (1us)
+[30/76] proto.sasl_scram_server.test_0 ... OK (1us)
+[31/76] proto.signed_delta.test_0 ... OK (1us)
+[32/76] proto.toml.test_0 ... OK (1us)
+[33/76] proto.x509.test_0 ... OK (1us)
+[34/76] daemon.modules.manifest.test_0 ... OK (1us)
+[35/76] daemon.key_transparency.test_0 ... OK (1us)
+[36/76] daemon.acme_cli.test_0 ... OK (1us)
+[37/76] daemon.acme_http01_listener.test_0 ... OK (1us)
+[38/76] daemon.acme_renewal.test_0 ... OK (1us)
+[39/76] daemon.acme_runner.test_0 ... OK (1us)
+[40/76] daemon.config_format.test_0 ... OK (1us)
+[41/76] daemon.helix.root.test_0 ... OK (1us)
+[42/76] daemon.metrics_http.test_0 ... OK (1us)
+[43/76] daemon.webhook.test_0 ... OK (1us)
+[44/76] daemon.webhook_render.test_0 ... OK (1us)
+[45/76] daemon.webhook_http.test_0 ... OK (1us)
+[46/76] daemon.oauth_jwt.test_0 ... OK (1us)
+[47/76] daemon.ocsp_staple.test_0 ... OK (1us)
+[48/76] daemon.reactor_pool.test_0 ... OK (1us)
+[49/76] daemon.sasl_bridge.test_0 ... OK (1us)
+[50/76] daemon.scram_store.test_0 ... OK (1us)
+[51/76] daemon.server.test.UPGRADE canceled CONNECT survives SQ-full and retries through fair activation ... OK (104ms)
+[52/76] daemon.server.test.threaded server: registration EXTERNAL resumes before oper prefix and applies vhost to siblings ... OK (77ms)
+[53/76] daemon.server.test.threaded server: WHISPER and DATA relay to a remote-shard channel co-member ... OK (207ms)
+[54/76] daemon.server.test.same-nick exact sibling close keeps restored mesh membership live ... OK (50ms)
+[55/76] daemon.server.test.GAP-P11 IRCX screens name a handler or a divergence ... GAP-P11 row=LISTX handler=src/daemon/server.zig:21759 test=GAP-P0c remote LISTX carries the peer topic
+GAP-P11 row=NAMES +x handler=src/daemon/server.zig:54236 test=threaded server: +x auditorium hides regular members in NAMES
+GAP-P11 row=NAMES +h handler=src/daemon/server.zig:20483 test=GAP-P11 IRCX screens name a handler or a divergence
+GAP-P11 row=EVENT CHANNEL handler=src/daemon/server.zig:31892 test=GAP-P11 IRCX screens name a handler or a divergence
+GAP-P11 row=DATA handler=src/daemon/server.zig:35952 test=threaded server: +V NOCOMICDATA refuses non-op DATA with 531
+GAP-P11 divergence=USER events stay operator-only because a connect line names every user
+GAP-P11 divergence=remote LISTX creation time stays 0 when the peer did not replicate created_unix handler=src/daemon/server.zig:21785
+GAP-P11 divergence=TACCESS, BTPROP, OPFORCE, and Comic Chat avatar payloads stay unwired
+GAP-P11 branch=handlers at file:line or an explicit divergence and the client stays in the Onyx repo
+OK (71ms)
+[56/76] daemon.server.test_0 ... OK (1us)
+[57/76] daemon.sessions.test_0 ... OK (1us)
+[58/76] daemon.tls_certs.test_0 ... OK (1us)
+[59/76] daemon.tls_conn.test_0 ... OK (1us)
+[60/76] daemon.tls_sni_load.test_0 ... OK (1us)
+[61/76] crypto.tls_server.test_0 ... OK (1us)
+[62/76] crypto.tls_record.test_0 ... OK (1us)
+[63/76] crypto.hkdf_tls13.test_0 ... OK (1us)
+[64/76] crypto.hash.test_0 ... OK (1us)
+[65/76] crypto.random.test_0 ... OK (1us)
+[66/76] crypto.kx.test_0 ... OK (1us)
+[67/76] crypto.sign.test_0 ... OK (1us)
+[68/76] crypto.xwing.test_0 ... OK (1us)
+[69/76] crypto.tls_client.test_0 ... OK (1us)
+[70/76] crypto.sct.test_0 ... OK (1us)
+[71/76] crypto.aead.test_0 ... OK (1us)
+[72/76] crypto.ecdsa_kat.test_0 ... OK (1us)
+[73/76] crypto.ed25519_batch.test_0 ... OK (1us)
+[74/76] crypto.sign_kat.test_0 ... OK (1us)
+[75/76] crypto.tls_props.test_0 ... OK (1us)
+[76/76] crypto.tls.test_0 ... OK (1us)
+verbose test summary: 76 passed; 0 skipped; 0 failed; 0 leaked; 0 log errors; elapsed 507ms
+slowest tests:
+  207ms  daemon.server.test.threaded server: WHISPER and DATA relay to a remote-shard channel co-member
+  104ms  daemon.server.test.UPGRADE canceled CONNECT survives SQ-full and retries through fair activation
+  77ms  daemon.server.test.threaded server: registration EXTERNAL resumes before oper prefix and applies vhost to siblings
+  71ms  daemon.server.test.GAP-P11 IRCX screens name a handler or a divergence
+  50ms  daemon.server.test.same-nick exact sibling close keeps restored mesh membership live
+  4us  root.test_0
+  1us  daemon.server.test_0
+  1us  crypto.root.test_0
+  1us  daemon.sessions.test_0
+  1us  proto.mooring.test_0
+Build Summary: 4/4 steps succeeded
+test-mod-verbose success
++- run test success 511ms
+   +- compile test ReleaseSafe native success 6m MaxRSS:2G
+      +- options cached
+

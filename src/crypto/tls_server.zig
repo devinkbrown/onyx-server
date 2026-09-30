@@ -175,8 +175,8 @@ pub const Error = error{
 
 /// Process-wide 0-RTT binder ring used when `Config.replay_guard` is null.
 /// A second copy of an accepted early-data flight is refused in this process
-/// even if the caller installed no guard, the ticket has no age, and no clock
-/// is set. 1-RTT resumption does not consult it.
+/// even if the caller installed no guard. Missing freshness evidence refuses
+/// early data before this ring is consulted. 1-RTT resumption does not consult it.
 var builtin_0rtt_replay: tls_resumption.ReplayGuard = .{};
 
 pub const Config = struct {
@@ -251,8 +251,9 @@ pub const Config = struct {
     /// Current wall-clock time (Unix seconds), supplied by the caller (this pure
     /// engine takes no clock). When set, it stamps issued NewSessionTickets and
     /// enforces the ticket lifetime on resumption (expired/future tickets are
-    /// rejected, falling back to a full handshake). When null, lifetime is not
-    /// enforced (back-compatible).
+    /// rejected, falling back to a full handshake). When null, 1-RTT retains
+    /// its compatibility policy without lifetime enforcement, but 0-RTT is
+    /// always refused because freshness cannot be established.
     now_unix_seconds: ?i64 = null,
     /// Shared 0-RTT anti-replay guard. When set, accepted early data is gated on
     /// this guard (a replayed PSK binder still resumes via 1-RTT). The caller
@@ -265,9 +266,10 @@ pub const Config = struct {
     /// more than this many ms in EITHER direction, early_data is refused (the
     /// handshake still resumes at 1-RTT). This is the multi-node age-window replay
     /// defense the single-process binder ring cannot provide. The check runs only
-    /// when a clock (`now_unix_seconds`) is set AND the ticket is v3 (carries an
-    /// age_add); legacy v1/v2 tickets skip it (degrading to prior behavior). The
-    /// default 10 s absorbs ordinary client/server clock skew and RTT.
+    /// when a clock (`now_unix_seconds`) is set and the ticket carries its issue
+    /// time, age_add, and sealed lifetime. Missing evidence refuses 0-RTT;
+    /// 1-RTT keeps the separate lifetime policy. The default 10 s absorbs skew
+    /// and RTT.
     early_data_age_skew_ms: u32 = 10_000,
     /// SNI-based additional certificates (RFC 6066). When a ClientHello's
     /// `server_name` matches an entry, the server presents that entry's chain and
@@ -604,9 +606,9 @@ pub const Server = struct {
     /// RFC 8446 §8.2–8.3: false when the accepted PSK's reported
     /// `obfuscated_ticket_age` fell OUTSIDE the freshness window. It only gates
     /// early_data (a stale-age resumption still completes at 1-RTT). Defaults
-    /// true — no clock, a legacy v1/v2 ticket, or an in-window age all leave it
-    /// true, so the check never regresses tickets that predate it.
-    accepted_age_within_window: bool = true,
+    /// false: only a configured clock and a ticket with sealed freshness
+    /// evidence can permit early data.
+    accepted_age_within_window: bool = false,
     legacy_session_id: [32]u8 = @splat(0),
     session_id_len: usize = 0,
 
@@ -1860,7 +1862,7 @@ pub const Server = struct {
         self.early_data_done = !offered_early_data;
         self.accepted_early_data_limit = 0;
         self.accepted_psk_len = 0;
-        self.accepted_age_within_window = true;
+        self.accepted_age_within_window = false;
 
         // HelloRetryRequest (RFC 8446 §4.1.4): if the client offered no key_share
         // we can use but DID advertise a group we support, ask it to retry with
@@ -2059,18 +2061,16 @@ pub const Server = struct {
     /// early_data must be refused. All arithmetic on public wire values (not
     /// secret), so ordinary branching is fine.
     ///
-    /// Returns TRUE (fresh, permit 0-RTT) for the legacy/degrade cases: a v1/v2
-    /// ticket with no sealed age_add, or a ticket with no real issue time — those
-    /// simply keep today's binder-ring-only behavior rather than failing closed on
-    /// data the ticket cannot carry.
+    /// Missing sealed freshness evidence refuses 0-RTT. Legacy tickets may
+    /// still use 1-RTT according to the separate lifetime policy.
     fn ticketAgeWithinWindow(
         self: *Server,
         opened: tls_resumption.OpenedTicket,
         obfuscated_ticket_age: u32,
         now_s: i64,
     ) bool {
-        const age_add = opened.ticket_age_add orelse return true; // legacy v1/v2
-        if (opened.issued_unix_ms == 0) return true; // no real issue time sealed
+        const age_add = opened.ticket_age_add orelse return false;
+        if (opened.issued_unix_ms == 0 or opened.ticket_lifetime == null) return false;
         // Client-reported elapsed time since it received the ticket (wraps mod 2^32).
         const reported_age_ms: u32 = obfuscated_ticket_age -% age_add;
         // Server-measured elapsed time since issuance, in ms. now_s ≥ issued (the
@@ -3290,6 +3290,7 @@ fn osEntropy(buf: []u8) Error!void {
                 filled += rc;
             }
         },
+        .openbsd => @import("random.zig").fillOsEntropy(buf) catch return error.BadState,
         else => return error.BadState,
     }
 }
@@ -5228,11 +5229,14 @@ test "loopback: TLS 1.3 PSK-DHE resumption accepts 0-RTT early data" {
         .is_ca = true,
     });
 
+    const now: i64 = 1_704_067_200;
+    var guard = tls_resumption.ReplayGuard{};
     var server = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
         .enable_session_tickets = true,
         .max_early_data_size = 4096,
+        .now_unix_seconds = now,
     });
     defer server.deinit();
     var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
@@ -5264,6 +5268,9 @@ test "loopback: TLS 1.3 PSK-DHE resumption accepts 0-RTT early data" {
         .cert_chain = &.{der},
         .signing_key = kp,
         .ticket_key = ticket_key,
+        .max_early_data_size = 4096,
+        .now_unix_seconds = now,
+        .replay_guard = &guard,
     });
     defer resumed_server.deinit();
     var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
@@ -5679,7 +5686,7 @@ test "0-RTT freshness window: exactly at the skew boundary is accepted, one ms p
     try std.testing.expect(!try runFreshnessWindowCase(alloc, t0, t0 + 5, 15_001, 10_000));
 }
 
-test "0-RTT freshness window: no server clock skips the check (back-compatible)" {
+test "0-RTT freshness window: no server clock refuses early data and completes 1-RTT" {
     const tls_client = @import("tls_client.zig");
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
@@ -5700,6 +5707,7 @@ test "0-RTT freshness window: no server clock skips the check (back-compatible)"
         .cert_chain = &.{der},
         .signing_key = kp,
         .enable_session_tickets = true,
+        .now_unix_seconds = 1_704_067_200,
         .max_early_data_size = 4096,
     });
     defer server.deinit();
@@ -5727,15 +5735,17 @@ test "0-RTT freshness window: no server clock skips the check (back-compatible)"
 
     var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
     defer resumed_client.deinit();
-    // A wildly wrong reported age; with no server clock the window is not applied.
-    try resumed_client.setSessionTicket(stored, 999_999_999);
+    // A valid ticket age cannot establish freshness without a server clock.
+    try resumed_client.setSessionTicket(stored, 0);
     try resumed_client.setEarlyData("hello");
     const rch = try resumed_client.start();
     defer alloc.free(rch);
+    var guard = tls_resumption.ReplayGuard{};
     var resume_server = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
         .ticket_key = ticket_key,
+        .replay_guard = &guard,
         .max_early_data_size = 4096,
     });
     defer resume_server.deinit();
@@ -5745,7 +5755,46 @@ test "0-RTT freshness window: no server clock skips the check (back-compatible)"
     };
     defer alloc.free(flight);
     try std.testing.expect(resume_server.acceptedSessionTicket());
-    try std.testing.expect(resume_server.earlyDataAccepted());
+    try std.testing.expect(!resume_server.earlyDataAccepted());
+    try std.testing.expect((try resume_server.takeEarlyData()) == null);
+    try std.testing.expectEqual(@as(usize, 0), guard.next);
+    const rfin = switch (try resumed_client.feed(flight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rfin);
+    try std.testing.expectEqual(@as(?bool, false), resumed_client.earlyDataAccepted());
+    _ = try resume_server.feed(rfin);
+    try std.testing.expect(resumed_client.handshakeDone());
+    try std.testing.expect(resume_server.handshakeDone());
+    const app = try resumed_client.encrypt("1-RTT fallback");
+    defer alloc.free(app);
+    const got = try resume_server.decrypt(app);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("1-RTT fallback", got);
+
+    // Restore freshness proof and retry the exact rejected bytes with the same
+    // guard: rejection must not burn the binder identity.
+    var retry_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = 4096,
+        .now_unix_seconds = 1_704_067_200,
+        .replay_guard = &guard,
+    });
+    defer retry_server.deinit();
+    const retry_flight = switch (try retry_server.feed(rch)) {
+        .bytes_to_send => |bytes| bytes,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(retry_flight);
+    try std.testing.expect(retry_server.acceptedSessionTicket());
+    try std.testing.expect(retry_server.earlyDataAccepted());
+    const retry_early = (try retry_server.takeEarlyData()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(retry_early);
+    try std.testing.expectEqualStrings("hello", retry_early);
+    try std.testing.expectEqual(@as(usize, 1), guard.next);
 }
 
 test "loopback: a replayed 0-RTT ClientHello is resumed but its early data refused" {
@@ -5768,6 +5817,7 @@ test "loopback: a replayed 0-RTT ClientHello is resumed but its early data refus
     var server = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .enable_session_tickets = true,
         .max_early_data_size = 4096,
     });
@@ -5808,6 +5858,7 @@ test "loopback: a replayed 0-RTT ClientHello is resumed but its early data refus
     var server_a = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .ticket_key = ticket_key,
         .max_early_data_size = 4096,
         .replay_guard = &guard,
@@ -5826,6 +5877,7 @@ test "loopback: a replayed 0-RTT ClientHello is resumed but its early data refus
     var server_b = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .ticket_key = ticket_key,
         .max_early_data_size = 4096,
         .replay_guard = &guard,
@@ -5867,6 +5919,7 @@ test "loopback: rejected 0-RTT early data beyond the fixed discard ceiling fails
     var server = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .enable_session_tickets = true,
         .max_early_data_size = 20_000,
     });
@@ -5914,6 +5967,7 @@ test "loopback: rejected 0-RTT early data beyond the fixed discard ceiling fails
     var server_a = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .ticket_key = ticket_key,
         .max_early_data_size = 20_000,
         .replay_guard = &guard,
@@ -5934,6 +5988,7 @@ test "loopback: rejected 0-RTT early data beyond the fixed discard ceiling fails
     var server_b = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .ticket_key = ticket_key,
         .max_early_data_size = 20_000,
         .replay_guard = &guard,
@@ -5962,6 +6017,7 @@ test "loopback: TLS 1.3 PSK-DHE resumption rejects 0-RTT when sealed ticket limi
     var server = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .enable_session_tickets = true,
         .max_early_data_size = 0,
     });
@@ -6005,7 +6061,9 @@ test "loopback: TLS 1.3 PSK-DHE resumption rejects 0-RTT when sealed ticket limi
     var resumed_server = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .ticket_key = ticket_key,
+        .max_early_data_size = 4096,
     });
     defer resumed_server.deinit();
     var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
@@ -6042,6 +6100,7 @@ fn gapK18Early(ticket_key: tls_resumption.TicketKey, der: []const u8, kp: Ed2551
     var server = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .ticket_key = ticket_key,
         .max_early_data_size = accept_limit,
         .replay_guard = &guard,
@@ -6083,6 +6142,7 @@ test "GAP-K18 turning 0-RTT off binds tickets already sealed with a limit" {
     var server = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .enable_session_tickets = true,
         .max_early_data_size = 64,
     });
@@ -6132,6 +6192,7 @@ test "GAP-K18 turning 0-RTT off binds tickets already sealed with a limit" {
     var over_server = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
+        .now_unix_seconds = 1_704_067_200,
         .ticket_key = ticket_key,
         .max_early_data_size = 16,
         .replay_guard = &over_guard,
@@ -8467,13 +8528,17 @@ test "exploit: a plaintext handshake record where an encrypted one is required i
     try std.testing.expect(!server.handshakeDone());
 }
 
-fn gapK10ExpectSecondFlightRefused(
+fn gapK10CheckEarlyAdmission(
     alloc: std.mem.Allocator,
     der: []const u8,
     kp: Ed25519.KeyPair,
     ticket_key: tls_resumption.TicketKey,
     stored: []const u8,
     early: []const u8,
+    now: ?i64,
+    expect_resumed: bool,
+    expect_first_early: bool,
+    explicit_guard: bool,
 ) !void {
     const tls_client = @import("tls_client.zig");
     var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
@@ -8483,11 +8548,14 @@ fn gapK10ExpectSecondFlightRefused(
     const flight = try client.start();
     defer alloc.free(flight);
 
+    var guard = tls_resumption.ReplayGuard{};
     var first = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
         .ticket_key = ticket_key,
         .max_early_data_size = 4096,
+        .now_unix_seconds = now,
+        .replay_guard = if (explicit_guard) &guard else null,
     });
     defer first.deinit();
     const first_out = switch (try first.feed(flight)) {
@@ -8495,14 +8563,24 @@ fn gapK10ExpectSecondFlightRefused(
         .need_more => return error.TestUnexpectedResult,
     };
     defer alloc.free(first_out);
-    try std.testing.expect(first.acceptedSessionTicket());
-    try std.testing.expect(first.earlyDataAccepted());
+    try std.testing.expectEqual(expect_resumed, first.acceptedSessionTicket());
+    try std.testing.expectEqual(expect_first_early, first.earlyDataAccepted());
+    const early_bytes = try first.takeEarlyData();
+    defer if (early_bytes) |bytes| alloc.free(bytes);
+    if (expect_first_early) {
+        try std.testing.expectEqualStrings(early, early_bytes.?);
+    } else {
+        try std.testing.expect(early_bytes == null);
+        try std.testing.expectEqual(@as(usize, 0), guard.next);
+    }
 
     var second = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,
         .ticket_key = ticket_key,
         .max_early_data_size = 4096,
+        .now_unix_seconds = now,
+        .replay_guard = if (explicit_guard) &guard else null,
     });
     defer second.deinit();
     const second_out = switch (try second.feed(flight)) {
@@ -8510,8 +8588,10 @@ fn gapK10ExpectSecondFlightRefused(
         .need_more => return error.TestUnexpectedResult,
     };
     defer alloc.free(second_out);
-    try std.testing.expect(second.acceptedSessionTicket());
+    try std.testing.expectEqual(expect_resumed, second.acceptedSessionTicket());
     try std.testing.expect(!second.earlyDataAccepted());
+    try std.testing.expect((try second.takeEarlyData()) == null);
+    if (!expect_first_early) try std.testing.expectEqual(@as(usize, 0), guard.next);
 
     const fin = switch (try client.feed(second_out)) {
         .bytes_to_send => |b| b,
@@ -8522,6 +8602,11 @@ fn gapK10ExpectSecondFlightRefused(
     try std.testing.expect(client.handshakeDone());
     _ = try second.feed(fin);
     try std.testing.expect(second.handshakeDone());
+    const app = try client.encrypt("safe fallback");
+    defer alloc.free(app);
+    const got = try second.decrypt(app);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("safe fallback", got);
 }
 
 test "GAP-K10 a second 0-RTT flight is rejected without a ReplayGuard" {
@@ -8570,12 +8655,16 @@ test "GAP-K10 a second 0-RTT flight is rejected without a ReplayGuard" {
     const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
     defer alloc.free(stored);
 
-    try gapK10ExpectSecondFlightRefused(alloc, der, kp, ticket_key, stored, "GET /early");
+    // Missing issue time refuses early data even with an explicit replay guard.
+    // Configuring a clock also rejects PSK per the sealed-lifetime policy.
+    try gapK10CheckEarlyAdmission(alloc, der, kp, ticket_key, stored, "GET /early", null, true, false, true);
+    try gapK10CheckEarlyAdmission(alloc, der, kp, ticket_key, stored, "GET /early", 1_704_067_200, false, false, true);
 
-    // Legacy ticket: no ticket_age_add. The age window stays open; the binder ring still refuses the copy.
+    // Legacy ticket: missing age_add and sealed lifetime cannot authorize 0-RTT.
+    // An explicit guard must not turn missing freshness proof into acceptance.
     const decoded = try tls_resumption.decodeStoredSession(stored);
     const nonce: [ChaCha20Poly1305.nonce_length]u8 = @splat(0x7a);
-    const v2 = try tls_resumption.sealLegacyV2(alloc, ticket_key, nonce, decoded.suite, decoded.psk, "n", 0, 4096);
+    const v2 = try tls_resumption.sealLegacyV2(alloc, ticket_key, nonce, decoded.suite, decoded.psk, "n", 1_704_067_200_000, 4096);
     defer alloc.free(v2);
     const legacy = try tls_resumption.encodeStoredSession(alloc, .{
         .suite = decoded.suite,
@@ -8586,9 +8675,10 @@ test "GAP-K10 a second 0-RTT flight is rejected without a ReplayGuard" {
         .max_early_data_size = 4096,
     });
     defer alloc.free(legacy);
-    try gapK10ExpectSecondFlightRefused(alloc, der, kp, ticket_key, legacy, "GET /legacy");
+    try gapK10CheckEarlyAdmission(alloc, der, kp, ticket_key, legacy, "GET /legacy", null, true, false, true);
+    try gapK10CheckEarlyAdmission(alloc, der, kp, ticket_key, legacy, "GET /legacy", 1_704_067_200, false, false, true);
 
-    // An unexpired ticket still completes a 1-RTT resumption.
+    // Mint a ticket carrying every required freshness field.
     const now: i64 = 1_700_000_000;
     var timed = try Server.init(alloc, .{
         .cert_chain = &.{der},
@@ -8620,6 +8710,13 @@ test "GAP-K10 a second 0-RTT flight is rejected without a ReplayGuard" {
     const timed_stored = timed_client.takeSessionTicket() orelse return error.TestUnexpectedResult;
     defer alloc.free(timed_stored);
 
+    // A valid timed ticket is accepted once by the built-in process guard,
+    // then the byte-identical replay completes safely at 1-RTT.
+    try gapK10CheckEarlyAdmission(alloc, der, kp, timed_key, timed_stored, "GET /timed", now, true, true, false);
+    // With no clock, even that valid ticket and an explicit guard refuse early data.
+    try gapK10CheckEarlyAdmission(alloc, der, kp, timed_key, timed_stored, "GET /untimed", null, true, false, true);
+
+    // An unexpired ticket still completes an ordinary 1-RTT resumption.
     var resume_server = try Server.init(alloc, .{
         .cert_chain = &.{der},
         .signing_key = kp,

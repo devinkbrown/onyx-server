@@ -1,0 +1,22 @@
+GAP-X4 portable bench
+binary=/tmp/onyx-server-openbsd-final
+work=/tmp/x4-portable
+uname=OpenBSD 7.9 amd64
+cpu=Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz
+load=0.02 0.02 0.00
+clients=4 privmsg_samples=16
+CELL sqpoll=false tls=off shards=1 register_ms=0.19 join_ms=0.08 privmsg_ms=0.06 rss_idle=3116 rss_loaded=3340 rss_per=56.0 note=kqueue one poller; ring_entries is not a queue depth; client and server TCP_NODELAY error=
+LOG   Onyx Server 0.7.0+15e09029
+LOG onyx-server: loaded config from /tmp/x4-portable/cell-s1.toml
+LOG onyx-server: listening on 127.0.0.1:33269 (kqueue) — PING + registration live
+CELL sqpoll=false tls=off shards=4 register_ms=0.16 join_ms=0.08 privmsg_ms=0.07 rss_idle=3144 rss_loaded=3340 rss_per=49.0 note=kqueue one poller; num_shards does not add a poller; ring_entries is not a queue depth; client and server TCP_NODELAY error=
+LOG   Onyx Server 0.7.0+15e09029
+LOG onyx-server: loaded config from /tmp/x4-portable/cell-s4.toml
+LOG onyx-server: listening on 127.0.0.1:17273 (kqueue) — PING + registration live
+CELL sqpoll=false tls=userspace shards=1 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=portable reactor does not serve a TLS listener
+CELL sqpoll=false tls=userspace shards=4 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=portable reactor does not serve a TLS listener
+CELL sqpoll=true tls=off shards=1 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=SQPOLL is Linux io_uring; this reactor is kqueue
+CELL sqpoll=true tls=off shards=4 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=SQPOLL is Linux io_uring; this reactor is kqueue
+CELL sqpoll=true tls=userspace shards=1 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=SQPOLL is Linux io_uring; this reactor is kqueue
+CELL sqpoll=true tls=userspace shards=4 register_ms= join_ms= privmsg_ms= rss_idle= rss_loaded= rss_per= note= error=SQPOLL is Linux io_uring; this reactor is kqueue
+GAP-X4 portable bench done

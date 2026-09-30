@@ -161,6 +161,9 @@ pub const world = @import("world.zig");
 // GAP-O4 doctor is exported outside the generated block: genroots currently
 // duplicates protected manual exports when regenerating this root.
 pub const kernel_other = @import("kernel_other.zig");
+pub const openbsd_sandbox = @import("openbsd_sandbox.zig");
+pub const os_runtime = @import("os_runtime.zig");
+pub const native_network = @import("native_network.zig");
 pub const doctor = @import("doctor.zig");
 pub const backup_set = @import("backup_set.zig");
 pub const gap_holds = @import("gap_holds.zig");
@@ -350,6 +353,9 @@ comptime {
 
 test {
     _ = kernel_other;
+    _ = openbsd_sandbox;
+    _ = os_runtime;
+    _ = native_network;
     _ = @import("io_backend.zig");
     _ = @import("foreign_kernel_exec.zig");
     _ = module_manifest;

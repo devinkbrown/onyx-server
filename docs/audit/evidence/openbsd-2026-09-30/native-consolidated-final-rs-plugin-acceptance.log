@@ -1,0 +1,6 @@
+PREPARED exact bridge.zig reply_wasm: bytes=77 sha256=6e17aa20ff3e4abbdf7404f5d0d0a22dad405a8f1dded4e0cbd0239a9bf22d26
+PREPARED native config: IRC33670 TLS33671 plugin_dir=/tmp/onyx-plugin-native/run-2121de96114c/plugins; SASL-bound REHASH group
+PIN native plugin artifact sha256=9e083f445abc3b5d97036e58a121270a914db5ecbfbdced3ee1e79a1eb38d975
+PASS confined native boot directory load: PINGME dispatch returned exact NOTICE :ok
+PASS native SASL-bound REHASH: new command replies, removed command421, original TLS socket survives
+CLEANUP owned plugin daemon/tunnel stopped; unique private directory removed

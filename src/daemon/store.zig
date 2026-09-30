@@ -41,6 +41,7 @@ pub const StoreError = error{
     TruncateFailed,
     SequenceExhausted,
     SnapshotCoverageMismatch,
+    ReadOnlyStore,
 };
 
 /// Narrow fault-injection seam for the prepared-write lane. This is kept on
@@ -208,6 +209,8 @@ pub const OroStore = struct {
     wal_path: []u8,
     snapshot_path: []u8,
     wal_file: ?std.Io.File = null,
+    staged_read_only: bool = false,
+    staged_write_file: ?std.Io.File = null,
     wal_offset: u64 = 0,
     // Headerless WALs predate epoch records. Give that format a deterministic
     // identity so snapshot coverage never serializes undefined bytes and can
@@ -244,6 +247,16 @@ pub const OroStore = struct {
         wal_path: []const u8,
         cfg: Config,
     ) !OroStore {
+        return openImpl(allocator, io, dir, wal_path, cfg, false);
+    }
+
+    /// Native Helix staging: replay existing files without creation, repair,
+    /// truncation, epoch writes or compaction. Every mutation remains refused.
+    pub fn openReadOnlyWithConfig(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, wal_path: []const u8, cfg: Config) !OroStore {
+        return openImpl(allocator, io, dir, wal_path, cfg, true);
+    }
+
+    fn openImpl(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, wal_path: []const u8, cfg: Config, read_only: bool) !OroStore {
         const owned_wal = try allocator.dupe(u8, wal_path);
         const owned_snapshot = std.mem.concat(allocator, u8, &.{ wal_path, ".snap" }) catch |err| {
             allocator.free(owned_wal);
@@ -264,12 +277,17 @@ pub const OroStore = struct {
             .maps = initMaps(allocator),
             .changefeed = changefeed,
             .cfg = cfg,
+            .staged_read_only = read_only,
         };
         errdefer store.deinit();
 
-        try store.ensureWal();
+        if (read_only) {
+            const file = try dir.openFile(io, wal_path, .{ .mode = .read_only, .allow_directory = false });
+            store.wal_file = file;
+            store.wal_offset = (try file.stat(io)).size;
+        } else try store.ensureWal();
         _ = try store.replayFile(store.snapshot_path, .snapshot, 0);
-        if (store.wal_offset == 0) try store.initializeEmptyWalAfterSnapshot();
+        if (store.wal_offset == 0 and !read_only) try store.initializeEmptyWalAfterSnapshot();
         try store.loadWalEpoch();
         const wal_start = try store.coveredWalReplayStart();
         const wal_good = try store.replayFile(store.wal_path, .wal, wal_start);
@@ -279,6 +297,7 @@ pub const OroStore = struct {
         // the tail tolerance no longer applies, and the store would refuse to
         // open at all (live impact: the SASL account store silently disabled).
         if (wal_good < store.wal_offset) {
+            if (read_only) return StoreError.BadRecord;
             const wal = store.wal_file.?;
             try wal.setLength(store.io, wal_good);
             try wal.sync(store.io);
@@ -288,8 +307,35 @@ pub const OroStore = struct {
         // Replay refuses a WAL larger than max_wal_bytes, so an uncompacted log
         // eventually bricks the store at reboot — compact at open when the WAL
         // has crossed the threshold (also bounds replay time).
-        try store.maybeCompact();
+        if (!read_only) try store.maybeCompact();
         return store;
+    }
+
+    pub fn isReadOnly(self: *const OroStore) bool {
+        return self.staged_read_only;
+    }
+
+    /// Reserve the existing WAL handle without creating/truncating/writing it.
+    /// All fallible work precedes READY; the parent is already quiesced.
+    pub fn preparePromotion(self: *OroStore) !void {
+        if (!self.staged_read_only or self.staged_write_file != null) return StoreError.ReadOnlyStore;
+        const original = self.wal_file orelse return StoreError.BadRecord;
+        const file = try self.dir.openFile(self.io, self.wal_path, .{ .mode = .read_write, .allow_directory = false });
+        errdefer file.close(self.io);
+        const before = try original.stat(self.io);
+        const after = try file.stat(self.io);
+        if (before.inode != after.inode or before.size != after.size or before.size != self.wal_offset) return StoreError.SnapshotCoverageMismatch;
+        self.staged_write_file = file;
+    }
+
+    /// Ownership changes only after authenticated COMMIT. This does no I/O,
+    /// allocation, log repair or compaction; normal mutations resume afterward.
+    pub fn promotePrepared(self: *OroStore) void {
+        std.debug.assert(self.staged_read_only and self.staged_write_file != null);
+        if (self.wal_file) |file| file.close(self.io);
+        self.wal_file = self.staged_write_file;
+        self.staged_write_file = null;
+        self.staged_read_only = false;
     }
 
     /// Returns the authoritative admission ceilings captured when this store
@@ -305,6 +351,7 @@ pub const OroStore = struct {
         self.discardActivePrepared();
         self.reclaimRetirements();
         if (self.wal_file) |file| file.close(self.io);
+        if (self.staged_write_file) |file| file.close(self.io);
         for (&self.maps) |*map| map.deinit();
         self.changefeed.deinit();
         self.allocator.free(self.wal_path);
@@ -341,6 +388,7 @@ pub const OroStore = struct {
         key: []const u8,
         value: []const u8,
     ) !PreparedPut {
+        if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
         if (self.active_prepared != null) return StoreError.PreparedMutationActive;
         if (self.next_prepared_generation == std.math.maxInt(u64)) return StoreError.SequenceExhausted;
@@ -404,6 +452,7 @@ pub const OroStore = struct {
     }
 
     pub fn put(self: *OroStore, store_family: Family, key: []const u8, value: []const u8) !void {
+        if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
         if (self.active_prepared != null) return StoreError.PreparedMutationActive;
         const sequence = try self.reserveSequence();
@@ -419,6 +468,7 @@ pub const OroStore = struct {
     }
 
     pub fn delete(self: *OroStore, store_family: Family, key: []const u8) !void {
+        if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
         if (self.active_prepared != null) return StoreError.PreparedMutationActive;
         const sequence = try self.reserveSequence();
@@ -431,6 +481,7 @@ pub const OroStore = struct {
 
     /// Writes current state to a snapshot and truncates the WAL.
     pub fn snapshotAndTruncate(self: *OroStore) !void {
+        if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
         if (self.active_prepared != null) return StoreError.PreparedMutationActive;
         try self.ensureWal();
@@ -544,6 +595,7 @@ pub const OroStore = struct {
     }
 
     fn ensureWal(self: *OroStore) !void {
+        if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.wal_file) |_| return;
         const file = try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false });
         self.wal_file = file;
@@ -2459,4 +2511,58 @@ test "STORE prepared replacement retires all four slots without publication allo
     try std.testing.expectEqual(@as(usize, 0), store.retirement_count);
     next.abort();
     prepared.deinit();
+}
+
+test "native Helix read-only store stages without disk mutations and promotes only after commit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var parent = try openTestStore(tmp, "native-stage.wal");
+    defer parent.deinit();
+    try parent.put(.accounts, "alice", "original");
+    const before = try readWalForTest(tmp, "native-stage.wal");
+    defer allocator.free(before);
+    // Force the normal boot compaction threshold below the existing size.
+    var staged = try OroStore.openReadOnlyWithConfig(allocator, io, tmp.dir, "native-stage.wal", .{ .max_wal_bytes = before.len + 1 });
+    defer staged.deinit();
+    try std.testing.expect(staged.isReadOnly());
+    try std.testing.expectEqualStrings("original", staged.get(.accounts, "alice").?);
+    try std.testing.expectError(StoreError.ReadOnlyStore, staged.put(.accounts, "alice", "changed"));
+    try std.testing.expectError(StoreError.ReadOnlyStore, staged.delete(.accounts, "alice"));
+    try std.testing.expectError(StoreError.ReadOnlyStore, staged.preparePut(.accounts, "alice", "prepared"));
+    try std.testing.expectError(StoreError.ReadOnlyStore, staged.snapshotAndTruncate());
+    try staged.preparePromotion();
+    try std.testing.expect(staged.isReadOnly());
+    const still = try readWalForTest(tmp, "native-stage.wal");
+    defer allocator.free(still);
+    try std.testing.expectEqualSlices(u8, before, still);
+    staged.promotePrepared();
+    try std.testing.expect(!staged.isReadOnly());
+    try staged.put(.accounts, "alice", "committed");
+    var reopened = try openTestStore(tmp, "native-stage.wal");
+    defer reopened.deinit();
+    try std.testing.expectEqualStrings("committed", reopened.get(.accounts, "alice").?);
+}
+
+test "native Helix read-only store refuses torn WAL without repair and detects parent changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    var parent = try openTestStore(tmp, "native-torn.wal");
+    defer parent.deinit();
+    try parent.put(.accounts, "alice", "first");
+    var staged = try OroStore.openReadOnlyWithConfig(allocator, std.testing.io, tmp.dir, "native-torn.wal", .{});
+    defer staged.deinit();
+    try parent.put(.accounts, "bob", "later");
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, staged.preparePromotion());
+    const wal = parent.wal_file.?;
+    try wal.writePositionalAll(std.testing.io, "torn", parent.wal_offset);
+    const before = try readWalForTest(tmp, "native-torn.wal");
+    defer allocator.free(before);
+    try std.testing.expectError(StoreError.BadRecord, OroStore.openReadOnlyWithConfig(allocator, std.testing.io, tmp.dir, "native-torn.wal", .{}));
+    const after = try readWalForTest(tmp, "native-torn.wal");
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectError(error.FileNotFound, OroStore.openReadOnlyWithConfig(allocator, std.testing.io, tmp.dir, "absent.wal", .{}));
 }

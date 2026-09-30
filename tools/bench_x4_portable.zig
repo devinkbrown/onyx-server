@@ -3,10 +3,12 @@
 
 //! GAP-X4 measurement for a portable onyx-server. Same client recipe as
 //! tools/bench_live.py: 4 clients, numeric 001, numeric 366, 16 PRIVMSG
-//! samples, RSS from `ps`. SQPOLL and TLS are reported as unmeasured cells.
+//! samples, RSS from `ps` or OpenBSD KERN_PROC. SQPOLL and TLS are reported
+//! as unmeasured cells.
 //! This reactor has no io_uring SQPOLL and no TLS listener.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const clients_n: usize = 4;
 const samples_n: usize = 16;
@@ -49,7 +51,9 @@ fn run(init: std.process.Init) !void {
     std.debug.print("GAP-X4 portable bench\n", .{});
     std.debug.print("binary={s}\n", .{bin});
     std.debug.print("work={s}\n", .{dir});
-    _ = try shellTo(init, "uname -srm > \"$1\" 2>&1", &.{dir ++ "/uname.txt"});
+    // OpenBSD's installer ramdisk has sysctl and no uname. FreeBSD has uname,
+    // so the first command still produces the FreeBSD provenance line.
+    _ = try shellTo(init, "uname -srm > \"$1\" 2>/dev/null || sysctl -n kern.ostype kern.osrelease hw.machine > \"$1\" 2>&1", &.{dir ++ "/uname.txt"});
     _ = try shellTo(init, "sysctl -n hw.model > \"$1\" 2>&1", &.{dir ++ "/cpu.txt"});
     _ = try shellTo(init, "sysctl -n vm.loadavg > \"$1\" 2>&1", &.{dir ++ "/load.txt"});
     try catFile("uname", dir ++ "/uname.txt");
@@ -57,6 +61,7 @@ fn run(init: std.process.Init) !void {
     try catFile("load", dir ++ "/load.txt");
     std.debug.print("clients={d} privmsg_samples={d}\n", .{ clients_n, samples_n });
 
+    var failed = false;
     for (cells) |cell| {
         if (cell.sqpoll) {
             emitSkip(cell, "SQPOLL is Linux io_uring; this reactor is kqueue");
@@ -67,9 +72,11 @@ fn run(init: std.process.Init) !void {
             continue;
         }
         measure(init, bin, dir, cell) catch |err| {
+            failed = true;
             std.debug.print("CELL sqpoll=false tls=off shards={d} error={s}\n", .{ cell.shards, @errorName(err) });
         };
     }
+    if (failed) return error.MeasurementFailed;
     std.debug.print("GAP-X4 portable bench done\n", .{});
 }
 
@@ -92,9 +99,8 @@ fn measure(init: std.process.Init, bin: []const u8, dir: []const u8, cell: Cell)
     const check_log = try std.fmt.bufPrintSentinel(&check_buf, "{s}/check.log", .{dir}, 0);
     const check_rc = try shellTo(init, "exec \"$1\" --check-config \"$2\" > \"$3\" 2>&1", &.{ bin, conf, check_log });
     if (check_rc != 0) {
-        std.debug.print("CELL sqpoll=false tls=off shards={d} error=check-config:{d}\n", .{ cell.shards, check_rc });
         try printAllow(check_log);
-        return;
+        return error.CheckConfigFailed;
     }
 
     const child = try std.process.spawn(init.io, .{
@@ -116,9 +122,7 @@ fn measure(init: std.process.Init, bin: []const u8, dir: []const u8, cell: Cell)
     errdefer printAllow(log) catch {};
 
     if (!try waitListen(irc, pid, &reaped)) {
-        std.debug.print("CELL sqpoll=false tls=off shards={d} error=listen-timeout\n", .{cell.shards});
-        try printAllow(log);
-        return;
+        return error.ListenTimeout;
     }
     const idle = try rssOf(init, dir, pid);
     var reg_ns: [clients_n]i128 = undefined;
@@ -306,9 +310,115 @@ fn rssOf(init: std.process.Init, dir: []const u8, pid: std.c.pid_t) !u64 {
     defer _ = std.c.close(fd);
     var buf: [64]u8 = undefined;
     const n = std.c.read(fd, &buf, buf.len);
-    if (n <= 0) return error.RssFailed;
-    const text = std.mem.trim(u8, buf[0..@intCast(n)], " \t\r\n");
-    return std.fmt.parseInt(u64, text, 10) catch return error.RssFailed;
+    if (n > 0) {
+        const text = std.mem.trim(u8, buf[0..@intCast(n)], " \t\r\n");
+        if (std.fmt.parseInt(u64, text, 10)) |parsed| return parsed else |_| {}
+    }
+    if (comptime builtin.os.tag == .openbsd) return rssOpenbsd(pid);
+    return error.RssFailed;
+}
+
+/// OpenBSD 7.x `struct kinfo_proc` through `p_vm_rssize`. New fields are only
+/// appended, and a mismatched `p_pid` is a failed cell rather than a number.
+const KinfoProc = extern struct {
+    p_forw: u64,
+    p_back: u64,
+    p_paddr: u64,
+    p_addr: u64,
+    p_fd: u64,
+    p_stats: u64,
+    p_limit: u64,
+    p_vmspace: u64,
+    p_sigacts: u64,
+    p_sess: u64,
+    p_tsess: u64,
+    p_ru: u64,
+    p_eflag: i32,
+    p_exitsig: i32,
+    p_flag: i32,
+    p_pid: i32,
+    p_ppid: i32,
+    p_sid: i32,
+    p_pgid: i32,
+    p_tpgid: i32,
+    p_uid: u32,
+    p_ruid: u32,
+    p_gid: u32,
+    p_rgid: u32,
+    p_groups: [16]u32,
+    p_ngroups: i16,
+    p_jobc: i16,
+    p_tdev: u32,
+    p_estcpu: u32,
+    p_rtime_sec: u32,
+    p_rtime_usec: u32,
+    p_cpticks: i32,
+    p_pctcpu: u32,
+    p_swtime: u32,
+    p_slptime: u32,
+    p_schedflags: i32,
+    p_uticks: u64,
+    p_sticks: u64,
+    p_iticks: u64,
+    p_tracep: u64,
+    p_traceflag: i32,
+    p_holdcnt: i32,
+    p_siglist: i32,
+    p_sigmask: u32,
+    p_sigignore: u32,
+    p_sigcatch: u32,
+    p_stat: i8,
+    p_priority: u8,
+    p_usrpri: u8,
+    p_nice: u8,
+    p_xstat: u16,
+    p_spare: u16,
+    p_comm: [24]u8,
+    p_wmesg: [8]u8,
+    p_wchan: u64,
+    p_login: [32]u8,
+    p_vm_rssize: i32,
+};
+
+fn rssOpenbsd(pid: std.c.pid_t) !u64 {
+    // CTL_KERN, KERN_PROC, KERN_PROC_PID, pid, element size, element count.
+    // OpenBSD sysctl_doproc accepts a prefix size, but requires all six MIB
+    // components even for a size query. Request exactly one process prefix.
+    // ABI: https://github.com/openbsd/src/blob/master/sys/sys/sysctl.h
+    // Contract: https://github.com/openbsd/src/blob/master/sys/kern/kern_sysctl.c
+    const mib = [_]c_int{ 1, 66, 1, @intCast(pid), @sizeOf(KinfoProc), 1 };
+    var info: KinfoProc = std.mem.zeroes(KinfoProc);
+    var got: usize = @sizeOf(KinfoProc);
+    if (std.c.sysctl(&mib, @intCast(mib.len), &info, &got, null, 0) != 0) {
+        std.debug.print("RSS data errno={d} got={d}\n", .{ @intFromEnum(std.c.errno(-1)), got });
+        return error.RssFailed;
+    }
+    if (got != @sizeOf(KinfoProc)) {
+        std.debug.print("RSS short got={d}\n", .{got});
+        return error.RssFailed;
+    }
+    if (info.p_pid != pid or info.p_vm_rssize <= 0) {
+        std.debug.print("RSS pid={d} want={d} pages={d} got={d}\n", .{ info.p_pid, pid, info.p_vm_rssize, got });
+        return error.RssFailed;
+    }
+    var page: i32 = 0;
+    var plen: usize = @sizeOf(i32);
+    const pmib = [_]c_int{ 6, 7 };
+    if (std.c.sysctl(&pmib, @intCast(pmib.len), &page, &plen, null, 0) != 0 or plen != @sizeOf(i32) or page < 1024) {
+        std.debug.print("RSS page errno={d} page={d}\n", .{ @intFromEnum(std.c.errno(-1)), page });
+        return error.RssFailed;
+    }
+    const pages: u64 = @intCast(info.p_vm_rssize);
+    const psz: u64 = @intCast(page);
+    return pages * psz / 1024;
+}
+
+test "OpenBSD RSS query returns the current process resident pages" {
+    if (comptime builtin.os.tag != .openbsd) return error.SkipZigTest;
+    // Exercise the ABI directly even on a full installation where `ps` makes
+    // rssOf's fallback unnecessary. The pid and returned prefix are validated
+    // by rssOpenbsd before this assertion.
+    try std.testing.expect(try rssOpenbsd(std.c.getpid()) > 0);
 }
 
 fn shellTo(init: std.process.Init, script: [:0]const u8, args: []const []const u8) !u8 {

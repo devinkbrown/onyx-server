@@ -58,11 +58,17 @@ fn tsToMillis(sec: i64, nsec: i64) i64 {
 /// Wall-clock (Unix epoch) time in milliseconds. Use for timestamps a client
 /// sees (server-time tags, TIME, signon, ban set-at); NOT for intervals.
 pub fn realtimeMillis() i64 {
+    return realtimeMillisChecked() orelse 0;
+}
+
+/// Checked Unix time for credential issuance and validation. A failed clock
+/// read must not publish undefined timestamps or authenticate expired tokens.
+pub fn realtimeMillisChecked() ?i64 {
     switch (os_tag) {
         .linux => {
             var ts: std.os.linux.timespec = undefined;
-            _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
-            return tsToMillis(@intCast(ts.sec), @intCast(ts.nsec));
+            if (std.os.linux.errno(std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts)) != .SUCCESS) return null;
+            return checkedUnixMillis(@intCast(ts.sec), @intCast(ts.nsec));
         },
         .windows => {
             // Windows FILETIME epoch is 1601; convert 100ns ticks to Unix ms.
@@ -70,14 +76,30 @@ pub fn realtimeMillis() i64 {
             GetSystemTimeAsFileTime(&ft);
             const ticks: u64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
             const unix_100ns: i128 = @as(i128, ticks) - 116_444_736_000_000_000;
-            return @intCast(@divTrunc(unix_100ns, 10_000));
+            const millis = @divTrunc(unix_100ns, 10_000);
+            if (millis < 0 or millis > std.math.maxInt(i64)) return null;
+            return @intCast(millis);
         },
         else => {
             var ts: std.c.timespec = undefined;
-            _ = std.c.clock_gettime(std.posix.CLOCK.REALTIME, &ts);
-            return tsToMillis(@intCast(ts.sec), @intCast(ts.nsec));
+            if (std.c.clock_gettime(std.posix.CLOCK.REALTIME, &ts) != 0) return null;
+            return checkedUnixMillis(@intCast(ts.sec), @intCast(ts.nsec));
         },
     }
+}
+
+fn checkedUnixMillis(sec: i64, nsec: i64) ?i64 {
+    if (sec < 0 or nsec < 0 or nsec >= 1_000_000_000) return null;
+    const seconds_ms = std.math.mul(i64, sec, 1000) catch return null;
+    return std.math.add(i64, seconds_ms, @divTrunc(nsec, 1_000_000)) catch null;
+}
+
+test "credential clock rejects malformed and overflowing Unix timestamps" {
+    try std.testing.expectEqual(@as(?i64, 123456), checkedUnixMillis(123, 456_999_999));
+    try std.testing.expect(checkedUnixMillis(-1, 0) == null);
+    try std.testing.expect(checkedUnixMillis(1, -1) == null);
+    try std.testing.expect(checkedUnixMillis(1, 1_000_000_000) == null);
+    try std.testing.expect(checkedUnixMillis(std.math.maxInt(i64), 0) == null);
 }
 
 /// Process id, used for fork/snapshot detection in the RNG layer. Returns the

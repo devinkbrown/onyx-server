@@ -128,7 +128,9 @@ pub const ServicesSessionTokenLookup = struct {
 
     fn verify(ptr: *anyopaque, creds: mechrouter.SessionTokenCredentials, account_out: []u8) ?[]const u8 {
         const self: *ServicesSessionTokenLookup = @ptrCast(@alignCast(ptr));
-        return self.services.validateSessionToken(creds.authcid, creds.token, @divTrunc(platform.realtimeMillis(), 1000), account_out);
+        const now_ms = platform.realtimeMillisChecked() orelse return null;
+        if (now_ms <= 0) return null;
+        return self.services.validateSessionToken(creds.authcid, creds.token, @divTrunc(now_ms, 1000), account_out);
     }
 };
 

@@ -437,7 +437,26 @@ test "GAP-X3 FreeBSD kernel TLS executes on this kernel" {
 
 test "GAP-X3 OpenBSD pledge executes on this kernel" {
     if (comptime builtin.os.tag != .openbsd) return error.SkipZigTest;
-    try executeOpenBsdPledge();
+    // Pledge/unveil is irreversible. Only the child may confine itself; a
+    // second fork proves the shared test runner retained its proc capability.
+    for (0..2) |attempt| {
+        const child = std.c.fork();
+        try std.testing.expect(child >= 0);
+        if (child == 0) {
+            if (attempt == 0) executeOpenBsdPledge() catch |err| {
+                std.debug.print("OpenBSD pledge child failed: {s}\n", .{@errorName(err)});
+                std.c._exit(101);
+            };
+            std.c._exit(0);
+        }
+        var status: c_int = 0;
+        while (std.c.waitpid(child, &status, 0) < 0) {
+            if (errnoNow() != @intFromEnum(std.c.E.INTR)) return error.TestUnexpectedResult;
+        }
+        const bits: u32 = @bitCast(status);
+        try std.testing.expect(std.c.W.IFEXITED(bits));
+        try std.testing.expectEqual(@as(u8, 0), std.c.W.EXITSTATUS(bits));
+    }
 }
 
 test "GAP-X1 Windows IOCP and RIO executes on this kernel" {

@@ -1,0 +1,225 @@
+1/218 root.test_0...OK
+2/218 crypto.root.test_0...OK
+3/218 daemon.root.test_0...OK
+4/218 proto.root.test_0...OK
+5/218 substrate.root.test_0...OK
+6/218 wasm.host.root.test_0...OK
+7/218 substrate.io.root.test_0...OK
+8/218 substrate.ripple_props.test_0...OK
+9/218 substrate.ripple.test_0...OK
+10/218 substrate.undertow.root.test_0...OK
+11/218 substrate.undertow.peer_link.test_0...OK
+12/218 substrate.io.buf_ring.test_0...OK
+13/218 substrate.io.ring.test_0...OK
+14/218 proto.asn1_time.test_0...OK
+15/218 proto.certfp.test_0...OK
+16/218 proto.cloak.test_0...OK
+17/218 proto.dtls12_messages.test.ClientHello round-trips and advertises the target cipher + srtp profile...OK
+18/218 proto.dtls12_messages.test.ClientHello with empty cookie parses...OK
+19/218 proto.dtls12_messages.test.version negotiation seam honours supported_versions and support_13...OK
+20/218 proto.dtls12_messages.test.ServerHello round-trips the chosen cipher and profile...OK
+21/218 proto.dtls12_messages.test.Certificate round-trips the leaf DER...OK
+22/218 proto.dtls12_messages.test.ServerKeyExchange round-trips point and signature...OK
+23/218 proto.dtls12_messages.test.CertificateRequest round-trips ecdsa_sign + secp256r1 sig alg...OK
+24/218 proto.dtls12_messages.test.CertificateVerify round-trips scheme and signature; rejects trailing garbage...OK
+25/218 proto.dtls12_messages.test.ClientKeyExchange round-trips the point...OK
+26/218 proto.dtls12_messages.test.parsers reject truncated input...OK
+27/218 proto.dtls12_messages.test.deriveKeyBlock is deterministic and input-sensitive...OK
+28/218 proto.dtls12_record.test.record header encode/decode round-trips and locates the fragment...OK
+29/218 proto.dtls12_record.test.record header seqNum combines epoch and seq...OK
+30/218 proto.dtls12_record.test.record decode rejects a truncated fragment...OK
+31/218 proto.dtls12_record.test.record decode rejects a runt header...OK
+32/218 proto.dtls12_record.test.GCM seal/open round-trips...OK
+33/218 proto.dtls12_record.test.GCM open rejects a tampered fragment...OK
+34/218 proto.dtls12_record.test.GCM open rejects a wrong-seq AAD...OK
+35/218 proto.dtls12_record.test.GCM open rejects a runt fragment...OK
+36/218 proto.dtls12_server.test.fingerprint is deterministic for a fixed cert and well-formed...OK
+37/218 proto.dtls12_server.test.HelloVerifyRequest cookie round-trip: bare ClientHello elicits a cookie, wrong cookie re-elicits, no session kept...OK
+38/218 proto.dtls12_server.test.malformed DTLS records are dropped without a trap and never allocate a session...OK
+39/218 proto.dtls12_server.test.full DTLS-SRTP loopback handshake: both sides derive identical SRTP keys...OK
+40/218 proto.dtls12_server.test.RFC 8122: an established session with no bound fingerprint exports keys (byte-identical default)...OK
+41/218 proto.dtls12_server.test.RFC 8122: a matching peer fingerprint verifies and unlocks the SRTP keys...OK
+42/218 proto.dtls12_server.test.RFC 8122: a mismatched peer fingerprint stays fail-closed (no keys, no profile)...OK
+43/218 proto.dtls12_server.test.mutual auth: a matching client cert completes the handshake and unlocks SRTP keys...OK
+44/218 proto.dtls12_server.test.mutual auth: a client cert whose fingerprint mismatches yields NO keys (fail closed)...OK
+45/218 proto.dtls12_server.test.mutual auth: a client that omits its Certificate is rejected (no completion, no keys)...OK
+46/218 proto.dtls12_server.test.mutual auth: a tampered CertificateVerify signature is rejected (no completion, no keys)...OK
+47/218 proto.dtls12_server.test.mutual auth off (server-auth only) is byte-identical to the pre-#64 flight 4...OK
+48/218 proto.dtls12_server.test.retransmitted second ClientHello resends the cached flight 4 verbatim...OK
+49/218 proto.dtls_srtp.test.TLS 1.2 P_SHA256 matches the well-known PRF test vector...OK
+50/218 proto.ircx_modex.test_0...OK
+51/218 proto.ircx_saccess.test_0...OK
+52/218 proto.listx.test_0...OK
+53/218 proto.mooring.test_0...OK
+54/218 proto.mooring_props.test_0...OK
+55/218 proto.quic_handshake.test_0...OK
+56/218 proto.quic_transport_params.test_0...OK
+57/218 proto.sasl_external_verify.test_0...OK
+58/218 proto.sasl_mechrouter.test_0...OK
+59/218 proto.sasl_oauthbearer.test_0...OK
+60/218 proto.sasl.test_0...OK
+61/218 proto.sasl_scram512_server.test_0...OK
+62/218 proto.sasl_scram.test_0...OK
+63/218 proto.sasl_scram_server.test_0...OK
+64/218 proto.signed_delta.test_0...OK
+65/218 proto.tls12_extensions.test.ec_point_formats round-trips multiple format octets in order...OK
+66/218 proto.tls12_extensions.test.ec_point_formats known vector for uncompressed only...OK
+67/218 proto.tls12_extensions.test.supportsUncompressed accepts only well-formed blocks containing format zero...OK
+68/218 proto.tls12_extensions.test.ec_point_formats rejects empty list, truncation, trailing data, and oversize build...OK
+69/218 proto.tls12_extensions.test.renegotiation_info initial handshake known vector parses as empty verify bytes...OK
+70/218 proto.tls12_extensions.test.renegotiation_info round-trips verify bytes...OK
+71/218 proto.tls12_extensions.test.renegotiation_info builds the empty initial-handshake vector...OK
+72/218 proto.tls12_extensions.test.renegotiation_info rejects truncation, trailing data, oversize, and short output...OK
+73/218 proto.tls12_extensions.test.SessionTicket round-trips an opaque ticket body...OK
+74/218 proto.tls12_extensions.test.SessionTicket encodes and parses the empty signalling body...OK
+75/218 proto.tls12_extensions.test.SessionTicket build reports NoSpaceLeft when the output is too small...OK
+76/218 proto.tls12_handshake.test.parseClientHello aliases vectors and iterates suites and extensions...OK
+77/218 proto.tls12_handshake.test.encodeServerHello round trips through parser and extension iterator...OK
+78/218 proto.tls12_handshake.test.encodeCertificate writes known body bytes and parser iterates entries...OK
+79/218 proto.tls12_handshake.test.server hello done and finished encode known message bodies...OK
+80/218 proto.tls12_handshake.test.new_session_ticket round-trips lifetime and opaque ticket...OK
+81/218 proto.tls12_handshake.test.new_session_ticket parser rejects truncation and trailing bytes...OK
+82/218 proto.tls12_handshake.test.wrapHandshake and parseHandshakeHeader round trip known vector...OK
+83/218 proto.tls12_handshake.test.parsers reject truncation, trailing bytes, and malformed vector lengths...OK
+84/218 proto.tls12_handshake.test.encoders report NoSpaceLeft and oversize inputs...OK
+85/218 proto.tls12_key_exchange.test.ServerKeyExchange encode -> parse round-trip...OK
+86/218 proto.tls12_key_exchange.test.ClientKeyExchange encode -> parse round-trip...OK
+87/218 proto.tls12_key_exchange.test.signedParams layout has client_random first then server_random...OK
+88/218 proto.tls12_key_exchange.test.truncated ServerKeyExchange yields error.Truncated...OK
+89/218 proto.tls12_key_exchange.test.truncated ClientKeyExchange yields error.Truncated...OK
+90/218 proto.tls12_key_exchange.test.non-named curve_type is rejected...OK
+91/218 proto.tls12_key_exchange.test.builders report NoSpaceLeft when buffer is too small...OK
+92/218 proto.tls12_prf.test.prfSha256 fills the requested output length exactly...OK
+93/218 proto.tls12_prf.test.P_SHA256 A() iteration matches a raw-HMAC re-derivation...OK
+94/218 proto.tls12_prf.test.prfSha384 single-block output equals one raw HMAC-SHA384 block...OK
+95/218 proto.tls12_prf.test.masterSecret produces 48 bytes and is deterministic...OK
+96/218 proto.tls12_prf.test.masterSecret equals direct PRF("master secret", cr||sr)...OK
+97/218 proto.tls12_prf.test.keyBlock fills an arbitrary length and uses server||client seed order...OK
+98/218 proto.tls12_prf.test.verifyData is deterministic and differs for client vs server label...OK
+99/218 proto.tls12_record.test.AES-GCM round-trip recovers plaintext for both key sizes...OK
+100/218 proto.tls12_record.test.AES-128-GCM explicit-nonce framing is correct...OK
+101/218 proto.tls12_record.test.AES-128-GCM tampered tag yields AuthFailed...OK
+102/218 proto.tls12_record.test.AES-128-GCM sequence-number mismatch yields AuthFailed...OK
+103/218 proto.tls12_record.test.ChaCha20-Poly1305 round-trip with no explicit nonce on the wire...OK
+104/218 proto.tls12_record.test.ChaCha20-Poly1305 content-type mismatch yields AuthFailed...OK
+105/218 proto.tls12_record.test.nonce derivation: AES-GCM is salt||explicit and ChaCha is IV xor seq...OK
+106/218 proto.tls_supported_versions.test.client list round-trips [tls13, tls12] in order...OK
+107/218 proto.toml.test_0...OK
+108/218 proto.x509.test_0...OK
+109/218 daemon.modules.manifest.test_0...OK
+110/218 daemon.key_transparency.test_0...OK
+111/218 daemon.acme_cli.test_0...OK
+112/218 daemon.acme_http01_listener.test_0...OK
+113/218 daemon.acme_renewal.test_0...OK
+114/218 daemon.acme_runner.test_0...OK
+115/218 daemon.config_format.test_0...OK
+116/218 daemon.helix.root.test_0...OK
+117/218 daemon.media_plane.test.DTLS-SRTP GAP-V1 hold-off: dtls13 off still answers a DTLS 1.2 ClientHello...GAP-V1 branch=hold-off dtls13=off caveat=kept dtls12=HelloVerifyRequest
+OK
+118/218 daemon.metrics_http.test_0...OK
+119/218 daemon.webhook.test_0...OK
+120/218 daemon.webhook_render.test_0...OK
+121/218 daemon.webhook_http.test_0...OK
+122/218 daemon.oauth_jwt.test_0...OK
+123/218 daemon.ocsp_staple.test_0...OK
+124/218 daemon.reactor_pool.test_0...OK
+125/218 daemon.sasl_bridge.test_0...OK
+126/218 daemon.scram_store.test_0...OK
+127/218 daemon.server.test_0...OK
+128/218 daemon.sessions.test_0...OK
+129/218 daemon.tls_certs.test_0...OK
+130/218 daemon.tls_conn.test.resumeFrom rejects a TLS 1.2 engine state when no 1.2 config is supplied...OK
+131/218 daemon.tls_conn.test.version-dispatch: a TLS 1.2 client completes through a dual TlsConn...OK
+132/218 daemon.tls_conn.test.version-dispatch: failed TLS 1.2 init leaves engine undecided...OK
+133/218 daemon.tls_conn.test.TLS 1.2 session ticket resumes across dual TlsConn instances (RFC 5077)...OK
+134/218 daemon.tls_conn.test_0...OK
+135/218 daemon.tls_sni_load.test_0...OK
+136/218 crypto.tls_server.test_0...OK
+137/218 crypto.tls_record.test_0...OK
+138/218 crypto.hkdf_tls13.test_0...OK
+139/218 crypto.hash.test_0...OK
+140/218 crypto.tls12_server.test.GAP-K13 an application record after the last sequence fails closed...GAP-K13 branch=an application record after the last sequence fails closed
+OK
+141/218 crypto.tls12_server.test.TLS 1.2 server fragments a flight larger than 16 KiB across multiple records (F6, large cert chain)...OK
+142/218 crypto.tls12_server.test.TLS 1.2 ServerHello.random carries the RFC 8446 downgrade sentinel...OK
+143/218 crypto.tls12_server.test.TLS 1.2 CertificateRequest wire format (mTLS)...OK
+144/218 crypto.tls12_server.test.TLS 1.2 clientKeyFromCert parses RSA and ECDSA P-256 leaves...OK
+145/218 crypto.tls12_server.test.TLS 1.2 mTLS: ECDSA P-256 client cert completes and exposes leaf + CertFP...OK
+146/218 crypto.tls12_server.test.TLS 1.2 mTLS: RSA client cert completes and exposes leaf + CertFP...OK
+147/218 crypto.tls12_server.test.TLS 1.2 mTLS: client may decline (empty Certificate) and still connect...OK
+148/218 crypto.tls12_server.test.TLS 1.2 mTLS: tampered client CertificateVerify is rejected, no certfp exposed...OK
+149/218 crypto.tls12_server.test.TLS 1.2 loopback ECDHE ECDSA AES-128-GCM...OK
+150/218 crypto.tls12_server.test.TLS 1.2 loopback ECDHE ECDSA AES-256-GCM-SHA384...OK
+151/218 crypto.tls12_server.test.TLS 1.2 loopback: record_size_limit negotiated + fragments outbound records (RFC 8449)...OK
+152/218 crypto.tls12_server.test.TLS 1.2 server rejects an out-of-range record_size_limit (RFC 8449)...OK
+153/218 crypto.tls12_server.test.TLS 1.2 exportResume/resumeConnected carries a live session across Server instances...OK
+154/218 crypto.tls12_server.test.TLS 1.2 loopback ECDHE ECDSA ChaCha20-Poly1305...OK
+155/218 crypto.tls12_server.test.TLS 1.2 loopback ECDHE RSA AES-128-GCM...OK
+156/218 crypto.tls12_server.test.TLS 1.2 tampered encrypted Finished is rejected...OK
+157/218 crypto.tls12_server.test.TLS 1.2 full handshake with tickets enabled issues a NewSessionTicket...OK
+158/218 crypto.tls12_server.test.TLS 1.2 presenting a ticket performs the abbreviated handshake and exchanges app data...OK
+159/218 crypto.tls12_server.test.TLS 1.2 takeAlert emits a PLAINTEXT fatal alert before the server ChangeCipherSpec...OK
+160/218 crypto.tls12_server.test.TLS 1.2 takeAlert seals an ENCRYPTED fatal alert after the resumed server ChangeCipherSpec...OK
+161/218 crypto.tls12_server.test.TLS 1.2 tampered ticket falls back to a full handshake and still connects...OK
+162/218 crypto.tls12_server.test.TLS 1.2 expired ticket falls back to a full handshake...OK
+163/218 crypto.tls12_server.test.TLS 1.2 ticket resumption is refused when the server has no clock (now_unix_seconds == 0)...OK
+164/218 crypto.tls12_server.test.TLS 1.2 replayed ticket falls back to a full handshake (replay guard refuses fast path)...OK
+165/218 crypto.tls12_server.test.TLS 1.2 tickets disabled issues no ticket and leaves the transcript unchanged...OK
+166/218 crypto.tls12_server.test.tls12 EMS: default loopback negotiates extended master secret on the wire...OK
+167/218 crypto.tls12_server.test.tls12 EMS required: a legacy ClientHello without the extension is rejected, alert = handshake_failure...OK
+168/218 crypto.tls12_server.test.tls12 EMS optional: with the requirement loosened a non-EMS client completes via classic derivation...OK
+169/218 crypto.tls12_server.test.tls12 weak cipher suites offered alone are rejected (no RSA-kx / CBC / 3DES / RC4 / NULL)...OK
+170/218 crypto.tls12_server.test.tls12 FALLBACK_SCSV in a 1.2 ClientHello aborts with inappropriate_fallback (RFC 7507)...OK
+171/218 crypto.tls12_server.test.tls12 renegotiation_info: a non-empty renegotiated_connection in the initial ClientHello is rejected...OK
+172/218 crypto.tls12_server.test.tls12 compression: a ClientHello without null compression is rejected (CRIME closed)...OK
+173/218 crypto.tls12_server.test.tls12 malformed handshake bytes yield typed errors, never a crash...OK
+174/218 crypto.tls12_server.test.tls12 EMS ticket binding: non-EMS sessions get no ticket and a non-EMS resume falls back to a full handshake...OK
+175/218 crypto.tls12.test.completeRecord accepts the legacy ClientHello record version...OK
+176/218 crypto.tls12.test.TLS 1.2 SHA-256 PRF RFC vector...OK
+177/218 crypto.tls12.test.tls12 EMS derivation matches an independent P_hash implementation (RFC 7627 KAT)...OK
+178/218 crypto.tls12.test.TLS 1.2 AEAD record round trips GCM and ChaCha...OK
+179/218 crypto.tls12_client.test.tls12 client downgrade sentinel (RFC 8446 4.1.3): inert for a 1.2-only client, aborts when a higher version was offered...OK
+180/218 crypto.tls12_client.test.tls12 EMS required: client aborts when the ServerHello does not echo the extension...OK
+181/218 crypto.tls12_client.test.tls12 client fails closed on hostile ServerHello extensions...OK
+182/218 crypto.tls12_client.test.TLS 1.2 client rejects an out-of-range server record_size_limit (RFC 8449)...OK
+183/218 crypto.tls12_client.test.TLS 1.2 client anchors an RSA PKCS#1 SHA-256 self-signed chain (regression)...OK
+184/218 crypto.tls12_client.test.TLS 1.2 client anchors an RSA PKCS#1 SHA-384 self-signed chain (new: sha384WithRSA)...OK
+185/218 crypto.tls12_client.test.TLS 1.2 client anchors an RSASSA-PSS self-signed chain (new: params threaded through)...OK
+186/218 crypto.tls12_client.test.TLS 1.2 client anchors an ECDSA P-256 SHA-256 self-signed chain (regression)...OK
+187/218 crypto.tls12_client.test.TLS 1.2 client anchors an Ed25519 self-signed chain (new)...OK
+188/218 crypto.tls12_client.test.TLS 1.2 client rejects a self-signed chain whose signature byte was flipped (isolates the sig check)...OK
+189/218 crypto.tls12_client.test.TLS 1.2 client rejects a name-constrained CA's cross-domain leaf (F1)...OK
+190/218 crypto.tls12_client.test.TLS 1.2 client rejects a pathLen:0 CA with a spliced intermediate (F1)...OK
+191/218 crypto.tls12_client.test.GAP-K11 a trust anchor's name constraints and path length bind a chain that omits it...GAP-K11 branch=a trust anchor's name constraints and path length bind a chain that omits it
+OK
+192/218 crypto.tls12_client.test.GAP-K12 a leaf keyUsage without digitalSignature is rejected before CertificateVerify...GAP-K12 branch=a leaf keyUsage without digitalSignature is rejected before CertificateVerify
+OK
+193/218 crypto.tls12_client.test.GAP-K15 an IP literal matches an iPAddress SAN only...GAP-K15 branch=an IP literal matches an iPAddress SAN only
+OK
+194/218 crypto.tls12_client.test.TLS 1.2 client reassembles a Certificate message split across two TLS records (F5)...OK
+195/218 crypto.tls12_client.test.TLS 1.2 client rejects a handshake message whose reassembled size exceeds the cap (F5, fail-closed)...OK
+196/218 crypto.tls12_client.test.exploit: TLS 1.2 ClientHello offers OCSP status_request...OK
+197/218 crypto.tls12_client.test.exploit: TLS 1.2 require_crl fails closed on an unusable CRL...OK
+198/218 crypto.tls12_client.test.exploit: TLS 1.2 CertificateStatus for the wrong serial fails closed...OK
+199/218 crypto.tls12_client.test.exploit: TLS 1.2 CertificateStatus body must be status_type=ocsp...OK
+200/218 crypto.random.test_0...OK
+201/218 crypto.sign.test_0...OK
+202/218 crypto.kx.test_0...OK
+203/218 crypto.xwing.test_0...OK
+204/218 crypto.sct.test_0...OK
+205/218 crypto.tls_client.test_0...OK
+206/218 daemon.helix.tls_snapshot.test.tls12 snapshot round-trips key material and seqs...OK
+207/218 crypto.aead.test_0...OK
+208/218 crypto.ecdsa_kat.test_0...OK
+209/218 crypto.ed25519_batch.test_0...OK
+210/218 crypto.sign_kat.test_0...OK
+211/218 crypto.tls_fuzz.test.cov-fuzz: tls12 handshake parsers never trap on arbitrary bytes...OK
+212/218 crypto.tls_props.test.fuzzed TLS 1.2 record seal and open params keep AAD and nonce sequences aligned...OK
+213/218 crypto.tls_props.test.tampered TLS 1.2 records fail closed...OK
+214/218 crypto.tls_props.test_0...OK
+215/218 crypto.tls.test.policy allows only hardened TLS 1.2 ECDHE AEAD suites...OK
+216/218 crypto.tls.test.record cipher state derives TLS 1.2 and 1.3 nonces without network IO...OK
+217/218 crypto.tls.test.TLS 1.2 record params keep AAD and nonce sequence aligned across round trips...OK
+218/218 crypto.tls.test_0...OK
+All 218 tests passed.
+1 fuzz tests found.

@@ -65,7 +65,11 @@ pub const MarkReadArgs = struct {
 };
 
 pub const ForwardDecision = struct {
+    /// Borrows the caller's account with its original spelling.
     original_account: []const u8,
+    /// With zero hops, borrows original_account unchanged. Otherwise borrows
+    /// the normalized store target until its forwarding entry is changed or
+    /// removed, or the store is deinitialized. Resolving never allocates.
     delivery_account: []const u8,
     forwarded: bool,
     hops: usize,
@@ -197,9 +201,7 @@ pub fn MemoForwardStoreWith(comptime params: Params) type {
             try validateAccountWith(params, account);
             var original_buf: [params.max_account_bytes]u8 = undefined;
             const original = lowerAccountWith(params, account, &original_buf);
-            var current_buf: [params.max_account_bytes]u8 = undefined;
-            @memcpy(current_buf[0..original.len], original);
-            var current = current_buf[0..original.len];
+            var current = original;
             var seen: [params.max_forward_hops + 1][]const u8 = undefined;
             seen[0] = current;
 
@@ -216,7 +218,7 @@ pub fn MemoForwardStoreWith(comptime params: Params) type {
 
             return .{
                 .original_account = account,
-                .delivery_account = current,
+                .delivery_account = if (hops == 0) account else current,
                 .forwarded = hops != 0,
                 .hops = hops,
             };
@@ -520,7 +522,40 @@ test "resolve delivery reports unforwarded account" {
     try testing.expect(!decision.forwarded);
     try testing.expectEqual(@as(usize, 0), decision.hops);
     try testing.expectEqualStrings("Alice", decision.original_account);
-    try testing.expectEqualStrings("alice", decision.delivery_account);
+    try testing.expectEqualStrings("Alice", decision.delivery_account);
+    try testing.expectEqual(decision.original_account.ptr, decision.delivery_account.ptr);
+}
+
+test "resolve delivery borrows caller storage across repeated resolutions" {
+    var store = MemoForwardStore.init(testing.allocator);
+    defer store.deinit();
+
+    var account = [_]u8{ 'A', 'l', 'i', 'c', 'e' };
+    const first = try store.resolveDelivery(&account);
+    try testing.expectEqual(account[0..].ptr, first.delivery_account.ptr);
+    const second = try store.resolveDelivery("A_DIFFERENT_ACCOUNT");
+    try testing.expectEqualStrings("A_DIFFERENT_ACCOUNT", second.delivery_account);
+    try testing.expectEqualStrings("Alice", first.delivery_account);
+    account[0] = 'a';
+    try testing.expectEqualStrings("alice", first.delivery_account);
+}
+
+test "resolve delivery allocates neither direct nor forwarded decisions" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var store = MemoForwardStore.init(failing.allocator());
+    defer store.deinit();
+
+    try store.setForward("Alice", "Bob");
+    try store.setForward("Bob", "Carol");
+    const allocations = failing.alloc_index;
+    failing.fail_index = allocations;
+    const direct = try store.resolveDelivery("Direct");
+    const forwarded = try store.resolveDelivery("ALICE");
+    try testing.expectEqualStrings("Direct", direct.delivery_account);
+    try testing.expectEqualStrings("carol", forwarded.delivery_account);
+    try testing.expectEqual(@as(usize, 2), forwarded.hops);
+    try testing.expectEqual(allocations, failing.alloc_index);
+    try testing.expect(!failing.has_induced_failure);
 }
 
 test "forward cycles and self-forward are rejected" {

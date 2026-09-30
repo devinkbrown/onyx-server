@@ -1,0 +1,88 @@
+secured live establishment replaces an expired deterministic collision winner
+client active gauge follows physical slot ownership through close and refusal
+session replica replay preflights SendQ before AEAD advance and resumes at eight frames
+session replica gates establishment and RESYNC membership behind every retained authority page
+v2 Store hot-adoption is SQ-inert until authority-first link activation
+hot-adopt secured link tears down cleanly when RESYNC exceeds the carried SendQ
+portability-enabled hot-adopt rejects a rolling-old peer before roster release
+UPGRADE restored property checkpoint bursts after preserved-link activation
+GAP-D2 kill-restart and same-image USR2 deliver the memo and fire MEMO_PUSH
+GAP-D3 same-image USR2 keeps the gag and the granted vhost
+GAP-D4 same-image USR2 keeps shun spamtrap Koshi reputation and the account score
+GAP-D5 same-image USR2 invalidates recovery tokens and keeps SCRAM and CertFP
+GAP-D1 same-image USR2 restores channel and DM msgids
+UPGRADE mandatory state round trip is exact and deterministic
+UPGRADE seal + adopt carries the cross-mesh oper-grant registry (grants, tombstones, incarnation)
+UPGRADE arena without an oper-grant checkpoint (pre-checkpoint predecessor) adopts with an empty registry
+UPGRADE legacy v3 session mints stable AID and nonempty ADS1 follows it across two hops
+DST GAP-A2 one accepted id survives partition and USR2 without a duplicate or a legacy twin
+UPGRADE rejects torn MESSAGE_V2 authority checkpoints before publication
+UPGRADE mandatory state rejects missing duplicate and late corruption without publication
+UPGRADE current mandatory handoff requires MHLC PRPC SRST and PMST
+MESSAGE_V2 Helix activation is staged exact and monotonic across current handoff
+DST GAP-A4 event history reloads across USR2 and a signed id is not duplicated
+DST GAP-P2 channel slowmode gap survives USR2 with oper and voice exemptions
+UPGRADE exact client adoption failure is startup fatal and restores displaced World
+UPGRADE successor adopts one canonical TLS ticket-key authority atomically
+UPGRADE successor rejects missing duplicate corrupt and late-failing TLS ticket authority without publication
+UPGRADE successor rejects noncanonical TLS ticket wrapper and disabled authority
+UPGRADE logged-in client without exact session token is incomplete
+UPGRADE oversized MONITOR sidecar makes registered client incomplete
+UPGRADE registered client seals one exact empty MONITOR and SILENCE sidecar
+UPGRADE established secured mesh snapshot failure marks complete seal fatal
+UPGRADE services cannot start before inherited state is consumed
+UPGRADE completed secured mesh recv seals and resumes one continuous record stream
+UPGRADE timer deferral still dispatches later recv CQE in copied batch
+UPGRADE quiesce applies completed unreaped recv before safe point
+UPGRADE send completion and exact cancel retain the unsent suffix
+UPGRADE quiet recv exact cancel rearms on failure resume
+UPGRADE final fixed point carries post-barrier marker on all four shards
+multi-shard UPGRADE adopt re-pins carried clients across shards and serves both
+webhook queued before refused UPGRADE drains once and retained listener accepts once after resume
+DPROP1 hot activation without PRPC restores authority and is observationally silent
+DPROP1 hot carried conflict is purge-first authority-wins and final edge allocates nothing
+DPROP1 hot unrelated future PRPC clock is fatal and leaves causal triplet exact
+E2EEGROUP Helix carries receipt metadata and ACK_CONFIRM retires pending exact after adopt
+E2EEGROUP Helix corrupt mandatory checkpoint leaves live authority byte exact
+reusable attachment SendQ pressure retains tagged event without poisoning
+tiny ring fairly activates more than 64 quiet inherited sockets with pending output
+send error waits for quiet recv CQE and stale generation cannot free reuse
+secured accept using final SQ slot retains partial I/O ownership
+configured boot dial resolves and recognizes inherited outbound survivor
+UPGRADE refuses an incompatible target before listener or client CLOEXEC mutation
+failed inherited client adoption does not advance HLC or queue carried output
+current Helix adoption rederives only configured-local operator authority
+current Helix adoption resumes a fragmented binary WebSocket message
+failed inherited TLS plus WebSocket adoption frees carried SendQ overflow
+threaded server: four-client reusable session survives sequential Helix upgrades across secured mesh
+threaded server: reusable session stays exact-once across a three-node secured line
+threaded server: UPGRADE resume arena re-attaches a live TLS client
+UPGRADE resume arena restores the mesh event clock high-water mark
+UPGRADE resume atomically restores exact property rows clocks and tombstones
+UPGRADE property checkpoint selection fails closed without tearing the live triplet
+UPGRADE property checkpoint rejects malformed required outer capsule shapes
+UPGRADE resume arena restores the multi-session registry (re-track + snapshot)
+DPROP1 UPGRADE late malformed sessions failure preserves causal triplet and MeshClock
+UPGRADE session registry ghosts cannot collide with a live successor client id
+UPGRADE resume arena re-stages carried .pending_migration capsules
+UPGRADE arena read failure closes exact carried fd manifest but preserves listeners
+UPGRADE authoritative manifest rejects an arena fd aliased to a listener
+UPGRADE authoritative manifest accepts only open connected stream sockets
+UPGRADE authoritative state fd manifest requires an exact capsule bijection before restore
+UPGRADE duplicate owner capsules are rejected before fd or io_uring adoption
+UPGRADE exact Store and PMST singletons reject malformed outer shapes
+UPGRADE rejects SESSION_REPLICA Store from pre-manifest v1 predecessor
+UPGRADE late corrupt Store leaves valid property and all live sentinels unpublished
+UPGRADE late corrupt PMST leaves valid property Store and all live sentinels unpublished
+threaded server: UPGRADE resume arena re-dials a carried mesh peer
+GAP-O11 outbound webhooks sign retries and refuse loopback
+GAP-O12 scoped expiring bot grants survive USR2 and are not an oper bit
+GAP-O12 missing bot-grant checkpoint still adopts
+GAP-O12 malformed bot-grant checkpoint rejects the handoff
+GAP-P1 threads keep a stable id, a bounded reply list, and the reply tag across USR2
+GAP-P1 missing thread checkpoint still adopts
+GAP-P1 malformed thread checkpoint rejects the handoff
+GAP-P3 reactor 0 fires a deferred channel message and oper mode once
+GAP-P3 missing schedule checkpoint still adopts
+GAP-P3 malformed schedule checkpoint rejects the handoff
+GAP-P12 a loopback history read matches CHATHISTORY visibility

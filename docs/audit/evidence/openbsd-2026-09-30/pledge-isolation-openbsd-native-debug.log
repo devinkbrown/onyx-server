@@ -1,0 +1,82 @@
+b160827810d351062aba6b6f9109f9374c9257d9c468d8d3362256a158a1f095
+1/75 root.test_0...OK
+2/75 crypto.root.test_0...OK
+3/75 daemon.root.test_0...OK
+4/75 proto.root.test_0...OK
+5/75 substrate.root.test_0...OK
+6/75 wasm.host.root.test_0...OK
+7/75 substrate.io.root.test_0...OK
+8/75 substrate.ripple_props.test_0...OK
+9/75 substrate.ripple.test_0...OK
+10/75 substrate.undertow.root.test_0...OK
+11/75 substrate.undertow.peer_link.test_0...OK
+12/75 substrate.io.buf_ring.test_0...OK
+13/75 substrate.io.ring.test_0...OK
+14/75 proto.asn1_time.test_0...OK
+15/75 proto.certfp.test_0...OK
+16/75 proto.cloak.test_0...OK
+17/75 proto.ircx_modex.test_0...OK
+18/75 proto.ircx_saccess.test_0...OK
+19/75 proto.listx.test_0...OK
+20/75 proto.mooring.test_0...OK
+21/75 proto.mooring_props.test_0...OK
+22/75 proto.quic_handshake.test_0...OK
+23/75 proto.quic_transport_params.test_0...OK
+24/75 proto.sasl_external_verify.test_0...OK
+25/75 proto.sasl_mechrouter.test_0...OK
+26/75 proto.sasl_oauthbearer.test_0...OK
+27/75 proto.sasl.test_0...OK
+28/75 proto.sasl_scram512_server.test_0...OK
+29/75 proto.sasl_scram.test_0...OK
+30/75 proto.sasl_scram_server.test_0...OK
+31/75 proto.signed_delta.test_0...OK
+32/75 proto.toml.test_0...OK
+33/75 proto.x509.test_0...OK
+34/75 daemon.kernel_other.test.GAP-X3 FreeBSD Capsicum and SO_REUSEPORT_LB, OpenBSD pledge, and a Windows job fail closed...OK
+35/75 daemon.os_runtime.test.native runtime descriptors retain CLOEXEC and reject retired handles...OK
+36/75 daemon.io_backend.test.BSD kqueue: interrupted wait preserves armed buffer and original completion...OK
+37/75 daemon.foreign_kernel_exec.test.GAP-X3 OpenBSD pledge executes on this kernel...GAP-X3 openbsd path /etc present=true
+GAP-X3 openbsd path /usr present=true
+GAP-X3 openbsd path /var present=true
+GAP-X3 openbsd path /tmp present=true
+GAP-X3 openbsd pledge result=ok errno=0
+OK
+38/75 daemon.modules.manifest.test_0...OK
+39/75 daemon.key_transparency.test_0...OK
+40/75 daemon.acme_cli.test_0...OK
+41/75 daemon.acme_http01_listener.test_0...OK
+42/75 daemon.acme_renewal.test_0...OK
+43/75 daemon.acme_runner.test_0...OK
+44/75 daemon.config_format.test_0...OK
+45/75 daemon.helix.root.test_0...OK
+46/75 daemon.metrics_http.test_0...OK
+47/75 daemon.webhook.test_0...OK
+48/75 daemon.webhook_render.test_0...OK
+49/75 daemon.webhook_http.test_0...OK
+50/75 daemon.oauth_jwt.test_0...OK
+51/75 daemon.ocsp_staple.test_0...OK
+52/75 daemon.reactor_pool.test_0...OK
+53/75 daemon.sasl_bridge.test_0...OK
+54/75 daemon.scram_store.test_0...OK
+55/75 daemon.server.test_0...OK
+56/75 daemon.sessions.test_0...OK
+57/75 daemon.tls_certs.test_0...OK
+58/75 daemon.tls_conn.test_0...OK
+59/75 daemon.tls_sni_load.test_0...OK
+60/75 crypto.tls_server.test_0...OK
+61/75 crypto.tls_record.test_0...OK
+62/75 crypto.hkdf_tls13.test_0...OK
+63/75 crypto.hash.test_0...OK
+64/75 crypto.random.test_0...OK
+65/75 crypto.kx.test_0...OK
+66/75 crypto.sign.test_0...OK
+67/75 crypto.xwing.test_0...OK
+68/75 crypto.sct.test_0...OK
+69/75 crypto.tls_client.test_0...OK
+70/75 crypto.aead.test_0...OK
+71/75 crypto.ecdsa_kat.test_0...OK
+72/75 crypto.ed25519_batch.test_0...OK
+73/75 crypto.sign_kat.test_0...OK
+74/75 crypto.tls_props.test_0...OK
+75/75 crypto.tls.test_0...OK
+All 75 tests passed.

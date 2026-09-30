@@ -12,7 +12,7 @@
 //! not perturb the client/S2S event loop.
 const std = @import("std");
 const builtin = @import("builtin");
-const linux = std.os.linux;
+const sys = std.posix.system;
 const posix = std.posix;
 const ice = @import("../proto/ice.zig");
 const media_transport = @import("media_transport.zig");
@@ -33,29 +33,29 @@ fn nativeToBigU32(v: u32) u32 {
 pub const Error = error{ SocketUnavailable, BindFailed, AddrLookupFailed };
 
 pub const MediaSocket = struct {
-    fd: linux.fd_t,
+    fd: sys.fd_t,
+    recv_timeout_ms: u32 = 250,
 
     /// Create and bind a UDP socket. `bind_addr_be` is an IPv4 address already in
     /// network byte order (use `loopback_be` / `any_be`); `port` 0 = ephemeral.
     pub fn bind(bind_addr_be: u32, port: u16) Error!MediaSocket {
-        // Linux-only: uses `SOCK_CLOEXEC` and the linux socket ABI. Gate the body
-        // at comptime so foreign-target test builds compile (this UDP media socket
-        // only ever runs on the Linux daemon). On Linux it is byte-identical.
-        if (comptime builtin.os.tag == .linux) {
-            const rc = linux.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+        // Use each target's native socket ABI. Linux retains its blocking UDP
+        // path; OpenBSD uses nonblocking reads after finite readiness polls.
+        if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
+            const rc = sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | (if (builtin.os.tag == .linux) @as(u32, 0) else posix.SOCK.NONBLOCK), posix.IPPROTO.UDP);
             if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
-            const fd: linux.fd_t = @intCast(rc);
-            errdefer _ = linux.close(fd);
+            const fd: sys.fd_t = @intCast(rc);
+            errdefer _ = sys.close(fd);
 
-            var addr = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = bind_addr_be };
-            if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+            var addr = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = bind_addr_be };
+            if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))) != .SUCCESS)
                 return error.BindFailed;
             return .{ .fd = fd };
         } else return error.SocketUnavailable;
     }
 
     pub fn deinit(self: *MediaSocket) void {
-        _ = linux.close(self.fd);
+        _ = sys.close(self.fd);
         self.* = undefined;
     }
 
@@ -63,38 +63,48 @@ pub const MediaSocket = struct {
     pub fn localPort(self: *const MediaSocket) Error!u16 {
         var storage: posix.sockaddr.storage = undefined;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-        if (posix.errno(linux.getsockname(self.fd, @ptrCast(&storage), &len)) != .SUCCESS)
+        if (posix.errno(sys.getsockname(self.fd, @ptrCast(&storage), &len)) != .SUCCESS)
             return error.AddrLookupFailed;
-        const a: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
+        const a: *const sys.sockaddr.in = @ptrCast(@alignCast(&storage));
         return std.mem.bigToNative(u16, a.port);
     }
 
     /// Bound a blocking recv with a timeout so the pump loop can re-check a stop
     /// flag (and tests never hang).
     pub fn setRecvTimeoutMs(self: *MediaSocket, ms: u32) void {
-        const tv = linux.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
-        _ = linux.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        if (comptime builtin.os.tag != .linux) {
+            self.recv_timeout_ms = @max(ms, 1);
+            return;
+        }
+        const tv = sys.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
+        _ = sys.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
     }
 
     /// Send `bytes` to an IPv4 destination. Non-IPv4 addresses are dropped.
     pub fn sendTo(self: *MediaSocket, dest: TransportAddress, bytes: []const u8) void {
         if (dest.ip_len != 4) return;
-        var sa = linux.sockaddr.in{
+        var sa = sys.sockaddr.in{
             .port = std.mem.nativeToBig(u16, dest.port),
             .addr = @bitCast(dest.ip[0..4].*),
         };
-        _ = linux.sendto(self.fd, bytes.ptr, bytes.len, 0, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
+        _ = sys.sendto(self.fd, bytes.ptr, bytes.len, 0, @ptrCast(&sa), @sizeOf(sys.sockaddr.in));
     }
 
     pub const Received = struct { data: []u8, from: TransportAddress };
 
     /// Receive one datagram into `buf`. Returns null on timeout/error/non-IPv4.
     pub fn recvFrom(self: *MediaSocket, buf: []u8) ?Received {
-        var sa: linux.sockaddr.in = undefined;
-        var slen: posix.socklen_t = @sizeOf(linux.sockaddr.in);
-        const rc = linux.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&sa), &slen);
+        if (comptime builtin.os.tag != .linux) {
+            var pfd = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
+            const ready = sys.poll(&pfd, 1, @intCast(@min(self.recv_timeout_ms, std.math.maxInt(c_int))));
+            if (ready <= 0 or pfd[0].revents & posix.POLL.IN == 0) return null;
+        }
+        var sa: sys.sockaddr.in = undefined;
+        var slen: posix.socklen_t = @sizeOf(sys.sockaddr.in);
+        const rc = sys.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&sa), &slen);
         if (posix.errno(rc) != .SUCCESS) return null;
         const n: usize = @intCast(rc);
+        if (slen != @sizeOf(sys.sockaddr.in) or sa.family != posix.AF.INET or n > buf.len) return null;
         const ip4: [4]u8 = @bitCast(sa.addr);
         const from = TransportAddress.fromBytes(&ip4, std.mem.bigToNative(u16, sa.port)) catch return null;
         return .{ .data = buf[0..n], .from = from };

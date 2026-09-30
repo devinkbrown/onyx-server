@@ -890,6 +890,8 @@ pub const ReplyCode = Numeric;
 
 const ringlane = @import("ringlane.zig");
 const io_backend = @import("io_backend.zig");
+const reactor_backend = @import("reactor_backend.zig");
+const os_runtime = @import("os_runtime.zig");
 const sendq = @import("sendq.zig");
 const search_cmd = @import("search_cmd.zig");
 const media_cmd = @import("media_cmd.zig");
@@ -923,8 +925,48 @@ const PendingMeshSearch = struct {
 fn ringTokenEql(a: RingFdToken, b: RingFdToken) bool {
     return a.slot == b.slot and a.gen == b.gen;
 }
-const RingCore = ringlane.Ring;
+const RingCore = reactor_backend.Ring;
 const RingFeatureSet = ringlane.RingFeatures;
+
+pub const ListenerKind = enum(u8) { plain, s2s, tls, ws };
+pub const ListenerFamily = enum(u8) { ipv4 = 4, ipv6 = 6 };
+/// Native Helix must transfer every listening socket, keyed by owner and role.
+/// A wildcard OpenBSD endpoint has two rows with the same port and distinct
+/// families; a numeric fd list alone cannot reconstruct its accept ownership.
+pub const ListenerDescriptor = struct {
+    shard: u12,
+    kind: ListenerKind,
+    family: ListenerFamily,
+    fd: linux.fd_t,
+};
+
+/// Borrowed only for the duration of transferAndCommit, while every socket
+/// owner is quiescent and World remains locked at the authoritative seal.
+pub const NativeUpgradeSnapshot = struct {
+    pieces: []const helix_live.StatePiece,
+    state_fds: []const linux.fd_t,
+    listeners: []const ListenerDescriptor,
+    epoch: u64,
+    now_ms: i64,
+};
+
+pub const NativeUpgradeHooks = struct {
+    ctx: *anyopaque,
+    /// Execute the inert successor and authenticate its actual capabilities
+    /// before the server freezes any service/socket owner.
+    begin: *const fn (*anyopaque, []const u8) anyerror!void,
+    /// Error returns are pre-COMMIT only. Success exits the predecessor without
+    /// shutdown/deinit of sockets shared with the committed successor.
+    transferAndCommit: *const fn (*anyopaque, NativeUpgradeSnapshot) anyerror!noreturn,
+    abort: *const fn (*anyopaque) void,
+};
+
+pub const NativeAdoptBarrier = struct {
+    ctx: *anyopaque,
+    /// Any returned error is strictly pre-COMMIT. After authenticated COMMIT,
+    /// return success or terminate; the serving predecessor cannot roll back.
+    readyAndAwaitCommit: *const fn (*anyopaque) anyerror!void,
+};
 
 const listener_token: RingFdToken = .{ .slot = 0, .gen = 0 };
 /// Distinct accept token for the S2S listener so handleAccept can tell the two
@@ -968,6 +1010,10 @@ const wake_token: RingFdToken = .{ .slot = 4, .gen = 0 };
 /// Distinct accept token for the secure-WebSocket (wss) browser listener, so
 /// handleAccept can tell it apart from the plaintext/S2S/TLS listeners.
 const ws_listener_token: RingFdToken = .{ .slot = 5, .gen = 0 };
+const listener_companion_token: RingFdToken = .{ .slot = 6, .gen = 0 };
+const s2s_listener_companion_token: RingFdToken = .{ .slot = 7, .gen = 0 };
+const tls_listener_companion_token: RingFdToken = .{ .slot = 8, .gen = 0 };
+const ws_listener_companion_token: RingFdToken = .{ .slot = 9, .gen = 0 };
 
 /// Set by the SIGUSR2 handler; polled by reactor 0's housekeeping tick to fire a
 /// connection-preserving Helix UPGRADE out of signal context. A process-global
@@ -991,7 +1037,7 @@ fn onUpgradeSignal(_: posix.SIG) callconv(.c) void {
 /// EINTR-storming the reactors' blocking syscalls — the upgrade is observed on
 /// the next ≤2s housekeeping tick, which is ample for a deploy.
 pub fn installUpgradeSignalHandler() void {
-    if (comptime builtin.os.tag != .linux) return;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return;
     const act = posix.Sigaction{
         .handler = .{ .handler = onUpgradeSignal },
         .mask = posix.sigemptyset(),
@@ -1005,7 +1051,7 @@ pub fn installUpgradeSignalHandler() void {
 /// process. Called from Server.init so both the daemon and test binaries are
 /// covered.
 fn ignoreSigpipe() void {
-    if (comptime builtin.os.tag != .linux) return;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return;
     const act = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = posix.sigemptyset(),
@@ -1715,6 +1761,18 @@ pub const Config = struct {
     /// Entries past the successor's shard count are closed at init; shards past
     /// the list bind fresh SO_REUSEPORT listeners. Linux only.
     inherited_listener_fds: []const linux.fd_t = &.{},
+    /// OpenBSD wildcard listeners have a shard-ordered IPv6 companion to each
+    /// IPv4 plaintext listener. An inherited wildcard pair requires both fds;
+    /// replacing the companion would discard its queued accepts at Helix.
+    inherited_listener_companion_fds: []const linux.fd_t = &.{},
+    /// Exact authenticated native listener authority. A successor must carry
+    /// every enabled role/family/shard; no missing row is replaced by a bind.
+    native_listener_manifest: []const ListenerDescriptor = &.{},
+    native_upgrade_hooks: ?NativeUpgradeHooks = null,
+    /// Authenticated decrypted arena, borrowed from the native process owner.
+    /// It stays in memory and never passes through Linux memfd readArena.
+    native_arena_bytes: ?[]const u8 = null,
+    native_adopt_barrier: ?NativeAdoptBarrier = null,
     /// Inherited Helix state-arena memfd (UPGRADE handoff); `adoptInheritedSessions`
     /// reads it after init and before serving to re-attach clients. null = none.
     resume_arena_fd: ?linux.fd_t = null,
@@ -2331,6 +2389,9 @@ pub const ConnState = struct {
     /// RECV completion clears this latch.
     recv_armed: bool = false,
     send_armed: bool = false,
+    /// Declared in-memory fixture sink; no descriptor or kernel ownership.
+    /// The field and arm bypass are absent from daemon builds.
+    test_sendq_capture: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// Exact-cancel SQEs already queued for the corresponding ownership latch.
     /// The matching original RECV/SEND CQE clears both the latch and this bit.
     recv_cancel_pending: bool = false,
@@ -3051,6 +3112,12 @@ const Reactor = struct {
     tls_listener_fd: linux.fd_t = -1,
     /// Secure-WebSocket (wss) browser listener (-1 = disabled) + accept flag.
     ws_listener_fd: linux.fd_t = -1,
+    /// OpenBSD wildcard endpoints own separate IPv4 and IPv6 listening sockets.
+    /// Primary fields above remain unchanged for Linux and literal-address BSD.
+    listener_companion_fd: linux.fd_t = -1,
+    s2s_listener_companion_fd: linux.fd_t = -1,
+    tls_listener_companion_fd: linux.fd_t = -1,
+    ws_listener_companion_fd: linux.fd_t = -1,
 
     accept_armed: bool = false,
     s2s_accept_armed: bool = false,
@@ -3060,6 +3127,14 @@ const Reactor = struct {
     s2s_accept_cancel_pending: bool = false,
     tls_accept_cancel_pending: bool = false,
     ws_accept_cancel_pending: bool = false,
+    companion_accept_armed: bool = false,
+    s2s_companion_accept_armed: bool = false,
+    tls_companion_accept_armed: bool = false,
+    ws_companion_accept_armed: bool = false,
+    companion_accept_cancel_pending: bool = false,
+    s2s_companion_accept_cancel_pending: bool = false,
+    tls_companion_accept_cancel_pending: bool = false,
+    ws_companion_accept_cancel_pending: bool = false,
     /// Whether the periodic timeout-sweep timer is currently in flight.
     timer_armed: bool = false,
     timer_spec: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
@@ -3091,6 +3166,38 @@ const Reactor = struct {
     /// synchronization needed: it is reactor-local, like `clients`/`send_buf`.
     wake_batch: WakeBatch = .{},
 
+    const AcceptOp = struct {
+        fd: linux.fd_t,
+        token: RingFdToken,
+        kind: ListenerKind,
+        armed: *bool,
+        pending: *bool,
+    };
+
+    fn acceptOps(self: *Reactor) [8]AcceptOp {
+        return .{
+            .{ .fd = self.listener_fd, .token = listener_token, .kind = .plain, .armed = &self.accept_armed, .pending = &self.accept_cancel_pending },
+            .{ .fd = self.s2s_listener_fd, .token = s2s_listener_token, .kind = .s2s, .armed = &self.s2s_accept_armed, .pending = &self.s2s_accept_cancel_pending },
+            .{ .fd = self.tls_listener_fd, .token = tls_listener_token, .kind = .tls, .armed = &self.tls_accept_armed, .pending = &self.tls_accept_cancel_pending },
+            .{ .fd = self.ws_listener_fd, .token = ws_listener_token, .kind = .ws, .armed = &self.ws_accept_armed, .pending = &self.ws_accept_cancel_pending },
+            .{ .fd = self.listener_companion_fd, .token = listener_companion_token, .kind = .plain, .armed = &self.companion_accept_armed, .pending = &self.companion_accept_cancel_pending },
+            .{ .fd = self.s2s_listener_companion_fd, .token = s2s_listener_companion_token, .kind = .s2s, .armed = &self.s2s_companion_accept_armed, .pending = &self.s2s_companion_accept_cancel_pending },
+            .{ .fd = self.tls_listener_companion_fd, .token = tls_listener_companion_token, .kind = .tls, .armed = &self.tls_companion_accept_armed, .pending = &self.tls_companion_accept_cancel_pending },
+            .{ .fd = self.ws_listener_companion_fd, .token = ws_listener_companion_token, .kind = .ws, .armed = &self.ws_companion_accept_armed, .pending = &self.ws_companion_accept_cancel_pending },
+        };
+    }
+
+    fn acceptsQuiesced(self: *Reactor) bool {
+        for (self.acceptOps()) |op| if (op.armed.* or op.pending.*) return false;
+        return true;
+    }
+
+    fn ownsListenerFd(self: *Reactor, fd: linux.fd_t) bool {
+        if (fd < 0) return false;
+        for (self.acceptOps()) |op| if (fd == op.fd) return true;
+        return false;
+    }
+
     /// Tear down the reactor's ring, connection table, wake fd, and listeners.
     /// The caller drains per-connection link/tls/multiline state first.
     fn deinit(self: *Reactor) void {
@@ -3104,6 +3211,10 @@ const Reactor = struct {
         if (self.s2s_listener_fd >= 0) closeFd(self.s2s_listener_fd);
         if (self.tls_listener_fd >= 0) closeFd(self.tls_listener_fd);
         if (self.ws_listener_fd >= 0) closeFd(self.ws_listener_fd);
+        if (self.listener_companion_fd >= 0) closeFd(self.listener_companion_fd);
+        if (self.s2s_listener_companion_fd >= 0) closeFd(self.s2s_listener_companion_fd);
+        if (self.tls_listener_companion_fd >= 0) closeFd(self.tls_listener_companion_fd);
+        if (self.ws_listener_companion_fd >= 0) closeFd(self.ws_listener_companion_fd);
     }
 };
 
@@ -3456,9 +3567,27 @@ const flight_recorder_max_file_bytes: usize = 96 * 1024;
 /// stored). `init` returns the server by value, so the pointer is not stable there.
 var flight_panic_server: std.atomic.Value(usize) = .init(0);
 
+fn sleepOneMillis() void {
+    if (builtin.os.tag == .openbsd) {
+        os_runtime.sleepMillis(1);
+        return;
+    }
+    var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+    _ = linux.nanosleep(&req, null);
+}
+
 fn writeAllLinux(fd: linux.fd_t, bytes: []const u8) bool {
     var off: usize = 0;
     while (off < bytes.len) {
+        if (comptime builtin.os.tag == .openbsd) {
+            const written = os_runtime.write(fd, bytes[off..]) catch |err| switch (err) {
+                error.Interrupted => continue,
+                else => return false,
+            };
+            if (written == 0) return false;
+            off += written;
+            continue;
+        }
         const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
         switch (linux.errno(rc)) {
             .SUCCESS => {
@@ -3986,6 +4115,9 @@ pub const LinuxServer = struct {
     reactor: ?reactor_mod.Reactor = null,
     /// Run flag from runThreaded, so DIE/RESTART can stop the reactor.
     shutdown: ?*std.atomic.Value(bool) = null,
+    /// First terminal reactor outcome, published before the shared stop flag.
+    /// 0 = clean stop, 1 = poisoned backend, 2 = persistent reactor failure.
+    runtime_failure: std.atomic.Value(u8) = .init(0),
     accepts: accept_list.AcceptList(.{}),
     msg_seq: u64 = 0,
     /// Cross-mesh Hybrid Logical Clock. Its physical base is WALL-CLOCK time so
@@ -4014,6 +4146,9 @@ pub const LinuxServer = struct {
     /// When set under the test build, `runOnce` fails before the ring so
     /// `runLoopResilient` can reach its real give-up return.
     reactor_fail_for_test: bool = false,
+    /// Atomic so a test can poison one already-running shard without touching
+    /// owner-thread I/O state. Never read outside a test artifact.
+    reactor_poison_shard_for_test: std.atomic.Value(u16) = .init(std.math.maxInt(u16)),
     /// Observability: allocation-free runtime counters (totals + gauges), bumped
     /// inline on the hot path and rendered on demand (STATS z / Prometheus).
     stats: server_stats.Stats = .{},
@@ -4444,6 +4579,7 @@ pub const LinuxServer = struct {
         // older) predecessor carries just shard 0's fd. Shards past the carried
         // list — and fresh boots — create their own.
         const inherited: ?linux.fd_t = blk: {
+            if (nativeManifestListener(config, shard_id, .plain, false)) |fd| break :blk fd;
             if (shard_id < config.inherited_listener_fds.len) break :blk config.inherited_listener_fds[shard_id];
             if (shard_id == 0 and config.inherited_listener_fds.len == 0) break :blk config.inherited_listener_fd;
             break :blk null;
@@ -4453,52 +4589,89 @@ pub const LinuxServer = struct {
             // Restore exec hygiene: the fd survived ONE execve on purpose;
             // re-arm CLOEXEC so it never leaks into any other child. The next
             // UPGRADE clears it again for exactly the listeners it carries.
-            _ = linux.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
-            try kernel_linux.applyListenerOptions(fd);
+            if (comptime builtin.os.tag == .linux) {
+                _ = linux.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
+                try kernel_linux.applyListenerOptions(fd);
+            } else {
+                try os_runtime.setCloexec(fd, true);
+                try os_runtime.setNonblocking(fd);
+            }
             break :blk fd;
-        } else try reuseport.createReusePortListener(config.host, config.port, config.backlog);
+        } else try reuseport.createReusePortListener(primaryListenerHost(config.host), config.port, config.backlog);
         errdefer closeFd(listener_fd);
+        const inherited_companion: ?linux.fd_t = if (nativeManifestListener(config, shard_id, .plain, true)) |fd|
+            fd
+        else if (shard_id < config.inherited_listener_companion_fds.len)
+            config.inherited_listener_companion_fds[shard_id]
+        else
+            null;
+        const listener_companion_fd = try stageListenerCompanion(config.host, config.port, listener_fd, config.backlog, true, inherited, inherited_companion);
+        errdefer if (listener_companion_fd >= 0) closeFd(listener_companion_fd);
 
         // S2S peers must be accepted on reactor 0: the mesh dial table,
         // collision resolver, and link-establish side effects are reactor-0
         // state. In sharded mode no other reactor even binds this port.
+        const inherited_s2s = nativeManifestListener(config, shard_id, .s2s, false);
         const s2s_listener_fd: linux.fd_t = if (config.s2s_port != 0 and (!reuse_port or shard_id == 0))
-            try createListener(config.host, config.s2s_port, config.backlog)
+            if (inherited_s2s) |fd| try adoptNativeListener(fd) else try createListener(primaryListenerHost(config.host), config.s2s_port, config.backlog)
         else
             -1;
         errdefer if (s2s_listener_fd >= 0) closeFd(s2s_listener_fd);
+        const s2s_listener_companion_fd = if (s2s_listener_fd >= 0)
+            try stageListenerCompanion(config.host, config.s2s_port, s2s_listener_fd, config.backlog, false, inherited_s2s, nativeManifestListener(config, shard_id, .s2s, true))
+        else
+            -1;
+        errdefer if (s2s_listener_companion_fd >= 0) closeFd(s2s_listener_companion_fd);
 
         // Cert presence is the "TLS configured" signal (main.zig only supplies a
         // chain when [tls] is enabled). Port 0 then means an ephemeral bind, the
         // same convention the plaintext listener uses.
+        const inherited_tls = nativeManifestListener(config, shard_id, .tls, false);
         const tls_listener_fd: linux.fd_t = if (certReady(config))
-            (if (reuse_port)
-                try reuseport.createReusePortListener(config.host, config.tls_port, config.backlog)
+            (if (inherited_tls) |fd|
+                try adoptNativeListener(fd)
+            else if (reuse_port)
+                try reuseport.createReusePortListener(primaryListenerHost(config.host), config.tls_port, config.backlog)
             else
-                try createListener(config.host, config.tls_port, config.backlog))
+                try createListener(primaryListenerHost(config.host), config.tls_port, config.backlog))
         else
             -1;
         errdefer if (tls_listener_fd >= 0) closeFd(tls_listener_fd);
+        const tls_listener_companion_fd = if (tls_listener_fd >= 0)
+            try stageListenerCompanion(config.host, config.tls_port, tls_listener_fd, config.backlog, reuse_port, inherited_tls, nativeManifestListener(config, shard_id, .tls, true))
+        else
+            -1;
+        errdefer if (tls_listener_companion_fd >= 0) closeFd(tls_listener_companion_fd);
 
         // Secure-WebSocket (wss) browser listener: gated on `ws_enabled` AND the
         // same cert-presence signal as the TLS listener (browsers require wss).
         // The testing-only plain mode stands it up without a certificate.
+        const inherited_ws = nativeManifestListener(config, shard_id, .ws, false);
         const ws_listener_fd: linux.fd_t = if (config.ws_enabled and (certReady(config) or config.ws_allow_plain))
-            (if (reuse_port)
-                try reuseport.createReusePortListener(config.host, config.ws_port, config.backlog)
+            (if (inherited_ws) |fd|
+                try adoptNativeListener(fd)
+            else if (reuse_port)
+                try reuseport.createReusePortListener(primaryListenerHost(config.host), config.ws_port, config.backlog)
             else
-                try createListener(config.host, config.ws_port, config.backlog))
+                try createListener(primaryListenerHost(config.host), config.ws_port, config.backlog))
         else
             -1;
         errdefer if (ws_listener_fd >= 0) closeFd(ws_listener_fd);
+        const ws_listener_companion_fd = if (ws_listener_fd >= 0)
+            try stageListenerCompanion(config.host, config.ws_port, ws_listener_fd, config.backlog, reuse_port, inherited_ws, nativeManifestListener(config, shard_id, .ws, true))
+        else
+            -1;
+        errdefer if (ws_listener_companion_fd >= 0) closeFd(ws_listener_companion_fd);
 
-        const incoming_cpu = kernel_linux.shardIncomingCpu(shard_id);
-        try kernel_linux.setIncomingCpu(listener_fd, incoming_cpu);
-        if (s2s_listener_fd >= 0) try kernel_linux.setIncomingCpu(s2s_listener_fd, incoming_cpu);
-        if (tls_listener_fd >= 0) try kernel_linux.setIncomingCpu(tls_listener_fd, incoming_cpu);
-        if (ws_listener_fd >= 0) try kernel_linux.setIncomingCpu(ws_listener_fd, incoming_cpu);
+        if (comptime builtin.os.tag == .linux) {
+            const incoming_cpu = kernel_linux.shardIncomingCpu(shard_id);
+            try kernel_linux.setIncomingCpu(listener_fd, incoming_cpu);
+            if (s2s_listener_fd >= 0) try kernel_linux.setIncomingCpu(s2s_listener_fd, incoming_cpu);
+            if (tls_listener_fd >= 0) try kernel_linux.setIncomingCpu(tls_listener_fd, incoming_cpu);
+            if (ws_listener_fd >= 0) try kernel_linux.setIncomingCpu(ws_listener_fd, incoming_cpu);
+        }
 
-        var ring = io_backend.openLinuxRing(config.ring_entries, config.features) catch |err| {
+        var ring = RingCore.init(config.ring_entries, config.features) catch |err| {
             if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
             return err;
         };
@@ -4519,6 +4692,10 @@ pub const LinuxServer = struct {
             .s2s_listener_fd = s2s_listener_fd,
             .tls_listener_fd = tls_listener_fd,
             .ws_listener_fd = ws_listener_fd,
+            .listener_companion_fd = listener_companion_fd,
+            .s2s_listener_companion_fd = s2s_listener_companion_fd,
+            .tls_listener_companion_fd = tls_listener_companion_fd,
+            .ws_listener_companion_fd = ws_listener_companion_fd,
             // Best-effort: a daemon without eventfd simply runs un-wakeable (a
             // single reactor never needs an external nudge; multi-reactor needs it
             // for cross-shard delivery, so a failure there degrades to busier polls).
@@ -4544,12 +4721,15 @@ pub const LinuxServer = struct {
         allocator: std.mem.Allocator,
         raw_config: Config,
     ) !void {
-        if (builtin.os.tag != .linux) return error.Unsupported;
+        if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
 
-        const self_pidfd = try kernel_linux.openSelfPidfd();
-        var self_pidfd_owned = true;
+        const self_pidfd: linux.fd_t = if (comptime builtin.os.tag == .linux)
+            try kernel_linux.openSelfPidfd()
+        else
+            -1;
+        var self_pidfd_owned = self_pidfd >= 0;
         errdefer if (self_pidfd_owned) {
-            _ = linux.close(self_pidfd);
+            os_runtime.close(self_pidfd);
         };
 
         // Ignore SIGPIPE process-wide. The reactors do socket I/O through io_uring
@@ -4616,6 +4796,7 @@ pub const LinuxServer = struct {
         }
 
         const shard_count = clampShards(config);
+        try validateNativeInheritedListenerClaims(config);
         // For >1 shard EVERY listener (shard 0 included) must be SO_REUSEPORT or
         // the kernel rejects the second bind on the shared port. The single-shard
         // path keeps plain sockets so its behavior is byte-identical to before.
@@ -4626,19 +4807,38 @@ pub const LinuxServer = struct {
         var built: usize = 0;
         errdefer for (reactors[0..built]) |*r| r.deinit();
         while (built < shard_count) : (built += 1) {
-            reactors[built] = try initReactor(allocator, config, @intCast(built), reuse_port);
+            var shard_config = config;
+            if (builtin.os.tag == .openbsd and built > 0) {
+                // A wildcard pair uses one selected ephemeral port. Every later
+                // shard must bind that same port, including TLS/WS port0 cases.
+                if (shard_config.port == 0) shard_config.port = try socketPort(reactors[0].listener_fd);
+                if (shard_config.tls_port == 0 and reactors[0].tls_listener_fd >= 0)
+                    shard_config.tls_port = try socketPort(reactors[0].tls_listener_fd);
+                if (shard_config.ws_port == 0 and reactors[0].ws_listener_fd >= 0)
+                    shard_config.ws_port = try socketPort(reactors[0].ws_listener_fd);
+            }
+            reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+        }
+        if (builtin.os.tag == .openbsd and config.inherited_listener_companion_fds.len > shard_count) {
+            for (config.inherited_listener_companion_fds[shard_count..]) |fd| closeFd(fd);
         }
         // A predecessor with MORE shards than this successor carried extra
         // listener fds no reactor adopted: close them now so they neither leak
         // nor keep receiving SO_REUSEPORT-balanced SYNs nobody will accept.
         var surplus_closed_with_close_range = false;
         if (config.inherited_listener_fds.len > shard_count) {
-            surplus_closed_with_close_range = try kernel_linux.closeOwnedFdSpan(config.inherited_listener_fds[shard_count..]);
+            if (comptime builtin.os.tag == .linux) {
+                surplus_closed_with_close_range = try kernel_linux.closeOwnedFdSpan(config.inherited_listener_fds[shard_count..]);
+            } else {
+                for (config.inherited_listener_fds[shard_count..]) |fd| closeFd(fd);
+            }
         }
         var msg_ring_booted = false;
-        if (shard_count >= 2) {
-            try reactors[0].ring.bootMsgRing(&reactors[1].ring);
-            msg_ring_booted = true;
+        if (comptime builtin.os.tag == .linux) {
+            if (shard_count >= 2) {
+                try reactors[0].ring.bootMsgRing(&reactors[1].ring);
+                msg_ring_booted = true;
+            }
         }
 
         var tls_ticket_key: tls_resumption.TicketKey = @splat(0);
@@ -5055,6 +5255,9 @@ pub const LinuxServer = struct {
 
     fn inheritedStateConsumedBeforeServices(self: *const LinuxServer) bool {
         return self.config.resume_arena_fd == null and
+            self.config.native_arena_bytes == null and
+            self.config.native_adopt_barrier == null and
+            (builtin.os.tag != .openbsd or self.config.native_listener_manifest.len == 0) and
             !self.config.inherited_state_fd_manifest_present;
     }
 
@@ -5994,7 +6197,7 @@ pub const LinuxServer = struct {
     }
 
     test "server start gates media transports on media_enabled" {
-        if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
         const allocator = std.testing.allocator;
 
         var media_off = LinuxServer.init(allocator, .{
@@ -6026,7 +6229,7 @@ pub const LinuxServer = struct {
     }
 
     test "Server.init threads content filter and memo configs" {
-        if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
         const allocator = std.testing.allocator;
 
         var server = LinuxServer.init(allocator, .{
@@ -6422,21 +6625,11 @@ pub const LinuxServer = struct {
     /// Arm the accept SQE if needed. Submission is batched by `runOnce`.
     pub fn armAccept(self: *LinuxServer) !void {
         if (self.rx().socket_io_quiescing) return;
-        if (!self.rx().accept_armed) {
-            try io_backend.submitAccept(&self.rx().ring, listener_token, self.rx().listener_fd);
-            self.rx().accept_armed = true;
-        }
-        if (self.rx() == &self.reactors[0] and self.rx().s2s_listener_fd >= 0 and !self.rx().s2s_accept_armed) {
-            try io_backend.submitAccept(&self.rx().ring, s2s_listener_token, self.rx().s2s_listener_fd);
-            self.rx().s2s_accept_armed = true;
-        }
-        if (self.rx().tls_listener_fd >= 0 and !self.rx().tls_accept_armed) {
-            try io_backend.submitAccept(&self.rx().ring, tls_listener_token, self.rx().tls_listener_fd);
-            self.rx().tls_accept_armed = true;
-        }
-        if (self.rx().ws_listener_fd >= 0 and !self.rx().ws_accept_armed) {
-            try io_backend.submitAccept(&self.rx().ring, ws_listener_token, self.rx().ws_listener_fd);
-            self.rx().ws_accept_armed = true;
+        for (self.rx().acceptOps()) |op| {
+            if (op.fd < 0 or op.armed.*) continue;
+            if (op.kind == .s2s and self.rx() != &self.reactors[0]) continue;
+            try io_backend.submitAccept(&self.rx().ring, op.token, op.fd);
+            op.armed.* = true;
         }
     }
 
@@ -7898,6 +8091,10 @@ pub const LinuxServer = struct {
     pub fn runOnce(self: *LinuxServer) !void {
         if (comptime builtin.is_test) {
             if (self.reactor_fail_for_test) return error.ReactorGiveUp;
+            if (current_reactor) |r| {
+                if (self.reactor_poison_shard_for_test.load(.acquire) == r.shard_id)
+                    return error.BackendPoisoned;
+            }
         }
         // Bind this thread to its reactor so every handler's rx() resolves to the
         // reactor whose ring produced the completions. A multi-reactor worker has
@@ -7921,7 +8118,7 @@ pub const LinuxServer = struct {
         _ = try self.rx().ring.submitAndWait(1);
 
         var handler = CompletionHandler{ .server = self };
-        var cqes: [ringlane.max_cqe_batch]linux.io_uring_cqe = undefined;
+        var cqes: [ringlane.max_cqe_batch]reactor_backend.CompletionBuffer = undefined;
         const cqe_batch = @min(@as(usize, self.config.cqe_batch), cqes.len);
         _ = try self.rx().ring.reapCompletions(cqes[0..cqe_batch], 0, &handler);
         if (handler.err) |err| return err;
@@ -8121,6 +8318,35 @@ pub const LinuxServer = struct {
         return socketPort(self.rx().listener_fd);
     }
 
+    /// Deterministic native Helix listener custody: shard order, primary roles,
+    /// then companion roles. Call under the upgrade owner barrier before
+    /// transferring rights; this method neither arms I/O nor changes flags.
+    pub fn collectListenerManifest(self: *LinuxServer, allocator: std.mem.Allocator) ![]ListenerDescriptor {
+        var count: usize = 0;
+        for (self.reactors) |*r| for (r.acceptOps()) |op| {
+            if (op.fd >= 0) count += 1;
+        };
+        const rows = try allocator.alloc(ListenerDescriptor, count);
+        errdefer allocator.free(rows);
+        var index: usize = 0;
+        for (self.reactors) |*r| for (r.acceptOps()) |op| {
+            if (op.fd < 0) continue;
+            var address: posix.sockaddr.storage = undefined;
+            var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            if (posix.errno(socket_system.getsockname(op.fd, @ptrCast(&address), &len)) != .SUCCESS)
+                return error.InvalidInheritedListener;
+            const family: ListenerFamily = switch (address.family) {
+                posix.AF.INET => .ipv4,
+                posix.AF.INET6 => .ipv6,
+                else => return error.InvalidInheritedListener,
+            };
+            for (rows[0..index]) |prior| if (prior.fd == op.fd) return error.InvalidInheritedListener;
+            rows[index] = .{ .shard = r.shard_id, .kind = op.kind, .family = family, .fd = op.fd };
+            index += 1;
+        };
+        return rows;
+    }
+
     /// Run the reactor loop on the calling thread until `run` is cleared. Wakes
     /// on each io_uring completion and re-checks the flag, so a client
     /// disconnect (or any I/O) lets a requested shutdown take effect. (T1 of the
@@ -8168,6 +8394,24 @@ pub const LinuxServer = struct {
         self.pool.join();
     }
 
+    /// Inspect only after runThreaded joins every worker. Terminal I/O failure
+    /// must reach the process exit status instead of looking like DIE/shutdown.
+    pub fn runtimeFailure(self: *const LinuxServer) ?anyerror {
+        return switch (self.runtime_failure.load(.acquire)) {
+            0 => null,
+            1 => error.BackendPoisoned,
+            else => error.ReactorGiveUp,
+        };
+    }
+
+    fn stopFailedReactors(self: *LinuxServer, run: *std.atomic.Value(bool), failure: u8) void {
+        const first = self.runtime_failure.cmpxchgStrong(0, failure, .acq_rel, .acquire) == null;
+        // Keep backend-owned socket buffers and slots intact until deinit.
+        // Wake all siblings, including any parked at the upgrade safe point.
+        self.requestStop(run);
+        if (first) self.flushFlightRecorder(.reactor, "reactor giving up after persistent errors");
+    }
+
     /// One reactor worker thread: bind this thread to its shard's reactor, then
     /// loop `runOnce` (which arms accept/wake/timer and reaps completions) until
     /// the shared run flag clears. Each worker touches only its own reactor's ring
@@ -8193,6 +8437,7 @@ pub const LinuxServer = struct {
             // is reached within one turn. Resumes when the sealer clears the
             // flag (upgrade failed) or never (execve replaced the process).
             self.parkForUpgradeQuiesce(run);
+            if (!run.load(.acquire)) break;
             if (self.runOnce()) |_| {
                 consecutive_failures = 0;
             } else |err| {
@@ -8201,9 +8446,9 @@ pub const LinuxServer = struct {
                     "onyx-server: reactor loop error {s} ({d} consecutive)\n",
                     .{ @errorName(err), consecutive_failures },
                 );
-                if (consecutive_failures >= 64) {
+                if (err == error.BackendPoisoned or consecutive_failures >= 64) {
                     srvLog("onyx-server: reactor giving up after persistent errors\n", .{});
-                    self.flushFlightRecorder(.reactor, "reactor giving up after persistent errors");
+                    self.stopFailedReactors(run, if (err == error.BackendPoisoned) 1 else 2);
                     return;
                 }
             }
@@ -8212,9 +8457,7 @@ pub const LinuxServer = struct {
 
     fn ownedSocketIoQuiesced(self: *LinuxServer) bool {
         const r = self.rx();
-        if (r.accept_armed or r.s2s_accept_armed or r.tls_accept_armed or r.ws_accept_armed or
-            r.accept_cancel_pending or r.s2s_accept_cancel_pending or
-            r.tls_accept_cancel_pending or r.ws_accept_cancel_pending) return false;
+        if (!r.acceptsQuiesced()) return false;
         for (self.rx().clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
             if (slot.value.recv_armed or slot.value.send_armed or slot.value.connect_armed) return false;
@@ -8234,13 +8477,7 @@ pub const LinuxServer = struct {
         var first_err: ?anyerror = null;
         while (!self.ownedSocketIoQuiesced()) {
             var sq_full = false;
-            const accept_ops = [_]struct { armed: *bool, pending: *bool, token: RingFdToken }{
-                .{ .armed = &r.accept_armed, .pending = &r.accept_cancel_pending, .token = listener_token },
-                .{ .armed = &r.s2s_accept_armed, .pending = &r.s2s_accept_cancel_pending, .token = s2s_listener_token },
-                .{ .armed = &r.tls_accept_armed, .pending = &r.tls_accept_cancel_pending, .token = tls_listener_token },
-                .{ .armed = &r.ws_accept_armed, .pending = &r.ws_accept_cancel_pending, .token = ws_listener_token },
-            };
-            for (accept_ops) |op| {
+            for (r.acceptOps()) |op| {
                 if (!op.armed.* or op.pending.*) continue;
                 io_backend.submitCancel(&r.ring, .accept, op.token) catch |err| switch (err) {
                     error.SubmissionQueueFull => {
@@ -8306,7 +8543,7 @@ pub const LinuxServer = struct {
                 break :blk 0;
             };
             var handler = CompletionHandler{ .server = self };
-            var cqes: [ringlane.max_cqe_batch]linux.io_uring_cqe = undefined;
+            var cqes: [ringlane.max_cqe_batch]reactor_backend.CompletionBuffer = undefined;
             const cqe_batch = @min(@as(usize, self.config.cqe_batch), cqes.len);
             r.ring.reapCompletions(cqes[0..cqe_batch], 0, &handler) catch |err| {
                 if (first_err == null) first_err = err;
@@ -8316,8 +8553,7 @@ pub const LinuxServer = struct {
             }
             if (self.ownedSocketIoQuiesced()) break;
             if (waited_ms >= 5_000) return first_err orelse error.SocketIoQuiesceFailed;
-            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            _ = linux.nanosleep(&req, null);
+            sleepOneMillis();
             waited_ms += 1;
             if (sq_full or waited_ms % 200 == 0) self.wakeReactor();
         }
@@ -8350,9 +8586,7 @@ pub const LinuxServer = struct {
         const inline_fallback = self.pool.count() == 0;
         for (self.reactors) |*r| {
             const inactive_foreign = inline_fallback and r != self.rx() and !r.socket_io_quiescing;
-            if (r.accept_armed or r.s2s_accept_armed or r.tls_accept_armed or r.ws_accept_armed or
-                r.accept_cancel_pending or r.s2s_accept_cancel_pending or
-                r.tls_accept_cancel_pending or r.ws_accept_cancel_pending)
+            if (!r.acceptsQuiesced())
                 return error.UpgradeSocketOwnerNotQuiesced;
             if (inactive_foreign and r.clients.len() != 0)
                 return error.UpgradeSocketOwnerNotQuiesced;
@@ -8396,8 +8630,7 @@ pub const LinuxServer = struct {
                 // zero-progress boundary rather than trusting the entry check.
                 for (self.reactors) |*r| {
                     if (inline_fallback and r != self.rx() and !r.socket_io_quiescing) continue;
-                    if (!r.socket_io_quiescing or r.accept_armed or r.s2s_accept_armed or
-                        r.tls_accept_armed or r.ws_accept_armed) return error.UpgradeSocketOwnerNotQuiesced;
+                    if (!r.socket_io_quiescing or !r.acceptsQuiesced()) return error.UpgradeSocketOwnerNotQuiesced;
                     for (r.clients.slots.items) |*slot| {
                         if (!slot.occupied) continue;
                         const conn = &slot.value;
@@ -8426,10 +8659,7 @@ pub const LinuxServer = struct {
         if (!self.ownedSocketIoQuiesced()) _ = self.quiesceOwnedSocketIo() catch {};
         if (!self.ownedSocketIoQuiesced()) return;
         r.socket_io_quiescing = false;
-        r.accept_cancel_pending = false;
-        r.s2s_accept_cancel_pending = false;
-        r.tls_accept_cancel_pending = false;
-        r.ws_accept_cancel_pending = false;
+        for (r.acceptOps()) |op| op.pending.* = false;
         self.armAccept() catch self.wakeReactor();
         for (r.clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
@@ -8473,15 +8703,13 @@ pub const LinuxServer = struct {
             self.resumeOwnedSocketIo();
             if (!self.rx().socket_io_quiescing) break;
             self.upgrade_io_failed.store(true, .release);
-            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            _ = linux.nanosleep(&req, null);
+            sleepOneMillis();
         }
         _ = self.upgrade_resume_done.fetchAdd(1, .acq_rel);
         self.finishUpgradeResumeIfComplete();
         while (self.upgrade_quiesce_shard.load(.acquire) == resuming_quiesce_shard) {
             if (!run.load(.acquire)) return;
-            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            _ = linux.nanosleep(&req, null);
+            sleepOneMillis();
         }
     }
 
@@ -8502,8 +8730,7 @@ pub const LinuxServer = struct {
                         self.upgrade_coordinator_resumed.store(true, .release);
                         self.finishUpgradeResumeIfComplete();
                     }
-                    var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-                    _ = linux.nanosleep(&req, null);
+                    sleepOneMillis();
                 }
                 return;
             }
@@ -8520,8 +8747,7 @@ pub const LinuxServer = struct {
             self.upgrade_quiesce_shard.load(.acquire) == q)
         {
             if (!run.load(.acquire)) break;
-            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            _ = linux.nanosleep(&req, null);
+            sleepOneMillis();
         }
         if (self.upgrade_quiesce_shard.load(.acquire) != q) {
             self.resumeUpgradeSiblingAndWait(run);
@@ -8530,8 +8756,7 @@ pub const LinuxServer = struct {
         self.drainUpgradeFabric();
         _ = self.upgrade_parked.fetchAdd(1, .acq_rel);
         while (self.upgrade_quiesce_shard.load(.acquire) == q) {
-            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            _ = linux.nanosleep(&req, null);
+            sleepOneMillis();
         }
         self.resumeUpgradeSiblingAndWait(run);
     }
@@ -8581,8 +8806,7 @@ pub const LinuxServer = struct {
                 self.resumeSiblingReactors();
                 return error.ShardQuiesceFailed;
             }
-            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            _ = linux.nanosleep(&req, null);
+            sleepOneMillis();
             waited_ms += 1;
             // Re-nudge stragglers: a wake consumed before the flag was visible
             // leaves a sibling blocked in submitAndWait until its sweep timer.
@@ -8608,8 +8832,7 @@ pub const LinuxServer = struct {
                 self.resumeSiblingReactors();
                 return error.ShardQuiesceFailed;
             }
-            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            _ = linux.nanosleep(&req, null);
+            sleepOneMillis();
             waited_ms += 1;
             if (waited_ms % 200 == 0) self.wakeAllReactors();
         }
@@ -8651,33 +8874,25 @@ pub const LinuxServer = struct {
                 srvLog("onyx-server: UPGRADE resume barrier timed out; retaining RESUMING state\n", .{});
                 return;
             }
-            var req = linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            _ = linux.nanosleep(&req, null);
+            sleepOneMillis();
             waited_ms += 1;
             if (waited_ms % 200 == 0) self.wakeAllReactors();
         }
     }
 
     pub fn handleAccept(self: *LinuxServer, event: ringlane.AcceptEvent) !void {
-        const is_s2s = event.token.slot == s2s_listener_token.slot;
-        const is_tls = event.token.slot == tls_listener_token.slot;
-        const is_ws = event.token.slot == ws_listener_token.slot;
-        const armed = if (is_s2s)
-            &self.rx().s2s_accept_armed
-        else if (is_tls)
-            &self.rx().tls_accept_armed
-        else if (is_ws)
-            &self.rx().ws_accept_armed
-        else
-            &self.rx().accept_armed;
-        const cancel_pending = if (is_s2s)
-            &self.rx().s2s_accept_cancel_pending
-        else if (is_tls)
-            &self.rx().tls_accept_cancel_pending
-        else if (is_ws)
-            &self.rx().ws_accept_cancel_pending
-        else
-            &self.rx().accept_cancel_pending;
+        const op = blk: {
+            for (self.rx().acceptOps()) |candidate| {
+                if (ringTokenEql(candidate.token, event.token)) break :blk candidate;
+            }
+            if (event.res >= 0) closeFd(event.res);
+            return error.BadCompletion;
+        };
+        const is_s2s = op.kind == .s2s;
+        const is_tls = op.kind == .tls;
+        const is_ws = op.kind == .ws;
+        const armed = op.armed;
+        const cancel_pending = op.pending;
         const was_cancel_pending = cancel_pending.*;
         if (!event.more) {
             armed.* = false;
@@ -8842,8 +9057,10 @@ pub const LinuxServer = struct {
     fn captureClientHost(self: *LinuxServer, conn: *ConnState) void {
         var storage: posix.sockaddr.storage = undefined;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-        const rc = linux.getpeername(conn.fd, @ptrCast(&storage), &len);
-        if (posix.errno(rc) != .SUCCESS) return;
+        if (comptime builtin.os.tag == .linux) {
+            const rc = linux.getpeername(conn.fd, @ptrCast(&storage), &len);
+            if (posix.errno(rc) != .SUCCESS) return;
+        } else os_runtime.getpeername(conn.fd, &storage, &len) catch return;
         const sa: *const posix.sockaddr = @ptrCast(@alignCast(&storage));
         const addr: dns.Address = switch (sa.family) {
             posix.AF.INET => blk: {
@@ -12338,8 +12555,19 @@ pub const LinuxServer = struct {
         };
         defer plan.deinit();
         if (plan.outcome() != .exact_duplicate) return false;
+        // An exact ingress replay cannot undo a durable neighbor ACK or widen
+        // the event's original coverage set. Keep its receipt, but reserve
+        // retries only for still-unconfirmed peers in the retained authority.
+        const retained = self.relay_v2_event_log.viewFor(relay_id) orelse return false;
+        var pending_len: usize = 0;
+        for (peers) |peer| {
+            if (std.mem.indexOfScalar(u64, retained.required_nodes, peer) == null or
+                std.mem.indexOfScalar(u64, retained.confirmed_nodes, peer) != null) continue;
+            peers[pending_len] = peer;
+            pending_len += 1;
+        }
         self.relay_v2_outbox.putBatchExcluding(
-            peers,
+            peers[0..pending_len],
             via_peer,
             relay_id,
             wire,
@@ -13912,6 +14140,12 @@ pub const LinuxServer = struct {
     }
 
     pub fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
+        if (comptime builtin.is_test) {
+            if (conn.test_sendq_capture) {
+                std.debug.assert(conn.fd < 0);
+                return;
+            }
+        }
         if (self.rx().socket_io_quiescing or conn.send_armed) return;
         if (conn.send_offset >= conn.send_len) return;
         // A staged activation that still owes RECV must acquire that ownership
@@ -14115,7 +14349,10 @@ pub const LinuxServer = struct {
                 conn.closing = true;
                 conn.io_activation_pending = false;
                 conn.activation_recv_required = false;
-                _ = linux.shutdown(conn.fd, linux.SHUT.RDWR);
+                if (comptime builtin.os.tag == .linux)
+                    _ = linux.shutdown(conn.fd, linux.SHUT.RDWR)
+                else
+                    os_runtime.shutdownBoth(conn.fd);
                 return;
             }
             // This is the only fallible phase allowed to precede teardown for a
@@ -23236,6 +23473,16 @@ pub const LinuxServer = struct {
         self.rebuildThreadsFromHistory();
     }
 
+    /// The native candidate reads the predecessor's WAL without mutation.
+    /// Hold World after every socket owner and producer reaches the seal cut;
+    /// publish the canonical durable image before either history capsule is
+    /// encoded. A failed write refuses the handoff and leaves its serving
+    /// predecessor and accepted in-memory history in place.
+    fn prepareNativeDurableHistoryUpgradeBoundary(self: *LinuxServer) !void {
+        const svc = self.account_services orelse return;
+        try history_durable.replaceAll(HistoryStore, svc.store, &self.history);
+    }
+
     fn snapshotDurableHistory(self: *LinuxServer) void {
         const svc = self.account_services orelse return;
         history_durable.replaceAll(HistoryStore, svc.store, &self.history) catch |err| {
@@ -26995,7 +27242,7 @@ pub const LinuxServer = struct {
                     if (est and self.sealSecuredLink(e.value, link, pieces, blobs)) {
                         // Preserved: carry the fd across execve; do NOT also seal a
                         // re-dial hint (that would open a duplicate link → churn).
-                        if (!setCloexec(e.value.fd, false)) {
+                        if (!setCloexec(e.value.fd, builtin.os.tag == .openbsd)) {
                             counts.fd_prepare_failed = true;
                             continue;
                         }
@@ -27329,7 +27576,7 @@ pub const LinuxServer = struct {
             if (tls_blob != null) counts.tls += 1;
             if (carry_ws) counts.ws += 1;
             // Preserve the client socket across execve so the successor re-attaches it.
-            if (!setCloexec(e.value.fd, false)) {
+            if (!setCloexec(e.value.fd, builtin.os.tag == .openbsd)) {
                 counts.fd_prepare_failed = true;
                 continue;
             }
@@ -27340,8 +27587,17 @@ pub const LinuxServer = struct {
     }
 
     fn performUpgrade(self: *LinuxServer, request: DeferredUpgradeRequest) !void {
+        if (comptime builtin.os.tag == .openbsd) {
+            const hooks = self.config.native_upgrade_hooks orelse return error.NativeUpgradeUnavailable;
+            const exe_target = self.config.exe_path orelse return error.NativeUpgradeUnavailable;
+            // Only the control socket crosses fork+exec. The leaf authenticates
+            // the actual running image before any service/socket owner pauses.
+            try hooks.begin(hooks.ctx, exe_target);
+            defer hooks.abort(hooks.ctx);
+            return self.performUpgradeAfterCompatibleTarget(request, -1, exe_target);
+        }
         if (comptime builtin.os.tag != .linux) {
-            self.deferredUpgradeNotice(request, "UPGRADE is Linux-only");
+            self.deferredUpgradeNotice(request, "UPGRADE is unavailable on this target");
             return;
         }
         const exe_target = self.config.exe_path orelse "/proc/self/exe";
@@ -27522,6 +27778,14 @@ pub const LinuxServer = struct {
             return error.PropertyStateConverging;
         };
 
+        if (comptime builtin.os.tag == .openbsd) {
+            self.prepareNativeDurableHistoryUpgradeBoundary() catch |err| {
+                srvLog("onyx-server: UPGRADE refused — native durable history synchronization failed ({s})\n", .{@errorName(err)});
+                self.deferredUpgradeNotice(request, "UPGRADE refused: exact durable history could not be synchronized before sealing");
+                return err;
+            };
+        }
+
         // Serialize every registered session into encoded snapshot pieces.
         var blobs: std.ArrayList([]u8) = .empty;
         defer {
@@ -27655,6 +27919,21 @@ pub const LinuxServer = struct {
         // Seal the complete state arena. Any failure refuses UPGRADE and restores
         // descriptor hygiene; listener-only re-exec is RESTART-only.
         const now = self.nowMs();
+        if (comptime builtin.os.tag == .openbsd) {
+            const hooks = self.config.native_upgrade_hooks orelse return error.NativeUpgradeUnavailable;
+            const listeners = try self.collectListenerManifest(self.allocator);
+            defer self.allocator.free(listeners);
+            // The native leaf appends the same whole-handoff manifest and
+            // encrypts before any file write. A return is pre-COMMIT only;
+            // success exits this process without shutting down shared sockets.
+            hooks.transferAndCommit(hooks.ctx, .{
+                .pieces = pieces.items,
+                .state_fds = carried_fds[0..carried_fd_count],
+                .listeners = listeners,
+                .epoch = @intCast(@max(0, now)),
+                .now_ms = now,
+            }) catch |err| return err;
+        }
         var prepared = helix_live.prepare(self.allocator, .{
             .epoch = @intCast(@max(0, now)),
             .now_ms = now,
@@ -27777,6 +28056,15 @@ pub const LinuxServer = struct {
     /// state sockets disjoint from the arena and every inherited/live listener.
     /// A malformed environment must never trick cleanup into closing the port.
     fn inheritedStateFdIsConnectedStreamSocket(fd: linux.fd_t) bool {
+        if (comptime builtin.os.tag == .openbsd) {
+            if (!os_runtime.fdValid(fd)) return false;
+            const socket_type = os_runtime.socketType(fd) catch return false;
+            if (socket_type != posix.SOCK.STREAM) return false;
+            var peer: os_runtime.AddressStorage = undefined;
+            var peer_len: os_runtime.AddressLength = @sizeOf(os_runtime.AddressStorage);
+            os_runtime.getpeername(fd, &peer, &peer_len) catch return false;
+            return true;
+        }
         if (fd < 0 or linux.errno(linux.fcntl(fd, posix.F.GETFD, 0)) != .SUCCESS)
             return false;
 
@@ -27817,12 +28105,11 @@ pub const LinuxServer = struct {
             for (self.config.inherited_listener_fds) |listener_fd| {
                 if (arena_fd == listener_fd) return false;
             }
+            for (self.config.inherited_listener_companion_fds) |listener_fd| {
+                if (arena_fd == listener_fd) return false;
+            }
             for (self.reactors) |*r| {
-                if (arena_fd == r.listener_fd or
-                    (r.s2s_listener_fd >= 0 and arena_fd == r.s2s_listener_fd) or
-                    (r.tls_listener_fd >= 0 and arena_fd == r.tls_listener_fd) or
-                    (r.ws_listener_fd >= 0 and arena_fd == r.ws_listener_fd))
-                    return false;
+                if (r.ownsListenerFd(arena_fd)) return false;
             }
         }
 
@@ -27834,12 +28121,11 @@ pub const LinuxServer = struct {
             for (self.config.inherited_listener_fds) |listener_fd| {
                 if (fd == listener_fd) return false;
             }
+            for (self.config.inherited_listener_companion_fds) |listener_fd| {
+                if (fd == listener_fd) return false;
+            }
             for (self.reactors) |*r| {
-                if (fd == r.listener_fd or
-                    (r.s2s_listener_fd >= 0 and fd == r.s2s_listener_fd) or
-                    (r.tls_listener_fd >= 0 and fd == r.tls_listener_fd) or
-                    (r.ws_listener_fd >= 0 and fd == r.ws_listener_fd))
-                    return false;
+                if (r.ownsListenerFd(fd)) return false;
             }
             for (self.config.inherited_state_fds[0..i]) |prior| {
                 if (fd == prior) return false;
@@ -27909,39 +28195,64 @@ pub const LinuxServer = struct {
     /// replay guard considers unseen/equivocating, would publish a torn handoff.
     /// Receipt-only RVO2 rows are deliberately excluded because a confirmed or
     /// retired RVL2 row may leave its ingress ACK proof alive until confirmation.
+    const RelayV2RestoreRelationFailure = enum {
+        retry_without_event,
+        retry_unbound_peer,
+        retry_local_peer,
+        retry_peer_not_required,
+        retry_peer_already_confirmed,
+        retry_wire_mismatch,
+        local_node_not_required,
+        local_node_not_confirmed,
+        unknown_required_peer,
+        invalid_retained_wire,
+        replay_probe_failed,
+        replay_identity_mismatch,
+        replay_authority_missing,
+    };
+
+    fn relayV2RestoreRelationFailure(
+        self: *const LinuxServer,
+        guard: *const relay_v2_replay_guard.Guard,
+        outbox: *const relay_v2_outbox.Outbox,
+        event_log: *const relay_v2_event_log.EventLog,
+    ) ?RelayV2RestoreRelationFailure {
+        for (outbox.items()) |entry| {
+            const row = event_log.viewFor(entry.relay_id) orelse return .retry_without_event;
+            if (entry.peer == relay_v2_outbox.unbound_peer) return .retry_unbound_peer;
+            if (entry.peer == self.config.node_id) return .retry_local_peer;
+            if (std.mem.indexOfScalar(u64, row.required_nodes, entry.peer) == null) return .retry_peer_not_required;
+            if (std.mem.indexOfScalar(u64, row.confirmed_nodes, entry.peer) != null) return .retry_peer_already_confirmed;
+            if (!std.mem.eql(u8, row.wire, entry.wire)) return .retry_wire_mismatch;
+        }
+        for (0..event_log.len()) |index| {
+            const row = event_log.viewAt(index);
+            if (self.config.node_id == 0 or
+                std.mem.indexOfScalar(u64, row.required_nodes, self.config.node_id) == null) return .local_node_not_required;
+            if (std.mem.indexOfScalar(u64, row.confirmed_nodes, self.config.node_id) == null) return .local_node_not_confirmed;
+            for (row.required_nodes) |required| {
+                if (std.mem.indexOfScalar(u64, row.confirmed_nodes, required) != null) continue;
+                if (std.mem.indexOfScalar(u64, self.relay_v2_required_nodes, required) == null)
+                    return .unknown_required_peer;
+            }
+            var owned = message_relay_v2.decode(self.allocator, row.wire) catch return .invalid_retained_wire;
+            defer owned.deinit(self.allocator);
+            switch (guard.probeMessage(owned.msg) catch return .replay_probe_failed) {
+                .duplicate => |id| if (!std.mem.eql(u8, &id, &row.relay_id)) return .replay_identity_mismatch,
+                .retired => |id| if (!std.mem.eql(u8, &id, &row.relay_id)) return .replay_identity_mismatch,
+                else => return .replay_authority_missing,
+            }
+        }
+        return null;
+    }
+
     fn relayV2RestoreRelationValid(
         self: *const LinuxServer,
         guard: *const relay_v2_replay_guard.Guard,
         outbox: *const relay_v2_outbox.Outbox,
         event_log: *const relay_v2_event_log.EventLog,
     ) bool {
-        for (outbox.items()) |entry| {
-            const row = event_log.viewFor(entry.relay_id) orelse return false;
-            if (entry.peer == relay_v2_outbox.unbound_peer or
-                entry.peer == self.config.node_id or
-                std.mem.indexOfScalar(u64, row.required_nodes, entry.peer) == null or
-                std.mem.indexOfScalar(u64, row.confirmed_nodes, entry.peer) != null or
-                !std.mem.eql(u8, row.wire, entry.wire)) return false;
-        }
-        for (0..event_log.len()) |index| {
-            const row = event_log.viewAt(index);
-            if (self.config.node_id == 0 or
-                std.mem.indexOfScalar(u64, row.required_nodes, self.config.node_id) == null or
-                std.mem.indexOfScalar(u64, row.confirmed_nodes, self.config.node_id) == null) return false;
-            for (row.required_nodes) |required| {
-                if (std.mem.indexOfScalar(u64, row.confirmed_nodes, required) != null) continue;
-                if (std.mem.indexOfScalar(u64, self.relay_v2_required_nodes, required) == null)
-                    return false;
-            }
-            var owned = message_relay_v2.decode(self.allocator, row.wire) catch return false;
-            defer owned.deinit(self.allocator);
-            switch (guard.probeMessage(owned.msg) catch return false) {
-                .duplicate => |id| if (!std.mem.eql(u8, &id, &row.relay_id)) return false,
-                .retired => |id| if (!std.mem.eql(u8, &id, &row.relay_id)) return false,
-                else => return false,
-            }
-        }
-        return true;
+        return self.relayV2RestoreRelationFailure(guard, outbox, event_log) == null;
     }
 
     fn abandonInheritedSessionState(self: *LinuxServer, caps: anytype, arena_fd: linux.fd_t, reason: []const u8) void {
@@ -27956,15 +28267,62 @@ pub const LinuxServer = struct {
         }
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
+        self.config.native_arena_bytes = null;
         srvLog("onyx-server: UPGRADE resume refused inherited state: {s}\n", .{reason});
     }
 
+    const NativeBotStage = struct {
+        allocator: std.mem.Allocator,
+        table: *bot_grant_snapshot.Table,
+        registry: bot_registry_mod.BotRegistry,
+
+        fn deinit(self: *NativeBotStage) void {
+            self.registry.deinit();
+            self.allocator.destroy(self.table);
+        }
+    };
+
+    fn stageNativeBotGrants(self: *LinuxServer, checkpoint: ?bot_grant_snapshot.Snapshot) !NativeBotStage {
+        const table = try self.allocator.create(bot_grant_snapshot.Table);
+        errdefer self.allocator.destroy(table);
+        table.* = self.bot_grants;
+        var registry = bot_registry_mod.BotRegistry.init(self.allocator);
+        errdefer registry.deinit();
+        var existing = self.bot_registry.map.iterator();
+        while (existing.next()) |row| {
+            try registry.register(row.key_ptr.*, row.value_ptr.info);
+            const replacement = registry.map.getPtr(row.key_ptr.*).?;
+            @memcpy(replacement.ring.stamps, row.value_ptr.ring.stamps);
+            replacement.ring.head = row.value_ptr.ring.head;
+            replacement.ring.len = row.value_ptr.ring.len;
+        }
+        if (checkpoint) |snap| {
+            var bots = snap.botIterator();
+            while (bots.next()) |account| {
+                try table.insertBot(account);
+                try registry.register(account, .{});
+            }
+            var grants = snap.grantIterator();
+            while (grants.next()) |g| try table.upsert(g.account, g.kind, g.scope, g.expiry_ms, self.grantNowU64());
+        }
+        return .{ .allocator = self.allocator, .table = table, .registry = registry };
+    }
+
     pub fn adoptInheritedSessions(self: *LinuxServer) error{ InvalidInheritedHandoff, DurableDeviceActivationFailed }!void {
-        if (comptime builtin.os.tag != .linux) {
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) {
             io_backend.refuseForeignCapsule() catch return error.InvalidInheritedHandoff;
             return error.InvalidInheritedHandoff;
         }
-        const arena_fd = self.config.resume_arena_fd orelse {
+        const arena_fd: linux.fd_t = if (builtin.os.tag == .openbsd) blk: {
+            if (self.config.native_arena_bytes == null) {
+                if (self.config.resume_arena_fd != null or self.config.inherited_state_fd_manifest_present or
+                    self.config.native_adopt_barrier != null or self.config.native_listener_manifest.len != 0) return error.InvalidInheritedHandoff;
+                return;
+            }
+            if (self.config.resume_arena_fd != null or self.config.native_adopt_barrier == null or
+                self.config.native_listener_manifest.len == 0) return error.InvalidInheritedHandoff;
+            break :blk -1;
+        } else self.config.resume_arena_fd orelse {
             // A state-fd manifest without its arena is an incomplete handoff. A
             // malformed/colliding list is startup-fatal because guessing at
             // numeric fds is unsafe (the kernel closes the whole table on exit).
@@ -27992,10 +28350,15 @@ pub const LinuxServer = struct {
         // 0, the reactor that owns the inherited listener and every connection
         // adopted below.
         current_reactor = &self.reactors[0];
-        const caps = helix_live.readArena(self.allocator, arena_fd) catch |e| {
+        const caps = (if (builtin.os.tag == .openbsd) blk: {
+            const bytes = self.config.native_arena_bytes.?;
+            if (bytes.len > helix_live.max_arena_bytes) break :blk error.ArenaTooLarge;
+            break :blk helix_capsule.decodeStream(self.allocator, bytes);
+        } else helix_live.readArena(self.allocator, arena_fd)) catch |e| {
             _ = self.closeInheritedStateFdManifest(arena_fd);
             closeFd(arena_fd);
             self.config.resume_arena_fd = null;
+            self.config.native_arena_bytes = null;
             srvLog("onyx-server: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
             return error.InvalidInheritedHandoff;
         };
@@ -28312,11 +28675,12 @@ pub const LinuxServer = struct {
             return error.InvalidInheritedHandoff;
         };
         defer relay_event_log_replacement.deinit();
-        if (!self.relayV2RestoreRelationValid(
+        if (self.relayV2RestoreRelationFailure(
             &relay_replay_replacement,
             &relay_outbox_replacement,
             &relay_event_log_replacement,
-        )) {
+        )) |reason| {
+            srvLog("onyx-server: inherited MESSAGE_V2 relation failed ({s})\n", .{@tagName(reason)});
             self.abandonInheritedSessionState(caps, arena_fd, "inconsistent MESSAGE_V2 replay, retry, and retained-event checkpoints");
             return error.InvalidInheritedHandoff;
         }
@@ -28882,9 +29246,7 @@ pub const LinuxServer = struct {
         // returns; a caller may catch InvalidInheritedHandoff without observing a
         // torn successor. No reactor SQE or service thread is active here.
         for (self.reactors) |*reactor| {
-            if (reactor.clients.len() != 0 or reactor.accept_armed or
-                reactor.s2s_accept_armed or reactor.tls_accept_armed or
-                reactor.ws_accept_armed or reactor.timer_armed or
+            if (reactor.clients.len() != 0 or !reactor.acceptsQuiesced() or reactor.timer_armed or
                 reactor.wake_armed)
             {
                 self.abandonInheritedSessionState(caps, arena_fd, "successor reactor is not inert before inherited-state adoption");
@@ -28986,6 +29348,7 @@ pub const LinuxServer = struct {
             self.session_replica_store_generation +%= 1;
         }
         errdefer self.session_replica_store_generation = prior_replica_store_generation;
+        var adoption_stage: []const u8 = "TLS sidecars";
         // Registered after every candidate authority swap so it executes first
         // on error. This destructor releases only candidate-owned heap state;
         // the exact inherited-fd manifest remains the one close authority.
@@ -28997,7 +29360,10 @@ pub const LinuxServer = struct {
             std.mem.swap(sessions_mod.SessionStore, &self.sessions, &sessions_replacement);
             std.mem.swap(monitor.MonitorStore, &self.monitor, &monitor_replacement);
             std.mem.swap(silence.Store, &self.silence, &silence_replacement);
-            self.abandonInheritedSessionState(caps, arena_fd, "late inherited-state transaction failed");
+            var reason_buf: [160]u8 = undefined;
+            const reason = std.fmt.bufPrint(&reason_buf, "late inherited-state transaction failed during {s}", .{adoption_stage}) catch
+                "late inherited-state transaction failed";
+            self.abandonInheritedSessionState(caps, arena_fd, reason);
         }
         const replica_objects_restored = self.session_replica_store.entryCount() +
             self.session_replica_store.attachmentLeaseCount() +
@@ -29063,6 +29429,7 @@ pub const LinuxServer = struct {
         // Pass 1b: index the carried WebSocket adapter markers by socket fd, the
         // same join key. A wss client is joined to BOTH its TLS state and this
         // marker; the marker tells the successor to rebuild the WS framing layer.
+        adoption_stage = "WebSocket sidecars";
         var ws_snaps: std.ArrayList(ws_snapshot.Snapshot) = .empty;
         defer ws_snaps.deinit(self.allocator);
         for (caps) |c| {
@@ -29105,6 +29472,7 @@ pub const LinuxServer = struct {
         }
 
         // Pass 2: adopt the carried clients.
+        adoption_stage = "physical client adoption";
         var adopted: usize = 0;
         var adopted_tls: usize = 0;
         var adopted_ws: usize = 0;
@@ -29183,6 +29551,7 @@ pub const LinuxServer = struct {
             srvLog("onyx-server: UPGRADE resume fatal — orphan TLS/WebSocket sidecar(s) remain after exact client join\n", .{});
             return error.InvalidInheritedHandoff;
         }
+        adoption_stage = "World client relations";
         const adopted_world_resolver = self.helixWorldRelationResolver();
         world_replacement.validateAdoptedMembersResolved(
             &self.world,
@@ -29213,6 +29582,7 @@ pub const LinuxServer = struct {
         // in the rollback-owned candidate before restoring watcher relations.
         // Primary World owners first preserve the authoritative display casing;
         // same-fold secondary attachments are idempotent in the second pass.
+        adoption_stage = "MONITOR relations";
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
                 if (!slot.occupied) continue;
@@ -29325,6 +29695,7 @@ pub const LinuxServer = struct {
         // Pass 2b (cont.): restore the exact one-per-client SILENCE relation.
         // Duplicate masks are invalid wire state: the predecessor Store is a
         // set, so accepting one would hide corruption or an ambiguous join.
+        adoption_stage = "SILENCE relations";
         const silence_fds = self.allocator.alloc(i32, client_capsule_count) catch {
             world_replacement.swapWorldInto(&self.world);
             return error.InvalidInheritedHandoff;
@@ -29405,6 +29776,7 @@ pub const LinuxServer = struct {
         // abort, not a silent skip); each account otherwise applies atomically
         // (all-or-nothing), so a fault never leaves a torn subset of an
         // account's sessions.
+        adoption_stage = "session and attachment relations";
         var session_accounts: usize = 0;
         var sessions_restored: usize = 0;
         var detached_session_seq: u64 = 0;
@@ -29520,6 +29892,7 @@ pub const LinuxServer = struct {
         // SQEs staged. The first reactor turn must reserve SQ space for
         // accept/wake/timer and inherited client activation before any redial.
         // Config-managed [mesh].connect peers are likewise staged by runOnce.
+        adoption_stage = "mesh redial staging";
         var redialed: usize = 0;
         var redial_replacement: std.ArrayListUnmanaged(posix.sockaddr.in6) = .empty;
         defer redial_replacement.deinit(self.allocator);
@@ -29577,6 +29950,7 @@ pub const LinuxServer = struct {
         // (crypto + inner framing) and RESYNC with the peer to refill the roster.
         // These are disjoint from the re-dial hints above (a preserved link never
         // sealed one), so there is no double-connect.
+        adoption_stage = "secured mesh link adoption";
         var s2s_resumed: usize = 0;
         for (caps) |c| {
             if (c.header.kind != .s2s_link) continue;
@@ -29618,6 +29992,7 @@ pub const LinuxServer = struct {
         // but drains candidate transition queues and suppresses client/history/
         // activity emissions. Any fallible or semantically invalid projection
         // rejects the entire handoff.
+        adoption_stage = "session replica projection";
         if (!self.reprojectLiveSessionReplicasV2(.helix_silent) or
             self.sessions.dirtyReplicaRowCount() != 0 or
             self.sessions.dirtyReplicaProjectionRowCount() != 0 or
@@ -29627,6 +30002,52 @@ pub const LinuxServer = struct {
             world_replacement.swapWorldInto(&self.world);
             srvLog("onyx-server: UPGRADE resume fatal — inherited session-replica projection was incomplete\n", .{});
             return error.InvalidInheritedHandoff;
+        }
+
+        adoption_stage = "native pre-commit preparation";
+        var native_bot_stage: ?NativeBotStage = null;
+        defer if (native_bot_stage) |*stage| stage.deinit();
+        if (comptime builtin.os.tag == .openbsd) {
+            native_bot_stage = self.stageNativeBotGrants(bot_grant_checkpoint) catch |err| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("onyx-server: UPGRADE resume fatal — native bot staging failed ({s})\n", .{@errorName(err)});
+                return error.InvalidInheritedHandoff;
+            };
+            if (self.account_services) |svc| {
+                // A candidate may read the serving predecessor's WAL, but must
+                // not recover, compact, append or repair it before COMMIT.
+                if (comptime @hasDecl(@TypeOf(svc.store.*), "isReadOnly")) {
+                    if (!svc.store.isReadOnly()) {
+                        world_replacement.swapWorldInto(&self.world);
+                        srvLog("onyx-server: UPGRADE resume fatal — native candidate store is mutable\n", .{});
+                        return error.InvalidInheritedHandoff;
+                    }
+                    history_durable.replaceAll(HistoryStore, svc.store, &history_replacement) catch |err| {
+                        world_replacement.swapWorldInto(&self.world);
+                        srvLog("onyx-server: UPGRADE resume fatal — native durable history validation failed ({s})\n", .{@errorName(err)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    svc.store.preparePromotion() catch |err| {
+                        world_replacement.swapWorldInto(&self.world);
+                        srvLog("onyx-server: UPGRADE resume fatal — native store promotion preparation failed ({s})\n", .{@errorName(err)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else {
+                    world_replacement.swapWorldInto(&self.world);
+                    return error.InvalidInheritedHandoff;
+                }
+            }
+            const barrier = self.config.native_adopt_barrier.?;
+            barrier.readyAndAwaitCommit(barrier.ctx) catch |err| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("onyx-server: UPGRADE resume fatal — native commit barrier failed ({s})\n", .{@errorName(err)});
+                return error.InvalidInheritedHandoff;
+            };
+            // The authenticated control owner returned only after COMMIT.
+            // Promotion and all remaining authority swaps cannot fail.
+            if (self.account_services) |svc| {
+                if (comptime @hasDecl(@TypeOf(svc.store.*), "promotePrepared")) svc.store.promotePrepared();
+            }
         }
 
         // Single no-fail commit edge. Every decoder, allocator, relation join,
@@ -29675,7 +30096,10 @@ pub const LinuxServer = struct {
         self.mesh_clock_lock.unlock();
         std.mem.swap(HistoryStore, &self.history, &history_replacement);
         std.mem.swap(search_index_mod.SearchIndex, &self.search_index, &search_replacement);
-        self.snapshotDurableHistory();
+        // Identical durable history is a no-op. Divergent carried state still
+        // needs this legacy fallible snapshot (including V2/edit/redaction state);
+        // its publication has not yet been converted to a prepared transaction.
+        if (comptime builtin.os.tag == .linux) self.snapshotDurableHistory();
         self.event_history.publishCheckpoint(&event_history_replacement);
         std.mem.swap(
             relay_v2_replay_guard.Guard,
@@ -29741,7 +30165,11 @@ pub const LinuxServer = struct {
         // the account stays gated. Nothing in this restore sets `is_oper`.
         var bot_grants_restored: usize = 0;
         var bot_grants_dropped: usize = 0;
-        if (bot_grant_checkpoint) |snap| {
+        if (comptime builtin.os.tag == .openbsd) {
+            const stage = &native_bot_stage.?;
+            std.mem.swap(bot_grant_snapshot.Table, &self.bot_grants, stage.table);
+            std.mem.swap(bot_registry_mod.BotRegistry, &self.bot_registry, &stage.registry);
+        } else if (bot_grant_checkpoint) |snap| {
             var bot_it = snap.botIterator();
             while (bot_it.next()) |account| {
                 self.bot_grants.insertBot(account) catch {
@@ -29797,6 +30225,9 @@ pub const LinuxServer = struct {
         // re-enter handoff abandonment.
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
+        self.config.native_arena_bytes = null;
+        self.config.native_adopt_barrier = null;
+        self.config.native_listener_manifest = &.{};
         // Every carried descriptor is now reactor-owned. Drop the manifest
         // without closing it; ordinary connection teardown owns them from here.
         self.clearInheritedStateFdManifest();
@@ -30379,7 +30810,7 @@ pub const LinuxServer = struct {
         // Restore exec hygiene before the final causal stamp. A bad inherited
         // descriptor rejects the candidate and leaves the manifest as the sole
         // close authority for transactional callers.
-        if (linux.errno(linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC)) != .SUCCESS) {
+        if (!setCloexec(snap.fd, true)) {
             self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
             return false;
         }
@@ -30672,7 +31103,7 @@ pub const LinuxServer = struct {
 
         // The fd survived ONE execve on purpose; re-arm CLOEXEC before the slot
         // becomes a successful candidate.
-        if (linux.errno(linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC)) != .SUCCESS) {
+        if (!setCloexec(snap.fd, true)) {
             self.rollbackInheritedS2sBeforeIo(id, snap.fd, close_fd_on_failure);
             return null;
         }
@@ -30725,17 +31156,17 @@ pub const LinuxServer = struct {
     /// RESTART-only listener handoff: re-exec preserving just the listening
     /// socket (no state arena). This is never an UPGRADE fallback.
     pub fn upgradeListenerOnly(self: *LinuxServer, requester: ?*ConnState) !void {
-        _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
+        if (!setCloexec(self.rx().listener_fd, false)) return error.InvalidInheritedListener;
         const exe_target = self.config.exe_path orelse "/proc/self/exe";
         var plan = helix_live.buildListenerExecPlan(self.allocator, exe_target, self.rx().listener_fd, self.config.config_path) catch |e| {
-            _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            _ = setCloexec(self.rx().listener_fd, true);
             var eb: [96]u8 = undefined;
             self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
         defer plan.deinit(self.allocator);
         plan.commit(self.allocator) catch |e| {
-            _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            _ = setCloexec(self.rx().listener_fd, true);
             var eb: [96]u8 = undefined;
             self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
@@ -30813,9 +31244,13 @@ pub const LinuxServer = struct {
             self.traceLog(.info, .s2s, "skipped plaintext S2S dial ([mesh].require_secured)");
             return error.SecuredS2sRequired;
         }
-        // Dual-stack outbound socket: connects to a real IPv6 peer directly and
-        // to an IPv4 peer via its IPv4-mapped form (::ffff:a.b.c.d).
-        const fd = try socketTcp6();
+        // The logical dial/capsule address remains canonical in6. OpenBSD has
+        // no mapped-v4 sockets: the backend translates that address for an
+        // AF_INET socket before connect; real IPv6 uses AF_INET6 on both OSes.
+        const fd = if (builtin.os.tag == .openbsd and isV4Mapped(addr.addr))
+            try socketTcp()
+        else
+            try socketTcp6();
         errdefer closeFd(fd);
         const id = try self.rx().clients.alloc(ConnState.init(fd));
         errdefer _ = self.rx().clients.free(id);
@@ -31224,15 +31659,19 @@ pub const LinuxServer = struct {
         var path_buf: [flight_path_max + 1]u8 = undefined;
         @memcpy(path_buf[0..path.len], path);
         path_buf[path.len] = 0;
-        const opened = linux.open(path_buf[0..path.len :0], .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .TRUNC = true,
-            .CLOEXEC = true,
-        }, 0o600);
-        if (linux.errno(opened) != .SUCCESS) return;
-        const fd: linux.fd_t = @intCast(opened);
-        defer _ = linux.close(fd);
+        const fd: linux.fd_t = if (builtin.os.tag == .openbsd)
+            os_runtime.openTruncateZ(path_buf[0..path.len :0], 0o600) catch return
+        else blk: {
+            const opened = linux.open(path_buf[0..path.len :0], .{
+                .ACCMODE = .WRONLY,
+                .CREAT = true,
+                .TRUNC = true,
+                .CLOEXEC = true,
+            }, 0o600);
+            if (linux.errno(opened) != .SUCCESS) return;
+            break :blk @intCast(opened);
+        };
+        defer os_runtime.close(fd);
 
         // Same oldest-to-newest window as FlightRecorder.dump, one event at a
         // time, so the fault path does not stage the whole ring on the stack.
@@ -39349,7 +39788,14 @@ pub const LinuxServer = struct {
         }
         const svc = self.account_services orelse return self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         const account = conn.session.account() orelse return self.failReply(conn, command, "NOT_LOGGED_IN", "Log in before requesting a session token");
-        const now_unix: i64 = @divTrunc(self.nowMs(), 1000);
+        // Durable expiry and the SASL verifier share the Unix clock domain.
+        // Refuse an unavailable clock before rotating any stored credential.
+        const wall_ms = if (self.reactor) |r|
+            r.wallMillis()
+        else
+            platform.realtimeMillisChecked() orelse return self.failReply(conn, command, "TOKEN_ISSUE_FAILED", "Could not issue session token");
+        const now_unix = @divTrunc(wall_ms, 1000);
+        if (now_unix <= 0) return self.failReply(conn, command, "TOKEN_ISSUE_FAILED", "Could not issue session token");
         const issued = svc.issueSessionToken(account, now_unix) catch return self.failReply(conn, command, "TOKEN_ISSUE_FAILED", "Could not issue session token");
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(
@@ -47423,8 +47869,8 @@ pub const LinuxServer = struct {
                 .forwarded = false,
                 .hops = 0,
             };
-            // delivery_account only outlives the call when actually forwarded (it
-            // then points into the store); for the direct case use `to`.
+            // Direct delivery borrows `to`; a forwarded account borrows the
+            // forwarding store. Consume either before changing its owner.
             const delivery = if (decision.forwarded) decision.delivery_account else to;
             // A forward target must itself be a known account.
             if (decision.forwarded) {
@@ -53950,7 +54396,7 @@ pub const LinuxServer = struct {
 /// Public entry point. `LinuxServer` is the io_uring fast path. Other targets
 /// construct `PortableServer`, which serves on the native `IoBackend`.
 /// Helix USR2 adoption stays on `LinuxServer`.
-pub const Server = if (builtin.os.tag == .linux) LinuxServer else PortableServer;
+pub const Server = if (builtin.os.tag == .linux or builtin.os.tag == .openbsd) LinuxServer else PortableServer;
 
 const PortableChan = struct {
     name: []u8,
@@ -53988,8 +54434,10 @@ const PortableServer = struct {
     backend: io_backend.IoBackend = undefined,
     listener: linux.fd_t = -1,
     port: u16 = 0,
-    conns: []*PortableConn = &.{},
-    chans: []PortableChan = &.{},
+    max_clients: usize = 0,
+    chanlimit: usize = 0,
+    conns: std.ArrayList(*PortableConn) = .empty,
+    chans: std.ArrayList(PortableChan) = .empty,
     next_slot: u32 = 1,
     pending: bool = false,
     wake_armed: bool = false,
@@ -54028,6 +54476,8 @@ const PortableServer = struct {
             .backend = backend,
             .listener = listener.fd,
             .port = listener.port,
+            .max_clients = config.max_clients,
+            .chanlimit = config.chanlimit,
         };
     }
     /// Heap slot used by `main`. Same listener and backend as `init`.
@@ -54037,7 +54487,7 @@ const PortableServer = struct {
     pub fn deinit(self: *PortableServer) void {
         const listen_token = RingFdToken{ .slot = 0, .gen = 1 };
         self.backend.cancel(.accept, listen_token) catch {};
-        for (self.conns) |conn| {
+        for (self.conns.items) |conn| {
             if (conn.recv_armed) self.backend.cancel(.recv, conn.token) catch {};
             if (conn.send_armed) self.backend.cancel(.send, conn.token) catch {};
         }
@@ -54052,13 +54502,13 @@ const PortableServer = struct {
         }
         self.backend.deinit();
         self.freeChans();
-        for (self.conns) |conn| {
+        for (self.conns.items) |conn| {
             io_backend.closeSocket(conn.fd);
             self.allocator.destroy(conn.state);
             self.allocator.destroy(conn);
         }
-        if (self.conns.len != 0) self.allocator.free(self.conns);
-        self.conns = &.{};
+        self.conns.deinit(self.allocator);
+        self.conns = .empty;
         io_backend.closeSocket(self.listener);
         self.listener = -1;
     }
@@ -54090,6 +54540,7 @@ const PortableServer = struct {
             _ = self.backend.submit() catch return error.Unsupported;
             self.pending = false;
         }
+        try self.retireClosedConns();
     }
     /// Serve loop `main` runs after `init` returns a listener.
     pub fn runThreaded(self: *PortableServer, run: *std.atomic.Value(bool)) void {
@@ -54104,7 +54555,7 @@ const PortableServer = struct {
     fn dispatch(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
         switch (ev.op) {
             .timeout => self.wake_armed = false,
-            .cancel, .poll => {},
+            .cancel, .poll, .connect => {},
             .accept => try self.onAccept(ev),
             .recv => try self.onRecv(ev),
             .send => try self.onSend(ev),
@@ -54121,6 +54572,7 @@ const PortableServer = struct {
     fn onRecv(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
         const conn = self.findConn(ev.token) orelse return;
         if (!self.backend.levelTriggered()) conn.recv_armed = false;
+        if (!conn.live) return;
         if (ev.result < 0) {
             if (portableAgain(ev.result)) {
                 if (!self.backend.levelTriggered()) try self.armRecv(conn);
@@ -54140,6 +54592,7 @@ const PortableServer = struct {
     fn onSend(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
         const conn = self.findConn(ev.token) orelse return;
         conn.send_armed = false;
+        if (!conn.live) return;
         if (ev.result < 0) {
             if (portableAgain(ev.result)) {
                 try self.armSend(conn);
@@ -54149,7 +54602,7 @@ const PortableServer = struct {
             return;
         }
         const sent: usize = @intCast(ev.result);
-        if (conn.send_off + sent > conn.send_len) {
+        if (sent == 0 or conn.send_off + sent > conn.send_len) {
             self.dropConn(conn);
             return;
         }
@@ -54158,6 +54611,12 @@ const PortableServer = struct {
     }
 
     fn adopt(self: *PortableServer, fd: linux.fd_t) ServerError!void {
+        // Closing connections still own backend buffers and count toward the
+        // allocation bound until their original completions are retired.
+        if (self.conns.items.len >= self.max_clients) {
+            io_backend.closeSocket(fd);
+            return;
+        }
         if (self.next_slot == 0) {
             io_backend.closeSocket(fd);
             return error.Unexpected;
@@ -54178,19 +54637,13 @@ const PortableServer = struct {
             .token = .{ .slot = self.next_slot, .gen = 1 },
             .state = state,
         };
-        const grown = self.allocator.alloc(*PortableConn, self.conns.len + 1) catch {
+        self.conns.append(self.allocator, conn) catch {
             self.allocator.destroy(state);
             self.allocator.destroy(conn);
             io_backend.closeSocket(fd);
             return error.OutOfMemory;
         };
-        if (self.conns.len != 0) {
-            @memcpy(grown[0..self.conns.len], self.conns);
-            self.allocator.free(self.conns);
-        }
-        grown[grown.len - 1] = conn;
-        self.conns = grown;
-        self.next_slot += 1;
+        self.next_slot +%= 1;
         self.armRecv(conn) catch |err| {
             self.dropConn(conn);
             return err;
@@ -54249,16 +54702,57 @@ const PortableServer = struct {
         if (!conn.live) return;
         self.detachChan(conn);
         conn.live = false;
-        if (conn.recv_armed) self.backend.cancel(.recv, conn.token) catch {};
-        if (conn.send_armed) self.backend.cancel(.send, conn.token) catch {};
-        conn.recv_armed = false;
-        conn.send_armed = false;
-        // Flush the EV_DELETE while the fd is still open. Closing first makes
-        // kqueue report EBADF, and that receipt aborts the listen loop.
-        _ = self.backend.submit() catch {};
-        self.pending = false;
-        io_backend.closeSocket(conn.fd);
-        conn.fd = -1;
+    }
+
+    fn retireClosedConns(self: *PortableServer) ServerError!void {
+        // Reap and dispatch the whole batch first: kqueue may already have
+        // forgotten a send registration whose completion follows an EOF here.
+        // Ring/IOCP buffers remain owned until their original CQEs arrive.
+        var i: usize = 0;
+        while (i < self.conns.items.len) {
+            const conn = self.conns.items[i];
+            if (conn.live) {
+                i += 1;
+                continue;
+            }
+            if (conn.fd >= 0) {
+                var cancelled = false;
+                if (conn.recv_armed) {
+                    self.backend.cancel(.recv, conn.token) catch return error.Unsupported;
+                    cancelled = true;
+                }
+                if (conn.send_armed) {
+                    self.backend.cancel(.send, conn.token) catch return error.Unsupported;
+                    cancelled = true;
+                }
+                if (cancelled) _ = self.backend.submit() catch return error.Unsupported;
+                if (self.backend.levelTriggered()) {
+                    conn.recv_armed = false;
+                    conn.send_armed = false;
+                }
+                io_backend.closeSocket(conn.fd);
+                conn.fd = -1;
+            }
+            if (conn.recv_armed or conn.send_armed) {
+                i += 1;
+                continue;
+            }
+            _ = self.conns.swapRemove(i);
+            self.allocator.destroy(conn.state);
+            self.allocator.destroy(conn);
+        }
+        // Channel pointers can be in use by the current fanout, so reclaim
+        // empty channels only after the entire completion batch has finished.
+        i = 0;
+        while (i < self.chans.items.len) {
+            if (self.chans.items[i].live != 0) {
+                i += 1;
+                continue;
+            }
+            const chan = self.chans.swapRemove(i);
+            self.allocator.free(chan.name);
+            self.allocator.free(chan.members);
+        }
     }
 
     fn handleLine(self: *PortableServer, conn: *PortableConn, line: []const u8) ServerError!void {
@@ -54266,10 +54760,22 @@ const PortableServer = struct {
             self.dropConn(conn);
             return;
         };
+        if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
+            self.dropConn(conn);
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(parsed.command, "NICK") and parsed.param_count != 0) {
+            const requested = parsed.paramSlice()[0];
+            for (self.conns.items) |other| {
+                if (!other.live or other == conn or !other.state.session.registration.nick_seen) continue;
+                if (std.ascii.eqlIgnoreCase(other.state.session.displayName(), requested))
+                    return self.portableNumeric(conn, "433", requested, "Nickname is already in use");
+            }
+        }
         if (conn.state.session.registered() and
             (std.ascii.eqlIgnoreCase(parsed.command, "JOIN") or std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")))
         {
-            try self.handleChannel(conn, parsed);
+            self.handleChannel(conn, parsed) catch self.dropConn(conn);
             return;
         }
         var sink = PortableSendSink{ .conn = conn };
@@ -54277,6 +54783,10 @@ const PortableServer = struct {
             self.dropConn(conn);
             return;
         };
+        if (conn.state.session.client.registration.prereg == .closing) {
+            self.dropConn(conn);
+            return;
+        }
         try self.armSend(conn);
     }
 
@@ -54288,6 +54798,15 @@ const PortableServer = struct {
             if (parsed.param_count == 0) return self.portableNumeric(conn, "461", "JOIN", "Not enough parameters");
             const name = parsed.paramSlice()[0];
             if (!portableChanName(name)) return self.portableNumeric(conn, "479", name, "Illegal channel name");
+            if (self.findChan(name)) |existing| {
+                if (self.onChan(existing, conn)) return;
+            }
+            var joined: usize = 0;
+            for (self.chans.items) |*joined_chan| {
+                if (self.onChan(joined_chan, conn)) joined += 1;
+            }
+            if (joined >= self.chanlimit)
+                return self.portableNumeric(conn, "405", name, "You have joined too many channels");
             const chan = try self.ensureChan(name);
             try self.addMember(chan, conn);
             try self.broadcastJoin(chan, conn);
@@ -54326,10 +54845,14 @@ const PortableServer = struct {
             chan.name,
         }) catch return error.OutputTooSmall;
         var i: usize = 0;
-        while (i < chan.live) : (i += 1) {
+        while (i < chan.live) {
             const dest = chan.members[i];
-            if (!dest.live) continue;
-            self.enqueueBytes(dest, line) catch {};
+            if (!dest.live) {
+                i += 1;
+                continue;
+            }
+            self.enqueueBytes(dest, line) catch self.dropConn(dest);
+            if (i < chan.live and chan.members[i] == dest) i += 1;
         }
     }
 
@@ -54375,10 +54898,14 @@ const PortableServer = struct {
             text,
         }) catch return error.OutputTooSmall;
         var i: usize = 0;
-        while (i < chan.live) : (i += 1) {
+        while (i < chan.live) {
             const dest = chan.members[i];
-            if (!dest.live or dest == from) continue;
-            self.enqueueBytes(dest, line) catch {};
+            if (!dest.live or dest == from) {
+                i += 1;
+                continue;
+            }
+            self.enqueueBytes(dest, line) catch self.dropConn(dest);
+            if (i < chan.live and chan.members[i] == dest) i += 1;
         }
     }
 
@@ -54393,22 +54920,14 @@ const PortableServer = struct {
     fn ensureChan(self: *PortableServer, name: []const u8) ServerError!*PortableChan {
         if (self.findChan(name)) |existing| return existing;
         const owned = self.allocator.alloc(u8, name.len) catch return error.OutOfMemory;
+        errdefer self.allocator.free(owned);
         @memcpy(owned, name);
-        const grown = self.allocator.alloc(PortableChan, self.chans.len + 1) catch {
-            self.allocator.free(owned);
-            return error.OutOfMemory;
-        };
-        if (self.chans.len != 0) {
-            @memcpy(grown[0..self.chans.len], self.chans);
-            self.allocator.free(self.chans);
-        }
-        grown[grown.len - 1] = .{
+        self.chans.append(self.allocator, .{
             .name = owned,
             .members = &.{},
             .live = 0,
-        };
-        self.chans = grown;
-        return &self.chans[self.chans.len - 1];
+        }) catch return error.OutOfMemory;
+        return &self.chans.items[self.chans.items.len - 1];
     }
 
     fn addMember(self: *PortableServer, chan: *PortableChan, conn: *PortableConn) ServerError!void {
@@ -54435,14 +54954,14 @@ const PortableServer = struct {
     }
 
     fn findChan(self: *PortableServer, name: []const u8) ?*PortableChan {
-        for (self.chans) |*chan| {
+        for (self.chans.items) |*chan| {
             if (std.ascii.eqlIgnoreCase(chan.name, name)) return chan;
         }
         return null;
     }
 
     fn detachChan(self: *PortableServer, conn: *PortableConn) void {
-        for (self.chans) |*chan| {
+        for (self.chans.items) |*chan| {
             var w: usize = 0;
             var i: usize = 0;
             while (i < chan.live) : (i += 1) {
@@ -54455,17 +54974,17 @@ const PortableServer = struct {
     }
 
     fn freeChans(self: *PortableServer) void {
-        for (self.chans) |chan| {
+        for (self.chans.items) |chan| {
             self.allocator.free(chan.name);
             if (chan.members.len != 0) self.allocator.free(chan.members);
         }
-        if (self.chans.len != 0) self.allocator.free(self.chans);
-        self.chans = &.{};
+        self.chans.deinit(self.allocator);
+        self.chans = .empty;
     }
 
     fn findConn(self: *PortableServer, token: RingFdToken) ?*PortableConn {
-        for (self.conns) |conn| {
-            if (conn.live and conn.token.slot == token.slot and conn.token.gen == token.gen) return conn;
+        for (self.conns.items) |conn| {
+            if (conn.token.slot == token.slot and conn.token.gen == token.gen) return conn;
         }
         return null;
     }
@@ -54476,6 +54995,7 @@ fn portableAgain(result: i32) bool {
 }
 
 test "GAP-X1 PortableServer answers PING through processLine" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = PortableServer.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
         else => return err,
@@ -54483,31 +55003,31 @@ test "GAP-X1 PortableServer answers PING through processLine" {
     defer server.deinit();
     const port = try server.boundPort();
     try std.testing.expectError(error.SocketFailed, io_backend.pullAccept(-1));
-    var addr = linux.sockaddr.in{
+    var addr = posix.sockaddr.in{
         .port = std.mem.nativeToBig(u16, port),
         .addr = std.mem.nativeToBig(u32, 0x7f000001),
     };
-    var tv = linux.timeval{ .sec = 2, .usec = 0 };
+    var tv = posix.timeval{ .sec = 2, .usec = 0 };
     const rounds = [_][]const u8{ "lane", "two", "third" };
     for (rounds, 0..) |token, round| {
-        const raw = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+        const raw = portable_test_system.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
         if (posix.errno(raw) != .SUCCESS) {
             if (round == 0) return error.SkipZigTest;
             return error.Unexpected;
         }
         const client: linux.fd_t = @intCast(raw);
-        defer _ = linux.close(client);
-        if (posix.errno(linux.connect(client, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.Unexpected;
-        _ = linux.setsockopt(client, posix.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        defer _ = portable_test_system.close(client);
+        if (posix.errno(portable_test_system.connect(client, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) != .SUCCESS) return error.Unexpected;
+        if (posix.errno(portable_test_system.setsockopt(client, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(posix.timeval))) != .SUCCESS) return error.Unexpected;
         var msg_buf: [32]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "PING {s}\r\n", .{token}) catch return error.Unexpected;
         var off: usize = 0;
         while (off < msg.len) {
-            const wrote = linux.write(client, msg[off..].ptr, msg.len - off);
+            const wrote = portable_test_system.write(client, msg[off..].ptr, msg.len - off);
             switch (posix.errno(wrote)) {
                 .SUCCESS => {
                     if (wrote == 0) return error.Unexpected;
-                    off += wrote;
+                    off += @intCast(wrote);
                 },
                 .INTR => continue,
                 else => return error.Unexpected,
@@ -54516,12 +55036,12 @@ test "GAP-X1 PortableServer answers PING through processLine" {
         var spins: u8 = 0;
         while (spins < 12) : (spins += 1) try server.runOnce();
         var got: [128]u8 = @splat(0);
-        const read_rc = linux.read(client, &got, got.len);
+        const read_rc = portable_test_system.read(client, &got, got.len);
         if (posix.errno(read_rc) != .SUCCESS or read_rc == 0) return error.Unexpected;
-        const text = got[0..read_rc];
+        const text = got[0..@intCast(read_rc)];
         try std.testing.expect(std.mem.indexOf(u8, text, "PONG") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, token) != null);
-        _ = linux.shutdown(client, linux.SHUT.RDWR);
+        _ = portable_test_system.shutdown(client, 2);
         var drain: u8 = 0;
         while (drain < 12) : (drain += 1) try server.runOnce();
     }
@@ -54530,41 +55050,42 @@ test "GAP-X1 PortableServer answers PING through processLine" {
 }
 
 test "GAP-X4 PortableServer joins and fans out PRIVMSG" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = PortableServer.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
     const port = try server.boundPort();
-    var addr = linux.sockaddr.in{
+    var addr = posix.sockaddr.in{
         .port = std.mem.nativeToBig(u16, port),
         .addr = std.mem.nativeToBig(u32, 0x7f000001),
     };
-    var tv = linux.timeval{ .sec = 2, .usec = 0 };
+    var tv = posix.timeval{ .sec = 2, .usec = 0 };
     var fds = [3]linux.fd_t{ -1, -1, -1 };
     defer {
         for (fds) |fd| {
-            if (fd >= 0) _ = linux.close(fd);
+            if (fd >= 0) _ = portable_test_system.close(fd);
         }
     }
     for (&fds, 0..) |*slot, i| {
-        const raw = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+        const raw = portable_test_system.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
         if (posix.errno(raw) != .SUCCESS) {
             if (i == 0) return error.SkipZigTest;
             return error.Unexpected;
         }
         slot.* = @intCast(raw);
-        if (posix.errno(linux.connect(slot.*, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.Unexpected;
-        _ = linux.setsockopt(slot.*, posix.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        if (posix.errno(portable_test_system.connect(slot.*, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) != .SUCCESS) return error.Unexpected;
+        if (posix.errno(portable_test_system.setsockopt(slot.*, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(posix.timeval))) != .SUCCESS) return error.Unexpected;
         var reg_buf: [64]u8 = undefined;
         const reg = std.fmt.bufPrint(&reg_buf, "NICK b{d}\r\nUSER b{d} 0 * :bench\r\n", .{ i, i }) catch return error.Unexpected;
         var off: usize = 0;
         while (off < reg.len) {
-            const wrote = linux.write(slot.*, reg[off..].ptr, reg.len - off);
+            const wrote = portable_test_system.write(slot.*, reg[off..].ptr, reg.len - off);
             switch (posix.errno(wrote)) {
                 .SUCCESS => {
                     if (wrote == 0) return error.Unexpected;
-                    off += wrote;
+                    off += @intCast(wrote);
                 },
                 .INTR => continue,
                 else => return error.Unexpected,
@@ -54577,11 +55098,11 @@ test "GAP-X4 PortableServer joins and fans out PRIVMSG" {
         const join = std.fmt.bufPrint(&join_buf, "JOIN #bench\r\n", .{}) catch return error.Unexpected;
         var off: usize = 0;
         while (off < join.len) {
-            const wrote = linux.write(fd, join[off..].ptr, join.len - off);
+            const wrote = portable_test_system.write(fd, join[off..].ptr, join.len - off);
             switch (posix.errno(wrote)) {
                 .SUCCESS => {
                     if (wrote == 0) return error.Unexpected;
-                    off += wrote;
+                    off += @intCast(wrote);
                 },
                 .INTR => continue,
                 else => return error.Unexpected,
@@ -54594,11 +55115,11 @@ test "GAP-X4 PortableServer joins and fans out PRIVMSG" {
     const msg = std.fmt.bufPrint(&msg_buf, "PRIVMSG #bench :{s}\r\n", .{token}) catch return error.Unexpected;
     var off: usize = 0;
     while (off < msg.len) {
-        const wrote = linux.write(fds[0], msg[off..].ptr, msg.len - off);
+        const wrote = portable_test_system.write(fds[0], msg[off..].ptr, msg.len - off);
         switch (posix.errno(wrote)) {
             .SUCCESS => {
                 if (wrote == 0) return error.Unexpected;
-                off += wrote;
+                off += @intCast(wrote);
             },
             .INTR => continue,
             else => return error.Unexpected,
@@ -54607,16 +55128,121 @@ test "GAP-X4 PortableServer joins and fans out PRIVMSG" {
     if (!try portableExpect(&server, fds[1], token)) return error.Unexpected;
     if (!try portableExpect(&server, fds[2], token)) return error.Unexpected;
     var live_nodelay: usize = 0;
-    for (server.conns) |conn| {
+    for (server.conns.items) |conn| {
         if (!conn.live) continue;
         var nodelay: u32 = 0;
         var opt_len: posix.socklen_t = @sizeOf(u32);
-        const rc = linux.getsockopt(conn.fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&nodelay), &opt_len);
-        if (posix.errno(rc) != .SUCCESS or nodelay != 1) return error.Unexpected;
+        const rc = portable_test_system.getsockopt(conn.fd, posix.IPPROTO.TCP, 1, @ptrCast(&nodelay), &opt_len);
+        if (posix.errno(rc) != .SUCCESS or opt_len != @sizeOf(u32)) return error.Unexpected;
+        // OpenBSD returns the enabled TF_NODELAY bit (4); the public option is
+        // boolean. Linux normalizes its readback to exactly 1.
+        const enabled = if (builtin.os.tag == .openbsd) nodelay != 0 else nodelay == 1;
+        try std.testing.expect(enabled);
         live_nodelay += 1;
     }
     if (live_nodelay != 3) return error.Unexpected;
+
+    // A full queue disconnects that receiver. Detaching its membership must
+    // not skip the following healthy receiver during the same fan-out.
+    var slow_token: ?RingFdToken = null;
+    for (server.conns.items) |conn| {
+        if (!std.mem.eql(u8, conn.state.session.displayName(), "b1")) continue;
+        try std.testing.expect(!conn.send_armed);
+        slow_token = conn.token;
+        conn.send_len = conn.send_buf.len;
+    }
+    try std.testing.expect(slow_token != null);
+    try writeAllFd(fds[0], "PRIVMSG #bench :after-slow-receiver\r\n");
+    try std.testing.expect(try portableExpect(&server, fds[2], "after-slow-receiver"));
+    var drains: usize = 0;
+    while (server.findConn(slow_token.?) != null and drains < 16) : (drains += 1)
+        try server.runOnce();
+    try std.testing.expect(server.findConn(slow_token.?) == null);
     std.debug.print("GAP-X4 branch=PortableServer registered three clients, answered 366, fanned out PRIVMSG, and set TCP_NODELAY on {s}\n", .{@tagName(server.backend.family)});
+}
+
+test "PortableServer churn preserves nick ownership and ignores retired completion tokens" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var server = PortableServer.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 2, .chanlimit = 1 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var owner_fd = try connectPortableLoopbackForTest(port);
+    defer if (owner_fd >= 0) closeFd(owner_fd);
+    try writeAllFd(owner_fd, "NICK Owner\r\nUSER owner 0 * :Owner\r\n");
+    try std.testing.expect(try portableExpect(&server, owner_fd, " 001 "));
+    const owner = server.conns.items[0];
+    try writeAllFd(owner_fd, "JOIN #keeper\r\n");
+    try std.testing.expect(try portableExpect(&server, owner_fd, " 366 "));
+    try writeAllFd(owner_fd, "JOIN #over-channel-limit\r\n");
+    try std.testing.expect(try portableExpect(&server, owner_fd, " 405 "));
+    try std.testing.expectEqual(@as(usize, 1), server.chans.items.len);
+
+    const guest_fd = try connectPortableLoopbackForTest(port);
+    var guest_open = true;
+    defer if (guest_open) closeFd(guest_fd);
+    try writeAllFd(guest_fd, "NICK owner\r\nUSER guest 0 * :Guest\r\n");
+    try std.testing.expect(try portableExpect(&server, guest_fd, " 433 "));
+    try std.testing.expect(!server.conns.items[1].state.session.registered());
+    try writeAllFd(guest_fd, "NICK Guest\r\n");
+    try std.testing.expect(try portableExpect(&server, guest_fd, " 001 "));
+    try writeAllFd(guest_fd, "NICK OWNER\r\n");
+    try std.testing.expect(try portableExpect(&server, guest_fd, " 433 "));
+    try std.testing.expectEqualStrings("Guest", server.conns.items[1].state.session.displayName());
+    const excess_fd = try connectPortableLoopbackForTest(port);
+    defer closeFd(excess_fd);
+    const next_slot = server.next_slot;
+    var admission_spins: usize = 0;
+    while (admission_spins < 4) : (admission_spins += 1) try server.runOnce();
+    var refused: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try readFd(excess_fd, &refused));
+    try std.testing.expectEqual(@as(usize, 2), server.conns.items.len);
+    try std.testing.expectEqual(next_slot, server.next_slot);
+    closeFd(guest_fd);
+    guest_open = false;
+    var drains: usize = 0;
+    while (server.conns.items.len != 1 and drains < 16) : (drains += 1) try server.runOnce();
+    try std.testing.expectEqual(@as(usize, 1), server.conns.items.len);
+
+    for (0..64) |round| {
+        const fd = try connectPortableLoopbackForTest(port);
+        var open = true;
+        defer if (open) closeFd(fd);
+        var register: [128]u8 = undefined;
+        const commands = try std.fmt.bufPrint(&register, "NICK Churn\r\nUSER churn 0 * :Churn\r\nJOIN #churn-{d}\r\n", .{round});
+        try writeAllFd(fd, commands);
+        var spins: usize = 0;
+        while ((server.conns.items.len != 2 or !server.conns.items[1].state.session.registered()) and spins < 16) : (spins += 1)
+            try server.runOnce();
+        try std.testing.expectEqual(@as(usize, 2), server.conns.items.len);
+        try std.testing.expect(server.conns.items[1].state.session.registered());
+        try std.testing.expectEqual(@as(usize, 2), server.chans.items.len);
+        const retired = server.conns.items[1].token;
+        try writeAllFd(fd, "QUIT :churn complete\r\n");
+        drains = 0;
+        while (server.conns.items.len != 1 and drains < 16) : (drains += 1) try server.runOnce();
+        try std.testing.expectEqual(@as(usize, 1), server.conns.items.len);
+        try std.testing.expectEqual(@as(usize, 1), server.chans.items.len);
+        closeFd(fd);
+        open = false;
+        try server.dispatch(.{ .op = .recv, .token = retired, .result = 0 });
+        try server.dispatch(.{ .op = .send, .token = retired, .result = 0 });
+        try std.testing.expect(owner.live);
+    }
+    try writeAllFd(owner_fd, "PING :after-churn\r\n");
+    try std.testing.expect(try portableExpect(&server, owner_fd, "after-churn"));
+    closeFd(owner_fd);
+    owner_fd = -1;
+    drains = 0;
+    while (server.conns.items.len != 0 and drains < 16) : (drains += 1) try server.runOnce();
+    try std.testing.expectEqual(@as(usize, 0), server.conns.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.chans.items.len);
+    const reused_fd = try connectPortableLoopbackForTest(port);
+    defer closeFd(reused_fd);
+    try writeAllFd(reused_fd, "NICK owner\r\nUSER next 0 * :Next\r\n");
+    try std.testing.expect(try portableExpect(&server, reused_fd, " 001 "));
 }
 
 fn portableChanName(name: []const u8) bool {
@@ -54628,8 +55254,21 @@ fn portableChanName(name: []const u8) bool {
     return true;
 }
 
+const portable_test_system = if (builtin.os.tag == .openbsd) posix.system else linux;
+
+fn connectPortableLoopbackForTest(port: u16) !linux.fd_t {
+    const fd = if (comptime builtin.os.tag == .openbsd)
+        try connectNativeLoopbackForTest(.ipv4, port)
+    else
+        try connectLoopback(port);
+    errdefer closeFd(fd);
+    const timeout: posix.timeval = .{ .sec = 2, .usec = 0 };
+    if (posix.errno(portable_test_system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout), @sizeOf(posix.timeval))) != .SUCCESS) return error.Unexpected;
+    return fd;
+}
+
 fn portableExpect(server: *PortableServer, fd: linux.fd_t, needle: []const u8) !bool {
-    if (comptime builtin.os.tag != .linux) return error.Unsupported;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
     var acc: [8192]u8 = undefined;
     var n: usize = 0;
     var warm: u8 = 0;
@@ -54637,11 +55276,11 @@ fn portableExpect(server: *PortableServer, fd: linux.fd_t, needle: []const u8) !
     var spins: u8 = 0;
     while (spins < 4 and n < acc.len) : (spins += 1) {
         try server.runOnce();
-        const got = linux.read(fd, acc[n..].ptr, acc.len - n);
+        const got = portable_test_system.read(fd, acc[n..].ptr, acc.len - n);
         switch (posix.errno(got)) {
             .SUCCESS => {
                 if (got == 0) return false;
-                n += got;
+                n += @intCast(got);
                 if (std.mem.indexOf(u8, acc[0..n], needle) != null) return true;
             },
             .INTR, .AGAIN => continue,
@@ -54658,6 +55297,7 @@ fn expectListenerKernelOptions(fd: linux.fd_t, cpu: u32) !void {
 }
 
 test "GAP-X3 live listener sets TCP_FASTOPEN, TCP_USER_TIMEOUT, and SO_INCOMING_CPU" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const direct = createListener("127.0.0.1", 0, 8) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -54742,6 +55382,7 @@ fn expectSecretPageAdvised(page: [*]u8) !void {
 }
 
 test "GAP-X3 secret page is DONTDUMP and WIPEONFORK" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var id = try node_identity.fromSeed(@as([32]u8, @splat(0x5a)), "gap-x3");
     defer id.deinit();
     const page = id.sign_kp.secretPage() orelse return error.TestUnexpectedResult;
@@ -54752,6 +55393,7 @@ test "GAP-X3 secret page is DONTDUMP and WIPEONFORK" {
 }
 
 test "GAP-X3 openat2 resolves regular files beneath their directory and rejects magic links" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var dir_buf: [80]u8 = undefined;
     const dir = std.fmt.bufPrintSentinel(&dir_buf, "/tmp/onyx-x3-rd-{d}", .{linux.getpid()}, 0) catch return error.Unexpected;
     if (posix.errno(linux.mkdir(dir.ptr, 0o700)) != .SUCCESS) return error.Unexpected;
@@ -54795,6 +55437,7 @@ test "GAP-X3 openat2 resolves regular files beneath their directory and rejects 
 }
 
 test "GAP-X3 close_range drops surplus inherited fds and msg_ring boots a second reactor" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var source = ringlane.Ring.init(32, .{}) catch |err| switch (err) {
         error.PermissionDenied, error.SystemOutdated, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.ArgumentsInvalid => return error.SkipZigTest,
         else => return err,
@@ -54844,6 +55487,7 @@ test "GAP-X3 close_range drops surplus inherited fds and msg_ring boots a second
 }
 
 test "GAP-X3 landlock and seccomp restrict a forked daemon sandbox" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const child = linux.fork();
     if (posix.errno(child) != .SUCCESS) return error.Unexpected;
     if (child == 0) linux.exit_group(kernel_linux.sandboxChildStatus());
@@ -55118,6 +55762,10 @@ fn restoreCloexec(fds: []const linux.fd_t) void {
 }
 
 fn setCloexec(fd: linux.fd_t, enabled: bool) bool {
+    if (builtin.os.tag == .openbsd) {
+        os_runtime.setCloexec(fd, enabled) catch return false;
+        return true;
+    }
     const flags: usize = if (enabled) posix.FD_CLOEXEC else 0;
     return linux.errno(linux.fcntl(fd, posix.F.SETFD, flags)) == .SUCCESS;
 }
@@ -55618,7 +56266,7 @@ test "GAP-X5 enqueuePlainFanout queues one line on the connection SendQ" {
 }
 
 test "GAP-O5 REHASH DRY prints diffs and applies none" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -55740,7 +56388,7 @@ test "GAP-O5 REHASH DRY prints diffs and applies none" {
 }
 
 test "GAP-V3 MEDIA ABR stores independent spatial ceilings from the hint" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -55791,7 +56439,7 @@ test "GAP-V3 MEDIA ABR stores independent spatial ceilings from the hint" {
 }
 
 test "GAP-V4 recording waits for every member and stops when one joins" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -55854,7 +56502,7 @@ test "GAP-V4 recording waits for every member and stops when one joins" {
 }
 
 test "GAP-V5 a participant or oper reads loss rtt and layer without key material" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -55966,7 +56614,7 @@ test "GAP-V5 a participant or oper reads loss rtt and layer without key material
 }
 
 test "GAP-V6 the room reads the speaking queue and the server forwards positions" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -56057,7 +56705,7 @@ fn expectFlightOnce(haystack: []const u8, needle: []const u8) !void {
 }
 
 test "GAP-O3 a fault writes the tracelog to the named file" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -56288,7 +56936,7 @@ fn resetTestSendQ(conn: *ConnState) void {
 }
 
 test "secured establishment immediately publishes authenticated trust route" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -56403,7 +57051,7 @@ test "secured establishment immediately publishes authenticated trust route" {
 }
 
 test "mesh peer-count publish and RTT probe refuse a sibling (non-reactor-0) caller" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -56455,7 +57103,7 @@ test "mesh peer-count publish and RTT probe refuse a sibling (non-reactor-0) cal
 }
 
 test "published mesh peers grow past the old 32 by 64 ceiling" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -56529,7 +57177,7 @@ test "published mesh peers grow past the old 32 by 64 ceiling" {
 }
 
 test "stats_peak_clients counts registered clients across shards" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -56601,7 +57249,7 @@ fn gapA11RosterHas(members: []const s2s_peer_mod.MemberInfo, nick: []const u8) b
 }
 
 test "DST GAP-A11 maintenance reactor re-bursts the local roster on the membership interval" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -56723,7 +57371,7 @@ test "DST GAP-A11 maintenance reactor re-bursts the local roster on the membersh
 }
 
 test "isMaintenanceReactor is false off reactor 0 and onTimerTick leaves shared last_*_ms still" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -56764,7 +57412,7 @@ test "isMaintenanceReactor is false off reactor 0 and onTimerTick leaves shared 
 }
 
 test "secured establish collision winner teardown trust lifecycle" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -56831,7 +57479,7 @@ test "secured establish collision winner teardown trust lifecycle" {
 }
 
 test "secured mesh probe deadline actively tears down a silent established socket" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -56884,7 +57532,7 @@ test "secured mesh probe deadline actively tears down a silent established socke
 }
 
 test "secured mesh probe deadline starts only after whole record reaches SendQ" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -57191,7 +57839,7 @@ test "secured live establishment replaces an expired deterministic collision win
 }
 
 test "secured collision scan passes stale loser before resolving viable route" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -57321,7 +57969,7 @@ test "client active gauge follows physical slot ownership through close and refu
 }
 
 test "non-dedup S2S close immediately removes published peer" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -57381,7 +58029,7 @@ test "non-dedup S2S close immediately removes published peer" {
 }
 
 test "session replica live publication pairs a newer lease and detached publication invalidates it" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x6a)), "lease-publisher.test");
     defer ident.deinit();
     var server = LinuxServer.init(std.testing.allocator, .{
@@ -57447,7 +58095,7 @@ test "session replica live publication pairs a newer lease and detached publicat
 }
 
 test "DST GAP-A10 late lease refresh does not emit QUIT while the session is live" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var home = try node_identity.fromSeed(@as([32]u8, @splat(0x81)), "late-lease-home.test");
     defer home.deinit();
@@ -57661,7 +58309,7 @@ fn gapA3Exchange(
 }
 
 test "DST GAP-A3 replica residence keeps two honest nicks and UID-renames a forged account" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var home = try node_identity.fromSeed(@as([32]u8, @splat(0xA3)), "a3-third.test");
     defer home.deinit();
@@ -57772,7 +58420,7 @@ test "DST GAP-A3 replica residence keeps two honest nicks and UID-renames a forg
 }
 
 test "session attachment lease encode OOM retains exact dirty token until full retry succeeds" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x6d)), "lease-oom.test");
     defer ident.deinit();
@@ -57824,7 +58472,7 @@ test "session attachment lease encode OOM retains exact dirty token until full r
 }
 
 test "session replica orphaned final revoke survives encode Store OOM and checkpoint" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x6e)), "revoke-retry.test");
     defer ident.deinit();
@@ -57879,7 +58527,7 @@ test "session replica orphaned final revoke survives encode Store OOM and checkp
 }
 
 test "session replica sweep retains expired orphan until local revoke retry succeeds" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x70)), "revoke-presweep.test");
     defer ident.deinit();
@@ -57946,7 +58594,7 @@ test "session replica sweep retains expired orphan until local revoke retry succ
 }
 
 test "session replica replay skips attachment leases for rolling-old peers without pinning burst" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
     defer pair.deinit();
@@ -58003,7 +58651,7 @@ test "session replica replay skips attachment leases for rolling-old peers witho
 }
 
 test "session replica mid-flight RESYNC restarts canonical Store without revision churn" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
     defer pair.deinit();
@@ -58094,7 +58742,7 @@ test "session replica mid-flight RESYNC restarts canonical Store without revisio
 }
 
 test "session replica value replay completes 140 objects under continuous behind-cursor renewal" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
     defer pair.deinit();
@@ -58170,7 +58818,7 @@ test "session replica value replay completes 140 objects under continuous behind
 }
 
 test "session replica conflicted lease replays both witnesses back to ingress peer" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
     defer pair.deinit();
@@ -58555,7 +59203,7 @@ test "session replica gates establishment and RESYNC membership behind every ret
 }
 
 test "session replica burst retains whole-record ciphertext across SendQ backpressure" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
     defer pair.deinit();
@@ -58689,7 +59337,7 @@ test "session replica burst retains whole-record ciphertext across SendQ backpre
 }
 
 test "session replica live fanout preserves retained ciphertext on a full peer SendQ" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
@@ -58786,7 +59434,7 @@ test "session replica live fanout preserves retained ciphertext on a full peer S
 }
 
 test "session replica secured receipt retry does not duplicate retained ciphertext" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
@@ -58849,7 +59497,7 @@ test "session replica secured receipt retry does not duplicate retained cipherte
 }
 
 test "session replica deferred sidecar retry bounds retained ciphertext" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
@@ -58929,7 +59577,7 @@ test "session replica deferred sidecar retry bounds retained ciphertext" {
 }
 
 test "session replica burst retries incomplete family after secured record allocation failure" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
     defer pair.deinit();
@@ -59006,7 +59654,7 @@ test "session replica burst retries incomplete family after secured record alloc
 }
 
 test "session replica replay leaves no inner residue after outer record allocation failure" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
     defer pair.deinit();
@@ -59069,7 +59717,7 @@ test "session replica replay leaves no inner residue after outer record allocati
 }
 
 test "session replica burst sends every legal mesh ward beyond legacy scratch cap" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
     defer pair.deinit();
@@ -59141,7 +59789,7 @@ test "session replica burst sends every legal mesh ward beyond legacy scratch ca
 }
 
 test "session replica replay budgets actual ciphertext with one-frame progress exception" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const replay_budget: usize = 256 * 1024;
     var pair = try SessionReplayTestPair.init(allocator);
@@ -59257,7 +59905,7 @@ test "session replica replay budgets actual ciphertext with one-frame progress e
 }
 
 test "maximum legal session replica fits the clamped server-link SendQ and progresses" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
     defer pair.deinit();
@@ -59410,7 +60058,7 @@ test "v2 Store hot-adoption is SQ-inert until authority-first link activation" {
 }
 
 test "secured roster repair follows inbound membership generations across asymmetric replay" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
@@ -60284,6 +60932,20 @@ fn hasSep(s: []const u8) bool {
 fn writeFileAbs(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) void {
     const zpath = allocator.dupeSentinel(u8, path, 0) catch return;
     defer allocator.free(zpath);
+    if (comptime builtin.os.tag == .openbsd) {
+        const fd = os_runtime.openTruncateZ(zpath, 0o600) catch return;
+        defer os_runtime.close(fd);
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = os_runtime.write(fd, bytes[off..]) catch |err| switch (err) {
+                error.Interrupted => continue,
+                else => return,
+            };
+            if (n == 0) return;
+            off += n;
+        }
+        return;
+    }
     const rc = linux.open(zpath, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
     if (posix.errno(rc) != .SUCCESS) return;
     const fd: linux.fd_t = @intCast(rc);
@@ -60537,7 +61199,171 @@ fn formatIp6(out: []u8, address: [16]u8) ![]const u8 {
     });
 }
 
+fn wildcardListenerHost(host: []const u8) bool {
+    return host.len == 0 or std.mem.eql(u8, host, "0.0.0.0") or std.mem.eql(u8, host, "::");
+}
+
+fn primaryListenerHost(host: []const u8) []const u8 {
+    return if (builtin.os.tag == .openbsd and wildcardListenerHost(host)) "0.0.0.0" else host;
+}
+
+fn nativeManifestListener(config: Config, shard: u12, kind: ListenerKind, companion: bool) ?linux.fd_t {
+    if (comptime builtin.os.tag != .openbsd) return null;
+    const family: ListenerFamily = if (companion or std.mem.indexOfScalar(u8, primaryListenerHost(config.host), ':') != null) .ipv6 else .ipv4;
+    for (config.native_listener_manifest) |row| {
+        if (row.shard == shard and row.kind == kind and row.family == family) return row.fd;
+    }
+    return null;
+}
+
+fn adoptNativeListener(fd: linux.fd_t) !linux.fd_t {
+    try os_runtime.setCloexec(fd, true);
+    try os_runtime.setNonblocking(fd);
+    return fd;
+}
+
+fn nativeListenerEnabled(config: Config, shard: u12, kind: ListenerKind) bool {
+    return switch (kind) {
+        .plain => true,
+        .s2s => config.s2s_port != 0 and shard == 0,
+        .tls => LinuxServer.certReady(config),
+        .ws => config.ws_enabled and (LinuxServer.certReady(config) or config.ws_allow_plain),
+    };
+}
+
+fn nativeListenerPort(config: Config, kind: ListenerKind) u16 {
+    return switch (kind) {
+        .plain => config.port,
+        .s2s => config.s2s_port,
+        .tls => config.tls_port,
+        .ws => config.ws_port,
+    };
+}
+
+fn validateNativeInheritedListenerClaims(config: Config) !void {
+    if (comptime builtin.os.tag != .openbsd) return;
+    const rows = config.native_listener_manifest;
+    if (config.native_arena_bytes != null or config.native_adopt_barrier != null) {
+        if (config.native_arena_bytes == null or config.native_adopt_barrier == null or rows.len == 0 or
+            config.resume_arena_fd != null) return error.InvalidInheritedListener;
+    }
+    if (rows.len != 0) {
+        if (config.inherited_listener_fd != null or config.inherited_listener_fds.len != 0 or
+            config.inherited_listener_companion_fds.len != 0) return error.InvalidInheritedListener;
+        const shards = LinuxServer.clampShards(config);
+        const wildcard = wildcardListenerHost(config.host);
+        const primary_family: ListenerFamily = if (std.mem.indexOfScalar(u8, primaryListenerHost(config.host), ':') != null) .ipv6 else .ipv4;
+        var expected: usize = 0;
+        for (0..shards) |shard| {
+            for (std.enums.values(ListenerKind)) |kind| {
+                if (nativeListenerEnabled(config, @intCast(shard), kind)) expected += if (wildcard) @as(usize, 2) else 1;
+            }
+        }
+        if (rows.len != expected) return error.InvalidInheritedListener;
+        for (rows, 0..) |row, i| {
+            if (row.shard >= shards or row.fd < 0 or !nativeListenerEnabled(config, row.shard, row.kind) or
+                (!wildcard and row.family != primary_family)) return error.InvalidInheritedListener;
+            for (rows[0..i]) |prior| {
+                if (prior.fd == row.fd or (prior.shard == row.shard and prior.kind == row.kind and prior.family == row.family))
+                    return error.InvalidInheritedListener;
+                // A port0 configuration still carries one exact selected port
+                // for every shard/family of this role.
+                if (prior.kind == row.kind and (try socketPort(prior.fd)) != (try socketPort(row.fd)))
+                    return error.InvalidInheritedListener;
+            }
+            const host = if (wildcard) (if (row.family == .ipv4) "0.0.0.0" else "::") else config.host;
+            try validateNativeListenerAddress(row.fd, host, nativeListenerPort(config, row.kind));
+            for (config.inherited_state_fds) |fd| if (fd == row.fd) return error.InvalidInheritedListener;
+            if (config.resume_arena_fd) |fd| if (fd == row.fd) return error.InvalidInheritedListener;
+        }
+        // Complete cardinality plus unique valid keys proves every required
+        // role/shard/family is present; init may never fall back to binding.
+        return;
+    }
+    var singular: [1]linux.fd_t = undefined;
+    const primary = if (config.inherited_listener_fds.len != 0)
+        config.inherited_listener_fds
+    else if (config.inherited_listener_fd) |fd| blk: {
+        singular[0] = fd;
+        break :blk singular[0..];
+    } else &.{};
+    const companions = config.inherited_listener_companion_fds;
+    if (wildcardListenerHost(config.host)) {
+        if (primary.len != companions.len) return error.InvalidInheritedListener;
+    } else if (companions.len != 0) return error.InvalidInheritedListener;
+    if (config.inherited_listener_fds.len != 0) {
+        if (config.inherited_listener_fd) |fd| {
+            if (fd != config.inherited_listener_fds[0]) return error.InvalidInheritedListener;
+        }
+    }
+    for (primary, 0..) |fd, i| {
+        if (fd < 0) return error.InvalidInheritedListener;
+        for (primary[0..i]) |prior| if (fd == prior) return error.InvalidInheritedListener;
+    }
+    for (companions, 0..) |fd, i| {
+        if (fd < 0) return error.InvalidInheritedListener;
+        for (primary) |prior| if (fd == prior) return error.InvalidInheritedListener;
+        for (companions[0..i]) |prior| if (fd == prior) return error.InvalidInheritedListener;
+    }
+}
+
+fn validateNativeListenerAddress(fd: linux.fd_t, host: []const u8, port: u16) !void {
+    if (comptime builtin.os.tag != .openbsd) return;
+    if (!os_runtime.fdValid(fd) or (os_runtime.socketType(fd) catch return error.InvalidInheritedListener) != posix.SOCK.STREAM)
+        return error.InvalidInheritedListener;
+    var listening: i32 = 0;
+    var option_len: posix.socklen_t = @sizeOf(i32);
+    const option_rc = posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ACCEPTCONN, @ptrCast(&listening), &option_len);
+    if (posix.errno(option_rc) != .SUCCESS or option_len != @sizeOf(i32) or listening == 0)
+        return error.InvalidInheritedListener;
+    var address: posix.sockaddr.storage = undefined;
+    var address_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (posix.errno(posix.system.getsockname(fd, @ptrCast(&address), &address_len)) != .SUCCESS)
+        return error.InvalidInheritedListener;
+    if (std.mem.indexOfScalar(u8, host, ':') != null) {
+        if (address.family != posix.AF.INET6 or address_len < @sizeOf(posix.sockaddr.in6)) return error.InvalidInheritedListener;
+        const actual: *const posix.sockaddr.in6 = @ptrCast(@alignCast(&address));
+        const expected = try std.Io.net.Ip6Address.parse(host, port);
+        if (!std.mem.eql(u8, &actual.addr, &expected.bytes) or
+            actual.scope_id != expected.interface.index or (port != 0 and actual.port != std.mem.nativeToBig(u16, port)))
+            return error.InvalidInheritedListener;
+    } else {
+        if (address.family != posix.AF.INET or address_len < @sizeOf(posix.sockaddr.in)) return error.InvalidInheritedListener;
+        const actual: *const posix.sockaddr.in = @ptrCast(@alignCast(&address));
+        const expected = try std.Io.net.Ip4Address.parse(host, port);
+        if (actual.addr != @as(u32, @bitCast(expected.bytes)) or
+            (port != 0 and actual.port != std.mem.nativeToBig(u16, port))) return error.InvalidInheritedListener;
+    }
+}
+
+fn stageListenerCompanion(
+    host: []const u8,
+    requested_port: u16,
+    primary: linux.fd_t,
+    backlog: u31,
+    reuse_port: bool,
+    inherited_primary: ?linux.fd_t,
+    inherited_companion: ?linux.fd_t,
+) !linux.fd_t {
+    if (comptime builtin.os.tag != .openbsd) return -1;
+    try validateNativeListenerAddress(primary, primaryListenerHost(host), requested_port);
+    if (!wildcardListenerHost(host)) {
+        if (inherited_companion != null) return error.InvalidInheritedListener;
+        return -1;
+    }
+    if (inherited_primary != null and inherited_companion == null) return error.InvalidInheritedListener;
+    if (inherited_companion == primary) return error.InvalidInheritedListener;
+    const port = try socketPort(primary);
+    const companion = inherited_companion orelse try reuseport.createOpenBsdListener("::", port, backlog, reuse_port);
+    errdefer closeFd(companion);
+    try validateNativeListenerAddress(companion, "::", port);
+    try os_runtime.setCloexec(companion, true);
+    try os_runtime.setNonblocking(companion);
+    return companion;
+}
+
 fn createListener(host: []const u8, port: u16, backlog: u31) ServerError!linux.fd_t {
+    if (comptime builtin.os.tag == .openbsd) return reuseport.createOpenBsdListener(host, port, backlog, false);
     // Dual-stack: a single AF_INET6 socket accepts both IPv6 and IPv4 peers (the
     // latter as IPv4-mapped ::ffff:a.b.c.d, normalized in captureClientHost).
     // V6ONLY is disabled explicitly so this never depends on the host's
@@ -60706,7 +61532,9 @@ const mesh_redial_interval_ms: i64 = if (builtin.is_test) 250 else 10_000;
 /// How long a TCP-up peer may sit without a finished handshake, or an
 /// established peer may sit without anti-entropy, before that counts as one
 /// breaker failure. The sweep records at most one failure per backoff window.
-const mooring_stall_ms: u64 = if (builtin.is_test) 1_000 else 60_000;
+// Runtime tests share production's anti-entropy cadence. Fault tests age their
+// simulated clock instead of shortening the grace below that cadence.
+const mooring_stall_ms: u64 = 60_000;
 
 /// One [mesh].connect auto-dial slot. Owned (and only touched) by reactor 0,
 /// the reactor that owns every outbound ConnState the dial creates.
@@ -60768,7 +61596,8 @@ fn sockaddrIn(host: []const u8, port: u16) ServerError!posix.sockaddr.in {
 /// blocking DNS lookup (bounded by `timeout_ms` per nameserver) — an A record
 /// first (dialed IPv4-mapped), falling back to AAAA so a v6-only peer such as
 /// `[mesh].connect = ["node.example:6900"]` or oper `CONNECT node.example 6900`
-/// still resolves. The outbound socket is AF_INET6, so both families dial.
+/// still resolves. Linux dials both through AF_INET6; OpenBSD translates the
+/// canonical mapped address and selects a native AF_INET socket for IPv4.
 fn sockaddrForHost(host: []const u8, port: u16, timeout_ms: u31) ServerError!posix.sockaddr.in6 {
     if (sockaddrIn6(host, port)) |addr| return addr else |_| {}
     if (http_fetch.resolveHostA(host, port, timeout_ms)) |resolved| {
@@ -60796,8 +61625,12 @@ fn sockaddrIn6FromV4(addr4: [4]u8, port: u16) posix.sockaddr.in6 {
     return sockaddrIn6FromV6(a, port);
 }
 
+const socket_system = if (builtin.os.tag == .openbsd) posix.system else linux;
+
 fn socketTcp() ServerError!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC |
+        (if (builtin.os.tag == .openbsd) posix.SOCK.NONBLOCK else 0);
+    const rc = socket_system.socket(posix.AF.INET, flags, posix.IPPROTO.TCP);
     switch (posix.errno(rc)) {
         .SUCCESS => return @intCast(rc),
         .ACCES, .PERM => return error.PermissionDenied,
@@ -60807,7 +61640,9 @@ fn socketTcp() ServerError!linux.fd_t {
 }
 
 fn socketTcp6() ServerError!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC |
+        (if (builtin.os.tag == .openbsd) posix.SOCK.NONBLOCK else 0);
+    const rc = socket_system.socket(posix.AF.INET6, flags, posix.IPPROTO.TCP);
     switch (posix.errno(rc)) {
         .SUCCESS => return @intCast(rc),
         .ACCES, .PERM => return error.PermissionDenied,
@@ -60818,7 +61653,7 @@ fn socketTcp6() ServerError!linux.fd_t {
 
 fn bindSocket(fd: linux.fd_t, addr: *const posix.sockaddr.in) ServerError!void {
     const ptr: *const posix.sockaddr = @ptrCast(addr);
-    const rc = linux.bind(fd, ptr, @sizeOf(posix.sockaddr.in));
+    const rc = socket_system.bind(fd, ptr, @sizeOf(posix.sockaddr.in));
     switch (posix.errno(rc)) {
         .SUCCESS => return,
         .ACCES, .PERM => return error.PermissionDenied,
@@ -60850,7 +61685,7 @@ fn sockaddrIn6(host: []const u8, port: u16) ServerError!posix.sockaddr.in6 {
 
 fn bindSocket6(fd: linux.fd_t, addr: *const posix.sockaddr.in6) ServerError!void {
     const ptr: *const posix.sockaddr = @ptrCast(addr);
-    const rc = linux.bind(fd, ptr, @sizeOf(posix.sockaddr.in6));
+    const rc = socket_system.bind(fd, ptr, @sizeOf(posix.sockaddr.in6));
     switch (posix.errno(rc)) {
         .SUCCESS => return,
         .ACCES, .PERM => return error.PermissionDenied,
@@ -60860,7 +61695,7 @@ fn bindSocket6(fd: linux.fd_t, addr: *const posix.sockaddr.in6) ServerError!void
 }
 
 fn listenSocket(fd: linux.fd_t, backlog: u31) ServerError!void {
-    const rc = linux.listen(fd, backlog);
+    const rc = socket_system.listen(fd, @intCast(backlog));
     switch (posix.errno(rc)) {
         .SUCCESS => return,
         .ADDRINUSE => return error.AddressInUse,
@@ -60870,7 +61705,7 @@ fn listenSocket(fd: linux.fd_t, backlog: u31) ServerError!void {
 }
 
 fn setsockopt(fd: linux.fd_t, level: i32, optname: u32, opt: []const u8) ServerError!void {
-    const rc = linux.setsockopt(fd, level, optname, opt.ptr, @intCast(opt.len));
+    const rc = socket_system.setsockopt(fd, level, @intCast(optname), opt.ptr, @intCast(opt.len));
     switch (posix.errno(rc)) {
         .SUCCESS => return,
         .ACCES, .PERM => return error.PermissionDenied,
@@ -60893,22 +61728,31 @@ fn applyClientKeepalive(fd: linux.fd_t) void {
     const intvl: u32 = 10; // seconds between probes
     const cnt: u32 = 3; // failed probes before the socket is declared dead
     setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&on)) catch {};
-    setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPIDLE, std.mem.asBytes(&idle)) catch {};
-    setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPINTVL, std.mem.asBytes(&intvl)) catch {};
-    setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPCNT, std.mem.asBytes(&cnt)) catch {};
-    setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&on)) catch {};
+    if (builtin.os.tag == .linux) {
+        setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPIDLE, std.mem.asBytes(&idle)) catch {};
+        setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPINTVL, std.mem.asBytes(&intvl)) catch {};
+        setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPCNT, std.mem.asBytes(&cnt)) catch {};
+    }
+    io_backend.setTcpNoDelay(fd);
 }
 
 fn socketPort(fd: linux.fd_t) ServerError!u16 {
     var storage: posix.sockaddr.storage = undefined;
     var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    const rc = linux.getsockname(fd, @ptrCast(&storage), &len);
+    const rc = socket_system.getsockname(fd, @ptrCast(&storage), &len);
     switch (posix.errno(rc)) {
         .SUCCESS => {},
         else => return error.Unexpected,
     }
-    const addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&storage));
-    return std.mem.bigToNative(u16, addr.port);
+    if (storage.family == posix.AF.INET and len >= @sizeOf(posix.sockaddr.in)) {
+        const addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+        return std.mem.bigToNative(u16, addr.port);
+    }
+    if (storage.family == posix.AF.INET6 and len >= @sizeOf(posix.sockaddr.in6)) {
+        const addr: *const posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+        return std.mem.bigToNative(u16, addr.port);
+    }
+    return error.Unexpected;
 }
 
 // --- SASL-oper test fixtures (oper is SASL-only) ---------------------------
@@ -61310,7 +62154,18 @@ fn saslOAuthBearerPrelude(fd: linux.fd_t, token: []const u8) ServerError!void {
 }
 
 fn connectLoopback(port: u16) ServerError!linux.fd_t {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .openbsd) {
+        // Test clients are blocking; the daemon's socketTcp helper deliberately
+        // creates nonblocking OpenBSD sockets for reactor ownership.
+        const fd = try connectNativeLoopbackForTest(.ipv4, port);
+        errdefer closeFd(fd);
+        // Bound direct TLS/WebSocket fixture reads as well as poll-driven IRC
+        // reads. A missing reply must fail the runner rather than hang it.
+        var timeout = posix.timeval{ .sec = 20, .usec = 0 };
+        if (posix.errno(posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout), @sizeOf(posix.timeval))) != .SUCCESS)
+            return error.Unexpected;
+        return fd;
+    } else if (comptime builtin.os.tag == .linux) {
         const fd = try socketTcp();
         errdefer closeFd(fd);
         var addr = try sockaddrIn("127.0.0.1", port);
@@ -61322,6 +62177,23 @@ fn connectLoopback(port: u16) ServerError!linux.fd_t {
             else => return error.Unexpected,
         }
     } else return error.Unsupported;
+}
+
+fn connectNativeLoopbackForTest(family: ListenerFamily, port: u16) !linux.fd_t {
+    if (comptime builtin.os.tag != .openbsd) return error.Unsupported;
+    const rc = posix.system.socket(if (family == .ipv4) posix.AF.INET else posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
+    const fd: linux.fd_t = @intCast(rc);
+    errdefer closeFd(fd);
+    const result = if (family == .ipv4) blk: {
+        var address = try sockaddrIn("127.0.0.1", port);
+        break :blk posix.system.connect(fd, @ptrCast(&address), @sizeOf(posix.sockaddr.in));
+    } else blk: {
+        var address = try sockaddrIn6("::1", port);
+        break :blk posix.system.connect(fd, @ptrCast(&address), @sizeOf(posix.sockaddr.in6));
+    };
+    if (posix.errno(result) != .SUCCESS) return error.Unexpected;
+    return fd;
 }
 
 /// Deterministically stop a threaded server and join its reactor thread within a
@@ -61351,8 +62223,12 @@ fn stopThreadedServer(server: *Server, run: *std.atomic.Value(bool), thr: std.Th
                     );
                     @panic("stopThreadedServer watchdog: reactor never stopped");
                 }
-                var req = linux.timespec{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
-                _ = linux.nanosleep(&req, null);
+                if (builtin.os.tag == .openbsd) {
+                    os_runtime.sleepMillis(25);
+                } else {
+                    var req = linux.timespec{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
+                    _ = linux.nanosleep(&req, null);
+                }
             }
         }
     };
@@ -61368,6 +62244,21 @@ fn stopThreadedServer(server: *Server, run: *std.atomic.Value(bool), thr: std.Th
 
 fn writeAllFd(fd: linux.fd_t, bytes: []const u8) ServerError!void {
     var sent: usize = 0;
+    if (comptime builtin.os.tag == .openbsd) {
+        while (sent < bytes.len) {
+            const rc = posix.system.write(fd, bytes[sent..].ptr, bytes.len - sent);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return error.ConnectionReset;
+                    sent += @intCast(rc);
+                },
+                .INTR => continue,
+                .CONNRESET => return error.ConnectionReset,
+                else => return error.Unexpected,
+            }
+        }
+        return;
+    }
     while (sent < bytes.len) {
         const rc = linux.write(fd, bytes[sent..].ptr, bytes.len - sent);
         switch (posix.errno(rc)) {
@@ -61388,6 +62279,13 @@ fn readFd(fd: linux.fd_t, buf: []u8) ServerError!usize {
 }
 
 fn closeFd(fd: linux.fd_t) void {
+    if (comptime builtin.os.tag == .openbsd) {
+        // kqueue drops registrations at close; no io_uring reference needs a
+        // forced shutdown. SCM_RIGHTS copies share a socket with the serving
+        // predecessor, so an aborted inert candidate must close only its copy.
+        os_runtime.close(fd);
+        return;
+    }
     // Force FIN to the peer and complete any in-flight recv NOW. An io_uring
     // recv SQE holds a reference to the socket's `struct file`, so a bare
     // close(fd) only drops the fd-table entry — the socket lingers (no FIN)
@@ -61646,6 +62544,8 @@ fn appendCurrentMandatoryUpgradeStateForTest(
     server.world.lockWrite();
     defer server.world.unlockWrite();
 
+    if (comptime builtin.os.tag == .openbsd) try server.prepareNativeDurableHistoryUpgradeBoundary();
+
     const upgrade_mesh_clock = server.preparePropertyUpgradeClockBoundary() orelse
         return error.PropertyStateConverging;
     lockSpin(&server.mesh_clock_lock);
@@ -61826,7 +62726,7 @@ fn eventHistoryBytesForTest(
 }
 
 test "UPGRADE GAP-D2 offline memo survives the dropped process image" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -61863,7 +62763,7 @@ test "UPGRADE GAP-D2 offline memo survives the dropped process image" {
 }
 
 test "UPGRADE GAP-D2 restored memo is delivered when the account attaches" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -62007,7 +62907,7 @@ test "GAP-D2 kill-restart and same-image USR2 deliver the memo and fire MEMO_PUS
 }
 
 test "UPGRADE GAP-P16 MARKREAD survives the dropped process image and rewind stays bounded" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -62066,7 +62966,7 @@ test "UPGRADE GAP-P16 MARKREAD survives the dropped process image and rewind sta
 }
 
 test "UPGRADE GAP-D3 gag and granted vhost survive the dropped process image" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -62177,7 +63077,7 @@ test "GAP-D3 same-image USR2 keeps the gag and the granted vhost" {
 }
 
 test "DST GAP-D4 oper ABUSE explains live throttle and abuse rows survive the dropped image" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -62462,7 +63362,7 @@ test "GAP-D4 same-image USR2 keeps shun spamtrap Koshi reputation and the accoun
 }
 
 test "UPGRADE GAP-D5 restart keeps SCRAM and CertFP and invalidates recovery tokens" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const scram_store_mod = @import("scram_store.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -62644,7 +63544,7 @@ test "GAP-D5 same-image USR2 invalidates recovery tokens and keeps SCRAM and Cer
 }
 
 test "GAP-D6 daemon backup set verifies and restores into a scratch directory" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     defer current_reactor = null;
@@ -62725,7 +63625,7 @@ test "GAP-D6 daemon backup set verifies and restores into a scratch directory" {
 }
 
 test "UPGRADE GAP-D1 cold restart restores history msgids and skips ciphertext search" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -62796,7 +63696,7 @@ test "UPGRADE GAP-D1 cold restart restores history msgids and skips ciphertext s
 }
 
 test "GAP-D1 kill-restart restores channel and DM msgids" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -62848,16 +63748,26 @@ test "GAP-D1 same-image USR2 restores channel and DM msgids" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
-    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d1-usr2.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    const config = Config{ .host = "127.0.0.1", .port = 0, .account_services = &services };
     const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer alloc.destroy(predecessor);
     defer predecessor.deinit();
-    predecessor.recordHistoryRelayAt("#room", "alice!a@h", "chan-usr2", "PRIVMSG", "hello durableword", null, 30);
+    var local_author = ConnState{};
+    try local_author.session.setNick("alice");
+    predecessor.recordHistoryAt("#room", &local_author, "chan-usr2", "PRIVMSG", "hello durableword", null, 30);
     predecessor.recordHistoryRelayAt("$dm:nick:alice:bob", "alice!a@h", "dm-usr2", "PRIVMSG", "dm body", null, 31);
     predecessor.recordHistoryRelayAt("#room", "alice!a@h", "e2ee-usr2", "PRIVMSG", "ONYXROOM1 secretphrase", "+onyx/e2ee=mls", 32);
+    // Establish the canonical durable image before sealing; the successor
+    // should recognize it byte-for-byte rather than publish another generation.
+    predecessor.snapshotDurableHistory();
     try std.testing.expect(predecessor.search_index.find("durableword").len == 1);
     try std.testing.expect(predecessor.search_index.find("secretphrase").len == 0);
 
@@ -62873,9 +63783,11 @@ test "GAP-D1 same-image USR2 restores channel and DM msgids" {
     const successor = createTestServer(alloc, config) catch |err| return err;
     defer alloc.destroy(successor);
     defer successor.deinit();
-    try std.testing.expectEqual(@as(usize, 0), successor.history.totalStoredCount());
+    try std.testing.expectEqual(@as(usize, 3), successor.history.totalStoredCount());
+    const changes_before = store.changeCount();
     _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-gap-d1-usr2");
     current_reactor = null;
+    try std.testing.expectEqual(changes_before, store.changeCount());
 
     var out: [4]lotus.Message = undefined;
     const channel = try successor.history.latest("#room", 4, &out);
@@ -62890,6 +63802,26 @@ test "GAP-D1 same-image USR2 restores channel and DM msgids" {
     try std.testing.expectEqualStrings("dm body", dm[0].text);
     try std.testing.expect(successor.search_index.find("durableword").len == 1);
     try std.testing.expect(successor.search_index.find("secretphrase").len == 0);
+
+    // The silent handoff must also leave the cold-start durable image usable.
+    var reopened_store = try services_mod.OroStore.open(alloc, std.testing.io, tmp.dir, "gap-d1-usr2.wal");
+    defer reopened_store.deinit();
+    var reopened_services = services_mod.Services.init(&reopened_store, null);
+    var cold_config = config;
+    cold_config.account_services = &reopened_services;
+    const cold = try createTestServer(alloc, cold_config);
+    defer alloc.destroy(cold);
+    defer cold.deinit();
+    const cold_channel = try cold.history.latest("#room", 4, &out);
+    try std.testing.expectEqual(@as(usize, 2), cold_channel.len);
+    try std.testing.expectEqualStrings("e2ee-usr2", cold_channel[0].msgid);
+    try std.testing.expectEqualStrings("chan-usr2", cold_channel[1].msgid);
+    const cold_dm = try cold.history.latest("$dm:nick:alice:bob", 2, &dm_out);
+    try std.testing.expectEqual(@as(usize, 1), cold_dm.len);
+    try std.testing.expectEqualStrings("dm-usr2", cold_dm[0].msgid);
+    try std.testing.expectEqual(@as(usize, 0), reopened_store.changeCount());
+    try std.testing.expect(cold.search_index.find("durableword").len == 1);
+    try std.testing.expect(cold.search_index.find("secretphrase").len == 0);
     std.debug.print("GAP-D1 branch=same-image USR2 restored chan-usr2 and dm-usr2\n", .{});
 }
 
@@ -63420,7 +64352,7 @@ test "UPGRADE legacy v3 session mints stable AID and nonempty ADS1 follows it ac
 }
 
 test "MESSAGE_V2 replay and Lotus publish transactionally with one accepted identity" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "relay-transaction-test");
@@ -63518,7 +64450,7 @@ test "MESSAGE_V2 replay and Lotus publish transactionally with one accepted iden
 }
 
 test "MESSAGE_V2 durable admission fails closed without explicit direct-neighbor pins" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x81)), "rvl2-membership-test");
@@ -63560,7 +64492,7 @@ test "MESSAGE_V2 durable admission fails closed without explicit direct-neighbor
 }
 
 test "MESSAGE_V2 authoring activation requires a staged canonical full-mesh roster" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x91)), "relay-v2-activation");
@@ -63666,7 +64598,7 @@ test "MESSAGE_V2 authoring activation requires a staged canonical full-mesh rost
 }
 
 test "MESSAGE_V2 Helix legacy egress seam suppresses a twin after durable admission" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
@@ -63748,7 +64680,7 @@ test "MESSAGE_V2 Helix legacy egress seam suppresses a twin after durable admiss
 }
 
 test "MESSAGE_V2 Helix authored row waits for rolling-old peer then replays once and retires" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
@@ -63885,7 +64817,7 @@ test "MESSAGE_V2 Helix authored row waits for rolling-old peer then replays once
 }
 
 test "MESSAGE_V2 RVL2 duplicate ingress and ACK handshake retire every direct-neighbor obligation" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x82)), "rvl2-cycle-test");
@@ -63953,12 +64885,28 @@ test "MESSAGE_V2 RVL2 duplicate ingress and ACK handshake retire every direct-ne
     try std.testing.expect(server.commitRelayV2NeighborAck(peer_c.shortId(), relay_id));
     try std.testing.expect(server.relay_v2_event_log.isConfirmedBy(relay_id, peer_c.shortId()));
     try std.testing.expect(!server.relay_v2_outbox.contains(peer_c.shortId(), relay_id));
+    // The ingress may replay after another neighbor has already accepted.
+    // Re-ACK that ingress without resurrecting the confirmed retry obligation.
+    try std.testing.expect(try server.retainRelayV2DuplicateIngress(relay_id, wire, peer_b.shortId()));
+    try std.testing.expect(server.relay_v2_outbox.containsReceipt(peer_b.shortId(), relay_id));
+    try std.testing.expect(!server.relay_v2_outbox.contains(peer_c.shortId(), relay_id));
+    try std.testing.expect(server.relayV2RestoreRelationValid(
+        &server.relay_v2_replay_guard,
+        &server.relay_v2_outbox,
+        &server.relay_v2_event_log,
+    ));
     try std.testing.expect(server.commitRelayV2IngressAckConfirm(peer_b.shortId(), relay_id));
     try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
     try std.testing.expect(!server.relay_v2_outbox.contains(peer_b.shortId(), relay_id));
     try std.testing.expect(!server.relay_v2_outbox.containsReceipt(peer_b.shortId(), relay_id));
     try std.testing.expect(server.commitRelayV2IngressAckConfirm(peer_c.shortId(), relay_id));
     try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.receiptItems().len);
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.len());
+    try std.testing.expect(server.relayV2RestoreRelationValid(
+        &server.relay_v2_replay_guard,
+        &server.relay_v2_outbox,
+        &server.relay_v2_event_log,
+    ));
 }
 
 test "MESSAGE_V2 custody ACK and ACK_CONFIRM fail closed for off-mesh and unsolicited peers" {
@@ -63967,7 +64915,7 @@ test "MESSAGE_V2 custody ACK and ACK_CONFIRM fail closed for off-mesh and unsoli
     // reserved it. Off-mesh, self, unsolicited, and cross-peer confirmations
     // must leave every authority byte-identical — otherwise a forged hop could
     // manufacture coverage, free receipt capacity, or retire the last wire.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0xa1)), "rvl2-ack-failclosed");
@@ -64075,7 +65023,7 @@ test "MESSAGE_V2 custody ACK and ACK_CONFIRM fail closed for off-mesh and unsoli
 }
 
 test "MESSAGE_V2 RVL2 retry sweep cannot starve a later direct neighbor" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x85)), "rvl2-peer-fairness-test");
@@ -64147,7 +65095,7 @@ test "MESSAGE_V2 RVL2 retry sweep cannot starve a later direct neighbor" {
 }
 
 test "MESSAGE_V2 egress emits a >64 same-origin backlog old-HLC-before-new per neighbor" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x91)), "rvl2-egress-order-test");
@@ -64244,7 +65192,7 @@ test "MESSAGE_V2 egress emits a >64 same-origin backlog old-HLC-before-new per n
 }
 
 test "MESSAGE_V2 egress retains a partitioned neighbor's obligation and retires it once on heal" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x94)), "rvl2-partition-heal-test");
@@ -64546,7 +65494,7 @@ test "DST GAP-A2 one accepted id survives partition and USR2 without a duplicate
 }
 
 test "MESSAGE_V2 Helix restore relation rejects individually valid torn authorities" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x88)), "rvl2-restore-relation-test");
@@ -64747,7 +65695,7 @@ test "UPGRADE rejects torn MESSAGE_V2 authority checkpoints before publication" 
 }
 
 test "MESSAGE_V2 retained RVL2 row re-acks every direct neighbor after RVG2 window eviction" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "relay-receipt-test");
@@ -64845,7 +65793,7 @@ test "MESSAGE_V2 retained RVL2 row re-acks every direct neighbor after RVG2 wind
 }
 
 test "Event Spine v2 history conflict rolls back staged replay authority byte-exact" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x7b)), "event-transaction-test");
@@ -64920,7 +65868,7 @@ test "Event Spine v2 history conflict rolls back staged replay authority byte-ex
 }
 
 test "Event Spine v2 undefined severity fails closed without authority mutation" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x7d)), "event-severity-test");
@@ -64975,7 +65923,7 @@ test "Event Spine v2 undefined severity fails closed without authority mutation"
 }
 
 test "Event Spine v2 binds local and remote origins before authority mutation" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var local_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x7e)), "event-origin-test");
@@ -65055,7 +66003,7 @@ test "Event Spine v2 binds local and remote origins before authority mutation" {
 }
 
 test "Event Spine v2 guard allocation failures leave replay and history byte-exact" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x7c)), "event-oom-test");
@@ -65480,7 +66428,7 @@ test "MESSAGE_V2 Helix activation is staged exact and monotonic across current h
 }
 
 test "UPGRADE continuity gate accepts idle state and refuses every media or companion owner" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -65708,7 +66656,7 @@ test "DST GAP-A4 event history reloads across USR2 and a signed id is not duplic
 }
 
 test "DST GAP-A7 listener add or remove refuses UPGRADE with cold restart required" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -66107,7 +67055,7 @@ fn gapP4Newest(server: *Server, target: []const u8, id_out: []u8) !struct { id: 
 }
 
 test "DST GAP-P4 channel retention TTL deletes history search ids and memo copies" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
@@ -66332,7 +67280,7 @@ fn gapO6FloodVerdicts(server: *Server, needle: []const u8) usize {
 }
 
 test "DST GAP-O6 raid shield correlates peers and relaxes slowmode" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
@@ -66435,7 +67383,7 @@ test "DST GAP-O6 raid shield correlates peers and relaxes slowmode" {
 }
 
 test "UPGRADE mandatory restored EventHistory and webhook store skip stale disk reload at start" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -66616,13 +67564,18 @@ fn fixedHexAfter(haystack: []const u8, marker: []const u8, hex_len: usize) ?[]co
 }
 
 fn addTestLocalClient(server: *Server, nick: []const u8, account: ?[]const u8) !client_model.ClientId {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const id = try server.rx().clients.alloc(ConnState.init(-1));
         const conn = server.rx().clients.get(id).?;
         conn.token = try tokenFromId(id);
         // Match the production accept path: tests that exercise a real SendQ
         // overflow must have an allocator for the heap-backed tail.
         conn.overflow_allocator = server.allocator;
+        // These clients have no socket and their tests inspect the retained
+        // SendQ. Native kqueue rejects fd=-1 immediately; declare the fixture
+        // sink instead of attempting an operation or inventing kernel custody.
+        if (comptime builtin.is_test and builtin.os.tag == .openbsd)
+            conn.test_sendq_capture = true;
         try conn.session.setNick(nick);
         if (account) |acct| conn.session.loginAs(acct);
         try server.world.registerNick(nick, worldIdFromClient(id));
@@ -66684,7 +67637,7 @@ fn addTestRelayHomes(
 }
 
 test "verified webhook residence bypass is restricted to server-authored channel PRIVMSG" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -66733,7 +67686,7 @@ fn assignTestSessionAttachment(server: *Server, account: []const u8, id: client_
 }
 
 test "remote QUIT marked mesh departures render once per local recipient across shared channels" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -66822,15 +67775,15 @@ const LiveClient = struct {
     len: usize = 0,
 
     fn readAvailable(self: *LiveClient) ServerError!void {
-        if (comptime builtin.os.tag == .linux) {
+        if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
             while (true) {
                 var fds = [_]posix.pollfd{.{
                     .fd = self.fd,
-                    .events = linux.POLL.IN,
+                    .events = posix.POLL.IN,
                     .revents = 0,
                 }};
                 const ready = posix.poll(&fds, 0) catch return error.Unexpected;
-                if (ready == 0 or (fds[0].revents & linux.POLL.IN) == 0) return;
+                if (ready == 0 or (fds[0].revents & posix.POLL.IN) == 0) return;
                 if (self.len == self.buf.len) return error.OutputTooSmall;
                 const n = try readFd(self.fd, self.buf[self.len..]);
                 if (n == 0) return;
@@ -66849,7 +67802,7 @@ const LiveClient = struct {
 };
 
 test "rebroadcastLocalOpers re-mints an oper homed on a non-zero shard" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -67603,7 +68556,10 @@ const ResyncQuietFixture = struct {
             .crypto_io = std.testing.io,
             .mesh_pass = "session-replay-secret",
         }) catch |err| switch (err) {
-            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+                if (comptime builtin.os.tag == .openbsd) return err;
+                return error.SkipZigTest;
+            },
             else => return err,
         };
         errdefer {
@@ -67614,15 +68570,31 @@ const ResyncQuietFixture = struct {
         pair.a.setResidenceVerifier(trevResidenceVerifier(predecessor));
 
         var sockets: [2]linux.fd_t = undefined;
-        if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
-            return error.SkipZigTest;
+        if (comptime builtin.os.tag == .openbsd) {
+            if (posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets) != 0)
+                return error.SocketUnavailable;
+            errdefer {
+                closeFd(sockets[0]);
+                closeFd(sockets[1]);
+            }
+            try os_runtime.setCloexec(sockets[0], true);
+            try os_runtime.setCloexec(sockets[1], true);
+        } else {
+            if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+                return error.SkipZigTest;
+        }
+        var socket0_owned_by_fixture = true;
+        errdefer if (socket0_owned_by_fixture) closeFd(sockets[0]);
         errdefer closeFd(sockets[1]);
 
         const peer_id = try predecessor.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+        socket0_owned_by_fixture = false;
         const peer_conn = predecessor.reactors[0].clients.get(peer_id).?;
         peer_conn.overflow_allocator = alloc;
         peer_conn.token = try tokenFromId(peer_id);
         peer_conn.s2s_secured = &pair.a;
+        // The pair owns this borrowed link even if fixture preparation fails.
+        errdefer peer_conn.s2s_secured = null;
 
         // Pre-upgrade convergence: the peer projects remote oper `trev` as an
         // OP (+o) member of #root; the predecessor's route table converges and
@@ -67667,6 +68639,7 @@ const ResyncQuietFixture = struct {
         // Transfer descriptor ownership exactly as execve would.
         peer_conn.s2s_secured = null;
         peer_conn.fd = -1;
+        socket0_owned_by_fixture = true;
 
         var successor = createTestServer(alloc, .{
             .host = "127.0.0.1",
@@ -67677,7 +68650,10 @@ const ResyncQuietFixture = struct {
             .crypto_io = std.testing.io,
             .mesh_pass = "session-replay-secret",
         }) catch |err| switch (err) {
-            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => {
+                if (comptime builtin.os.tag == .openbsd) return err;
+                return error.SkipZigTest;
+            },
             else => return err,
         };
         errdefer {
@@ -67693,6 +68669,18 @@ const ResyncQuietFixture = struct {
         const alice = successor.connFor(alice_id).?;
         alice.overflow_allocator = alloc;
         alice.session.registration.registered = true;
+        if (comptime builtin.os.tag == .openbsd) {
+            // Only the declared fixture sink bypasses I/O. An ordinary invalid
+            // descriptor must still fail native admission without poisoning a
+            // real reactor registration or consuming its token.
+            var invalid = ConnState.init(-1);
+            invalid.token = alice.token;
+            invalid.send_buf[0] = 'x';
+            invalid.send_len = 1;
+            try std.testing.expectError(error.MissingOp, successor.armSendIfNeeded(&invalid));
+            try std.testing.expect(!invalid.send_armed and !alice.send_armed);
+            try std.testing.expect(!alice.closing);
+        }
         _ = try successor.world.join("#root", worldIdFromClient(alice_id));
         // Topic setter is trev (+o via the carried link roster): the receiver's
         // +t defense resolves the setter across the combined projection, so a
@@ -67706,6 +68694,8 @@ const ResyncQuietFixture = struct {
             return error.TestUnexpectedResult;
         const snap = try s2s_snapshot.decode(link_bytes, s2s_snapshot.schema_version);
         try std.testing.expect(snap.roster_count != 0);
+        // The adopter consumes the descriptor on either success or refusal.
+        socket0_owned_by_fixture = false;
         try std.testing.expect(successor.adoptInheritedS2sLink(snap, true) != null);
         var resumed: ?*secured_s2s_link.SecuredLink = null;
         var clients_it = successor.reactors[0].clients.iterator();
@@ -67786,7 +68776,7 @@ const ResyncQuietFixture = struct {
 };
 
 test "UPGRADE resume: peer RESYNC re-burst of unchanged remote state emits zero client-visible lines" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
@@ -67851,7 +68841,7 @@ test "UPGRADE resume: peer RESYNC re-burst of unchanged remote state emits zero 
 }
 
 test "UPGRADE resume: first override grant after missing registry projects +Y once" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
@@ -68042,7 +69032,7 @@ test "UPGRADE quiet recv exact cancel rearms on failure resume" {
 }
 
 test "UPGRADE canceled CONNECT survives SQ-full and retries through fair activation" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
     var server = Server.init(std.testing.allocator, .{
@@ -68056,7 +69046,7 @@ test "UPGRADE canceled CONNECT survives SQ-full and retries through fair activat
     defer server.deinit();
     current_reactor = &server.reactors[0];
 
-    const fd = try socketTcp6();
+    const fd = if (comptime builtin.os.tag == .openbsd) try socketTcp() else try socketTcp6();
     const id = try server.reactors[0].clients.alloc(ConnState.init(fd));
     const conn = server.reactors[0].clients.get(id).?;
     conn.overflow_allocator = std.testing.allocator;
@@ -68067,8 +69057,14 @@ test "UPGRADE canceled CONNECT survives SQ-full and retries through fair activat
 
     var long_timeout = linux.kernel_timespec{ .sec = 60, .nsec = 0 };
     var filled = false;
-    for (0..64) |_| {
-        server.reactors[0].ring.submitTimeout(timer_token, &long_timeout) catch |err| switch (err) {
+    for (0..64) |index| {
+        // Native timers are keyed by token. Fill with distinct registrations
+        // so this exercises queue pressure rather than duplicate ownership.
+        const fill_token = if (comptime builtin.os.tag == .openbsd)
+            RingFdToken{ .slot = @intCast(1_000 + index), .gen = 1 }
+        else
+            timer_token;
+        server.reactors[0].ring.submitTimeout(fill_token, &long_timeout) catch |err| switch (err) {
             error.SubmissionQueueFull => {
                 filled = true;
                 break;
@@ -68178,7 +69174,7 @@ test "UPGRADE final fixed point carries post-barrier marker on all four shards" 
 }
 
 test "UPGRADE quiesce generation CAS and RESUMING completion are exact" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
@@ -68349,7 +69345,7 @@ test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves
 }
 
 test "periodic timer tick re-mints live oper grants inside the TTL" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -68718,7 +69714,7 @@ test "threaded server: a labeled WHOIS is reframed under the @label via SerpentR
 }
 
 test "webhook Helix unwind stays paused until every owner reaches IDLE" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -68767,7 +69763,7 @@ test "webhook Helix unwind stays paused until every owner reaches IDLE" {
 }
 
 test "webhook Helix resume failure remains on bounded timer retry lane" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -68907,7 +69903,7 @@ test "webhook queued before refused UPGRADE drains once and retained listener ac
 }
 
 test "webhook: a Discord POST is delivered to the bound channel as a bot integration" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -68968,7 +69964,7 @@ test "webhook: a Discord POST is delivered to the bound channel as a bot integra
 }
 
 test "webhook: Block-Kit-lite actions are delivered as IRCv3 client tags" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -69024,7 +70020,7 @@ test "webhook: Block-Kit-lite actions are delivered as IRCv3 client tags" {
 }
 
 test "webhook: CREATE/LIST/DELETE gate on channel operator status" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -69080,7 +70076,7 @@ test "webhook: CREATE/LIST/DELETE gate on channel operator status" {
 }
 
 test "webhook disabled: WEBHOOK returns 421 and no listener binds (byte-identical off)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -69116,7 +70112,7 @@ test "webhook disabled: WEBHOOK returns 421 and no listener binds (byte-identica
 }
 
 test "enforceDnsbl fails open: no resolver, an unresolved IP, and opers all pass" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -69145,7 +70141,7 @@ test "enforceDnsbl fails open: no resolver, an unresolved IP, and opers all pass
 }
 
 test "threaded server: multi-reactor (num_shards=4) survives concurrent clients" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 4 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -69202,7 +70198,7 @@ test "threaded server: multi-reactor (num_shards=4) survives concurrent clients"
 }
 
 test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABLE" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const ct = @import("../crypto/totp.zig");
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -69274,7 +70270,7 @@ test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABL
 }
 
 test "TOTP enforcement: IDENTIFY + SASL gated for a 2FA account; tokens revoked on enable" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const ct = @import("../crypto/totp.zig");
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -69340,7 +70336,7 @@ test "TOTP enforcement: IDENTIFY + SASL gated for a 2FA account; tokens revoked 
 }
 
 test "GAP-P0b IRCX OAUTHBEARER refuses an unregistered account unless oauth_auto_provision" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-ircx-oauth-known.wal");
@@ -69495,7 +70491,7 @@ fn waTokenAfter(buf: []const u8, marker: []const u8) ?[]const u8 {
 }
 
 test "WEBAUTHN inert until [webauthn] configured" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-wa-inert.wal");
@@ -69519,7 +70515,7 @@ test "WEBAUTHN inert until [webauthn] configured" {
 }
 
 test "KEYTRANS exposes credential transparency root and inclusion proof" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-keytrans.wal");
@@ -69626,7 +70622,7 @@ test "KEYTRANS exposes credential transparency root and inclusion proof" {
 }
 
 test "GAP-K2 a stored signed head shows a revocation and a missing log fails closed only when required" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-keytrans-peer.wal");
@@ -69783,7 +70779,7 @@ fn gapK2Peer(server: *Server, conn: *ConnState, node: []const u8) ![]const u8 {
 }
 
 test "GAP-K2 a revocation is visible on the other node after anti-entropy" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -69944,7 +70940,7 @@ fn expectNodeProof(ident: *const node_identity.NodeIdentity, entry: *const svc_o
 }
 
 test "GAP-K3 a node public key verifies a ban or kick after restart and a removed entry breaks the chain" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const wal_name = "server-proof-chain.wal";
@@ -70033,7 +71029,7 @@ test "GAP-K3 a node public key verifies a ban or kick after restart and a remove
 }
 
 test "KEYTRANS DEVICE and EVENT survive store restart" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const wal_name = "server-keytrans-restart.wal";
@@ -70102,7 +71098,7 @@ test "KEYTRANS DEVICE and EVENT survive store restart" {
 }
 
 test "KEYTRANS DEVICE reports bound then deleted and rejects a bad account" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-keytrans-device.wal");
@@ -70142,7 +71138,7 @@ test "KEYTRANS DEVICE reports bound then deleted and rejects a bad account" {
 }
 
 test "KEYTRANS corrupt store is fail-closed and restore is idempotent" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const kt_store = @import("key_transparency_store.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -70355,7 +71351,7 @@ test "DPROP1 shared cold-hot candidate is purge-first idempotent allocation-fail
 }
 
 test "DPROP1 cold activation publishes exact authority and stays observationally silent" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-dprop-cold-activate.wal");
@@ -70708,7 +71704,7 @@ test "DPROP1 hot unrelated future PRPC clock is fatal and leaves causal triplet 
 }
 
 test "DPROP1 cold startup without mandatory signer rejects local device writes" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const wal_name = "server-kt-cold-obs.wal";
@@ -70756,7 +71752,7 @@ test "DPROP1 cold startup without mandatory signer rejects local device writes" 
 }
 
 test "KEYTRANS local mutation does not rollback or false-fail when observation is unavailable" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-no-rollback.wal");
@@ -70806,7 +71802,7 @@ test "KEYTRANS local mutation does not rollback or false-fail when observation i
 }
 
 test "DPROP1 remote user device ENTITY_PROP is quarantined before all admission side effects" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-remote-once.wal");
@@ -70849,7 +71845,7 @@ test "DPROP1 remote user device ENTITY_PROP is quarantined before all admission 
 }
 
 test "DPROP1 remote device quarantine persists as policy across restart" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const wal_name = "server-kt-remote-replay.wal";
@@ -70890,7 +71886,7 @@ test "DPROP1 remote device quarantine persists as policy across restart" {
 }
 
 test "KEYTRANS generic local PROP observes exact user credential keys" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-observe.wal");
@@ -70929,7 +71925,7 @@ test "KEYTRANS generic local PROP observes exact user credential keys" {
 }
 
 test "KEYTRANS generic local PROP identity.key is observed and residence is not" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-ident.wal");
@@ -70962,7 +71958,7 @@ test "KEYTRANS generic local PROP identity.key is observed and residence is not"
 }
 
 test "KEYTRANS generic local PROP rejects and member entities do not observe" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-reject.wal");
@@ -70995,7 +71991,7 @@ test "KEYTRANS generic local PROP rejects and member entities do not observe" {
 }
 
 test "KEYTRANS generic local PROP missing delete does not observe" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-prop-missing-del.wal");
@@ -71018,7 +72014,7 @@ test "KEYTRANS generic local PROP missing delete does not observe" {
 }
 
 test "DPROP1 remote device origin cannot bypass quarantine after cold restart" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const wal_name = "server-kt-origin-restart.wal";
@@ -71058,7 +72054,7 @@ test "DPROP1 remote device origin cannot bypass quarantine after cold restart" {
 }
 
 test "DPROP1 local device write converges exact signed durable live clock and transparency fact" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -71104,7 +72100,7 @@ test "DPROP1 local device write converges exact signed durable live clock and tr
 }
 
 test "DPROP1 missing-row delete commits exact signed tombstone without creating live PROP" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -71144,7 +72140,7 @@ test "DPROP1 missing-row delete commits exact signed tombstone without creating 
 }
 
 test "DPROP1 channel and member device-looking properties retain generic PROP behavior" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -71178,7 +72174,7 @@ test "DPROP1 channel and member device-looking properties retain generic PROP be
 }
 
 test "DPROP1 ambiguous durable cut is sticky requests stop and publishes no live state" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -71228,7 +72224,7 @@ test "DPROP1 ambiguous durable cut is sticky requests stop and publishes no live
 }
 
 test "DPROP1 transaction preparation signing clock and Services failures publish nothing" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -71311,7 +72307,7 @@ test "DPROP1 transaction preparation signing clock and Services failures publish
 }
 
 test "DPROP1 PROP CLEAR scans beyond sixty four rows and preserves reserved device facts" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -71336,7 +72332,7 @@ test "DPROP1 PROP CLEAR scans beyond sixty four rows and preserves reserved devi
 }
 
 test "DPROP1 user PROP and E2EEKEY enumerate all one hundred twenty eight capacity rows" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -71385,7 +72381,7 @@ test "DPROP1 user PROP and E2EEKEY enumerate all one hundred twenty eight capaci
 }
 
 test "DPROP1 reserved local PROP numerics and oper override remain fail closed" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -71422,7 +72418,7 @@ test "DPROP1 reserved local PROP numerics and oper override remain fail closed" 
 }
 
 test "DPROP1 stale durable admission maps generic PROP to ERR_SECURITY 908" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -71583,7 +72579,7 @@ fn runRemotePropFailureSweep(tmp: *std.testing.TmpDir, variant: RemotePropFailur
 }
 
 test "KEYTRANS remote apply allocation failure leaves props clocks and log unchanged" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -71595,7 +72591,7 @@ test "KEYTRANS remote apply allocation failure leaves props clocks and log uncha
 }
 
 test "KEYTRANS remote apply fresh server allocator is atomic for every prop mutation shape" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const variants = [_]RemotePropFailureVariant{ .absent_entity, .absent_key, .replacement, .delete };
@@ -71603,7 +72599,7 @@ test "KEYTRANS remote apply fresh server allocator is atomic for every prop muta
 }
 
 test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure creating a brand-new entity leaves no stranded entity, props, clock, HLC, or log growth" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-entity-oom.wal");
@@ -71659,7 +72655,7 @@ test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure creating 
 }
 
 test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure inserting a new key into an existing entity leaves its existing prop, clock, HLC, and log unchanged" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-key-oom.wal");
@@ -71719,7 +72715,7 @@ test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure inserting
 }
 
 test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure replacing an existing value leaves the old value, clock, HLC, and log unchanged" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-replace-oom.wal");
@@ -71770,7 +72766,7 @@ test "KEYTRANS remote ENTITY_PROP apply: prop-store allocation failure replacing
 }
 
 test "KEYTRANS remote ENTITY_PROP apply: clock-stage allocation failure on a delete fact leaves the prop, clock, HLC, and log unchanged" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-kt-delete-oom.wal");
@@ -71827,7 +72823,7 @@ test "KEYTRANS remote ENTITY_PROP apply: clock-stage allocation failure on a del
 }
 
 test "E2EEKEY advertises account device keys through user props" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -71892,7 +72888,7 @@ fn testOgc1Advertisement() !struct {
 }
 
 test "E2EEKEY ADD accepts onyx-ogc1-v1 only with the derived device id" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const directory = @import("../proto/e2ee_device_directory.zig");
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -71935,7 +72931,7 @@ test "E2EEKEY ADD accepts onyx-ogc1-v1 only with the derived device id" {
 }
 
 test "DPROP1 E2EEKEY mixed-case ODD1 commits folded PROP lists and restores" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const dprop_boot = @import("durable_credential_props_boot.zig");
     const directory = @import("../proto/e2ee_device_directory.zig");
@@ -72036,7 +73032,7 @@ test "DPROP1 E2EEKEY mixed-case ODD1 commits folded PROP lists and restores" {
 }
 
 test "E2EEKEY and IDENTITY live mutations append verifiable key transparency events" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -72173,7 +73169,7 @@ fn enrollTestE2eeDevice(server: *Server, account: []const u8, device: []const u8
 }
 
 test "E2EEGROUP cap-exhausted login and late negotiation fail explicitly before membership" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -72226,7 +73222,7 @@ test "E2EEGROUP cap-exhausted login and late negotiation fail explicitly before 
 }
 
 test "E2EEGROUP guest CAP REQ onyx/e2ee after registration stays open" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -72255,7 +73251,7 @@ test "E2EEGROUP guest CAP REQ onyx/e2ee after registration stays open" {
 }
 
 test "E2EEGROUP local handler renders exact capable-member and targeted Welcome lines" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -72327,7 +73323,7 @@ test "E2EEGROUP local handler renders exact capable-member and targeted Welcome 
 }
 
 test "E2EEGROUP local handler fails closed and accepts the full payload bound" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -72431,7 +73427,7 @@ test "E2EEGROUP local handler fails closed and accepts the full payload bound" {
 }
 
 test "E2EEGROUP live operator quiesce is privileged observable non-mutating and reversible" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
@@ -72703,7 +73699,7 @@ test "E2EEGROUP live operator quiesce is privileged observable non-mutating and 
 }
 
 test "E2EEGROUP mesh live path accepts once refloods exact wire retries and retires exact peer ACK" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
@@ -73580,7 +74576,7 @@ test "E2EEGROUP mesh live path accepts once refloods exact wire retries and reti
 }
 
 test "E2EEGROUP configured disconnected peer remains in event-time custody" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x51)), "e2ee-disconnected");
     defer local.deinit();
@@ -73671,7 +74667,7 @@ test "E2EEGROUP configured disconnected peer remains in event-time custody" {
 }
 
 test "E2EEGROUP Helix seal refuses outstanding opaque custody without mutation" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x54)), "e2ee-seal");
     defer ident.deinit();
@@ -74003,7 +74999,7 @@ test "E2EEGROUP Helix corrupt mandatory checkpoint leaves live authority byte ex
 }
 
 test "IDENTITY advertises self-signed portable account keys through user props" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -74072,7 +75068,7 @@ test "IDENTITY advertises self-signed portable account keys through user props" 
 }
 
 test "IDENTITY RESIDENCE publishes an account residence proof as a replicated user prop (fail-closed)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "local");
     defer ident.deinit();
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
@@ -74174,7 +75170,7 @@ test "IDENTITY RESIDENCE publishes an account residence proof as a replicated us
 }
 
 test "secured Server canonicalizes configured node id to the identity short id" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x6a)), "boot-realistic");
     defer ident.deinit();
     try std.testing.expect(ident.shortId() != 1);
@@ -74233,7 +75229,7 @@ fn makeEntityPropChange(
 }
 
 test "P1: identity.key ENTITY_PROP ingest rejects a REMOTE write for a LOCALLY-homed account (local SASL anchor)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "local");
     defer ident.deinit();
     const self_node = ident.shortId();
@@ -74264,7 +75260,7 @@ test "P1: identity.key ENTITY_PROP ingest rejects a REMOTE write for a LOCALLY-h
 }
 
 test "E5E1 identity ENTITY_PROP ingest rejects every remote origin before LWW" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "local");
     defer ident.deinit();
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
@@ -74299,7 +75295,7 @@ test "E5E1 identity ENTITY_PROP ingest rejects every remote origin before LWW" {
 }
 
 test "P1: a NON-identity user prop is NOT origin-bound (regression: ordinary ENTITY_PROP LWW is unchanged)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x73)), "local");
     defer ident.deinit();
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
@@ -74338,7 +75334,7 @@ test "ISUPPORT advertises ACCOUNTRESIDENCE only when the node has a mesh identit
 }
 
 test "WEBAUTHN register + passwordless auth (ES256), with tamper/challenge/regression rejects" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-wa-e2e.wal");
@@ -74492,7 +75488,7 @@ test "WEBAUTHN register + passwordless auth (ES256), with tamper/challenge/regre
 }
 
 test "WEBAUTHN LIST/RENAME ride the EVENT plane; CRED carries created_unix; RENAME round-trips" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-wa-event.wal");
@@ -74577,7 +75573,7 @@ test "WEBAUTHN LIST/RENAME ride the EVENT plane; CRED carries created_unix; RENA
 }
 
 test "WEBAUTHN malformed base64 rejected without panic" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-wa-bad.wal");
@@ -74658,7 +75654,7 @@ fn waBindTestCred(
 }
 
 test "exploit: WEBAUTHN RENAME rejects a CRLF-smuggled label (no poison stored, no wire injection)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "exploit-wa-rename.wal");
@@ -74709,7 +75705,7 @@ test "exploit: WEBAUTHN RENAME rejects a CRLF-smuggled label (no poison stored, 
 }
 
 test "exploit: WEBAUTHN REGISTER rejects a control-byte label before arming a challenge" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "exploit-wa-register.wal");
@@ -74748,7 +75744,7 @@ test "exploit: WEBAUTHN REGISTER rejects a control-byte label before arming a ch
 }
 
 test "exploit: WEBAUTHN RENAME cannot relabel another account's passkey (ownership gate)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "exploit-wa-owner.wal");
@@ -74793,7 +75789,7 @@ test "exploit: WEBAUTHN RENAME cannot relabel another account's passkey (ownersh
 }
 
 test "exploit: webauthnReply drops a CRLF-bearing body (Event-Spine render firewall, last line of defence)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "exploit-wa-firewall.wal");
@@ -74833,7 +75829,7 @@ test "exploit: webauthnReply drops a CRLF-bearing body (Event-Spine render firew
 }
 
 test "SETPASS cert recovery: 1-arg reset only on a cert-verified connection" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-setpass-cert.wal");
@@ -74879,7 +75875,7 @@ test "SETPASS cert recovery: 1-arg reset only on a cert-verified connection" {
 }
 
 test "RESETPASS confirm: valid emailed code sets a new password; wrong code is rejected" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-resetpass.wal");
@@ -75050,7 +76046,7 @@ fn publishTestSessionReplicaAuthority(
 }
 
 test "portable local NICK publishes exact Store authority before v2 authorization" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x6E)), "portable-nick-authority");
     defer ident.deinit();
     var server = Server.init(std.testing.allocator, .{
@@ -75089,7 +76085,7 @@ test "portable local NICK publishes exact Store authority before v2 authorizatio
 }
 
 test "exact-token NICK enforces no-nick across sibling membership union" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -75129,7 +76125,7 @@ test "exact-token NICK enforces no-nick across sibling membership union" {
 }
 
 test "MONITOR rename prepares unbounded watcher output before identity commit" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -75188,7 +76184,7 @@ test "MONITOR rename prepares unbounded watcher output before identity commit" {
 }
 
 test "repeated JOIN repairs exact siblings without emitting a duplicate logical event" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -75215,7 +76211,7 @@ test "repeated JOIN repairs exact siblings without emitting a duplicate logical 
 }
 
 test "clone CREATE bootstraps every exact attachment with one JOIN view" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -75298,7 +76294,7 @@ test "clone CREATE bootstraps every exact attachment with one JOIN view" {
 }
 
 test "UPGRADE preflight flushes deferred resume sidecars only after exact authority is publishable" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x6D)), "upgrade-session-boundary");
     defer ident.deinit();
     var server = Server.init(std.testing.allocator, .{
@@ -75337,7 +76333,7 @@ test "UPGRADE preflight flushes deferred resume sidecars only after exact author
 }
 
 test "UPGRADE preflight converges a live local channel projection journal" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -75369,7 +76365,7 @@ test "UPGRADE preflight converges a live local channel projection journal" {
 }
 
 test "UPGRADE preflight retains and refuses a detached local channel projection journal" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -75401,7 +76397,7 @@ test "UPGRADE preflight retains and refuses a detached local channel projection 
 }
 
 test "deferred resume sidecar flush preserves old nick across peer queue allocation failure" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -75488,7 +76484,7 @@ test "deferred resume sidecar flush preserves old nick across peer queue allocat
 }
 
 test "UPGRADE preflight refuses an unbound deferred resume without erasing its old nick" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -75518,7 +76514,7 @@ test "UPGRADE preflight refuses an unbound deferred resume without erasing its o
 }
 
 test "UPGRADE preflight refuses an unpublished portable mutation without clearing it" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     // No node identity: the retry cannot sign a Store object. The dirty bit is
     // therefore the only durable record of the mutation and must survive a
     // refused upgrade intact.
@@ -75544,7 +76540,7 @@ test "UPGRADE preflight refuses an unpublished portable mutation without clearin
 }
 
 test "UPGRADE seal restores signed replica authority and revoke replay protection" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x5A)), "upgrade-replica-store");
     defer ident.deinit();
@@ -75620,7 +76616,7 @@ fn expectTestSessionReplicaRevoked(server: *LinuxServer, token: session_migrate.
 }
 
 test "session replica lifecycle LOGOUT revokes the final local portable token" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x91)), "local");
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
@@ -75650,7 +76646,7 @@ test "session replica lifecycle LOGOUT revokes the final local portable token" {
 }
 
 test "session replica lifecycle account switch revokes the abandoned portable token" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x92)), "local");
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
@@ -75680,7 +76676,7 @@ test "session replica lifecycle account switch revokes the abandoned portable to
 }
 
 test "session replica lifecycle IRCX AUTH guest rebind revokes the abandoned portable token" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x96)), "local");
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
@@ -75710,7 +76706,7 @@ test "session replica lifecycle IRCX AUTH guest rebind revokes the abandoned por
 }
 
 test "session replica lifecycle REGISTER rebind revokes the abandoned portable token" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var account_store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "replica-register-rebind.wal");
@@ -75751,7 +76747,7 @@ test "session replica lifecycle REGISTER rebind revokes the abandoned portable t
 }
 
 test "session replica lifecycle DROP revokes every distinct local token" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var account_store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "replica-drop-revoke.wal");
@@ -75814,7 +76810,7 @@ test "session replica lifecycle DROP revokes every distinct local token" {
 }
 
 test "multi-reactor DROP poison wins a raced authenticated recv before owner close" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var account_store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "drop-cross-reactor-race.wal");
@@ -75892,7 +76888,7 @@ test "multi-reactor DROP poison wins a raced authenticated recv before owner clo
 }
 
 test "session replica lifecycle keeps one-of-N authority and last nonportable sibling revokes" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x93)), "local");
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
@@ -75926,7 +76922,7 @@ test "session replica lifecycle keeps one-of-N authority and last nonportable si
 }
 
 test "session tracking at cap preserves detached portable authority for exact resume" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x94)), "local");
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
@@ -75957,7 +76953,7 @@ test "session tracking at cap preserves detached portable authority for exact re
 }
 
 test "session replica lifecycle revokes portable authority replaced on same-client attach" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x95)), "local");
     defer ident.deinit();
     const server = try std.testing.allocator.create(Server);
@@ -75988,7 +76984,7 @@ test "session replica lifecycle revokes portable authority replaced on same-clie
 }
 
 test "session replica nick index is case-folded bounded and ambiguity-safe" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
     server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -76105,7 +77101,7 @@ test "mesh nick-home claim fold is deterministic across every link order" {
 }
 
 test "relay direct messages honor local +R SILENCE and recipient session-sync" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -76192,7 +77188,7 @@ test "relay direct messages honor local +R SILENCE and recipient session-sync" {
 // SILENCE is per-recipient access control, and a case-sensitive owner key let a
 // silenced sender bypass the ignore simply by varying the target nick's case.
 test "SILENCE ACCESS control is case-insensitive: nick-case cannot bypass the ignore" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -76242,7 +77238,7 @@ test "SILENCE ACCESS control is case-insensitive: nick-case cannot bypass the ig
 }
 
 test "session-sync: sender same-account same-nick sibling gets the DM sent-copy without the cap" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -76272,7 +77268,7 @@ test "session-sync: sender same-account same-nick sibling gets the DM sent-copy 
 }
 
 test "session-sync exact-once matrix: local same-account distinct tokens dedupe mandatory and optional copies" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -76323,7 +77319,7 @@ test "session-sync exact-once matrix: local same-account distinct tokens dedupe 
 }
 
 test "threaded server: auxiliary direct events fan out exact-token attachments once with stable identity" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xA9)), "auxiliary-matrix.test");
     defer identity.deinit();
@@ -76470,7 +77466,7 @@ test "threaded server: auxiliary direct events fan out exact-token attachments o
 }
 
 test "threaded server: inactive OCG1 never authorizes remote DATA reserved tags" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -76506,7 +77502,7 @@ test "threaded server: inactive OCG1 never authorizes remote DATA reserved tags"
 }
 
 test "session-sync exact-once matrix: authenticated inbound relay dedupes exact tokens and account mirror" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -76564,7 +77560,7 @@ test "session-sync exact-once matrix: authenticated inbound relay dedupes exact 
 }
 
 test "relay DM rejects an unproven same-account sender-copy claim" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -76626,7 +77622,7 @@ test "relay DM rejects an unproven same-account sender-copy claim" {
 }
 
 test "relay direct messages honor local +C and +g callerid policy" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -76685,7 +77681,7 @@ test "relay direct messages honor local +C and +g callerid policy" {
 }
 
 test "relay +n accepts a verified multi-hop origin membership attestation" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -76710,7 +77706,7 @@ test "relay +n accepts a verified multi-hop origin membership attestation" {
 }
 
 test "relay +n denies a verified direct-origin nonmember" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -76735,7 +77731,7 @@ test "relay +n denies a verified direct-origin nonmember" {
 }
 
 test "relay +n denies an unsigned multi-hop nonmember" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -76760,7 +77756,7 @@ test "relay +n denies an unsigned multi-hop nonmember" {
 }
 
 test "relay channel speech gate mirrors local +C +T +U and status sender policy" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -76869,7 +77865,7 @@ test "relay channel speech gate mirrors local +C +T +U and status sender policy"
 }
 
 test "relayed channel message is recorded into CHATHISTORY for cross-node read-back" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -76938,7 +77934,7 @@ test "relayed channel message is recorded into CHATHISTORY for cross-node read-b
 }
 
 test "relayed TAGMSG reaches capable members only and preserves its live msgid in CHATHISTORY" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -76989,7 +77985,7 @@ test "relayed TAGMSG reaches capable members only and preserves its live msgid i
 }
 
 test "local stable-HLC PRIVMSG NOTICE TAGMSG and webhook keep live identity in history" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .server_name = "history-origin.test" }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -77108,7 +78104,7 @@ test "pinned messages: command mutators preserve bounded comma-list state" {
 }
 
 test "pinned messages: channelBuiltinSet gates PINS but leaves storage to the generic prop" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{
             .host = "127.0.0.1",
             .port = 0,
@@ -77197,7 +78193,7 @@ test "threaded server: PINS command uses channel prop storage and op gate" {
 }
 
 test "ephemeral room: EPHEMERAL prop bounds are validated on SET" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -77216,7 +78212,7 @@ test "ephemeral room: EPHEMERAL prop bounds are validated on SET" {
 }
 
 test "ephemeral room: TTL reader parses the prop; DMs never expire" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -77236,7 +78232,7 @@ test "ephemeral room: TTL reader parses the prop; DMs never expire" {
 }
 
 test "AI policy: channel PROP flags validate, persist, and resolve precedence" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -77290,7 +78286,7 @@ test "AI policy: channel PROP flags validate, persist, and resolve precedence" {
 }
 
 test "history policy: channel PROP validates and tightens CHATHISTORY access" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -77319,7 +78315,7 @@ test "history policy: channel PROP validates and tightens CHATHISTORY access" {
 }
 
 test "E2EE policy: channel PROP validates and required rooms reject plaintext" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -77376,7 +78372,7 @@ fn testMaxRoomEnvelope(out: []u8) []const u8 {
 }
 
 test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -77648,7 +78644,7 @@ test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh"
 }
 
 test "E2EEPOLICYBODY optional rooms still accept untagged plaintext" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -77674,7 +78670,7 @@ test "E2EEPOLICYBODY optional rooms still accept untagged plaintext" {
 }
 
 test "E2EEPOLICYBODY off rooms still accept untagged plaintext" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -77699,7 +78695,7 @@ test "E2EEPOLICYBODY off rooms still accept untagged plaintext" {
 }
 
 test "E2EEPOLICYBODY TAGMSG stays tag-only in required rooms" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -77753,7 +78749,7 @@ test "E2EEPOLICYBODY TAGMSG stays tag-only in required rooms" {
 }
 
 test "AI policy: public PROP visibility reaches non-op channel members" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -77794,7 +78790,7 @@ test "AI policy: public PROP visibility reaches non-op channel members" {
 }
 
 test "ephemeral room: replay drops messages older than the TTL, keeps fresh ones" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -77829,7 +78825,7 @@ test "ephemeral room: replay drops messages older than the TTL, keeps fresh ones
 }
 
 test "topics: registry PROP gates, auto-adds, records a mesh clock, and is CRDT-portable" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -77873,7 +78869,7 @@ test "topics: registry PROP gates, auto-adds, records a mesh clock, and is CRDT-
 }
 
 test "topics: CHATHISTORY topic filter replays only the matching conversation" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -78058,7 +79054,7 @@ test "threaded server: onyx/topics receives topic tags without generic message-t
 }
 
 test "status.json: emits node health + mesh peers for the public status page" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-status-kt.wal");
@@ -78165,7 +79161,7 @@ test "status.json: emits node health + mesh peers for the public status page" {
 }
 
 test "stats node health summarizes peer and quorum state" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -78189,7 +79185,7 @@ test "stats node health summarizes peer and quorum state" {
 }
 
 test "prometheus export includes mesh health and E2EEGROUP drain gauges" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -78223,7 +79219,7 @@ test "prometheus export includes mesh health and E2EEGROUP drain gauges" {
 }
 
 test "GAP-O1 merges reactor latency samples once into the metrics snapshot" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const previous_reactor = current_reactor;
     defer current_reactor = previous_reactor;
@@ -78268,7 +79264,7 @@ test "GAP-O1 merges reactor latency samples once into the metrics snapshot" {
 }
 
 test "GAP-O2 MESH and metrics expose peer rtt backlog anti-entropy and partitioned versus down" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const server = createTestServer(allocator, .{
         .host = "127.0.0.1",
@@ -78408,7 +79404,7 @@ test "status.json: peerStatusString maps every link state" {
 }
 
 test "ephemeral room: messages are not recorded into durable chanstats" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -78444,7 +79440,7 @@ test "chanstats TOPIC history payload keeps only topic text" {
 }
 
 test "mesh WARD applies and removes via applyRemoteWard" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -78514,7 +79510,7 @@ test "rotatable cloak key: a ward on the old-key cloak misses the new-key cloak"
 }
 
 test "cloak auth-split: anonymous gets epoch opaque, logged-in keeps the stable account cloak" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -78555,7 +79551,7 @@ test "cloak auth-split: anonymous gets epoch opaque, logged-in keeps the stable 
 }
 
 test "cloak auth-split: anon_epoch_secs=0 keeps the stable hierarchical cloak (back-compat)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -78785,7 +79781,7 @@ fn pumpServerTestPeers(
 }
 
 test "deliverRelay accepts a correctly signed origin message" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -78811,7 +79807,7 @@ test "deliverRelay accepts a correctly signed origin message" {
 }
 
 test "E5E1 session replica residence rejects downgrade without widening exact token authority" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var local_ident = try node_identity.fromSeed(@as([32]u8, @splat(0x35)), "session-downgrade-local");
     defer local_ident.deinit();
@@ -78928,7 +79924,7 @@ test "E5E1 session replica residence rejects downgrade without widening exact to
 }
 
 test "signed peer ingest uses Store residence decisions for downgrade and v2 rowless sidecars" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var local_ident = try node_identity.fromSeed(@as([32]u8, @splat(0x38)), "peer-residence-local");
     defer local_ident.deinit();
@@ -79366,7 +80362,7 @@ test "signed peer ingest uses Store residence decisions for downgrade and v2 row
 }
 
 test "Helix silent session projection is complete without derived output and rejects invalid profile" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var local_ident = try node_identity.fromSeed(@as([32]u8, @splat(0x2d)), "helix-projection-local");
     defer local_ident.deinit();
@@ -79458,7 +80454,7 @@ test "Helix silent session projection is complete without derived output and rej
 }
 
 test "signed session replica projects JOIN PART only to the exact token and never republishes" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var local_ident = try node_identity.fromSeed(@as([32]u8, @splat(0x31)), "session-projection-local");
     defer local_ident.deinit();
@@ -79683,7 +80679,7 @@ test "signed session replica projects JOIN PART only to the exact token and neve
 }
 
 test "rowless signed session replica retries Pending staging after capacity clears" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var remote_kp = try sign_mod.KeyPair.fromSeed(@as([sign_mod.seed_len]u8, @splat(0x33)));
     defer remote_kp.deinit();
@@ -79747,7 +80743,7 @@ test "rowless signed session replica retries Pending staging after capacity clea
 }
 
 test "pending v2 reconnect projection cannot outlive signed Store authority" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -79781,7 +80777,7 @@ test "pending v2 reconnect projection cannot outlive signed Store authority" {
 }
 
 test "deliverRelay rejects a signed WHISPER from an off-channel remote sender" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -79821,7 +80817,7 @@ test "deliverRelay rejects a signed WHISPER from an off-channel remote sender" {
 }
 
 test "verified relay DM stores canonical account history with origin time and unsigned claims cannot select it" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -79932,7 +80928,7 @@ test "verified relay DM stores canonical account history with origin time and un
 }
 
 test "deliverRelay rejects a forged signature: not delivered, counted" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -79957,7 +80953,7 @@ test "deliverRelay rejects a forged signature: not delivered, counted" {
 }
 
 test "deliverRelay rejects a pubkey whose originShortId != origin_node" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -79982,7 +80978,7 @@ test "deliverRelay rejects a pubkey whose originShortId != origin_node" {
 }
 
 test "deliverRelay still delivers a legacy unsigned message (backward compat)" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -80013,7 +81009,7 @@ test "deliverRelay still delivers a legacy unsigned message (backward compat)" {
 }
 
 test "deliverRelay rejects unsafe direct callers before delivery and dedup observation" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -80050,7 +81046,7 @@ test "deliverRelay rejects unsafe direct callers before delivery and dedup obser
 }
 
 test "legacy relay signature payload stays self-verifiable" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -80081,7 +81077,7 @@ test "legacy relay signature payload stays self-verifiable" {
 }
 
 test "deliverRelay binds sender nick to home: legit delivers, mismatch and unknown drop" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .node_id = 2 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -80159,7 +81155,7 @@ test "deliverRelay binds sender nick to home: legit delivers, mismatch and unkno
 }
 
 test "MESSAGE_V2 unknown home retries then converges and delivers once" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x31)), "relay-v2-unknown-home");
@@ -80258,7 +81254,7 @@ test "MESSAGE_V2 unknown home retries then converges and delivers once" {
 }
 
 test "MESSAGE_V2 unknown home convergence to different node drops permanently" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x33)), "relay-v2-unknown-mismatch");
@@ -80343,7 +81339,7 @@ test "MESSAGE_V2 unknown home convergence to different node drops permanently" {
 }
 
 test "MESSAGE_V2 deferred unknown-home expires without delivery" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x35)), "relay-v2-unknown-expiry");
@@ -80401,7 +81397,7 @@ test "MESSAGE_V2 deferred unknown-home expires without delivery" {
 }
 
 test "MESSAGE_V2 signed member modes bypass unknown-home retry" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x37)), "relay-v2-membermode-bypass");
@@ -80454,7 +81450,7 @@ test "MESSAGE_V2 signed member modes bypass unknown-home retry" {
 }
 
 test "MESSAGE_V2 known-home mismatch with signed member modes still drops permanently" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var local = try node_identity.fromSeed(@as([32]u8, @splat(0x39)), "relay-v2-mismatch-membermode");
@@ -80607,7 +81603,7 @@ fn buildSignedProp(
 }
 
 test "channel prop: a locally-authored fact is signed and verifies against its origin" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "local");
         defer ident.deinit();
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
@@ -80641,7 +81637,7 @@ test "channel prop: a locally-authored fact is signed and verifies against its o
 }
 
 test "channel prop: an inbound signed fact verifies, applies, and is stored for re-broadcast" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -80676,7 +81672,7 @@ test "channel prop: an inbound signed fact verifies, applies, and is stored for 
 }
 
 test "channel prop: a forged inbound fact is rejected, counted, and not applied" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -80716,7 +81712,7 @@ test "channel prop: a forged inbound fact is rejected, counted, and not applied"
 }
 
 test "channel prop: a re-broadcast preserves the ORIGINAL author's signature (multi-hop)" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -80764,7 +81760,7 @@ test "channel prop: a re-broadcast preserves the ORIGINAL author's signature (mu
 }
 
 test "channel prop: a legacy unsigned inbound fact still applies (backward compat)" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -80855,7 +81851,7 @@ fn buildSignedEntityProp(
 }
 
 test "E5E1 remote identity namespace quarantine precedes signatures clocks stores and authority" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -80896,7 +81892,7 @@ test "E5E1 remote identity namespace quarantine precedes signatures clocks store
 }
 
 test "E5E1 local identity add residence and delete never export to plaintext or secured links" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -80973,7 +81969,7 @@ test "E5E1 local identity add residence and delete never export to plaintext or 
 }
 
 test "remote property admission advances HLC only for accepted channel and entity facts" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -81093,7 +82089,7 @@ test "remote property admission advances HLC only for accepted channel and entit
 }
 
 test "entity prop: a local user prop and member prop are signed and verify against their origin" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "local");
         defer ident.deinit();
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
@@ -81134,7 +82130,7 @@ test "entity prop: a local user prop and member prop are signed and verify again
 }
 
 test "entity prop: an inbound signed user fact verifies, applies, and is stored for re-broadcast" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -81168,7 +82164,7 @@ test "entity prop: an inbound signed user fact verifies, applies, and is stored 
 }
 
 test "entity prop: an inbound signed member fact verifies and applies" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -81189,7 +82185,7 @@ test "entity prop: an inbound signed member fact verifies and applies" {
 }
 
 test "entity prop: a forged inbound fact is rejected, counted, and not applied" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -81233,7 +82229,7 @@ test "entity prop: a forged inbound fact is rejected, counted, and not applied" 
 }
 
 test "entity prop: a re-broadcast preserves the ORIGINAL author's signature (multi-hop)" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -81276,7 +82272,7 @@ test "entity prop: a re-broadcast preserves the ORIGINAL author's signature (mul
 }
 
 test "entity prop: a legacy unsigned inbound fact still applies (backward compat)" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -81305,7 +82301,7 @@ test "entity prop: a legacy unsigned inbound fact still applies (backward compat
 }
 
 test "entity prop: newer hlc wins, older is ignored (LWW for user and member)" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -81334,7 +82330,7 @@ test "entity prop: newer hlc wins, older is ignored (LWW for user and member)" {
 }
 
 test "remote aggregate channel mode flags cannot clear local +nt policy" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -81359,7 +82355,7 @@ test "remote aggregate channel mode flags cannot clear local +nt policy" {
 }
 
 test "remote channel mode state applies params and respects local MLOCK" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -81438,7 +82434,7 @@ fn pumpLinkPair(a: *s2s_link.S2sLink, b: *s2s_link.S2sLink, alloc: std.mem.Alloc
 }
 
 test "S2S identity transition renders PART before NICK before JOIN" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .node_id = 2 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -81508,7 +82504,7 @@ test "S2S identity transition renders PART before NICK before JOIN" {
 }
 
 test "secured S2S v2 identity transition renders PART before NICK before JOIN" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(alloc);
     defer pair.deinit();
@@ -81580,7 +82576,7 @@ test "secured S2S v2 identity transition renders PART before NICK before JOIN" {
 }
 
 test "mesh LIST: remote-only channels join the union with the global count, secret hidden, deduped" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -81680,7 +82676,7 @@ test "mesh LIST: remote-only channels join the union with the global count, secr
 }
 
 test "GAP-P0c remote LISTX carries the peer topic" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -81724,7 +82720,7 @@ test "GAP-P0c remote LISTX carries the peer topic" {
 /// test instead of hanging). Accumulates into `client` and returns when `needle`
 /// is present, or errors after ~3s.
 fn recvUntil(client: *LiveClient, needle: []const u8, max_polls: usize) !void {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         // Use a WALL-CLOCK deadline rather than a fixed poll count: under heavy
         // parallel-test CPU contention the reactor thread can be briefly starved, so
         // a count-based budget (poll returns early on data, burning iterations)
@@ -81736,10 +82732,10 @@ fn recvUntil(client: *LiveClient, needle: []const u8, max_polls: usize) !void {
         while (true) {
             if (std.mem.indexOf(u8, client.written(), needle) != null) return;
             if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
-            var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
+            var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = posix.POLL.IN, .revents = 0 }};
             const ready = posix.poll(&fds, 50) catch return error.Unexpected;
             if (ready == 0) continue;
-            if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+            if ((fds[0].revents & posix.POLL.IN) == 0) continue;
             if (client.len == client.buf.len) return error.OutputTooSmall;
             const n = try readFd(client.fd, client.buf[client.len..]);
             if (n == 0) return error.ConnectionReset;
@@ -82001,6 +82997,87 @@ test "threaded server: SASLINFO advertises EXTERNAL when configured" {
     client.reset();
     try writeAllFd(fd, "SASLINFO\r\n");
     try recvUntil(&client, "SASL mechanisms: EXTERNAL", 200);
+}
+
+test "SESSIONTOKEN live dispatch issues Unix expiry and survives durable cold reopen" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    current_reactor = null;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Clock = struct {
+        wall_ms: i64,
+        fn mono(_: *anyopaque) i64 {
+            return 10_000;
+        }
+        fn wall(ctx: *anyopaque) i64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.wall_ms;
+        }
+        const vtable = reactor_mod.Reactor.VTable{ .nowMillis = mono, .wallMillis = wall };
+    };
+    var clock = Clock{ .wall_ms = platform.realtimeMillis() };
+    var token: []u8 = &.{};
+    defer allocator.free(token);
+    var expiry: i64 = 0;
+    {
+        var store = try services_mod.OroStore.open(allocator, std.testing.io, tmp.dir, "sessiontoken-clock.wal");
+        defer store.deinit();
+        var services = services_mod.Services.init(&store, null);
+        var scratch: [1024]u8 = undefined;
+        _ = try services.registerAccount("alice", "session-token-clock-fixture", &scratch);
+        const server = try createTestServer(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .crypto_io = std.testing.io,
+            .account_services = &services,
+            .reactor = .{ .ptr = &clock, .vtable = &Clock.vtable },
+        });
+        defer allocator.destroy(server);
+        defer server.deinit();
+        current_reactor = &server.reactors[0];
+        const id = try server.rx().clients.alloc(ConnState.init(-1));
+        const conn = server.rx().clients.get(id).?;
+        conn.token = try tokenFromId(id);
+        conn.is_tls = true;
+        conn.session.loginAs("alice");
+        try server.processLiveLine(id, conn, "NICK TokenUser");
+        try server.processLiveLine(id, conn, "USER token 0 * :Token User");
+        conn.send_len = 0;
+        conn.send_offset = 0;
+        try server.processLiveLine(id, conn, "SESSIONTOKEN");
+        const written = conn.send_buf[0..conn.send_len];
+        const marker = " :SESSIONTOKEN alice ";
+        const start = (std.mem.indexOf(u8, written, marker) orelse return error.TestUnexpectedResult) + marker.len;
+        const token_end = std.mem.indexOfScalar(u8, written[start..], ' ') orelse return error.TestUnexpectedResult;
+        token = try allocator.dupe(u8, written[start..][0..token_end]);
+        const expiry_start = (std.mem.indexOf(u8, written, " expires=") orelse return error.TestUnexpectedResult) + " expires=".len;
+        const expiry_end = std.mem.indexOfScalar(u8, written[expiry_start..], '\r') orelse return error.TestUnexpectedResult;
+        expiry = try std.fmt.parseInt(i64, written[expiry_start..][0..expiry_end], 10);
+        try std.testing.expectEqual(@divTrunc(clock.wall_ms, 1000) + services_mod.default_session_token_ttl_seconds, expiry);
+        var bridge = @import("sasl_bridge.zig").ServicesSessionTokenLookup{ .services = &services };
+        var account: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("alice", bridge.lookup().verify(.{ .authcid = "alice", .token = token }, &account) orelse return error.TestUnexpectedResult);
+        const changes_before = store.changeCount();
+        clock.wall_ms = 0;
+        conn.send_len = 0;
+        conn.send_offset = 0;
+        try server.processLiveLine(id, conn, "SESSIONTOKEN");
+        try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], "FAIL SESSIONTOKEN TOKEN_ISSUE_FAILED") != null);
+        try std.testing.expectEqual(changes_before, store.changeCount());
+        try std.testing.expectEqualStrings("alice", bridge.lookup().verify(.{ .authcid = "alice", .token = token }, &account) orelse return error.TestUnexpectedResult);
+    }
+    current_reactor = null;
+    var restored = try services_mod.OroStore.open(allocator, std.testing.io, tmp.dir, "sessiontoken-clock.wal");
+    defer restored.deinit();
+    var services = services_mod.Services.init(&restored, null);
+    var bridge = @import("sasl_bridge.zig").ServicesSessionTokenLookup{ .services = &services };
+    var account: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("alice", bridge.lookup().verify(.{ .authcid = "ALICE", .token = token }, &account) orelse return error.TestUnexpectedResult);
+    try std.testing.expect(services.validateSessionToken("alice", token, expiry, &account) == null);
+    token[token.len - 1] = if (token[token.len - 1] == '0') '1' else '0';
+    try std.testing.expect(bridge.lookup().verify(.{ .authcid = "alice", .token = token }, &account) == null);
 }
 
 test "threaded server: SESSIONTOKEN refuses non-TLS transport" {
@@ -82349,7 +83426,7 @@ test "threaded server: mesh-token local resume restores detached snapshot" {
 }
 
 test "threaded server: one mesh credential attaches multiple live clients without nonce races" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const mesh_key = "unit-mesh-reclaim-key";
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -82411,7 +83488,7 @@ test "threaded server: one mesh credential attaches multiple live clients withou
 }
 
 test "threaded server: session reclaim local restore failure leaves the ghost reclaimable" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -82470,7 +83547,7 @@ test "threaded server: session reclaim local restore failure leaves the ghost re
 }
 
 test "SESSION RESUME retry latch clears on terminal and already-attached attempts" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -82527,7 +83604,7 @@ test "SESSION RESUME retry latch clears on terminal and already-attached attempt
 }
 
 test "SESSION RESUME composite rejects malformed terminal and forged exact authority without downgrade" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xd1)), "resume-security");
     defer identity.deinit();
     var foreign_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xd2)), "resume-security-foreign");
@@ -82736,7 +83813,7 @@ test "SESSION RESUME composite rejects malformed terminal and forged exact autho
 }
 
 test "SESSION RESUME exact selector moves only its sibling and durable spool" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -82817,7 +83894,7 @@ test "SESSION RESUME exact selector moves only its sibling and durable spool" {
 }
 
 test "ReleaseSafe SESSION TOKEN reader-first issuance gate defaults legacy and explicitly enables SRM2" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xd3)), "resume-issuance-gate");
     defer identity.deinit();
     var server = Server.init(std.testing.allocator, .{
@@ -82872,7 +83949,7 @@ test "ReleaseSafe SESSION TOKEN reader-first issuance gate defaults legacy and e
 }
 
 test "E2EE at-cap exact resume hold isolates succeeds on proof and closes on expiry" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -82944,7 +84021,7 @@ test "E2EE at-cap exact resume hold isolates succeeds on proof and closes on exp
 }
 
 test "SESSION RESUME legacy local and SRM1 create new without stripping ghost spool" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83027,7 +84104,7 @@ test "SESSION RESUME legacy local and SRM1 create new without stripping ghost sp
 }
 
 test "expired SESSION RESUME retry hold clears TOKEN latch and restores UPGRADE readiness" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83065,7 +84142,7 @@ test "expired SESSION RESUME retry hold clears TOKEN latch and restores UPGRADE 
 }
 
 test "manual SESSION RESUME retry preservation expires without autojoin deferral and restores UPGRADE readiness" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83105,7 +84182,7 @@ test "manual SESSION RESUME retry preservation expires without autojoin deferral
 }
 
 test "threaded server: explicit detached session resume spool conflict aborts before identity commit" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, .{
         .host = "127.0.0.1",
@@ -83201,7 +84278,7 @@ test "threaded server: explicit detached session resume spool conflict aborts be
 }
 
 test "SESSION DROP removes a sibling attachment by LIST index" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83289,7 +84366,7 @@ fn sessionListSidForClient(haystack: []const u8, idx: usize) ![]const u8 {
 }
 
 test "SESSION DROP #n cannot retarget after list snapshot mutation" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83354,7 +84431,7 @@ test "SESSION DROP #n cannot retarget after list snapshot mutation" {
 }
 
 test "SESSION DROP sid revokes exactly one physical attachment and leaves shared-token siblings live" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83448,7 +84525,7 @@ test "SESSION DROP sid revokes exactly one physical attachment and leaves shared
 }
 
 test "SESSION DROP crosses two live reactors and preserves an exact-token sibling identity" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83578,7 +84655,7 @@ test "SESSION DROP crosses two live reactors and preserves an exact-token siblin
 }
 
 test "SESSION DROP fails closed on absent, stale, and account-switched ids" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83657,7 +84734,7 @@ test "SESSION DROP fails closed on absent, stale, and account-switched ids" {
 }
 
 test "SESSION DROP leaves an attached foreign-shard row untouched until the reserved handoff protocol exists" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83712,7 +84789,7 @@ test "SESSION DROP leaves an attached foreign-shard row untouched until the rese
 }
 
 test "closing a token sibling cancels reserved DROP before detaching its row" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83764,7 +84841,7 @@ test "closing a token sibling cancels reserved DROP before detaching its row" {
 }
 
 test "SESSION DROP never treats a local target with an unattested foreign token sibling as final" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83806,7 +84883,7 @@ test "SESSION DROP never treats a local target with an unattested foreign token 
 }
 
 test "SESSION DROP prefers the current nick-owning sibling among three local token attachments" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83852,7 +84929,7 @@ test "SESSION DROP prefers the current nick-owning sibling among three local tok
 }
 
 test "threaded server: EXTERNAL auto-resume latch excludes certificates and PLAIN" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -83902,7 +84979,7 @@ test "threaded server: EXTERNAL auto-resume latch excludes certificates and PLAI
 }
 
 test "threaded server: EXTERNAL exact account nick auto-attaches one local token and picks canonical among many" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84014,7 +85091,7 @@ test "threaded server: EXTERNAL exact account nick auto-attaches one local token
 }
 
 test "threaded server: EXTERNAL prefers live local over competing mesh replicas" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84075,7 +85152,7 @@ test "threaded server: EXTERNAL prefers live local over competing mesh replicas"
 }
 
 test "threaded server: EXTERNAL picks highest-revision staged mesh replica among many" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84135,7 +85212,7 @@ test "threaded server: EXTERNAL picks highest-revision staged mesh replica among
 }
 
 test "threaded server: secured replica permits tokenless EXTERNAL exact account nick resume" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84199,7 +85276,7 @@ test "threaded server: secured replica permits tokenless EXTERNAL exact account 
 }
 
 test "threaded server: first EXTERNAL login proactively publishes its portable session" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x6f)), "external-origin");
     defer identity.deinit();
     var server = Server.init(std.testing.allocator, .{
@@ -84238,7 +85315,7 @@ test "threaded server: first EXTERNAL login proactively publishes its portable s
 }
 
 test "threaded server: detached EXTERNAL proof uses bootstrap source tie break" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84300,7 +85377,7 @@ test "threaded server: detached EXTERNAL proof uses bootstrap source tie break" 
 }
 
 test "threaded server: fresh EXTERNAL publication failure preserves cap ghost byte exact" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84345,7 +85422,7 @@ test "threaded server: fresh EXTERNAL publication failure preserves cap ghost by
 }
 
 test "threaded server: registration EXTERNAL resumes before oper prefix and applies vhost to siblings" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x70)), "external-registration");
     defer identity.deinit();
     var server = Server.init(std.testing.allocator, .{
@@ -84364,7 +85441,7 @@ test "threaded server: registration EXTERNAL resumes before oper prefix and appl
     defer server.deinit();
 
     const owner_id = try addTestLocalClient(&server, "admin", "admin");
-    const owner = server.connFor(owner_id).?;
+    var owner = server.connFor(owner_id).?;
     try server.world.restoreMember(
         "#root",
         worldIdFromClient(owner_id),
@@ -84380,10 +85457,13 @@ test "threaded server: registration EXTERNAL resumes before oper prefix and appl
     try server.host_requests.approve("admin", server.nowMs());
 
     const claimant_id = try server.rx().clients.alloc(ConnState.init(-1));
+    owner = server.connFor(owner_id).?;
     const claimant = server.connFor(claimant_id).?;
     claimant.token = try tokenFromId(claimant_id);
     server.injectSessionState(claimant);
     claimant.session.tls_certfp = "verified-certfp";
+    // This direct allocation is a socketless SendQ inspection fixture too.
+    if (comptime builtin.os.tag == .openbsd) claimant.test_sendq_capture = true;
     try server.processLiveLine(claimant_id, claimant, "CAP REQ :sasl");
     try server.processLiveLine(claimant_id, claimant, "AUTHENTICATE EXTERNAL");
     try server.processLiveLine(claimant_id, claimant, "AUTHENTICATE YWRtaW4=");
@@ -84420,7 +85500,7 @@ test "threaded server: registration EXTERNAL resumes before oper prefix and appl
 }
 
 test "threaded server: approved account vhost reaches attachments on every reactor" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84452,7 +85532,7 @@ test "threaded server: approved account vhost reaches attachments on every react
 }
 
 test "threaded server: cap-bound detached EXTERNAL registration preserves and restores exact token" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84498,7 +85578,7 @@ test "threaded server: cap-bound detached EXTERNAL registration preserves and re
 }
 
 test "threaded server: EXTERNAL registration blocks on missing stale or mismatched mesh projection" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const Scenario = enum { missing, stale_revision, mismatched_snapshot };
     for ([_]Scenario{ .missing, .stale_revision, .mismatched_snapshot }) |scenario| {
         var server = Server.init(std.testing.allocator, .{
@@ -84560,7 +85640,7 @@ test "threaded server: EXTERNAL registration blocks on missing stale or mismatch
 }
 
 test "threaded server: local resume joins an attached reusable session" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84718,7 +85798,7 @@ test "threaded server: local resume joins an attached reusable session" {
 }
 
 test "threaded server: resume roster pressure aborts before World or token commit" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84783,7 +85863,7 @@ test "threaded server: resume roster pressure aborts before World or token commi
 }
 
 test "threaded server: already-seated no-implicit resume emits no bootstrap bytes" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84837,7 +85917,7 @@ test "threaded server: already-seated no-implicit resume emits no bootstrap byte
 }
 
 test "threaded server: resume reuses exact server-time tags for claimant and peers" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84925,7 +86005,7 @@ test "threaded server: resume reuses exact server-time tags for claimant and pee
 }
 
 test "live session identity handoff requires the exact reusable token" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -84984,7 +86064,7 @@ test "live session identity handoff requires the exact reusable token" {
 }
 
 test "live session identity handoff never transfers nick after allocation failure" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var fail_offset: usize = 0;
     while (fail_offset < 128) : (fail_offset += 1) {
         const completed = blk: {
@@ -85033,7 +86113,7 @@ test "live session identity handoff never transfers nick after allocation failur
 }
 
 test "close retries exact-session handoff before teardown after allocation failure" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var server = Server.init(failing.allocator(), .{
         .host = "127.0.0.1",
@@ -85096,7 +86176,7 @@ test "close retries exact-session handoff before teardown after allocation failu
 }
 
 test "portable teardown requires exact remote authority and retains clean QUIT channels" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pair = try SessionReplayTestPair.init(allocator);
     defer pair.deinit();
@@ -85210,7 +86290,7 @@ test "portable teardown requires exact remote authority and retains clean QUIT c
 }
 
 test "threaded server: legacy consumed notice cannot delete a reusable session replica" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -85235,7 +86315,7 @@ test "threaded server: legacy consumed notice cannot delete a reusable session r
 }
 
 test "threaded server: migration staging isolates equal nonces from different peer signers" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -85285,7 +86365,7 @@ test "threaded server: migration staging isolates equal nonces from different pe
 }
 
 test "threaded server: session migration restore cannot switch the authenticated account" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -85323,7 +86403,7 @@ test "threaded server: session migration restore cannot switch the authenticated
 }
 
 test "atomic RESUME staged capsule adopts a rowless verified token" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, .{
         .host = "127.0.0.1",
@@ -85380,7 +86460,7 @@ test "atomic RESUME staged capsule adopts a rowless verified token" {
 }
 
 test "atomic legacy SRM1 staged capsule joins without consuming an existing ghost" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const mesh_key = "atomic-staged-ghost-key";
     var server = Server.init(allocator, .{
@@ -85472,7 +86552,7 @@ test "atomic legacy SRM1 staged capsule joins without consuming an existing ghos
 }
 
 test "atomic RESUME refuses pending token A and an attached old token group" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -85547,7 +86627,7 @@ test "atomic RESUME refuses pending token A and an attached old token group" {
 }
 
 test "atomic RESUME rendered PART preserves target and old-identity siblings" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -85622,7 +86702,7 @@ test "atomic RESUME rendered PART preserves target and old-identity siblings" {
 }
 
 test "threaded server: session reclaim crypto_io-null disables reclaim not constant zero tokens" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -85664,7 +86744,7 @@ test "threaded server: session reclaim crypto_io-null disables reclaim not const
 }
 
 test "threaded server: MTOKEN is withheld when portable snapshot preflight cannot complete" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, .{
         .host = "127.0.0.1",
@@ -85705,7 +86785,7 @@ test "threaded server: MTOKEN is withheld when portable snapshot preflight canno
 }
 
 test "threaded server: mesh reclaim credentials use portable wall-clock expiry" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const mesh_key = "wall-clock-mesh-key";
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -85733,7 +86813,7 @@ test "threaded server: mesh reclaim credentials use portable wall-clock expiry" 
 }
 
 test "threaded server: session tracking at cap with all slots attached is surfaced not fatal" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -86223,10 +87303,16 @@ test "threaded server: SASL oper elevation persists inactive OCG1 compatibility 
     // tmpDir. A realtime-millisecond `/tmp` name collides when test-mod and
     // test-roadmap run this artifact in parallel, letting one process truncate
     // the other's grant between 381 and the assertion.
-    var tmp_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const tmp_path_len = try tmp.dir.realPath(std.testing.io, &tmp_path_buf);
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const grants_path = try std.fmt.bufPrint(&path_buf, "{s}/oper-grants.tsv", .{tmp_path_buf[0..tmp_path_len]});
+    const grants_path = if (builtin.os.tag == .openbsd)
+        // TmpDir is rooted under the runner's .zig-cache/tmp. OpenBSD has no
+        // descriptor-to-path operation; keep the same unique owned directory.
+        try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/oper-grants.tsv", .{tmp.sub_path})
+    else blk: {
+        var tmp_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const tmp_path_len = try tmp.dir.realPath(std.testing.io, &tmp_path_buf);
+        break :blk try std.fmt.bufPrint(&path_buf, "{s}/oper-grants.tsv", .{tmp_path_buf[0..tmp_path_len]});
+    };
 
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -86343,7 +87429,7 @@ test "threaded server: a joining network operator announces the derived +Y prefi
 }
 
 test "server services replay restores registered channels mlocks akicks and wards" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
@@ -86395,7 +87481,7 @@ test "server services replay restores registered channels mlocks akicks and ward
 // handle and replaying into a freshly-initialized server, asserting the
 // restored entries are present and enforce (matchHostmask).
 test "server services replay restores persisted SACCESS entries" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
@@ -86438,7 +87524,7 @@ test "server services replay restores persisted SACCESS entries" {
 // GAP 2: a CLEAR mutation is durable. After clearing one type, replay restores
 // only the surviving types.
 test "server services replay honors persisted SACCESS clear" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
@@ -86840,7 +87926,7 @@ test "threaded server: registered nick requires owner authentication before use"
 }
 
 test "threaded server: VERIFY accepts account argument and legacy code form" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
@@ -86955,7 +88041,7 @@ test "threaded server: GHOST rejects caller account for non-account nick" {
 }
 
 test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         // Two reactor threads, SO_REUSEPORT listeners — the kernel may place each
         // client on either reactor. Several clients in one channel raise the odds two
         // of them land on DIFFERENT shards; a PRIVMSG must still reach every member,
@@ -87047,7 +88133,7 @@ test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {
 }
 
 test "threaded server: oper EVENT delivery + cross-shard fan-out under num_shards=2" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         // Exercises the multi-reactor oper-event path: several SASL-admin opers (all
         // auto-subscribed on elevation), one broadcasts, and EVERY oper must receive
         // it. publishOperEvent delivers locally AND fans the event to other shards'
@@ -89461,8 +90547,622 @@ test "threaded server: draft/multiline enforces runtime line limit" {
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "PRIVMSG #m :three") == null);
 }
 
+test "shared full server: OpenBSD wildcard pairs deliver across families and quiesce every listener" {
+    if (comptime builtin.os.tag != .openbsd) return error.SkipZigTest;
+    current_reactor = null;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x52)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try @import("../proto/x509_selfsign.zig").buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x52, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{der};
+
+    for ([_][]const u8{ "", "0.0.0.0", "::" }) |host| {
+        const reservation = try reuseport.createOpenBsdListener("127.0.0.1", 0, 8, false);
+        const mesh_port = try socketPort(reservation);
+        closeFd(reservation);
+        const server = try createTestServer(allocator, .{
+            .host = host,
+            .port = 0,
+            .s2s_port = mesh_port,
+            .num_shards = 2,
+            .max_clients = 8,
+            .tls_port = 0,
+            .tls_cert_chain = &chain,
+            .tls_signing_key = kp,
+            .ws_enabled = true,
+            .ws_allow_plain = true,
+            .ws_port = 0,
+        });
+        defer allocator.destroy(server);
+        var deinited = false;
+        defer if (!deinited) server.deinit();
+        const rows = try server.collectListenerManifest(allocator);
+        defer allocator.free(rows);
+        // Plain/TLS/WS have two families on each shard; S2S only reactor0.
+        try std.testing.expectEqual(@as(usize, 14), rows.len);
+        var kinds: [4]usize = @splat(0);
+        var families: [2]usize = @splat(0);
+        for (rows) |row| {
+            kinds[@intFromEnum(row.kind)] += 1;
+            families[if (row.family == .ipv4) @as(usize, 0) else 1] += 1;
+            if (row.kind == .s2s) try std.testing.expectEqual(@as(u12, 0), row.shard);
+            const flags = posix.system.fcntl(row.fd, posix.F.GETFD, @as(i32, 0));
+            try std.testing.expect(posix.errno(flags) == .SUCCESS);
+            try std.testing.expect(flags & posix.FD_CLOEXEC != 0);
+            const port = try socketPort(row.fd);
+            for (rows) |other| {
+                if (other.kind == row.kind) {
+                    try std.testing.expectEqual(port, try socketPort(other.fd));
+                }
+            }
+        }
+        try std.testing.expectEqual([4]usize{ 4, 2, 4, 4 }, kinds);
+        try std.testing.expectEqual([2]usize{ 7, 7 }, families);
+
+        var run = std.atomic.Value(bool).init(true);
+        const thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
+        var stopped = false;
+        defer if (!stopped) stopThreadedServer(server, &run, thr);
+        const port = try server.boundPort();
+        const fd4 = try connectNativeLoopbackForTest(.ipv4, port);
+        defer closeFd(fd4);
+        const fd6 = try connectNativeLoopbackForTest(.ipv6, port);
+        defer closeFd(fd6);
+        var v4 = LiveClient{ .fd = fd4 };
+        var v6 = LiveClient{ .fd = fd6 };
+        try writeAllFd(fd4, "NICK V4\r\nUSER four 0 * :Four\r\nJOIN #native-dual\r\n");
+        try recvUntil(&v4, " 366 V4 #native-dual ", 200);
+        try writeAllFd(fd6, "NICK V6\r\nUSER six 0 * :Six\r\nJOIN #native-dual\r\n");
+        try recvUntil(&v6, " 366 V6 #native-dual ", 200);
+        v6.reset();
+        try writeAllFd(fd4, "PRIVMSG #native-dual :native-two-families\r\n");
+        const message = "PRIVMSG #native-dual :native-two-families";
+        try recvUntil(&v6, message, 200);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, v6.written(), message));
+
+        var transport_probes: [4]?*NativeTlsProbeForTest = @splat(null);
+        defer for (transport_probes) |maybe| if (maybe) |probe| probe.deinit(allocator);
+        const tls_port = try server.tlsBoundPort();
+        const ws_port = try server.wsBoundPort();
+        for ([_]ListenerFamily{ .ipv4, .ipv6 }, 0..) |family, family_index| {
+            const tls_probe = try NativeTlsProbeForTest.init(allocator, try connectNativeLoopbackForTest(family, tls_port), &chain);
+            transport_probes[family_index * 2] = tls_probe;
+            try tls_probe.probe.handshake();
+            var command: [256]u8 = undefined;
+            const suffix = if (family == .ipv4) "4" else "6";
+            try tls_probe.probe.send(try std.fmt.bufPrint(&command, "NICK T{s}\r\nUSER tls 0 * :TLS\r\nJOIN #native-dual\r\n", .{suffix}));
+            var needle: [128]u8 = undefined;
+            try tls_probe.probe.pumpUntil(try std.fmt.bufPrint(&needle, " 366 T{s} #native-dual ", .{suffix}), 20_000);
+            v4.reset();
+            const body = try std.fmt.bufPrint(&command, "PRIVMSG #native-dual :native-tls-{s}\r\n", .{suffix});
+            try tls_probe.probe.send(body);
+            try recvUntil(&v4, body[0 .. body.len - 2], 200);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, v4.written(), body[0 .. body.len - 2]));
+
+            const ws_probe = try NativeTlsProbeForTest.init(allocator, try connectNativeLoopbackForTest(family, ws_port), &chain);
+            transport_probes[family_index * 2 + 1] = ws_probe;
+            try ws_probe.probe.handshake();
+            try ws_probe.probe.send("GET /irc HTTP/1.1\r\nHost: irc.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: irc\r\n\r\n");
+            try ws_probe.probe.pumpUntil("HTTP/1.1 101 Switching Protocols", 20_000);
+            try ws_probe.sendTextFrame(try std.fmt.bufPrint(&command, "NICK W{s}\r\nUSER wss 0 * :WSS\r\nJOIN #native-dual\r\n", .{suffix}));
+            try ws_probe.probe.pumpUntil(try std.fmt.bufPrint(&needle, " 366 W{s} #native-dual ", .{suffix}), 20_000);
+            v6.reset();
+            const ws_body = try std.fmt.bufPrint(&command, "PRIVMSG #native-dual :native-wss-{s}\r\n", .{suffix});
+            try ws_probe.sendTextFrame(ws_body);
+            try recvUntil(&v6, ws_body[0 .. ws_body.len - 2], 200);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, v6.written(), ws_body[0 .. ws_body.len - 2]));
+        }
+        const broadcast = "PRIVMSG #native-dual :all-native-transports";
+        try writeAllFd(fd4, broadcast ++ "\r\n");
+        for (transport_probes) |maybe| {
+            const probe = maybe.?;
+            try probe.probe.pumpUntil(broadcast, 20_000);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.probe.plain.items, broadcast));
+        }
+        stopThreadedServer(server, &run, thr);
+        stopped = true;
+        try std.testing.expect(server.runtimeFailure() == null);
+        var tls_owned: usize = 0;
+        var ws_owned: usize = 0;
+        var plain_owned: usize = 0;
+        for (server.reactors) |*r| {
+            current_reactor = r;
+            for (r.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const owner = r.clients.get(idFromToken(slot.value.token)) orelse return error.TestUnexpectedResult;
+                try std.testing.expect(owner == &slot.value);
+                try std.testing.expect(os_runtime.fdValid(owner.fd));
+                if (slot.value.ws != null) {
+                    ws_owned += 1;
+                    try std.testing.expect(slot.value.tls != null);
+                } else if (slot.value.tls != null) tls_owned += 1 else plain_owned += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), tls_owned);
+        try std.testing.expectEqual(@as(usize, 2), ws_owned);
+        try std.testing.expectEqual(@as(usize, 2), plain_owned);
+        for (server.reactors) |*r| {
+            current_reactor = r;
+            // Genuine kqueue cancel receipts must retire both family tokens for
+            // all four roles, without publishing EOF for the registered users.
+            try server.quiesceOwnedSocketIo();
+            try std.testing.expect(r.acceptsQuiesced());
+            try std.testing.expect(server.ownedSocketIoQuiesced());
+        }
+        const after = try server.collectListenerManifest(allocator);
+        defer allocator.free(after);
+        try std.testing.expectEqual(rows.len, after.len);
+        for (rows, after) |before, preserved| try std.testing.expectEqualDeep(before, preserved);
+        server.deinit();
+        deinited = true;
+        current_reactor = null;
+        for (rows) |row| try std.testing.expect(!os_runtime.fdValid(row.fd));
+    }
+}
+
+test "shared full server: OpenBSD inherited wildcard listener claims require the exact pair" {
+    if (comptime builtin.os.tag != .openbsd) return error.SkipZigTest;
+    current_reactor = null;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const predecessor = try createTestServer(allocator, .{ .host = "::", .port = 0, .max_clients = 2 });
+    defer allocator.destroy(predecessor);
+    defer predecessor.deinit();
+    const primary = try os_runtime.duplicate(predecessor.reactors[0].listener_fd);
+    const companion = try os_runtime.duplicate(predecessor.reactors[0].listener_companion_fd);
+    var primary_live = true;
+    var companion_live = true;
+    defer if (primary_live) closeFd(primary);
+    defer if (companion_live) closeFd(companion);
+    try std.testing.expectError(error.InvalidInheritedListener, createTestServer(allocator, .{
+        .host = "::",
+        .port = 0,
+        .max_clients = 2,
+        .inherited_listener_fd = primary,
+    }));
+    try std.testing.expect(os_runtime.fdValid(primary));
+    try std.testing.expectError(error.InvalidInheritedListener, createTestServer(allocator, .{
+        .host = "::",
+        .port = 0,
+        .max_clients = 2,
+        .inherited_listener_fd = primary,
+        .inherited_listener_companion_fds = &.{primary},
+    }));
+    try std.testing.expect(os_runtime.fdValid(primary));
+    const successor = try createTestServer(allocator, .{
+        .host = "::",
+        .port = 0,
+        .max_clients = 2,
+        .inherited_listener_fd = primary,
+        .inherited_listener_companion_fds = &.{companion},
+    });
+    primary_live = false;
+    companion_live = false;
+    defer allocator.destroy(successor);
+    defer successor.deinit();
+    try std.testing.expectEqual(primary, successor.reactors[0].listener_fd);
+    try std.testing.expectEqual(companion, successor.reactors[0].listener_companion_fd);
+    const rows = try successor.collectListenerManifest(allocator);
+    defer allocator.free(rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(ListenerFamily.ipv4, rows[0].family);
+    try std.testing.expectEqual(ListenerFamily.ipv6, rows[1].family);
+}
+
+test "shared full server: native bot staging is allocation-failure atomic" {
+    const allocator = std.testing.allocator;
+    const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+    defer current_reactor = null;
+    const now = server.grantNowU64();
+    try server.bot_grants.insertBot("existing");
+    try server.bot_registry.register("existing", .{ .verified = true, .may_announce = true, .announce_scope = .own_channels, .per_hour = 2 });
+    const existing = server.bot_registry.map.getPtr("existing").?;
+    existing.ring.stamps[0] = now;
+    existing.ring.len = 1;
+    var incoming = bot_grant_snapshot.Table{};
+    try incoming.insertBot("carried");
+    try incoming.upsert("carried", .speak, "#room", now + 60_000, now);
+    const wire = try bot_grant_snapshot.encodeFrom(allocator, &incoming, now);
+    defer allocator.free(wire);
+    const checkpoint = try bot_grant_snapshot.decodeCurrent(wire);
+    const Sweep = struct {
+        fn run(staging_allocator: std.mem.Allocator, srv: *Server, snap: bot_grant_snapshot.Snapshot, stamp: u64) !void {
+            const previous = srv.allocator;
+            srv.allocator = staging_allocator;
+            defer srv.allocator = previous;
+            var stage = srv.stageNativeBotGrants(snap) catch |err| {
+                try std.testing.expect(srv.bot_grants.isBot("existing"));
+                try std.testing.expect(!srv.bot_grants.isBot("carried"));
+                try std.testing.expectEqual(@as(usize, 1), srv.bot_registry.map.count());
+                try std.testing.expectEqual(stamp, srv.bot_registry.map.get("existing").?.ring.stamps[0]);
+                return err;
+            };
+            defer stage.deinit();
+            try std.testing.expect(stage.table.isBot("carried"));
+            try std.testing.expect(stage.registry.isBot("carried"));
+            try std.testing.expectEqual(@as(usize, 1), stage.registry.map.get("existing").?.ring.len);
+            try std.testing.expectEqual(stamp, stage.registry.map.get("existing").?.ring.stamps[0]);
+            try std.testing.expect(!srv.bot_grants.isBot("carried"));
+            try std.testing.expectEqual(@as(usize, 1), srv.bot_registry.map.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Sweep.run, .{ server, checkpoint, now });
+}
+
+test "shared full server: OpenBSD native Helix stages live clients until COMMIT and preserves ABORT peers" {
+    if (comptime builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    current_reactor = null;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store_allocator = std.testing.FailingAllocator.init(allocator, .{});
+    var store = try services_mod.OroStore.open(store_allocator.allocator(), std.testing.io, tmp.dir, "native-history.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    const predecessor = try createTestServer(allocator, .{
+        .host = "::",
+        .port = 0,
+        .max_clients = 8,
+        .ws_enabled = true,
+        .ws_allow_plain = true,
+        .ws_port = 0,
+        .num_shards = 2,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+    });
+    defer allocator.destroy(predecessor);
+    var predecessor_deinited = false;
+    defer if (!predecessor_deinited) predecessor.deinit();
+    var run = std.atomic.Value(bool).init(true);
+    var thread = try std.Thread.spawn(.{}, Server.runThreaded, .{ predecessor, &run });
+    var running = true;
+    defer if (running) stopThreadedServer(predecessor, &run, thread);
+    const port = try predecessor.boundPort();
+    const fd4 = try connectNativeLoopbackForTest(.ipv4, port);
+    defer closeFd(fd4);
+    const fd6 = try connectNativeLoopbackForTest(.ipv6, port);
+    defer closeFd(fd6);
+    var v4 = LiveClient{ .fd = fd4 };
+    var v6 = LiveClient{ .fd = fd6 };
+    try writeAllFd(fd4, "NICK Four\r\nUSER four 0 * :Four\r\nJOIN #native-helix\r\n");
+    try recvUntil(&v4, " 366 Four #native-helix ", 200);
+    try writeAllFd(fd6, "NICK Six\r\nUSER six 0 * :Six\r\nJOIN #native-helix\r\n");
+    try recvUntil(&v6, " 366 Six #native-helix ", 200);
+    v6.reset();
+    try writeAllFd(fd4, "PRIVMSG #native-helix :before-native-upgrade\r\n");
+    try recvUntil(&v6, "PRIVMSG #native-helix :before-native-upgrade", 200);
+    // A second live channel is appended after the first, while canonical
+    // iteration orders it first. The readonly candidate cannot repair this
+    // ordinary append-order difference in the predecessor's WAL.
+    try writeAllFd(fd4, "JOIN #aaa-native-history\r\n");
+    try recvUntil(&v4, " 366 Four #aaa-native-history ", 200);
+    try writeAllFd(fd6, "JOIN #aaa-native-history\r\n");
+    try recvUntil(&v6, " 366 Six #aaa-native-history ", 200);
+    try writeAllFd(fd4, "PRIVMSG #aaa-native-history :accepted-durable-history\r\n");
+    try recvUntil(&v6, "PRIVMSG #aaa-native-history :accepted-durable-history", 200);
+    stopThreadedServer(predecessor, &run, thread);
+    running = false;
+    for (predecessor.reactors) |*r| {
+        current_reactor = r;
+        try predecessor.quiesceOwnedSocketIo();
+    }
+    // Exercise the production refusal/unwind before any capsule or native
+    // transfer. Only the storage allocator fails; live accepted history and
+    // the prior published durable generation must remain usable.
+    const meta_before = try allocator.dupe(u8, store.get(.history, "meta").?);
+    defer allocator.free(meta_before);
+    const wal_offset_before = store.wal_offset;
+    const history_before = try predecessor.history.encodeCheckpoint(allocator);
+    defer allocator.free(history_before);
+    const history_count_before = predecessor.history.totalStoredCount();
+    try std.testing.expect(history_count_before >= 2);
+    current_reactor = &predecessor.reactors[0];
+    store_allocator.fail_index = store_allocator.alloc_index;
+    const refused = predecessor.performUpgradeAfterCompatibleTarget(.signal, -1, "/unused-native-test-image");
+    store_allocator.fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.OutOfMemory, refused);
+    try std.testing.expect(store_allocator.has_induced_failure);
+    try std.testing.expectEqualSlices(u8, meta_before, store.get(.history, "meta").?);
+    try std.testing.expectEqual(wal_offset_before, store.wal_offset);
+    const history_after_refusal = try predecessor.history.encodeCheckpoint(allocator);
+    defer allocator.free(history_after_refusal);
+    try std.testing.expectEqualSlices(u8, history_before, history_after_refusal);
+    try std.testing.expectEqual(no_quiesce_shard, predecessor.upgrade_quiesce_shard.load(.acquire));
+
+    // Refusal resumed its coordinator as production requires. Re-enter each
+    // owner safe point before this stopped-worker fixture seals a candidate.
+    for (predecessor.reactors) |*r| {
+        current_reactor = r;
+        try predecessor.quiesceOwnedSocketIo();
+    }
+    predecessor.world.lockWrite();
+    const synchronized = predecessor.prepareNativeDurableHistoryUpgradeBoundary();
+    predecessor.world.unlockWrite();
+    try synchronized;
+    const original_rows = try predecessor.collectListenerManifest(allocator);
+    defer allocator.free(original_rows);
+
+    const Barrier = struct {
+        candidate: *Server,
+        abort: bool,
+        calls: usize = 0,
+        wal_dir: std.Io.Dir,
+        wal_before: []const u8,
+        fn expectWalUnchanged(self: *const @This()) !void {
+            const bytes = try self.wal_dir.readFileAlloc(std.testing.io, "native-history.wal", std.testing.allocator, .unlimited);
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectEqualSlices(u8, self.wal_before, bytes);
+        }
+        fn ready(ctx: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            try std.testing.expect(!self.candidate.inheritedStateConsumedBeforeServices());
+            const candidate_store = self.candidate.account_services.?.store;
+            try std.testing.expect(candidate_store.isReadOnly());
+            try std.testing.expectEqual(@as(usize, 0), candidate_store.changeCount());
+            try self.expectWalUnchanged();
+            try std.testing.expectEqual(@as(usize, 2), self.candidate.reactors.len);
+            for (self.candidate.reactors) |*r| {
+                // Canonical copied fds below deliberately select both modulo
+                // owners; kernel REUSEPORT distribution is not assumed.
+                try std.testing.expectEqual(@as(usize, 1), r.clients.len());
+                try std.testing.expect(r.acceptsQuiesced());
+                for (r.clients.slots.items) |slot| if (slot.occupied) {
+                    try std.testing.expect(!slot.value.recv_armed and !slot.value.send_armed);
+                };
+            }
+            if (self.abort) return error.NativeCandidateAborted;
+        }
+    };
+
+    for ([_]bool{ true, false }) |abort| {
+        const rows = try allocator.dupe(ListenerDescriptor, original_rows);
+        defer allocator.free(rows);
+        var duplicated: usize = 0;
+        var listeners_transferred = false;
+        defer if (!listeners_transferred) for (rows[0..duplicated]) |row| os_runtime.close(row.fd);
+        for (rows) |*row| {
+            row.fd = try os_runtime.duplicate(row.fd);
+            duplicated += 1;
+        }
+        const wal_before_adopt = try tmp.dir.readFileAlloc(std.testing.io, "native-history.wal", allocator, .unlimited);
+        defer allocator.free(wal_before_adopt);
+        var readonly_store = try services_mod.OroStore.openReadOnlyWithConfig(allocator, std.testing.io, tmp.dir, "native-history.wal", .{});
+        defer readonly_store.deinit();
+        var readonly_services = services_mod.Services.init(&readonly_store, null);
+        var cfg = predecessor.config;
+        cfg.account_services = &readonly_services;
+        cfg.native_listener_manifest = rows;
+        // No descriptor may be silently dropped or replaced by a fresh bind.
+        var missing = cfg;
+        missing.native_listener_manifest = rows[0 .. rows.len - 1];
+        try std.testing.expectError(error.InvalidInheritedListener, createTestServer(allocator, missing));
+        var invalid = try allocator.dupe(ListenerDescriptor, rows);
+        defer allocator.free(invalid);
+        invalid[1].kind = invalid[0].kind;
+        invalid[1].family = invalid[0].family;
+        var duplicate_key = cfg;
+        duplicate_key.native_listener_manifest = invalid;
+        try std.testing.expectError(error.InvalidInheritedListener, createTestServer(allocator, duplicate_key));
+        for (rows) |row| try std.testing.expect(os_runtime.fdValid(row.fd));
+        const candidate = try createTestServer(allocator, cfg);
+        listeners_transferred = true;
+        defer allocator.destroy(candidate);
+        defer candidate.deinit();
+        const adopted_rows = try candidate.collectListenerManifest(allocator);
+        defer allocator.free(adopted_rows);
+        try std.testing.expectEqualSlices(ListenerDescriptor, rows, adopted_rows);
+
+        // Duplicate accepted sockets as SCM_RIGHTS does. For this one-process
+        // fixture seal their canonical copied numbers while retaining the
+        // serving predecessor's original descriptor and socket authority.
+        const Saved = struct { conn: *ConnState, original: linux.fd_t };
+        var saved: [2]Saved = undefined;
+        var copied_fds: [2]linux.fd_t = undefined;
+        var count: usize = 0;
+        var restored = false;
+        var state_transferred = false;
+        defer {
+            if (!restored) for (saved[0..count]) |s| {
+                s.conn.fd = s.original;
+            };
+            if (!state_transferred) for (copied_fds[0..count]) |fd| os_runtime.close(fd);
+        }
+        var minimum: i32 = 0;
+        for (rows) |row| minimum = @max(minimum, row.fd);
+        for (predecessor.reactors) |*r| for (r.clients.slots.items) |slot| {
+            if (slot.occupied) minimum = @max(minimum, slot.value.fd);
+        };
+        minimum = (minimum + 32) & ~@as(i32, 1);
+        for (predecessor.reactors) |*r| for (r.clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            try std.testing.expect(count < saved.len);
+            const rc = posix.system.fcntl(slot.value.fd, posix.F.DUPFD, minimum + @as(i32, @intCast(count)));
+            if (posix.errno(rc) != .SUCCESS) return error.Unexpected;
+            const copy: linux.fd_t = @intCast(rc);
+            saved[count] = .{ .conn = &slot.value, .original = slot.value.fd };
+            copied_fds[count] = copy;
+            slot.value.fd = copy;
+            count += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 2), count);
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |blob| allocator.free(blob);
+            blobs.deinit(allocator);
+        }
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(allocator);
+        try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+        _ = predecessor.sealSessionRegistry(&pieces, &blobs) orelse return error.TestUnexpectedResult;
+        var carried: [2]linux.fd_t = undefined;
+        var carried_count: usize = 0;
+        var counts = Server.SealCounts{};
+        for (predecessor.reactors) |*r| predecessor.sealShardClients(r, &pieces, &blobs, &carried, &carried_count, &counts);
+        try std.testing.expectEqual(@as(usize, 2), counts.clients);
+        try std.testing.expect(!counts.fd_prepare_failed);
+        for (saved[0..count]) |s| s.conn.fd = s.original;
+        restored = true;
+        for (carried[0..carried_count]) |fd| {
+            const flags = posix.system.fcntl(fd, posix.F.GETFD, @as(i32, 0));
+            try std.testing.expect(flags & posix.FD_CLOEXEC != 0);
+        }
+        // No source piece has kind handoff_manifest, so this test helper leaves
+        // every header canonical and appends the mandatory manifest normally.
+        const arena = try encodeUpgradeStreamWithWidenedHeaderForTest(allocator, pieces.items, .handoff_manifest);
+        defer {
+            std.crypto.secureZero(u8, arena);
+            allocator.free(arena);
+        }
+        var barrier = Barrier{ .candidate = candidate, .abort = abort, .wal_dir = tmp.dir, .wal_before = wal_before_adopt };
+        candidate.config.native_arena_bytes = arena;
+        candidate.config.native_adopt_barrier = .{ .ctx = &barrier, .readyAndAwaitCommit = Barrier.ready };
+        candidate.config.inherited_state_fds = &copied_fds;
+        candidate.config.inherited_state_fd_manifest_present = true;
+        candidate.config.inherited_state_fd_manifest_valid = true;
+        state_transferred = true;
+        if (abort) {
+            try std.testing.expectError(error.InvalidInheritedHandoff, candidate.adoptInheritedSessions());
+            try std.testing.expectEqual(@as(usize, 1), barrier.calls);
+            try std.testing.expect(readonly_store.isReadOnly());
+            try barrier.expectWalUnchanged();
+            try std.testing.expectEqual(@as(usize, 0), readonly_store.changeCount());
+            for (candidate.reactors) |*r| try std.testing.expectEqual(@as(usize, 0), r.clients.len());
+            try std.testing.expectEqual(@as(usize, 0), candidate.world.channelCount());
+            for (copied_fds) |fd| try std.testing.expect(!os_runtime.fdValid(fd));
+            // An aborted candidate closes its copies without shutdown of the
+            // same socket OFDs still owned by the serving predecessor.
+            // This fixture stopped and joined the original workers; a live
+            // upgrade instead resumes them. Drain retained delivery before
+            // releasing the old run's pool/fabric and starting a fresh run.
+            for (predecessor.reactors) |*r| {
+                current_reactor = r;
+                predecessor.drainUpgradeFabric();
+            }
+            predecessor.world.lockWrite();
+            const drained = predecessor.drainAllUpgradeFabricFixedPointLocked();
+            predecessor.world.unlockWrite();
+            _ = try drained;
+            predecessor.pool.deinit();
+            if (predecessor.fabric) |*fabric| fabric.deinit();
+            predecessor.fabric = null;
+            for (predecessor.reactors) |*r| {
+                current_reactor = r;
+                predecessor.resumeOwnedSocketIo();
+            }
+            run.store(true, .release);
+            thread = try std.Thread.spawn(.{}, Server.runThreaded, .{ predecessor, &run });
+            running = true;
+            v4.reset();
+            try writeAllFd(fd4, "PING :abort-preserved\r\n");
+            try recvUntil(&v4, "PONG onyx.local :abort-preserved", 200);
+            stopThreadedServer(predecessor, &run, thread);
+            running = false;
+            for (predecessor.reactors) |*r| {
+                current_reactor = r;
+                try predecessor.quiesceOwnedSocketIo();
+            }
+        } else {
+            try candidate.adoptInheritedSessions();
+            try std.testing.expectEqual(@as(usize, 1), barrier.calls);
+            try std.testing.expect(candidate.inheritedStateConsumedBeforeServices());
+            try std.testing.expect(!readonly_store.isReadOnly());
+            try std.testing.expectEqual(@as(usize, 0), readonly_store.changeCount());
+            try std.testing.expectEqual(history_count_before, candidate.history.totalStoredCount());
+            try barrier.expectWalUnchanged();
+            predecessor.deinit();
+            predecessor_deinited = true;
+            current_reactor = null;
+            var next_run = std.atomic.Value(bool).init(true);
+            const next_thread = try std.Thread.spawn(.{}, Server.runThreaded, .{ candidate, &next_run });
+            defer stopThreadedServer(candidate, &next_run, next_thread);
+            v4.reset();
+            v6.reset();
+            try writeAllFd(fd6, "PING :commit-preserved\r\n");
+            try recvUntil(&v6, "PONG onyx.local :commit-preserved", 200);
+            try writeAllFd(fd4, "PRIVMSG #native-helix :after-native-commit\r\n");
+            const message = "PRIVMSG #native-helix :after-native-commit";
+            try recvUntil(&v6, message, 200);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, v6.written(), message));
+        }
+        current_reactor = null;
+    }
+}
+
+test "shared full server: poisoned shard stops and joins every reactor with a terminal outcome" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    current_reactor = null;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .max_clients = 8,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+    try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
+    try std.testing.expect(server.runtimeFailure() == null);
+    for (server.reactors) |r| try std.testing.expect(r.wake != null);
+
+    var run = std.atomic.Value(bool).init(true);
+    const Runner = struct {
+        fn entry(s: *Server, flag: *std.atomic.Value(bool), done: *std.atomic.Value(bool)) void {
+            s.runThreaded(flag);
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const thr = try std.Thread.spawn(.{}, Runner.entry, .{ server, &run, &done });
+    defer stopThreadedServer(server, &run, thr);
+
+    // Both real reactor threads must have armed and consumed a native wake
+    // before poisoning just shard 1; shard 0 is healthy and can be asleep.
+    const startup_deadline = platform.monotonicMillis() + 5_000;
+    while (server.reactors[0].wake_count.load(.acquire) == 0 or
+        server.reactors[1].wake_count.load(.acquire) == 0)
+    {
+        if (platform.monotonicMillis() >= startup_deadline) return error.TestTimeout;
+        server.wakeAllReactors();
+        os_runtime.sleepMillis(1);
+    }
+    server.reactor_poison_shard_for_test.store(1, .release);
+    server.wakeAllReactors();
+    const stop_deadline = platform.monotonicMillis() + 5_000;
+    while (!done.load(.acquire)) {
+        if (platform.monotonicMillis() >= stop_deadline) return error.TestTimeout;
+        os_runtime.sleepMillis(1);
+    }
+    try std.testing.expect(!run.load(.acquire));
+    try std.testing.expectEqual(error.BackendPoisoned, server.runtimeFailure().?);
+    try std.testing.expectEqual(@as(usize, 0), server.pool.count());
+    // Runtime shutdown preserves the slabs until backend teardown releases all
+    // outstanding references; no fatal callback frees another shard's buffers.
+    for (server.reactors) |r| try std.testing.expect(r.clients.slots.capacity >= 8);
+}
+
 test "threaded server: external wakeReactor drives the running reactor loop" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -89515,7 +91215,7 @@ test "ring: poll op fires a completion when a watched eventfd becomes readable" 
             got: bool = false,
             slot: u32 = 0,
             res: i32 = 0,
-            fn onCompletion(self: *@This(), c: ringlane.Completion) void {
+            pub fn onCompletion(self: *@This(), c: ringlane.Completion) void {
                 switch (c) {
                     .poll => |e| {
                         self.got = true;
@@ -89538,7 +91238,7 @@ test "ring: poll op fires a completion when a watched eventfd becomes readable" 
 }
 
 test "threaded server: implicit-TLS client handshakes + registers over the wire" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const Ed25519 = std.crypto.sign.Ed25519;
         const tls_client = @import("../crypto/tls_client.zig");
         const x509_selfsign = @import("../proto/x509_selfsign.zig");
@@ -89674,8 +91374,21 @@ const TlsRecordProbe = struct {
         try writeAllFd(self.fd, ch);
         var rbuf: [4096]u8 = undefined;
         var guard: usize = 0;
+        const native_deadline = platform.monotonicMillis() + 20_000;
         while (!self.client.handshakeDone()) : (guard += 1) {
             if (guard > 64) return error.TestUnexpectedResult;
+            if (comptime builtin.os.tag == .openbsd) {
+                var ready = false;
+                while (platform.monotonicMillis() < native_deadline) {
+                    var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
+                    if (try posix.poll(&fds, 50) != 0) {
+                        if (fds[0].revents & posix.POLL.IN == 0) return error.ConnectionReset;
+                        ready = true;
+                        break;
+                    }
+                }
+                if (!ready) return error.TestTimeout;
+            }
             const n = try readFd(self.fd, &rbuf);
             if (n == 0) return error.TestUnexpectedResult;
             switch (try self.client.feed(rbuf[0..n])) {
@@ -89723,10 +91436,11 @@ const TlsRecordProbe = struct {
         var rbuf: [4096]u8 = undefined;
         while (std.mem.indexOf(u8, self.plain.items, needle) == null) {
             if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
-            var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
+            const poll_in = if (builtin.os.tag == .openbsd) posix.POLL.IN else linux.POLL.IN;
+            var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = poll_in, .revents = 0 }};
             const ready = posix.poll(&fds, 50) catch return error.Unexpected;
             if (ready == 0) continue;
-            if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+            if ((fds[0].revents & poll_in) == 0) continue;
             const n = try readFd(self.fd, &rbuf);
             if (n == 0) return error.ConnectionReset;
             try self.cipher.appendSlice(self.alloc, rbuf[0..n]);
@@ -89743,13 +91457,40 @@ const TlsRecordProbe = struct {
     }
 };
 
+const NativeTlsProbeForTest = struct {
+    client: @import("../crypto/tls_client.zig").Client,
+    probe: TlsRecordProbe,
+
+    fn init(allocator: std.mem.Allocator, fd: linux.fd_t, chain: []const []const u8) !*@This() {
+        errdefer closeFd(fd);
+        const self = try allocator.create(@This());
+        errdefer allocator.destroy(self);
+        self.client = try @import("../crypto/tls_client.zig").Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = chain });
+        self.probe = .{ .fd = fd, .alloc = allocator, .client = &self.client };
+        return self;
+    }
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        self.probe.deinit();
+        self.client.deinit();
+        closeFd(self.probe.fd);
+        allocator.destroy(self);
+    }
+
+    fn sendTextFrame(self: *@This(), text: []const u8) !void {
+        var buffer: [1024]u8 = undefined;
+        const frame = try websocket.encodeFrame(8192, .{ .opcode = .text, .mask_key = .{ 0x13, 0x27, 0x35, 0x49 } }, text, &buffer);
+        try self.probe.send(frame);
+    }
+};
+
 // Regression pin for atomic tag+line delivery. A tagged channel PRIVMSG to a
 // userspace-TLS recipient must seal the `@tag` prefix and line into ONE TLS
 // record on the wire. This drives a REAL tagged fan-out through the reactor's
 // delivery path and asserts the recipient's single body-bearing record ALSO
 // carries the tag, while a plaintext member receives the same intact line.
 test "threaded server: tagged PRIVMSG to a userspace-TLS member seals one TLS record; plaintext unaffected" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const Ed25519 = std.crypto.sign.Ed25519;
         const tls_client = @import("../crypto/tls_client.zig");
         const x509_selfsign = @import("../proto/x509_selfsign.zig");
@@ -89866,7 +91607,7 @@ test "threaded server: tagged PRIVMSG to a userspace-TLS member seals one TLS re
 }
 
 test "threaded server: implicit-TLS raw public key negotiates and registers" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const Ed25519 = std.crypto.sign.Ed25519;
         const tls_client = @import("../crypto/tls_client.zig");
         const tls_extension = @import("../proto/tls_extension.zig");
@@ -89972,7 +91713,7 @@ test "threaded server: implicit-TLS raw public key negotiates and registers" {
 }
 
 test "threaded server: mTLS client cert binds CertFP for SASL EXTERNAL (WHOIS 276)" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const Ed25519 = std.crypto.sign.Ed25519;
         const tls_client = @import("../crypto/tls_client.zig");
         const sign = @import("../crypto/sign.zig");
@@ -90100,7 +91841,7 @@ test "threaded server: mTLS client cert binds CertFP for SASL EXTERNAL (WHOIS 27
 }
 
 test "threaded server: ws upgrade + framed registration (plain testing mode)" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
         var server = Server.init(alloc, .{
             .host = "127.0.0.1",
@@ -90210,7 +91951,7 @@ test "threaded server: ws upgrade + framed registration (plain testing mode)" {
 }
 
 test "threaded server: wss listener — TLS handshake, upgrade, framed welcome" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const Ed25519 = std.crypto.sign.Ed25519;
         const tls_client = @import("../crypto/tls_client.zig");
         const x509_selfsign = @import("../proto/x509_selfsign.zig");
@@ -90420,7 +92161,7 @@ test "WebSocket handshake retains negotiated application protocol in live state"
 }
 
 test "text.ircv3.net binary application frame closes 1002 before media routing" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -90446,7 +92187,7 @@ test "text.ircv3.net binary application frame closes 1002 before media routing" 
 }
 
 test "fragmented binary aggregate over 4 MiB closes 1009 without routing" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -90478,7 +92219,7 @@ test "fragmented binary aggregate over 4 MiB closes 1009 without routing" {
 }
 
 test "single binary frame declaring over 4 MiB closes 1009 from its header" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -90507,7 +92248,7 @@ test "single binary frame declaring over 4 MiB closes 1009 from its header" {
 }
 
 test "coalesced Deframer buffer overflow closes 1009 instead of abnormally" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -90542,7 +92283,7 @@ test "coalesced Deframer buffer overflow closes 1009 instead of abnormally" {
 }
 
 test "malformed WebSocket frame closes 1002 instead of abnormally" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -90564,7 +92305,7 @@ test "malformed WebSocket frame closes 1002 instead of abnormally" {
 }
 
 test "custom and legacy empty binary opening fragments begin reassembly" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -90596,7 +92337,7 @@ test "custom and legacy empty binary opening fragments begin reassembly" {
 }
 
 test "coalesced feed preserves pending binary opening-frame identity" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -90645,7 +92386,7 @@ test "coalesced feed preserves pending binary opening-frame identity" {
 }
 
 test "coalesced feed preserves pending final-continuation identity" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -90698,7 +92439,7 @@ test "coalesced feed preserves pending final-continuation identity" {
 }
 
 test "text.ircv3.net rejects CRLF batched text before routing a line" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -90747,7 +92488,7 @@ test "binary application compatibility is explicit by selected subprotocol" {
 }
 
 test "threaded server: ws listener rejects a non-upgrade HTTP request" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
         var server = Server.init(alloc, .{
             .host = "127.0.0.1",
@@ -90975,7 +92716,7 @@ fn assertNoInjectedWireLine(captured: []const u8) !void {
 }
 
 test "exploit: failReply rejects CRLF-smuggled command (notice branch, fail-closed)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -90998,7 +92739,7 @@ test "exploit: failReply rejects CRLF-smuggled command (notice branch, fail-clos
 }
 
 test "exploit: failReply rejects CRLF-smuggled fields (standard-replies branch)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -91028,7 +92769,7 @@ test "exploit: failReply rejects CRLF-smuggled fields (standard-replies branch)"
 }
 
 test "exploit: noticeTo rejects CRLF-smuggled text (fail-closed)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -91049,7 +92790,7 @@ test "exploit: noticeTo rejects CRLF-smuggled text (fail-closed)" {
 }
 
 test "exploit: control-byte-free FAIL reply is still emitted byte-for-byte" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -91085,7 +92826,7 @@ test "exploit: control-byte-free FAIL reply is still emitted byte-for-byte" {
 // assert the daemon FAILS CLOSED — no forged wire line is emitted.
 
 test "exploit: emitReplyLine drops CRLF-smuggled reflected fields (all sinks, fail-closed)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -91126,7 +92867,7 @@ test "exploit: emitReplyLine drops CRLF-smuggled reflected fields (all sinks, fa
 }
 
 test "exploit: emitReplyLine emits control-byte-free reply lines byte-for-byte" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -91152,7 +92893,7 @@ test "exploit: emitReplyLine emits control-byte-free reply lines byte-for-byte" 
 }
 
 test "exploit: SHUN list drops a CRLF-smuggled stored reason (oper handler, end-to-end)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -91209,7 +92950,7 @@ test "exploit: SHUN list drops a CRLF-smuggled stored reason (oper handler, end-
 // byte-identical. This drives the real sink end-to-end and asserts fail-closed.
 
 test "exploit: fantasyReply drops CRLF-smuggled external-feed content (broadcast + relay sink)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -91329,7 +93070,7 @@ test "exploit: processLine survives adversarial-but-wellformed lines without pan
 // class, nothing a client sends can grant it. Asserts fail-closed non-elevation.
 
 test "exploit: OPER command grants no operator status (SASL-only elevation, fail-closed)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -91371,7 +93112,7 @@ test "exploit: channel PRIVMSG with mIRC colour admits under active MESSAGE_V2 a
     // channel path FAILed PRIVMSG TEMPORARILY_UNAVAILABLE. Formatting codes are
     // body content; durable admit must succeed with the peer merely configured
     // (not live). CWE-755 / fail-closed-but-still-chat.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -91450,7 +93191,7 @@ test "exploit: channel PRIVMSG #root durably admits with mesh peer configured bu
     // line is retained for the peer and local members still receive it. FAIL
     // TEMPORARILY_UNAVAILABLE is the #root brick class this pins against.
     // CWE-755: exceptional mesh conditions must not brick local chat.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -91537,7 +93278,7 @@ test "exploit: channel PRIVMSG ADS1 soft-fail after durable admit still delivers
     // accept. It must not turn that accepted event into FAIL or silence the room.
     // Local members still receive the line; once capacity returns, durable
     // attachment batches resume. CWE-755 / #root brick.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -91634,7 +93375,7 @@ test "exploit: channel PRIVMSG durable admit capacity fails closed with TEMPORAR
     // Unlike ADS1 soft-fail, a full RVO2 outbox aborts durable admit. The
     // fail-closed contract: no local delivery, PRIVMSG gets TEMPORARILY_UNAVAILABLE.
     // NOTICE stays silent and also does not deliver.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -91719,7 +93460,7 @@ test "exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without au
     // Direct path matches channel: true durable-admission failure emits
     // TEMPORARILY_UNAVAILABLE for PRIVMSG and stays silent for NOTICE. It never
     // falls through to local or cross-shard recipient/sender-session delivery.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -91934,7 +93675,7 @@ test "exploit: oversized color-formatted PRIVMSG does not brick channel chat" {
     // Pathological mIRC colour bodies: densest colour codes, then a large
     // visible payload, on a +f NOFORMAT channel. Daemon must strip (or keep
     // delivering), never panic / never leave the room silent. CWE-400.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -92004,7 +93745,7 @@ test "exploit: PRIVMSG flood does not permanently brick channel chat" {
     // A sustained PRIVMSG flood may throttle/disconnect the flooder (fail-
     // toward-refuse), but the channel itself must stay usable for other
     // members and for a recovered flooder after the window refills. CWE-400.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -92337,7 +94078,7 @@ test "threaded server: NAMES honors multi-prefix cap" {
 }
 
 test "session resume projection: large channel NAMES is complete and chunked past 512 members" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, .{
         .host = "127.0.0.1",
@@ -92443,7 +94184,7 @@ test "session resume projection: large channel NAMES is complete and chunked pas
 }
 
 test "NAMES rejects an admitted malformed remote member without partial 353 or 366" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, .{
@@ -92526,7 +94267,7 @@ test "JOIN auto-NAMES rejects malformed remote roster without empty nicklist" {
     // nor 366. The client armed an implicit NAMES burst and suppressed re-poll
     // while believing the burst was in flight — empty nicklist until TTL expiry.
     // Fail-closed like explicit NAMES: close the connection, emit no partial roster.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, .{
@@ -92598,7 +94339,7 @@ test "JOIN auto-NAMES rejects malformed remote roster without empty nicklist" {
 }
 
 test "labeled NAMES capture follows remaining SendQ beyond legacy 65 arenas" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var conn = ConnState.init(-1);
     const legacy_cap = default_reply_bytes * 65;
     conn.sendq_cap = legacy_cap + 128 * 1024;
@@ -92719,8 +94460,10 @@ test "threaded server: WHISPER delivers to channel co-member only" {
     try writeAllFd(fd_a, "IRCX\r\n");
     try recvUntil(a, " 800 A 1 0 ", 200);
     try writeAllFd(fd_a, "JOIN #w\r\n");
-    try writeAllFd(fd_b, "JOIN #w\r\n");
+    // Establish A as the founder before B's independently scheduled JOIN.
+    // The later MODE assertions require A's authority, not socket write order.
     try recvUntil(a, " 366 A #w ", 200);
+    try writeAllFd(fd_b, "JOIN #w\r\n");
     try recvUntil(b, " 366 B #w ", 200);
     b.reset();
     // A whispers B on #w; B receives it.
@@ -93836,7 +95579,7 @@ test "threaded server: authenticated call participants relay bounded opaque E2EE
 }
 
 test "WS media admission binds a valid participant MAC to its own stream and active kind" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
     var server = Server.init(std.testing.allocator, .{
@@ -94114,7 +95857,7 @@ test "WS media admission binds a valid participant MAC to its own stream and act
 }
 
 test "GAP-V2 a node identity still delivers the signed media handshake" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
     const seed = @as([32]u8, @splat(0x5c));
@@ -94185,7 +95928,7 @@ test "GAP-V2 a node identity still delivers the signed media handshake" {
 }
 
 test "GAP-V2 a rejected browser media frame returns numeric 404" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
     var server = Server.init(std.testing.allocator, .{
@@ -94298,7 +96041,7 @@ test "GAP-V2 a rejected browser media frame returns numeric 404" {
 }
 
 test "GAP-V2 TURN is cut and allocates no relay" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -94328,7 +96071,7 @@ test "MEDIA WS OFFER suppresses unroutable NATIVE/TRANSPORT; non-WS still gets U
     // Browser WS media is MACKEY + binary Cadence (E2EE ciphertext). OFFER must
     // not advertise loopback NATIVE/TRANSPORT candidates that the browser cannot
     // use, and must not seat the WS client on the native↔WebRTC bridge.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
     var server = Server.init(std.testing.allocator, .{
@@ -95058,7 +96801,7 @@ test "threaded server: +U OPMODERATE held message surfaces a POLICY event to ope
 }
 
 test "event spine: +U OPMODERATE POLICY fan-out reaches oper on another shard" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var cfg = operTestConfig(0);
         cfg.num_shards = 2;
         var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
@@ -95119,7 +96862,7 @@ test "broadcast wake batch coalesces M member marks into K distinct shard wakes"
 }
 
 test "delivery fanout continues past stale and poisoned members to a later healthy member" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -95167,7 +96910,7 @@ test "delivery fanout continues past stale and poisoned members to a later healt
 }
 
 test "tagged near-max line fails atomically without retaining its prefix" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -95242,7 +96985,7 @@ test "reusable attachment SendQ pressure retains tagged event without poisoning"
 }
 
 test "detached reusable attachment transfers retained event to resumed physical id" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -95276,7 +97019,7 @@ test "detached reusable attachment transfers retained event to resumed physical 
 }
 
 test "authored MESSAGE_V2 ADS1 capacity soft-fail preserves spool while mesh authorities publish" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x6d)), "authored-spool-cut-test");
     defer identity.deinit();
@@ -95363,7 +97106,7 @@ test "authored MESSAGE_V2 ADS1 capacity soft-fail preserves spool while mesh aut
 // the event. This is intentionally narrower than a durable-admission failure,
 // which remains fail-closed before any delivery.
 test "threaded server: PRIVMSG NOTICE ADS1 soft-fail after durable admission still delivers locally" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -95463,7 +97206,7 @@ test "threaded server: PRIVMSG NOTICE ADS1 soft-fail after durable admission sti
 // is saturated. A reusable-session recipient on a foreign shard must not be
 // left on the prepared_batch wake-only path (empty spool → silent drop).
 test "threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admission reaches foreign member" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
@@ -95564,7 +97307,7 @@ test "threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admissio
 }
 
 test "tracking at cap preserves detached spool and leaves newcomer untracked" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -95598,7 +97341,7 @@ test "tracking at cap preserves detached spool and leaves newcomer untracked" {
 }
 
 test "logout retires pending attachment rows before socket close and later token reuse" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -95637,7 +97380,7 @@ test "logout retires pending attachment rows before socket close and later token
 }
 
 test "account rebind retires pending attachment rows before socket close and old-account reuse" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -95681,7 +97424,7 @@ test "cross-shard deliver: pool-exhaustion drops are counted, never silent" {
     // than block the reactor — but the drop MUST be observable (counter/warn), not
     // a silent black-hole. Drive one delivery into a deliberately-exhausted shard
     // pool and assert the drop counter rises by exactly one.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -95729,7 +97472,7 @@ test "cross-shard deliver: pool-exhaustion drops are counted, never silent" {
 }
 
 test "cross-shard delivery poison: saturated special broadcasts poison only matching subscribers" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -95814,7 +97557,7 @@ test "cross-shard delivery poison: saturated special broadcasts poison only matc
 }
 
 test "cross-shard delivery poison: stale generation never aborts reused slot" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -95863,7 +97606,7 @@ test "cross-shard delivery poison: stale generation never aborts reused slot" {
 }
 
 test "cross-shard delivery poison: partial chunk pool exhaustion aborts exact target" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -95917,7 +97660,7 @@ test "cross-shard delivery poison: partial chunk pool exhaustion aborts exact ta
 }
 
 test "cross-shard delivery poison: target SendQ overflow isolates later recipient" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -95975,7 +97718,7 @@ test "cross-shard delivery poison: target SendQ overflow isolates later recipien
 }
 
 test "cross-shard delivery poison: recv executes no later command" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -96018,7 +97761,7 @@ test "cross-shard delivery poison: recv executes no later command" {
 }
 
 test "cross-shard delivery poison: send CQE discards inline and overflow tails before retryable close" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var server = Server.init(failing.allocator(), .{
         .host = "127.0.0.1",
@@ -96221,7 +97964,7 @@ test "threaded server: LISTX inclusive >=N member-count threshold includes the b
 }
 
 test "threaded server: LISTX emits PICS 813 after channel entries" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -97328,7 +99071,7 @@ fn testSaslPlainAccountLogin(conn: *ConnState, account: []const u8) !void {
 }
 
 test "account-switch ratchet standard SASL then post-auth replacement never unions oper authority" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -97409,7 +99152,7 @@ test "account-switch ratchet standard SASL then post-auth replacement never unio
 }
 
 test "account-switch ratchet IRCX AUTH guest and logout clear exact oper authority" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -97888,7 +99631,7 @@ fn installPropGeoTestDatabases(server: *LinuxServer) !void {
 }
 
 test "threaded server: PROP user geo fields are self-or-oper only" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -98690,7 +100433,7 @@ test "threaded server: legacy GRANT and REVOKE never announce oper prefix transi
 }
 
 test "mesh OCG1 GRANT converges records but never authorizes sessions or prefixes" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -98903,7 +100646,7 @@ test "mesh OCG1 GRANT converges records but never authorizes sessions or prefixe
 }
 
 test "remote WHOIS projects a live mesh grant as display-only oper status" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
     var server = Server.init(std.testing.allocator, .{
@@ -98953,7 +100696,7 @@ test "remote WHOIS projects a live mesh grant as display-only oper status" {
 }
 
 test "GAP-P0c remote WHOIS copies roster identity and leaves idle away and secure unreplicated" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
     var server = Server.init(std.testing.allocator, .{
@@ -99002,7 +100745,7 @@ test "GAP-P0c remote WHOIS copies roster identity and leaves idle away and secur
 }
 
 test "GAP-P0c remote SYS and ADM DATA tags stay closed for an operator account" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -99033,7 +100776,7 @@ test "GAP-P0c remote SYS and ADM DATA tags stay closed for an operator account" 
 }
 
 test "GAP-P0c an operator session still gets no oper message-tag" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var session = dispatch.ClientSession.init();
     try reconcileTestOper(&session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "ircop", "Watcher");
     try std.testing.expect(session.isOper());
@@ -100283,7 +102026,7 @@ test "threaded server: +p private + +h hidden channel flags" {
 }
 
 test "LIST C and T filters use channel creation and topic ages" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -101742,7 +103485,7 @@ test "threaded server: MONITOR online fanout flushes beyond fixed sink size" {
 }
 
 test "threaded server: live S2S listener completes a peer handshake" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         // Non-default mesh identity exercises the config-driven SID/node id path.
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .s2s_port = 0, .node_id = 42, .num_shards = 2 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -101785,10 +103528,10 @@ test "threaded server: live S2S listener completes a peer handshake" {
         var rx: [4096]u8 = undefined;
         var polls: usize = 0;
         while (polls < 200 and !peer.established()) : (polls += 1) {
-            var fds = [_]posix.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+            var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
             const ready = posix.poll(&fds, 25) catch return error.Unexpected;
             if (ready == 0) continue;
-            if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+            if ((fds[0].revents & posix.POLL.IN) == 0) continue;
             const n = try readFd(fd, &rx);
             if (n == 0) return error.ConnectionReset;
             now += 1;
@@ -101815,7 +103558,7 @@ test "threaded server: live S2S listener completes a peer handshake" {
 }
 
 test "squit lookup finds secured peer entries" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
         var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -101855,7 +103598,7 @@ test "squit lookup finds secured peer entries" {
 }
 
 test "squit lookup finds reactor-zero peer from another shard" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
         var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
@@ -101899,7 +103642,7 @@ test "squit lookup finds reactor-zero peer from another shard" {
 }
 
 test "threaded server: oper CONNECT opens an outbound S2S link" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         // A test-owned listener stands in for the remote peer; the server dials it.
         const listen_fd = createListener("127.0.0.1", 0, 8) catch return error.SkipZigTest;
         defer closeFd(listen_fd);
@@ -101949,18 +103692,37 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         try recvUntil(&a, connect_event, 400);
 
         // Accept the server's outbound connection on the test listener.
-        var poll_listen = [_]posix.pollfd{.{ .fd = listen_fd, .events = linux.POLL.IN, .revents = 0 }};
-        var waited: usize = 0;
-        while (waited < 200) : (waited += 1) {
-            const r = posix.poll(&poll_listen, 25) catch return error.Unexpected;
-            if (r != 0 and (poll_listen[0].revents & linux.POLL.IN) != 0) break;
-        }
-        const accept_rc = linux.accept4(listen_fd, null, null, 0);
-        const peer_fd: linux.fd_t = switch (posix.errno(accept_rc)) {
-            .SUCCESS => @intCast(accept_rc),
-            else => return error.SkipZigTest,
+        var poll_listen = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const peer_fd: linux.fd_t = if (builtin.os.tag == .openbsd) blk: {
+            // Once CONNECT was accepted, a missing native dial is a failure.
+            // Readiness may race accept on a nonblocking listener, so retain
+            // the existing five-second budget across AGAIN/INTR retries.
+            const deadline = platform.monotonicMillis() + 5_000;
+            while (platform.monotonicMillis() < deadline) {
+                const ready = posix.poll(&poll_listen, 25) catch return error.Unexpected;
+                if (ready == 0 or poll_listen[0].revents & posix.POLL.IN == 0) continue;
+                const rc = posix.system.accept(listen_fd, null, null);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => break :blk @intCast(rc),
+                    .AGAIN, .INTR => continue,
+                    else => return error.Unexpected,
+                }
+            }
+            return error.TestTimeout;
+        } else blk: {
+            var waited: usize = 0;
+            while (waited < 200) : (waited += 1) {
+                const ready = posix.poll(&poll_listen, 25) catch return error.Unexpected;
+                if (ready != 0 and poll_listen[0].revents & posix.POLL.IN != 0) break;
+            }
+            const rc = linux.accept4(listen_fd, null, null, 0);
+            break :blk switch (posix.errno(rc)) {
+                .SUCCESS => @intCast(rc),
+                else => return error.SkipZigTest,
+            };
         };
         defer closeFd(peer_fd);
+        if (builtin.os.tag == .openbsd) try os_runtime.setCloexec(peer_fd, true);
 
         // Drive a responding S2sLink (no start — the server opened the handshake).
         const alloc = std.testing.allocator;
@@ -101980,10 +103742,10 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         var now: u64 = 1;
         var polls: usize = 0;
         while (polls < 200 and !peer.established()) : (polls += 1) {
-            var fds = [_]posix.pollfd{.{ .fd = peer_fd, .events = linux.POLL.IN, .revents = 0 }};
+            var fds = [_]posix.pollfd{.{ .fd = peer_fd, .events = posix.POLL.IN, .revents = 0 }};
             const ready = posix.poll(&fds, 25) catch return error.Unexpected;
             if (ready == 0) continue;
-            if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+            if ((fds[0].revents & posix.POLL.IN) == 0) continue;
             const n = try readFd(peer_fd, &rx);
             if (n == 0) return error.ConnectionReset;
             now += 1;
@@ -102280,7 +104042,7 @@ test "secured accept using final SQ slot retains partial I/O ownership" {
 }
 
 test "configured boot dial cursor reaches three peers behind a fast failure" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const specs = [_][]const u8{
         "127.0.0.1:65001",
@@ -102303,7 +104065,10 @@ test "configured boot dial cursor reaches three peers behind a fast failure" {
     // restart-from-zero budgeted loop retries entry 0 forever; the fair cursor
     // must visit entries 1 and 2 on the next two turns and complete the boot.
     server.config.max_clients = 0;
-    const sq_before = server.rx().ring.inner.sq_ready();
+    const queued_before: u32 = if (builtin.os.tag == .openbsd)
+        server.rx().ring.backend.kq.?.n
+    else
+        server.rx().ring.inner.sq_ready();
     try std.testing.expect(!server.sweepMeshAutoConnect(true, 1));
     try std.testing.expectEqual(@as(usize, 1), server.mesh_dial_cursor);
     try std.testing.expectEqual(@as(usize, 2), server.mesh_boot_remaining);
@@ -102314,7 +104079,11 @@ test "configured boot dial cursor reaches three peers behind a fast failure" {
     try std.testing.expectEqual(@as(usize, 0), server.mesh_dial_cursor);
     try std.testing.expectEqual(@as(usize, 0), server.mesh_boot_remaining);
     for (server.mesh_dials) |dial| try std.testing.expect(dial.last_attempt_ms != 0);
-    try std.testing.expectEqual(sq_before, server.rx().ring.inner.sq_ready());
+    const queued_after: u32 = if (builtin.os.tag == .openbsd)
+        server.rx().ring.backend.kq.?.n
+    else
+        server.rx().ring.inner.sq_ready();
+    try std.testing.expectEqual(queued_before, queued_after);
 }
 
 test "configured boot dial resolves and recognizes inherited outbound survivor" {
@@ -102376,7 +104145,7 @@ test "configured boot dial resolves and recognizes inherited outbound survivor" 
 }
 
 test "GAP-O7 handshake and anti-entropy stalls open a breaker and an unsigned frame stays refused" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const allocator = std.testing.allocator;
     const specs = [_][]const u8{
@@ -102384,7 +104153,7 @@ test "GAP-O7 handshake and anti-entropy stalls open a breaker and an unsigned fr
         "127.0.0.1:65082",
     };
     var sim = reactor_mod.SimReactor.init(50_000);
-    var server = Server.init(allocator, .{
+    const server = createTestServer(allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .mesh_connect = &specs,
@@ -102393,7 +104162,10 @@ test "GAP-O7 handshake and anti-entropy stalls open a breaker and an unsigned fr
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
-    defer server.deinit();
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
     current_reactor = &server.reactors[0];
     try std.testing.expectEqual(@as(usize, 2), server.mesh_dials.len);
     server.mesh_dials[0].addr = try sockaddrForHost("127.0.0.1", 65081, 2_000);
@@ -102536,10 +104308,23 @@ test "GAP-O7 handshake and anti-entropy stalls open a breaker and an unsigned fr
     stall.overflow_allocator = allocator;
     stall.token = try tokenFromId(stall_id);
     stall.s2s = stall_receiver;
+    // The server now owns the link, including cleanup after a failed assertion.
+    stall_live = false;
     stall.s2s_initiator = true;
     server.mesh_dials[1].token = stall.token;
     server.markPeerHealth("stall-peer.test", .established);
     const health = server.peer_health.get("stall-peer.test") orelse return error.TestExpectedEqual;
+    // A healthy newly established peer has not missed the first scheduled
+    // anti-entropy burst. Runtime tests must use the same grace as production;
+    // shortening only the stall threshold would close this live dial early.
+    sim.advance(membership_resync_interval_ms - 1);
+    try std.testing.expect(server.mooringStallReason(stall, server.nowU64()) == null);
+    server.sweepMooringStalls();
+    try std.testing.expectEqual(@as(u32, 0), server.mesh_dials[1].backoff_failures);
+    try std.testing.expectEqual(circuit_breaker.BreakerState.closed, server.mesh_dials[1].breaker.state());
+    try std.testing.expect(server.rx().clients.get(stall_id) != null);
+    // The same live peer becomes a real stall when its last completed round
+    // lies beyond the production grace; advance the simulator, not real time.
     health.state_since_ms = 0;
     health.last_anti_entropy_ms = 0;
     const logs_before = server.mooring_breaker_logs;
@@ -102563,7 +104348,7 @@ test "GAP-O7 handshake and anti-entropy stalls open a breaker and an unsigned fr
 }
 
 test "GAP-O8 mesh ban filter is exchanged before the authoritative list" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const allocator = std.testing.allocator;
 
@@ -102691,7 +104476,7 @@ test "GAP-O8 mesh ban filter is exchanged before the authoritative list" {
 }
 
 test "SIGUSR2 handler sets the upgrade-request flag; reactor-0 consume is one-shot" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         // Deterministic, execve-safe: drive the handler directly (it only stores the
         // flag) and consume it the same way `onTimerTick` does — never installs a
         // process signal handler and never runs a reactor, so there is no path to an
@@ -103030,7 +104815,7 @@ test "failed inherited TLS plus WebSocket adoption frees carried SendQ overflow"
 }
 
 test "threaded server: [mesh].connect auto-links two nodes without an oper" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
 
         // Node 2 (the dial target) boots first so its ephemeral S2S port is known
@@ -103132,7 +104917,7 @@ test "threaded server: [mesh].connect auto-links two nodes without an oper" {
 }
 
 fn reserveTwoLoopbackPorts() ServerError!struct { u16, u16 } {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const fd1 = try createListener("127.0.0.1", 0, 8);
         defer closeFd(fd1);
         const fd2 = try createListener("127.0.0.1", 0, 8);
@@ -103142,7 +104927,7 @@ fn reserveTwoLoopbackPorts() ServerError!struct { u16, u16 } {
 }
 
 fn reserveThreeLoopbackPorts() ServerError!struct { u16, u16, u16 } {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const fd1 = try createListener("127.0.0.1", 0, 8);
         defer closeFd(fd1);
         const fd2 = try createListener("127.0.0.1", 0, 8);
@@ -103180,6 +104965,10 @@ fn acquireHeavyMeshAcceptanceTestLock() !linux.fd_t {
 }
 
 fn testSleepMs(ms: isize) void {
+    if (comptime builtin.os.tag == .openbsd) {
+        os_runtime.sleepMillis(@intCast(@max(ms, 0)));
+        return;
+    }
     var ts = linux.timespec{
         .sec = @divFloor(ms, 1000),
         .nsec = @mod(ms, 1000) * @as(isize, std.time.ns_per_ms),
@@ -103188,16 +104977,16 @@ fn testSleepMs(ms: isize) void {
 }
 
 fn expectMeshPeerVisible(client: *LiveClient, peer_name: []const u8, max_probes: usize) !void {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var probes: usize = 0;
         while (probes < max_probes) : (probes += 1) {
             client.reset();
             try writeAllFd(client.fd, "LINKS\r\nLUSERS\r\n");
             const deadline = platform.monotonicMillis() + 250;
             while (platform.monotonicMillis() < deadline) {
-                var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
+                var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = posix.POLL.IN, .revents = 0 }};
                 const ready = posix.poll(&fds, 20) catch return error.Unexpected;
-                if (ready != 0 and (fds[0].revents & linux.POLL.IN) != 0) try client.readAvailable();
+                if (ready != 0 and (fds[0].revents & posix.POLL.IN) != 0) try client.readAvailable();
                 const got_now = client.written();
                 if (std.mem.indexOf(u8, got_now, " 365 ") != null and
                     std.mem.indexOf(u8, got_now, " 255 ") != null) break;
@@ -103212,16 +105001,16 @@ fn expectMeshPeerVisible(client: *LiveClient, peer_name: []const u8, max_probes:
 }
 
 fn expectMeshPeersVisible(client: *LiveClient, peer_names: []const []const u8, max_probes: usize) !void {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var probes: usize = 0;
         while (probes < max_probes) : (probes += 1) {
             client.reset();
             try writeAllFd(client.fd, "LINKS\r\n");
             const deadline = platform.monotonicMillis() + 250;
             while (platform.monotonicMillis() < deadline) {
-                var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
+                var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = posix.POLL.IN, .revents = 0 }};
                 const ready = posix.poll(&fds, 20) catch return error.Unexpected;
-                if (ready != 0 and (fds[0].revents & linux.POLL.IN) != 0) try client.readAvailable();
+                if (ready != 0 and (fds[0].revents & posix.POLL.IN) != 0) try client.readAvailable();
                 if (std.mem.indexOf(u8, client.written(), " 365 ") != null) break;
             }
             const got = client.written();
@@ -103249,7 +105038,7 @@ fn countMeshLogDetail(server: *const LinuxServer, detail: []const u8) usize {
 }
 
 fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
         const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
         const s2s_port1 = s2s_ports[0];
@@ -103377,7 +105166,7 @@ fn parseLusersUserCount(buf: []const u8) ?u64 {
 // the server count (2) and the user count. Asymmetric 4<->1 mirrors the live
 // topology (eshmaki 8 cores, ircx.us 1 core).
 fn runLusersCrossShardConsistencyTest(shards1: u16, shards2: u16) !void {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
         const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
         var spec1_buf: [32]u8 = undefined;
@@ -103531,7 +105320,7 @@ const test_line_mesh_checker = sasl.PlainChecker{ .ptr = &test_line_mesh_anchor,
 // route_table / s2s_peer unit tests and the seed-replayable residence DST
 // (`substrate/undertow/residence_trust_dst.zig`).
 test "threaded server: an UNPROVEN cross-node same-account claim grants no coexistence relay (F1 fail-closed)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
     var spec1_buf: [32]u8 = undefined;
@@ -103673,7 +105462,7 @@ test "threaded server: an UNPROVEN cross-node same-account claim grants no coexi
 }
 
 test "threaded server: one reusable session stays live and participatory across a secured mesh" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
 
@@ -105538,7 +107327,7 @@ test "threaded server: reusable session stays exact-once across a three-node sec
 // per-node and only converge on the 30s anti-entropy cadence, so the asymmetry
 // is stable for the test's lifetime when A sets -n/-t before B materializes #c.
 test "threaded server: inbound relay re-enforces local +n / +t against a remote actor" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
         const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
         var spec1_buf: [32]u8 = undefined;
@@ -105686,7 +107475,7 @@ test "threaded server: inbound relay re-enforces local +n / +t against a remote 
 }
 
 test "threaded server: WHISPER and DATA relay to a remote-shard channel co-member" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
         const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
         var spec1_buf: [32]u8 = undefined;
@@ -105785,7 +107574,7 @@ test "threaded server: WHISPER and DATA relay to a remote-shard channel co-membe
         var wp: usize = 0;
         while (wp < 80 and !whisper_ok) : (wp += 1) {
             try writeAllFd(fd_a, "WHISPER #x Bob :psst over the mesh\r\n");
-            recvUntil(&bob, ":Alice!al@", 120) catch {};
+            recvUntil(&bob, "WHISPER #x Bob :psst over the mesh", 120) catch {};
             if (std.mem.indexOf(u8, bob.written(), "WHISPER #x Bob :psst over the mesh") != null) whisper_ok = true;
         }
         try std.testing.expect(whisper_ok);
@@ -106161,7 +107950,7 @@ test "UPGRADE resume arena restores the mesh event clock high-water mark" {
 }
 
 test "UPGRADE property clock boundary prepares successor HLC without mutating predecessor" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -107902,7 +109691,7 @@ fn rehashTmpPath(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, name: []
 }
 
 test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior reload gen, keeps boot certs" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const allocator = std.testing.allocator;
         const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
         const pem = @import("../proto/pem.zig");
@@ -108047,7 +109836,7 @@ test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior relo
 }
 
 test "REHASH cert hot-reload: invalid cert path keeps current certs and errors" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const allocator = std.testing.allocator;
 
         var a_buf: [1024]u8 = undefined;
@@ -108086,7 +109875,7 @@ test "REHASH cert hot-reload: invalid cert path keeps current certs and errors" 
 }
 
 test "REHASH cert hot-reload: not configured when TLS is absent" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const allocator = std.testing.allocator;
         var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -108105,7 +109894,7 @@ test "REHASH cert hot-reload: not configured when TLS is absent" {
 }
 
 test "GAP-P0c KNOCK sends 711 only after local operator notification" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -108137,7 +109926,7 @@ test "GAP-P0c KNOCK sends 711 only after local operator notification" {
 }
 
 test "GAP-P0c WHOWAS reply includes the account and the real host" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -108164,7 +109953,7 @@ test "GAP-P0c WHOWAS reply includes the account and the real host" {
 }
 
 test "rotateTicketKey moves current to previous and generates a fresh key" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const allocator = std.testing.allocator;
         var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -108191,7 +109980,7 @@ test "rotateTicketKey moves current to previous and generates a fresh key" {
 }
 
 test "REHASH applyReloadedLimits: swaps class registry + throttle without double-free" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const allocator = std.testing.allocator;
         var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -108246,7 +110035,7 @@ test "REHASH applyReloadedLimits: swaps class registry + throttle without double
 }
 
 test "same-nick atomic restore sends only safe deferred mesh departures" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     const CaptureLink = struct {
         offer_count: usize = 0,
@@ -108424,7 +110213,7 @@ test "same-nick atomic restore sends only safe deferred mesh departures" {
 }
 
 test "same-nick exact sibling close keeps restored mesh membership live" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var server = Server.init(allocator, .{
@@ -108529,7 +110318,15 @@ test "same-nick exact sibling close keeps restored mesh membership live" {
 
     // Allocating the peer link above may relocate the client slot array. Do not
     // dereference the earlier claimant pointer across that allocation boundary.
-    const claimant_token = server.connFor(claimant_id).?.token;
+    const pending_claimant = server.connFor(claimant_id).?;
+    const claimant_token = pending_claimant.token;
+    if (comptime builtin.os.tag == .openbsd) {
+        try std.testing.expect(pending_claimant.test_sendq_capture);
+        try std.testing.expect(pending_claimant.send_len > pending_claimant.send_offset);
+        // Capture owns no kernel operation. Explicitly stage the in-flight
+        // SEND this close/CQE fixture models, then release it below.
+        pending_claimant.send_armed = true;
+    }
     try server.closeConn(claimant_token, "transport lost");
     const retained_claimant = server.connFor(claimant_id) orelse return error.TestUnexpectedResult;
     try std.testing.expect(retained_claimant.closing);
@@ -108586,7 +110383,7 @@ test "same-nick exact sibling close keeps restored mesh membership live" {
 }
 
 test "atomic session restore and token bind preserve every component on allocation failure" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var fail_offset: usize = 0;
     while (fail_offset < 256) : (fail_offset += 1) {
@@ -108906,7 +110703,7 @@ test "atomic session restore and token bind preserve every component on allocati
 }
 
 test "session-foundation adversarial: rejected ordinary JOIN OOM restores the exact prior local projection" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var server = Server.init(failing.allocator(), .{
@@ -108977,7 +110774,7 @@ test "session-foundation adversarial: rejected ordinary JOIN OOM restores the ex
 }
 
 test "session-foundation adversarial: rejected auto-clone prepare and seated commit OOM restore the prior projection" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     const Scenario = struct {
         fn run(fail_offset: usize) !void {
@@ -109062,7 +110859,7 @@ test "session-foundation adversarial: rejected auto-clone prepare and seated com
 }
 
 test "session-foundation adversarial: rejected clone CREATE seated commit OOM restores the prior projection" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var server = Server.init(failing.allocator(), .{
@@ -109125,7 +110922,7 @@ test "session-foundation adversarial: rejected clone CREATE seated commit OOM re
 }
 
 test "session-foundation adversarial: detached RESUME overlays absent present and status journals before any output" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -109230,7 +111027,7 @@ test "session-foundation adversarial: detached RESUME overlays absent present an
 }
 
 test "session-foundation adversarial: detached RESUME overlays the full journal capacity with case-insensitive collisions" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -109333,7 +111130,7 @@ test "session-foundation adversarial: detached RESUME overlays the full journal 
 }
 
 test "session-foundation adversarial: KICK privately reaches every exact attachment while a same-nick token survives" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -109419,7 +111216,7 @@ test "session-foundation adversarial: KICK privately reaches every exact attachm
 }
 
 test "session-foundation adversarial: absent projector converges live exact rows but retains work for a detached sibling" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -109495,7 +111292,7 @@ test "session-foundation adversarial: absent projector converges live exact rows
 }
 
 test "session-foundation locked rows: folded exact owner survives while a current detached sibling is excluded" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -109579,7 +111376,7 @@ test "session-foundation locked rows: folded exact owner survives while a curren
 }
 
 test "session-foundation locked rows: duplicate client across folded accounts fails closed and clean retry succeeds" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -109664,7 +111461,7 @@ test "session-foundation locked rows: duplicate client across folded accounts fa
 }
 
 test "session-foundation locked rows: retained ticket blocks detach drift until abort" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var server = Server.init(std.testing.allocator, .{
         .host = "127.0.0.1",
@@ -109748,7 +111545,7 @@ test "session-foundation locked rows: retained ticket blocks detach drift until 
 }
 
 test "session-foundation locked rows: capture OOM is failure-atomic and retryable through RESUME" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var server = Server.init(failing.allocator(), .{
@@ -109828,7 +111625,7 @@ test "session-foundation locked rows: capture OOM is failure-atomic and retryabl
 }
 
 test "OCG2 server runtime requires an exact paired monotonic origin" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -109875,7 +111672,7 @@ test "OCG2 REHASH reports every restart-only authority intent" {
 }
 
 test "OCG2 server runtime is inert by default and reactor zero owns terminal cadence" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
     const defaults = Config{ .host = "127.0.0.1", .port = 0 };
@@ -109929,7 +111726,7 @@ test "OCG2 server runtime is inert by default and reactor zero owns terminal cad
 }
 
 test "GAP-P0c reaction tally is readable after a late subscribe" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
     var server = Server.init(allocator, .{
@@ -109975,7 +111772,7 @@ test "GAP-P0c reaction tally is readable after a late subscribe" {
 }
 
 test "GAP-O9 DIE, RESTART, and mesh bans wait for a second operator" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var sim = reactor_mod.SimReactor.init(1_000_000);
@@ -110136,7 +111933,7 @@ test "GAP-O9 DIE, RESTART, and mesh bans wait for a second operator" {
 }
 
 test "GAP-O10 policy rollback restores the last ward, filter, class, and ban generation" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x51)), "policy-rollback.test");
@@ -111161,7 +112958,7 @@ test "GAP-P1 threads keep a stable id, a bounded reply list, and the reply tag a
 }
 
 test "GAP-P1 cold start rebuilds the thread from durable history" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     var tmp = std.testing.tmpDir(.{});
@@ -111460,7 +113257,7 @@ test "GAP-P3 reactor 0 fires a deferred channel message and oper mode once" {
 }
 
 test "GAP-P3 a cron fire is delivered once by reactor 0" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     var sim_time = reactor_mod.SimReactor.init(1_700_000_000_000);
@@ -111614,7 +113411,7 @@ test "GAP-P3 malformed schedule checkpoint rejects the handoff" {
 }
 
 test "GAP-P5 a search on one node returns an authorized hit from another node" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "search.test" };
@@ -111666,7 +113463,7 @@ test "GAP-P5 a search on one node returns an authorized hit from another node" {
 }
 
 test "GAP-P5 merged search stays inside the hard cap" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "search.test" };
@@ -111713,7 +113510,7 @@ test "GAP-P5 merged search stays inside the hard cap" {
 }
 
 test "GAP-P5 a mesh link returns an authorized hit from the other node" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "search.test" };
@@ -111797,7 +113594,7 @@ test "GAP-P5 a mesh link returns an authorized hit from the other node" {
 }
 
 test "GAP-P5 a mesh link keeps the hard cap across both nodes" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "search.test" };
@@ -111887,7 +113684,7 @@ fn gapP6Resolve(host: []const u8) anyerror!std.Io.net.IpAddress {
 }
 
 test "GAP-P6 unfurl is opt-in, bounded, and refuses private addresses" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     gap_p6_fetches = 0;
@@ -111975,7 +113772,7 @@ test "GAP-P6 unfurl is opt-in, bounded, and refuses private addresses" {
 }
 
 test "GAP-P7 a banned connection files one appeal and the oper answer is audited" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "appeal.test" };
@@ -112105,7 +113902,7 @@ fn gapP8Pow(seed: []const u8, out: []u8) ?[]const u8 {
 }
 
 test "GAP-P8 a tripped connection answers a challenge before 001" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     const config = Config{
@@ -112215,7 +114012,7 @@ fn gapP9HistoryHas(server: *Server, channel: []const u8, needle: []const u8) boo
 }
 
 test "GAP-P9 a channel prop holds first messages and quarantine is audited" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "p9.test" };
@@ -112300,7 +114097,7 @@ test "GAP-P9 a channel prop holds first messages and quarantine is audited" {
 }
 
 test "GAP-P10 a speak grant registers a command and a run is not an oper bit" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "p10.test" };
@@ -112354,7 +114151,7 @@ test "GAP-P10 a speak grant registers a command and a run is not an oper bit" {
 }
 
 test "GAP-P11 IRCX screens name a handler or a divergence" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
     const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "p11.test" };
@@ -112439,50 +114236,50 @@ test "GAP-P11 IRCX screens name a handler or a divergence" {
 
     const src = try gapP11ReadSource(alloc);
     defer alloc.free(src);
-    try std.testing.expect(gapP11LineHas(src, 21493, "pub fn handleListx"));
-    try std.testing.expect(gapP11LineHas(src, 55382, "auditorium.visibleTo"));
-    try std.testing.expect(gapP11LineHas(src, 20225, "isHidden(channel)"));
-    try std.testing.expect(gapP11LineHas(src, 32194, "IrcxEventType.parse(params[1])"));
-    try std.testing.expect(gapP11LineHas(src, 36193, "pub fn handleData"));
-    try std.testing.expect(gapP11LineHas(src, 21519, "created_unix > 0"));
+    const listx_line = gapP11HandlerLine(src, "    pub fn handleListx(", "pub fn handleListx(") orelse return error.TestUnexpectedResult;
+    const auditorium_line = gapP11HandlerLine(src, "    fn sendNamesWithProjection(", "auditorium.visibleTo") orelse return error.TestUnexpectedResult;
+    const hidden_line = gapP11HandlerLine(src, "    pub fn handleNames(", "isHidden(channel)") orelse return error.TestUnexpectedResult;
+    const event_line = gapP11HandlerLine(src, "    pub fn handleEvent(", "IrcxEventType.parse(params[1])") orelse return error.TestUnexpectedResult;
+    const data_line = gapP11HandlerLine(src, "    pub fn handleData(", "pub fn handleData(") orelse return error.TestUnexpectedResult;
+    const created_line = gapP11HandlerLine(src, "    pub fn handleListx(", "created_unix > 0") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, src, "fn handle" ++ "Taccess") == null);
     try std.testing.expect(std.mem.indexOf(u8, src, "fn handle" ++ "Btprop") == null);
     try std.testing.expect(std.mem.indexOf(u8, src, "fn handle" ++ "Opforce") == null);
 
     current_reactor = null;
-    std.debug.print("GAP-P11 row=LISTX handler=src/daemon/server.zig:21493 test=GAP-P0c remote LISTX carries the peer topic\n", .{});
-    std.debug.print("GAP-P11 row=NAMES +x handler=src/daemon/server.zig:55382 test=threaded server: +x auditorium hides regular members in NAMES\n", .{});
-    std.debug.print("GAP-P11 row=NAMES +h handler=src/daemon/server.zig:20225 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
-    std.debug.print("GAP-P11 row=EVENT CHANNEL handler=src/daemon/server.zig:32194 test=GAP-P11 IRCX screens name a handler or a divergence\n", .{});
-    std.debug.print("GAP-P11 row=DATA handler=src/daemon/server.zig:36193 test=threaded server: +V NOCOMICDATA refuses non-op DATA with 531\n", .{});
+    std.debug.print("GAP-P11 row=LISTX handler=src/daemon/server.zig:{d} test=GAP-P0c remote LISTX carries the peer topic\n", .{listx_line});
+    std.debug.print("GAP-P11 row=NAMES +x handler=src/daemon/server.zig:{d} test=threaded server: +x auditorium hides regular members in NAMES\n", .{auditorium_line});
+    std.debug.print("GAP-P11 row=NAMES +h handler=src/daemon/server.zig:{d} test=GAP-P11 IRCX screens name a handler or a divergence\n", .{hidden_line});
+    std.debug.print("GAP-P11 row=EVENT CHANNEL handler=src/daemon/server.zig:{d} test=GAP-P11 IRCX screens name a handler or a divergence\n", .{event_line});
+    std.debug.print("GAP-P11 row=DATA handler=src/daemon/server.zig:{d} test=threaded server: +V NOCOMICDATA refuses non-op DATA with 531\n", .{data_line});
     std.debug.print("GAP-P11 divergence=USER events stay operator-only because a connect line names every user\n", .{});
-    std.debug.print("GAP-P11 divergence=remote LISTX creation time stays 0 when the peer did not replicate created_unix handler=src/daemon/server.zig:21519\n", .{});
+    std.debug.print("GAP-P11 divergence=remote LISTX creation time stays 0 when the peer did not replicate created_unix handler=src/daemon/server.zig:{d}\n", .{created_line});
     std.debug.print("GAP-P11 divergence=TACCESS, BTPROP, OPFORCE, and Comic Chat avatar payloads stay unwired\n", .{});
     std.debug.print("GAP-P11 branch=handlers at file:line or an explicit divergence and the client stays in the Onyx repo\n", .{});
 }
 
 fn gapP11ReadSource(allocator: std.mem.Allocator) ![]u8 {
-    // @src().file is the compiler's relative name, and the test process is not
-    // standing in the source tree. The repository path is the one the daemon
-    // is built from.
-    return try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
-        "/home/kain/onyx-server/src/daemon/server.zig",
-        allocator,
-        .limited(64 * 1024 * 1024),
-    );
+    // Bind each handler witness to the source compiled into this test, even
+    // when the artifact runs on another host or outside its build checkout.
+    return try allocator.dupe(u8, @embedFile("server.zig"));
 }
 
-fn gapP11LineHas(text: []const u8, line_no: usize, needle: []const u8) bool {
-    var n: usize = 1;
-    var i: usize = 0;
-    while (i < text.len and n < line_no) : (i += 1) {
-        if (text[i] == '\n') n += 1;
+fn gapP11HandlerLine(text: []const u8, declaration: []const u8, needle: []const u8) ?usize {
+    // Restrict each witness to its actual method, so the test's own string
+    // literals cannot satisfy the contract after a handler is removed.
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var line_no: usize = 0;
+    var in_handler = false;
+    while (lines.next()) |line| {
+        line_no += 1;
+        if (!in_handler) {
+            if (!std.mem.startsWith(u8, line, declaration)) continue;
+            in_handler = true;
+        }
+        if (std.mem.eql(u8, line, "    }")) return null;
+        if (std.mem.indexOf(u8, line, needle) != null) return line_no;
     }
-    if (n != line_no or i >= text.len) return false;
-    const rest = text[i..];
-    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-    return std.mem.indexOf(u8, rest[0..end], needle) != null;
+    return null;
 }
 
 fn gapP12HttpReady(buf: []const u8) bool {
@@ -112631,7 +114428,7 @@ test "GAP-P12 a loopback history read matches CHATHISTORY visibility" {
 }
 
 test "GAP-K4 a sealed room refuses the clear roster and an ordinary room still lists it" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 

@@ -1,0 +1,121 @@
+1/116 root.test_0...OK
+2/116 crypto.root.test_0...OK
+3/116 daemon.root.test_0...OK
+4/116 proto.root.test_0...OK
+5/116 substrate.root.test_0...OK
+6/116 wasm.host.root.test_0...OK
+7/116 substrate.io.root.test_0...OK
+8/116 substrate.ripple_props.test_0...OK
+9/116 substrate.ripple.test_0...OK
+10/116 substrate.undertow.root.test_0...OK
+11/116 substrate.undertow.peer_link.test_0...OK
+12/116 substrate.io.buf_ring.test_0...OK
+13/116 substrate.io.ring.test_0...OK
+14/116 proto.asn1_time.test_0...OK
+15/116 proto.certfp.test_0...OK
+16/116 proto.cloak.test_0...OK
+17/116 proto.dns.test.DNS native resolver forward reverse and confirmation use IPv4 and IPv6 UDP...OK
+18/116 proto.ircx_modex.test_0...OK
+19/116 proto.ircx_saccess.test_0...OK
+20/116 proto.listx.test_0...OK
+21/116 proto.mooring.test_0...OK
+22/116 proto.mooring_props.test_0...OK
+23/116 proto.quic_handshake.test_0...OK
+24/116 proto.quic_transport_params.test_0...OK
+25/116 proto.sasl_external_verify.test_0...OK
+26/116 proto.sasl_mechrouter.test_0...OK
+27/116 proto.sasl_oauthbearer.test_0...OK
+28/116 proto.sasl.test_0...OK
+29/116 proto.sasl_scram512_server.test_0...OK
+30/116 proto.sasl_scram.test_0...OK
+31/116 proto.sasl_scram_server.test_0...OK
+32/116 proto.signed_delta.test_0...OK
+33/116 proto.toml.test_0...OK
+34/116 proto.x509.test_0...OK
+35/116 daemon.modules.manifest.test_0...OK
+36/116 daemon.key_transparency.test_0...OK
+37/116 daemon.acme_cli.test_0...OK
+38/116 daemon.acme_http01_listener.test_0...OK
+39/116 daemon.acme_renewal.test.shouldRenew: due inside threshold and at the boundary...OK
+40/116 daemon.acme_renewal.test.shouldRenew: expired leaves are due...OK
+41/116 daemon.acme_renewal.test.shouldRenew: handles large timestamps without addition overflow...OK
+42/116 daemon.acme_renewal.test.certFileLeafNotAfterUnix reads the leaf expiry from a PEM certificate file...OK
+43/116 daemon.acme_renewal.test_0...OK
+44/116 daemon.acme_runner.test.Url.parse extracts host, default port, and path...OK
+45/116 daemon.acme_runner.test.Url.parse honors explicit port and bare authority...OK
+46/116 daemon.acme_runner.test.Url.parse rejects non-https and empty authority...OK
+47/116 daemon.acme_runner.test.frameRecordLen needs a full record...OK
+48/116 daemon.acme_runner.test.consumePrefix shifts remaining bytes down...OK
+49/116 daemon.acme_runner.test.acme writeKeyAtomic writes the TLS private key owner-only (0o600)...OK
+50/116 daemon.acme_runner.test.acme writeCertAtomic leaves the public cert chain default-readable...OK
+51/116 daemon.acme_runner.test.applyToml overlays runner acme tunables...OK
+52/116 daemon.acme_runner.test.applyToml leaves runner defaults when acme table absent...OK
+53/116 daemon.acme_runner.test.v6 nameserver sockaddr is built with INET6 family, big-endian port, and raw bytes...OK
+54/116 daemon.acme_runner.test.udpSocket opens an AF_INET6 datagram socket...OK
+55/116 daemon.acme_runner.test.queryOneServer6 round-trips an A record against a ::1 DNS responder...OK
+56/116 daemon.acme_runner.test_0...OK
+57/116 daemon.config_format.test_0...OK
+58/116 daemon.helix.root.test_0...OK
+59/116 daemon.mail_sender.test.DST GAP-D7 configured relay with a trust store records a durable delivery failure...GAP-D7 branch=configured relay with a non-empty trust store records a durable delivery failure; empty trust still refuses remote AUTH; live mail stays off
+OK
+60/116 daemon.mail_sender.test.enqueue copies the three strings; the ring holds the owned copy...OK
+61/116 daemon.mail_sender.test.the ring is bounded: overflow is dropped without crashing...OK
+62/116 daemon.mail_sender.test.deinit frees queued (un-sent) jobs with no leak...OK
+63/116 daemon.mail_sender.test.buildMessage emits well-formed headers and truncates an over-long body...OK
+64/116 daemon.mail_sender.test.buildMessage refuses a CRLF in a header field (header-injection guard)...OK
+65/116 daemon.mail_sender.test.isLoopback detects 127.0.0.0/8 and ::1, rejects public addresses...OK
+66/116 daemon.metrics_http.test_0...OK
+67/116 daemon.webhook.test_0...OK
+68/116 daemon.webhook_render.test_0...OK
+69/116 daemon.webhook_http.test_0...OK
+70/116 daemon.oauth_jwt.test_0...OK
+71/116 daemon.ocsp_staple.test.refreshDelaySeconds halves the validity window, clamped...OK
+72/116 daemon.ocsp_staple.test.backoffSeconds doubles per failure, clamped to [min,max]...OK
+73/116 daemon.ocsp_staple.test.extractOcspBody returns body only for a 200 with content...OK
+74/116 daemon.ocsp_staple.test.tls ocsp fetch uses the daemon trust store and a bad certificate keeps the previous staple...GAP-A8 branch=trust-store bad-cert=keep signature-fail=keep previous=previous-staple
+OK
+75/116 daemon.ocsp_staple.test_0...OK
+76/116 daemon.reactor_pool.test_0...OK
+77/116 daemon.sasl_bridge.test_0...OK
+78/116 daemon.scram_store.test_0...OK
+79/116 daemon.server.test_0...OK
+80/116 daemon.services.test.DST GAP-D7 a failed pending-address write issues no verification token...GAP-D7 branch=a failed pending-address write issues no verification token; live mail stays off
+OK
+81/116 daemon.sessions.test_0...OK
+82/116 daemon.webpush.test.subscription list encode/decode round-trip...OK
+83/116 daemon.webpush.test.decodeList rejects malformed records...OK
+84/116 daemon.webpush.test.validEndpoint enforces https, length and character rules...OK
+85/116 daemon.webpush.test.webpush tls SSRF guard classifies push endpoint addresses...OK
+86/116 daemon.webpush.test.webpush tls SSRF guard refuses an internal-IP endpoint before connect...OK
+87/116 daemon.webpush.test.Vapid.loadOrCreate persists and reloads the same key...OK
+88/116 daemon.webpush.test.worker enqueue/shutdown never blocks and bounds the queue...OK
+89/116 daemon.webpush.test.DST GAP-D8 webpush queue overflow increments a metric and emits an oper event...GAP-D8 branch=full webpush queue increments onyx_webpush_dropped and emits an oper event; subscription rows in props stay; live mail stays off; non-Linux keeps the explicit disable
+OK
+90/116 daemon.tls_certs.test_0...OK
+91/116 daemon.tls_conn.test_0...OK
+92/116 daemon.tls_sni_load.test_0...OK
+93/116 crypto.tls_server.test_0...OK
+94/116 crypto.tls_record.test_0...OK
+95/116 crypto.hkdf_tls13.test_0...OK
+96/116 crypto.hash.test_0...OK
+97/116 crypto.random.test_0...OK
+98/116 crypto.webpush.test.RFC 8291 Appendix A — full known-answer vector...OK
+99/116 crypto.webpush.test.webpush tls encrypt wipes transient key material and preserves the RFC 8291 KAT...OK
+100/116 crypto.tls_client.test_0...OK
+101/116 crypto.kx.test_0...OK
+102/116 crypto.sign.test_0...OK
+103/116 crypto.ocsp.test.ocsp verifyResponseSignature accepts direct issuer Ed25519 signature...OK
+104/116 crypto.ocsp.test.isStapleServable accepts a good, signed, in-window response...OK
+105/116 crypto.ocsp.test.isStapleServable rejects revoked, wrong-serial, and tampered responses...OK
+106/116 crypto.ocsp.test.isStapleServable accepts a delegated OCSP responder (issuer-signed + OCSPSigning EKU)...OK
+107/116 crypto.ocsp.test.isStapleServable rejects a responder cert lacking id-kp-OCSPSigning...OK
+108/116 crypto.ocsp.test.delegated OCSP: byName + EXPLICIT-byKey accept; ResponderID-mismatch and wrong-signer reject...OK
+109/116 crypto.sct.test_0...OK
+110/116 crypto.xwing.test_0...OK
+111/116 crypto.aead.test_0...OK
+112/116 crypto.ecdsa_kat.test_0...OK
+113/116 crypto.ed25519_batch.test_0...OK
+114/116 crypto.sign_kat.test_0...OK
+115/116 crypto.tls_props.test_0...OK
+116/116 crypto.tls.test_0...OK
+All 116 tests passed.

@@ -1,0 +1,86 @@
+1/76 root.test_0...OK
+2/76 crypto.root.test_0...OK
+3/76 daemon.root.test_0...OK
+4/76 proto.root.test_0...OK
+5/76 substrate.root.test_0...OK
+6/76 wasm.host.root.test_0...OK
+7/76 substrate.io.root.test_0...OK
+8/76 substrate.ripple_props.test_0...OK
+9/76 substrate.ripple.test_0...OK
+10/76 substrate.undertow.root.test_0...OK
+11/76 substrate.undertow.peer_link.test_0...OK
+12/76 substrate.io.buf_ring.test_0...OK
+13/76 substrate.io.ring.test_0...OK
+14/76 proto.asn1_time.test_0...OK
+15/76 proto.certfp.test_0...OK
+16/76 proto.cloak.test_0...OK
+17/76 proto.ircx_modex.test_0...OK
+18/76 proto.ircx_saccess.test_0...OK
+19/76 proto.listx.test_0...OK
+20/76 proto.mooring.test_0...OK
+21/76 proto.mooring_props.test_0...OK
+22/76 proto.quic_handshake.test_0...OK
+23/76 proto.quic_transport_params.test_0...OK
+24/76 proto.sasl_external_verify.test_0...OK
+25/76 proto.sasl_mechrouter.test_0...OK
+26/76 proto.sasl_oauthbearer.test_0...OK
+27/76 proto.sasl.test_0...OK
+28/76 proto.sasl_scram512_server.test_0...OK
+29/76 proto.sasl_scram.test_0...OK
+30/76 proto.sasl_scram_server.test_0...OK
+31/76 proto.signed_delta.test_0...OK
+32/76 proto.toml.test_0...OK
+33/76 proto.x509.test_0...OK
+34/76 daemon.modules.manifest.test_0...OK
+35/76 daemon.key_transparency.test_0...OK
+36/76 daemon.acme_cli.test_0...OK
+37/76 daemon.acme_http01_listener.test_0...OK
+38/76 daemon.acme_renewal.test_0...OK
+39/76 daemon.acme_runner.test_0...OK
+40/76 daemon.config_format.test_0...OK
+41/76 daemon.helix.root.test_0...OK
+42/76 daemon.metrics_http.test_0...OK
+43/76 daemon.webhook.test_0...OK
+44/76 daemon.webhook_render.test_0...OK
+45/76 daemon.webhook_http.test_0...OK
+46/76 daemon.oauth_jwt.test_0...OK
+47/76 daemon.ocsp_staple.test_0...OK
+48/76 daemon.reactor_pool.test_0...OK
+49/76 daemon.sasl_bridge.test_0...OK
+50/76 daemon.scram_store.test_0...OK
+51/76 daemon.server.test.UPGRADE canceled CONNECT survives SQ-full and retries through fair activation...OK
+52/76 daemon.server.test.threaded server: registration EXTERNAL resumes before oper prefix and applies vhost to siblings...OK
+53/76 daemon.server.test.threaded server: WHISPER and DATA relay to a remote-shard channel co-member...OK
+54/76 daemon.server.test.same-nick exact sibling close keeps restored mesh membership live...OK
+55/76 daemon.server.test.GAP-P11 IRCX screens name a handler or a divergence...GAP-P11 row=LISTX handler=src/daemon/server.zig:21759 test=GAP-P0c remote LISTX carries the peer topic
+GAP-P11 row=NAMES +x handler=src/daemon/server.zig:54236 test=threaded server: +x auditorium hides regular members in NAMES
+GAP-P11 row=NAMES +h handler=src/daemon/server.zig:20483 test=GAP-P11 IRCX screens name a handler or a divergence
+GAP-P11 row=EVENT CHANNEL handler=src/daemon/server.zig:31892 test=GAP-P11 IRCX screens name a handler or a divergence
+GAP-P11 row=DATA handler=src/daemon/server.zig:35952 test=threaded server: +V NOCOMICDATA refuses non-op DATA with 531
+GAP-P11 divergence=USER events stay operator-only because a connect line names every user
+GAP-P11 divergence=remote LISTX creation time stays 0 when the peer did not replicate created_unix handler=src/daemon/server.zig:21785
+GAP-P11 divergence=TACCESS, BTPROP, OPFORCE, and Comic Chat avatar payloads stay unwired
+GAP-P11 branch=handlers at file:line or an explicit divergence and the client stays in the Onyx repo
+OK
+56/76 daemon.server.test_0...OK
+57/76 daemon.sessions.test_0...OK
+58/76 daemon.tls_certs.test_0...OK
+59/76 daemon.tls_conn.test_0...OK
+60/76 daemon.tls_sni_load.test_0...OK
+61/76 crypto.tls_server.test_0...OK
+62/76 crypto.tls_record.test_0...OK
+63/76 crypto.hkdf_tls13.test_0...OK
+64/76 crypto.hash.test_0...OK
+65/76 crypto.random.test_0...OK
+66/76 crypto.kx.test_0...OK
+67/76 crypto.sign.test_0...OK
+68/76 crypto.xwing.test_0...OK
+69/76 crypto.tls_client.test_0...OK
+70/76 crypto.sct.test_0...OK
+71/76 crypto.aead.test_0...OK
+72/76 crypto.ecdsa_kat.test_0...OK
+73/76 crypto.ed25519_batch.test_0...OK
+74/76 crypto.sign_kat.test_0...OK
+75/76 crypto.tls_props.test_0...OK
+76/76 crypto.tls.test_0...OK
+All 76 tests passed.

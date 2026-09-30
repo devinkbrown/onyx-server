@@ -889,10 +889,7 @@ fn randomIdHost() ResolveError!u16 {
         .linux, .windows => return error.RandomSourceFailed,
         else => {
             var b: [2]u8 = undefined;
-            const c = struct {
-                extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
-            };
-            c.arc4random_buf(&b, b.len);
+            std.c.arc4random_buf(&b, b.len);
             const id = std.mem.readInt(u16, &b, .little);
             return if (id == 0) 1 else id;
         },
@@ -942,6 +939,66 @@ pub fn responseMatchesQuestion(
 
 pub fn rrMatchesQuestion(rr: ResourceRecord, name: []const u8, qtype: RecordType) bool {
     return rr.class == class_in and rr.rr_type == qtype and namesEqual(rr.name.slice(), name);
+}
+
+/// Validate the answer section's bounded CNAME chain against the original
+/// question. parseMessage intentionally drops CNAME records, so their ownership
+/// must be checked on the original wire before accepting a canonical address.
+pub fn responseAnswersFollowCnames(comptime max_addresses: usize, packet: []const u8, name: []const u8, qtype: RecordType) bool {
+    if (packet.len < 12 or packet.len > max_message_len or readU16(packet, 4) != 1) return false;
+    const Alias = struct { owner: Name, target: Name };
+    var aliases: [16]Alias = undefined;
+    var alias_n: usize = 0;
+    var owners: [max_addresses]Name = undefined;
+    var owner_n: usize = 0;
+    var question = Name{};
+    var pos = decodeName(packet, 12, &question) catch return false;
+    if (pos + 4 > packet.len or !namesEqual(question.slice(), name) or readU16(packet, pos) != @intFromEnum(qtype) or readU16(packet, pos + 2) != class_in) return false;
+    pos += 4;
+    for (0..readU16(packet, 6)) |_| {
+        var owner = Name{};
+        pos = decodeName(packet, pos, &owner) catch return false;
+        if (pos + 10 > packet.len) return false;
+        const typ = readU16(packet, pos);
+        const class = readU16(packet, pos + 2);
+        const rdlen = readU16(packet, pos + 8);
+        pos += 10;
+        if (rdlen > packet.len - pos) return false;
+        const end = pos + rdlen;
+        if (typ == 5) {
+            if (class != class_in or alias_n == aliases.len) return false;
+            var target = Name{};
+            if ((decodeName(packet, pos, &target) catch return false) != end) return false;
+            aliases[alias_n] = .{ .owner = owner, .target = target };
+            alias_n += 1;
+        } else if (typ == @intFromEnum(qtype)) {
+            if (class != class_in or owner_n == owners.len) return false;
+            owners[owner_n] = owner;
+            owner_n += 1;
+        } else if (RecordType.fromInt(typ)) |_| {
+            return false;
+        } else |_| {}
+        pos = end;
+    }
+    var current = Name.fromSlice(name) catch return false;
+    var visited: [16]bool = @splat(false);
+    var traversed: usize = 0;
+    while (true) {
+        var next: ?usize = null;
+        for (aliases[0..alias_n], 0..) |alias, i| {
+            if (!namesEqual(alias.owner.slice(), current.slice())) continue;
+            // Repeated owner or cycle is ambiguous and fails closed.
+            if (next != null or visited[i]) return false;
+            next = i;
+        }
+        const idx = next orelse break;
+        visited[idx] = true;
+        traversed += 1;
+        current = aliases[idx].target;
+    }
+    if (traversed != alias_n or owner_n == 0) return false;
+    for (owners[0..owner_n]) |owner| if (!namesEqual(owner.slice(), current.slice())) return false;
+    return true;
 }
 
 fn responseAnswersInBailiwick(
@@ -1006,6 +1063,33 @@ fn queryServer(ns: Address, port: u16, query: []const u8, recv_buf: []u8, timeou
             if (posix.errno(got) != .SUCCESS) return error.Timeout;
             return recv_buf[0..@intCast(got)];
         },
+        .openbsd => {
+            const sys = posix.system;
+            const family: c_uint = if (ns == .ipv4) posix.AF.INET else posix.AF.INET6;
+            const fd = sys.socket(family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);
+            if (posix.errno(fd) != .SUCCESS) return error.SocketUnavailable;
+            defer _ = sys.close(fd);
+            const finite_ms = @max(timeout_ms, 1);
+            const tv = sys.timeval{ .sec = @intCast(finite_ms / 1000), .usec = @intCast((finite_ms % 1000) * 1000) };
+            if (posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(@TypeOf(tv)))) != .SUCCESS or
+                posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(@TypeOf(tv)))) != .SUCCESS) return error.SocketUnavailable;
+            const connected = switch (ns) {
+                .ipv4 => |bytes| blk: {
+                    var addr = posix.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(bytes) };
+                    break :blk sys.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+                },
+                .ipv6 => |bytes| blk: {
+                    var addr = posix.sockaddr.in6{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = bytes, .scope_id = 0 };
+                    break :blk sys.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+                },
+            };
+            if (posix.errno(connected) != .SUCCESS) return error.SendFailed;
+            const sent = sys.sendto(fd, query.ptr, query.len, 0, null, 0);
+            if (posix.errno(sent) != .SUCCESS or sent != query.len) return error.SendFailed;
+            const received = sys.recvfrom(fd, recv_buf.ptr, recv_buf.len, 0, null, null);
+            if (posix.errno(received) != .SUCCESS) return error.Timeout;
+            return recv_buf[0..@intCast(received)];
+        },
         else => return error.SocketUnavailable,
     }
 }
@@ -1030,11 +1114,13 @@ fn queryAll(
         for (cfg.nsSlice()) |ns| {
             const resp = queryServer(ns, cfg.port, query, &rbuf, cfg.timeout_ms) catch continue;
             const msg = parseMessage(maxq, maxa, resp) catch continue;
-            if (msg.header.id != id) continue;
+            if (msg.header.id != id or msg.header.flags & 0x7a00 != 0) continue;
             if (!responseMatchesQuestion(maxq, maxa, &msg, name, qtype)) continue;
             switch (msg.header.rcode()) {
                 0 => {
-                    if (!responseAnswersInBailiwick(maxq, maxa, &msg, name, qtype)) continue;
+                    if ((qtype == .a or qtype == .aaaa) and msg.answer_count != 0) {
+                        if (!responseAnswersFollowCnames(maxa, resp, name, qtype)) continue;
+                    } else if (!responseAnswersInBailiwick(maxq, maxa, &msg, name, qtype)) continue;
                     return msg;
                 },
                 3 => return error.NameError, // NXDOMAIN — authoritative "no such name"
@@ -1345,4 +1431,108 @@ test "forwardConfirms implements the FCrDNS match (anti-spoof)" {
     // Family mismatch never confirms.
     const v6 = Address{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
     try std.testing.expect(!forwardConfirms(v6, &matching));
+}
+
+test "DNS CNAME answer ownership follows canonical target and rejects unrelated cycles" {
+    const q = Query{ .name = "alias.test", .qtype = .a };
+    var bytes: [512]u8 = undefined;
+    const address = Answer{ .name = "canonical.test", .rr_type = .a, .ttl = 5, .data = .{ .a = .{ 127, 0, 0, 7 } } };
+    const response = try encodeMessage(&bytes, .{ .id = 7, .response = true, .questions = &.{q}, .answers = &.{address} });
+    var w = Writer{ .buf = &bytes, .pos = response.len };
+    try encodeName(&w, q.name);
+    try w.putU16(5);
+    try w.putU16(class_in);
+    try w.putU32(5);
+    const rdlen_at = w.pos;
+    try w.putU16(0);
+    const start = w.pos;
+    try encodeName(&w, "canonical.test");
+    std.mem.writeInt(u16, bytes[rdlen_at..][0..2], @intCast(w.pos - start), .big);
+    std.mem.writeInt(u16, bytes[6..8], 2, .big);
+    try std.testing.expect(responseAnswersFollowCnames(4, bytes[0..w.pos], q.name, .a));
+    // No CNAME authority means the canonical owner is unrelated to the question.
+    std.mem.writeInt(u16, bytes[6..8], 1, .big);
+    try std.testing.expect(!responseAnswersFollowCnames(4, bytes[0..response.len], q.name, .a));
+    std.mem.writeInt(u16, bytes[6..8], 2, .big);
+    // The original owner points to itself: no cyclic authority is accepted.
+    var cycle = Writer{ .buf = bytes[start..] };
+    try encodeName(&cycle, q.name);
+    std.mem.writeInt(u16, bytes[rdlen_at..][0..2], @intCast(cycle.pos), .big);
+    try std.testing.expect(!responseAnswersFollowCnames(4, bytes[0 .. start + cycle.pos], q.name, .a));
+}
+
+test "DNS native resolver forward reverse and confirmation use IPv4 and IPv6 UDP" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const sys = posix.system;
+    const Worker = struct {
+        fd: posix.fd_t,
+        count: usize = 0,
+        fn run(self: *@This()) void {
+            for (0..4) |_| {
+                var packet: [1024]u8 = undefined;
+                var peer: posix.sockaddr.storage = undefined;
+                var peer_len: posix.socklen_t = @sizeOf(@TypeOf(peer));
+                const got = sys.recvfrom(self.fd, &packet, packet.len, 0, @ptrCast(&peer), &peer_len);
+                if (posix.errno(got) != .SUCCESS) return;
+                const parsed = parseMessage(1, 0, packet[0..@intCast(got)]) catch return;
+                if (parsed.question_count != 1) return;
+                const q = parsed.questions[0];
+                const question = Query{ .name = q.name.slice(), .qtype = q.qtype };
+                var ipv6: [16]u8 = @splat(0);
+                ipv6[15] = 1;
+                const answer = Answer{ .name = question.name, .rr_type = q.qtype, .ttl = 5, .data = switch (q.qtype) {
+                    .a => .{ .a = .{ 127, 0, 0, 7 } },
+                    .aaaa => .{ .aaaa = ipv6 },
+                    .ptr => .{ .ptr = "confirmed-worker.test" },
+                    else => return,
+                } };
+                var reply_buf: [1024]u8 = undefined;
+                const reply = encodeMessage(&reply_buf, .{ .id = parsed.header.id, .response = true, .questions = &.{question}, .answers = &.{answer} }) catch return;
+                const sent = sys.sendto(self.fd, reply.ptr, reply.len, 0, @ptrCast(&peer), peer_len);
+                if (posix.errno(sent) != .SUCCESS or sent != reply.len) return;
+                self.count += 1;
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |ipv6| {
+        const fd_raw = sys.socket(if (ipv6) posix.AF.INET6 else posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);
+        try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(fd_raw));
+        const fd: posix.fd_t = @intCast(fd_raw);
+        defer _ = sys.close(fd);
+        const tv = sys.timeval{ .sec = 1, .usec = 0 };
+        try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(@TypeOf(tv)))));
+        var loopback6: [16]u8 = @splat(0);
+        loopback6[15] = 1;
+        var port: u16 = 0;
+        if (ipv6) {
+            var addr = posix.sockaddr.in6{ .port = 0, .flowinfo = 0, .addr = loopback6, .scope_id = 0 };
+            try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)))));
+            var len: posix.socklen_t = @sizeOf(@TypeOf(addr));
+            try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.getsockname(fd, @ptrCast(&addr), &len)));
+            port = std.mem.bigToNative(u16, addr.port);
+        } else {
+            var addr = posix.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+            try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)))));
+            var len: posix.socklen_t = @sizeOf(@TypeOf(addr));
+            try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.getsockname(fd, @ptrCast(&addr), &len)));
+            port = std.mem.bigToNative(u16, addr.port);
+        }
+        var cfg = ResolverConfig{ .port = port, .timeout_ms = 100, .attempts = 1 };
+        cfg.addNameserver(if (ipv6) .{ .ipv6 = loopback6 } else .{ .ipv4 = .{ 127, 0, 0, 1 } });
+        var worker = Worker{ .fd = fd };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        var joined = false;
+        defer if (!joined) thread.join();
+        const target = if (ipv6) Address{ .ipv6 = loopback6 } else Address{ .ipv4 = .{ 127, 0, 0, 7 } };
+        var addresses: [4]Address = undefined;
+        const forward = try resolveForward(&cfg, "confirmed-worker.test", ipv6, &addresses);
+        try std.testing.expectEqual(@as(usize, 1), forward.len);
+        try std.testing.expect(addressEql(target, forward[0]));
+        var host: [max_domain_text_len]u8 = undefined;
+        try std.testing.expectEqualStrings("confirmed-worker.test", try resolveReverse(&cfg, target, &host));
+        try std.testing.expectEqualStrings("confirmed-worker.test", resolveConfirmed(&cfg, target, &host) orelse return error.TestUnexpectedResult);
+        thread.join();
+        joined = true;
+        try std.testing.expectEqual(@as(usize, 4), worker.count);
+    }
 }

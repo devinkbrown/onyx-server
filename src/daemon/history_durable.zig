@@ -21,6 +21,7 @@ const max_sender: usize = 512;
 const max_text: usize = 8192;
 const max_command: usize = 32;
 const max_tags: usize = 8192;
+const max_record_bytes = 32 + max_target + max_msgid + max_sender + max_text + max_command + max_tags;
 
 pub const Error = error{
     BadRecord,
@@ -68,11 +69,10 @@ fn messageKey(gen: u64, seq: u64, out: *[17]u8) []const u8 {
     return out;
 }
 
-fn putRecord(store: *OroStore, gen: u64, seq: u64, rec: Record) !void {
+fn encodeRecord(rec: Record, body: *[max_record_bytes]u8) ![]const u8 {
     if (rec.target.len > max_target or rec.msgid.len > max_msgid or rec.sender.len > max_sender or
         rec.text.len > max_text or rec.command.len > max_command or rec.client_tags.len > max_tags)
         return error.RecordTooLarge;
-    var body: [32 + max_target + max_msgid + max_sender + max_text + max_command + max_tags]u8 = undefined;
     var n: usize = 0;
     body[n] = 1;
     n += 1;
@@ -91,8 +91,14 @@ fn putRecord(store: *OroStore, gen: u64, seq: u64, rec: Record) !void {
     n += 4;
     @memcpy(body[n..][0..rec.text.len], rec.text);
     n += rec.text.len;
+    return body[0..n];
+}
+
+fn putRecord(store: *OroStore, gen: u64, seq: u64, rec: Record) !void {
+    var body: [max_record_bytes]u8 = undefined;
+    const encoded = try encodeRecord(rec, &body);
     var key_buf: [17]u8 = undefined;
-    try store.put(.history, messageKey(gen, seq, &key_buf), body[0..n]);
+    try store.put(.history, messageKey(gen, seq, &key_buf), encoded);
 }
 
 const Owned = struct {
@@ -188,9 +194,12 @@ pub fn append(store: *OroStore, rec: Record) !void {
 }
 
 /// Replace the durable image with the messages still inside `lotus`. The new
-/// generation is published last.
+/// generation is published last. An already-identical canonical image is a
+/// read-only, allocation-free no-op. Different ordering conservatively rewrites
+/// the image, preserving compaction and repair after failed ordinary appends.
 pub fn replaceAll(comptime LotusT: type, store: *OroStore, lotus: *const LotusT) !void {
     const meta = readMeta(store);
+    if (try imageMatches(LotusT, store, lotus, meta)) return;
     const generation = meta.generation + 1;
     var seq: u64 = 0;
     var it = lotus.deterministicIterator();
@@ -209,6 +218,33 @@ pub fn replaceAll(comptime LotusT: type, store: *OroStore, lotus: *const LotusT)
         seq += 1;
     }
     try writeMeta(store, .{ .generation = generation, .count = seq });
+}
+
+fn imageMatches(comptime LotusT: type, store: *OroStore, lotus: *const LotusT, meta: Meta) !bool {
+    if (store.get(.history, meta_key)) |raw| {
+        if (raw.len != 16) return false;
+    }
+    if (meta.count != lotus.totalStoredCount()) return false;
+    var it = lotus.deterministicIterator();
+    var seq: u64 = 0;
+    var body: [max_record_bytes]u8 = undefined;
+    while (it.next()) |entry| {
+        var key_buf: [17]u8 = undefined;
+        const raw = store.get(.history, messageKey(meta.generation, seq, &key_buf)) orelse return false;
+        const encoded = try encodeRecord(.{
+            .target = entry.target,
+            .msgid = entry.message.msgid,
+            .sender = entry.message.sender,
+            .text = entry.message.text,
+            .timestamp = entry.message.timestamp,
+            .command = entry.message.command,
+            .client_tags = entry.message.client_tags orelse "",
+            .tombstone = entry.message.tombstone,
+        }, &body);
+        if (!std.mem.eql(u8, raw, encoded)) return false;
+        seq += 1;
+    }
+    return seq == meta.count;
 }
 
 /// Stage a restored ring and search projection, then swap both in. A failure
@@ -249,6 +285,56 @@ pub fn restoreInto(comptime LotusT: type, store: *OroStore, lotus: *LotusT, sear
 }
 
 const test_lotus = @import("../proto/lotus.zig");
+
+test "GAP-D1 identical history snapshot is allocation-free and divergent history repairs the durable image" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var store = try OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "history-noop.wal");
+    defer store.deinit();
+    const LotusT = test_lotus.Lotus(.{ .max_targets = 4, .max_per_target = 8, .max_text = 128 });
+    var lotus = LotusT.init(alloc);
+    defer lotus.deinit();
+    // Even an empty image must not emit a metadata/changefeed write.
+    const empty_changes = store.changeCount();
+    try replaceAll(LotusT, &store, &lotus);
+    try std.testing.expectEqual(empty_changes, store.changeCount());
+    _ = try lotus.append("#room", .{
+        .msgid = "m1",
+        .sender = "alice",
+        .text = "before",
+        .timestamp = 1,
+        .client_tags = "+draft/reply=parent",
+    });
+    try replaceAll(LotusT, &store, &lotus);
+    const before_meta = readMeta(&store);
+    const before_changes = store.changeCount();
+    const before_allocs = failing.alloc_index;
+    failing.fail_index = before_allocs;
+    try replaceAll(LotusT, &store, &lotus);
+    try std.testing.expectEqual(before_allocs, failing.alloc_index);
+    try std.testing.expectEqual(before_changes, store.changeCount());
+    try std.testing.expectEqual(before_meta, readMeta(&store));
+
+    // Preserve reconciliation: a divergent edit must attempt a real write,
+    // and retry after allocation pressure must retain the edited text.
+    try lotus.edit("#room", "m1", "after");
+    try std.testing.expectError(error.OutOfMemory, replaceAll(LotusT, &store, &lotus));
+    try std.testing.expectEqual(before_meta, readMeta(&store));
+    failing.fail_index = std.math.maxInt(usize);
+    try replaceAll(LotusT, &store, &lotus);
+    var restored = LotusT.init(alloc);
+    defer restored.deinit();
+    var search = search_index_mod.SearchIndex.init(alloc);
+    defer search.deinit();
+    try restoreInto(LotusT, &store, &restored, &search);
+    var out: [1]test_lotus.Message = undefined;
+    const messages = try restored.latest("#room", 1, &out);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("after", messages[0].text);
+    try std.testing.expectEqualStrings("+draft/reply=parent", messages[0].client_tags.?);
+}
 
 test "UPGRADE GAP-D1 history restore is allocation-failure atomic" {
     const alloc = std.testing.allocator;

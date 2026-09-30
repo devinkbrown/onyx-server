@@ -1,0 +1,271 @@
+1/270 root.test_0...OK
+2/270 crypto.root.test_0...OK
+3/270 daemon.root.test_0...OK
+4/270 proto.root.test_0...OK
+5/270 substrate.root.test_0...OK
+6/270 wasm.host.root.test_0...OK
+7/270 substrate.io.root.test_0...OK
+8/270 substrate.ripple_props.test_0...OK
+9/270 substrate.ripple.test_0...OK
+10/270 substrate.undertow.root.test_0...OK
+11/270 substrate.undertow.peer_link.test_0...OK
+12/270 substrate.undertow.s2s_peer.test.SESSION_MIGRATE frame is dispatched and staged for the daemon to drain...OK
+13/270 substrate.undertow.s2s_peer.test.SESSION_MIGRATE_CONSUMED is dispatched to its convergence queue...OK
+14/270 substrate.undertow.s2s_peer.test.SESSION_MIGRATE from an unknown origin is rejected, not staged...OK
+15/270 substrate.undertow.s2s_peer.test.session replica v3 negotiates one strict attachment schema per secured link...OK
+16/270 substrate.undertow.s2s_peer.test.session replica v3 probe leaves a rolling v2 peer on v2...OK
+17/270 substrate.undertow.s2s_peer.test.session replica v2 inner peer transports offers acks revokes and attachment leases...OK
+18/270 substrate.undertow.s2s_peer.test.session replica v2 rolling old and plaintext peers stay inert...OK
+19/270 substrate.undertow.s2s_peer.test.session replica v2 hot resume preserves negotiated capability...OK
+20/270 substrate.undertow.s2s_peer.test.session replica v2 malformed cross-tag and bounded queue input fail closed...OK
+21/270 crypto.sign.test_0...OK
+22/270 proto.s2s_frame.test.session replica v2 frames are secured and capability gated...OK
+23/270 proto.session_replica_frame.test.session replica transport OFFER ACK REVOKE and attachment lease round-trip...OK
+24/270 proto.session_replica_frame.test.attachment session replica transport round-trips every v3 object kind...OK
+25/270 proto.session_replica_frame.test.session replica transport never guesses or falls back across v2 and v3...OK
+26/270 proto.session_replica_frame.test.attachment session replica transport binds distinct inner objects to outer kind...OK
+27/270 proto.session_replica_frame.test.attachment session replica transport rejects all truncation and trailing bytes...OK
+28/270 proto.session_replica_frame.test.attachment session replica transport rejects malformed identity status and lengths...OK
+29/270 proto.session_replica_frame.test.session replica transport binds inner object to outer kind...OK
+30/270 proto.session_replica_frame.test.session replica transport rejects every truncation and trailing bytes...OK
+31/270 proto.session_replica_frame.test.session replica transport rejects malformed headers lengths and payloads...OK
+32/270 proto.session_replica_frame.test.session replica transport enforces frame-size bound before allocation or parse...OK
+33/270 proto.session_replica_frame.test.session replica transport OFFER declared fields are strict and bounded...OK
+34/270 substrate.io.buf_ring.test_0...OK
+35/270 substrate.io.ring.test_0...OK
+36/270 proto.asn1_time.test_0...OK
+37/270 proto.certfp.test_0...OK
+38/270 proto.cloak.test_0...OK
+39/270 proto.ircx_modex.test_0...OK
+40/270 proto.ircx_saccess.test_0...OK
+41/270 proto.listx.test_0...OK
+42/270 proto.mooring.test_0...OK
+43/270 proto.mooring_props.test_0...OK
+44/270 proto.quic_handshake.test_0...OK
+45/270 proto.quic_transport_params.test_0...OK
+46/270 proto.sasl_external_verify.test_0...OK
+47/270 proto.sasl_mechrouter.test.SESSION-TOKEN accepts and rejects through router callback...OK
+48/270 proto.sasl_mechrouter.test_0...OK
+49/270 proto.sasl_oauthbearer.test_0...OK
+50/270 proto.sasl.test_0...OK
+51/270 proto.sasl_scram512_server.test_0...OK
+52/270 proto.sasl_scram.test_0...OK
+53/270 proto.sasl_scram_server.test_0...OK
+54/270 proto.signed_delta.test_0...OK
+55/270 proto.toml.test_0...OK
+56/270 proto.x509.test_0...OK
+57/270 daemon.modules.manifest.test_0...OK
+58/270 daemon.key_transparency.test_0...OK
+59/270 daemon.durable_credential_props.test.DPROP1 empty image has deterministic framing and KAT...OK
+60/270 daemon.durable_credential_props.test.DPROP1 empty state exposes exact immutable local origin...OK
+61/270 daemon.durable_credential_props.test.DPROP1 integration API exposes exact store bounds and bounded factAt...OK
+62/270 daemon.durable_credential_props.test.DPROP1 signed facts round-trip sorted and restore max HLC...OK
+63/270 daemon.durable_credential_props.test.DPROP1 validates legacy and folded stored-key ODD1 device material...OK
+64/270 daemon.durable_credential_props.test.DPROP1 LWW stale replay and equivocation outcomes...OK
+65/270 daemon.durable_credential_props.test.DPROP1 tombstone replaces and rejects nonempty delete...OK
+66/270 daemon.durable_credential_props.test.DPROP1 malformed prefix trailing checksum and canonical inputs fail closed...OK
+67/270 daemon.durable_credential_props.test.DPROP1 rejects noncredential namespace and unsigned event...OK
+68/270 daemon.durable_credential_props.test.DPROP1 prepared update is invisible until commit and abort is exact...OK
+69/270 daemon.durable_credential_props.test.DPROP1 decoder rejects duplicate, unsorted, proper-prefix, and trailing records...OK
+70/270 daemon.durable_credential_props.test.DPROP1 decoder enforces count bound before body allocation...OK
+71/270 daemon.durable_credential_props.test.DPROP1 enforces the per-account cap but permits replacement at cap...OK
+72/270 daemon.durable_credential_props.test.DPROP1 rejects zero local-origin configuration...OK
+73/270 daemon.durable_credential_props.test.DPROP1 tombstones prevent stale resurrection and reject foreign origin...OK
+74/270 daemon.durable_credential_props.test.DPROP1 signed fact validation is fail-closed for clock account owner origin and tamper...OK
+75/270 daemon.durable_credential_props.test.DPROP1 decode is allocation-failure atomic...OK
+76/270 daemon.durable_credential_props.test.DPROP1 prepare is allocation-failure atomic...OK
+77/270 daemon.acme_cli.test_0...OK
+78/270 daemon.acme_http01_listener.test_0...OK
+79/270 daemon.acme_renewal.test_0...OK
+80/270 daemon.acme_runner.test_0...OK
+81/270 daemon.config_boot.test.MESSAGE_V2 activation fields map without reparsing deployment identities...OK
+82/270 daemon.config_boot.test.MESSAGE_V2 empty projection cannot downgrade a base plan...OK
+83/270 daemon.config_format.test.parseToml: MESSAGE_V2 activation plan is explicit complete and type-strict...OK
+84/270 daemon.config_format.test.parseToml: MESSAGE_V2 activation plan survives every allocation failure...OK
+85/270 daemon.config_format.test_0...OK
+86/270 daemon.dispatch.test.sasl CAP and 908 gate SESSION-TOKEN OAUTHBEARER ANONYMOUS and SCRAM-SHA-512-PLUS...OK
+87/270 daemon.helix.root.test_0...OK
+88/270 daemon.metrics_http.test_0...OK
+89/270 daemon.webhook.test_0...OK
+90/270 daemon.webhook_render.test_0...OK
+91/270 daemon.webhook_http.test_0...OK
+92/270 daemon.oauth_jwt.test_0...OK
+93/270 daemon.ocsp_staple.test_0...OK
+94/270 daemon.reactor_pool.test_0...OK
+95/270 daemon.s2s_link.test.session replica v2 signed plaintext S2sLink remains disabled...OK
+96/270 daemon.sasl_bridge.test_0...OK
+97/270 daemon.scram_store.test_0...OK
+98/270 daemon.secured_s2s_link.test.session replica v2 activates only inside established Mooring SecuredLink...OK
+99/270 daemon.server.test.session replica live publication pairs a newer lease and detached publication invalidates it...OK
+100/270 daemon.server.test.session replica orphaned final revoke survives encode Store OOM and checkpoint...OK
+101/270 daemon.server.test.session replica sweep retains expired orphan until local revoke retry succeeds...OK
+102/270 daemon.server.test.session replica replay skips attachment leases for rolling-old peers without pinning burst...OK
+103/270 daemon.server.test.session replica mid-flight RESYNC restarts canonical Store without revision churn...OK
+104/270 daemon.server.test.session replica value replay completes 140 objects under continuous behind-cursor renewal...OK
+105/270 daemon.server.test.session replica conflicted lease replays both witnesses back to ingress peer...OK
+106/270 daemon.server.test.session replica replay preflights SendQ before AEAD advance and resumes at eight frames...SKIP
+107/270 daemon.server.test.session replica gates establishment and RESYNC membership behind every retained authority page...SKIP
+108/270 daemon.server.test.session replica burst retains whole-record ciphertext across SendQ backpressure...SKIP
+109/270 daemon.server.test.session replica live fanout preserves retained ciphertext on a full peer SendQ...SKIP
+110/270 daemon.server.test.session replica secured receipt retry does not duplicate retained ciphertext...OK
+111/270 daemon.server.test.session replica deferred sidecar retry bounds retained ciphertext...SKIP
+112/270 daemon.server.test.session replica burst retries incomplete family after secured record allocation failure...SKIP
+113/270 daemon.server.test.session replica replay leaves no inner residue after outer record allocation failure...OK
+114/270 daemon.server.test.session replica burst sends every legal mesh ward beyond legacy scratch cap...OK
+115/270 daemon.server.test.session replica replay budgets actual ciphertext with one-frame progress exception...OK
+116/270 daemon.server.test.maximum legal session replica fits the clamped server-link SendQ and progresses...OK
+117/270 daemon.server.test.MESSAGE_V2 replay and Lotus publish transactionally with one accepted identity...OK
+118/270 daemon.server.test.MESSAGE_V2 durable admission fails closed without explicit direct-neighbor pins...OK
+119/270 daemon.server.test.MESSAGE_V2 authoring activation requires a staged canonical full-mesh roster...OK
+120/270 daemon.server.test.MESSAGE_V2 Helix legacy egress seam suppresses a twin after durable admission...OK
+121/270 daemon.server.test.MESSAGE_V2 Helix authored row waits for rolling-old peer then replays once and retires...OK
+122/270 daemon.server.test.MESSAGE_V2 RVL2 duplicate ingress and ACK handshake retire every direct-neighbor obligation...OK
+123/270 daemon.server.test.MESSAGE_V2 custody ACK and ACK_CONFIRM fail closed for off-mesh and unsolicited peers...OK
+124/270 daemon.server.test.MESSAGE_V2 RVL2 retry sweep cannot starve a later direct neighbor...OK
+125/270 daemon.server.test.MESSAGE_V2 egress emits a >64 same-origin backlog old-HLC-before-new per neighbor...OK
+126/270 daemon.server.test.MESSAGE_V2 egress retains a partitioned neighbor's obligation and retires it once on heal...OK
+127/270 daemon.server.test.MESSAGE_V2 Helix restore relation rejects individually valid torn authorities...OK
+128/270 daemon.server.test.UPGRADE rejects torn MESSAGE_V2 authority checkpoints before publication...SKIP
+129/270 daemon.server.test.MESSAGE_V2 retained RVL2 row re-acks every direct neighbor after RVG2 window eviction...OK
+130/270 daemon.server.test.MESSAGE_V2 Helix activation is staged exact and monotonic across current handoff...SKIP
+131/270 daemon.server.test.DPROP1 startup authority union rejects partial and mismatched configurations...OK
+132/270 daemon.server.test.DPROP1 shared cold-hot candidate is purge-first idempotent allocation-failure atomic...OK
+133/270 daemon.server.test.DPROP1 cold activation publishes exact authority and stays observationally silent...OK
+134/270 daemon.server.test.DPROP1 hot activation without PRPC restores authority and is observationally silent...SKIP
+135/270 daemon.server.test.DPROP1 hot carried conflict is purge-first authority-wins and final edge allocates nothing...SKIP
+136/270 daemon.server.test.DPROP1 hot unrelated future PRPC clock is fatal and leaves causal triplet exact...SKIP
+137/270 daemon.server.test.DPROP1 cold startup without mandatory signer rejects local device writes...SKIP
+138/270 daemon.server.test.DPROP1 remote user device ENTITY_PROP is quarantined before all admission side effects...OK
+139/270 daemon.server.test.DPROP1 remote device quarantine persists as policy across restart...OK
+140/270 daemon.server.test.DPROP1 remote device origin cannot bypass quarantine after cold restart...OK
+141/270 daemon.server.test.DPROP1 local device write converges exact signed durable live clock and transparency fact...SKIP
+142/270 daemon.server.test.DPROP1 missing-row delete commits exact signed tombstone without creating live PROP...SKIP
+143/270 daemon.server.test.DPROP1 channel and member device-looking properties retain generic PROP behavior...SKIP
+144/270 daemon.server.test.DPROP1 ambiguous durable cut is sticky requests stop and publishes no live state...SKIP
+145/270 daemon.server.test.DPROP1 transaction preparation signing clock and Services failures publish nothing...SKIP
+146/270 daemon.server.test.DPROP1 PROP CLEAR scans beyond sixty four rows and preserves reserved device facts...SKIP
+147/270 daemon.server.test.DPROP1 user PROP and E2EEKEY enumerate all one hundred twenty eight capacity rows...SKIP
+148/270 daemon.server.test.DPROP1 reserved local PROP numerics and oper override remain fail closed...SKIP
+149/270 daemon.server.test.DPROP1 stale durable admission maps generic PROP to ERR_SECURITY 908...SKIP
+150/270 daemon.server.test.DPROP1 E2EEKEY mixed-case ODD1 commits folded PROP lists and restores...SKIP
+151/270 daemon.server.test.session replica lifecycle LOGOUT revokes the final local portable token...SKIP
+152/270 daemon.server.test.session replica lifecycle account switch revokes the abandoned portable token...SKIP
+153/270 daemon.server.test.session replica lifecycle IRCX AUTH guest rebind revokes the abandoned portable token...SKIP
+154/270 daemon.server.test.session replica lifecycle REGISTER rebind revokes the abandoned portable token...SKIP
+155/270 daemon.server.test.session replica lifecycle DROP revokes every distinct local token...SKIP
+156/270 daemon.server.test.session replica lifecycle keeps one-of-N authority and last nonportable sibling revokes...SKIP
+157/270 daemon.server.test.session replica lifecycle revokes portable authority replaced on same-client attach...SKIP
+158/270 daemon.server.test.session replica nick index is case-folded bounded and ambiguity-safe...OK
+159/270 daemon.server.test.E5E1 session replica residence rejects downgrade without widening exact token authority...SKIP
+160/270 daemon.server.test.signed session replica projects JOIN PART only to the exact token and never republishes...SKIP
+161/270 daemon.server.test.rowless signed session replica retries Pending staging after capacity clears...OK
+162/270 daemon.server.test.MESSAGE_V2 unknown home retries then converges and delivers once...SKIP
+163/270 daemon.server.test.MESSAGE_V2 unknown home convergence to different node drops permanently...SKIP
+164/270 daemon.server.test.MESSAGE_V2 deferred unknown-home expires without delivery...SKIP
+165/270 daemon.server.test.MESSAGE_V2 signed member modes bypass unknown-home retry...SKIP
+166/270 daemon.server.test.MESSAGE_V2 known-home mismatch with signed member modes still drops permanently...SKIP
+167/270 daemon.server.test.SESSIONTOKEN live dispatch issues Unix expiry and survives durable cold reopen...OK
+168/270 daemon.server.test.threaded server: SESSIONTOKEN refuses non-TLS transport...OK
+169/270 daemon.server.test.threaded server: login defers autojoin and restores only after exact SESSION RESUME token...OK
+170/270 daemon.server.test.threaded server: session-sync fresh login defers autojoin until SESSION TOKEN...OK
+171/270 daemon.server.test.SESSION RESUME retry latch clears on terminal and already-attached attempts...SKIP
+172/270 daemon.server.test.SESSION RESUME composite rejects malformed terminal and forged exact authority without downgrade...SKIP
+173/270 daemon.server.test.SESSION RESUME exact selector moves only its sibling and durable spool...SKIP
+174/270 daemon.server.test.ReleaseSafe SESSION TOKEN reader-first issuance gate defaults legacy and explicitly enables SRM2...SKIP
+175/270 daemon.server.test.SESSION RESUME legacy local and SRM1 create new without stripping ghost spool...SKIP
+176/270 daemon.server.test.expired SESSION RESUME retry hold clears TOKEN latch and restores UPGRADE readiness...SKIP
+177/270 daemon.server.test.manual SESSION RESUME retry preservation expires without autojoin deferral and restores UPGRADE readiness...SKIP
+178/270 daemon.server.test.SESSION DROP removes a sibling attachment by LIST index...SKIP
+179/270 daemon.server.test.SESSION DROP #n cannot retarget after list snapshot mutation...SKIP
+180/270 daemon.server.test.SESSION DROP sid revokes exactly one physical attachment and leaves shared-token siblings live...SKIP
+181/270 daemon.server.test.SESSION DROP crosses two live reactors and preserves an exact-token sibling identity...SKIP
+182/270 daemon.server.test.SESSION DROP fails closed on absent, stale, and account-switched ids...SKIP
+183/270 daemon.server.test.SESSION DROP leaves an attached foreign-shard row untouched until the reserved handoff protocol exists...SKIP
+184/270 daemon.server.test.SESSION DROP never treats a local target with an unattested foreign token sibling as final...SKIP
+185/270 daemon.server.test.SESSION DROP prefers the current nick-owning sibling among three local token attachments...SKIP
+186/270 daemon.server.test.threaded server: legacy consumed notice cannot delete a reusable session replica...SKIP
+187/270 daemon.server.test.exploit: channel PRIVMSG with mIRC colour admits under active MESSAGE_V2 authoring...SKIP
+188/270 daemon.server.test.authored MESSAGE_V2 ADS1 capacity soft-fail preserves spool while mesh authorities publish...SKIP
+189/270 daemon.server.test.threaded server: SESSIONS lists connections and filters (oper)...OK
+190/270 daemon.server.test.DPROP1 UPGRADE late malformed sessions failure preserves causal triplet and MeshClock...SKIP
+191/270 daemon.server.test.UPGRADE rejects SESSION_REPLICA Store from pre-manifest v1 predecessor...SKIP
+192/270 daemon.server.test_0...OK
+193/270 daemon.sessions.test_0...OK
+194/270 daemon.svc_sessionview.test.formatter renders SESSION terminator as numeric...OK
+195/270 daemon.tls_certs.test_0...OK
+196/270 daemon.tls_conn.test_0...OK
+197/270 daemon.tls_sni_load.test_0...OK
+198/270 crypto.tls_server.test_0...OK
+199/270 crypto.tls_record.test_0...OK
+200/270 crypto.hkdf_tls13.test_0...OK
+201/270 crypto.hash.test_0...OK
+202/270 crypto.random.test_0...OK
+203/270 daemon.helix.session_replica.test.session replica revision comparison is a deterministic total order...OK
+204/270 daemon.helix.session_replica.test.session replica attachment lease round-trips and tampering fails closed...OK
+205/270 daemon.helix.session_replica.test.session replica attachment lease makes retained OFFER liveness explicit and ordered...OK
+206/270 daemon.helix.session_replica.test.session replica attachment lease conflict and allocation failure stay fail closed...OK
+207/270 daemon.helix.session_replica.test.session replica attachment lease replay floor rejects older live lease after newer expiry...OK
+208/270 daemon.helix.session_replica.test.session replica attachment lease conflict floor survives unequal expiry replay...OK
+209/270 daemon.helix.session_replica.test.session replica attachment lease conflict witnesses replay fail closed to a fresh store...OK
+210/270 daemon.helix.session_replica.test.session replica attachment lease conflict OOM checkpoint remains denied and recovers witness...OK
+211/270 daemon.helix.session_replica.test.session replica signed OFFER upsert round-trips and verifies...OK
+212/270 daemon.helix.session_replica.test.session replica OFFER rejects non-canonical mesh-clock revisions...OK
+213/270 daemon.helix.session_replica.test.session replica portable snapshot fits transport and boundary plus one rejects...OK
+214/270 daemon.helix.session_replica.test.session replica signed OFFER remove round-trips and canonical shape is enforced...OK
+215/270 daemon.helix.session_replica.test.session replica OFFER rejects signer-origin mismatch tampering truncation and trailing bytes...OK
+216/270 daemon.helix.session_replica.test.session replica OFFER decode rejects invalid operation and oversized declared fields...OK
+217/270 daemon.helix.session_replica.test.session replica signed ACK round-trips verifies and rejects tampering...OK
+218/270 daemon.helix.session_replica.test.session replica ACK rejects non-canonical offered and observed revisions...OK
+219/270 daemon.helix.session_replica.test.session replica ACK signer must self-certify ack node and wire has no trailing tolerance...OK
+220/270 daemon.helix.session_replica.test.session replica every single-byte OFFER and ACK corruption fails closed...OK
+221/270 daemon.helix.session_replica.test.session replica store distinguishes duplicate conflict stale and supersede without mutation leaks...OK
+222/270 daemon.helix.session_replica.test.session replica cross-node equal-clock origins coexist and best identity is deterministic...OK
+223/270 daemon.helix.session_replica.test.session replica A B C attachments preserve independent origins paths and removal...OK
+224/270 daemon.helix.session_replica.test.session replica retained canonical wire replays OFFER and REVOKE after origin loss...OK
+225/270 daemon.helix.session_replica.test.session replica retained enumeration is bounded across concurrent origins...OK
+226/270 daemon.helix.session_replica.test.session replica retained value cursor survives 182 objects replacement and rehash...OK
+227/270 daemon.helix.session_replica.test.session replica retained value cursor orders all kinds and conflict witnesses...OK
+228/270 daemon.helix.session_replica.test.session replica live token pages are unique stable and fair after cursor disappearance...OK
+229/270 daemon.helix.session_replica.test.session replica stored token and live origin pages preserve expiry cleanup keys...OK
+230/270 daemon.helix.session_replica.test.session replica authority token pages include revoke and quarantine retry keys...OK
+231/270 daemon.helix.session_replica.test.session replica nick revisions evolve until account conflict quarantines the token...OK
+232/270 daemon.helix.session_replica.test.session replica cross-origin account permutations converge on portable quarantine evidence...OK
+233/270 daemon.helix.session_replica.test.session replica all lifecycle arrival permutations converge after a higher revision...OK
+234/270 daemon.helix.session_replica.test.session replica all A B C authority permutations converge independently...OK
+235/270 daemon.helix.session_replica.test.session replica remove creates a bounded tombstone blocks replay and yields to a newer upsert...OK
+236/270 daemon.helix.session_replica.test.session replica same revision remove versus upsert picks deterministic digest...OK
+237/270 daemon.helix.session_replica.test.session replica equivocation permutations retain the same canonical winner...OK
+238/270 daemon.helix.session_replica.test.session replica entry route and tombstone bounds fail closed...OK
+239/270 daemon.helix.session_replica.test.session replica store rejects expired overlong and far-future offers without mutation...OK
+240/270 daemon.helix.session_replica.test.session replica signed ACK is authenticated receipt metadata and never a route...OK
+241/270 daemon.helix.session_replica.test.session replica ACK ignores route capacity and rejects expiry and revision mismatch...OK
+242/270 daemon.helix.session_replica.test.session replica line and triangle reflections never create OFFER or ACK route loops...OK
+243/270 daemon.helix.session_replica.test.session replica peer loss drops the pinned route and old revision cannot reparent...OK
+244/270 daemon.helix.session_replica.test.session replica sweep expires entries routes and tombstones at their exact boundaries...OK
+245/270 daemon.helix.session_replica.test.session replica sweep removes only the expired origin and its paths...OK
+246/270 daemon.helix.session_replica.test.session replica routesInto reports bounded route values...OK
+247/270 daemon.helix.session_replica.test.session replica insertion is leak-clean at every allocation failure...OK
+248/270 daemon.helix.session_replica.test.session replica concurrent origin insertion is transactional at every allocation failure...OK
+249/270 daemon.helix.session_replica.test.session replica hot lookups cover max origins without allocation and filter expiry...OK
+250/270 daemon.helix.session_replica.test.session replica unique origin nick lookup is live ambiguity and quarantine safe...OK
+251/270 daemon.helix.session_replica.test.session replica retained REVOKE replacement is transactional at every allocation failure...OK
+252/270 daemon.helix.session_replica.test.session replica deterministic equivocation replacement is transactional at every allocation failure...OK
+253/270 daemon.helix.session_replica.test.session replica account quarantine is fail-closed at every allocation failure...OK
+254/270 daemon.helix.session_replica.test.session replica upgrade checkpoint preserves exact authority and deny state without routes...OK
+255/270 daemon.helix.session_replica.test.session replica upgrade checkpoint v2 preserves attachment leases and accepts v1...OK
+256/270 daemon.helix.session_replica.test.session replica upgrade checkpoint strictly rejects truncation corruption duplicates and excess capacity...OK
+257/270 daemon.helix.session_replica.test.session replica upgrade checkpoint replacement is atomic under capacity corruption and OOM...OK
+258/270 daemon.helix.session_replica.test.session replica upgrade checkpoint sweeps at restore time and tolerates wall rollback...OK
+259/270 daemon.helix.session_replica.test.session replica upgrade checkpoint restore is leak-free at every allocation failure...OK
+260/270 daemon.helix.session_replica.test.session replica max authority revision scans entries tombstones quarantine and fallback rows...OK
+261/270 crypto.kx.test_0...OK
+262/270 crypto.xwing.test_0...OK
+263/270 crypto.tls_client.test_0...OK
+264/270 crypto.sct.test_0...OK
+265/270 crypto.aead.test_0...OK
+266/270 crypto.ecdsa_kat.test_0...OK
+267/270 crypto.ed25519_batch.test_0...OK
+268/270 crypto.sign_kat.test_0...OK
+269/270 crypto.tls_props.test_0...OK
+270/270 crypto.tls.test_0...OK
+214 passed; 56 skipped; 0 failed.

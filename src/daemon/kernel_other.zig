@@ -72,6 +72,10 @@ pub const job_limit_die_on_unhandled: u32 = 0x00000400;
 pub const job_limit_kill_on_close: u32 = 0x00002000;
 
 pub const daemon_pledge = "stdio rpath wpath cpath inet dns";
+/// Full runtime promises include the transactional Helix candidate process
+/// and descriptor transport. Paths remain independently restricted by unveil.
+pub const runtime_pledge = "stdio rpath wpath cpath inet dns proc exec sendfd recvfd fattr flock getpw";
+pub const RuntimeAccess = struct { path: [:0]const u8, perms: [:0]const u8 };
 pub const unveil_paths = [_]struct { path: [:0]const u8, perms: [:0]const u8 }{
     .{ .path = "/etc", .perms = "r" },
     .{ .path = "/usr", .perms = "r" },
@@ -321,6 +325,27 @@ pub fn pledgeDaemonPaths() Error!void {
     if (pledge(daemon_pledge, null) != 0) return error.MissingOp;
 }
 
+/// The caller resolves and validates the complete configured path set before
+/// this irreversible confinement boundary. No global home-directory allowance.
+pub fn pledgeRuntimePaths(paths: []const RuntimeAccess) Error!void {
+    if (comptime builtin.os.tag != .openbsd) return error.MissingOp;
+    if (paths.len == 0) return error.MissingOp;
+    for (paths) |row| {
+        if (row.path.len == 0 or row.path[0] != '/' or row.perms.len == 0) return error.MissingOp;
+        if (unveil(row.path.ptr, row.perms.ptr) != 0) return error.MissingOp;
+    }
+    if (unveil(null, null) != 0) return error.MissingOp;
+    if (pledge(runtime_pledge, runtime_pledge) != 0) return error.MissingOp;
+}
+
+/// An authenticated native Helix successor inherits the predecessor's locked
+/// unveil map across fork and exec. It cannot reinstall or widen that map.
+/// Call only in the private successor path after validating its control channel.
+pub fn pledgeInheritedRuntime() Error!void {
+    if (comptime builtin.os.tag != .openbsd) return error.MissingOp;
+    if (pledge(runtime_pledge, runtime_pledge) != 0) return error.MissingOp;
+}
+
 pub fn assignDaemonJob() Error!void {
     if (comptime builtin.os.tag != .windows) return error.MissingOp;
     const windows = std.os.windows;
@@ -439,6 +464,12 @@ test "GAP-X3 FreeBSD Capsicum and SO_REUSEPORT_LB, OpenBSD pledge, and a Windows
     try std.testing.expectEqual(cap_write, stdio.words[0] & cap_write);
     const cap_low: u64 = 0x01ffffffffffffff;
     try std.testing.expectEqual(@as(u64, 0), stdio.words[0] & cap_accept & cap_low);
+
+    // This tail probes off-target refusal with Linux syscalls. Calling the
+    // supported OpenBSD pledge (or FreeBSD Capsicum) here would irreversibly
+    // confine the shared test runner. Native confinement is exercised in the
+    // isolated fork/exec sandbox probe instead.
+    if (comptime builtin.os.tag != .linux) return;
 
     try std.testing.expectError(error.MissingOp, applyReusePortLb(-1));
     try std.testing.expectError(error.MissingOp, createLoadBalanceListener(0));

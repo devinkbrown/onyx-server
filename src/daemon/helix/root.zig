@@ -14,6 +14,13 @@ pub const handoff_manifest = @import("handoff_manifest.zig");
 pub const handoff_relations = @import("handoff_relations.zig");
 pub const supervisor = @import("supervisor.zig");
 pub const conduit = @import("conduit.zig");
+pub const native_arena_envelope = @import("native_arena_envelope.zig");
+pub const native_arena_file = @import("native_arena_file.zig");
+pub const native_control = @import("native_control.zig");
+pub const native_exchange = @import("native_exchange.zig");
+pub const native_manifest = @import("native_manifest.zig");
+pub const native_process = @import("native_process.zig");
+pub const native_bootstrap = @import("native_bootstrap.zig");
 
 // State-migration capsules (one schema per resumable subsystem).
 pub const conn_capsule = @import("conn_capsule.zig");
@@ -64,6 +71,13 @@ pub const session_adopt_dst = @import("session_adopt_dst.zig");
 pub const multishard_upgrade_dst = @import("multishard_upgrade_dst.zig");
 
 test {
+    _ = native_arena_envelope;
+    _ = native_arena_file;
+    _ = native_control;
+    _ = native_exchange;
+    _ = native_manifest;
+    _ = native_process;
+    _ = native_bootstrap;
     std.testing.refAllDecls(@This());
     _ = thread_snapshot;
     _ = schedule_snapshot;

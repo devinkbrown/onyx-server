@@ -1,0 +1,5 @@
+Pinned native daemon SHA256=d663468d99ca2e337f00414c1a2e048aee9280e5c588903a3488570d1c309f97
+PASS 40 original IPv4/IPv6 all transport attachments
+PASS rejected candidate: same predecessor and 40 original sockets alive
+PASS upgrade 1: PID 67641->95827; all original sockets retained; 39 single deliveries observed through the drain window
+PASS upgrade 2: PID 95827->97603; all original sockets retained; 39 single deliveries observed through the drain window

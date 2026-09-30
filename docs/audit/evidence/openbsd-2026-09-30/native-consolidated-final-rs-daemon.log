@@ -1,0 +1,121 @@
+Onyx Server 0.7.0+15e09029-dirty
+  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+
+onyx-server: loaded config from /tmp/onyx-full-native/config.toml
+onyx-server: node identity loaded from /tmp/onyx-full-native/onyx-server-node.key
+onyx-server: SASL account store opened (/tmp/onyx-full-native/accounts.db); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL + SESSION-TOKEN live
+onyx-server: cloak key generated (per-boot; set [cloak] secret to persist)
+onyx-server: WARNING — meshed node has NO shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence. Set the SAME [cloak] secret on every mesh node.
+onyx-server: TLS listener enabled on port 33371
+onyx-server: kTLS unavailable on this kernel (no TLS ULP); TLS stays in userspace
+onyx-server: hardened TLS 1.2 also accepted (ECDSA-P256 leg)
+onyx-server: WebSocket (wss) listener enabled on port 33372
+onyx-server: MESSAGE_V2 durable membership disabled: require a non-empty, fully valid, bounded direct-neighbor trust-root set
+onyx-server: /metrics on TCP :33374
+onyx-server: listening on 127.0.0.1:33370 (kqueue) — PING + registration live
+onyx-server: starting 2 reactor threads (SO_REUSEPORT)
+
+  Onyx Server 0.7.0+15e09029-dirty
+  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+
+onyx-server: UPGRADE: exact I/O boundary reached; sealing live state
+onyx-server: UPGRADE — shard 0: 0 client(s) sealed
+onyx-server: UPGRADE — shard 1: 40 client(s) sealed
+onyx-server: loaded config from /tmp/onyx-full-native/config.toml
+onyx-server: fatal — OCG2 requires existing node key /tmp/onyx-full-native/onyx-server-node.key (FileNotFound)
+error: FileNotFound
+error(SafeAllocator): leaked [addr: f076be5b808, len: 7 (0x7) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b7d0, len: 14 (0xe) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b708, len: 19 (0x13) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b640, len: 10 (0xa) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b628, len: 11 (0xb) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b5e0, len: 9 (0x9) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b5b0, len: 12 (0xc) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b580, len: 15 (0xf) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b568, len: 16 (0x10) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b520, len: 13 (0xd) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b508, len: 11 (0xb) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b4d8, len: 11 (0xb) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b4a8, len: 12 (0xc) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b460, len: 10 (0xa) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b430, len: 12 (0xc) align: 1] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+error(SafeAllocator): leaked [addr: f076be5b198, len: 512 (0x200) align: 8] allocated at: 
+Cannot print stack trace: stack tracing is disabled
+
+onyx-server: deferred UPGRADE failed: Protocol
+
+  Onyx Server 0.7.0+15e09029-dirty
+  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+
+onyx-server: UPGRADE: exact I/O boundary reached; sealing live state
+onyx-server: UPGRADE — shard 0: 0 client(s) sealed
+onyx-server: UPGRADE — shard 1: 40 client(s) sealed
+onyx-server: loaded config from /tmp/onyx-full-native/config.toml
+onyx-server: node identity loaded from /tmp/onyx-full-native/onyx-server-node.key
+onyx-server: SASL account store opened (/tmp/onyx-full-native/accounts.db); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL + SESSION-TOKEN live
+onyx-server: cloak key generated (per-boot; set [cloak] secret to persist)
+onyx-server: WARNING — meshed node has NO shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence. Set the SAME [cloak] secret on every mesh node.
+onyx-server: TLS listener enabled on port 33371
+onyx-server: kTLS unavailable on this kernel (no TLS ULP); TLS stays in userspace
+onyx-server: hardened TLS 1.2 also accepted (ECDSA-P256 leg)
+onyx-server: WebSocket (wss) listener enabled on port 33372
+onyx-server: adopting inherited listener fd 4 (shard 0)
+onyx-server: adopting inherited listener fd 15 (shard 1)
+onyx-server: MESSAGE_V2 durable membership disabled: require a non-empty, fully valid, bounded direct-neighbor trust-root set
+onyx-server: UPGRADE resume — restored mandatory World/history/events/replay/webhooks (1/498/83/exact/0), 0 property entity(s)/0 clock(s), re-attached 40 client connection(s) (30 TLS, 10 wss), 40 MONITOR list(s), 0 session(s) across 0 account(s), 0 replica object(s), 0 staged migration(s), 0 consumed tombstone(s), 0 mesh link(s) preserved, 0 mesh re-dial(s)
+onyx-server: /metrics on TCP :33374
+onyx-server: listening on 127.0.0.1:33370 (kqueue) — PING + registration live
+onyx-server: starting 2 reactor threads (SO_REUSEPORT)
+
+  Onyx Server 0.7.0+15e09029-dirty
+  Zig-native mesh IRC daemon — Undertow + Mooring mesh
+
+onyx-server: UPGRADE: exact I/O boundary reached; sealing live state
+onyx-server: UPGRADE — shard 0: 20 client(s) sealed
+onyx-server: UPGRADE — shard 1: 20 client(s) sealed
+onyx-server: loaded config from /tmp/onyx-full-native/config.toml
+onyx-server: node identity loaded from /tmp/onyx-full-native/onyx-server-node.key
+onyx-server: SASL account store opened (/tmp/onyx-full-native/accounts.db); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL + SESSION-TOKEN live
+onyx-server: cloak key generated (per-boot; set [cloak] secret to persist)
+onyx-server: WARNING — meshed node has NO shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence. Set the SAME [cloak] secret on every mesh node.
+onyx-server: TLS listener enabled on port 33371
+onyx-server: kTLS unavailable on this kernel (no TLS ULP); TLS stays in userspace
+onyx-server: hardened TLS 1.2 also accepted (ECDSA-P256 leg)
+onyx-server: WebSocket (wss) listener enabled on port 33372
+onyx-server: adopting inherited listener fd 4 (shard 0)
+onyx-server: adopting inherited listener fd 15 (shard 1)
+onyx-server: MESSAGE_V2 durable membership disabled: require a non-empty, fully valid, bounded direct-neighbor trust-root set
+onyx-server: UPGRADE resume — restored mandatory World/history/events/replay/webhooks (1/498/84/exact/0), 0 property entity(s)/0 clock(s), re-attached 40 client connection(s) (30 TLS, 10 wss), 40 MONITOR list(s), 0 session(s) across 0 account(s), 0 replica object(s), 0 staged migration(s), 0 consumed tombstone(s), 0 mesh link(s) preserved, 0 mesh re-dial(s)
+onyx-server: /metrics on TCP :33374
+onyx-server: listening on 127.0.0.1:33370 (kqueue) — PING + registration live
+onyx-server: starting 2 reactor threads (SO_REUSEPORT)

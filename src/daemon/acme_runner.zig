@@ -516,6 +516,7 @@ fn systemResolveA(
 
 /// Send `query` to a v4 nameserver:<dns_port> and return the first A record, or null.
 fn queryOneServer(ns_v4: [4]u8, query: []const u8, dns_port: u16) !?[4]u8 {
+    if (comptime builtin.os.tag == .openbsd) return queryNativeServer(.{ .ip4 = .{ .bytes = ns_v4, .port = dns_port } }, query);
     const fd = try udpSocket(posix.AF.INET);
     defer closeFd(fd);
     var sa = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, dns_port), .addr = @bitCast(ns_v4) };
@@ -529,6 +530,7 @@ fn queryOneServer(ns_v4: [4]u8, query: []const u8, dns_port: u16) !?[4]u8 {
 /// socket family and `sockaddr_in6` (flowinfo/scope_id left zero — link-local
 /// scopes are not expressible in resolv.conf's textual form we parse).
 fn queryOneServer6(ns_v6: [16]u8, query: []const u8, dns_port: u16) !?[4]u8 {
+    if (comptime builtin.os.tag == .openbsd) return queryNativeServer(.{ .ip6 = .{ .bytes = ns_v6, .port = dns_port } }, query);
     const fd = try udpSocket(posix.AF.INET6);
     defer closeFd(fd);
     var sa = linux.sockaddr.in6{
@@ -561,11 +563,34 @@ fn exchangeQuery(fd: linux.fd_t, query: []const u8) !?[4]u8 {
     return null;
 }
 
+fn queryNativeServer(address: net.IpAddress, query: []const u8) !?[4]u8 {
+    const native = @import("native_network.zig");
+    const fd = try native.socket(if (address == .ip4) posix.AF.INET else posix.AF.INET6, true, false);
+    defer @import("os_runtime.zig").close(fd);
+    try native.setTimeout(fd, 3000);
+    try native.connectSocket(fd, address);
+    try native.writeAll(fd, query);
+    var response: [dns.max_message_len]u8 = undefined;
+    const count = try native.readSome(fd, &response);
+    const question = dns.parseMessage(1, 0, query) catch return null;
+    if (question.question_count != 1) return null;
+    const name = question.questionSlice()[0].name.slice();
+    const message = dns.parseMessage(1, dns.max_cache_addrs, response[0..count]) catch return null;
+    if (message.header.id != question.header.id or message.header.rcode() != 0 or (message.header.flags & 0x7a00) != 0 or !dns.responseMatchesQuestion(1, dns.max_cache_addrs, &message, name, .a) or
+        !dns.responseAnswersFollowCnames(dns.max_cache_addrs, response[0..count], name, .a)) return null;
+    for (message.answerSlice()) |rr| switch (rr.data) {
+        .a => |bytes| return bytes,
+        else => {},
+    };
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // Low-level socket helpers (raw linux syscalls, matching server.zig idiom)
 // ---------------------------------------------------------------------------
 
 fn connectAddr(addr: net.IpAddress) Error!linux.fd_t {
+    if (comptime builtin.os.tag == .openbsd) return @import("native_network.zig").connect(addr, 5000) catch return error.ConnectFailed;
     const a4 = switch (addr) {
         .ip4 => |x| x,
         .ip6 => return error.UnsupportedAddressFamily,
@@ -607,10 +632,12 @@ fn udpSocket(family: u32) Error!linux.fd_t {
 }
 
 fn closeFd(fd: linux.fd_t) void {
+    if (comptime builtin.os.tag == .openbsd) return @import("os_runtime.zig").close(fd);
     _ = linux.close(fd);
 }
 
 fn writeAll(fd: linux.fd_t, bytes: []const u8) Error!void {
+    if (comptime builtin.os.tag == .openbsd) return @import("native_network.zig").writeAll(fd, bytes) catch return error.ConnectionClosed;
     var off: usize = 0;
     while (off < bytes.len) {
         const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
@@ -622,6 +649,7 @@ fn writeAll(fd: linux.fd_t, bytes: []const u8) Error!void {
 }
 
 fn readSome(fd: linux.fd_t, buf: []u8) Error!usize {
+    if (comptime builtin.os.tag == .openbsd) return @import("native_network.zig").readSome(fd, buf) catch return error.ConnectionClosed;
     const rc = linux.read(fd, buf.ptr, buf.len);
     switch (posix.errno(rc)) {
         .SUCCESS => {
@@ -634,6 +662,10 @@ fn readSome(fd: linux.fd_t, buf: []u8) Error!usize {
 }
 
 fn osEntropy(buf: []u8) void {
+    if (comptime builtin.os.tag != .linux) {
+        @import("../substrate/platform.zig").fillOsEntropy(buf) catch @panic("ACME DNS entropy unavailable");
+        return;
+    }
     var filled: usize = 0;
     while (filled < buf.len) {
         const rc = linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
@@ -658,6 +690,7 @@ fn frameRecordLen(buf: []const u8) ?usize {
 
 /// Wall-clock time in Unix seconds, used to reject expired ACME server certs.
 fn wallClockSeconds() i64 {
+    if (comptime builtin.os.tag != .linux) return @divTrunc(@import("../substrate/platform.zig").realtimeMillis(), 1000);
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
     return @intCast(ts.sec);
@@ -780,14 +813,18 @@ test "consumePrefix shifts remaining bytes down" {
 }
 
 test "acme writeKeyAtomic writes the TLS private key owner-only (0o600)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const io = std.testing.io;
 
     // Pin umask so the resulting mode is deterministic, then restore it. Zig's
     // test runner executes test blocks sequentially on one thread, so mutating
     // the process-global umask here is race-free.
-    const old_umask = std.os.linux.syscall1(.umask, 0o022);
-    defer _ = std.os.linux.syscall1(.umask, old_umask);
+    const old_umask = if (comptime builtin.os.tag == .openbsd) std.c.umask(0o022) else std.os.linux.syscall1(.umask, 0o022);
+    defer if (comptime builtin.os.tag == .openbsd) {
+        _ = std.c.umask(old_umask);
+    } else {
+        _ = std.os.linux.syscall1(.umask, old_umask);
+    };
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -804,11 +841,15 @@ test "acme writeKeyAtomic writes the TLS private key owner-only (0o600)" {
 }
 
 test "acme writeCertAtomic leaves the public cert chain default-readable" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const io = std.testing.io;
 
-    const old_umask = std.os.linux.syscall1(.umask, 0o022);
-    defer _ = std.os.linux.syscall1(.umask, old_umask);
+    const old_umask = if (comptime builtin.os.tag == .openbsd) std.c.umask(0o022) else std.os.linux.syscall1(.umask, 0o022);
+    defer if (comptime builtin.os.tag == .openbsd) {
+        _ = std.c.umask(old_umask);
+    } else {
+        _ = std.os.linux.syscall1(.umask, old_umask);
+    };
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -878,13 +919,13 @@ test "v6 nameserver sockaddr is built with INET6 family, big-endian port, and ra
     // sockaddr is shaped correctly (family/port/addr/scope) and is reachable —
     // it is no longer skipped with `continue` as the old loop did.
     const ns_v6: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }; // ::1
-    const sa = linux.sockaddr.in6{
+    const sa = posix.sockaddr.in6{
         .port = std.mem.nativeToBig(u16, 53),
         .flowinfo = 0,
         .addr = ns_v6,
         .scope_id = 0,
     };
-    try std.testing.expectEqual(@as(linux.sa_family_t, posix.AF.INET6), sa.family);
+    try std.testing.expectEqual(@as(@TypeOf(sa.family), posix.AF.INET6), sa.family);
     try std.testing.expectEqual(std.mem.nativeToBig(u16, 53), sa.port);
     try std.testing.expectEqual(@as(u32, 0), sa.flowinfo);
     try std.testing.expectEqual(@as(u32, 0), sa.scope_id);
@@ -894,12 +935,74 @@ test "v6 nameserver sockaddr is built with INET6 family, big-endian port, and ra
 test "udpSocket opens an AF_INET6 datagram socket" {
     // The v6 transport must actually open an IPv6 UDP socket (the gap was that
     // this path didn't exist). Skip only if the kernel/sandbox lacks IPv6.
-    const fd = udpSocket(posix.AF.INET6) catch return error.SkipZigTest;
+    const fd = if (comptime builtin.os.tag == .openbsd)
+        try @import("native_network.zig").socket(posix.AF.INET6, true, false)
+    else
+        udpSocket(posix.AF.INET6) catch return error.SkipZigTest;
     closeFd(fd);
 }
 
+fn nativeDnsFixture() !void {
+    if (comptime builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const sys = posix.system;
+    const Responder = struct {
+        fd: i32,
+        served: usize = 0,
+        fn run(self: *@This()) void {
+            for (0..3) |index| {
+                var bytes: [dns.max_message_len]u8 = undefined;
+                var peer: posix.sockaddr.in6 = undefined;
+                var len: posix.socklen_t = @sizeOf(@TypeOf(peer));
+                const got = sys.recvfrom(self.fd, &bytes, bytes.len, 0, @ptrCast(&peer), &len);
+                if (posix.errno(got) != .SUCCESS) return;
+                const question = dns.parseMessage(1, 0, bytes[0..@intCast(got)]) catch return;
+                if (question.question_count != 1) return;
+                const q = question.questions[0];
+                var wire: [dns.max_message_len]u8 = undefined;
+                const reply = dns.encodeMessage(&wire, .{
+                    .id = question.header.id,
+                    .response = true,
+                    .questions = &.{.{ .name = q.name.slice(), .qtype = q.qtype }},
+                    .answers = &.{.{ .name = q.name.slice(), .rr_type = .a, .ttl = 30, .data = .{ .a = .{ 203, 0, 113, 7 } } }},
+                }) catch return;
+                // Valid framing/ID/question cannot make a truncated or error
+                // response authoritative, even when it contains an address.
+                if (index == 1) wire[2] |= 0x02;
+                if (index == 2) wire[3] |= 0x03;
+                const sent = sys.sendto(self.fd, reply.ptr, reply.len, 0, @ptrCast(&peer), len);
+                if (posix.errno(sent) != .SUCCESS or sent != reply.len) return;
+                self.served += 1;
+            }
+        }
+    };
+    const fd = try @import("native_network.zig").socket(posix.AF.INET6, true, false);
+    defer closeFd(fd);
+    try @import("native_network.zig").setTimeout(fd, 1000);
+    var loopback: [16]u8 = @splat(0);
+    loopback[15] = 1;
+    var address = posix.sockaddr.in6{ .addr = loopback, .port = 0, .scope_id = 0, .flowinfo = 0 };
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.bind(fd, @ptrCast(&address), @sizeOf(@TypeOf(address)))));
+    var len: posix.socklen_t = @sizeOf(@TypeOf(address));
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.getsockname(fd, @ptrCast(&address), &len)));
+    var responder = Responder{ .fd = fd };
+    const thread = try std.Thread.spawn(.{}, Responder.run, .{&responder});
+    var joined = false;
+    defer if (!joined) thread.join();
+    var query_buf: [dns.max_message_len]u8 = undefined;
+    const query = try dns.encodeQuery(&query_buf, 0x4242, "host.test", .a);
+    const port = std.mem.bigToNative(u16, address.port);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 203, 0, 113, 7 }), try queryOneServer6(loopback, query, port));
+    try std.testing.expectEqual(@as(?[4]u8, null), try queryOneServer6(loopback, query, port));
+    try std.testing.expectEqual(@as(?[4]u8, null), try queryOneServer6(loopback, query, port));
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(@as(usize, 3), responder.served);
+}
+
 test "queryOneServer6 round-trips an A record against a ::1 DNS responder" {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .openbsd) {
+        try nativeDnsFixture();
+    } else if (comptime builtin.os.tag == .linux) {
         // End-to-end proof the v6 path opens a socket, connects, sends the query,
         // and parses the reply — exercising exactly queryOneServer6 -> exchangeQuery.
         // A real UDP/IPv6 loopback responder answers with one A record. If the

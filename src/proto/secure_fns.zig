@@ -184,6 +184,9 @@ pub fn randomLessThan(n: u64) u64 {
 /// Core OS entropy fill. Handles short reads and EINTR by looping, and maps any
 /// hard failure to `error.RandomSourceFailed`.
 fn fillFromOs(buf: []u8) Error!void {
+    if (comptime builtin.os.tag != .linux) {
+        return @import("../substrate/platform.zig").fillOsEntropy(buf);
+    }
     var filled: usize = 0;
     while (filled < buf.len) {
         const want = buf.len - filled;

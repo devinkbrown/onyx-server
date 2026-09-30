@@ -77,6 +77,81 @@ The daemon target must be 64-bit. The `wasm` step is the deliberate
 `wasm32-freestanding` exception for browser codec and transport artifacts, not
 for the daemon.
 
+### OpenBSD runtime
+
+OpenBSD uses the shared full daemon over a native kqueue completion backend.
+Native OpenBSD 7.9 amd64 acceptance covers IPv4/IPv6 IRC, TLS 1.2/1.3, secure
+WebSocket, secured mesh, network workers, and connection-preserving Helix.
+The remaining full-port gates and exact evidence are tracked in
+[the OpenBSD port record](../dev/openbsd-full-port.md). Cross-build with:
+
+```sh
+zig build -Dtarget=x86_64-openbsd -Doptimize=ReleaseFast
+zig build-exe -target x86_64-openbsd -OReleaseFast \
+  -femit-bin=bench_x4_portable tools/bench_x4_portable.zig
+```
+
+Copy `zig-out/bin/onyx-server` and the benchmark to `/tmp` on the OpenBSD machine. A
+minimal loopback config for local testing is:
+
+```toml
+[node]
+id = 1
+[listen]
+host = "127.0.0.1"
+irc = 16680
+[limits]
+max_clients = 128
+chanlimit = 8
+[io]
+ring_entries = 32
+sqpoll = false
+```
+
+Run `/tmp/onyx-server --check-config local.toml` before
+`/tmp/onyx-server local.toml`, or `/tmp/bench_x4_portable /tmp/onyx-server` for the
+four-client benchmark. Use a normal installation: the installer ramdisk can
+serve IRC but may lack both `ps` and the `KERN_PROC` RSS query.
+
+The shared OpenBSD daemon supports multiple reactors, account services,
+durable history, TLS, WebSocket, mesh, media, metrics, and PROXY-header policy.
+Wildcard IPv6 listeners have explicit IPv4 companions. TLS encryption stays
+in userspace. OpenBSD confinement derives unveiled paths from the configured
+runtime resources and preserves them across native Helix execution. A successor
+must validate its complete checkpoint and existing identity before READY;
+storage stays read-only until COMMIT. FreeBSD retains the separate minimal
+portable runtime and its preflight feature guards. See the
+[native benchmark evidence](../audit/bench-gap-x4.md) for the earlier basic slice.
+
+Build the native acceptance executables with the same target and optimization
+mode as the daemon:
+
+```sh
+zig build openbsd-probes -Dtarget=x86_64-openbsd -Doptimize=ReleaseSafe
+```
+
+This installs the Helix descriptor, confinement, and worker protocol probes in
+`zig-out/bin`; execution requires an isolated OpenBSD guest. The worker probe
+requires a temporary `198.51.100.77/32` alias on that guest's `lo0`, removed after
+the run. Host-side runtime probes live in `tools/openbsd_runtime_smoke.py` and
+`tools/openbsd_session_smoke.py`. Both require an expected daemon SHA-256 and
+use explicit fixture paths and ports. The session probe also requires Python's
+`cryptography` package on the host. The transport probe expects the daemon and IPv4/IPv6 SSH forwards already
+running; the session probe owns its private three-node fixtures and forwards.
+Their `--help` output documents the arguments.
+
+To build complete unit-test runners for execution on the target machine:
+
+```sh
+zig build test-artifacts -Dtarget=x86_64-openbsd -Doptimize=ReleaseSafe
+```
+
+The installed runners are `onyx-server-module-tests`,
+`onyx-server-daemon-tests`, and `onyx-server-cli-tests`. This step builds without
+executing them on the build host; native execution is a separate gate. Run the installed runners from a writable
+matching source checkout on OpenBSD: source-witness tests also read repository
+files at runtime. Copying only the executables is insufficient.
+
 ## Optimization
 
 Use Zig's standard `-Doptimize=` modes. Debug builds keep symbols; optimized

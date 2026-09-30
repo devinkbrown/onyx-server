@@ -101,6 +101,7 @@ pub const Sender = struct {
     /// Spawn the worker. Inert (no thread) when relay/from is unconfigured;
     /// enqueued jobs then sit in the ring and are freed at deinit.
     pub fn start(self: *Sender) void {
+        if (comptime @import("builtin").os.tag == .windows) return;
         if (self.thread != null) return;
         if (self.config.relay_host.len == 0 or self.config.from.len == 0) return;
         self.stop_flag.store(false, .release);
@@ -196,6 +197,7 @@ pub const Sender = struct {
 
     /// Resolve, connect, and run the ESMTP conversation for one job (outside the lock).
     fn deliver(self: *Sender, job: Job) !void {
+        if (comptime @import("builtin").os.tag == .windows) return error.SocketUnavailable;
         const job_start = platform.monotonicMillis();
         const addr = try http_fetch.resolveHostA(self.config.relay_host, self.config.relay_port, io_timeout_ms);
 
@@ -207,7 +209,7 @@ pub const Sender = struct {
 
         const fd = try connectAddr(addr, io_timeout_ms);
         defer closeFd(fd);
-        setRecvTimeout(fd, io_timeout_ms);
+        try setRecvTimeout(fd, io_timeout_ms);
 
         var msg_buf: [max_message_len]u8 = undefined;
         const message = buildMessage(&msg_buf, self.config, job);
@@ -379,6 +381,7 @@ fn buildMessage(out: *[max_message_len]u8, config: Config, job: Job) []const u8 
 }
 
 fn wallClockSeconds() i64 {
+    if (comptime @import("builtin").os.tag != .linux) return @divTrunc(platform.realtimeMillis(), 1000);
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
     return @intCast(ts.sec);
@@ -469,6 +472,8 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
 const SocketError = error{ SocketUnavailable, ConnectFailed, ConnectTimeout, ConnectionClosed, RecvTimeout };
 
 fn connectAddr(addr: net.IpAddress, timeout_ms: u31) SocketError!linux.fd_t {
+    if (comptime @import("builtin").os.tag == .windows) return error.SocketUnavailable;
+    if (comptime @import("builtin").os.tag == .openbsd) return @import("native_network.zig").connect(addr, timeout_ms);
     const a4 = switch (addr) {
         .ip4 => |x| x,
         .ip6 => return error.ConnectFailed,
@@ -513,17 +518,21 @@ fn setBlocking(fd: linux.fd_t) void {
     _ = linux.fcntl(fd, linux.F.SETFL, flags & ~@as(usize, linux.SOCK.NONBLOCK));
 }
 
-fn setRecvTimeout(fd: linux.fd_t, timeout_ms: u31) void {
+fn setRecvTimeout(fd: linux.fd_t, timeout_ms: u31) SocketError!void {
+    if (comptime @import("builtin").os.tag == .openbsd) return @import("native_network.zig").setTimeout(fd, timeout_ms);
     const tv = linux.timeval{ .sec = @divTrunc(timeout_ms, 1000), .usec = @as(i64, @intCast(timeout_ms % 1000)) * 1000 };
     _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
     _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
 }
 
 fn closeFd(fd: linux.fd_t) void {
+    if (comptime @import("builtin").os.tag == .windows) return;
+    if (comptime @import("builtin").os.tag != .linux) return @import("os_runtime.zig").close(fd);
     _ = linux.close(fd);
 }
 
 fn writeAll(fd: linux.fd_t, bytes: []const u8) SocketError!void {
+    if (comptime @import("builtin").os.tag == .openbsd) return @import("native_network.zig").writeAll(fd, bytes);
     var off: usize = 0;
     while (off < bytes.len) {
         const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
@@ -541,6 +550,7 @@ fn writeAll(fd: linux.fd_t, bytes: []const u8) SocketError!void {
 }
 
 fn readSome(fd: linux.fd_t, buf: []u8) SocketError!usize {
+    if (comptime @import("builtin").os.tag == .openbsd) return @import("native_network.zig").readSome(fd, buf);
     while (true) {
         const rc = linux.read(fd, buf.ptr, buf.len);
         switch (posix.errno(rc)) {
@@ -561,6 +571,11 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 }
 
 fn sleepMs(ms: u32) void {
+    if (comptime @import("builtin").os.tag == .windows) return;
+    if (comptime @import("builtin").os.tag != .linux) {
+        @import("os_runtime.zig").sleepMillis(ms);
+        return;
+    }
     var req = linux.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
     _ = linux.nanosleep(&req, null);
 }
