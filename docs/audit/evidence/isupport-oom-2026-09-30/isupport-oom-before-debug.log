@@ -1,0 +1,474 @@
+test-mod
++- run test 73 pass, 2 fail (75 total); 18 leaks
+error: 'daemon.server.test.buildIsupportTokens allocation failures preserve ownership and publication across optional tokens' failed:
+       expected 680, found 663
+       /usr/local/lib/zig-0.17/lib/zig/std/Io/Writer.zig:2575:25: 0x1368582 in initCapacity (std.zig)
+                               return error.OutOfMemory)[0..capacity],
+                               ^
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:486:14: 0x15fc499 in print__anon_177006 (std.zig)
+           var aw = try std.Io.Writer.Allocating.initCapacity(a, format.len);
+                    ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:5: 0x15fc188 in allocPrint__anon_176435 (std.zig)
+           return gpa.print(fmt, args);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1380:22: 0x15f56cb in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "NICKLEN={d}", .{cfg.nicklen});
+                            ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x165b7c9 in expectEqualInner__anon_190271 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x2bde00b in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:93975:17: 0x2bde0e0 in test.buildIsupportTokens allocation failures preserve ownership and publication across optional tokens (root.zig)
+                       try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                       ^
+       [SafeAllocator] (err): leaked [addr: 7fcdd393fa10, len: 17 (0x11) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fda92 in print__anon_177105 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fd67c in allocPrint__anon_176398 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1372:44: 0x15f504e in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "NETWORK={s}", .{cfg.network_name});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:93967:36: 0x2bdd8a2 in test.buildIsupportTokens allocation failures preserve ownership and publication across optional tokens (root.zig)
+                   if (buildIsupportTokens(failing.allocator(), cfg)) |actual| {
+                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+error: 'daemon.server.test.buildIsupportTokens successful retry publishes complete live 005 advertisement' failed:
+       expected 3641, found 3380
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x165b7c9 in expectEqualInner__anon_190271 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x167ed7c in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:94014:5: 0x167edf2 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+           ^
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f3e38, len: 13 (0xd) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fc03c in print__anon_176977 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fbc32 in allocPrint__anon_176444 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1382:44: 0x15f57ce in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "CHANNELLEN={d}", .{cfg.channellen});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f3da0, len: 11 (0xb) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fcabc in print__anon_177033 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fc6b2 in allocPrint__anon_176426 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1378:44: 0x15f54ce in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "KICKLEN={d}", .{cfg.kicklen});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f3c70, len: 11 (0xb) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fcffc in print__anon_177057 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fcbf2 in allocPrint__anon_176417 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1376:44: 0x15f534e in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "AWAYLEN={d}", .{cfg.awaylen});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f3b40, len: 12 (0xc) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fd53c in print__anon_177081 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fd132 in allocPrint__anon_176408 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1374:44: 0x15f51ce in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "TOPICLEN={d}", .{cfg.topiclen});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f39f8, len: 10 (0xa) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fc57c in print__anon_177006 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fc172 in allocPrint__anon_176435 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1380:44: 0x15f564e in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "NICKLEN={d}", .{cfg.nicklen});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f3940, len: 20 (0x14) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fda92 in print__anon_177105 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fd67c in allocPrint__anon_176398 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1372:44: 0x15f504e in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "NETWORK={s}", .{cfg.network_name});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f0a20, len: 27 (0x1b) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15f8402 in print__anon_176675 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15f7f8c in allocPrint__anon_176538 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1415:88: 0x15f6895 in buildIsupportTokens (root.zig)
+               out[base.len + 3 + @as(usize, @intFromBool(has_icon))] = try std.fmt.allocPrint(allocator, "VAPID={s}", .{cfg.webpush_vapid_pub});
+                                                                                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f08a0, len: 44 (0x2c) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15f8972 in print__anon_176678 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15f853c in allocPrint__anon_176533 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1410:51: 0x15f66c1 in buildIsupportTokens (root.zig)
+               out[base.len + 3] = try std.fmt.allocPrint(allocator, "NETWORKICON={s}", .{cfg.network_icon_url});
+                                                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f0730, len: 7 (0x7) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15f8edc in print__anon_176702 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15f8aa2 in allocPrint__anon_176528 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1406:47: 0x15f654f in buildIsupportTokens (root.zig)
+           out[base.len + 2] = try std.fmt.allocPrint(allocator, "MODES={d}", .{cfg.modes_per_line});
+                                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f0678, len: 14 (0xe) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15f93f7 in print__anon_176731 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15f9003 in allocPrint__anon_176523 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1402:47: 0x15f6409 in buildIsupportTokens (root.zig)
+           out[base.len + 1] = try std.fmt.allocPrint(allocator, "STATUSMSG={s}", .{chanmode.MemberModes.statusmsg_symbols});
+                                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f0530, len: 19 (0x13) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15f98e7 in print__anon_176754 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15f9513 in allocPrint__anon_176512 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1401:43: 0x15f62d8 in buildIsupportTokens (root.zig)
+           out[base.len] = try std.fmt.allocPrint(allocator, "PREFIX={s}", .{chanmode.MemberModes.isupport_prefix});
+                                                 ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f03e8, len: 10 (0xa) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fa0bc in print__anon_176843 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15f9d92 in allocPrint__anon_176498 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1394:44: 0x15f60ce in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "SILENCE={d}", .{cfg.silencelimit});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f0350, len: 11 (0xb) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fa5fc in print__anon_176850 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fa1f2 in allocPrint__anon_176489 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1392:44: 0x15f5f4e in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "MONITOR={d}", .{cfg.monitorlimit});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f0208, len: 9 (0x9) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fab3c in print__anon_176874 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fa732 in allocPrint__anon_176480 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1390:44: 0x15f5dce in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "KEYLEN={d}", .{cfg.keylen});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f0158, len: 12 (0xc) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fb07c in print__anon_176898 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fac72 in allocPrint__anon_176471 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1388:44: 0x15f5c4e in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "MAXTARGETS={d}", .{cfg.maxtargets});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f00a8, len: 15 (0xf) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fb5bc in print__anon_176921 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fb1b2 in allocPrint__anon_176462 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1386:44: 0x15f5ace in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "CHANLIMIT=#&:{d}", .{cfg.chanlimit});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 7fcdbf2f0010, len: 16 (0x10) align: 1] allocated at: 
+       /usr/local/lib/zig-0.17/lib/zig/std/mem/Allocator.zig:491:27: 0x15fbafc in print__anon_176948 (std.zig)
+           return aw.toOwnedSlice();
+                                 ^
+       /usr/local/lib/zig-0.17/lib/zig/std/fmt.zig:626:21: 0x15fb6f2 in allocPrint__anon_176453 (std.zig)
+           return gpa.print(fmt, args);
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:1384:44: 0x15f594e in buildIsupportTokens (root.zig)
+                   out[i] = try std.fmt.allocPrint(allocator, "MAXLIST=beIZ:{d}", .{cfg.maxlist});
+                                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:94013:71: 0x167ec40 in test.buildIsupportTokens successful retry publishes complete live 005 advertisement (root.zig)
+           try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+                                                                             ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:143:68: 0x146aeb3 in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /usr/local/lib/zig-0.17/lib/zig/compiler/test_runner.zig:71:26: 0x146bced in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /usr/local/lib/zig-0.17/lib/zig/std/start.zig:752:88: 0x14684ef in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       (additional stack frames may have been skipped...)
+failed command: ./.zig-cache/o/3b9d16c2ec7ac1fbbe005d88c881d54a/test --cache-dir=./.zig-cache --seed=0x3a1261ad --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 73/75 tests passed (2 failed)
+test-mod transitive failure
++- run test 73 pass, 2 fail (75 total); 18 leaks
+   +- compile test Debug native success 6s MaxRSS:626M
+      +- options success
+

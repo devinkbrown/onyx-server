@@ -1366,7 +1366,10 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
     // default-off ⇒ byte-identical gate) and clients never publish proofs.
     const has_residence = cfg.node_identity != null;
     const out = try allocator.alloc([]const u8, base.len + 3 + @as(usize, @intFromBool(has_icon)) + @as(usize, @intFromBool(has_vapid)) + @as(usize, @intFromBool(has_residence)));
-    errdefer allocator.free(out);
+    // Every slot is either borrowed static data or a completed owned token,
+    // including when a later dynamic replacement or optional token fails.
+    @memset(out, base[0]);
+    errdefer freeIsupportTokens(allocator, out);
     for (base, 0..) |tok, i| {
         if (std.mem.startsWith(u8, tok, "NETWORK=")) {
             out[i] = try std.fmt.allocPrint(allocator, "NETWORK={s}", .{cfg.network_name});
@@ -93917,6 +93920,136 @@ test "threaded server: PRIVMSG beyond MAXTARGETS yields ERR_TOOMANYTARGETS" {
     // 5 targets > default MAXTARGETS (4) -> ERR_TOOMANYTARGETS (407).
     try writeAllFd(fd_a, "PRIVMSG a,b,c,d,e :hi\r\n");
     try recvUntil(&a, " 407 ", 200);
+}
+
+test "buildIsupportTokens allocation failures preserve ownership and publication across optional tokens" {
+    const Checks = struct {
+        fn output(expected: []const []const u8, actual: []const []const u8) !void {
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual) |want, got| try std.testing.expectEqualStrings(want, got);
+            var borrowed: usize = 0;
+            for (protocol_inventory.isupport_tokens, 0..) |static, i| {
+                if (expected[i].ptr == static.ptr) {
+                    try std.testing.expect(actual[i].ptr == static.ptr);
+                    borrowed += 1;
+                }
+            }
+            try std.testing.expect(borrowed != 0);
+        }
+
+        fn publication(previous: []const []const u8) !void {
+            const current = protocol_inventory.currentIsupport();
+            try std.testing.expect(current.ptr == previous.ptr);
+            try std.testing.expectEqual(previous.len, current.len);
+            try std.testing.expectEqualStrings("IRCX", current[0]);
+            try std.testing.expectEqualStrings("NETWORK=AlreadyPublished", current[1]);
+        }
+    };
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x63)), "isupport-oom");
+    defer ident.deinit();
+    const saved = protocol_inventory.currentIsupport();
+    const previous = [_][]const u8{ "IRCX", "NETWORK=AlreadyPublished" };
+    protocol_inventory.setIsupportOverride(&previous);
+    defer protocol_inventory.setIsupportOverride(saved);
+    var total_failures: usize = 0;
+    for (0..8) |options| {
+        const cfg = Config{
+            .port = 0,
+            .network_name = "OOM-Sweep",
+            .network_icon_url = if (options & 1 != 0) "https://example.invalid/icon.png" else "",
+            .webpush_vapid_pub = if (options & 2 != 0) "test-vapid-public-key" else "",
+            .node_identity = if (options & 4 != 0) &ident else null,
+        };
+        // Force remap fallback so allocation indices are independent of the
+        // backing allocator's in-place growth and shrink decisions.
+        var reference = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        const expected = try buildIsupportTokens(reference.allocator(), cfg);
+        defer freeIsupportTokens(reference.allocator(), expected);
+        const allocation_count = reference.allocations;
+        try std.testing.expect(allocation_count != 0);
+        for (0..allocation_count + 1) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+            if (buildIsupportTokens(failing.allocator(), cfg)) |actual| {
+                defer freeIsupportTokens(failing.allocator(), actual);
+                try std.testing.expect(!failing.has_induced_failure);
+                try std.testing.expectEqual(allocation_count, fail_index);
+                try Checks.output(expected, actual);
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                try std.testing.expectEqual(failing.allocations, failing.deallocations);
+                try Checks.publication(&previous);
+                total_failures += 1;
+                // Retry using the same allocator after removing the injected
+                // pressure. Failed construction must leave no stranded owner.
+                failing.fail_index = std.math.maxInt(usize);
+                const retry = try buildIsupportTokens(failing.allocator(), cfg);
+                defer freeIsupportTokens(failing.allocator(), retry);
+                try Checks.output(expected, retry);
+            }
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            try std.testing.expectEqual(failing.allocations, failing.deallocations);
+            try Checks.publication(&previous);
+        }
+        std.debug.print("ISUPPORT OOM options={d}: {d} failures, {d} successful retries, final success index={d}\n", .{ options, allocation_count, allocation_count, allocation_count });
+    }
+    std.debug.print("ISUPPORT OOM sweep: 8 optional-token combinations, {d} failures and retries, 8 final successes\n", .{total_failures});
+}
+
+test "buildIsupportTokens successful retry publishes complete live 005 advertisement" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x63)), "isupport-live");
+    defer ident.deinit();
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .network_name = "RetryNetwork",
+        .network_icon_url = "https://example.invalid/icon.png",
+        .webpush_vapid_pub = "test-vapid-public-key",
+        .node_identity = &ident,
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const reference = try buildIsupportTokens(failing.allocator(), cfg);
+    const allocation_count = failing.allocations;
+    freeIsupportTokens(failing.allocator(), reference);
+    // Fail the final optional entry after every earlier dynamic token exists.
+    failing.fail_index = failing.alloc_index + allocation_count - 1;
+    try std.testing.expectError(error.OutOfMemory, buildIsupportTokens(failing.allocator(), cfg));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    failing.fail_index = std.math.maxInt(usize);
+    const tokens = try buildIsupportTokens(failing.allocator(), cfg);
+    defer freeIsupportTokens(failing.allocator(), tokens);
+    const saved = protocol_inventory.currentIsupport();
+    protocol_inventory.setIsupportOverride(tokens);
+    defer protocol_inventory.setIsupportOverride(saved);
+
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    try server.initInPlace(std.testing.allocator, cfg);
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    const thread = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thread.join();
+    }
+    const fd = try connectLoopback(port);
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+    try writeAllFd(fd, "NICK Retry\r\nUSER retry 0 * :Retry\r\n");
+    var residence_buf: [64]u8 = undefined;
+    const residence = try std.fmt.bufPrint(&residence_buf, "ACCOUNTRESIDENCE={x:0>16}", .{ident.shortId()});
+    try recvUntil(&client, residence, 200);
+    try expectContains(client.written(), " 005 Retry ");
+    try expectContains(client.written(), "NETWORK=RetryNetwork");
+    try expectContains(client.written(), "NETWORKICON=https://example.invalid/icon.png");
+    try expectContains(client.written(), "VAPID=test-vapid-public-key");
+    try expectContains(client.written(), "PREFIX=" ++ chanmode.MemberModes.isupport_prefix);
+    try expectContains(client.written(), "STATUSMSG=" ++ chanmode.MemberModes.statusmsg_symbols);
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), "NETWORK=AlreadyPublished") == null);
 }
 
 test "buildIsupportTokens replaces length tokens with configured values" {

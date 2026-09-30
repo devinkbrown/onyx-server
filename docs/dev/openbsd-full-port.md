@@ -162,6 +162,15 @@ compile check; the original mesh/transport runtime evidence remains pinned to
 the original port artifacts. Explicit process-exit calls still bypass
 deferred cleanup.
 
+The next [ISUPPORT allocation-failure follow-up](../audit/evidence/isupport-oom-2026-09-30/README.md)
+also closes partial-construction leaks. Linux and native OpenBSD Debug and
+ReleaseSafe focused runners each pass 75/75, including all eight optional-token
+combinations, 308 induced allocation failures and successful retries, and real
+registration after the final optional-entry failure. The native fixture uses
+heap-based server initialization and the default process stack limit. Full
+Linux Debug and ReleaseSafe gates each pass 8763/8787, with 24 skips and zero
+failures, on this follow-up source.
+
 The native reactor now treats interrupted `kevent` waits as an empty poll,
 preserving registered operations and buffer custody. A syscall-return-only
 trace observed EINTR during real upgrades; deterministic native tests verify

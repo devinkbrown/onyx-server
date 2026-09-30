@@ -9,6 +9,14 @@ the local source changes, not acceptance of every item in the gap roadmap.
 
 ## Changes and bounds
 
+- Follow-up to `67eceb46`: free completed ISUPPORT token strings when any
+  subsequent construction allocation fails. The previously published override
+  remains unchanged, borrowed static tokens retain their pointers, and retry
+  produces identical token bytes. Actual Linux/OpenBSD Debug/ReleaseSafe
+  focused runners pass 75/75, with 308 injected failures and retries per run
+  and live socket registration after retry. See
+  [the allocation-failure evidence](evidence/isupport-oom-2026-09-30/README.md).
+
 - Follow-up to full-port commit `e83b2939`: free boot-created ISUPPORT tokens
   on normal main returns after server teardown, clearing the borrowed global
   override first. The same missing-key refusal has 16 allocation records /

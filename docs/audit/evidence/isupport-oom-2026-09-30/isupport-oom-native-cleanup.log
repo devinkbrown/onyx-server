@@ -1,0 +1,11 @@
+total 245368
+drwx------  2 root  wheel       512 Sep 30 15:38 .
+drwxrwxrwt  6 root  wheel       512 Sep 30 15:28 ..
+-rwx------  1 root  wheel  61791120 Sep 30 15:36 debug
+-rw-------  1 root  wheel  23186224 Sep 30 15:29 debug.core
+-rw-r--r--  1 root  wheel      3723 Sep 30 15:36 debug.raw.log
+-rwx------  1 root  wheel  40494576 Sep 30 15:38 rs
+-rw-r--r--  1 root  wheel      3723 Sep 30 15:38 rs.raw.log
+fixture process checks: debug=absent rs=absent onyx-server=absent
+fixture path absent: /tmp/onyx-isupport-oom-67eceb46
+PASS: graceful guest shutdown completed; owned QEMU name absent; PID file removed; fixture SSH port 2225 closed.

@@ -1,0 +1,19 @@
+test-mod
++- run test w
+ISUPPORT OOM options=0: 34 failures, 34 successful retries, final success index=34
+ISUPPORT OOM options=1: 37 failures, 37 successful retries, final success index=37
+ISUPPORT OOM options=2: 37 failures, 37 successful retries, final success index=37
+ISUPPORT OOM options=3: 40 failures, 40 successful retries, final success index=40
+ISUPPORT OOM options=4: 37 failures, 37 successful retries, final success index=37
+ISUPPORT OOM options=5: 40 failures, 40 successful retries, final success index=40
+ISUPPORT OOM options=6: 40 failures, 40 successful retries, final success index=40
+ISUPPORT OOM options=7: 43 failures, 43 successful retries, final success index=43
+ISUPPORT OOM sweep: 8 optional-token combinations, 308 failures and retries, 8 final successes
+failed command: ./.zig-cache/o/c5813007cbfbd2f5d23677ad1da45abb/test --cache-dir=./.zig-cache --seed=0xcb56d58b --listen=-
+
+Build Summary: 4/4 steps succeeded; 75/75 tests passed
+test-mod success
++- run test 75 pass (75 total) 257ms MaxRSS:89M
+   +- compile test Debug native success 7s MaxRSS:634M
+      +- options cached
+

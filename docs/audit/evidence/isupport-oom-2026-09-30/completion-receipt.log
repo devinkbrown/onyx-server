@@ -1,0 +1,12 @@
+server_source_sha256=b9dabd1970c0f3155c4ce814ae774129e4b717d23152095b0bbbc80f9da169db
+base_commit=67eceb46
+focused_linux_debug=exit0 75/75 zero_skips zero_failures
+focused_linux_rs=exit0 75/75 zero_skips zero_failures
+focused_native_debug=exit0 75/75 zero_skips zero_failures
+focused_native_rs=exit0 75/75 zero_skips zero_failures
+named_linux_debug=exit0 7/7 steps 1017/1021 tests 4_skips zero_failures
+named_linux_rs=exit0 7/7 steps 1017/1021 tests 4_skips zero_failures
+full_linux_debug=exit0 8/8 steps 8763/8787 tests 24_skips zero_failures
+full_linux_rs=exit0 8/8 steps 8763/8787 tests 24_skips zero_failures
+check_linux=exit0 3/3 steps
+check_openbsd=exit0 3/3 steps
