@@ -1,0 +1,16 @@
+test-mod
++- run test 71 pass, 1 fail (72 total)
+error: 'daemon.server.test.same-IP mesh dial unknown inbound peer cannot claim another configured endpoint' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x162fc79 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:105810:5: 0x1651dc7 in test.same-IP mesh dial unknown inbound peer cannot claim another configured endpoint (root.zig)
+           try std.testing.expect(!server.meshPeerLinkedByDial(&server.mesh_dials[0]));
+           ^
+failed command: ./.zig-cache/o/b14f904242f8ca34cdfb1902224b8a14/test --cache-dir=./.zig-cache --seed=0xed03e316 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 71/72 tests passed (1 failed)
+test-mod transitive failure
++- run test 71 pass, 1 fail (72 total)
+   +- compile test Debug native success 5s MaxRSS:570M
+      +- options success

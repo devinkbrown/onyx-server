@@ -1,0 +1,29 @@
+test-mod
++- run test 71 pass, 2 fail (73 total)
+error: 'daemon.server.test.same-IP mesh dial retiring plaintext roster expiration cannot publish or fold legacy PART' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x16a9679 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:106804:5: 0x16b2246 in expectRetiringPlainMaintenance (root.zig)
+           try std.testing.expect(server.world.isMember("#legacy", worldIdFromClient(target_id)));
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106833:5: 0x2768299 in test.same-IP mesh dial retiring plaintext roster expiration cannot publish or fold legacy PART (root.zig)
+           try expectRetiringPlainMaintenance(false);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring plaintext pending identity cannot publish NICK PART or fold legacy state' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x16a9679 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:106804:5: 0x16b2246 in expectRetiringPlainMaintenance (root.zig)
+           try std.testing.expect(server.world.isMember("#legacy", worldIdFromClient(target_id)));
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106836:5: 0x16bb6b9 in test.same-IP mesh dial retiring plaintext pending identity cannot publish NICK PART or fold legacy state (root.zig)
+           try expectRetiringPlainMaintenance(true);
+           ^
+failed command: ./.zig-cache/o/b214ab605a5700e6a25717969a117d12/test --cache-dir=./.zig-cache --seed=0x5f1b40e9 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 71/73 tests passed (2 failed)
+test-mod transitive failure
++- run test 71 pass, 2 fail (73 total)
+   +- compile test Debug native success 6s MaxRSS:568M
+      +- options cached

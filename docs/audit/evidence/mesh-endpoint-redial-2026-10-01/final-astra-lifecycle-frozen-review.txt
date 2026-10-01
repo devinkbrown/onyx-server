@@ -1,0 +1,29 @@
+**One blocking policy gap remains.**
+
+- **MEDIUM — retirement during secured processing does not stop subsequent application drains.** [`drainRelayV2`](/home/kain/onyx-server/src/daemon/server.zig:13231) sets `conn.closing` when deferred admission fails. Its [caller continues](/home/kain/onyx-server/src/daemon/server.zig:9903): identity transitions correctly stop, but [channel MODE publication](/home/kain/onyx-server/src/daemon/server.zig:18610) and [SEARCH reply encoding](/home/kain/onyx-server/src/daemon/server.zig:25146) still run through link-only helpers. Thus a closing physical connection can publish authority and author fresh output. Revalidate shared ownership/eligibility after potentially retiring operations and at live application-drain boundaries. Add a same-feed deferred-exhaustion plus MODE/SEARCH fixture asserting no subsequent mutation or encoding, with an active control. Preserve lifecycle output and independently accepted stores.
+
+Two additional consumer omissions:
+
+- **LOW — maintenance still credits retiring links.** [`noteMeshDialSuccessByName`](/home/kain/onyx-server/src/daemon/server.zig:31961) uses raw established identity, allowing retained same-name links to reset dial breakers through their endpoint fallback. Require central active eligibility before crediting success.
+- **LOW — SQUIT can select the retained loser first.** [`findSquitVictim`](/home/kain/onyx-server/src/daemon/server.zig:32135) returns the first name match without eligibility checks. Prefer the active survivor; retain any intended handshake cancellation as an explicit separate fallback.
+
+The principal routing/roster selectors, maintenance bursts/probes/rebinds, INFO, and [physical-owner transition boundary](/home/kain/onyx-server/src/daemon/server.zig:18399) now use the shared policy. I found no additional blocking issue in exact endpoint provenance, full-key reciprocal transfer, CONNECT storage, adopted-address validation, postcommit publication, retained-flight drainage, or immediate-drive teardown. Drain completion requires released SEND ownership and empty buffers—not merely queued SEND.
+
+The revised fixtures feed signed secured membership with bounded residence verification, distinguish historical negative projection, reverse roster ordering, and include plaintext mutation/output controls. The scripted resume peer proves retained JOIN across two requests. These are source observations, not test results.
+
+Evidence remains distinct: socketpair drainage; native TCP close/reheal; Linux-only in-process Helix; Python native fork/exec with `--skip-partition`. Python retains client sockets/tokens, checks equal msgid/time and cumulative deliveries, and compares appended-log dial counts before upgrades, after each exec, and across the final 22-second window. Full far-nickname routing is not established.
+
+**Exact SHA-256 values were identical at start and end:**
+
+```text
+src/daemon/server.zig
+3f59ad4a758fec622ce657f777deb9da4c89f343bf465ff2068f55f3ef628f53
+
+src/daemon/helix/s2s_snapshot.zig
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+```
+
+Static review only, including both requested cached reviews. No edits, tests, agents, credentials, or VM operations. Runtime acceptance and cached-metric semantics remain unverified; the parent owns all gates.

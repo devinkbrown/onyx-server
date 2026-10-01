@@ -1,0 +1,26 @@
+ARTIFACT native daemon sha256=58da23faecea855bd70838bbdc01a464338c50ba835887143761de163d1556e8
+PASS OpenBSD three pinned nodes: one IP, distinct ports, reciprocal dials, stack 8192 KiB; secured A-B-C line, degrees 1/2/1
+PASS REGISTER: separate durable account stores on all three native nodes
+PASS PLAIN SASL before NICK + SESSIONTOKEN + four reusable same-token physical attachments across all nodes
+PASS before-upgrade: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+SKIP partition: this run isolates sequential Helix/session acceptance
+PASS native fork/exec COMMIT on node 1: predecessor exited, secured line recovered
+PASS after-node-1: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS native fork/exec COMMIT on node 2: predecessor exited, secured line recovered
+PASS after-node-2: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS native fork/exec COMMIT on node 3: predecessor exited, secured line recovered
+PASS after-node-3: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+CLEANUP fixture PIDs: zero; loopback/PF baseline restored; private configs/WAL/logs retained at /tmp/onyx-session-native/913080f2d8fa27b4
+Traceback (most recent call last):
+  File "/home/kain/onyx-server/tools/openbsd_session_smoke.py", line 753, in <module>
+    main()
+    ~~~~^^
+  File "/home/kain/onyx-server/tools/openbsd_session_smoke.py", line 747, in main
+    fixture.run()
+    ~~~~~~~~~~~^^
+  File "/home/kain/onyx-server/tools/openbsd_session_smoke.py", line 692, in run
+    self.stable_dials()
+    ~~~~~~~~~~~~~~~~~^^
+  File "/home/kain/onyx-server/tools/openbsd_session_smoke.py", line 598, in stable_dials
+    raise RuntimeError("configured dial churn after sequential Helix")
+RuntimeError: configured dial churn after sequential Helix

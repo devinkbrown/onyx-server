@@ -1,0 +1,2 @@
+Final 63bf1cb095faf88d1fb7dd575d273a340d393e81dfd1a5fe51bc4d0d40ef1aff
+Exact reversal of only the six modified test sections reproduces all bytes of0323be5cfb568173b41fb8fc343356947cb62f83ef74e4c2efc6c4e403b8aa49. All production bytes through the complete LinuxServer struct are byte-identical. Seven standalone ConnState declarations now bind their real borrowed established secured link and use test_sendq_capture instead of fake armed SEND; active-owner preconditions and preflight counter assertion added. No other section differs.

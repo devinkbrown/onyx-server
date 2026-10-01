@@ -1,0 +1,14 @@
+{
+  "source": {
+    "src/daemon/server.zig": "a08b0e8aa2089c5e09ce3501b72a618cff1af92c852e8bc4f07caffbca20ac1b",
+    "src/daemon/helix/s2s_snapshot.zig": "c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37",
+    "tools/openbsd_session_smoke.py": "c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff"
+  },
+  "artifacts": {
+    "native-debug/bin/onyx-server": "958738e31ed37e5075f6ea50bf9c604ac19fda0ff84a0d0f5dfb88c2c21e2fa5",
+    "native-debug/bin/armor": "3515415e2a78871571c22e991bd2cd9c981d20624aec23a9586b1aa8b4f706e5",
+    "native-tests-debug/bin/onyx-server-daemon-tests": "cb6493f8a436cad6ec1bc6938c248a1c66e69ff8e93fa062eaa5ba622212970c",
+    "native-tests-debug/bin/onyx-server-cli-tests": "06f231e0e91ab8e904eadf852f28dd651b99538de5adc304999ea51c6567c8fc",
+    "native-tests-debug/bin/onyx-server-module-tests": "cdf5a7370595c8e3bd4fda8ed001dc8ec9cd3b66468e41a726aa3742771745c0"
+  }
+}

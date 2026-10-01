@@ -1,0 +1,26 @@
+Frozen server SHA-256: 63bf1cb095faf88d1fb7dd575d273a340d393e81dfd1a5fe51bc4d0d40ef1aff
+Zig: 0.17.0-dev.1282+c0f9b51d8
+
+zig build test --summary all
+Result: exit 0; 8/8 steps; 8845/8869 tests passed; 24 skipped.
+Receipt: full-owner-final-debug.log
+
+zig build test -Doptimize=ReleaseSafe --summary all
+Result: exit 0; 8/8 steps; 8845/8869 tests passed; 24 skipped.
+Receipt: full-owner-final-release-safe.log
+
+zig build test-server test-services test-helix test-mesh --summary all
+Result: exit 0; 13/13 steps; 2354/2365 tests passed; 11 skipped.
+Receipt: named-owner-final-debug.log
+
+zig build test-server test-services test-helix test-mesh -Doptimize=ReleaseSafe --summary all
+Result: exit 0; 13/13 steps; 2354/2365 tests passed; 11 skipped.
+Receipt: named-owner-final-release-safe.log
+
+zig fmt --check src/daemon/server.zig src/daemon/helix/s2s_snapshot.zig
+python3 -m py_compile tools/openbsd_session_smoke.py
+git diff --check
+Result: each exit 0.
+
+Native selected runner, build, exec and cleanup commands/results are recorded
+in native-owner-final-* receipts and owner-final-artifacts.json. No deployment.

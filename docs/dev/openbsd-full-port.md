@@ -143,12 +143,24 @@ It restores the original PF rules and aliases and confirms zero fixture PIDs.
 A valid SESSION REDIRECT is retried with the same credential within the existing
 40-second deadline; only a real attachment response can pass the probe.
 
-Two existing shared mesh limitations remain outside this operating-system port:
-a far-only unbound nickname can return 401 in a line topology, and the inbound
-dial fallback compares peer IP without distinguishing colocated same-IP nodes.
-The latter can suppress a redial after a partition in a same-IP fixture.
-Both paths match the pre-port source; neither is counted as solved by these
-native gates. Shared-authoritative-session channel and direct delivery are
+The shared-IP inbound dial fallback is repaired by the subsequent
+[endpoint reconnect follow-up](../audit/evidence/mesh-endpoint-redial-2026-10-01/README.md).
+It binds exact completed outbound endpoints to authenticated reciprocal survivors,
+retains final handshake output through SEND completion, and uses one shared
+connection lifecycle policy for admission, authority, routing and maintenance.
+Receive drivers revalidate ownership after each frame family, including retirement
+in a deferred batch. Fresh Astra source reviews found no blocking finding.
+Final native Debug and ReleaseSafe each pass 108/109 selected module cases with
+one existing Linux-only arena skip. Accepted artifacts pass all three real exec
+upgrades, unchanged settled dial counts before, during and after upgrades,
+stable sockets/tokens, durable cold authentication, and 47 events / 225 exact
+deliveries. This is separate from the original distinct-host PF campaign;
+shared-IP close/reheal is verified by socket tests. Final full Linux Debug and
+ReleaseSafe each pass 8845/8869 with 24 skips; named gates each pass 2354/2365
+with 11 skips. Exact source/artifact hashes and receipts are in the follow-up.
+The OS-independent far-only unbound nickname still can return 401 in a line
+topology and remains open. The shared-session proof does not establish that route.
+Shared-authoritative-session channel and direct delivery are
 covered across all three distinct hosts. The subsequent
 [TOTP storage atomicity follow-up](../audit/evidence/totp-atomic-2026-09-30/README.md)
 closes local policy/token partial publication under storage faults. Its selected

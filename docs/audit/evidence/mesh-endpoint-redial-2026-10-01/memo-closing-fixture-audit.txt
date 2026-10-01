@@ -1,0 +1,6 @@
+All top-level test bodies with explicit closing=true after correction:
+58048: secured establish collision winner teardown trust lifecycle
+87769: close retries exact-session handoff before teardown after allocation failure
+95398: exploit: PRIVMSG flood does not permanently brick channel chat
+
+The standalone DrainingRouteOperation helper intentionally holds a closing duplicate loser for negative routing coverage. Production closing paths are outside this audit. GAP-D2 was the only obsolete synthetic output-retention fixture.

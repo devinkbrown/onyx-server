@@ -1,0 +1,55 @@
+test-mod
++- run test 71 pass, 6 fail (77 total)
+error: 'daemon.server.test.session replica replay skips attachment leases for rolling-old peers without pinning burst' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x1621c79 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:59407:5: 0x2785cea in test.session replica replay skips attachment leases for rolling-old peers without pinning burst (root.zig)
+           try std.testing.expect(!conn.session_replica_replay_pending);
+           ^
+error: 'daemon.server.test.session replica value replay completes 140 objects under continuous behind-cursor renewal' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x1621c79 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:59584:5: 0x278332a in test.session replica value replay completes 140 objects under continuous behind-cursor renewal (root.zig)
+           try std.testing.expect(!conn.session_replica_replay_pending);
+           ^
+error: 'daemon.server.test.session replica replay preflights SendQ before AEAD advance and resumes at eight frames' failed:
+       expected 8, found 0
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x1643109 in expectEqualInner__anon_192169 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x277cb4b in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:59726:5: 0x277cc1f in test.session replica replay preflights SendQ before AEAD advance and resumes at eight frames (root.zig)
+           try std.testing.expectEqual(@as(usize, 8), conn.session_replica_replay_cursor);
+           ^
+error: 'daemon.server.test.session replica replay leaves no inner residue after outer record allocation failure' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x1621c79 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:60465:5: 0x2778319 in test.session replica replay leaves no inner residue after outer record allocation failure (root.zig)
+           try std.testing.expect(failing.has_induced_failure);
+           ^
+error: 'daemon.server.test.session replica replay budgets actual ciphertext with one-frame progress exception' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x1621c79 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:60601:9: 0x27713db in test.session replica replay budgets actual ciphertext with one-frame progress exception (root.zig)
+               try std.testing.expect(first.len != 0 and first.len <= replay_budget);
+               ^
+error: 'daemon.server.test.maximum legal session replica fits the clamped server-link SendQ and progresses' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x1621c79 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:60721:5: 0x1648987 in test.maximum legal session replica fits the clamped server-link SendQ and progresses (root.zig)
+           try std.testing.expect(!conn.session_replica_replay_pending);
+           ^
+failed command: ./.zig-cache/o/197f2879f622a2af17a9326a7569dd8b/test --cache-dir=./.zig-cache --seed=0xdbbcf78c --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 71/77 tests passed (6 failed)
+test-mod transitive failure
++- run test 71 pass, 6 fail (77 total)
+   +- compile test Debug native success 5s MaxRSS:529M
+      +- options cached

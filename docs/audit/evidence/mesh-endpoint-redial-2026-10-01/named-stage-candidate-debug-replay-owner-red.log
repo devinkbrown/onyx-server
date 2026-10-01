@@ -1,0 +1,37 @@
+test-mesh
++- run test w
+GAP-A2 branch=check-config refuse unsecured mesh.connect; compat default
+GAP-K7 branch=written threat boundary; history rekey is not a daemon mode because the daemon holds no epoch key; metadata-min is refused because NAMES search and abuse require server-visible membership; implementation does not follow
+GAP-O8 branch=filter exchanged before the ward list; a hit is re-checked and is not the authority
+GAP-O9 branch=two-person rule waits for a second distinct operator; flag off is unchanged
+GAP-P5 branch=mesh link returns one authorized hit and skips ciphertext
+GAP-P5 branch=mesh link local batch plus peer hits stay inside the hard cap
+failed command: ./.zig-cache/o/bf4aae0d188d0b5d41d187c035e7be9e/test --cache-dir=./.zig-cache --seed=0xfa70c516 --listen=-
+
+test-helix
++- run test 777 pass, 5 skip, 1 fail (783 total)
+GAP-A7 branch=refuse cold restart required before UPGRADE; unchanged listeners still queue
+GAP-O12 branch=a malformed BGNT image rejects the whole handoff
+GAP-P1 branch=a malformed THRD image rejects the whole handoff
+GAP-P3 branch=a malformed SCHD image rejects the whole handoff
+GAP-K8 branch=an HRR resumption binder covers ClientHello1 and the HelloRetryRequest
+error: 'daemon.server.test.session replica replay preflights SendQ before AEAD advance and resumes at eight frames' failed:
+       section 10 branch=stop maintaining memo_capsule away_capsule and ratelimit_capsule; CapsuleKind stays 1 through 17; ban_capsule stays
+       expected 8, found 0
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x156a499 in expectEqualInner__anon_41941 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x36715ab in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:59726:5: 0x367167f in test.session replica replay preflights SendQ before AEAD advance and resumes at eight frames (root.zig)
+           try std.testing.expectEqual(@as(usize, 8), conn.session_replica_replay_cursor);
+           ^
+failed command: ./.zig-cache/o/86cd1702254d1b64db0619d79aaa3cfd/test --cache-dir=./.zig-cache --seed=0xfa70c516 --listen=-
+
+test-server
++- run test w
+GAP-D3 branch=same-image USR2 kept gag 192.0.2.11 and granted vhost staff
+GAP-D5 branch=same-image USR2 invalidated the pre-crash verify and reset tokens, then SCRAM and CertFP still resolved and a new token confirmed
+GAP-X2 step3 branch=SEARCH command family moved behind the messaging thunk and the membership rate-limit and result cap still hold
+failed command: ./.zig-cache/o/27b412c4c6a54d48411b0455172c6a7b/test --cache-dir=./.zig-cache --seed=0xfa70c516 --listen=-

@@ -1,0 +1,72 @@
+test-services
++- run test 565 pass, 1 fail (566 total)
+GAP-D4 branch=same-image USR2 kept shun spamtrap Koshi reputation and account score; the new connection guard started full
+TOTP atomic allocation sweep disable=false failures=7 then success
+TOTP atomic allocation sweep disable=true failures=5 then success
+TOTP atomic cold replay disable=false write=failed sync=false active=false token_valid=true
+TOTP atomic cold replay disable=false write=short sync=false active=false token_valid=true
+TOTP atomic cold replay disable=false write=none sync=true active=true token_valid=false
+TOTP atomic cold replay disable=true write=failed sync=false active=true token_valid=true
+TOTP atomic cold replay disable=true write=short sync=false active=true token_valid=true
+TOTP atomic cold replay disable=true write=none sync=true active=false token_valid=false
+TOTP atomic RESETPASS allocation failures before password=9 then success
+GAP-P0b branch=oauth refuses unknown account unless oauth_auto_provision
+GAP-P0c branch=remote SYS and ADM DATA tags stay closed even for an operator account
+GAP-P0c branch=whowas account and real host
+TOTP atomic enable: 7 induced allocation failures, retries, and cold reopens
+TOTP atomic disable: 5 induced allocation failures, retries, and cold reopens
+TOTP atomic replace: 7 induced allocation failures, retries, and cold reopens
+TOTP atomic revoke: 3 induced allocation failures, retries, and cold reopens
+TOTP atomic rotate: 11 induced allocation failures, retries, and cold reopens
+TOTP atomic reset: 9 induced allocation failures, retries, and cold reopens
+GAP-D7 branch=a failed pending-address write issues no verification token; live mail stays off
+error: 'daemon.server.test.GAP-D2 kill-restart and same-image USR2 deliver the memo and fire MEMO_PUSH' failed:
+       GAP-P0b branch=cap onyx/2fa=IDENTIFY before AUTHENTICATE
+       GAP-P0b branch=oauth refuses unknown account unless oauth_auto_provision
+       GAP-A3 branch=rowless session replica proof; forged account is UID-renamed
+failed command: ./.zig-cache/o/d88b0b92d4c609f816a053b212a87222/test --cache-dir=./.zig-cache --seed=0x296ea54c --listen=-
+
+test-helix
++- run test w
+section 10 branch=stop maintaining memo_capsule away_capsule and ratelimit_capsule; CapsuleKind stays 1 through 17; ban_capsule stays
+GAP-A7 branch=refuse cold restart required before UPGRADE; unchanged listeners still queue
+GAP-O12 branch=a malformed BGNT image rejects the whole handoff
+GAP-P1 branch=a malformed THRD image rejects the whole handoff
+GAP-P3 branch=a malformed SCHD image rejects the whole handoff
+GAP-K8 branch=an HRR resumption binder covers ClientHello1 and the HelloRetryRequest
+failed command: ./.zig-cache/o/6f7ceabdb4b42282fe0e0b660b8349cb/test --cache-dir=./.zig-cache --seed=0x296ea54c --listen=-
+
+test-mesh
++- run test w
+GAP-A2 branch=check-config refuse unsecured mesh.connect; compat default
+GAP-K7 branch=written threat boundary; history rekey is not a daemon mode because the daemon holds no epoch key; metadata-min is refused because NAMES search and abuse require server-visible membership; implementation does not follow
+GAP-O8 branch=filter exchanged before the ward list; a hit is re-checked and is not the authority
+GAP-O9 branch=two-person rule waits for a second distinct operator; flag off is unchanged
+GAP-P5 branch=mesh link returns one authorized hit and skips ciphertext
+GAP-P5 branch=mesh link local batch plus peer hits stay inside the hard cap
+failed command: ./.zig-cache/o/f479f0b9163d0334afefca7cd19d369c/test --cache-dir=./.zig-cache --seed=0x296ea54c --listen=-
+
+test-server
++- run test w
+GAP-D3 branch=same-image USR2 kept gag 192.0.2.11 and granted vhost staff
+GAP-D5 branch=same-image USR2 invalidated the pre-crash verify and reset tokens, then SCRAM and CertFP still resolved and a new token confirmed
+GAP-X2 step3 branch=SEARCH command family moved behind the messaging thunk and the membership rate-limit and result cap still hold
+failed command: ./.zig-cache/o/11c39ac3ea5c2c6288ea580743427437/test --cache-dir=./.zig-cache --seed=0x296ea54c --listen=-
+
+Build Summary: 11/13 steps succeeded (1 failed); 2332/2344 tests passed (11 skipped, 1 failed)
+test-server success
++- run test 469 pass, 4 skip (473 total) 1m MaxRSS:457M
+   +- compile test ReleaseSafe native success 10m MaxRSS:2G
+      +- options cached
+test-services transitive failure
++- run test 565 pass, 1 fail (566 total)
+   +- compile test ReleaseSafe native success 9m MaxRSS:2G
+      +- options (reused)
+test-helix success
++- run test 777 pass, 5 skip (782 total) 29s MaxRSS:461M
+   +- compile test ReleaseSafe native success 10m MaxRSS:3G
+      +- options (reused)
+test-mesh success
++- run test 521 pass, 2 skip (523 total) 30s MaxRSS:460M
+   +- compile test ReleaseSafe native success 11m MaxRSS:3G
+      +- options (reused)

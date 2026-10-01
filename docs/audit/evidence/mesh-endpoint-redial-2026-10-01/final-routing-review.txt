@@ -1,0 +1,26 @@
+No blocking finding in the inspected delta. This is a source review, with runtime acceptance left to the parent’s gates.
+
+- Endpoint matching requires a known complete target; secured reciprocal transfer compares full authenticated keys and preserves direction/CONNECT storage ownership. See [server.zig:52160](/home/kain/onyx-server/src/daemon/server.zig:52160).
+- Adoption rejects malformed size, family, and zero port before slot allocation. Dial-token publication follows the entire adoption commit. See [validation](/home/kain/onyx-server/src/daemon/server.zig:31397) and [publication](/home/kain/onyx-server/src/daemon/server.zig:31613).
+- Drain retirement waits for retained output, inline/overflow backlog, and armed SEND ownership to clear. SQ pressure retains work; SEND faults terminate; expiry retains kernel-storage safeguards. The exact-generation check protects immediate-drive callers from synchronous teardown. See [drain](/home/kain/onyx-server/src/daemon/server.zig:52216), [completions](/home/kain/onyx-server/src/daemon/server.zig:10544), and [caller check](/home/kain/onyx-server/src/daemon/server.zig:10271).
+- I found no remaining live outbound selector admitting a closing/dedup link in the inspected paths. Empty secured flush validates the connection before success; lifecycle draining still uses the unguarded retained-output pager. Loser-first regression fixtures cover the reported MESSAGE_V2 and E2EEGROUP selectors. See [preflight](/home/kain/onyx-server/src/daemon/server.zig:19348) and [fixtures](/home/kain/onyx-server/src/daemon/server.zig:106273).
+
+The socket tests distinguish Linux-only in-process Helix from native close/reheal. Python checks original physical attachments, stable group tokens, equal msgid/time, cumulative delivery counts, and unchanged cumulative dial counts across a 22-second baseline, each native fork/exec, and another 22-second window. Logs append, keeping counters comparable. Its same-IP mode requires `--skip-partition`. See [socket campaign](/home/kain/onyx-server/src/daemon/server.zig:109044) and [Python oracle](/home/kain/onyx-server/tools/openbsd_session_smoke.py:522). Full far-nickname routing is not established.
+
+Hashes, start → end:
+
+```text
+src/daemon/server.zig
+25511580870d8eafec0bb2365fd4e92c09106483920e900c554d5dd2443d9192
+a08b0e8aa2089c5e09ce3501b72a618cff1af92c852e8bc4f07caffbca20ac1b
+
+src/daemon/helix/s2s_snapshot.zig
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+```
+
+Limitations: `server.zig` changed during review, adding the mesh-search closing/dedup guard; I inspected that addition, but this was not an immutable snapshot. Pin the final hash for parent gates. No files changed by me, tests run, agents spawned, credentials read, or VMs operated. Native/backend behavior and partial-SEND/overflow execution remain unverified.

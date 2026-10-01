@@ -1,0 +1,91 @@
+1/86 root.test_0...OK
+2/86 crypto.root.test_0...OK
+3/86 daemon.root.test_0...OK
+4/86 proto.root.test_0...OK
+5/86 substrate.root.test_0...OK
+6/86 wasm.host.root.test_0...OK
+7/86 substrate.io.root.test_0...OK
+8/86 substrate.ripple_props.test_0...OK
+9/86 substrate.ripple.test_0...OK
+10/86 substrate.undertow.root.test_0...OK
+11/86 substrate.undertow.peer_link.test_0...OK
+12/86 substrate.io.buf_ring.test_0...OK
+13/86 substrate.io.ring.test_0...OK
+14/86 proto.asn1_time.test_0...OK
+15/86 proto.certfp.test_0...OK
+16/86 proto.cloak.test_0...OK
+17/86 proto.ircx_modex.test_0...OK
+18/86 proto.ircx_saccess.test_0...OK
+19/86 proto.listx.test_0...OK
+20/86 proto.mooring.test_0...OK
+21/86 proto.mooring_props.test_0...OK
+22/86 proto.quic_handshake.test_0...OK
+23/86 proto.quic_transport_params.test_0...OK
+24/86 proto.sasl_external_verify.test_0...OK
+25/86 proto.sasl_mechrouter.test_0...OK
+26/86 proto.sasl_oauthbearer.test_0...OK
+27/86 proto.sasl.test_0...OK
+28/86 proto.sasl_scram512_server.test_0...OK
+29/86 proto.sasl_scram.test_0...OK
+30/86 proto.sasl_scram_server.test_0...OK
+31/86 proto.signed_delta.test_0...OK
+32/86 proto.toml.test_0...OK
+33/86 proto.x509.test_0...OK
+34/86 daemon.modules.manifest.test_0...OK
+35/86 daemon.key_transparency.test_0...OK
+36/86 daemon.acme_cli.test_0...OK
+37/86 daemon.acme_http01_listener.test_0...OK
+38/86 daemon.acme_renewal.test_0...OK
+39/86 daemon.acme_runner.test_0...OK
+40/86 daemon.config_format.test_0...OK
+41/86 daemon.helix.root.test_0...OK
+42/86 daemon.metrics_http.test_0...OK
+43/86 daemon.webhook.test_0...OK
+44/86 daemon.webhook_render.test_0...OK
+45/86 daemon.webhook_http.test_0...OK
+46/86 daemon.oauth_jwt.test_0...OK
+47/86 daemon.ocsp_staple.test_0...OK
+48/86 daemon.reactor_pool.test_0...OK
+49/86 daemon.sasl_bridge.test_0...OK
+50/86 daemon.scram_store.test_0...OK
+51/86 daemon.server.test.same-IP mesh dial plaintext responder loser delivers its final handshake before close...OK
+52/86 daemon.server.test.same-IP mesh dial secured responder loser retains armed ciphertext until send completion...OK
+53/86 daemon.server.test.same-IP mesh dial blocked duplicate drain expires and Helix refuses its partial cut...OK
+54/86 daemon.server.test.same-IP mesh dial receive caller observes zero-output loser retirement by exact generation...OK
+55/86 daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 replay...OK
+56/86 daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK...OK
+57/86 daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK_CONFIRM...OK
+58/86 daemon.server.test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK...OK
+59/86 daemon.server.test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK_CONFIRM...OK
+60/86 daemon.server.test.same-IP mesh dial routing excludes draining loser from Event Spine fanout...OK
+61/86 daemon.server.test.same-IP mesh dial routing excludes draining loser from legacy message fanout...OK
+62/86 daemon.server.test.same-IP mesh dial unknown inbound peer cannot claim another configured endpoint...OK
+63/86 daemon.server.test.same-IP mesh dial binding requires the full secured key despite equal peer names...OK
+64/86 daemon.server.test.same-IP mesh dial malformed carried endpoint is refused before slot or dial mutation...OK
+65/86 daemon.server.test.threaded server: same-IP mesh dial partition heals after inbound binding and sequential Helix...OK
+66/86 daemon.server.test_0...OK
+67/86 daemon.sessions.test_0...OK
+68/86 daemon.tls_certs.test_0...OK
+69/86 daemon.tls_conn.test_0...OK
+70/86 daemon.tls_sni_load.test_0...OK
+71/86 crypto.tls_server.test_0...OK
+72/86 crypto.tls_record.test_0...OK
+73/86 crypto.hkdf_tls13.test_0...OK
+74/86 crypto.hash.test_0...OK
+75/86 crypto.random.test_0...OK
+76/86 crypto.kx.test_0...OK
+77/86 crypto.sign.test_0...OK
+78/86 crypto.xwing.test_0...OK
+79/86 crypto.tls_client.test_0...OK
+80/86 crypto.sct.test_0...OK
+81/86 crypto.aead.test_0...OK
+82/86 crypto.ecdsa_kat.test_0...OK
+83/86 crypto.ed25519_batch.test_0...OK
+84/86 crypto.sign_kat.test_0...OK
+85/86 crypto.tls_props.test_0...OK
+86/86 crypto.tls.test_0...OK
+All 86 tests passed.
+All 0 tests passed.
+1/2 armor_main.test_0...OK
+2/2 root.test_0...OK
+All 2 tests passed.

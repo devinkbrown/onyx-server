@@ -23,7 +23,7 @@ three-host partition/rejoin, stable reusable sessions and all three Helix
 upgrades (51 events / 243 bounded deliveries). On the final ISUPPORT
 allocation-failure follow-up source, full Linux suites each pass 8763/8787
 with 24 skips and zero failures. Native evidence and the existing
-far-nickname and same-IP mesh limitations are recorded in
+far-nickname and historical same-IP mesh limitations are recorded in
 [the full-port record](dev/openbsd-full-port.md). The subsequent
 [ISUPPORT cleanup follow-up](audit/evidence/isupport-exit-2026-09-30/README.md)
 closes the rejected-candidate missing-key allocation leak, with actual Linux
@@ -58,6 +58,19 @@ synchronizes durable history before checkpoint encoding; the native candidate
 remains read-only through READY and ABORT, as verified in both native modes.
 Commands, native acceptance, and outstanding gates are recorded in
 [the continuation evidence](audit/gap-continuation-2026-09-30.md).
+
+The [shared-IP endpoint reconnect follow-up](audit/evidence/mesh-endpoint-redial-2026-10-01/README.md)
+repairs exact endpoint association, reciprocal handshake truncation and receive-slot
+retirement. A shared lifecycle policy revokes retiring peers' admission and
+connection-backed authority, with per-frame-family ownership revalidation.
+Fresh Astra reviews found no blocking finding. Final focused and named Linux
+Debug/ReleaseSafe gates pass. Native Debug/ReleaseSafe selected modules each pass
+108/109 with one Linux-only skip; accepted artifacts pass all three execs,
+unchanged dial counts, stable sockets/tokens, cold auth and 47 events / 225 exact
+deliveries. Final full Linux Debug/ReleaseSafe each pass 8845/8869 with 24 skips;
+named gates each pass 2354/2365 with 11 skips. Far-only unbound nickname routing
+remains a separate gap.
+No deployment or push was performed.
 
 **Audience:** the person deciding what the daemon builds next.
 **Baseline source audit:** the tree at `99974787`, whose Zig sources are byte-identical

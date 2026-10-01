@@ -1,0 +1,1722 @@
+{
+  "source_sha256": "0323be5cfb568173b41fb8fc343356947cb62f83ef74e4c2efc6c4e403b8aa49",
+  "criteria": "\\.s2s\\b|\\.s2s_secured\\b|\\.s2s_|\\bs2s[A-Z_]|\\bmesh_dials\\b|\\.established\\(|bestNickClaim|findRemoteMember|channelMembers\\(|channelNames\\(|channelTopic\\(|remoteNickCount|collectTopology|mesh_published_peers|\\blink\\.(peer|send|take|remote|channel|inner|supports|find|best)|link: anytype|isActiveMeshPeer|ownsActiveMeshLink|meshAdmissionOpen|establishedPeerName|activeMeshPeerName|drainIdentityTransitions",
+  "rows": [
+    {
+      "function": "initReactor",
+      "line": 4613,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "initInPlace",
+      "line": 4762,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "e2eeGroupExpectsExternalPeers",
+      "line": 5397,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "e2eeGroupPeerReadiness",
+      "line": 5417,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "injectWebhookPost",
+      "line": 5713,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "deinit",
+      "line": 6435,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "armAccept",
+      "line": 6672,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "projectOcg2LiveSessions",
+      "line": 6981,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "onTimerTick",
+      "line": 7024,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "resyncMeshStateToPeers",
+      "line": 7201,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "pruneStaleMeshMembers",
+      "line": 7245,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "clearDroppedPeerRouteOrigin",
+      "line": 7261,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "tallyRegisteredLocalClients",
+      "line": 7322,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "maybeWriteStats",
+      "line": 7338,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "buildStatusJson",
+      "line": 7736,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "sweepTimeouts",
+      "line": 8014,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "s2sBoundPort",
+      "line": 8123,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "captureLiveUpgradeForTest",
+      "line": 8249,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "handleAccept",
+      "line": 8930,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "penalizePeer",
+      "line": 9649,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "s2sSecured",
+      "line": 9662,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "newSecuredLink",
+      "line": 9678,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "bindRelayV2UnboundIfReady",
+      "line": 9752,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "noteS2sEstablished",
+      "line": 9799,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "driveS2sSecured",
+      "line": 9813,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendLocalOperBurstTo",
+      "line": 10012,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendMeshWardsTo",
+      "line": 10054,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "rebroadcastLocalOpers",
+      "line": 10091,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "driveS2s",
+      "line": 10104,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainRepairResync",
+      "line": 10201,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "handleConnect",
+      "line": 10229,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "driveClientBytes",
+      "line": 10295,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "handleKtlsRxControl",
+      "line": 10429,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "handleRecv",
+      "line": 10525,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "handleSend",
+      "line": 10616,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "beginDeliveryGapAbort",
+      "line": 10694,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "revokeAttachedSessionOnLocalOwner",
+      "line": 10825,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "relayToPeers",
+      "line": 11780,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "relayLegacyToPeers",
+      "line": 11790,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "hasSecureRelayV2Peer",
+      "line": 11821,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "relayWanted",
+      "line": 11835,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "relayWantedBySessionReplica",
+      "line": 11851,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "relayDirectMessagePolicyBlocks",
+      "line": 11864,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "hasEstablishedPeer",
+      "line": 11889,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "relayOriginIsDirectPeer",
+      "line": 11911,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "relayOriginAuth",
+      "line": 11937,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "recordRelaySignatureReject",
+      "line": 11961,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "meshNickHomeNode",
+      "line": 11976,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "trustedRemoteAccountAtNode",
+      "line": 12021,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "replicatedSessionProof",
+      "line": 12091,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "recordRelayHomeMismatch",
+      "line": 12255,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "recordRelayUnknownHomeV1",
+      "line": 12266,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "signRelayOrigin",
+      "line": 12285,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "relayOriginServerName",
+      "line": 12415,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "isVerifiedWebhookRelay",
+      "line": 12438,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "deferRelayV2",
+      "line": 12886,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "sendRelayV2AckToPeer",
+      "line": 12924,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendRelayV2AckConfirmToPeer",
+      "line": 12949,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainRelayV2Acks",
+      "line": 13021,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "replayRelayV2WireToPeer",
+      "line": 13138,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainRelayV2",
+      "line": 13257,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "deliverRelayV2",
+      "line": 13293,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "deliverRelay",
+      "line": 13775,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "deliverRelayWhisper",
+      "line": 14172,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "armConnect",
+      "line": 14245,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "closeConn",
+      "line": 14451,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "challengeRequired",
+      "line": 15014,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "processLiveLine",
+      "line": 15233,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "handoffLiveSessionIdentity",
+      "line": 15836,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "deliverChannelBatchGated",
+      "line": 15947,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "netsplitOnPeerDrop",
+      "line": 15962,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "sendMeshStateBurstTo",
+      "line": 16014,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "flushMeshBurstStage",
+      "line": 16083,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "setChannelModeFlagBits",
+      "line": 16184,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "sendMembershipBurstTo",
+      "line": 16198,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendChannelModeFlagsBurstTo",
+      "line": 16284,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendChannelModeStateBurstTo",
+      "line": 16387,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "announceChannelModeState",
+      "line": 16402,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "burstPropOrigin",
+      "line": 16589,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "burstEntityPropOrigin",
+      "line": 16815,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "announceEntityProp",
+      "line": 16844,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "recordEntityPropSignatureReject",
+      "line": 17120,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "recordEntityPropAuthorityReject",
+      "line": 17236,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "applyRemoteEntityProp",
+      "line": 17252,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "drainEntityPropChanges",
+      "line": 17381,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendEntityPropBurstTo",
+      "line": 17403,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendChannelPropBurstTo",
+      "line": 17432,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendChannelListToConn",
+      "line": 17486,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "announceMembership",
+      "line": 17506,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "announceChannelModeFlags",
+      "line": 17529,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "announceChannelList",
+      "line": 17552,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "announceChannelProp",
+      "line": 17589,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "membershipIdentityOf",
+      "line": 17620,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "nickIsLiveLocal",
+      "line": 17644,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "localNickSameAccount",
+      "line": 17655,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "assignConnClass",
+      "line": 17669,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "s2sSendqCap",
+      "line": 17694,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "matchCtx",
+      "line": 17702,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "broadcastCloneCounts",
+      "line": 17818,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainCloneCountsFrom",
+      "line": 17859,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendCloneAntiEntropy",
+      "line": 17873,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "countClassMembers",
+      "line": 17897,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "classCounts",
+      "line": 17925,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "remoteMemberStatusInChannel",
+      "line": 17979,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "emitRemoteMembership",
+      "line": 18100,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "remoteNickInChannel",
+      "line": 18144,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "emitRemoteQuit",
+      "line": 18184,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "nickInChannelAnywhere",
+      "line": 18288,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "announceOperPrefixForAccount",
+      "line": 18331,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "announceRemoteOperPrefixForAccount",
+      "line": 18382,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainIdentityTransitions",
+      "line": 18446,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "discardIdentityTransitions",
+      "line": 18508,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "shouldFoldLegacySessionMembership",
+      "line": 18525,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "foldLegacySessionMembership",
+      "line": 18530,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "drainChannelModeFlagChanges",
+      "line": 18657,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainChannelModeStateChanges",
+      "line": 18675,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainOriginRejections",
+      "line": 18690,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "applyRemoteChannelModeState",
+      "line": 18703,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "extBitHas",
+      "line": 18812,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "recordChannelPropSignatureReject",
+      "line": 18821,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "drainChannelPropChanges",
+      "line": 18916,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainChannelListChanges",
+      "line": 18960,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainTopicChanges",
+      "line": 18974,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "emitRemoteNick",
+      "line": 19054,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "announceTopic",
+      "line": 19095,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "localNickSessionToken",
+      "line": 19152,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "localNickResolver",
+      "line": 19164,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "sessionReplicaResidenceDecision",
+      "line": 19194,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "residenceTrusted",
+      "line": 19257,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "residenceVerifier",
+      "line": 19290,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "resolveSessionMembershipToken",
+      "line": 19298,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "sessionTokenResolver",
+      "line": 19331,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "authorizeSessionTokenNick",
+      "line": 19335,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "sessionTokenNickAuthorizer",
+      "line": 19368,
+      "category": "Independent accepted record / signed authority",
+      "reason": "Signed retained Store/config/local authority has its own validity and custody rules. Roster-dependent home/account lookups reach active selectors; replay of independent accepted objects is not invalidated by transport loss."
+    },
+    {
+      "function": "announceNickChange",
+      "line": 19372,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendTopicBurstTo",
+      "line": 19402,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "flushS2sOutbound",
+      "line": 19418,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "flushS2sOutboundTo",
+      "line": 19424,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "flushSecuredS2sOutboundTo",
+      "line": 19438,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "globalMemberCount",
+      "line": 19571,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "remotePublishedTopic",
+      "line": 19615,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "remoteChannelSecret",
+      "line": 19651,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "remoteOnlyChannelNames",
+      "line": 19679,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "findRemoteWhois",
+      "line": 22196,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "remoteWhoisFromLink",
+      "line": 22214,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "remoteMemberChannels",
+      "line": 22333,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendKillToOwner",
+      "line": 22539,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainKills",
+      "line": 22569,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "applyRemoteKill",
+      "line": 22585,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "publishAccountReadMarker",
+      "line": 23693,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "announceReadMarker",
+      "line": 23710,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendReadMarkerBurstTo",
+      "line": 23722,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "attachMeshSearchPeer",
+      "line": 24957,
+      "category": "Explicit standalone test bridge",
+      "reason": "Repository-wide call searches find only unit test registration/driving; live runtime peers use guarded physical scans. Peer drain bridges are compile-time test-only and enter the pure admitted payload implementation without claiming physical connection authority."
+    },
+    {
+      "function": "noteMeshSearchLink",
+      "line": 24967,
+      "category": "Explicit standalone test bridge",
+      "reason": "Repository-wide call searches find only unit test registration/driving; live runtime peers use guarded physical scans. Peer drain bridges are compile-time test-only and enter the pure admitted payload implementation without claiming physical connection authority."
+    },
+    {
+      "function": "dispatchMeshSearchQuery",
+      "line": 25055,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendKeyTransHeadOn",
+      "line": 25164,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "drainKeyTransHeads",
+      "line": 25174,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainKeyTransHeadsAdmitted",
+      "line": 25179,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "drainKeyTransPeer",
+      "line": 25192,
+      "category": "Explicit standalone test bridge",
+      "reason": "Repository-wide call searches find only unit test registration/driving; live runtime peers use guarded physical scans. Peer drain bridges are compile-time test-only and enter the pure admitted payload implementation without claiming physical connection authority."
+    },
+    {
+      "function": "drainMeshSearch",
+      "line": 25206,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainMeshSearchAdmitted",
+      "line": 25211,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "drainMeshSearchPeer",
+      "line": 25230,
+      "category": "Explicit standalone test bridge",
+      "reason": "Repository-wide call searches find only unit test registration/driving; live runtime peers use guarded physical scans. Peer drain bridges are compile-time test-only and enter the pure admitted payload implementation without claiming physical connection authority."
+    },
+    {
+      "function": "collectAttachedExactTokenClients",
+      "line": 25966,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "collectAttachedTokenAuthorityClients",
+      "line": 25996,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "projectLocalChannelProjection",
+      "line": 26164,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "mirrorTokenGroupMemberModes",
+      "line": 26325,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "partTokenGroupChannel",
+      "line": 26352,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "configuredListenerSet",
+      "line": 26831,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "prepareSessionReplicaUpgradeBoundary",
+      "line": 26877,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "openCompatibleUpgradeTarget",
+      "line": 26971,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "sealSecuredLink",
+      "line": 27005,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "sealSessionRegistry",
+      "line": 27131,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "helixWorldRelationIdentity",
+      "line": 27315,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "helixWorldRelationClient",
+      "line": 27328,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "sealMeshRedialUpgradeHint",
+      "line": 27732,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "sealShardClients",
+      "line": 27778,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "performUpgradeAfterCompatibleTarget",
+      "line": 28249,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "inheritedOwningCapsuleFd",
+      "line": 28722,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "adoptInheritedSessions",
+      "line": 28882,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "deinitInheritedCandidateClients",
+      "line": 31118,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "rollbackInheritedS2sBeforeIo",
+      "line": 31181,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "primeInheritedS2sRoster",
+      "line": 31469,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "adoptInheritedS2sLink",
+      "line": 31500,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "publishInheritedS2sLink",
+      "line": 31716,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "dialManaged",
+      "line": 31745,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "handleConnectCmd",
+      "line": 31815,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "initiateS2sConnectToAddr",
+      "line": 31835,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "publishMooringBreakerGauge",
+      "line": 31966,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "meshDialForToken",
+      "line": 32004,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "meshDialForConn",
+      "line": 32012,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "noteMeshDialSuccessByName",
+      "line": 32027,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "mooringStallReason",
+      "line": 32039,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sweepMeshAutoConnect",
+      "line": 32141,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "peerRemoteName",
+      "line": 32195,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "findSquitVictim",
+      "line": 32201,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "meshBroadcastObserveEvent",
+      "line": 33306,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainObserveEvents",
+      "line": 33332,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "reapWardMatches",
+      "line": 33585,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "serverNameJuped",
+      "line": 33827,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "refuseJupedPeer",
+      "line": 33836,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "fantasyReply",
+      "line": 34523,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "handleClones",
+      "line": 34851,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "handleData",
+      "line": 36583,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "relayChannelData",
+      "line": 36893,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "relayNickData",
+      "line": 36932,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "handleWhisper",
+      "line": 37028,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "remoteMemberOfChannel",
+      "line": 37200,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "remoteMemberOfChannelAtNode",
+      "line": 37218,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "linkChannelHasMember",
+      "line": 37239,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "relayWhisperRemote",
+      "line": 37250,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "meshUserCount",
+      "line": 37881,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "handleLusers",
+      "line": 37896,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "collectExactLogicalClients",
+      "line": 38175,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "localRenderedNickOccupiedExcept",
+      "line": 38589,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "broadcastOperGrant",
+      "line": 39112,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "broadcastMeshWard",
+      "line": 39130,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainWards",
+      "line": 39163,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "ingestMeshWardPayload",
+      "line": 39183,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "applyRemoteWard",
+      "line": 39207,
+      "category": "Admitted application payload operation",
+      "reason": "Production callers reach exact-owner guarded frame-family drains before consuming/publishing. MODE/PROP/membership helpers operate admitted deltas rather than select a physical link; pure SEARCH/KEYTRANS payload implementations are additionally used only by explicit test bridges."
+    },
+    {
+      "function": "collectE2eeGroupOutboxPeers",
+      "line": 40667,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "e2eeGroupDirectNeighbor",
+      "line": 40712,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "replayE2eeGroupWireToPeer",
+      "line": 40732,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendE2eeGroupAckOnLink",
+      "line": 40829,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendE2eeGroupAckToPeer",
+      "line": 40850,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendE2eeGroupAckConfirmToPeer",
+      "line": 40874,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainE2eeGroup",
+      "line": 41100,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainE2eeGroupAcks",
+      "line": 41129,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "appendE2eeGroupRecipient",
+      "line": 41185,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "queueDeferredSessionMeshAnnouncementsTo",
+      "line": 43093,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "flushDeferredSessionMeshAnnouncements",
+      "line": 43219,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "flushReadyDeferredSessionMeshAnnouncements",
+      "line": 43370,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "revokeAttachedSessionReserved",
+      "line": 44167,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "trustedReclaimRoute",
+      "line": 44758,
+      "category": "Derived published identity cache",
+      "reason": "The active peer publisher stages complete replacement and preserves the previous full-key identity snapshot on OOM. Cache consumers copy identity/names, never select the retiring physical connection. Accepted credential full-key matching remains required."
+    },
+    {
+      "function": "publishCurrentSessionReplicaToken",
+      "line": 45382,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "broadcastSessionReplicaV2",
+      "line": 45703,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "releaseMeshBurstAfterSessionReplicaReplay",
+      "line": 45791,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "replaySessionReplicaStoreTo",
+      "line": 45831,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "resumeSessionReplicaReplays",
+      "line": 45942,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "refreshPortableSessionReplicasV2",
+      "line": 45954,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "refreshAttachedSessionReplicaLeases",
+      "line": 46002,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "broadcastSessionMigration",
+      "line": 46033,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "convergeSessionConsumed",
+      "line": 46050,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainSessionMigrationConsumed",
+      "line": 46072,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sendSessionReplicaAckV2",
+      "line": 46084,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "rebindSessionReplicaRoutes",
+      "line": 46170,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "reconcileSessionReplicaRouteProjection",
+      "line": 46244,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "projectSessionReplicaChannels",
+      "line": 46411,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "drainSessionReplicaV2",
+      "line": 46820,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainSessionMigrations",
+      "line": 47038,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "restoreAndBindMigrationSnapshotWithTicket",
+      "line": 47750,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "meshBroadcastMemoPush",
+      "line": 48841,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainMemoPushes",
+      "line": 48857,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "meshBroadcastMediaWsDatagram",
+      "line": 48874,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainMediaWsDatagrams",
+      "line": 48893,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "installClassRegistry",
+      "line": 50220,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "meshBroadcastAuthoredOperEventV2",
+      "line": 51399,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "meshBroadcastOperEvent",
+      "line": 51428,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainOperEvents",
+      "line": 51454,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "drainOperEventsV2",
+      "line": 51488,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "meshForwardOperEventV2",
+      "line": 51515,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "liveListenerSet",
+      "line": 51581,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "infoRuntimeLines",
+      "line": 52127,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "handleLinks",
+      "line": 52224,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "peerDescription",
+      "line": 52267,
+      "category": "Physical transport / diagnostic / class metadata",
+      "reason": "Physical socket/type/config counts and protocol-established transport telemetry are distinct from active route authority. Diagnostics do not choose a roster for application admission. Existing stats establishment counter remains until final teardown."
+    },
+    {
+      "function": "activeMeshPeerName",
+      "line": 52279,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "establishedPeerName",
+      "line": 52284,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "meshPeerLinkedByDial",
+      "line": 52295,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "sameS2sPeer",
+      "line": 52308,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "transferMeshDialBinding",
+      "line": 52323,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "requestS2sDedupDrain",
+      "line": 52349,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "progressS2sDedupDrain",
+      "line": 52361,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "resolveS2sCollision",
+      "line": 52414,
+      "category": "Handshake / configured dial control",
+      "reason": "Handshake/configured endpoint or collision identity must be inspectable before establishment and during final-flight custody. No roster projection is admitted through these paths; CONNECT storage and full-key provenance remain exact. Stalls use admissionOpen; collision retains raw identity."
+    },
+    {
+      "function": "distinctPeerCount",
+      "line": 52470,
+      "category": "Derived published identity cache",
+      "reason": "The active peer publisher stages complete replacement and preserves the previous full-key identity snapshot on OOM. Cache consumers copy identity/names, never select the retiring physical connection. Accepted credential full-key matching remains required."
+    },
+    {
+      "function": "publishPeerCount",
+      "line": 52482,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "storePublishedMeshPeers",
+      "line": 52529,
+      "category": "Derived published identity cache",
+      "reason": "The active peer publisher stages complete replacement and preserves the previous full-key identity snapshot on OOM. Cache consumers copy identity/names, never select the retiring physical connection. Accepted credential full-key matching remains required."
+    },
+    {
+      "function": "freePublishedMeshPeers",
+      "line": 52557,
+      "category": "Derived published identity cache",
+      "reason": "The active peer publisher stages complete replacement and preserves the previous full-key identity snapshot on OOM. Cache consumers copy identity/names, never select the retiring physical connection. Accepted credential full-key matching remains required."
+    },
+    {
+      "function": "readPeerNames",
+      "line": 52582,
+      "category": "Derived published identity cache",
+      "reason": "The active peer publisher stages complete replacement and preserves the previous full-key identity snapshot on OOM. Cache consumers copy identity/names, never select the retiring physical connection. Accepted credential full-key matching remains required."
+    },
+    {
+      "function": "handleMap",
+      "line": 52607,
+      "category": "Derived published identity cache",
+      "reason": "The active peer publisher stages complete replacement and preserves the previous full-key identity snapshot on OOM. Cache consumers copy identity/names, never select the retiring physical connection. Accepted credential full-key matching remains required."
+    },
+    {
+      "function": "s2sPeerLivenessExpired",
+      "line": 52707,
+      "category": "Final-flight custody / teardown / checkpoint",
+      "reason": "Retained physical/kernel storage must remain observable for drain/cancel/deadline/fault close and strict Helix refusal. Candidate roster restoration discards transitions before commit; inherited publication follows whole-adopt commit. Genuine netsplit cleanup reads the dropped roster, while dedup teardown suppresses netsplit."
+    },
+    {
+      "function": "maybeProbeMeshPeerRtt",
+      "line": 52716,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "assembleMeshTopology",
+      "line": 52791,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "collectPeerNames",
+      "line": 52914,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    },
+    {
+      "function": "handleTagmsg",
+      "line": 53134,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "messageOne",
+      "line": 53919,
+      "category": "Inherited active selector / output contract",
+      "reason": "Caller reaches the shared active policy before selecting/encoding. Link-only caller edges are enumerated below; active name selection guards endpoint success credit."
+    },
+    {
+      "function": "isOverrideOper",
+      "line": 54875,
+      "category": "Local attachment / client policy",
+      "reason": "S2S field checks exclude peer sockets from local attachment handling. Publications use guarded mesh broadcast selectors; no retained peer roster authority is read here."
+    },
+    {
+      "function": "sendNamesWithProjection",
+      "line": 54897,
+      "category": "Shared active policy boundary",
+      "reason": "Occupied slot iterator / exact physical owner reaches the common predicate before routing, authority, projection, maintenance or application consumption. Handshake drivers use admissionOpen before feed and exact active owner after establishment; SQUIT separately permits admitted named handshake cancellation."
+    }
+  ]
+}

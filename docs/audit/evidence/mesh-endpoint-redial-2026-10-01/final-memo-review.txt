@@ -1,0 +1,23 @@
+No blocking finding in the reviewed delta against HEAD `d9991c00040a3c2623fb5fcf858f6e5127c62915`. This is a source-review conclusion; runtime acceptance remains with the parent’s gates.
+
+- **Endpoint provenance:** configured-dial matching requires a known complete endpoint, including port and scope. Secured reciprocal transfer compares full authenticated keys, preserves direction, and avoids overwriting CONNECT-owned address storage. [Matching and transfer](/home/kain/onyx-server/src/daemon/server.zig:52160)
+- **Transactional adoption:** nonempty carried addresses reject incorrect size, family, or zero port before slot allocation. Dial bindings publish after the whole adoption commit. [Validation](/home/kain/onyx-server/src/daemon/server.zig:31397), [publication](/home/kain/onyx-server/src/daemon/server.zig:31613)
+- **Drain lifecycle:** SEND submission alone cannot retire a loser. Retained output, SEND ownership, partial-send offsets, and overflow backlog remain part of the completion path; timeout and SEND faults enter ownership-safe teardown. The exact-generation check protects the RECV caller after immediate retirement. Incomplete drains refuse Helix. [Drain](/home/kain/onyx-server/src/daemon/server.zig:52216), [SEND completion](/home/kain/onyx-server/src/daemon/server.zig:10544), [caller protection](/home/kain/onyx-server/src/daemon/server.zig:10271), [Helix refusal](/home/kain/onyx-server/src/daemon/server.zig:27696)
+- **Routing regression:** I found no remaining reachable outbound selector admitting a closing/dedup loser in the inspected paths. MESSAGE_V2 and adjacent E2EEGROUP guards exclude it; empty secured flush validates the live connection first. Lifecycle flushing remains available. Tests place the loser before its survivor. [Flush guard](/home/kain/onyx-server/src/daemon/server.zig:19347), [routing tests](/home/kain/onyx-server/src/daemon/server.zig:106285)
+
+The socket tests inspect received bytes and EOF, including retained secured suffixes. The threaded same-IP campaign performs in-process Helix only on Linux; native socket close/reheal runs separately. The Python probe checks original client sockets, reusable tokens, equal msgid/time, cumulative deliveries, and real fork/exec. Its appended logs support comparable cumulative dial counts across the pre-upgrade 22-second window, each exec, and the final 22-second window. [Socket tests](/home/kain/onyx-server/src/daemon/server.zig:105947), [platform distinction](/home/kain/onyx-server/src/daemon/server.zig:109181), [Python counters](/home/kain/onyx-server/tools/openbsd_session_smoke.py:575)
+
+Limitations: no tests, agents, VM operations, credential reads, or edits. Backend internals outside the three-file scope were not reviewed. The native same-IP exec probe requires `--skip-partition`. This review does **not** establish repair of full far-nickname routing.
+
+Exact SHA-256 values at **start and end were identical**:
+
+```text
+src/daemon/server.zig
+dfcd1a71457ca43c093bbba2ee06a5fd5810c28d8b5e8070846eef31b0770f8b
+
+src/daemon/helix/s2s_snapshot.zig
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+```

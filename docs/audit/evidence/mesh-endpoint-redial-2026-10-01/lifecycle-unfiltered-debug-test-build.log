@@ -1,0 +1,11 @@
+Build Summary: 8/8 steps succeeded
+test-artifacts success
++- install generated to bin/onyx-server-module-tests success
+|  +- compile test Debug native success 22s MaxRSS:1G
+|     +- options cached
++- install generated to bin/onyx-server-daemon-tests success
+|  +- compile test Debug native success 1s MaxRSS:254M
+|     +- options (reused)
++- install generated to bin/onyx-server-cli-tests success
+   +- compile test Debug native success 4s MaxRSS:298M
+      +- options (reused)

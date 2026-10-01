@@ -1,0 +1,165 @@
+test-mod
++- run test 71 pass, 10 fail (81 total)
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot override the survivor nick home' failed:
+       expected 17122434300667203023, found 91
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x164e9b3 in expectEqualInner__anon_192758 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x164ea97 in expectEqual (std.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:188:21: 0x164eaf0 in expectEqualInner__anon_192752 (std.zig)
+                           try expectEqual(expected_payload, actual_payload);
+                           ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x165ee85 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106530:13: 0x165f2e6 in expectRetiringRosterUsesSurvivor (root.zig)
+                   try std.testing.expectEqual(@as(?u64, peer), server.meshNickHomeNode("Ghost"));
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106646:5: 0x27b4a09 in test.same-IP mesh dial retiring roster cannot override the survivor nick home (root.zig)
+           try expectRetiringRosterUsesSurvivor(.home);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot supply stale trusted account authority' failed:
+       ====== expected this output: =========
+       live␃
+
+       ======== instead found this: =========
+       ␃
+
+       ======================================
+       First difference occurs on line 1:
+       expected:
+       live
+       ^ ('\x6c')
+       found:
+
+       ^ (end of string)
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:681:9: 0x164f365 in expectEqualStrings (std.zig)
+               return error.TestExpectedEqual;
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:106535:13: 0x16601c8 in expectRetiringRosterUsesSurvivor (root.zig)
+                   try std.testing.expectEqualStrings("live", server.trustedRemoteAccountAtNode("Sender", peer) orelse "");
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106649:5: 0x27b4989 in test.same-IP mesh dial retiring roster cannot supply stale trusted account authority (root.zig)
+           try expectRetiringRosterUsesSurvivor(.account);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot supply stale channel membership' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x162cc79 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:106540:13: 0x1661062 in expectRetiringRosterUsesSurvivor (root.zig)
+                   try std.testing.expect(!server.remoteMemberOfChannelAtNode("#authority", "StaleOnly", peer));
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106652:5: 0x27b4909 in test.same-IP mesh dial retiring roster cannot supply stale channel membership (root.zig)
+           try expectRetiringRosterUsesSurvivor(.membership);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot grant stale channel status' failed:
+       expected 0, found 4
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x164f464 in expectEqualInner__anon_192943 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x164f531 in expectEqual (std.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:188:21: 0x164f578 in expectEqualInner__anon_192936 (std.zig)
+                           try expectEqual(expected_payload, actual_payload);
+                           ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x16623e6 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106547:13: 0x1662847 in expectRetiringRosterUsesSurvivor (root.zig)
+                   try std.testing.expectEqual(@as(?u4, 0), server.remoteMemberStatusInChannel("#authority", "Sender"));
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106655:5: 0x27b4889 in test.same-IP mesh dial retiring roster cannot grant stale channel status (root.zig)
+           try expectRetiringRosterUsesSurvivor(.status);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster is absent from WHOIS identity and channels' failed:
+       ====== expected this output: =========
+       current␃
+
+       ======== instead found this: =========
+       obsolete␃
+
+       ======================================
+       First difference occurs on line 1:
+       expected:
+       current
+       ^ ('\x63')
+       found:
+       obsolete
+       ^ ('\x6f')
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:681:9: 0x164f365 in expectEqualStrings (std.zig)
+               return error.TestExpectedEqual;
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:106553:13: 0x1663be4 in expectRetiringRosterUsesSurvivor (root.zig)
+                   try std.testing.expectEqualStrings("current", remote.username);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106658:5: 0x27b4809 in test.same-IP mesh dial retiring roster is absent from WHOIS identity and channels (root.zig)
+           try expectRetiringRosterUsesSurvivor(.whois);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster is absent from LIST and NAMES projection' failed:
+       expected 3, found 4
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x164f729 in expectEqualInner__anon_193006 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x166504f in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106563:13: 0x16654b0 in expectRetiringRosterUsesSurvivor (root.zig)
+                   try std.testing.expectEqual(@as(usize, 3), server.globalMemberCount("#authority", 1));
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106661:5: 0x27b4789 in test.same-IP mesh dial retiring roster is absent from LIST and NAMES projection (root.zig)
+           try expectRetiringRosterUsesSurvivor(.projection);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot override current channel metadata' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x162cc79 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:106573:13: 0x16676d3 in expectRetiringRosterUsesSurvivor (root.zig)
+                   try std.testing.expect(!server.remoteChannelSecret("#authority"));
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106664:5: 0x27b4709 in test.same-IP mesh dial retiring roster cannot override current channel metadata (root.zig)
+           try expectRetiringRosterUsesSurvivor(.channel_metadata);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster is absent from the active mesh user count' failed:
+       expected 5, found 10
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x164e9b3 in expectEqualInner__anon_192758 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x1669460 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106586:13: 0x16698c1 in expectRetiringRosterUsesSurvivor (root.zig)
+                   try std.testing.expectEqual(@as(u64, 5), server.meshUserCount());
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106667:5: 0x27b4689 in test.same-IP mesh dial retiring roster is absent from the active mesh user count (root.zig)
+           try expectRetiringRosterUsesSurvivor(.user_count);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot reject current signed MESSAGE_V2' failed:
+       retiring roster MESSAGE_V2 outcome: .{ .permanent = void }
+       /home/kain/onyx-server/src/daemon/server.zig:106609:21: 0x166ab8f in expectRetiringRosterUsesSurvivor (root.zig)
+                           return error.TestUnexpectedResult;
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106670:5: 0x27b3ae9 in test.same-IP mesh dial retiring roster cannot reject current signed MESSAGE_V2 (root.zig)
+           try expectRetiringRosterUsesSurvivor(.message_v2);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot reject current signed E2EEGROUP' failed:
+       expected .accepted, found .rejected
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x1656ec4 in expectEqualInner__anon_193649 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x166c8cc in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106635:13: 0x166cd42 in expectRetiringRosterUsesSurvivor (root.zig)
+                   try std.testing.expectEqual(Server.E2eeGroupDeliveryOutcome.accepted, server.deliverE2eeGroup(record, wire, peer));
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106673:5: 0x1676cf9 in test.same-IP mesh dial retiring roster cannot reject current signed E2EEGROUP (root.zig)
+           try expectRetiringRosterUsesSurvivor(.e2ee_group);
+           ^
+failed command: ./.zig-cache/o/af1d122e78ee78b928f31fdde75453e4/test --cache-dir=./.zig-cache --seed=0xde74124b --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 71/81 tests passed (10 failed)
+test-mod transitive failure
++- run test 71 pass, 10 fail (81 total)

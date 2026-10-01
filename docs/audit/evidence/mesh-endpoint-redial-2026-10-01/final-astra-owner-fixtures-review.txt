@@ -1,0 +1,22 @@
+**No blocking findings. Approve the six-section fixture delta on static review.**
+
+- Independently reversing those six sections reproduces **every byte** of prior `0323be5cfb568173b41fb8fc343356947cb62f83ef74e4c2efc6c4e403b8aa49`. No production change lies outside that prior review.
+- All seven connections borrow the actual handshake-established `pair.a`. Exact-owner preconditions remain strict. The existing test-only capture sink suppresses SEND submission without bypassing admission.
+- No assertions were weakened. SendQ preflight/no AEAD advance, outer-allocation rollback and recovery, eight-frame cursor/resumption, ciphertext budgets, maximum replica contents, rolling-old lease skipping, and 140-object progress remain meaningful.
+- Replacing fabricated `send_armed` does not alter these fixtures’ queue-capacity behavior: their send offsets remain zero.
+- The applicable delta artifact is `replay-owner-test-delta.json`; the discovered `memo-fixture-test-only.diff` concerns an earlier change. Existing logs report **71/77 with the six failures**, then **84/84**; I did not rerun them.
+
+**All three start/end SHA-256 values were identical:**
+
+```text
+src/daemon/server.zig
+63bf1cb095faf88d1fb7dd575d273a340d393e81dfd1a5fe51bc4d0d40ef1aff
+
+src/daemon/helix/s2s_snapshot.zig
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+```
+
+Limits: static delta review only; full final gates remain parent-owned. No runtime acceptance or far-nickname completeness claim. No edits, tests, agents, credentials, VM operations, or deployment. I cannot attest that this session used Astra.

@@ -1,0 +1,453 @@
+--- b815-server
++++ final-roster-server
+@@ -11839,7 +11839,7 @@
+     fn relayOriginIsDirectPeer(self: *LinuxServer, origin_node: u64) bool {
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 if (slot.value.s2s_secured) |link| {
+                     if (link.established() and link.remoteNodeId() == origin_node) return true;
+                 } else if (slot.value.s2s) |link| {
+@@ -11905,7 +11905,7 @@
+         var best: ?s2s_link.NickClaim = null;
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 if (slot.value.s2s_secured) |link| {
+                     if (!link.established()) continue;
+                     if (link.bestNickClaim(nick)) |claim| mergeMeshNickClaim(&best, claim);
+@@ -11950,7 +11950,7 @@
+         var found: ?[]const u8 = null;
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 const member = if (slot.value.s2s_secured) |link| blk: {
+                     if (!link.established()) continue;
+                     break :blk link.findRemoteMember(nick);
+@@ -12343,7 +12343,7 @@
+     fn relayOriginServerName(self: *LinuxServer, origin_node: u64) ?[]const u8 {
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 if (slot.value.s2s_secured) |link| {
+                     if (!link.established()) continue;
+                     if (link.remoteNodeId() == origin_node and link.remoteName().len != 0) return link.remoteName();
+@@ -17897,7 +17897,7 @@
+     fn remoteMemberStatusInChannel(self: *LinuxServer, channel: []const u8, nick: []const u8) ?u4 {
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 const members = if (slot.value.s2s_secured) |l|
+                     l.channelMembers(channel)
+                 else if (slot.value.s2s) |l|
+@@ -18062,7 +18062,7 @@
+     fn remoteNickInChannel(self: *LinuxServer, channel: []const u8, nick: []const u8) bool {
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 const members = blk: {
+                     if (slot.value.s2s_secured) |link| {
+                         if (link.established()) break :blk link.channelMembers(channel);
+@@ -18209,7 +18209,7 @@
+         }
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 const members = blk: {
+                     if (slot.value.s2s_secured) |link| {
+                         if (link.established()) break :blk link.channelMembers(channel);
+@@ -18273,7 +18273,7 @@
+         while (cit.next()) |cv| {
+             for (self.reactors) |*reactor| {
+                 for (reactor.clients.slots.items) |*slot| {
+-                    if (!slot.occupied) continue;
++                    if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                     const members = blk: {
+                         if (slot.value.s2s_secured) |link| {
+                             if (link.established()) break :blk link.channelMembers(cv.name);
+@@ -18308,7 +18308,7 @@
+         while (cit.next()) |cv| {
+             for (self.reactors) |*reactor| {
+                 for (reactor.clients.slots.items) |*slot| {
+-                    if (!slot.occupied) continue;
++                    if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                     const members = blk: {
+                         if (slot.value.s2s_secured) |link| {
+                             if (link.established()) break :blk link.channelMembers(cv.name);
+@@ -19489,7 +19489,7 @@
+         var seen: usize = 0;
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 const members = blk: {
+                     if (slot.value.s2s_secured) |link| {
+                         if (link.established()) break :blk link.channelMembers(channel);
+@@ -19529,7 +19529,7 @@
+         var best_set: i64 = 0;
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 const view: ?s2s_peer_mod.TopicView = if (slot.value.s2s_secured) |link| blk: {
+                     if (!link.established()) break :blk null;
+                     break :blk link.channelTopic(channel);
+@@ -19561,7 +19561,7 @@
+     fn remoteChannelSecret(self: *LinuxServer, channel: []const u8) bool {
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 const flags: ?u16 = blk: {
+                     if (slot.value.s2s_secured) |link| {
+                         if (link.established()) break :blk if (link.channelModeFlags(channel)) |f| f.flags else null;
+@@ -19593,7 +19593,7 @@
+         defer seen.deinit();
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 if (slot.value.s2s_secured) |link| {
+                     if (!link.established()) continue;
+                     if (link.channelNames()) |it_| {
+@@ -22106,7 +22106,7 @@
+     fn findRemoteWhois(self: *LinuxServer, nick: []const u8) ?RemoteWhois {
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 if (slot.value.s2s_secured) |link| {
+                     if (!link.established()) continue;
+                     if (remoteWhoisFromLink(link, nick)) |rw| return rw;
+@@ -22254,7 +22254,7 @@
+             if (self.channelHiddenFromWhois(cv.name, requester_wid)) continue;
+             for (self.reactors) |*reactor| {
+                 for (reactor.clients.slots.items) |*slot| {
+-                    if (!slot.occupied) continue;
++                    if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                     const members = blk: {
+                         if (slot.value.s2s_secured) |link| {
+                             if (link.established()) break :blk link.channelMembers(cv.name);
+@@ -37088,7 +37088,7 @@
+     fn remoteMemberOfChannel(self: *LinuxServer, channel: []const u8, nick: []const u8) bool {
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 if (slot.value.s2s_secured) |link| {
+                     if (link.established() and linkChannelHasMember(link, channel, nick)) return true;
+                 } else if (slot.value.s2s) |link| {
+@@ -37106,7 +37106,7 @@
+     fn remoteMemberOfChannelAtNode(self: *LinuxServer, channel: []const u8, nick: []const u8, origin_node: u64) bool {
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 const members = if (slot.value.s2s_secured) |link| blk: {
+                     if (!link.established()) continue;
+                     break :blk link.channelMembers(channel);
+@@ -37770,7 +37770,7 @@
+         var total: u64 = self.world.localNickCount();
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 if (slot.value.s2s_secured) |link| {
+                     if (link.established()) total += @intCast(link.remoteNickCount());
+                 } else if (slot.value.s2s) |link| {
+@@ -52108,6 +52108,7 @@
+         var it = self.reactors[0].clients.iterator();
+         outer: while (it.next()) |entry| {
+             const c = entry.value;
++            if (c.closing or c.s2s_dedup) continue;
+             const rname = establishedPeerName(c) orelse continue;
+             // One line per distinct peer: a transient duplicate link to the same
+             // server must not appear twice.
+@@ -52661,6 +52662,7 @@
+         while (it.next()) |entry| {
+             if (tn >= out.len) break;
+             const c = entry.value;
++            if (c.closing or c.s2s_dedup) continue;
+             if (c.s2s) |l| {
+                 if (!l.established()) continue;
+                 if (l.remoteNodeId()) |rid| {
+@@ -52780,6 +52782,7 @@
+     pub fn collectPeerNames(self: *LinuxServer, out: *std.ArrayList([]const u8)) !void {
+         var it = self.rx().clients.iterator();
+         while (it.next()) |entry| {
++            if (entry.value.closing or entry.value.s2s_dedup) continue;
+             const name = establishedPeerName(entry.value) orelse continue;
+             try out.append(self.allocator, name);
+         }
+@@ -54810,7 +54813,7 @@
+                 return error.OutputTooSmall;
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 const remote_count = if (slot.value.s2s_secured) |link|
+                     if (link.established()) link.channelMembers(channel).len else 0
+                 else if (slot.value.s2s) |link|
+@@ -54908,7 +54911,7 @@
+         // same pattern `findRemoteWhois`/`relayToPeers` already rely on.
+         for (self.reactors) |*reactor| {
+             for (reactor.clients.slots.items) |*slot| {
+-                if (!slot.occupied) continue;
++                if (!slot.occupied or slot.value.closing or slot.value.s2s_dedup) continue;
+                 if (slot.value.s2s_secured) |link| {
+                     if (link.established()) try self.addRemoteMembers(&roster, &seen, max_entries, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
+                 } else if (slot.value.s2s) |link| {
+@@ -106433,6 +106436,246 @@
+     try expectDrainingRouteUsesSurvivor(.legacy_message);
+ }
+
++const RetiringRosterOperation = enum { home, account, membership, status, whois, projection, channel_metadata, user_count, message_v2, e2ee_group };
++
++fn expectRetiringRosterUsesSurvivor(operation: RetiringRosterOperation) !void {
++    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
++    defer current_reactor = null;
++    const alloc = std.testing.allocator;
++    const pairs = try alloc.alloc(SessionReplayTestPair, 2);
++    defer alloc.free(pairs);
++    var initialized: usize = 0;
++    defer for (pairs[0..initialized]) |*pair| pair.deinit();
++    for (pairs) |*pair| {
++        pair.* = try SessionReplayTestPair.init(alloc);
++        initialized += 1;
++    }
++    const origin_root = std.fmt.bytesToHex(pairs[1].idb.sign_kp.public_key, .lower);
++    const roots = [_][]const u8{&origin_root};
++    const server = try createTestServer(alloc, .{
++        .host = "127.0.0.1",
++        .port = 0,
++        .node_identity = &pairs[0].ida,
++        .crypto_io = std.testing.io,
++        .mesh_trust_roots = &roots,
++        .server_name = "replay-a.test",
++    });
++    defer alloc.destroy(server);
++    defer server.deinit();
++    current_reactor = &server.reactors[0];
++    var ids: [2]client_model.ClientId = undefined;
++    var attached: usize = 0;
++    defer for (ids[0..attached]) |id| {
++        if (server.rx().clients.get(id)) |conn| conn.s2s_secured = null;
++    };
++    for (&ids, 0..) |*id, i| {
++        id.* = try server.rx().clients.alloc(ConnState.init(-1));
++        attached += 1;
++        const conn = server.rx().clients.get(id.*).?;
++        conn.token = try tokenFromId(id.*);
++        conn.overflow_allocator = alloc;
++        conn.test_sendq_capture = true;
++        conn.s2s_secured = &pairs[i].a;
++    }
++    const peer = pairs[1].idb.shortId();
++    // These are previously admitted roster facts, not new authority offered by
++    // the closing link. Its higher-HLC claim is frozen while the survivor has
++    // diverged. Both established transports authenticate the same full key.
++    const stale = &pairs[0].a.inner.?.peer.routes;
++    const live = &pairs[1].a.inner.?.peer.routes;
++    const obsolete = route_table_mod.MemberIdentity{
++        .username = "obsolete",
++        .realname = "Obsolete",
++        .host = "old.test",
++        .account = "obsolete",
++        .account_trusted = true,
++    };
++    const current = route_table_mod.MemberIdentity{
++        .username = "current",
++        .realname = "Current",
++        .host = "live.test",
++        .account = "live",
++        .account_trusted = true,
++    };
++    _ = try stale.applyMembership("#authority", "Sender", peer, 0b0100, 700, true, obsolete, 800);
++    _ = try stale.applyMembership("#authority", "Ghost", 91, 0b0100, 700, true, obsolete, 800);
++    _ = try stale.applyMembership("#authority", "StaleOnly", peer, 0b0100, 700, true, obsolete, 800);
++    _ = try stale.applyMembership("#obsolete", "Ghost", 91, 0, 700, true, obsolete, 800);
++    _ = try stale.applyMembership("#dead-only", "StaleOnly", peer, 0, 700, true, obsolete, 800);
++    _ = try live.applyMembership("#authority", "Sender", peer, 0, 600, true, current, 800);
++    _ = try live.applyMembership("#authority", "Ghost", peer, 0, 600, true, current, 800);
++    _ = try stale.applyChannelModeFlags("#authority", peer, Server.channel_secret_flag_bit, 700);
++    _ = try live.applyChannelModeFlags("#authority", peer, 0, 600);
++    _ = try stale.applyTopic("#authority", peer, 700, "obsolete topic", "Setter", 700, true);
++    _ = try live.applyTopic("#authority", peer, 600, "current topic", "Setter", 600, true);
++    const loser = server.rx().clients.get(ids[0]).?;
++    const survivor = server.rx().clients.get(ids[1]).?;
++    try std.testing.expect(Server.sameS2sPeer(loser, survivor));
++    try std.testing.expect(stale.bestNickClaim("Ghost").?.higherPriorityThan(live.bestNickClaim("Ghost").?));
++    loser.closing = true;
++    loser.s2s_dedup = true;
++    loser.s2s_dedup_drain_deadline_ms = server.nowMs() +| 5_000;
++    const held = "retained-final-flight";
++    loser.sendq_cap = held.len;
++    try rawAppendToConn(loser, held);
++    const loser_counter = pairs[0].a.exportOuter().send_counter;
++    const target_id = try addTestLocalClient(server, "Target", "target");
++    const target = server.connFor(target_id).?;
++    target.test_sendq_capture = true;
++    target.session.addCap(.message_tags);
++    target.session.addCap(.server_time);
++    target.session.addCap(.onyx_e2ee);
++    _ = try server.world.join("#authority", worldIdFromClient(target_id));
++    _ = try server.world.join("#obsolete", worldIdFromClient(target_id));
++
++    switch (operation) {
++        .home => {
++            try std.testing.expectEqual(@as(?u64, peer), server.meshNickHomeNode("Ghost"));
++            try std.testing.expectEqual(Server.RelaySenderHome.match, server.relaySenderHome("Ghost", peer));
++            try std.testing.expect(server.meshNickHomeNode("StaleOnly") == null);
++        },
++        .account => {
++            try std.testing.expectEqualStrings("live", server.trustedRemoteAccountAtNode("Sender", peer) orelse "");
++            try std.testing.expectEqualStrings("live", server.trustedRemoteAccountForNick("Ghost") orelse "");
++            try std.testing.expect(server.trustedRemoteAccountAtNode("StaleOnly", peer) == null);
++        },
++        .membership => {
++            try std.testing.expect(!server.remoteMemberOfChannelAtNode("#authority", "StaleOnly", peer));
++            try std.testing.expect(!server.remoteMemberOfChannel("#authority", "StaleOnly"));
++            try std.testing.expect(!server.nickInChannelAnywhere("#authority", "StaleOnly"));
++            try std.testing.expect(!server.remoteNickInChannel("#authority", "StaleOnly"));
++            try std.testing.expect(server.remoteMemberOfChannelAtNode("#authority", "Ghost", peer));
++        },
++        .status => {
++            try std.testing.expectEqual(@as(?u4, 0), server.remoteMemberStatusInChannel("#authority", "Sender"));
++            try std.testing.expectEqual(@as(u8, 0), server.relaySenderModes("#authority", "Sender").bits);
++            try std.testing.expect(!server.relaySenderIsMember("#authority", "StaleOnly"));
++        },
++        .whois => {
++            const remote = server.findRemoteWhois("Sender") orelse return error.TestUnexpectedResult;
++            try std.testing.expectEqualStrings("current", remote.username);
++            try std.testing.expectEqualStrings("live", remote.account);
++            try std.testing.expect(server.findRemoteWhois("StaleOnly") == null);
++            var memberships: [8]whois.ChannelMembership = undefined;
++            var prefixes: [8][2]u8 = undefined;
++            const count = server.remoteMemberChannels("Ghost", worldIdFromClient(target_id), &memberships, &prefixes);
++            try std.testing.expectEqual(@as(usize, 1), count);
++            try std.testing.expectEqualStrings("#authority", memberships[0].channel);
++        },
++        .projection => {
++            try std.testing.expectEqual(@as(usize, 3), server.globalMemberCount("#authority", 1));
++            const names = try server.remoteOnlyChannelNames();
++            defer alloc.free(names);
++            try std.testing.expectEqual(@as(usize, 0), names.len);
++            try server.sendNames(target, "#authority");
++            try expectContains(target.send_buf[0..target.send_len], "Sender");
++            try expectContains(target.send_buf[0..target.send_len], "Ghost");
++            try std.testing.expect(std.mem.indexOf(u8, target.send_buf[0..target.send_len], "StaleOnly") == null);
++        },
++        .channel_metadata => {
++            try std.testing.expect(!server.remoteChannelSecret("#authority"));
++            const topic = server.remotePublishedTopic("#authority") orelse return error.TestUnexpectedResult;
++            try std.testing.expectEqualStrings("current topic", topic.text);
++            try std.testing.expectEqual(@as(i64, 600), topic.set_at);
++        },
++        .user_count => {
++            // The existing route index counts both handshake server names as
++            // well as Sender and Ghost. Only the live index plus Target counts.
++            for ([_][]const u8{ "replay-a.test", "replay-b.test", "Sender", "Ghost" }) |nick| {
++                try std.testing.expect(live.nick_to_node.contains(nick));
++            }
++            try std.testing.expectEqual(@as(usize, 4), live.nickCount());
++            try std.testing.expectEqual(@as(u64, 1), server.world.localNickCount());
++            try std.testing.expectEqual(@as(u64, 5), server.meshUserCount());
++        },
++        .message_v2 => {
++            var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
++            var signature: [message_relay_v2.sig_len]u8 = undefined;
++            var msg = message_relay_v2.RelayMessage{
++                .verb = .privmsg,
++                .target = "#authority",
++                .source_prefix = "Ghost!current@live.test",
++                .account = "live",
++                .text = "current roster admits this event",
++                .scope_kind = .channel,
++                .origin_node = peer,
++                .hlc = server.nextMeshHlc(),
++            };
++            try message_relay_v2.stampOrigin(alloc, &msg, &pairs[1].idb.sign_kp, &pubkey, &signature);
++            const wire = try message_relay_v2.encode(alloc, msg);
++            defer alloc.free(wire);
++            const first = server.deliverRelayV2(msg, wire, peer);
++            switch (first) {
++                .accepted => {},
++                else => {
++                    std.debug.print("retiring roster MESSAGE_V2 outcome: {any}\n", .{first});
++                    return error.TestUnexpectedResult;
++                },
++            }
++            switch (server.deliverRelayV2(msg, wire, peer)) {
++                .duplicate => {},
++                else => return error.TestUnexpectedResult,
++            }
++            try std.testing.expectEqual(@as(usize, 1), countOccurrences(target.send_buf[0..target.send_len], "PRIVMSG #authority :current roster admits this event\r\n"));
++        },
++        .e2ee_group => {
++            try enrollTestE2eeDevice(server, "live", "phone");
++            var pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
++            var signature: [e2ee_group_relay.sig_len]u8 = undefined;
++            var record = e2ee_group_relay.RelayRecord{
++                .kind = .commit,
++                .channel = "#authority",
++                .source_prefix = "Ghost!current@live.test",
++                .account = "live",
++                .from_device = "phone",
++                .payload = "AQIDBA",
++                .origin_node = peer,
++                .hlc = server.nextMeshHlc(),
++            };
++            try e2ee_group_relay.stampOrigin(alloc, &record, &pairs[1].idb.sign_kp, &pubkey, &signature);
++            const wire = try e2ee_group_relay.encode(alloc, record);
++            defer alloc.free(wire);
++            try std.testing.expectEqual(Server.E2eeGroupDeliveryOutcome.accepted, server.deliverE2eeGroup(record, wire, peer));
++            try std.testing.expectEqual(Server.E2eeGroupDeliveryOutcome.duplicate, server.deliverE2eeGroup(record, wire, peer));
++            try std.testing.expectEqual(@as(usize, 1), countOccurrences(target.send_buf[0..target.send_len], "E2EE.COMMIT #authority live phone :AQIDBA\r\n"));
++        },
++    }
++    try std.testing.expectEqual(loser_counter, pairs[0].a.exportOuter().send_counter);
++    try std.testing.expectEqual(@as(usize, 0), pairs[0].a.outbound().len);
++    try std.testing.expectEqualStrings(held, loser.send_buf[loser.send_offset..loser.send_len]);
++}
++
++test "same-IP mesh dial retiring roster cannot override the survivor nick home" {
++    try expectRetiringRosterUsesSurvivor(.home);
++}
++test "same-IP mesh dial retiring roster cannot supply stale trusted account authority" {
++    try expectRetiringRosterUsesSurvivor(.account);
++}
++test "same-IP mesh dial retiring roster cannot supply stale channel membership" {
++    try expectRetiringRosterUsesSurvivor(.membership);
++}
++test "same-IP mesh dial retiring roster cannot grant stale channel status" {
++    try expectRetiringRosterUsesSurvivor(.status);
++}
++test "same-IP mesh dial retiring roster is absent from WHOIS identity and channels" {
++    try expectRetiringRosterUsesSurvivor(.whois);
++}
++test "same-IP mesh dial retiring roster is absent from LIST and NAMES projection" {
++    try expectRetiringRosterUsesSurvivor(.projection);
++}
++test "same-IP mesh dial retiring roster cannot override current channel metadata" {
++    try expectRetiringRosterUsesSurvivor(.channel_metadata);
++}
++test "same-IP mesh dial retiring roster is absent from the active mesh user count" {
++    try expectRetiringRosterUsesSurvivor(.user_count);
++}
++test "same-IP mesh dial retiring roster cannot reject current signed MESSAGE_V2" {
++    try expectRetiringRosterUsesSurvivor(.message_v2);
++}
++test "same-IP mesh dial retiring roster cannot reject current signed E2EEGROUP" {
++    try expectRetiringRosterUsesSurvivor(.e2ee_group);
++}
++
+ test "same-IP mesh dial unknown inbound peer cannot claim another configured endpoint" {
+     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+     defer current_reactor = null;

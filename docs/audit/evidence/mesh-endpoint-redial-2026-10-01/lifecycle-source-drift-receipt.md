@@ -1,0 +1,3 @@
+Source drift bounded receipt
+
+Observed live 2984d5c2841dd57905caea296f6a2eb725fe91e4f64e035e7cd962b67dbf308d at 2026-10-01 05:04:56 +0200 differed from last-owned 3f59ad4a758fec622ce657f777deb9da4c89f343bf465ff2068f55f3ef628f53 only in the sendCloneAntiEntropy exact owner check and additional pending-maintenance wrong-owner/dedup-only test assertions. Reconstructing those exact two owned additions produced byte-exact known 3f59. No other bytes differ. The live source was restored with explicit matched text replacements under a 2984 hash precondition; both predecessor and reconstructed/final source were preserved. No source writer was identified for the rollback; do not attribute one. No whole-file blind restore or unrelated edits.

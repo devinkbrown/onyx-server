@@ -1,0 +1,25 @@
+**One blocking finding remains.**
+
+- **MEDIUM — retiring plaintext links still publish roster transitions.** [pruneStaleMeshMembers](/home/kain/onyx-server/src/daemon/server.zig:7224) skips secured links but does not exclude closing/dedup plaintext links. During the new five-second drain, maintenance can prune their stale roster and call [drainIdentityTransitions](/home/kain/onyx-server/src/daemon/server.zig:18364). This publishes PART/QUIT/NICK changes; legacy membership folding can also [remove or restore local membership](/home/kain/onyx-server/src/daemon/server.zig:18475), despite a divergent live survivor. Exclude retiring links from this maintenance path and add a loser-before-survivor fixture with expired/pending transitions. Preserve lifecycle drain and netsplit custody separately.
+- **LOW — INFO still counts retiring links as established.** [infoRuntimeLines](/home/kain/onyx-server/src/daemon/server.zig:52020) lacks the closing/dedup guard used by the other active topology views. Apply the same exclusion.
+
+I found no additional blocking issue in endpoint matching/full-key secured transfer, CONNECT storage ownership, adopted address validation, postcommit dial publication, secured routing selectors, or immediate-drive teardown. Drain success requires released SEND ownership and empty retained/backlog buffers; merely queuing SEND does not satisfy it.
+
+The reviewed roster fixtures configure neighbor trust roots, but [populate membership directly](/home/kain/onyx-server/src/daemon/server.zig:106501), including `account_trusted = true`. They sign MESSAGE_V2/E2EEGROUP records; they do **not** feed genuinely signed secured membership as described. This limits their admission-path evidence and should be corrected before attributing any gate failure to stale-roster rejection.
+
+The source distinguishes socketpair drain tests, native TCP close/reheal, Linux-only in-process Helix, and Python native fork/exec with `--skip-partition`. Python retains client sockets, checks tokens/equal msgid/time/cumulative deliveries, and compares appended-log dial counters across the initial 22-second window, each exec, and the final 22-second window. The resume fixture preserves JOIN across retries and checks exact replies.
+
+**SHA-256 at start and end were identical:**
+
+```text
+src/daemon/server.zig
+b060677639a5f6f63c83dada6ebe7254f7fbb6a83a31e7d61b942cebabe2c187
+
+src/daemon/helix/s2s_snapshot.zig
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+```
+
+Static review only: no edits, tests, agents, credentials, or VM operations. Runtime acceptance remains with the parent’s gates; full far-nickname routing is not established by this review.

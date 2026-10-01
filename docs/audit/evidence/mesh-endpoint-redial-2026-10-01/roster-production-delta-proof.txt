@@ -1,0 +1,4 @@
+Final source SHA-256 b060677639a5f6f63c83dada6ebe7254f7fbb6a83a31e7d61b942cebabe2c187
+Baseline b815280a0cc44db9e7f8a02dc7b86ae3cc665a0d343103ae360c27d05eccb708
+Reversing exactly 22 selector bodies and removing only the new retiring-roster fixture/helper block reproduces the entire b815 source byte-identically.
+23 scan guard additions across 22 functions; ten new tests; no other production/test changes.

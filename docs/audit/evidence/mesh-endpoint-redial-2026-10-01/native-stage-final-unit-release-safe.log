@@ -1,0 +1,115 @@
+f982f91c8f97e2a24ccc8aba5ab4511ad6e36c0b2190d2ae9fe4d0612f22a364
+1/109 root.test_0...OK
+2/109 crypto.root.test_0...OK
+3/109 daemon.root.test_0...OK
+4/109 proto.root.test_0...OK
+5/109 substrate.root.test_0...OK
+6/109 wasm.host.root.test_0...OK
+7/109 substrate.io.root.test_0...OK
+8/109 substrate.ripple_props.test_0...OK
+9/109 substrate.ripple.test_0...OK
+10/109 substrate.undertow.root.test_0...OK
+11/109 substrate.undertow.peer_link.test_0...OK
+12/109 substrate.io.buf_ring.test_0...OK
+13/109 substrate.io.ring.test_0...OK
+14/109 proto.asn1_time.test_0...OK
+15/109 proto.certfp.test_0...OK
+16/109 proto.cloak.test_0...OK
+17/109 proto.ircx_modex.test_0...OK
+18/109 proto.ircx_saccess.test_0...OK
+19/109 proto.listx.test_0...OK
+20/109 proto.mooring.test_0...OK
+21/109 proto.mooring_props.test_0...OK
+22/109 proto.quic_handshake.test_0...OK
+23/109 proto.quic_transport_params.test_0...OK
+24/109 proto.sasl_external_verify.test_0...OK
+25/109 proto.sasl_mechrouter.test_0...OK
+26/109 proto.sasl_oauthbearer.test_0...OK
+27/109 proto.sasl.test_0...OK
+28/109 proto.sasl_scram512_server.test_0...OK
+29/109 proto.sasl_scram.test_0...OK
+30/109 proto.sasl_scram_server.test_0...OK
+31/109 proto.signed_delta.test_0...OK
+32/109 proto.toml.test_0...OK
+33/109 proto.x509.test_0...OK
+34/109 daemon.modules.manifest.test_0...OK
+35/109 daemon.key_transparency.test_0...OK
+36/109 daemon.acme_cli.test_0...OK
+37/109 daemon.acme_http01_listener.test_0...OK
+38/109 daemon.acme_renewal.test_0...OK
+39/109 daemon.acme_runner.test_0...OK
+40/109 daemon.config_format.test_0...OK
+41/109 daemon.helix.root.test_0...OK
+42/109 daemon.metrics_http.test_0...OK
+43/109 daemon.webhook.test_0...OK
+44/109 daemon.webhook_render.test_0...OK
+45/109 daemon.webhook_http.test_0...OK
+46/109 daemon.oauth_jwt.test_0...OK
+47/109 daemon.ocsp_staple.test_0...OK
+48/109 daemon.reactor_pool.test_0...OK
+49/109 daemon.sasl_bridge.test_0...OK
+50/109 daemon.scram_store.test_0...OK
+51/109 daemon.server.test.UPGRADE GAP-D2 offline memo survives the dropped process image...OK
+52/109 daemon.server.test.UPGRADE GAP-D2 restored memo is delivered when the account attaches...OK
+53/109 daemon.server.test.GAP-D2 kill-restart and same-image USR2 deliver the memo and fire MEMO_PUSH...SKIP
+54/109 daemon.server.test.same-IP mesh dial plaintext responder loser delivers its final handshake before close...OK
+55/109 daemon.server.test.same-IP mesh dial secured responder loser retains armed ciphertext until send completion...OK
+56/109 daemon.server.test.same-IP mesh dial blocked duplicate drain expires and Helix refuses its partial cut...OK
+57/109 daemon.server.test.same-IP mesh dial receive caller observes zero-output loser retirement by exact generation...OK
+58/109 daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 replay...OK
+59/109 daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK...OK
+60/109 daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK_CONFIRM...OK
+61/109 daemon.server.test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK...OK
+62/109 daemon.server.test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK_CONFIRM...OK
+63/109 daemon.server.test.same-IP mesh dial routing excludes draining loser from Event Spine fanout...OK
+64/109 daemon.server.test.same-IP mesh dial routing excludes draining loser from legacy message fanout...OK
+65/109 daemon.server.test.same-IP mesh dial retiring peer cannot credit endpoint breaker...OK
+66/109 daemon.server.test.same-IP mesh dial SQUIT selects active survivor before retained loser...OK
+67/109 daemon.server.test.same-IP mesh dial mid-turn retirement stops MODE publication...OK
+68/109 daemon.server.test.same-IP mesh dial mid-turn retirement stops SEARCH encoding...OK
+69/109 daemon.server.test.same-IP mesh dial active frame-family control publishes MODE and SEARCH...OK
+70/109 daemon.server.test.same-IP mesh dial retiring roster cannot override the survivor nick home...OK
+71/109 daemon.server.test.same-IP mesh dial retiring roster cannot supply stale trusted account authority...OK
+72/109 daemon.server.test.same-IP mesh dial retiring roster cannot supply stale channel membership...OK
+73/109 daemon.server.test.same-IP mesh dial retiring roster cannot grant stale channel status...OK
+74/109 daemon.server.test.same-IP mesh dial retiring roster is absent from WHOIS identity and channels...OK
+75/109 daemon.server.test.same-IP mesh dial retiring roster is absent from LIST and NAMES projection...OK
+76/109 daemon.server.test.same-IP mesh dial retiring roster cannot override current channel metadata...OK
+77/109 daemon.server.test.same-IP mesh dial retiring roster is absent from the active mesh user count...OK
+78/109 daemon.server.test.same-IP mesh dial retiring roster is absent from active INFO peers...OK
+79/109 daemon.server.test.same-IP mesh dial retiring roster cannot reject current signed MESSAGE_V2...OK
+80/109 daemon.server.test.same-IP mesh dial retiring roster cannot reject current signed E2EEGROUP...OK
+81/109 daemon.server.test.same-IP mesh dial retiring plaintext roster expiration cannot publish or fold legacy PART...OK
+82/109 daemon.server.test.same-IP mesh dial retiring plaintext pending identity cannot publish NICK PART or fold legacy state...OK
+83/109 daemon.server.test.same-IP mesh dial unknown inbound peer cannot claim another configured endpoint...OK
+84/109 daemon.server.test.same-IP mesh dial binding requires the full secured key despite equal peer names...OK
+85/109 daemon.server.test.same-IP mesh dial malformed carried endpoint is refused before slot or dial mutation...OK
+86/109 daemon.server.test.same-IP mesh dial session resume retains JOIN received before a retry...OK
+87/109 daemon.server.test.threaded server: same-IP mesh dial partition heals after inbound binding and sequential Helix...OK
+88/109 daemon.server.test_0...OK
+89/109 daemon.sessions.test_0...OK
+90/109 daemon.tls_certs.test_0...OK
+91/109 daemon.tls_conn.test_0...OK
+92/109 daemon.tls_sni_load.test_0...OK
+93/109 crypto.tls_server.test_0...OK
+94/109 crypto.tls_record.test_0...OK
+95/109 crypto.hkdf_tls13.test_0...OK
+96/109 crypto.hash.test_0...OK
+97/109 crypto.random.test_0...OK
+98/109 crypto.kx.test_0...OK
+99/109 crypto.sign.test_0...OK
+100/109 crypto.xwing.test_0...OK
+101/109 crypto.tls_client.test_0...OK
+102/109 crypto.sct.test_0...OK
+103/109 daemon.memo_durable.test.GAP-D2 memo survives a dropped store image and keeps the mailbox bound...OK
+104/109 crypto.aead.test_0...OK
+105/109 crypto.ecdsa_kat.test_0...OK
+106/109 crypto.ed25519_batch.test_0...OK
+107/109 crypto.sign_kat.test_0...OK
+108/109 crypto.tls_props.test_0...OK
+109/109 crypto.tls.test_0...OK
+108 passed; 1 skipped; 0 failed.
+All 0 tests passed.
+1/2 armor_main.test_0...OK
+2/2 root.test_0...OK
+All 2 tests passed.

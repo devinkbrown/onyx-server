@@ -1,0 +1,33 @@
+**One MEDIUM blocking finding: retiring links still supply routing authority.**
+
+[meshNickHomeNode](/home/kain/onyx-server/src/daemon/server.zig:11904), [trustedRemoteAccountAtNode](/home/kain/onyx-server/src/daemon/server.zig:11949), and [remoteMemberOfChannelAtNode](/home/kain/onyx-server/src/daemon/server.zig:37106) omit `closing`/`s2s_dedup` exclusion. The new drain retains an established loser, stops parsing its input, and therefore freezes its roster.
+
+A loser-only stale home claim can cause a valid MESSAGE_V2 to receive [permanent rejection](/home/kain/onyx-server/src/daemon/server.zig:13300), or an E2EEGROUP record to receive [rejection](/home/kain/onyx-server/src/daemon/server.zig:40914), despite the survivor no longer carrying that claim. Stale account and membership rows also remain eligible authority.
+
+**Action:** exclude retiring links from these authority selectors; add a loser-before-survivor regression with divergent roster state. The new tests use matching established identities and check output selection, so they do not cover this case. This is distinct from repairing full far-nickname routing.
+
+Otherwise, static inspection found:
+
+- Exact endpoint matching, secured full-key transfer, preserved direction/CONNECT storage, strict adopted address rejection, and post-commit dial publication appear consistent.
+- Final draining bypasses the new application flush guard appropriately. SEND ownership/completion and backlog govern retirement; queuing SEND alone does not establish transmission. I found no immediate-drive teardown use-after-free.
+- MESSAGE_V2 and adjacent E2EEGROUP outbound selectors exclude the retained loser; empty secured flush validates the live connection first.
+
+The evidence scopes remain separate: Zig’s sequential in-process Helix branch is Linux-only; the same-IP socket close/reheal test also targets OpenBSD. Python exercises native fork/exec with `--skip-partition`, retains original client sockets/tokens, checks equal msgid/time and cumulative deliveries, and compares appended-log dial counts across the pre-upgrade 22-second window, every exec, and the final 22-second window.
+
+All three hashes were identical at start and end:
+
+```text
+src/daemon/server.zig
+start: b815280a0cc44db9e7f8a02dc7b86ae3cc665a0d343103ae360c27d05eccb708
+end:   b815280a0cc44db9e7f8a02dc7b86ae3cc665a0d343103ae360c27d05eccb708
+
+src/daemon/helix/s2s_snapshot.zig
+start: c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+end:   c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+start: c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+end:   c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+```
+
+Read-only source review only: no edits, tests, agents, credential reads, or VM operations. The finding is source-derived, not reproduced. Runtime acceptance and all gates remain with the parent.

@@ -1,0 +1,181 @@
+Final 63bf1cb095faf88d1fb7dd575d273a340d393e81dfd1a5fe51bc4d0d40ef1aff
+Bounded direct helper test-section audit. Six deficient tests corrected; seven captured owners now valid. The other adjacent replay/burst/authoring callers already bind real registered/adopted or declared standalone link owners. Genuine retirement-negative cases are byte-identical under the six-test reversal proof. Pure admitted peer bridges remain explicit test-only seams as documented in lifecycle inventory.
+
+59365 session replica replay skips attachment leases for rolling-old peers without pinning burst
+var conn = ConnState.init(-1);
+conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+
+59424 session replica mid-flight RESYNC restarts canonical Store without revision churn
+var conn = ConnState.init(-1);
+conn.send_armed = true;
+conn.s2s_secured = &pair.a;
+conn.s2s_secured = null;
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+
+59515 session replica value replay completes 140 objects under continuous behind-cursor renewal
+var conn = ConnState.init(-1);
+conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+
+59593 session replica conflicted lease replays both witnesses back to ingress peer
+var conn = ConnState.init(-1);
+conn.send_armed = true;
+conn.s2s_secured = &pair.a;
+_ = server.drainSessionReplicaV2(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+
+59679 session replica replay preflights SendQ before AEAD advance and resumes at eight frames
+var conn = ConnState.init(-1);
+conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+
+59790 session replica gates establishment and RESYNC membership behind every retained authority page
+var conn = ConnState.init(-1);
+conn.send_armed = true; // keep the unit seam independent of io_uring
+conn.s2s_secured = &pair.a;
+conn.s2s_secured = null;
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+
+59983 session replica burst retains whole-record ciphertext across SendQ backpressure
+var conn = ConnState.init(-1);
+conn.send_armed = true;
+conn.s2s_secured = &pair.a;
+conn.s2s_secured = null;
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+
+60117 session replica live fanout preserves retained ciphertext on a full peer SendQ
+const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+peer.send_armed = true;
+peer.s2s_secured = &pair.a;
+peer.s2s_secured = null;
+server.releaseMeshBurstAfterSessionReplicaReplay(peer, &pair.a);
+server.replaySessionReplicaStoreTo(peer, &pair.a);
+server.releaseMeshBurstAfterSessionReplicaReplay(peer, &pair.a);
+
+60357 session replica burst retries incomplete family after secured record allocation failure
+var conn = ConnState.init(-1);
+conn.send_armed = true;
+conn.s2s_secured = &pair.a;
+conn.s2s_secured = null;
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+
+60434 session replica replay leaves no inner residue after outer record allocation failure
+var conn = ConnState.init(-1);
+conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+
+60499 session replica burst sends every legal mesh ward beyond legacy scratch cap
+var conn = ConnState.init(-1);
+conn.send_armed = true;
+conn.s2s_secured = &pair.a;
+conn.s2s_secured = null;
+server.releaseMeshBurstAfterSessionReplicaReplay(&conn, &pair.a);
+
+60571 session replica replay budgets actual ciphertext with one-frame progress exception
+var conn = ConnState.init(-1);
+conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+var conn = ConnState.init(-1);
+conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+
+60691 maximum legal session replica fits the clamped server-link SendQ and progresses
+var conn = ConnState.init(-1);
+conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
+server.replaySessionReplicaStoreTo(&conn, &pair.a);
+
+60756 v2 Store hot-adoption is SQ-inert until authority-first link activation
+server.replaySessionReplicaStoreTo(conn, conn.s2s_secured.?);
+server.releaseMeshBurstAfterSessionReplicaReplay(conn, conn.s2s_secured.?);
+
+60846 secured roster repair follows inbound membership generations across asymmetric replay
+const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+peer.send_armed = true;
+peer.s2s_secured = &pair.a;
+peer.s2s_secured = null;
+try std.testing.expect(server.sendMembershipBurstTo(peer));
+try std.testing.expect(!server.sendMembershipBurstTo(peer));
+try std.testing.expect(server.sendMembershipBurstTo(peer));
+
+61077 portability-enabled hot-adopt rejects a rolling-old peer before roster release
+server.replaySessionReplicaStoreTo(conn, conn.s2s_secured.?);
+server.releaseMeshBurstAfterSessionReplicaReplay(conn, conn.s2s_secured.?);
+
+63912 MARKREAD secured burst keeps signed frontier through SendQ pressure outer OOM and duplicate repair
+receiver_conn.* = ConnState.init(-1);
+receiver_conn.s2s_secured = &pair.b;
+conn.* = ConnState.init(-1);
+conn.send_armed = true;
+conn.s2s_secured = &pair.a;
+conn.s2s_secured = null;
+try std.testing.expect(!author.sendMeshStateBurstTo(conn));
+try std.testing.expect(author.sendMeshStateBurstTo(conn));
+receiver.drainEntityPropChanges(receiver_conn, &pair.b);
+const oom_sent = author.sendReadMarkerBurstTo(conn);
+try std.testing.expect(author.sendReadMarkerBurstTo(conn));
+receiver.drainEntityPropChanges(receiver_conn, &pair.b);
+
+65939 MESSAGE_V2 Helix authored row waits for rolling-old peer then replays once and retires
+const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+peer_conn.send_armed = true;
+peer_conn.s2s_secured = &pair.a;
+peer_conn.s2s_secured = null;
+server.drainRelayV2Acks(peer_conn, &pair.a);
+
+107568 GAP-O8 mesh ban filter is exchanged before the authoritative list
+var link_conn = ConnState.init(-1);
+link_conn.send_armed = true;
+link_conn.s2s_secured = &pair.a;
+defer link_conn.s2s_secured = null;
+try std.testing.expect(sender.sendMeshWardsTo(&link_conn));
+var client = ConnState.init(-1);
+client.send_armed = true;
+var bystander = ConnState.init(-1);
+bystander.send_armed = true;
+var local = ConnState.init(-1);
+local.send_armed = true;
+
+107757 MARKREAD UPGRADE refuses a v4-only executable preserving private carried ciphertext
+client.send_armed = true;
+const mesh_id = try server.rx().clients.alloc(ConnState.init(-1));
+mesh.send_armed = true;
+mesh.s2s_secured = &pair.a;
+defer mesh.s2s_secured = null; // The pair, rather than Server, owns this link.
+try std.testing.expect(server.sendReadMarkerBurstTo(mesh));
+try std.testing.expect(server.sendReadMarkerBurstTo(mesh));

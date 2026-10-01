@@ -1,0 +1,24 @@
+**No blocking finding in the reviewed delta.** This is static review, not runtime acceptance.
+
+- **Central eligibility:** routing, roster authority, maintenance/resync/probes, session rebinding, bursts, and active views use the shared [ConnState policy](/home/kain/onyx-server/src/daemon/server.zig:2744), directly or through guarded callers. [drainIdentityTransitions](/home/kain/onyx-server/src/daemon/server.zig:18446) verifies the owning physical link before consuming, publishing, or folding transitions. I found no remaining retiring-link authority selector in the inspected production paths.
+- **Custody stays separate:** raw collision identity, netsplit cleanup, checkpoint custody, and independently accepted signed stores retain their required state. [Application flush](/home/kain/onyx-server/src/daemon/server.zig:19439) checks eligibility before empty-buffer success; lifecycle flushing remains available to closing links.
+- **Drain lifetime:** [drain progression](/home/kain/onyx-server/src/daemon/server.zig:52361) requires empty retained output/backlog and released SEND ownership. Queuing SEND is insufficient. Completion, partial-send/overflow, SQ-pressure retry, expiry, and fault paths preserve kernel-owned storage. [Immediate-drive return](/home/kain/onyx-server/src/daemon/server.zig:10343) checks the exact generation; I found no subsequent freed-pointer use. [Helix refuses incomplete drains](/home/kain/onyx-server/src/daemon/server.zig:27799).
+- **Endpoint/adoption:** [matching and transfer](/home/kain/onyx-server/src/daemon/server.zig:52295) require endpoint provenance and full secured-key equality without changing direction or armed CONNECT storage. [Adoption validation](/home/kain/onyx-server/src/daemon/server.zig:31500) rejects malformed size/family/zero port; dial publication occurs [after commit](/home/kain/onyx-server/src/daemon/server.zig:30823).
+- **Fixtures:** [secured roster cases](/home/kain/onyx-server/src/daemon/server.zig:106788) exercise signed membership, trust roots, admission preconditions, and both slot orders. Residence verification remains a declared test stub; historical conflicting-home projection is separately labeled. [Plaintext controls](/home/kain/onyx-server/src/daemon/server.zig:107074) require no loser output/local mutation and genuine active-control effects. The [resume probe](/home/kain/onyx-server/src/daemon/server.zig:109620) synchronizes replies to actual requests.
+
+The Python probe retains physical client sockets, checks tokens/equal msgid/time/cumulative delivery, and compares **append-only cumulative logs** across the settled 22-second baseline, each native exec, and another 22-second window: [log setup](/home/kain/onyx-server/tools/openbsd_session_smoke.py:224), [counters](/home/kain/onyx-server/tools/openbsd_session_smoke.py:575).
+
+Limits: socketpair drainage, native TCP close/reheal, Linux-only in-process Helix, and native fork/exec with `--skip-partition` are distinct evidence scopes. No full far-nickname repair or cached-metric semantic change is established. Parent runs all gates. No edits, tests, agents, credentials, or VM operations were performed.
+
+**Exact SHA-256 values at start and end were identical:**
+
+```text
+src/daemon/server.zig
+0323be5cfb568173b41fb8fc343356947cb62f83ef74e4c2efc6c4e403b8aa49
+
+src/daemon/helix/s2s_snapshot.zig
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+```

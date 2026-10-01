@@ -1,0 +1,99 @@
+test-mod
++- run test 71 pass, 7 fail (78 total)
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 replay' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x1605c79 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:106332:24: 0x1631aa8 in expectDrainingRouteUsesSurvivor (root.zig)
+               .message_v2 => try std.testing.expect(server.replayRelayV2WireToPeer(peer, wire)),
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:106400:5: 0x27657d9 in test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 replay (root.zig)
+           try expectDrainingRouteUsesSurvivor(.message_v2);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x1605c79 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:106333:17: 0x1631f78 in expectDrainingRouteUsesSurvivor (root.zig)
+               .ack => try std.testing.expect(server.sendRelayV2AckToPeer(peer, relay_id)),
+                       ^
+       /home/kain/onyx-server/src/daemon/server.zig:106403:5: 0x2765759 in test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK (root.zig)
+           try expectDrainingRouteUsesSurvivor(.ack);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK_CONFIRM' failed:
+       expected 2, found 3
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x16283f3 in expectEqualInner__anon_192449 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x1632d79 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106348:5: 0x16331ef in expectDrainingRouteUsesSurvivor (root.zig)
+           try std.testing.expectEqual(initial_counter, pairs[0].a.exportOuter().send_counter);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106406:5: 0x27656d9 in test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK_CONFIRM (root.zig)
+           try expectDrainingRouteUsesSurvivor(.ack_confirm);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK' failed:
+       expected 2, found 3
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x16283f3 in expectEqualInner__anon_192449 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x1632d79 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106348:5: 0x16331ef in expectDrainingRouteUsesSurvivor (root.zig)
+           try std.testing.expectEqual(initial_counter, pairs[0].a.exportOuter().send_counter);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106409:5: 0x2765659 in test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK (root.zig)
+           try expectDrainingRouteUsesSurvivor(.e2ee_ack);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK_CONFIRM' failed:
+       expected 2, found 3
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x16283f3 in expectEqualInner__anon_192449 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x1632d79 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106348:5: 0x16331ef in expectDrainingRouteUsesSurvivor (root.zig)
+           try std.testing.expectEqual(initial_counter, pairs[0].a.exportOuter().send_counter);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106412:5: 0x27655d9 in test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK_CONFIRM (root.zig)
+           try expectDrainingRouteUsesSurvivor(.e2ee_confirm);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser from Event Spine fanout' failed:
+       expected 2, found 3
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x16283f3 in expectEqualInner__anon_192449 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x1632d79 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106348:5: 0x16331ef in expectDrainingRouteUsesSurvivor (root.zig)
+           try std.testing.expectEqual(initial_counter, pairs[0].a.exportOuter().send_counter);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106415:5: 0x2764a39 in test.same-IP mesh dial routing excludes draining loser from Event Spine fanout (root.zig)
+           try expectDrainingRouteUsesSurvivor(.oper_event);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser from legacy message fanout' failed:
+       expected 2, found 3
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x16283f3 in expectEqualInner__anon_192449 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x1632d79 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106348:5: 0x16331ef in expectDrainingRouteUsesSurvivor (root.zig)
+           try std.testing.expectEqual(initial_counter, pairs[0].a.exportOuter().send_counter);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106418:5: 0x163f8f9 in test.same-IP mesh dial routing excludes draining loser from legacy message fanout (root.zig)
+           try expectDrainingRouteUsesSurvivor(.legacy_message);
+           ^
+failed command: ./.zig-cache/o/00b3a82ea070d3ec3e6fbe2a0bea92b7/test --cache-dir=./.zig-cache --seed=0xb80fcc6f --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 71/78 tests passed (7 failed)
+test-mod transitive failure
++- run test 71 pass, 7 fail (78 total)
+   +- compile test Debug native success 15s MaxRSS:559M
+      +- options cached

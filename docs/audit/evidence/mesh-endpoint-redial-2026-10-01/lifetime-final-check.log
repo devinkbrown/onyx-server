@@ -1,0 +1,4 @@
+Build Summary: 3/3 steps succeeded
+check success
++- compile exe onyx-server-check Debug native success 5s MaxRSS:348M
+   +- options cached

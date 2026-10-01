@@ -2648,8 +2648,16 @@ pub const ConnState = struct {
     /// `closeConn` must NOT emit a netsplit — the members never actually left, so
     /// a netsplit QUIT would spuriously churn the channel.
     s2s_dedup: bool = false,
-    /// Target address for an outbound S2S connect, kept here (the slot is stable)
-    /// so it outlives the in-flight IORING_OP_CONNECT submission.
+    /// A collision loser still owes its final handshake/output to the remote
+    /// initiator. Closing excludes it from routing, but shutdown must wait for
+    /// the exact SEND completion. A blocked peer cannot retain the slot forever.
+    s2s_dedup_drain_deadline_ms: i64 = 0,
+    /// True when the address below is initialized. An outbound dial establishes
+    /// the endpoint association; duplicate collapse may carry it to an inbound
+    /// survivor only after comparing the full authenticated peer public key.
+    s2s_dial_target_known: bool = false,
+    /// Configured target, also retained by an authenticated inbound survivor.
+    /// Stable inline storage outlives an in-flight IORING_OP_CONNECT submission.
     s2s_connect_addr: posix.sockaddr.in6 = undefined,
     /// Non-null while this client has an open inbound draft/multiline batch.
     /// Heap-owned; freed when the batch closes/aborts or the connection ends.
@@ -2729,6 +2737,30 @@ pub const ConnState = struct {
 
     pub fn init(fd: linux.fd_t) ConnState {
         return .{ .fd = fd };
+    }
+
+    /// Retirement revokes all new mesh admission immediately. Protocol state
+    /// stays intact while custody/lifecycle code drains the final owned flight.
+    fn meshAdmissionOpen(self: *const ConnState) bool {
+        return !self.closing and !self.s2s_dedup;
+    }
+
+    /// Single eligibility cut for connection-backed routing, authority,
+    /// projection and maintenance. Handshake/custody use their own boundaries.
+    fn isActiveMeshPeer(self: *const ConnState) bool {
+        if (!self.meshAdmissionOpen()) return false;
+        if (self.s2s_secured) |link| return link.established();
+        if (self.s2s) |link| return link.established();
+        return false;
+    }
+
+    fn ownsActiveMeshLink(self: *const ConnState, link: anytype) bool {
+        if (!self.isActiveMeshPeer()) return false;
+        if (comptime @TypeOf(link) == *secured_s2s_link.SecuredLink)
+            return self.s2s_secured == link;
+        if (comptime @TypeOf(link) == *s2s_link.S2sLink)
+            return self.s2s == link;
+        @compileError("unsupported mesh link type");
     }
 
     /// The channel this connection publishes WS media to, or null when not in a
@@ -5395,6 +5427,7 @@ pub const LinuxServer = struct {
                 for (self.reactors) |*reactor| {
                     var it = reactor.clients.iterator();
                     while (it.next()) |entry| {
+                        if (!entry.value.isActiveMeshPeer()) continue;
                         const link = entry.value.s2s_secured orelse continue;
                         if (!link.established() or !link.supportsE2eeGroup()) continue;
                         if (link.remoteNodeId() == required_node) {
@@ -5444,6 +5477,7 @@ pub const LinuxServer = struct {
         for (self.reactors) |*reactor| {
             var it = reactor.clients.iterator();
             while (it.next()) |entry| {
+                if (!entry.value.isActiveMeshPeer()) continue;
                 if (entry.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     Remember.peer(
@@ -7166,7 +7200,7 @@ pub const LinuxServer = struct {
     /// link-establish burst (`sendMembershipBurstTo`) on a periodic cadence.
     fn resyncMeshStateToPeers(self: *LinuxServer) void {
         for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
+            if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
             const is_peer = slot.value.s2s_secured != null or slot.value.s2s != null;
             if (!is_peer) continue;
             const established = if (slot.value.s2s_secured) |l|
@@ -7211,15 +7245,15 @@ pub const LinuxServer = struct {
     fn pruneStaleMeshMembers(self: *LinuxServer, now_ms: i64) void {
         const window: i64 = stale_member_ttl_ms;
         for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
+            if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
             if (slot.value.s2s_secured != null) continue;
             if (slot.value.s2s) |link| {
                 if (!link.established()) continue;
                 _ = link.peer.pruneStaleMembers(now_ms, window) catch {
-                    self.drainIdentityTransitions(link);
+                    self.drainIdentityTransitions(&slot.value, link);
                     continue;
                 };
-                self.drainIdentityTransitions(link);
+                self.drainIdentityTransitions(&slot.value, link);
             }
         }
     }
@@ -7982,7 +8016,10 @@ pub const LinuxServer = struct {
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
-            if (c.closing) continue; // already tearing down
+            if (c.closing) {
+                if (c.s2s_dedup_drain_deadline_ms != 0) self.progressS2sDedupDrain(c);
+                continue;
+            }
             if (c.s2s != null or c.s2s_secured != null) {
                 // TCP ESTABLISHED is not peer liveness: a vanished/restarted peer
                 // can leave a half-open socket indefinitely. RTT probes below set
@@ -8277,9 +8314,7 @@ pub const LinuxServer = struct {
         });
         defer prepared.deinit();
         const arena = prepared.runtime.arena orelse return error.SessionReplicaConverging;
-        const dup_rc = linux.dup(arena.fd);
-        if (linux.errno(dup_rc) != .SUCCESS) return error.SocketUnavailable;
-        capture.arena_fd = @intCast(dup_rc);
+        capture.arena_fd = try os_runtime.duplicate(arena.fd);
         errdefer {
             closeFd(capture.arena_fd);
             capture.arena_fd = -1;
@@ -9719,7 +9754,7 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         link: *secured_s2s_link.SecuredLink,
     ) void {
-        if (conn.relay_v2_unbound_bound or !link.established() or
+        if (!conn.ownsActiveMeshLink(link) or conn.relay_v2_unbound_bound or
             !link.supportsSecureRelayV2()) return;
         const peer = link.remoteNodeId() orelse return;
         if (!self.relayV2DirectNeighbor(peer)) return;
@@ -9776,6 +9811,7 @@ pub const LinuxServer = struct {
     /// Drive a PQ-secured S2S peer: feed inbound bytes through the framed Mooring
     /// link and queue its outbound. Logs the AKE establishment transition.
     fn driveS2sSecured(self: *LinuxServer, conn: *ConnState, link: *secured_s2s_link.SecuredLink, bytes: []const u8) void {
+        if (!conn.meshAdmissionOpen() or conn.s2s_secured != link) return;
         const was = link.established();
         const now: u64 = @intCast(@max(0, self.nowMs()));
         link.feed(bytes, now) catch |err| {
@@ -9832,6 +9868,7 @@ pub const LinuxServer = struct {
             // local OFFERs; they never trigger a whole-store refresh/remint.
             if (!conn.session_replica_replay_pending) self.scheduleSessionReplicaReplay(conn);
         }
+        if (!conn.ownsActiveMeshLink(link)) return;
         self.bindRelayV2UnboundIfReady(conn, link);
         if (link.established()) {
             self.accountPeerBytes(link.remoteName(), bytes.len, out_len);
@@ -9842,6 +9879,7 @@ pub const LinuxServer = struct {
         // the first MESSAGE can share one socket read; draining the frame-family
         // queues in the opposite order would falsely reject that first event.
         const residence_batch_complete = self.drainSessionReplicaV2(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         if (residence_batch_complete)
             link.processDeferredResidenceFrames(now)
         else
@@ -9864,48 +9902,73 @@ pub const LinuxServer = struct {
         // retained from an earlier read. Retry them before newer signed frames.
         self.retryDeferredRelayV2();
         self.drainRelayV2(conn, link);
-        self.drainRelayV2Acks(link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainRelayV2Acks(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Surface identity transitions in the exact order accepted by the peer.
-        self.drainIdentityTransitions(link);
+        self.drainIdentityTransitions(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply/surface remote aggregate channel MODE flag changes in real time.
-        self.drainChannelModeFlagChanges(link);
+        self.drainChannelModeFlagChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply/surface remote parameter/IRCX channel MODE state in real time.
-        self.drainChannelModeStateChanges(link);
+        self.drainChannelModeStateChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply/surface remote channel list-mode (+b/+e/+I) changes in real time.
-        self.drainChannelListChanges(link);
+        self.drainChannelListChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply remote IRCX channel PROP changes and surface non-secret updates.
-        self.drainChannelPropChanges(link);
+        self.drainChannelPropChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply remote IRCX user/member PROP changes (ENTITY_PROP) to the store.
-        self.drainEntityPropChanges(link);
+        self.drainEntityPropChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // E2EEGROUP authorization consumes the already-applied session,
         // residence, membership, and device-property authorities above.
         self.drainE2eeGroup(conn, link);
-        self.drainE2eeGroupAcks(link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainE2eeGroupAcks(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply/surface remote channel topic changes in real time.
-        self.drainTopicChanges(link);
+        self.drainTopicChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Audit origin-spoofed or misrouted direct-owned S2S frames.
-        self.drainOriginRejections(link);
+        self.drainOriginRejections(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Fold this peer's network-wide clone counts into the aggregate.
-        self.drainCloneCountsFrom(link);
-        self.drainOperEvents(link);
-        self.drainOperEventsV2(link);
-        self.drainObserveEvents(link);
-        self.drainKills(link);
-        self.drainWards(link);
-        self.drainMeshSearch(link);
-        self.drainKeyTransHeads(link);
-        self.drainMemoPushes(link);
-        self.drainMediaWsDatagrams(link);
+        self.drainCloneCountsFrom(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainOperEvents(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainOperEventsV2(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainObserveEvents(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainKills(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainWards(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainMeshSearch(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainKeyTransHeads(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainMemoPushes(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainMediaWsDatagrams(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         self.drainRepairResync(conn, link, true);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Consume tombstones first. The peer driver keeps frame families in
         // separate queues, so this ordering makes a consume win over a delayed
         // offer that arrived in the same socket turn.
-        self.drainSessionMigrationConsumed(link);
+        self.drainSessionMigrationConsumed(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Drain inbound live-session migration capsules: verify each against the
         // peer's authenticated node key (MigrationTarget.accept) and stage it in
         // pending_migrations for the client's eventual reconnect+reclaim. Only the
         // secured leg carries these (the capsule holds account/host state).
-        self.drainSessionMigrations(link);
+        self.drainSessionMigrations(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Drain inbound cross-mesh oper grants. Each is verified against the
         // peer's authenticated Ed25519 key from the Mooring handshake before it
         // can confer operator authority locally — an unverifiable grant is
@@ -9947,6 +10010,7 @@ pub const LinuxServer = struct {
     /// every burst made peers treat an unchanged privilege refresh as
     /// `superseded` and re-broadcast synthetic `MODE +Y` forever.
     fn sendLocalOperBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
         const link = conn.s2s_secured orelse return true;
         const kp = self.meshSignKey() orelse return true;
         const now = self.grantNowU64();
@@ -9988,6 +10052,7 @@ pub const LinuxServer = struct {
     }
 
     fn sendMeshWardsTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
         const link = conn.s2s_secured orelse return true;
         if (!link.established()) return true;
         // The compact filter is the first mesh-ban frame. The records below
@@ -10037,6 +10102,7 @@ pub const LinuxServer = struct {
     }
 
     fn driveS2s(self: *LinuxServer, conn: *ConnState, link: *s2s_link.S2sLink, bytes: []const u8) void {
+        if (!conn.meshAdmissionOpen() or conn.s2s != link) return;
         self.s2s_feed_seq +%= 1;
         const was = link.established();
         const now: u64 = @intCast(@max(0, self.nowMs()));
@@ -10070,6 +10136,7 @@ pub const LinuxServer = struct {
             self.syncPeerRtt(link.remoteName(), link.lastRttMs());
             self.notePeerSendBacklog(link.remoteName(), connSendBacklog(conn));
         }
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Drain inbound cross-node user messages and deliver to local clients.
         if (link.takeInbound()) |inbound| {
             for (inbound) |*owned| {
@@ -10079,30 +10146,46 @@ pub const LinuxServer = struct {
             self.allocator.free(inbound);
         } else |_| {}
         // Surface identity transitions in the exact order accepted by the peer.
-        self.drainIdentityTransitions(link);
+        self.drainIdentityTransitions(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply/surface remote aggregate channel MODE flag changes in real time.
-        self.drainChannelModeFlagChanges(link);
+        self.drainChannelModeFlagChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply/surface remote parameter/IRCX channel MODE state in real time.
-        self.drainChannelModeStateChanges(link);
+        self.drainChannelModeStateChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply/surface remote channel list-mode (+b/+e/+I) changes in real time.
-        self.drainChannelListChanges(link);
+        self.drainChannelListChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply remote IRCX channel PROP changes and surface non-secret updates.
-        self.drainChannelPropChanges(link);
+        self.drainChannelPropChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply remote IRCX user/member PROP changes (ENTITY_PROP) to the store.
-        self.drainEntityPropChanges(link);
+        self.drainEntityPropChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Apply/surface remote channel topic changes in real time.
-        self.drainTopicChanges(link);
+        self.drainTopicChanges(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Audit origin-spoofed or misrouted direct-owned S2S frames.
-        self.drainOriginRejections(link);
+        self.drainOriginRejections(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         // Fold this peer's network-wide clone counts into the aggregate.
-        self.drainCloneCountsFrom(link);
-        self.drainOperEvents(link);
-        self.drainObserveEvents(link);
-        self.drainKills(link);
-        self.drainWards(link);
-        self.drainMeshSearch(link);
-        self.drainKeyTransHeads(link);
+        self.drainCloneCountsFrom(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainOperEvents(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainObserveEvents(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainKills(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainWards(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainMeshSearch(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainKeyTransHeads(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         self.drainRepairResync(conn, link, false);
+        if (!conn.ownsActiveMeshLink(link)) return;
         if (!conn.s2s_burst_done and link.established()) {
             if (self.sendMeshStateBurstTo(conn)) {
                 conn.s2s_burst_done = true;
@@ -10116,7 +10199,7 @@ pub const LinuxServer = struct {
     /// peer-driver CRDT shadow; user-visible roster/mode/prop state still arrives
     /// through normal daemon-drained S2S frame families.
     fn drainRepairResync(self: *LinuxServer, conn: *ConnState, link: anytype, secured: bool) void {
-        if (!link.established() or !link.takeRepairResyncRequest()) return;
+        if (!conn.ownsActiveMeshLink(link) or !link.takeRepairResyncRequest()) return;
         self.traceLog(.info, .s2s, "s2s repair applied; requesting full state resync");
         link.sendResync() catch {
             conn.closing = true;
@@ -10257,7 +10340,10 @@ pub const LinuxServer = struct {
                 else => return err,
             };
         }
-        return true;
+        // A driver may synchronously finalize a collision loser or terminal
+        // failure after RECV released its storage reference. The completion
+        // caller must not use that old pointer, even if its slot was reused.
+        return self.connFor(id) != null;
     }
 
     fn driveProxyHeader(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, chunk: []const u8) !bool {
@@ -10400,7 +10486,7 @@ pub const LinuxServer = struct {
                     // false-trip an idle disconnect.
                     conn.last_activity_ms = self.nowMs();
                     conn.awaiting_pong = false;
-                    if (establishedPeerName(conn)) |peer_name| self.notePeerStillHere(peer_name, 0);
+                    if (activeMeshPeerName(conn)) |peer_name| self.notePeerStillHere(peer_name, 0);
                     self.stats.onBytesIn(pt.len);
                     if (!try self.driveClientBytes(id, conn, pt)) return .freed;
                     survived = true;
@@ -10511,7 +10597,7 @@ pub const LinuxServer = struct {
             conn.last_activity_ms = self.nowMs();
             conn.awaiting_pong = false;
             // Inbound bytes are presence. The peer's hybrid logical clock is not read.
-            if (establishedPeerName(conn)) |peer_name| self.notePeerStillHere(peer_name, 0);
+            if (activeMeshPeerName(conn)) |peer_name| self.notePeerStillHere(peer_name, 0);
             if (conn.proxy_pending) {
                 if (!try self.driveProxyHeader(id, conn, chunk)) return;
             } else {
@@ -10550,6 +10636,10 @@ pub const LinuxServer = struct {
         // now; sending any later queued bytes would cross the known stream gap.
         if (self.abortDeliveryGapFor(id, conn)) return;
         if (event.res < 0) {
+            // An actual stream error cannot complete the collision handshake.
+            // Preserve the ordinary immediate failure path instead of retrying
+            // a tail across a known byte gap.
+            conn.s2s_dedup_drain_deadline_ms = 0;
             try self.closeConn(event.token, conn.close_reason);
             return;
         }
@@ -10604,6 +10694,7 @@ pub const LinuxServer = struct {
     fn beginDeliveryGapAbort(_: *LinuxServer, conn: *ConnState) void {
         if (conn.delivery_abort_started) return;
         conn.delivery_abort_started = true;
+        conn.s2s_dedup_drain_deadline_ms = 0;
         conn.closing = true;
         conn.close_reason = delivery_gap_reason;
     }
@@ -11706,7 +11797,7 @@ pub const LinuxServer = struct {
         var sent: usize = 0;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -11730,7 +11821,7 @@ pub const LinuxServer = struct {
     fn hasSecureRelayV2Peer(self: *LinuxServer) bool {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 if (slot.value.s2s_secured) |link| {
                     if (link.established() and link.supportsSecureRelayV2()) return true;
                 }
@@ -11798,7 +11889,7 @@ pub const LinuxServer = struct {
     fn hasEstablishedPeer(self: *LinuxServer) bool {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 if (slot.value.s2s_secured) |l| {
                     if (l.established()) return true;
                 } else if (slot.value.s2s) |l| {
@@ -11820,7 +11911,7 @@ pub const LinuxServer = struct {
     fn relayOriginIsDirectPeer(self: *LinuxServer, origin_node: u64) bool {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 if (slot.value.s2s_secured) |link| {
                     if (link.established() and link.remoteNodeId() == origin_node) return true;
                 } else if (slot.value.s2s) |link| {
@@ -11886,7 +11977,7 @@ pub const LinuxServer = struct {
         var best: ?s2s_link.NickClaim = null;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     if (link.bestNickClaim(nick)) |claim| mergeMeshNickClaim(&best, claim);
@@ -11931,7 +12022,7 @@ pub const LinuxServer = struct {
         var found: ?[]const u8 = null;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const member = if (slot.value.s2s_secured) |link| blk: {
                     if (!link.established()) continue;
                     break :blk link.findRemoteMember(nick);
@@ -12324,7 +12415,7 @@ pub const LinuxServer = struct {
     fn relayOriginServerName(self: *LinuxServer, origin_node: u64) ?[]const u8 {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     if (link.remoteNodeId() == origin_node and link.remoteName().len != 0) return link.remoteName();
@@ -12837,7 +12928,7 @@ pub const LinuxServer = struct {
     ) bool {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsSecureRelayV2()) continue;
                 if ((link.remoteNodeId() orelse continue) != peer) continue;
@@ -12862,7 +12953,7 @@ pub const LinuxServer = struct {
     ) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsRelayV2AckConfirm()) continue;
                 if ((link.remoteNodeId() orelse continue) != peer) continue;
@@ -12929,8 +13020,10 @@ pub const LinuxServer = struct {
 
     fn drainRelayV2Acks(
         self: *LinuxServer,
+        conn: *const ConnState,
         link: *secured_s2s_link.SecuredLink,
     ) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const peer = link.remoteNodeId() orelse return;
         const acks = link.takeInboundV2Acks() catch return;
         defer self.allocator.free(acks);
@@ -13045,7 +13138,7 @@ pub const LinuxServer = struct {
     fn replayRelayV2WireToPeer(self: *LinuxServer, peer: u64, wire: []const u8) bool {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsSecureRelayV2()) continue;
                 if ((link.remoteNodeId() orelse continue) != peer) continue;
@@ -13166,6 +13259,7 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         link: *secured_s2s_link.SecuredLink,
     ) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const inbound = link.takeInboundV2() catch return;
         defer self.allocator.free(inbound);
         for (inbound, 0..) |*item, inbound_index| {
@@ -14150,6 +14244,7 @@ pub const LinuxServer = struct {
     /// exact-generation completion clears `connect_armed`.
     fn armConnect(self: *LinuxServer, conn: *ConnState) !void {
         if (self.rx().socket_io_quiescing or conn.connect_armed or conn.closing) return;
+        if (!conn.s2s_initiator or !conn.s2s_dial_target_known) return error.InvalidAddress;
         try self.rx().ring.submitConnect(
             conn.token,
             conn.fd,
@@ -14356,6 +14451,13 @@ pub const LinuxServer = struct {
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
         const id = idFromToken(token);
         if (self.rx().clients.get(id)) |conn| {
+            // A racing RECV (including cancellation at a Helix safe point) must
+            // not shutdown the socket while a collision's final SEND owns its
+            // buffer or retained link output still needs staging.
+            if (conn.s2s_dedup_drain_deadline_ms != 0) {
+                self.progressS2sDedupDrain(conn);
+                return;
+            }
             // Request-close and final teardown are deliberately separate. A CQE's
             // generation check protects dispatch, but it cannot stop the kernel
             // from touching inline slot storage. Retain the first reason, force a
@@ -15910,7 +16012,7 @@ pub const LinuxServer = struct {
     /// is shared by the one-shot link-establish burst and the periodic
     /// anti-entropy cadence so new state families have one re-sync hook.
     fn sendMeshStateBurstTo(self: *LinuxServer, conn: *ConnState) bool {
-        if (conn.closing) return false;
+        if (!conn.isActiveMeshPeer()) return false;
         if (conn.mesh_burst_stage == .idle) conn.mesh_burst_stage = .membership;
 
         while (conn.mesh_burst_stage != .idle) {
@@ -16094,6 +16196,7 @@ pub const LinuxServer = struct {
     /// link (the conn's s2s/s2s_secured), so the peer's NAMES/WHO is correct
     /// immediately rather than only after subsequent joins. Best-effort. (#65)
     fn sendMembershipBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
         // Wall-clock mesh HLC — feeds route_table's cross-host LWW (nick/channel
         // keyed), so it must be recency-comparable, never monotonic (was the
         // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
@@ -16179,6 +16282,7 @@ pub const LinuxServer = struct {
     /// Burst aggregate local channel MODE flags to ONE freshly-established peer
     /// so a relink converges immediately instead of waiting for the next MODE.
     fn sendChannelModeFlagsBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
         // Wall-clock mesh HLC — feeds route_table's cross-host LWW (nick/channel
         // keyed), so it must be recency-comparable, never monotonic (was the
         // per-host `self.nowMs()`, the membership-desync root cause). See nextMeshHlc.
@@ -16281,6 +16385,7 @@ pub const LinuxServer = struct {
     }
 
     fn sendChannelModeStateBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
         const hlc = self.nextMeshHlc();
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
@@ -16298,7 +16403,7 @@ pub const LinuxServer = struct {
         const ev = self.channelModeStateEvent(channel, self.nextMeshHlc());
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -16751,7 +16856,7 @@ pub const LinuxServer = struct {
         if (kind == .user and account_identity.isReservedNamespace(key)) return;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -17273,7 +17378,8 @@ pub const LinuxServer = struct {
     /// to the local store, then fan each applied change out to local IRCX clients
     /// (mirroring a local change's visibility) in addition to the on-demand
     /// PROP GET reply path.
-    fn drainEntityPropChanges(self: *LinuxServer, link: anytype) void {
+    fn drainEntityPropChanges(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const changes = link.takeEntityPropChanges() catch return;
         const remote = link.remoteName();
         for (changes) |*ch| {
@@ -17295,6 +17401,7 @@ pub const LinuxServer = struct {
     /// that has no clock yet), falling back to unsigned for an emit whose live
     /// tuple diverged from the signed one.
     fn sendEntityPropBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
         var it = self.entity_prop_clocks.iterator();
         while (it.next()) |entry| {
             const clock = entry.value_ptr;
@@ -17323,6 +17430,7 @@ pub const LinuxServer = struct {
     }
 
     fn sendChannelPropBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
             const entity = ircx_prop_store.Entity{ .kind = .channel, .id = cv.name };
@@ -17402,7 +17510,7 @@ pub const LinuxServer = struct {
         const hlc = self.nextMeshHlc();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -17425,7 +17533,7 @@ pub const LinuxServer = struct {
         const hlc = self.nextMeshHlc();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -17456,7 +17564,7 @@ pub const LinuxServer = struct {
         const hlc = self.nextMeshHlc();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -17490,7 +17598,7 @@ pub const LinuxServer = struct {
     ) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -17710,7 +17818,7 @@ pub const LinuxServer = struct {
     fn broadcastCloneCounts(self: *LinuxServer, payload: []const u8) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -17748,7 +17856,8 @@ pub const LinuxServer = struct {
     /// Drain a peer's inbound CLONE_COUNT payloads and fold them into the
     /// aggregate under that link's authenticated node id. Always frees the queued
     /// payloads (even when the link has no node id yet).
-    fn drainCloneCountsFrom(self: *LinuxServer, link: anytype) void {
+    fn drainCloneCountsFrom(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const payloads = link.takeCloneCounts() catch return;
         const node = link.remoteNodeId() orelse {
             for (payloads) |p| self.allocator.free(p);
@@ -17762,6 +17871,7 @@ pub const LinuxServer = struct {
     /// so it converges immediately. Chunked (bounded stack); best-effort. Flushes
     /// through `conn` (the drive path owns the connection, not a pid).
     fn sendCloneAntiEntropy(self: *LinuxServer, conn: *ConnState, link: anytype) bool {
+        if (!conn.ownsActiveMeshLink(link)) return false;
         if (self.config.max_clones_per_ip_net == 0) return true;
         const chunk = 256;
         var buf: [mesh_clones_mod.encodedLen(chunk)]u8 = undefined;
@@ -17778,7 +17888,6 @@ pub const LinuxServer = struct {
             const payload = mesh_clones_mod.encodeCounts(&buf, entries[0..n]) catch return false;
             link.sendCloneCounts(payload) catch return false;
         }
-        _ = conn;
         return true;
     }
 
@@ -17870,7 +17979,7 @@ pub const LinuxServer = struct {
     fn remoteMemberStatusInChannel(self: *LinuxServer, channel: []const u8, nick: []const u8) ?u4 {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const members = if (slot.value.s2s_secured) |l|
                     l.channelMembers(channel)
                 else if (slot.value.s2s) |l|
@@ -18035,7 +18144,7 @@ pub const LinuxServer = struct {
     fn remoteNickInChannel(self: *LinuxServer, channel: []const u8, nick: []const u8) bool {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const members = blk: {
                     if (slot.value.s2s_secured) |link| {
                         if (link.established()) break :blk link.channelMembers(channel);
@@ -18182,7 +18291,7 @@ pub const LinuxServer = struct {
         }
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const members = blk: {
                     if (slot.value.s2s_secured) |link| {
                         if (link.established()) break :blk link.channelMembers(channel);
@@ -18246,7 +18355,7 @@ pub const LinuxServer = struct {
         while (cit.next()) |cv| {
             for (self.reactors) |*reactor| {
                 for (reactor.clients.slots.items) |*slot| {
-                    if (!slot.occupied) continue;
+                    if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                     const members = blk: {
                         if (slot.value.s2s_secured) |link| {
                             if (link.established()) break :blk link.channelMembers(cv.name);
@@ -18281,7 +18390,7 @@ pub const LinuxServer = struct {
         while (cit.next()) |cv| {
             for (self.reactors) |*reactor| {
                 for (reactor.clients.slots.items) |*slot| {
-                    if (!slot.occupied) continue;
+                    if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                     const members = blk: {
                         if (slot.value.s2s_secured) |link| {
                             if (link.established()) break :blk link.channelMembers(cv.name);
@@ -18334,7 +18443,8 @@ pub const LinuxServer = struct {
     /// family order rewrote that sequence and exposed impossible client state.
     /// Consecutive same-channel JOINs are still grouped into bounded NETJOIN
     /// batches, but an intervening NICK is now an ordering barrier.
-    fn drainIdentityTransitions(self: *LinuxServer, link: anytype) void {
+    fn drainIdentityTransitions(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const remote = link.remoteName();
         const fold_legacy = !link.supportsSessionReplicaV2();
 
@@ -18544,7 +18654,8 @@ pub const LinuxServer = struct {
 
     /// Drain a link's remote aggregate channel MODE flag changes, apply each to
     /// the local world, and surface the actual local delta as a MODE line.
-    fn drainChannelModeFlagChanges(self: *LinuxServer, link: anytype) void {
+    fn drainChannelModeFlagChanges(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const changes = link.takeChannelModeFlagChanges() catch return;
         const remote = link.remoteName();
         for (changes) |*ch| {
@@ -18561,7 +18672,8 @@ pub const LinuxServer = struct {
 
     /// Drain remote parameter/IRCX channel MODE snapshots, preserving local MLOCK
     /// authority and surfacing actual local deltas as MODE lines.
-    fn drainChannelModeStateChanges(self: *LinuxServer, link: anytype) void {
+    fn drainChannelModeStateChanges(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const changes = link.takeChannelModeStateChanges() catch return;
         const remote = link.remoteName();
         for (changes) |*ch| {
@@ -18575,7 +18687,8 @@ pub const LinuxServer = struct {
         self.allocator.free(changes);
     }
 
-    fn drainOriginRejections(self: *LinuxServer, link: anytype) void {
+    fn drainOriginRejections(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const rejected = link.takeRejectedOriginFrames();
         if (rejected == 0) return;
         var buf: [160]u8 = undefined;
@@ -18800,7 +18913,8 @@ pub const LinuxServer = struct {
     /// Drain a link's remote IRCX channel PROP changes, apply them LWW to the
     /// local store, and fan PROP-change lines out to local IRCX members (per-tier
     /// for secret keys), mirroring a local change's visibility.
-    fn drainChannelPropChanges(self: *LinuxServer, link: anytype) void {
+    fn drainChannelPropChanges(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const changes = link.takeChannelPropChanges() catch return;
         const remote = link.remoteName();
         for (changes) |*ch| {
@@ -18843,7 +18957,8 @@ pub const LinuxServer = struct {
 
     /// Drain remote +b/+e/+I list-mode changes, apply them to local world state,
     /// and surface real changes as MODE lines to local channel members.
-    fn drainChannelListChanges(self: *LinuxServer, link: anytype) void {
+    fn drainChannelListChanges(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const changes = link.takeChannelListChanges() catch return;
         const remote = link.remoteName();
         for (changes) |*ch| {
@@ -18856,7 +18971,8 @@ pub const LinuxServer = struct {
     /// Drain remote channel topic changes, apply each to the local world (so
     /// TOPIC queries reflect it), and surface a live `TOPIC` line to local
     /// members. The route-table LWW already gated stale/re-burst events.
-    fn drainTopicChanges(self: *LinuxServer, link: anytype) void {
+    fn drainTopicChanges(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const changes = link.takeTopicChanges() catch return;
         const remote = link.remoteName();
         for (changes) |*ch| {
@@ -18980,7 +19096,7 @@ pub const LinuxServer = struct {
         const hlc = self.nextMeshHlc();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -19263,7 +19379,7 @@ pub const LinuxServer = struct {
         const hlc = self.nextMeshHlc();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -19284,6 +19400,7 @@ pub const LinuxServer = struct {
     /// Burst every local channel's current topic to ONE freshly-established peer
     /// so a relink converges immediately instead of waiting for the next TOPIC.
     fn sendTopicBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
             const info = self.world.topicInfo(cv.name) orelse continue;
@@ -19323,13 +19440,16 @@ pub const LinuxServer = struct {
         id: client_model.ClientId,
         link: *secured_s2s_link.SecuredLink,
     ) bool {
+        // Collision losers retain their final flight only. Validate the exact
+        // connection even for an empty link buffer before callers encode new
+        // application records on a route that is already retiring.
+        const conn = self.connFor(id) orelse return false;
+        if (!conn.ownsActiveMeshLink(link)) return false;
         if (link.outbound().len == 0) return true;
         if (id.shard != self.rx().shard_id) {
             self.wakeShard(id.shard);
             return false;
         }
-        const conn = self.rx().clients.get(id) orelse return false;
-        if (conn.s2s_secured != link or conn.closing) return false;
         return self.flushMeshBurstStage(conn);
     }
 
@@ -19459,7 +19579,7 @@ pub const LinuxServer = struct {
         var seen: usize = 0;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const members = blk: {
                     if (slot.value.s2s_secured) |link| {
                         if (link.established()) break :blk link.channelMembers(channel);
@@ -19499,7 +19619,7 @@ pub const LinuxServer = struct {
         var best_set: i64 = 0;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const view: ?s2s_peer_mod.TopicView = if (slot.value.s2s_secured) |link| blk: {
                     if (!link.established()) break :blk null;
                     break :blk link.channelTopic(channel);
@@ -19531,7 +19651,7 @@ pub const LinuxServer = struct {
     fn remoteChannelSecret(self: *LinuxServer, channel: []const u8) bool {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const flags: ?u16 = blk: {
                     if (slot.value.s2s_secured) |link| {
                         if (link.established()) break :blk if (link.channelModeFlags(channel)) |f| f.flags else null;
@@ -19563,7 +19683,7 @@ pub const LinuxServer = struct {
         defer seen.deinit();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     if (link.channelNames()) |it_| {
@@ -22076,7 +22196,7 @@ pub const LinuxServer = struct {
     fn findRemoteWhois(self: *LinuxServer, nick: []const u8) ?RemoteWhois {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     if (remoteWhoisFromLink(link, nick)) |rw| return rw;
@@ -22224,7 +22344,7 @@ pub const LinuxServer = struct {
             if (self.channelHiddenFromWhois(cv.name, requester_wid)) continue;
             for (self.reactors) |*reactor| {
                 for (reactor.clients.slots.items) |*slot| {
-                    if (!slot.occupied) continue;
+                    if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                     const members = blk: {
                         if (slot.value.s2s_secured) |link| {
                             if (link.established()) break :blk link.channelMembers(cv.name);
@@ -22420,7 +22540,7 @@ pub const LinuxServer = struct {
         const origin = self.serverName();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -22446,7 +22566,8 @@ pub const LinuxServer = struct {
     /// node already fanned it network-wide); the resulting QUIT propagates normally.
     /// A target that is not (or no longer) local is a no-op; malformed payloads are
     /// skipped. The frame was already signature-verified by the substrate link.
-    fn drainKills(self: *LinuxServer, link: anytype) void {
+    fn drainKills(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const payloads = link.takeKills() catch return;
         defer {
             for (payloads) |p| self.allocator.free(p);
@@ -23589,7 +23710,7 @@ pub const LinuxServer = struct {
     fn announceReadMarker(self: *LinuxServer, event: entity_prop_event.EntityPropEvent) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied or slot.value.closing) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.supportsReadMarkers()) continue;
                 link.sendEntityProp(event.kind, event.entity, event.key, event.value, event.owner, event.hlc, event.present, .{ .node = event.origin_node, .pubkey = event.origin_pubkey, .sig = event.origin_sig }) catch continue;
@@ -23599,6 +23720,7 @@ pub const LinuxServer = struct {
     }
 
     fn sendReadMarkerBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
         if (self.read_marker_unavailable) return true;
         const link = conn.s2s_secured orelse return true;
         if (!link.supportsReadMarkers()) return true;
@@ -24949,6 +25071,7 @@ pub const LinuxServer = struct {
         for (self.reactors) |*reactor| {
             var it = reactor.clients.iterator();
             while (it.next()) |entry| {
+                if (!entry.value.isActiveMeshPeer()) continue;
                 const secured = entry.value.s2s_secured orelse continue;
                 secured.sendSearchQuery(wire) catch continue;
                 sent += 1;
@@ -25048,7 +25171,12 @@ pub const LinuxServer = struct {
         return true;
     }
 
-    fn drainKeyTransHeads(self: *LinuxServer, link: anytype) void {
+    fn drainKeyTransHeads(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainKeyTransHeadsAdmitted(link);
+    }
+
+    fn drainKeyTransHeadsAdmitted(self: *LinuxServer, link: anytype) void {
         const payloads = link.takeKeyTransHeads() catch return;
         defer {
             for (payloads) |payload| self.allocator.free(payload);
@@ -25062,6 +25190,7 @@ pub const LinuxServer = struct {
     }
 
     fn drainKeyTransPeer(self: *LinuxServer, peer: *s2s_peer_mod.S2sPeer) void {
+        if (comptime !builtin.is_test) return;
         const KeyTransPeerBridge = struct {
             peer: *s2s_peer_mod.S2sPeer,
             fn takeKeyTransHeads(bridge: *@This()) ![][]u8 {
@@ -25069,12 +25198,17 @@ pub const LinuxServer = struct {
             }
         };
         var bridge = KeyTransPeerBridge{ .peer = peer };
-        self.drainKeyTransHeads(&bridge);
+        self.drainKeyTransHeadsAdmitted(&bridge);
     }
 
     /// Answer inbound queries and deliver inbound replies. `link` is the
     /// secured link, the plaintext link, or the test peer bridge.
-    fn drainMeshSearch(self: *LinuxServer, link: anytype) void {
+    fn drainMeshSearch(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainMeshSearchAdmitted(link);
+    }
+
+    fn drainMeshSearchAdmitted(self: *LinuxServer, link: anytype) void {
         const queries = link.takeSearchQueries() catch return;
         defer {
             for (queries) |payload| self.allocator.free(payload);
@@ -25094,6 +25228,7 @@ pub const LinuxServer = struct {
     }
 
     fn drainMeshSearchPeer(self: *LinuxServer, peer: *s2s_peer_mod.S2sPeer, sink: s2s_peer_mod.ByteSink) void {
+        if (comptime !builtin.is_test) return;
         const SearchPeerBridge = struct {
             peer: *s2s_peer_mod.S2sPeer,
             sink: s2s_peer_mod.ByteSink,
@@ -25108,7 +25243,7 @@ pub const LinuxServer = struct {
             }
         };
         var bridge = SearchPeerBridge{ .peer = peer, .sink = sink };
-        self.drainMeshSearch(&bridge);
+        self.drainMeshSearchAdmitted(&bridge);
     }
 
     /// `UNFURL ON|OFF|<https-url>`. The daemon flag defaults off. A client that
@@ -26969,7 +27104,7 @@ pub const LinuxServer = struct {
             .caps = caps,
             .caps_ext = caps_ext,
             .remote_name = remote_name,
-            .connect_addr = if (conn.s2s_initiator) std.mem.asBytes(&conn.s2s_connect_addr) else &.{},
+            .connect_addr = if (conn.s2s_dial_target_known) std.mem.asBytes(&conn.s2s_connect_addr) else &.{},
             .rec_inbuf = outer.rec_inbuf,
             .pending_out = pending,
             .roster = roster.items,
@@ -27661,6 +27796,13 @@ pub const LinuxServer = struct {
             // so the successor reconnects at boot; config-managed [mesh].connect
             // dials are re-dialed by the successor's mesh boot pass instead.
             if (e.value.s2s != null or e.value.s2s_secured != null) {
+                // This process-local retirement latch has no capsule schema.
+                // Refuse the cut until drain completes; carrying a closing loser
+                // as an ordinary established route would resurrect a duplicate.
+                if (e.value.s2s_dedup_drain_deadline_ms != 0) {
+                    counts.s2s_preserve_failed = true;
+                    continue;
+                }
                 if (e.value.s2s_secured) |link| {
                     // Preserve an established secured link only after every exact
                     // socket operation has been canceled and its completion reaped.
@@ -27686,7 +27828,7 @@ pub const LinuxServer = struct {
                         continue;
                     }
                 }
-                if (e.value.s2s_initiator and !self.dialManaged(e.value.token)) {
+                if (e.value.s2s_initiator and e.value.s2s_dial_target_known and !self.dialManaged(e.value.token)) {
                     if (!sealMeshRedialUpgradeHint(self.allocator, .{
                         .addr = e.value.s2s_connect_addr.addr,
                         .port = std.mem.bigToNative(u16, e.value.s2s_connect_addr.port),
@@ -31356,6 +31498,23 @@ pub const LinuxServer = struct {
     /// peer/event/stat visibility is published only after the whole transaction
     /// commits.
     fn adoptInheritedS2sLink(self: *LinuxServer, snap: s2s_snapshot.Snapshot, close_fd_on_failure: bool) ?client_model.ClientId {
+        // Validate before allocating a slot or touching a carried descriptor.
+        // Empty is the historical unknown-endpoint representation in either
+        // direction; nonempty addresses must be canonical in6 storage.
+        var target: ?posix.sockaddr.in6 = null;
+        if (snap.connect_addr.len != 0) {
+            if (snap.connect_addr.len != @sizeOf(posix.sockaddr.in6)) {
+                if (close_fd_on_failure) closeFd(snap.fd);
+                return null;
+            }
+            var addr: posix.sockaddr.in6 = undefined;
+            @memcpy(std.mem.asBytes(&addr), snap.connect_addr);
+            if (addr.family != posix.AF.INET6 or addr.port == 0) {
+                if (close_fd_on_failure) closeFd(snap.fd);
+                return null;
+            }
+            target = addr;
+        }
         if (!self.s2sSecured() or self.rx().clients.len() >= self.config.max_clients) {
             if (close_fd_on_failure) closeFd(snap.fd);
             return null;
@@ -31391,8 +31550,9 @@ pub const LinuxServer = struct {
         conn.s2s_initiator = snap.s2s_initiator;
         // Restore the dial target so the [mesh].connect sweep recognizes this
         // preserved link and never dials a duplicate (→ collision churn).
-        if (snap.connect_addr.len == @sizeOf(@TypeOf(conn.s2s_connect_addr))) {
-            @memcpy(std.mem.asBytes(&conn.s2s_connect_addr), snap.connect_addr);
+        if (target) |addr| {
+            conn.s2s_connect_addr = addr;
+            conn.s2s_dial_target_known = true;
         }
         self.captureClientHost(conn);
 
@@ -31558,6 +31718,14 @@ pub const LinuxServer = struct {
         defer current_reactor = &self.reactors[0];
         const conn = self.rx().clients.get(id) orelse return;
         const link = conn.s2s_secured orelse return;
+        // The whole adoption has committed. Only now may the configured-dial
+        // table point at this authenticated survivor; rollback never sees it.
+        if (conn.s2s_dial_target_known and link.peerNodeKey() != null) {
+            for (self.mesh_dials) |*dial| {
+                if (dial.addr == null) dial.addr = sockaddrForHost(dial.host, dial.port, 2_000) catch continue;
+                if (sameSockaddrIn(conn.s2s_connect_addr, dial.addr.?)) dial.token = conn.token;
+            }
+        }
         const rname = link.remoteName();
         if (rname.len != 0) {
             self.publishServerLink(rname, true);
@@ -31692,6 +31860,7 @@ pub const LinuxServer = struct {
         peer.sendq_cap = s2sSendqCap(configured_sendq);
         peer.token = try tokenFromId(id);
         peer.s2s_connect_addr = addr;
+        peer.s2s_dial_target_known = true;
         peer.s2s_initiator = true; // we dialed: this is the initiator side
 
         if (self.s2sSecured()) {
@@ -31842,7 +32011,7 @@ pub const LinuxServer = struct {
 
     fn meshDialForConn(self: *LinuxServer, conn: *const ConnState) ?*MeshDial {
         if (self.meshDialForToken(conn.token)) |dial| return dial;
-        if (!conn.s2s_initiator) return null;
+        if (!conn.s2s_dial_target_known) return null;
         for (self.mesh_dials) |*dial| {
             const addr = dial.addr orelse continue;
             if (sameSockaddrIn(conn.s2s_connect_addr, addr)) return dial;
@@ -31860,7 +32029,7 @@ pub const LinuxServer = struct {
         var it = self.reactors[0].clients.iterator();
         while (it.next()) |entry| {
             const conn = entry.value;
-            const remote = establishedPeerName(conn) orelse continue;
+            const remote = activeMeshPeerName(conn) orelse continue;
             if (!std.ascii.eqlIgnoreCase(remote, name)) continue;
             if (self.meshDialForConn(conn)) |dial| self.noteMeshDialSuccess(dial);
         }
@@ -31868,7 +32037,7 @@ pub const LinuxServer = struct {
 
     /// Handshake not finished, or anti-entropy quiet, long enough to count.
     fn mooringStallReason(self: *LinuxServer, conn: *const ConnState, now_u: u64) ?[]const u8 {
-        if (conn.closing) return null;
+        if (!conn.meshAdmissionOpen()) return null;
         if (conn.s2s == null and conn.s2s_secured == null) return null;
         if (establishedPeerName(conn) == null) {
             const idle_from: u64 = @intCast(@max(conn.last_activity_ms, 0));
@@ -32032,6 +32201,14 @@ pub const LinuxServer = struct {
     pub fn findSquitVictim(self: *LinuxServer, target: []const u8) ?SquitVictim {
         var it = self.reactors[0].clients.iterator();
         while (it.next()) |entry| {
+            const remote = activeMeshPeerName(entry.value) orelse continue;
+            if (std.ascii.eqlIgnoreCase(remote, target)) return .{ .id = entry.id, .token = entry.value.token };
+        }
+        // An oper may cancel an admitted named handshake, but a retained
+        // retiring leg cannot shadow an established survivor or be revived.
+        it = self.reactors[0].clients.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value.meshAdmissionOpen() or entry.value.isActiveMeshPeer()) continue;
             const remote = peerRemoteName(entry.value) orelse continue;
             if (std.ascii.eqlIgnoreCase(remote, target)) return .{ .id = entry.id, .token = entry.value.token };
         }
@@ -33131,7 +33308,7 @@ pub const LinuxServer = struct {
         const origin = self.serverName();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -33152,7 +33329,8 @@ pub const LinuxServer = struct {
     /// event carries (NOT this node). Never re-broadcast — a peer already fanned it
     /// to every node directly. An action value that is not a defined
     /// `observe_mod.Action` variant (a hostile peer could send any `u8`) is skipped.
-    fn drainObserveEvents(self: *LinuxServer, link: anytype) void {
+    fn drainObserveEvents(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const payloads = link.takeObserveEvents() catch return;
         defer {
             for (payloads) |p| self.allocator.free(p);
@@ -37022,7 +37200,7 @@ pub const LinuxServer = struct {
     fn remoteMemberOfChannel(self: *LinuxServer, channel: []const u8, nick: []const u8) bool {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 if (slot.value.s2s_secured) |link| {
                     if (link.established() and linkChannelHasMember(link, channel, nick)) return true;
                 } else if (slot.value.s2s) |link| {
@@ -37040,7 +37218,7 @@ pub const LinuxServer = struct {
     fn remoteMemberOfChannelAtNode(self: *LinuxServer, channel: []const u8, nick: []const u8, origin_node: u64) bool {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const members = if (slot.value.s2s_secured) |link| blk: {
                     if (!link.established()) continue;
                     break :blk link.channelMembers(channel);
@@ -37704,7 +37882,7 @@ pub const LinuxServer = struct {
         var total: u64 = self.world.localNickCount();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 if (slot.value.s2s_secured) |link| {
                     if (link.established()) total += @intCast(link.remoteNickCount());
                 } else if (slot.value.s2s) |link| {
@@ -38934,7 +39112,7 @@ pub const LinuxServer = struct {
     fn broadcastOperGrant(self: *LinuxServer, signed: []const u8) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
@@ -38965,7 +39143,7 @@ pub const LinuxServer = struct {
         const filter_wire = self.meshBanFilterWire(&filter_buf);
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
@@ -38982,7 +39160,8 @@ pub const LinuxServer = struct {
     /// (a network ban is operator authority). A received mesh ward is NOT re-
     /// broadcast here — each setting node fans it to all secured peers directly,
     /// and re-fanning would loop in a cyclic mesh. Malformed payloads are skipped.
-    fn drainWards(self: *LinuxServer, link: anytype) void {
+    fn drainWards(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const payloads = link.takeWards() catch return;
         defer {
             for (payloads) |p| self.allocator.free(p);
@@ -40511,6 +40690,7 @@ pub const LinuxServer = struct {
         for (self.reactors) |*reactor| {
             var it = reactor.clients.iterator();
             while (it.next()) |entry| {
+                if (!entry.value.isActiveMeshPeer()) continue;
                 const link = entry.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsE2eeGroup()) continue;
                 const peer = link.remoteNodeId() orelse continue;
@@ -40540,6 +40720,7 @@ pub const LinuxServer = struct {
         for (self.reactors) |*reactor| {
             var it = reactor.clients.iterator();
             while (it.next()) |entry| {
+                if (!entry.value.isActiveMeshPeer()) continue;
                 const link = entry.value.s2s_secured orelse continue;
                 if (link.established() and link.supportsE2eeGroup() and
                     link.remoteNodeId() == peer) return true;
@@ -40556,6 +40737,7 @@ pub const LinuxServer = struct {
         for (self.reactors) |*reactor| {
             var it = reactor.clients.iterator();
             while (it.next()) |entry| {
+                if (!entry.value.isActiveMeshPeer()) continue;
                 const link = entry.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsE2eeGroup() or
                     link.remoteNodeId() != peer) continue;
@@ -40650,6 +40832,7 @@ pub const LinuxServer = struct {
         link: *secured_s2s_link.SecuredLink,
         relay_id: e2ee_group_relay.RelayId,
     ) bool {
+        if (!conn.ownsActiveMeshLink(link)) return false;
         if (!link.established() or !link.supportsE2eeGroup()) return false;
         // Preflight any complete ciphertext retained by a prior congested ACK.
         // With a full healthy SendQ, one receipt may remain link-owned, but a
@@ -40671,7 +40854,7 @@ pub const LinuxServer = struct {
     ) bool {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsE2eeGroup()) continue;
                 if ((link.remoteNodeId() orelse continue) != peer) continue;
@@ -40695,7 +40878,7 @@ pub const LinuxServer = struct {
     ) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsE2eeGroupAckConfirm()) continue;
                 if ((link.remoteNodeId() orelse continue) != peer) continue;
@@ -40919,6 +41102,7 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         link: *secured_s2s_link.SecuredLink,
     ) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const peer = link.remoteNodeId() orelse return;
         const inbound = link.takeInboundE2eeGroup() catch return;
         defer self.allocator.free(inbound);
@@ -40944,8 +41128,10 @@ pub const LinuxServer = struct {
 
     fn drainE2eeGroupAcks(
         self: *LinuxServer,
+        conn: *const ConnState,
         link: *secured_s2s_link.SecuredLink,
     ) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const peer = link.remoteNodeId() orelse return;
         const acks = link.takeInboundE2eeGroupAcks() catch return;
         defer self.allocator.free(acks);
@@ -43040,7 +43226,7 @@ pub const LinuxServer = struct {
         var complete = true;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied or slot.value.closing) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const peer_id = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -45522,7 +45708,7 @@ pub const LinuxServer = struct {
     ) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established()) continue;
                 if (!link.supportsSessionReplicaV2()) {
@@ -45607,7 +45793,7 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         link: *secured_s2s_link.SecuredLink,
     ) void {
-        if (conn.closing or !link.established() or conn.session_replica_replay_pending) return;
+        if (!conn.ownsActiveMeshLink(link) or conn.session_replica_replay_pending) return;
         const establishment_pending = !conn.s2s_burst_done;
         if (!establishment_pending and !conn.session_replica_resync_burst_pending) return;
 
@@ -45647,6 +45833,7 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         link: *secured_s2s_link.SecuredLink,
     ) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         if (!conn.session_replica_replay_pending) return;
         if (!link.established()) {
             conn.session_replica_replay_pending = false;
@@ -45754,7 +45941,7 @@ pub const LinuxServer = struct {
 
     fn resumeSessionReplicaReplays(self: *LinuxServer) void {
         for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
+            if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
             const link = slot.value.s2s_secured orelse continue;
             if (slot.value.session_replica_replay_pending)
                 self.replaySessionReplicaStoreTo(&slot.value, link);
@@ -45846,8 +46033,7 @@ pub const LinuxServer = struct {
     fn broadcastSessionMigration(self: *LinuxServer, token: session_migrate.Token, wire: []const u8) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
-                if (slot.value.closing) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
@@ -45873,7 +46059,7 @@ pub const LinuxServer = struct {
         }, &payload_buf) catch return;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
@@ -45883,7 +46069,8 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn drainSessionMigrationConsumed(self: *LinuxServer, link: anytype) void {
+    fn drainSessionMigrationConsumed(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const notices = link.takeSessionMigrateConsumed() catch return;
         defer self.allocator.free(notices);
         for (notices) |wire| {
@@ -45896,6 +46083,7 @@ pub const LinuxServer = struct {
 
     fn sendSessionReplicaAckV2(
         self: *LinuxServer,
+        conn: *const ConnState,
         link: *secured_s2s_link.SecuredLink,
         status: session_replica_v2.AckStatus,
         offered: session_replica_v2.Revision,
@@ -45903,6 +46091,7 @@ pub const LinuxServer = struct {
         token: session_migrate.Token,
         now_wall: i64,
     ) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const ident = self.config.node_identity orelse return;
         if (ident.shortId() != self.config.node_id) return;
         const ack_ttl_ms: i64 = 5 * 60 * 1000;
@@ -45989,7 +46178,7 @@ pub const LinuxServer = struct {
         var complete = true;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsSessionReplicaV2()) continue;
                 _ = link.rebindSessionToken(origin_node, nick, token) catch {
@@ -46062,13 +46251,13 @@ pub const LinuxServer = struct {
         var complete = true;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsSessionReplicaV2()) continue;
                 _ = link.reconcileSessionToken(token, desired_nick, desired_channels) catch {
                     complete = false;
                     if (mode == .live)
-                        self.drainIdentityTransitions(link)
+                        self.drainIdentityTransitions(&slot.value, link)
                     else
                         self.discardIdentityTransitions(link);
                     continue;
@@ -46076,7 +46265,7 @@ pub const LinuxServer = struct {
                 // OFFER-only rename/revoke still has a client-visible event even
                 // when no compatibility NICK/PART sidecar follows this feed.
                 if (mode == .live)
-                    self.drainIdentityTransitions(link)
+                    self.drainIdentityTransitions(&slot.value, link)
                 else
                     self.discardIdentityTransitions(link);
             }
@@ -46633,6 +46822,7 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         link: *secured_s2s_link.SecuredLink,
     ) bool {
+        if (!conn.ownsActiveMeshLink(link)) return false;
         const dropped = link.takeDroppedSessionReplicaFrames();
         var residence_batch_complete = dropped == 0;
         var replica_resync_needed = dropped != 0;
@@ -46762,6 +46952,7 @@ pub const LinuxServer = struct {
                         replica_resync_needed = true;
                         switch (err) {
                             error.EntryFull, error.RouteFull, error.TombstoneFull, error.QuarantineFull => self.sendSessionReplicaAckV2(
+                                conn,
                                 link,
                                 .capacity,
                                 signed.offer.revision,
@@ -46778,6 +46969,7 @@ pub const LinuxServer = struct {
                         .conflict, .quarantined, .stale => {},
                     }
                     self.sendSessionReplicaAckV2(
+                        conn,
                         link,
                         result.disposition.ackStatus(),
                         signed.offer.revision,
@@ -46843,7 +47035,8 @@ pub const LinuxServer = struct {
     /// decoded session into the bounded, epoch-ordered `pending_migrations` store
     /// keyed by its 16-byte session token. A capsule that fails verification or
     /// whose outer/inner accounts disagree is dropped, never fatal to the link.
-    fn drainSessionMigrations(self: *LinuxServer, link: anytype) void {
+    fn drainSessionMigrations(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const caps = link.takeSessionMigrations() catch return;
         defer self.allocator.free(caps);
         const expected_signer = link.peerNodeKey() orelse {
@@ -48648,7 +48841,7 @@ pub const LinuxServer = struct {
     fn meshBroadcastMemoPush(self: *LinuxServer, account: []const u8, from: []const u8, text: []const u8) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
@@ -48661,7 +48854,8 @@ pub const LinuxServer = struct {
     /// Decode inbound secured MEMO_PUSH hints and run local Web Push delivery.
     /// No re-fan and no memo storage: the original node remains the memo source
     /// of truth, while this node can notify browsers subscribed here.
-    fn drainMemoPushes(self: *LinuxServer, link: anytype) void {
+    fn drainMemoPushes(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const payloads = link.takeMemoPushes() catch return;
         defer {
             for (payloads) |p| self.allocator.free(p);
@@ -48682,7 +48876,7 @@ pub const LinuxServer = struct {
         if (channel.len == 0 or channel.len > media_ws_relay.max_channel_len) return;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
@@ -48696,7 +48890,8 @@ pub const LinuxServer = struct {
     /// WS call participants. Never re-meshes: the origin node is the sole mesh
     /// emitter (loop prevention). Browser MAC is not re-verified — the origin
     /// already admitted the opaque E2EE datagram.
-    fn drainMediaWsDatagrams(self: *LinuxServer, link: anytype) void {
+    fn drainMediaWsDatagrams(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const payloads = link.takeMediaWsDatagrams() catch return;
         defer {
             for (payloads) |p| self.allocator.free(p);
@@ -51207,7 +51402,7 @@ pub const LinuxServer = struct {
     ) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -51236,7 +51431,7 @@ pub const LinuxServer = struct {
         const origin = self.serverName();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
@@ -51256,7 +51451,8 @@ pub const LinuxServer = struct {
     /// local oper subscribers, rendered with the ORIGIN server the event carries
     /// (NOT this node). Never re-broadcast — that would loop the mesh; a peer
     /// already fanned it to every node directly. Malformed payloads are skipped.
-    fn drainOperEvents(self: *LinuxServer, link: anytype) void {
+    fn drainOperEvents(self: *LinuxServer, conn: *const ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const payloads = link.takeOperEvents() catch return;
         defer {
             for (payloads) |p| self.allocator.free(p);
@@ -51289,7 +51485,8 @@ pub const LinuxServer = struct {
     /// transport already verified both immediate-hop and origin signatures, but
     /// the global guard repeats the self-contained verification before durable
     /// replay mutation; no per-link cache can authorize delivery.
-    fn drainOperEventsV2(self: *LinuxServer, link: *secured_s2s_link.SecuredLink) void {
+    fn drainOperEventsV2(self: *LinuxServer, conn: *const ConnState, link: *secured_s2s_link.SecuredLink) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
         const inbound = link.takeOperEventsV2() catch return;
         defer {
             for (inbound) |*item| item.deinit(self.allocator);
@@ -51318,7 +51515,7 @@ pub const LinuxServer = struct {
     fn meshForwardOperEventV2(self: *LinuxServer, wire: []const u8) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsEventSpineV2()) continue;
                 const emitted = link.forwardOperEventV2(wire) catch continue;
@@ -51947,7 +52144,7 @@ pub const LinuxServer = struct {
         var peers: usize = 0;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const c = &slot.value;
                 const up = if (c.s2s_secured) |l| l.established() else if (c.s2s) |l| l.established() else false;
                 if (up) peers += 1;
@@ -52038,6 +52235,7 @@ pub const LinuxServer = struct {
         var it = self.reactors[0].clients.iterator();
         outer: while (it.next()) |entry| {
             const c = entry.value;
+            if (!c.isActiveMeshPeer()) continue;
             const rname = establishedPeerName(c) orelse continue;
             // One line per distinct peer: a transient duplicate link to the same
             // server must not appear twice.
@@ -52078,6 +52276,11 @@ pub const LinuxServer = struct {
     /// The remote name of an established S2S peer on `conn` (plaintext or
     /// secured), or null when the connection is not an established peer. Shared
     /// by LINKS and MAP so both reflect the same live mesh neighbours as MESH.
+    fn activeMeshPeerName(conn: *const ConnState) ?[]const u8 {
+        if (!conn.isActiveMeshPeer()) return null;
+        return establishedPeerName(conn);
+    }
+
     fn establishedPeerName(conn: *const ConnState) ?[]const u8 {
         if (conn.s2s) |l| {
             if (l.established() and l.remoteName().len != 0) return l.remoteName();
@@ -52087,25 +52290,46 @@ pub const LinuxServer = struct {
         return null;
     }
 
-    /// Whether an established S2S peer link for this configured dial already exists
-    /// in either direction. The survivor after reciprocal auto-dial may be inbound,
-    /// so the configured dial token can disappear even though the peer is still up.
-    /// Match by server name when the dial host is a DNS name equal to the peer's
-    /// advertised name, and by the last resolved dial IP when the config used an IP
-    /// literal or different DNS label.
+    /// Only a proven complete target identifies a configured endpoint. Neither
+    /// an inbound source IP nor a peer's advertised name proves its listener.
     fn meshPeerLinkedByDial(self: *LinuxServer, dial: *const MeshDial) bool {
-        const dial_addr = dial.addr;
+        const addr = dial.addr orelse return false;
         var it = self.reactors[0].clients.iterator();
         while (it.next()) |entry| {
             const conn = entry.value;
-            const name = establishedPeerName(conn) orelse continue;
-            if (std.ascii.eqlIgnoreCase(name, dial.host)) return true;
-            if (dial_addr) |addr| {
-                if (conn.s2s_initiator and sameSockaddrIn(conn.s2s_connect_addr, addr)) return true;
-                if (!conn.s2s_initiator and samePeerIp(conn.peer_addr, addr)) return true;
-            }
+            if (!conn.isActiveMeshPeer() or !conn.s2s_dial_target_known or
+                self.s2sPeerLivenessExpired(conn, self.nowMs())) continue;
+            _ = establishedPeerName(conn) orelse continue;
+            if (sameSockaddrIn(conn.s2s_connect_addr, addr)) return true;
         }
         return false;
+    }
+
+    fn sameS2sPeer(a: *const ConnState, b: *const ConnState) bool {
+        if (a.s2s_secured) |al| {
+            const bl = b.s2s_secured orelse return false;
+            const ak = al.peerNodeKey() orelse return false;
+            const bk = bl.peerNodeKey() orelse return false;
+            return std.mem.eql(u8, &ak, &bk);
+        }
+        if (b.s2s_secured != null) return false;
+        const al = a.s2s orelse return false;
+        const bl = b.s2s orelse return false;
+        return al.remoteNodeId() == bl.remoteNodeId();
+    }
+
+    /// Move the existing endpoint binding before retiring its physical slot.
+    /// No address that is still owned by a CONNECT submission may be changed.
+    fn transferMeshDialBinding(self: *LinuxServer, loser: *const ConnState, survivor: *ConnState) void {
+        if (!sameS2sPeer(loser, survivor) or !loser.s2s_dial_target_known) return;
+        if (!survivor.s2s_dial_target_known and !survivor.connect_armed) {
+            survivor.s2s_connect_addr = loser.s2s_connect_addr;
+            survivor.s2s_dial_target_known = true;
+        }
+        for (self.mesh_dials) |*dial| {
+            const token = dial.token orelse continue;
+            if (token.slot == loser.token.slot and token.gen == loser.token.gen) dial.token = survivor.token;
+        }
     }
 
     /// Begin no-allocation S2S teardown while preserving exact io_uring storage
@@ -52120,6 +52344,58 @@ pub const LinuxServer = struct {
         if (!conn.closing or conn.close_reason.len == 0) retainCloseReason(conn, reason);
         const token = conn.token;
         self.closeConn(token, conn.close_reason) catch {};
+    }
+
+    fn requestS2sDedupDrain(self: *LinuxServer, conn: *ConnState) void {
+        retainCloseReason(conn, "Duplicate link collapsed");
+        conn.closing = true;
+        if (conn.s2s_dedup_drain_deadline_ms == 0)
+            conn.s2s_dedup_drain_deadline_ms = self.nowMs() +| 5_000;
+        self.progressS2sDedupDrain(conn);
+    }
+
+    /// Stage the retained final flight and retire only after the kernel releases
+    /// every SEND. The timer retries capacity/OOM/SQ pressure; no input is parsed
+    /// once closing is set. Fault/timeout retirement keeps closeConn's exact
+    /// kernel-storage ownership protocol.
+    fn progressS2sDedupDrain(self: *LinuxServer, conn: *ConnState) void {
+        std.debug.assert(conn.closing and conn.s2s_dedup);
+        if (self.rx().socket_io_quiescing) return;
+        if (self.nowMs() >= conn.s2s_dedup_drain_deadline_ms) {
+            conn.s2s_dedup_drain_deadline_ms = 0;
+            self.closeConn(conn.token, conn.close_reason) catch {};
+            return;
+        }
+        if (conn.s2s_secured != null) {
+            _ = self.flushMeshBurstStage(conn);
+        } else if (conn.s2s) |link| {
+            const out = link.outbound();
+            if (out.len != 0) {
+                reserveRawAppendToConn(conn, out.len) catch {
+                    self.armSendIfNeeded(conn) catch {};
+                    return;
+                };
+                appendToConn(conn, out) catch return;
+                // Commit ownership before attempting SEND so a submission
+                // failure cannot append the same handshake a second time.
+                link.clearOutbound();
+            }
+        }
+        self.armSendIfNeeded(conn) catch {
+            conn.s2s_dedup_drain_deadline_ms = 0;
+            self.closeConn(conn.token, conn.close_reason) catch {};
+            return;
+        };
+        const retained = if (conn.s2s_secured) |link|
+            link.outbound().len != 0
+        else if (conn.s2s) |link|
+            link.outbound().len != 0
+        else
+            false;
+        if (!retained and !conn.send_armed and connSendBacklog(conn) == 0) {
+            conn.s2s_dedup_drain_deadline_ms = 0;
+            self.closeConn(conn.token, conn.close_reason) catch {};
+        }
     }
 
     /// Collapse the duplicate S2S link that forms when both nodes auto-dial each
@@ -52144,9 +52420,11 @@ pub const LinuxServer = struct {
             if (other == new_conn) continue;
             const oname = establishedPeerName(other) orelse continue;
             if (!std.mem.eql(u8, oname, remote_name)) continue;
+            if (!sameS2sPeer(new_conn, other)) continue;
             const old_unusable = other.closing or other.s2s_dedup or
                 self.s2sPeerLivenessExpired(other, self.nowMs());
             if (old_unusable) {
+                self.transferMeshDialBinding(other, new_conn);
                 other.s2s_dedup = true; // the replacement keeps the peer reachable
                 self.requestS2sClose(other, "Stale duplicate link replaced");
                 self.logMeshEvent(.peer_down, remote_name, "stale duplicate link replaced");
@@ -52161,6 +52439,8 @@ pub const LinuxServer = struct {
             if (new_conn.s2s_initiator == other.s2s_initiator) continue;
             const keep_initiator = std.mem.lessThan(u8, self.serverName(), remote_name);
             const loser = if (new_conn.s2s_initiator == keep_initiator) other else new_conn;
+            const survivor = if (loser == new_conn) other else new_conn;
+            self.transferMeshDialBinding(loser, survivor);
             loser.s2s_dedup = true; // collapsed duplicate: suppress its netsplit on close
             if (loser == new_conn) {
                 // Finish the scan without touching new_conn again. Marking the
@@ -52169,13 +52449,13 @@ pub const LinuxServer = struct {
                 new_loses = true;
                 continue;
             }
-            self.requestS2sClose(loser, "Duplicate link collapsed");
             self.logMeshEvent(.peer_down, remote_name, "duplicate link collapsed");
+            self.requestS2sDedupDrain(loser);
         }
         if (new_loses) {
             new_conn.s2s_dedup = true;
-            self.requestS2sClose(new_conn, "Duplicate link collapsed");
             self.logMeshEvent(.peer_down, remote_name, "duplicate link collapsed");
+            self.requestS2sDedupDrain(new_conn);
             return true;
         }
         return false;
@@ -52219,7 +52499,7 @@ pub const LinuxServer = struct {
             // A collision loser remains established until its final close, but
             // it is no longer a route. Excluding it lets the winner replace the
             // authenticated node/key atomically at collision commitment.
-            if (entry.value.closing or entry.value.s2s_dedup) continue;
+            if (!entry.value.isActiveMeshPeer()) continue;
             const name = establishedPeerName(entry.value) orelse continue;
             for (seen.items) |row| {
                 if (std.mem.eql(u8, row.name, name)) continue :outer;
@@ -52446,8 +52726,7 @@ pub const LinuxServer = struct {
         self.last_peer_rtt_probe_ms = now;
         const now_u: u64 = @intCast(@max(@as(i64, 0), now));
         for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            if (slot.value.closing) continue;
+            if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
             if (slot.value.s2s_probe_pending) {
                 // The exact probe ciphertext survived a previous congestion/OOM
                 // turn inside SecuredLink. Its receipt clock begins only after
@@ -52515,6 +52794,7 @@ pub const LinuxServer = struct {
         while (it.next()) |entry| {
             if (tn >= out.len) break;
             const c = entry.value;
+            if (!c.isActiveMeshPeer()) continue;
             if (c.s2s) |l| {
                 if (!l.established()) continue;
                 if (l.remoteNodeId()) |rid| {
@@ -52634,6 +52914,7 @@ pub const LinuxServer = struct {
     pub fn collectPeerNames(self: *LinuxServer, out: *std.ArrayList([]const u8)) !void {
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
+            if (!entry.value.isActiveMeshPeer()) continue;
             const name = establishedPeerName(entry.value) orelse continue;
             try out.append(self.allocator, name);
         }
@@ -54664,7 +54945,7 @@ pub const LinuxServer = struct {
                 return error.OutputTooSmall;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const remote_count = if (slot.value.s2s_secured) |link|
                     if (link.established()) link.channelMembers(channel).len else 0
                 else if (slot.value.s2s) |link|
@@ -54762,7 +55043,7 @@ pub const LinuxServer = struct {
         // same pattern `findRemoteWhois`/`relayToPeers` already rely on.
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
-                if (!slot.occupied) continue;
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 if (slot.value.s2s_secured) |link| {
                     if (link.established()) try self.addRemoteMembers(&roster, &seen, max_entries, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
                 } else if (slot.value.s2s) |link| {
@@ -57295,6 +57576,16 @@ const SessionReplayTestPair = struct {
         local_seed: u8,
         remote_seed: u8,
     ) !SessionReplayTestPair {
+        return initWithSeedsAndNames(allocator, local_seed, remote_seed, "replay-a.test", "replay-b.test");
+    }
+
+    fn initWithSeedsAndNames(
+        allocator: std.mem.Allocator,
+        local_seed: u8,
+        remote_seed: u8,
+        name_a: []const u8,
+        name_b: []const u8,
+    ) !SessionReplayTestPair {
         var ida = try node_identity.fromSeed(
             @as([32]u8, @splat(local_seed)),
             "session-replay-test",
@@ -57320,7 +57611,7 @@ const SessionReplayTestPair = struct {
                 .now_ms = 20,
             },
             .rng = std.testing.io,
-            .server_name = "replay-a.test",
+            .server_name = name_a,
         });
         errdefer a.deinit();
         var b = try secured_s2s_link.SecuredLink.init(.{
@@ -57336,7 +57627,7 @@ const SessionReplayTestPair = struct {
                 .now_ms = 20,
             },
             .rng = std.testing.io,
-            .server_name = "replay-b.test",
+            .server_name = name_b,
         });
         errdefer b.deinit();
         var pair = SessionReplayTestPair{ .ida = ida, .idb = idb, .a = a, .b = b };
@@ -57894,7 +58185,7 @@ test "secured establish collision winner teardown trust lifecycle" {
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
-    var old_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x63, 0x64);
+    var old_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x63, 0x66);
     defer old_pair.deinit();
     var winner_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x65, 0x66);
     defer winner_pair.deinit();
@@ -58321,9 +58612,9 @@ test "secured collision scan passes stale loser before resolving viable route" {
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
-    var stale_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x71, 0x72);
+    var stale_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x71, 0x76);
     defer stale_pair.deinit();
-    var viable_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x73, 0x74);
+    var viable_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x73, 0x76);
     defer viable_pair.deinit();
     var new_pair = try SessionReplayTestPair.initWithSeeds(allocator, 0x75, 0x76);
     defer new_pair.deinit();
@@ -59108,7 +59399,9 @@ test "session replica replay skips attachment leases for rolling-old peers witho
 
     var conn = ConnState.init(-1);
     conn.overflow_allocator = allocator;
-    conn.send_armed = true;
+    conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+    conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+    try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
     conn.sendq_cap = default_sendq_cap;
     defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
     server.scheduleSessionReplicaReplay(&conn);
@@ -59249,7 +59542,9 @@ test "session replica value replay completes 140 objects under continuous behind
 
     var conn = ConnState.init(-1);
     conn.overflow_allocator = allocator;
-    conn.send_armed = true;
+    conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+    conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+    try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
     conn.sendq_cap = default_sendq_cap;
     defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
     server.scheduleSessionReplicaReplay(&conn);
@@ -59361,6 +59656,7 @@ test "session replica conflicted lease replays both witnesses back to ingress pe
     conn.send_armed = true;
     conn.sendq_cap = default_sendq_cap;
     defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+    conn.s2s_secured = &pair.a;
     _ = server.drainSessionReplicaV2(&conn, &pair.a);
     try std.testing.expect(conn.session_replica_replay_pending);
     server.replaySessionReplicaStoreTo(&conn, &pair.a);
@@ -59413,16 +59709,20 @@ test "session replica replay preflights SendQ before AEAD advance and resumes at
 
     var conn = ConnState.init(-1);
     conn.overflow_allocator = allocator;
-    conn.send_armed = true; // keep the unit seam independent of io_uring
+    conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+    conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+    try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
     defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
     const filler: [8192]u8 = @splat(0x5a);
     conn.sendq_cap = filler.len;
     try rawAppendToConn(&conn, &filler);
 
     server.scheduleSessionReplicaReplay(&conn);
+    const held_counter = pair.a.exportOuter().send_counter;
     server.replaySessionReplicaStoreTo(&conn, &pair.a);
     try std.testing.expectEqual(@as(usize, 0), conn.session_replica_replay_cursor);
     try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+    try std.testing.expectEqual(held_counter, pair.a.exportOuter().send_counter);
 
     // Resume with room. The first attempt did not advance the encrypted record
     // counter or manufacture shared outbound ownership, so this turn may encode
@@ -60157,7 +60457,9 @@ test "session replica replay leaves no inner residue after outer record allocati
 
     var conn = ConnState.init(-1);
     conn.overflow_allocator = allocator;
-    conn.send_armed = true;
+    conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+    conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+    try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
     conn.sendq_cap = default_sendq_cap;
     defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
     server.scheduleSessionReplicaReplay(&conn);
@@ -60299,7 +60601,9 @@ test "session replica replay budgets actual ciphertext with one-frame progress e
 
         var conn = ConnState.init(-1);
         conn.overflow_allocator = allocator;
-        conn.send_armed = true;
+        conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+        conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+        try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
         conn.sendq_cap = default_sendq_cap;
         defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
         server.scheduleSessionReplicaReplay(&conn);
@@ -60362,7 +60666,9 @@ test "session replica replay budgets actual ciphertext with one-frame progress e
 
         var conn = ConnState.init(-1);
         conn.overflow_allocator = allocator;
-        conn.send_armed = true;
+        conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+        conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+        try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
         conn.sendq_cap = default_sendq_cap;
         defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
         server.scheduleSessionReplicaReplay(&conn);
@@ -60416,7 +60722,9 @@ test "maximum legal session replica fits the clamped server-link SendQ and progr
 
     var conn = ConnState.init(-1);
     conn.overflow_allocator = allocator;
-    conn.send_armed = true;
+    conn.test_sendq_capture = true; // Buffered unit sink owns no kernel SEND.
+    conn.s2s_secured = &pair.a; // Borrowed; the pair owns the link.
+    try std.testing.expect(conn.ownsActiveMeshLink(&pair.a));
     // The server-link floor must fit the shared portable maximum plus every v2
     // and secured-record wrapper. The shared cap deliberately leaves legacy
     // envelope headroom, so the emitted record need not fill the entire queue.
@@ -62022,12 +62330,10 @@ const MeshDial = struct {
     /// Parsed host/port (slices borrow `spec`).
     host: []const u8,
     port: u16,
-    /// Token of the live outbound ConnState created by the last dial — set
-    /// while a connect is in flight or the link is up. Cleared when that slot
-    /// is gone (generation mismatch), which is the re-dial signal.
+    /// Token of the live endpoint-bound ConnState, including the authenticated
+    /// inbound survivor of a reciprocal dial. Slot retirement permits re-dial.
     token: ?RingFdToken = null,
-    /// Last resolved target address for this dial. Used to recognize an inbound
-    /// survivor after reciprocal auto-dial collision closes our outbound token.
+    /// Last resolved configured target. Match the complete proven endpoint.
     /// Dual-stack: IPv4 peers are held in IPv4-mapped form (::ffff:a.b.c.d).
     addr: ?posix.sockaddr.in6 = null,
     /// Monotonic ms of the last dial attempt (rate cap for re-dials). 0 =
@@ -62049,16 +62355,8 @@ const MeshDial = struct {
 };
 
 fn sameSockaddrIn(a: posix.sockaddr.in6, b: posix.sockaddr.in6) bool {
-    return std.mem.eql(u8, &a.addr, &b.addr) and a.port == b.port;
-}
-
-fn samePeerIp(peer_addr: ?dns.Address, dial_addr: posix.sockaddr.in6) bool {
-    const peer = peer_addr orelse return false;
-    return switch (peer) {
-        // A v4 peer matches an IPv4-mapped dial address on its embedded v4 bytes.
-        .ipv4 => |b| isV4Mapped(dial_addr.addr) and std.mem.eql(u8, &b, dial_addr.addr[12..16]),
-        .ipv6 => |b| std.mem.eql(u8, &b, &dial_addr.addr),
-    };
+    return a.family == b.family and std.mem.eql(u8, &a.addr, &b.addr) and
+        a.port == b.port and a.scope_id == b.scope_id;
 }
 
 fn sockaddrIn(host: []const u8, port: u16) ServerError!posix.sockaddr.in {
@@ -63369,7 +63667,8 @@ test "GAP-D2 kill-restart and same-image USR2 deliver the memo and fire MEMO_PUS
     peer.overflow_allocator = alloc;
     peer.token = try tokenFromId(id);
     peer.s2s_secured = link;
-    peer.closing = true;
+    // Capture queued ciphertext without pretending this eligible peer is closing.
+    peer.test_sendq_capture = true;
     link_owned_by_server = true;
     try std.testing.expect(link.established());
 
@@ -63379,8 +63678,12 @@ test "GAP-D2 kill-restart and same-image USR2 deliver the memo and fire MEMO_PUS
     const delivered = conn.send_buf[0..conn.send_len];
     try std.testing.expect(std.mem.indexOf(u8, delivered, "usr2 offline") != null);
     try std.testing.expectEqual(@as(usize, 0), second.memo.pending("carol").len);
-    try std.testing.expect(link.outbound().len != 0);
-    try pair.b.feed(link.outbound(), 90);
+    const pushed_wire = try copyTestSendQ(alloc, peer);
+    defer alloc.free(pushed_wire);
+    try std.testing.expect(pushed_wire.len != 0);
+    try std.testing.expectEqual(@as(usize, 0), link.outbound().len);
+    try std.testing.expect(!peer.closing and !peer.s2s_dedup);
+    try pair.b.feed(pushed_wire, 90);
     const pushes = try pair.b.takeMemoPushes();
     defer {
         for (pushes) |payload| alloc.free(payload);
@@ -63637,6 +63940,10 @@ test "MARKREAD secured burst keeps signed frontier through SendQ pressure outer 
     var fact_it = author.read_marker_facts.valueIterator();
     const retained = try alloc.dupe(u8, fact_it.next().?.*);
     defer alloc.free(retained);
+    const receiver_conn = try alloc.create(ConnState);
+    defer alloc.destroy(receiver_conn);
+    receiver_conn.* = ConnState.init(-1);
+    receiver_conn.s2s_secured = &pair.b;
     const conn = try alloc.create(ConnState);
     defer alloc.destroy(conn);
     conn.* = ConnState.init(-1);
@@ -63662,7 +63969,7 @@ test "MARKREAD secured burst keeps signed frontier through SendQ pressure outer 
     const sent = try copyTestSendQ(alloc, conn);
     defer alloc.free(sent);
     try pair.b.feed(sent, 700);
-    receiver.drainEntityPropChanges(&pair.b);
+    receiver.drainEntityPropChanges(receiver_conn, &pair.b);
     try std.testing.expectEqualStrings(ts.slice(), (try receiver.read_markers.get("carol", "#room")).?.slice());
     var received_it = receiver.read_marker_facts.valueIterator();
     try std.testing.expectEqualSlices(u8, retained, received_it.next().?.*);
@@ -63685,7 +63992,7 @@ test "MARKREAD secured burst keeps signed frontier through SendQ pressure outer 
     defer alloc.free(replay);
     try pair.b.feed(replay, 800);
     const seq = store2.next_seq;
-    receiver.drainEntityPropChanges(&pair.b);
+    receiver.drainEntityPropChanges(receiver_conn, &pair.b);
     try std.testing.expectEqual(seq, store2.next_seq);
     try std.testing.expectEqual(@as(u32, 1), receiver.read_marker_facts.count());
     var replay_it = receiver.read_marker_facts.valueIterator();
@@ -65761,7 +66068,7 @@ test "MESSAGE_V2 Helix authored row waits for rolling-old peer then replays once
     defer alloc.free(ack_ciphertext);
     pair.b.clearOutbound();
     try pair.a.feed(ack_ciphertext, 101);
-    server.drainRelayV2Acks(&pair.a);
+    server.drainRelayV2Acks(peer_conn, &pair.a);
     try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
     try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.len());
 }
@@ -69708,9 +70015,14 @@ const ResyncQuietFixture = struct {
         self.pair.b.clearOutbound();
         if (wire.len != 0) try self.resumed.feed(wire, now_ms);
         self.resumed.processDeferredResidenceFrames(now_ms);
-        self.successor.drainIdentityTransitions(self.resumed);
-        self.successor.drainChannelModeFlagChanges(self.resumed);
-        self.successor.drainTopicChanges(self.resumed);
+        var clients = self.successor.reactors[0].clients.iterator();
+        var owner: ?*ConnState = null;
+        while (clients.next()) |entry| {
+            if (entry.value.s2s_secured == self.resumed) owner = entry.value;
+        }
+        self.successor.drainIdentityTransitions(owner orelse return error.TestUnexpectedResult, self.resumed);
+        self.successor.drainChannelModeFlagChanges(owner orelse return error.TestUnexpectedResult, self.resumed);
+        self.successor.drainTopicChanges(owner orelse return error.TestUnexpectedResult, self.resumed);
     }
 
     fn deinit(self: *ResyncQuietFixture, alloc: std.mem.Allocator) void {
@@ -70002,6 +70314,7 @@ test "UPGRADE canceled CONNECT survives SQ-full and retries through fair activat
     conn.overflow_allocator = std.testing.allocator;
     conn.token = try tokenFromId(id);
     conn.s2s_connect_addr = try sockaddrForHost("127.0.0.1", 9, 2_000);
+    conn.s2s_dial_target_known = true;
     conn.s2s_initiator = true;
     conn.connect_rearm_pending = true;
 
@@ -105764,6 +106077,7 @@ test "configured boot dial resolves and recognizes inherited outbound survivor" 
     defer inherited.s2s_secured = null; // pair owns this stack-backed fixture
     inherited.s2s_initiator = true;
     inherited.s2s_connect_addr = try sockaddrForHost("127.0.0.1", 65041, 2_000);
+    inherited.s2s_dial_target_known = true;
 
     // A successor starts with an unresolved configured-dial table even though
     // the inherited link retains its exact target. Boot must resolve solely to
@@ -105776,6 +106090,1276 @@ test "configured boot dial resolves and recognizes inherited outbound survivor" 
     try std.testing.expect(server.mesh_dials[0].token == null);
     try std.testing.expectEqual(clients_before, server.rx().clients.len());
     try std.testing.expectEqual(sq_before, server.rx().ring.inner.sq_ready());
+}
+
+fn sameIPTestSocketPair() ![2]linux.fd_t {
+    var sockets: [2]linux.fd_t = undefined;
+    if (comptime builtin.os.tag == .openbsd) {
+        if (posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets) != 0)
+            return error.SocketUnavailable;
+    } else {
+        if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+            return error.SocketUnavailable;
+    }
+    return sockets;
+}
+
+/// Drive native SEND syscalls/completions as well as Ringlane CQEs while reading
+/// the physical peer. A control/RECV CQE may precede SEND; no blocking read may
+/// assume that one reap call already retired the stream.
+fn readSameIPDrainWire(server: *Server, fd: linux.fd_t, expected: []const u8, until_eof: bool) !void {
+    var handler = CompletionHandler{ .server = server };
+    var completions: [8]reactor_backend.CompletionBuffer = undefined;
+    var wire: [8192]u8 = undefined;
+    var received: usize = 0;
+    var eof = false;
+    const deadline = platform.monotonicMillis() + 3_000;
+    while (platform.monotonicMillis() < deadline) {
+        _ = try server.rx().ring.submit();
+        try server.rx().ring.reapCompletions(&completions, 0, &handler);
+        if (handler.err) |err| return err;
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&fds, 10) == 0) continue;
+        const capacity = if (received < expected.len) @min(wire.len, expected.len - received) else wire.len;
+        const n = try readFd(fd, wire[0..capacity]);
+        if (n == 0) {
+            eof = true;
+            break;
+        }
+        try std.testing.expect(n <= expected.len - received);
+        try std.testing.expectEqualSlices(u8, expected[received..][0..n], wire[0..n]);
+        received += n;
+        if (!until_eof and received == expected.len) break;
+    }
+    try std.testing.expectEqual(expected.len, received);
+    if (until_eof) try std.testing.expect(eof);
+}
+
+test "same-IP mesh dial plaintext responder loser delivers its final handshake before close" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var links: [4]*s2s_link.S2sLink = undefined;
+    var server_owned: [4]bool = @splat(false);
+    var initialized: usize = 0;
+    defer for (links[0..initialized], 0..) |link, i| {
+        if (!server_owned[i]) {
+            link.deinit();
+            alloc.destroy(link);
+        }
+    };
+    for (&links, 0..) |*slot, i| {
+        slot.* = try alloc.create(s2s_link.S2sLink);
+        errdefer alloc.destroy(slot.*);
+        try slot.*.init(.{
+            .allocator = alloc,
+            .local_node_id = if (i % 2 == 0) 1 else 2,
+            .remote_node_id = 0,
+            .local_epoch_ms = 1000,
+            .server_name = if (i % 2 == 0) "aaa-local.test" else "zzz-peer.test",
+            .config = .{ .require_signed_frames = false },
+        });
+        initialized += 1;
+    }
+    try links[0].start(10);
+    try links[1].feed(links[0].outbound(), 11, 1);
+    links[0].clearOutbound();
+    try links[0].feed(links[1].outbound(), 12, 2);
+    links[1].clearOutbound();
+    links[0].clearOutbound();
+    try std.testing.expect(links[0].established());
+    const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .server_name = "aaa-local.test" });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const old_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const old = server.rx().clients.get(old_id).?;
+    old.token = try tokenFromId(old_id);
+    old.s2s = links[0];
+    server_owned[0] = true;
+    old.test_sendq_capture = true;
+    old.s2s_initiator = true;
+    const sockets = try sameIPTestSocketPair();
+    defer closeFd(sockets[1]);
+    const id = try server.rx().clients.alloc(ConnState.init(sockets[0]));
+    const conn = server.rx().clients.get(id).?;
+    conn.token = try tokenFromId(id);
+    conn.overflow_allocator = alloc;
+    conn.s2s = links[2];
+    server_owned[2] = true;
+    try server.armRecv(conn);
+    try links[3].start(20);
+    server.driveS2s(conn, links[2], links[3].outbound());
+    links[3].clearOutbound();
+    try std.testing.expect(conn.s2s_dedup);
+    // Local establishment queued the responder's HELLO. The remote initiator
+    // still needs those bytes before it can authenticate and bind its endpoint.
+    try std.testing.expect(connSendBacklog(conn) > 0);
+    const expected = try copyTestSendQ(alloc, conn);
+    defer alloc.free(expected);
+    try server.armSendIfNeeded(conn);
+    try readSameIPDrainWire(server, sockets[1], expected, true);
+    try links[3].feed(expected, 21, 3);
+    try std.testing.expect(links[3].established());
+}
+
+test "same-IP mesh dial secured responder loser retains armed ciphertext until send completion" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const pairs = try alloc.alloc(SessionReplayTestPair, 2);
+    defer alloc.free(pairs);
+    var server_owned: [2]bool = @splat(false);
+    var attached: [2]?*secured_s2s_link.SecuredLink = @splat(null);
+    var initialized: usize = 0;
+    defer for (pairs[0..initialized], 0..) |*pair, i| {
+        if (!server_owned[i]) {
+            if (attached[i]) |link| alloc.destroy(link);
+            if (i == 0) pair.a.deinit() else pair.b.deinit();
+        }
+        if (i == 0) pair.b.deinit() else pair.a.deinit();
+        pair.ida.sign_kp.secret_key.page = null;
+        pair.idb.sign_kp.secret_key.page = null;
+        pair.ida.deinit();
+        pair.idb.deinit();
+    };
+    pairs[0] = try SessionReplayTestPair.init(alloc);
+    initialized += 1;
+    pairs[1] = try SessionReplayTestPair.initWithSeedsAndNames(alloc, 0x32, 0x31, "replay-b.test", "replay-a.test");
+    initialized += 1;
+    const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .server_name = "aaa-local.test" });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const old_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const old = server.rx().clients.get(old_id).?;
+    old.token = try tokenFromId(old_id);
+    attached[0] = try alloc.create(secured_s2s_link.SecuredLink);
+    attached[0].?.* = pairs[0].a;
+    old.s2s_secured = attached[0];
+    server_owned[0] = true;
+    old.test_sendq_capture = true;
+    old.s2s_initiator = true;
+    old.s2s_dial_target_known = true;
+    old.s2s_connect_addr = try sockaddrForHost("127.0.0.1", 65042, 2000);
+    const sockets = try sameIPTestSocketPair();
+    defer closeFd(sockets[1]);
+    const id = try server.rx().clients.alloc(ConnState.init(sockets[0]));
+    const conn = server.rx().clients.get(id).?;
+    conn.token = try tokenFromId(id);
+    conn.overflow_allocator = alloc;
+    attached[1] = try alloc.create(secured_s2s_link.SecuredLink);
+    attached[1].?.* = pairs[1].b;
+    conn.s2s_secured = attached[1];
+    server_owned[1] = true;
+    try server.armRecv(conn);
+    // On Ringlane, submit the quiet RECV separately. Its positive CQE can race
+    // the collision while the later SEND still has not crossed submission.
+    if (comptime builtin.os.tag == .linux) {
+        _ = try server.rx().ring.submit();
+        try writeAllFd(sockets[1], "racing-recv");
+    }
+    try std.testing.expectEqual(.responder, attached[1].?.role);
+    try attached[1].?.sendMembership("#drain", "retained-peer", 0, 400, true, .{}, "");
+    try std.testing.expect(server.flushMeshBurstStage(conn));
+    const expected = try copyTestSendQ(alloc, conn);
+    defer alloc.free(expected);
+    try std.testing.expect(expected.len != 0 and conn.send_armed);
+    conn.sendq_cap = expected.len;
+    try attached[1].?.sendMembership("#drain", "retained-next", 0, 401, true, .{}, "");
+    const suffix = try alloc.dupe(u8, attached[1].?.outbound());
+    defer alloc.free(suffix);
+    try std.testing.expect(suffix.len != 0 and suffix.len <= conn.sendq_cap);
+    try std.testing.expect(!server.flushMeshBurstStage(conn));
+    try std.testing.expect(server.resolveS2sCollision(conn, attached[1].?.remoteName()));
+    try std.testing.expect(old.s2s_dial_target_known and !old.closing);
+    var handler = CompletionHandler{ .server = server };
+    var completions: [8]reactor_backend.CompletionBuffer = undefined;
+    if (comptime builtin.os.tag == .linux) {
+        var turns: usize = 0;
+        while (conn.recv_armed and turns < 100) : (turns += 1) {
+            try server.rx().ring.reapCompletions(&completions, 0, &handler);
+            sleepOneMillis();
+        }
+        if (handler.err) |err| return err;
+        try std.testing.expect(!conn.recv_armed);
+        try std.testing.expect(conn.send_armed and conn.s2s_dedup_drain_deadline_ms != 0);
+        try std.testing.expectEqualSlices(u8, expected, conn.send_buf[conn.send_offset..conn.send_len]);
+        try std.testing.expectEqualSlices(u8, suffix, attached[1].?.outbound());
+    }
+    // SEND owns the exact buffer but has not yet been submitted to the kernel.
+    // A collision close must leave the stream open until that completion.
+    try readSameIPDrainWire(server, sockets[1], expected, false);
+    try pairs[1].a.feed(expected, 500);
+    // Releasing the first SEND makes capacity for the exact retained record.
+    try readSameIPDrainWire(server, sockets[1], suffix, true);
+    try pairs[1].a.feed(suffix, 501);
+}
+
+test "same-IP mesh dial blocked duplicate drain expires and Helix refuses its partial cut" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0 });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.token = try tokenFromId(id);
+    conn.test_sendq_capture = true;
+    conn.s2s_dedup = true;
+    const link = try alloc.create(s2s_link.S2sLink);
+    try link.init(.{ .allocator = alloc, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "drain.test" });
+    conn.s2s = link; // the slot owns the heap link through actual teardown
+    try rawAppendToConn(conn, "blocked-final-flight");
+    server.requestS2sDedupDrain(conn);
+    try std.testing.expect(conn.closing and conn.s2s_dedup_drain_deadline_ms != 0);
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var fds: [4]linux.fd_t = undefined;
+    var fd_count: usize = 0;
+    var counts: Server.SealCounts = .{};
+    server.sealShardClients(server.rx(), &pieces, &blobs, &fds, &fd_count, &counts);
+    try std.testing.expect(counts.s2s_preserve_failed);
+    try std.testing.expectEqual(@as(usize, 0), pieces.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fd_count);
+    try std.testing.expectEqualStrings("blocked-final-flight", conn.send_buf[0..conn.send_len]);
+    conn.s2s_dedup_drain_deadline_ms = server.nowMs() - 1;
+    server.sweepTimeouts();
+    try std.testing.expect(server.rx().clients.get(id) == null);
+}
+
+test "same-IP mesh dial receive caller observes zero-output loser retirement by exact generation" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |through_completion| {
+        var links: [4]*s2s_link.S2sLink = undefined;
+        var server_owned: [4]bool = @splat(false);
+        var initialized: usize = 0;
+        defer for (links[0..initialized], 0..) |link, i| {
+            if (!server_owned[i]) {
+                link.deinit();
+                alloc.destroy(link);
+            }
+        };
+        for (&links, 0..) |*slot, i| {
+            slot.* = try alloc.create(s2s_link.S2sLink);
+            errdefer alloc.destroy(slot.*);
+            try slot.*.init(.{
+                .allocator = alloc,
+                .local_node_id = if (i % 2 == 0) 1 else 2,
+                .remote_node_id = 0,
+                .local_epoch_ms = 1000,
+                .server_name = if (i % 2 == 0) "zzz-local.test" else "aaa-peer.test",
+                .config = .{ .require_signed_frames = false },
+            });
+            initialized += 1;
+        }
+        try links[0].start(10);
+        try links[1].feed(links[0].outbound(), 11, 1);
+        links[0].clearOutbound();
+        try links[0].feed(links[1].outbound(), 12, 2);
+        links[1].clearOutbound();
+        links[0].clearOutbound();
+        // This initiator's own handshake and burst already crossed its send
+        // boundary. Receiving the remote HELLO now produces no output.
+        try links[2].start(20);
+        links[2].clearOutbound();
+        links[2].peer.burst_sent = true;
+        try links[3].start(20);
+        const hello = try alloc.dupe(u8, links[3].outbound());
+        defer alloc.free(hello);
+        const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .server_name = "zzz-local.test" });
+        defer alloc.destroy(server);
+        defer server.deinit();
+        // A repeated low-severity LINK announcement may already be collapsed.
+        // That ordinary runtime case leaves this final drive with no audit tail
+        // to accidentally keep its slot alive after the zero-output handshake.
+        for (0..event_collapse_mod.default_threshold) |_| {
+            try std.testing.expect(server.event_collapse.admit(@intFromEnum(event_spine.EventCategory.server_link), @intFromEnum(event_spine.EventSeverity.notice), "SERVER LINK aaa-peer.test", platform.realtimeMillis()));
+        }
+        current_reactor = &server.reactors[0];
+        const old_id = try server.rx().clients.alloc(ConnState.init(-1));
+        const old = server.rx().clients.get(old_id).?;
+        old.token = try tokenFromId(old_id);
+        old.s2s = links[0];
+        server_owned[0] = true;
+        old.test_sendq_capture = true;
+        const sockets = try sameIPTestSocketPair();
+        defer closeFd(sockets[1]);
+        const id = try server.rx().clients.alloc(ConnState.init(sockets[0]));
+        const conn = server.rx().clients.get(id).?;
+        const token = try tokenFromId(id);
+        conn.token = token;
+        conn.s2s = links[2];
+        conn.s2s_initiator = true;
+        server_owned[2] = true;
+        if (through_completion) {
+            try server.armRecv(conn);
+            _ = try server.rx().ring.submit();
+            try writeAllFd(sockets[1], hello);
+            var handler = CompletionHandler{ .server = server };
+            var completions: [8]reactor_backend.CompletionBuffer = undefined;
+            const deadline = platform.monotonicMillis() + 3_000;
+            while (server.rx().clients.get(id) != null and platform.monotonicMillis() < deadline) {
+                try server.rx().ring.reapCompletions(&completions, 0, &handler);
+                sleepOneMillis();
+            }
+            if (handler.err) |err| return err;
+        } else {
+            // A false result tells the completion caller not to touch its
+            // original pointer after synchronous collision finalization.
+            try std.testing.expect(!try server.driveClientBytes(id, conn, hello));
+        }
+        if (server.rx().clients.get(id)) |remaining| {
+            std.debug.print("zero-output collision fixture completion={} closing={} dedup={} recv={} send={} backlog={d} retained={d} deadline={d}\n", .{ through_completion, remaining.closing, remaining.s2s_dedup, remaining.recv_armed, remaining.send_armed, connSendBacklog(remaining), if (remaining.s2s) |l| l.outbound().len else @as(usize, 0), remaining.s2s_dedup_drain_deadline_ms });
+        }
+        try std.testing.expect(server.rx().clients.get(id) == null);
+        const replacement = try server.rx().clients.alloc(ConnState.init(-1));
+        try std.testing.expectEqual(id.slot, replacement.slot);
+        try std.testing.expect(id.gen != replacement.gen);
+        const live = server.rx().clients.get(replacement).?;
+        live.token = try tokenFromId(replacement);
+        try rawAppendToConn(live, "replacement-generation");
+        try std.testing.expectError(error.ClientNotFound, server.handleRecv(.{ .token = token, .res = 1, .more = false }));
+        try std.testing.expectEqualStrings("replacement-generation", live.send_buf[0..live.send_len]);
+        try std.testing.expect(!live.recv_armed and !live.send_armed and !live.closing);
+    }
+}
+
+const DrainingRouteOperation = enum { message_v2, ack, ack_confirm, e2ee_ack, e2ee_confirm, oper_event, legacy_message };
+
+fn expectDrainingRouteUsesSurvivor(operation: DrainingRouteOperation) !void {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const pairs = try alloc.alloc(SessionReplayTestPair, 2);
+    defer alloc.free(pairs);
+    var initialized: usize = 0;
+    defer for (pairs[0..initialized]) |*pair| pair.deinit();
+    for (pairs) |*pair| {
+        pair.* = try SessionReplayTestPair.init(alloc);
+        initialized += 1;
+    }
+    const server = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pairs[0].ida.shortId(),
+        .server_name = "replay-a.test",
+    });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    var ids: [2]client_model.ClientId = undefined;
+    var attached: usize = 0;
+    defer for (ids[0..attached]) |id| {
+        if (server.rx().clients.get(id)) |conn| conn.s2s_secured = null;
+    };
+    for (&ids, 0..) |*id, i| {
+        id.* = try server.rx().clients.alloc(ConnState.init(-1));
+        attached += 1;
+        const conn = server.rx().clients.get(id.*).?;
+        conn.token = try tokenFromId(id.*);
+        conn.overflow_allocator = alloc;
+        conn.test_sendq_capture = true;
+        conn.s2s_secured = &pairs[i].a;
+    }
+    // The first exact slot is an established collision loser whose final
+    // SendQ flight is still retained. Empty link.outbound must not make it an
+    // eligible destination for fresh work before the live same-key survivor.
+    const loser = server.rx().clients.get(ids[0]).?;
+    loser.closing = true;
+    loser.s2s_dedup = true;
+    loser.s2s_dedup_drain_deadline_ms = server.nowMs() +| 5_000;
+    const held = "held-final-flight";
+    loser.sendq_cap = held.len;
+    try rawAppendToConn(loser, held);
+    const survivor = server.rx().clients.get(ids[1]).?;
+    try std.testing.expect(Server.sameS2sPeer(loser, survivor));
+    try std.testing.expect(pairs[0].a.supportsSecureRelayV2());
+    try std.testing.expect(pairs[1].a.supportsRelayV2AckConfirm());
+    try std.testing.expect(pairs[1].a.supportsE2eeGroupAckConfirm());
+    const initial_counter = pairs[0].a.exportOuter().send_counter;
+    const relay_id: message_relay_v2.RelayId = @splat(0x6c);
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#draining-route",
+        .source_prefix = "Sender!u@replay-a.test",
+        .account = "sender",
+        .text = "survivor-only",
+        .scope_kind = .channel,
+        .origin_node = pairs[0].ida.shortId(),
+        .hlc = 700,
+    };
+    try message_relay_v2.stampOrigin(alloc, &msg, &pairs[0].ida.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, msg);
+    defer alloc.free(wire);
+    const peer = pairs[0].idb.shortId();
+    switch (operation) {
+        .message_v2 => try std.testing.expect(server.replayRelayV2WireToPeer(peer, wire)),
+        .ack => try std.testing.expect(server.sendRelayV2AckToPeer(peer, relay_id)),
+        .ack_confirm => server.sendRelayV2AckConfirmToPeer(peer, relay_id),
+        .e2ee_ack => try std.testing.expect(server.sendE2eeGroupAckToPeer(peer, relay_id)),
+        .e2ee_confirm => server.sendE2eeGroupAckConfirmToPeer(peer, relay_id),
+        .oper_event => server.meshBroadcastOperEvent(.server_link, .notice, "survivor-only"),
+        .legacy_message => try std.testing.expectEqual(@as(usize, 1), server.relayToPeers(.{
+            .verb = .privmsg,
+            .target = "#draining-route",
+            .source_nick = "Sender",
+            .source_prefix = "Sender!u@replay-a.test",
+            .text = "survivor-only",
+            .origin_node = pairs[0].ida.shortId(),
+            .hlc = 700,
+        }, .all)),
+    }
+    try std.testing.expectEqual(initial_counter, pairs[0].a.exportOuter().send_counter);
+    try std.testing.expectEqual(@as(usize, 0), pairs[0].a.outbound().len);
+    try std.testing.expectEqualStrings(held, loser.send_buf[loser.send_offset..loser.send_len]);
+    const delivered = try copyTestSendQ(alloc, survivor);
+    defer alloc.free(delivered);
+    try std.testing.expect(delivered.len != 0);
+    try pairs[1].b.feed(delivered, 800);
+    switch (operation) {
+        .message_v2 => {
+            const inbound = try pairs[1].b.takeInboundV2();
+            defer {
+                for (inbound) |*item| item.deinit(alloc);
+                alloc.free(inbound);
+            }
+            try std.testing.expectEqual(@as(usize, 1), inbound.len);
+            try std.testing.expectEqualSlices(u8, wire, inbound[0].wire);
+        },
+        .ack, .ack_confirm, .e2ee_ack, .e2ee_confirm => {
+            const receipts = switch (operation) {
+                .ack => try pairs[1].b.takeInboundV2Acks(),
+                .ack_confirm => try pairs[1].b.takeInboundV2AckConfirms(),
+                .e2ee_ack => try pairs[1].b.takeInboundE2eeGroupAcks(),
+                .e2ee_confirm => try pairs[1].b.takeInboundE2eeGroupAckConfirms(),
+                else => unreachable,
+            };
+            defer alloc.free(receipts);
+            try std.testing.expectEqual(@as(usize, 1), receipts.len);
+            try std.testing.expectEqualSlices(u8, &relay_id, &receipts[0]);
+        },
+        .oper_event => {
+            const events = try pairs[1].b.takeOperEvents();
+            defer {
+                for (events) |event| alloc.free(event);
+                alloc.free(events);
+            }
+            try std.testing.expectEqual(@as(usize, 1), events.len);
+            const event = try oper_event.decode(events[0]);
+            try std.testing.expectEqualStrings("survivor-only", event.message);
+        },
+        .legacy_message => {
+            const inbound = try pairs[1].b.takeInbound();
+            defer {
+                for (inbound) |*item| item.deinit(alloc);
+                alloc.free(inbound);
+            }
+            try std.testing.expectEqual(@as(usize, 1), inbound.len);
+            try std.testing.expectEqualStrings("survivor-only", inbound[0].msg.text);
+        },
+    }
+}
+
+test "same-IP mesh dial routing excludes draining loser for MESSAGE_V2 replay" {
+    try expectDrainingRouteUsesSurvivor(.message_v2);
+}
+test "same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK" {
+    try expectDrainingRouteUsesSurvivor(.ack);
+}
+test "same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK_CONFIRM" {
+    try expectDrainingRouteUsesSurvivor(.ack_confirm);
+}
+test "same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK" {
+    try expectDrainingRouteUsesSurvivor(.e2ee_ack);
+}
+test "same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK_CONFIRM" {
+    try expectDrainingRouteUsesSurvivor(.e2ee_confirm);
+}
+test "same-IP mesh dial routing excludes draining loser from Event Spine fanout" {
+    try expectDrainingRouteUsesSurvivor(.oper_event);
+}
+test "same-IP mesh dial routing excludes draining loser from legacy message fanout" {
+    try expectDrainingRouteUsesSurvivor(.legacy_message);
+}
+
+const RetiringSelectorOperation = enum { dial_credit, squit };
+
+fn expectRetiringSelectorUsesActivePeer(operation: RetiringSelectorOperation) !void {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const pairs = try alloc.alloc(SessionReplayTestPair, 2);
+    defer alloc.free(pairs);
+    var initialized: usize = 0;
+    defer for (pairs[0..initialized]) |*pair| pair.deinit();
+    for (pairs) |*pair| {
+        pair.* = try SessionReplayTestPair.init(alloc);
+        initialized += 1;
+    }
+    const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .server_name = "replay-a.test" });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    var ids: [2]client_model.ClientId = undefined;
+    var attached: usize = 0;
+    defer for (ids[0..attached]) |id| {
+        if (server.rx().clients.get(id)) |conn| conn.s2s_secured = null;
+    };
+    for (&ids, 0..) |*id, i| {
+        id.* = try server.rx().clients.alloc(ConnState.init(-1));
+        attached += 1;
+        const conn = server.rx().clients.get(id.*).?;
+        conn.token = try tokenFromId(id.*);
+        conn.test_sendq_capture = true;
+        conn.overflow_allocator = alloc;
+        conn.s2s_secured = &pairs[i].a;
+    }
+    const loser = server.rx().clients.get(ids[0]).?;
+    const survivor = server.rx().clients.get(ids[1]).?;
+    try std.testing.expect(Server.sameS2sPeer(loser, survivor));
+    loser.closing = true;
+    loser.s2s_dedup = true;
+    try rawAppendToConn(loser, "retained-selector-flight");
+    if (operation == .squit) {
+        const victim = server.findSquitVictim("REPLAY-B.TEST") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(survivor.token.slot, victim.token.slot);
+        try std.testing.expectEqual(survivor.token.gen, victim.token.gen);
+        survivor.closing = true;
+        try std.testing.expect(server.findSquitVictim("replay-b.test") == null);
+    } else {
+        const addr = try sockaddrForHost("127.0.0.1", 32123, 2000);
+        server.mesh_dials = try alloc.alloc(MeshDial, 1);
+        server.mesh_dials[0] = .{ .spec = "127.0.0.1:32123", .host = "127.0.0.1", .port = 32123, .addr = addr, .backoff_failures = 3, .retry_not_before_ms = 999 };
+        loser.s2s_connect_addr = addr;
+        loser.s2s_dial_target_known = true;
+        server.noteMeshDialSuccessByName("replay-b.test");
+        try std.testing.expectEqual(@as(u32, 3), server.mesh_dials[0].backoff_failures);
+        try std.testing.expectEqual(@as(i64, 999), server.mesh_dials[0].retry_not_before_ms);
+        // The same complete endpoint on an active authenticated survivor is a
+        // legitimate success and must still clear its retry obligations.
+        survivor.s2s_connect_addr = addr;
+        survivor.s2s_dial_target_known = true;
+        server.noteMeshDialSuccessByName("replay-b.test");
+        try std.testing.expectEqual(@as(u32, 0), server.mesh_dials[0].backoff_failures);
+        try std.testing.expectEqual(@as(i64, 0), server.mesh_dials[0].retry_not_before_ms);
+    }
+    try std.testing.expectEqualStrings("retained-selector-flight", loser.send_buf[0..loser.send_len]);
+}
+
+test "same-IP mesh dial retiring peer cannot credit endpoint breaker" {
+    try expectRetiringSelectorUsesActivePeer(.dial_credit);
+}
+
+test "same-IP mesh dial SQUIT selects active survivor before retained loser" {
+    try expectRetiringSelectorUsesActivePeer(.squit);
+}
+
+const RetiringTurnOperation = enum { mode, search, active_control };
+
+fn expectRetirementStopsLaterFrameFamilies(operation: RetiringTurnOperation) !void {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const pair = try alloc.create(SessionReplayTestPair);
+    defer alloc.destroy(pair);
+    pair.* = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    const root = std.fmt.bytesToHex(pair.idb.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&root};
+    const server = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .node_identity = &pair.ida,
+        .mesh_trust_roots = &roots,
+        .server_name = "replay-a.test",
+    });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const pid = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(pid).?;
+    conn.token = try tokenFromId(pid);
+    conn.overflow_allocator = alloc;
+    conn.test_sendq_capture = true;
+    conn.s2s_secured = &pair.a;
+    defer conn.s2s_secured = null;
+    server.publishPeerCount();
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    target.test_sendq_capture = true;
+    _ = try server.world.join("#retiring-turn", worldIdFromClient(target_id));
+    try std.testing.expectEqual(Server.RelaySenderHome.unknown, server.relaySenderHome("Absent", pair.idb.shortId()));
+    try std.testing.expect(pair.a.supportsSecureRelayV2());
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .scope_kind = .channel,
+        .target = "#retiring-turn",
+        .source_prefix = "Absent!u@replay-b.test",
+        .text = "awaiting home authority",
+        .origin_node = pair.idb.shortId(),
+        .hlc = 1000,
+    };
+    if (operation != .active_control) {
+        // Fill the actual bounded deferred queue through signed secured ingress.
+        // No fake length or uninitialized deferred row participates in the test.
+        for (0..relay_v2_deferred_capacity) |i| {
+            msg.hlc = @intCast(1000 + i);
+            try message_relay_v2.stampOrigin(alloc, &msg, &pair.idb.sign_kp, &pubkey, &signature);
+            try pair.b.sendMessageV2(msg);
+        }
+        const initial_wire = try alloc.dupe(u8, pair.b.outbound());
+        defer alloc.free(initial_wire);
+        pair.b.clearOutbound();
+        server.driveS2sSecured(conn, &pair.a, initial_wire);
+        try std.testing.expect(conn.isActiveMeshPeer());
+        try std.testing.expectEqual(relay_v2_deferred_capacity, server.relay_v2_deferred_len);
+    }
+    resetTestSendQ(conn);
+    resetTestSendQ(target);
+    const before_counter = pair.a.exportOuter().send_counter;
+    const before_flags = server.channelModeFlagBits("#retiring-turn");
+    msg.hlc = 2000;
+    try message_relay_v2.stampOrigin(alloc, &msg, &pair.idb.sign_kp, &pubkey, &signature);
+    try pair.b.sendMessageV2(msg);
+    try pair.b.sendChannelModeFlags("#retiring-turn", before_flags | Server.channel_secret_flag_bit, 2001);
+    var search_buf: [1024]u8 = undefined;
+    const search = mesh_search.encodeQuery(41, "#retiring-turn", &.{"needle"}, &search_buf) orelse return error.TestUnexpectedResult;
+    try pair.b.sendSearchQuery(search);
+    const wire = try alloc.dupe(u8, pair.b.outbound());
+    defer alloc.free(wire);
+    pair.b.clearOutbound();
+    // MESSAGE_V2, MODE and SEARCH share the exact authenticated receive turn.
+    server.driveS2sSecured(conn, &pair.a, wire);
+    if (operation == .active_control) {
+        try std.testing.expect(conn.isActiveMeshPeer());
+        try std.testing.expect(server.channelModeFlagBits("#retiring-turn") & Server.channel_secret_flag_bit != 0);
+        try expectContains(target.send_buf[0..target.send_len], "MODE #retiring-turn +s");
+        try std.testing.expect(pair.a.exportOuter().send_counter > before_counter);
+        const reply = try copyTestSendQ(alloc, conn);
+        defer alloc.free(reply);
+        try std.testing.expect(reply.len != 0);
+        try pair.b.feed(reply, 3000);
+        const replies = try pair.b.takeSearchReplies();
+        defer {
+            for (replies) |payload| alloc.free(payload);
+            if (replies.len != 0) alloc.free(replies);
+        }
+        try std.testing.expectEqual(@as(usize, 1), replies.len);
+        var decoded: [search_cmd.max_results]mesh_search.HitView = undefined;
+        const response = mesh_search.decodeReply(replies[0], &decoded) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 41), response.id);
+    } else {
+        try std.testing.expect(conn.closing);
+        try std.testing.expectEqual(relay_v2_deferred_capacity, server.relay_v2_deferred_len);
+        if (operation == .mode) {
+            try std.testing.expectEqual(before_flags, server.channelModeFlagBits("#retiring-turn"));
+            try std.testing.expectEqual(@as(usize, 0), target.send_len);
+        } else {
+            try std.testing.expectEqual(before_counter, pair.a.exportOuter().send_counter);
+            try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+            try std.testing.expectEqual(@as(usize, 0), connSendBacklog(conn));
+        }
+    }
+}
+
+test "same-IP mesh dial mid-turn retirement stops MODE publication" {
+    try expectRetirementStopsLaterFrameFamilies(.mode);
+}
+
+test "same-IP mesh dial mid-turn retirement stops SEARCH encoding" {
+    try expectRetirementStopsLaterFrameFamilies(.search);
+}
+
+test "same-IP mesh dial active frame-family control publishes MODE and SEARCH" {
+    try expectRetirementStopsLaterFrameFamilies(.active_control);
+}
+
+const RetiringRosterOperation = enum { home, account, membership, status, whois, projection, channel_metadata, user_count, info, message_v2, e2ee_group };
+
+fn expectRetiringRosterUsesSurvivor(operation: RetiringRosterOperation) !void {
+    try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+    try expectRetiringRosterUsesSurvivorInOrder(operation, true);
+}
+
+fn expectRetiringRosterUsesSurvivorInOrder(operation: RetiringRosterOperation, reverse: bool) !void {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const pairs = try alloc.alloc(SessionReplayTestPair, 2);
+    defer alloc.free(pairs);
+    var initialized: usize = 0;
+    defer for (pairs[0..initialized]) |*pair| pair.deinit();
+    for (pairs) |*pair| {
+        pair.* = try SessionReplayTestPair.init(alloc);
+        initialized += 1;
+    }
+    const origin_root = std.fmt.bytesToHex(pairs[1].idb.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&origin_root};
+    const server = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &pairs[0].ida,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+        .server_name = "replay-a.test",
+    });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    var ids: [2]client_model.ClientId = undefined;
+    var attached: usize = 0;
+    defer for (0..attached) |ordinal| {
+        const i = if (reverse) ids.len - 1 - ordinal else ordinal;
+        if (server.rx().clients.get(ids[i])) |conn| conn.s2s_secured = null;
+    };
+    for (0..ids.len) |ordinal| {
+        const i = if (reverse) ids.len - 1 - ordinal else ordinal;
+        ids[i] = try server.rx().clients.alloc(ConnState.init(-1));
+        attached += 1;
+        const conn = server.rx().clients.get(ids[i]).?;
+        conn.token = try tokenFromId(ids[i]);
+        conn.overflow_allocator = alloc;
+        conn.test_sendq_capture = true;
+        conn.s2s_secured = &pairs[i].a;
+    }
+    const peer = pairs[1].idb.shortId();
+    // Unit-scoped residence proof: the fixture admits only its configured
+    // account/nick tuples at this exact authenticated direct origin. Membership
+    // still traverses signing, encrypted transport and the daemon feed boundary.
+    const Residence = struct {
+        fn verify(ctx: *anyopaque, account: []const u8, nick: []const u8, origin: u64, v2: bool) s2s_link.S2sLink.ResidenceDecision {
+            const identity: *node_identity.NodeIdentity = @ptrCast(@alignCast(ctx));
+            if (!v2 or origin != identity.shortId()) return .untrusted;
+            if (!std.mem.eql(u8, account, "obsolete") and !std.mem.eql(u8, account, "live")) return .untrusted;
+            for ([_][]const u8{ "Sender", "Ghost", "StaleOnly" }) |expected| {
+                if (std.mem.eql(u8, nick, expected)) return .trusted;
+            }
+            return .untrusted;
+        }
+    };
+    const obsolete = s2s_peer_mod.MemberIdentity{
+        .username = "obsolete",
+        .realname = "Obsolete",
+        .host = "old.test",
+        .account = "obsolete",
+    };
+    const current = s2s_peer_mod.MemberIdentity{
+        .username = "current",
+        .realname = "Current",
+        .host = "live.test",
+        .account = "live",
+    };
+    for (pairs, 0..) |*pair, i| {
+        pair.a.setResidenceVerifier(.{ .ctx = &pair.idb, .verify_fn = Residence.verify });
+        const ident = if (i == 0) obsolete else current;
+        const hlc: u64 = if (i == 0) 700 else 600;
+        const status: u4 = if (i == 0) 0b0100 else 0;
+        try pair.b.sendMembership("#authority", "Sender", status, hlc, true, ident, "");
+        try pair.b.sendMembership("#authority", "Ghost", 0, hlc, true, ident, "");
+        if (i == 0) {
+            try pair.b.sendMembership("#authority", "StaleOnly", status, hlc, true, ident, "");
+            try pair.b.sendMembership("#obsolete", "Ghost", 0, hlc, true, ident, "");
+            try pair.b.sendMembership("#dead-only", "StaleOnly", 0, hlc, true, ident, "");
+        }
+        try pair.b.sendChannelModeFlags("#authority", if (i == 0) Server.channel_secret_flag_bit else 0, hlc);
+        try pair.b.sendTopic("#authority", if (i == 0) "obsolete topic" else "current topic", "Setter", @intCast(hlc), hlc, true);
+        const wire = try alloc.dupe(u8, pair.b.outbound());
+        defer alloc.free(wire);
+        pair.b.clearOutbound();
+        const conn = server.rx().clients.get(ids[i]).?;
+        server.driveS2sSecured(conn, &pair.a, wire);
+        try std.testing.expect(!conn.closing);
+        const response = try copyTestSendQ(alloc, conn);
+        defer alloc.free(response);
+        resetTestSendQ(conn);
+        if (response.len != 0) try pair.b.feed(response, server.meshWallMs());
+        const admitted = pair.a.findRemoteMember("Ghost") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(peer, admitted.node);
+        try std.testing.expectEqualStrings(ident.account, admitted.account);
+        try std.testing.expect(admitted.account_trusted);
+        try std.testing.expectEqual(@as(usize, if (i == 0) 3 else 2), pair.a.channelMembers("#authority").len);
+    }
+    const stale = &pairs[0].a.inner.?.peer.routes;
+    const live = &pairs[1].a.inner.?.peer.routes;
+    if (operation == .home) {
+        // Only this direct selector case models a historical conflicting home
+        // projection. B cannot author MEMBERSHIP for C; no wire claim or account
+        // trust is fabricated for this negative checkpoint precondition.
+        _ = try stale.applyMembership("#authority", "Ghost", 91, 0b0100, 701, true, .{}, 800);
+    }
+    const loser = server.rx().clients.get(ids[0]).?;
+    const survivor = server.rx().clients.get(ids[1]).?;
+    try std.testing.expect(Server.sameS2sPeer(loser, survivor));
+    try std.testing.expect(stale.bestNickClaim("Ghost").?.higherPriorityThan(live.bestNickClaim("Ghost").?));
+    loser.closing = true;
+    loser.s2s_dedup = true;
+    loser.s2s_dedup_drain_deadline_ms = server.nowMs() +| 5_000;
+    const held = "retained-final-flight";
+    loser.sendq_cap = held.len;
+    try rawAppendToConn(loser, held);
+    const loser_counter = pairs[0].a.exportOuter().send_counter;
+    const target_id = try addTestLocalClient(server, "Target", "target");
+    const target = server.connFor(target_id).?;
+    target.test_sendq_capture = true;
+    target.session.addCap(.message_tags);
+    target.session.addCap(.server_time);
+    target.session.addCap(.onyx_e2ee);
+    _ = try server.world.join("#authority", worldIdFromClient(target_id));
+    _ = try server.world.join("#obsolete", worldIdFromClient(target_id));
+
+    switch (operation) {
+        .home => {
+            try std.testing.expectEqual(@as(?u64, peer), server.meshNickHomeNode("Ghost"));
+            try std.testing.expectEqual(Server.RelaySenderHome.match, server.relaySenderHome("Ghost", peer));
+            try std.testing.expect(server.meshNickHomeNode("StaleOnly") == null);
+        },
+        .account => {
+            try std.testing.expectEqualStrings("live", server.trustedRemoteAccountAtNode("Sender", peer) orelse "");
+            try std.testing.expectEqualStrings("live", server.trustedRemoteAccountForNick("Ghost") orelse "");
+            try std.testing.expect(server.trustedRemoteAccountAtNode("StaleOnly", peer) == null);
+        },
+        .membership => {
+            try std.testing.expect(!server.remoteMemberOfChannelAtNode("#authority", "StaleOnly", peer));
+            try std.testing.expect(!server.remoteMemberOfChannel("#authority", "StaleOnly"));
+            try std.testing.expect(!server.nickInChannelAnywhere("#authority", "StaleOnly"));
+            try std.testing.expect(!server.remoteNickInChannel("#authority", "StaleOnly"));
+            try std.testing.expect(server.remoteMemberOfChannelAtNode("#authority", "Ghost", peer));
+        },
+        .status => {
+            try std.testing.expectEqual(@as(?u4, 0), server.remoteMemberStatusInChannel("#authority", "Sender"));
+            try std.testing.expectEqual(@as(u8, 0), server.relaySenderModes("#authority", "Sender").bits);
+            try std.testing.expect(!server.relaySenderIsMember("#authority", "StaleOnly"));
+        },
+        .whois => {
+            const remote = server.findRemoteWhois("Sender") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("current", remote.username);
+            try std.testing.expectEqualStrings("live", remote.account);
+            try std.testing.expect(server.findRemoteWhois("StaleOnly") == null);
+            var memberships: [8]whois.ChannelMembership = undefined;
+            var prefixes: [8][2]u8 = undefined;
+            const count = server.remoteMemberChannels("Ghost", worldIdFromClient(target_id), &memberships, &prefixes);
+            try std.testing.expectEqual(@as(usize, 1), count);
+            try std.testing.expectEqualStrings("#authority", memberships[0].channel);
+        },
+        .projection => {
+            try std.testing.expectEqual(@as(usize, 3), server.globalMemberCount("#authority", 1));
+            const names = try server.remoteOnlyChannelNames();
+            defer alloc.free(names);
+            try std.testing.expectEqual(@as(usize, 0), names.len);
+            try server.sendNames(target, "#authority");
+            try expectContains(target.send_buf[0..target.send_len], "Sender");
+            try expectContains(target.send_buf[0..target.send_len], "Ghost");
+            try std.testing.expect(std.mem.indexOf(u8, target.send_buf[0..target.send_len], "StaleOnly") == null);
+        },
+        .channel_metadata => {
+            try std.testing.expect(!server.remoteChannelSecret("#authority"));
+            const topic = server.remotePublishedTopic("#authority") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("current topic", topic.text);
+            try std.testing.expectEqual(@as(i64, 600), topic.set_at);
+        },
+        .info => {
+            try server.handleInfo(target);
+            try expectContains(target.send_buf[0..target.send_len], "Mesh: 1 established S2S peer link(s)");
+        },
+        .user_count => {
+            // The existing route index counts both handshake server names as
+            // well as Sender and Ghost. Only the live index plus Target counts.
+            for ([_][]const u8{ "replay-a.test", "replay-b.test", "Sender", "Ghost" }) |nick| {
+                try std.testing.expect(live.nick_to_node.contains(nick));
+            }
+            try std.testing.expectEqual(@as(usize, 4), live.nickCount());
+            try std.testing.expectEqual(@as(u64, 1), server.world.localNickCount());
+            try std.testing.expectEqual(@as(u64, 5), server.meshUserCount());
+        },
+        .message_v2 => {
+            _ = try server.world.setChannelFlag("#authority", .mod_reg, true);
+            const home_before = server.meshNickHomeNode("Ghost");
+            const account_before = server.trustedRemoteAccountAtNode("Ghost", peer);
+            const member_before = server.remoteMemberOfChannelAtNode("#authority", "Ghost", peer);
+            var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+            var signature: [message_relay_v2.sig_len]u8 = undefined;
+            var msg = message_relay_v2.RelayMessage{
+                .verb = .privmsg,
+                .target = "#authority",
+                .source_prefix = "Ghost!current@live.test",
+                .account = "live",
+                .text = "current roster admits this event",
+                .scope_kind = .channel,
+                .origin_node = peer,
+                .hlc = server.nextMeshHlc(),
+            };
+            try message_relay_v2.stampOrigin(alloc, &msg, &pairs[1].idb.sign_kp, &pubkey, &signature);
+            const wire = try message_relay_v2.encode(alloc, msg);
+            defer alloc.free(wire);
+            const first = server.deliverRelayV2(msg, wire, peer);
+            switch (first) {
+                .accepted => {},
+                else => {
+                    std.debug.print("retiring roster MESSAGE_V2 outcome: {any}\n", .{first});
+                    return error.TestUnexpectedResult;
+                },
+            }
+            try std.testing.expectEqual(@as(?u64, peer), home_before);
+            try std.testing.expectEqualStrings("live", account_before orelse "");
+            try std.testing.expect(member_before);
+            switch (server.deliverRelayV2(msg, wire, peer)) {
+                .duplicate => {},
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(target.send_buf[0..target.send_len], "PRIVMSG #authority :current roster admits this event\r\n"));
+        },
+        .e2ee_group => {
+            try std.testing.expectEqual(@as(?u64, peer), server.meshNickHomeNode("Ghost"));
+            try std.testing.expectEqualStrings("live", server.trustedRemoteAccountAtNode("Ghost", peer) orelse "");
+            try std.testing.expect(server.remoteMemberOfChannelAtNode("#authority", "Ghost", peer));
+            try enrollTestE2eeDevice(server, "live", "phone");
+            var pubkey: [e2ee_group_relay.pubkey_len]u8 = undefined;
+            var signature: [e2ee_group_relay.sig_len]u8 = undefined;
+            var record = e2ee_group_relay.RelayRecord{
+                .kind = .commit,
+                .channel = "#authority",
+                .source_prefix = "Ghost!current@live.test",
+                .account = "live",
+                .from_device = "phone",
+                .payload = "AQIDBA",
+                .origin_node = peer,
+                .hlc = server.nextMeshHlc(),
+            };
+            try e2ee_group_relay.stampOrigin(alloc, &record, &pairs[1].idb.sign_kp, &pubkey, &signature);
+            const wire = try e2ee_group_relay.encode(alloc, record);
+            defer alloc.free(wire);
+            try std.testing.expectEqual(Server.E2eeGroupDeliveryOutcome.accepted, server.deliverE2eeGroup(record, wire, peer));
+            try std.testing.expectEqual(Server.E2eeGroupDeliveryOutcome.duplicate, server.deliverE2eeGroup(record, wire, peer));
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(target.send_buf[0..target.send_len], "E2EE.COMMIT #authority live phone :AQIDBA\r\n"));
+        },
+    }
+    try std.testing.expectEqual(loser_counter, pairs[0].a.exportOuter().send_counter);
+    try std.testing.expectEqual(@as(usize, 0), pairs[0].a.outbound().len);
+    try std.testing.expectEqualStrings(held, loser.send_buf[loser.send_offset..loser.send_len]);
+}
+
+test "same-IP mesh dial retiring roster cannot override the survivor nick home" {
+    try expectRetiringRosterUsesSurvivor(.home);
+}
+test "same-IP mesh dial retiring roster cannot supply stale trusted account authority" {
+    try expectRetiringRosterUsesSurvivor(.account);
+}
+test "same-IP mesh dial retiring roster cannot supply stale channel membership" {
+    try expectRetiringRosterUsesSurvivor(.membership);
+}
+test "same-IP mesh dial retiring roster cannot grant stale channel status" {
+    try expectRetiringRosterUsesSurvivor(.status);
+}
+test "same-IP mesh dial retiring roster is absent from WHOIS identity and channels" {
+    try expectRetiringRosterUsesSurvivor(.whois);
+}
+test "same-IP mesh dial retiring roster is absent from LIST and NAMES projection" {
+    try expectRetiringRosterUsesSurvivor(.projection);
+}
+test "same-IP mesh dial retiring roster cannot override current channel metadata" {
+    try expectRetiringRosterUsesSurvivor(.channel_metadata);
+}
+test "same-IP mesh dial retiring roster is absent from the active mesh user count" {
+    try expectRetiringRosterUsesSurvivor(.user_count);
+}
+test "same-IP mesh dial retiring roster is absent from active INFO peers" {
+    try expectRetiringRosterUsesSurvivor(.info);
+}
+test "same-IP mesh dial retiring roster cannot reject current signed MESSAGE_V2" {
+    try expectRetiringRosterUsesSurvivor(.message_v2);
+}
+test "same-IP mesh dial retiring roster cannot reject current signed E2EEGROUP" {
+    try expectRetiringRosterUsesSurvivor(.e2ee_group);
+}
+
+fn expectRetiringPlainMaintenance(pending: bool) !void {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .node_id = 2 });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const links = try alloc.alloc(s2s_link.S2sLink, 4);
+    defer alloc.free(links);
+    var initialized: usize = 0;
+    defer for (links[0..initialized]) |*link| link.deinit();
+    for (links, 0..) |*link, i| {
+        try link.init(.{
+            .allocator = alloc,
+            .local_node_id = if (i % 2 == 0) 1 else 2,
+            .remote_node_id = if (i % 2 == 0) 2 else 1,
+            .local_epoch_ms = 1_000 + i,
+            .server_name = if (i % 2 == 0) "legacy-peer.test" else "legacy-local.test",
+            .config = .{ .require_signed_frames = false },
+        });
+        initialized += 1;
+    }
+    var ids: [2]client_model.ClientId = undefined;
+    var attached: usize = 0;
+    defer for (ids[0..attached]) |id| {
+        if (server.rx().clients.get(id)) |conn| conn.s2s = null;
+    };
+    for (&ids, 0..) |*id, i| {
+        try links[2 * i].start(50);
+        try pumpLinkPair(&links[2 * i], &links[2 * i + 1], alloc);
+        try std.testing.expect(links[2 * i + 1].established());
+        try std.testing.expect(!links[2 * i + 1].supportsSessionReplicaV2());
+        id.* = try server.rx().clients.alloc(ConnState.init(-1));
+        attached += 1;
+        const conn = server.rx().clients.get(id.*).?;
+        conn.token = try tokenFromId(id.*);
+        conn.overflow_allocator = alloc;
+        conn.test_sendq_capture = true;
+        conn.s2s = &links[2 * i + 1];
+        // Captured legacy projections are maintenance inputs. No wire account
+        // trust is asserted; this tests expiration/publication and legacy fold.
+        const refreshed: i64 = if (i == 0) 1 else stale_member_ttl_ms + 10;
+        _ = try links[2 * i + 1].peer.routes.applyMembership("#legacy", "Target", 1, 0, 100, true, .{ .username = "target", .host = "legacy.test", .account = "target" }, refreshed);
+        _ = try links[2 * i + 1].peer.routes.applyMembership("#legacy", "OldNick", 1, 0, 101, true, .{ .username = "old", .host = "legacy.test" }, refreshed);
+        // A fresh shared channel remains visible when legacy rows expire; NICK
+        // recipient selection legitimately uses the post-prune live roster.
+        _ = try links[2 * i + 1].peer.routes.applyMembership("#witness", "OldNick", 1, 0, 101, true, .{ .username = "old", .host = "legacy.test" }, stale_member_ttl_ms * 3);
+    }
+    const target_id = try addTestLocalClient(server, "Target", "target");
+    const observer_id = try addTestLocalClient(server, "Observer", null);
+    const target = server.connFor(target_id).?;
+    const observer = server.connFor(observer_id).?;
+    target.test_sendq_capture = true;
+    observer.test_sendq_capture = true;
+    _ = try server.world.join("#legacy", worldIdFromClient(target_id));
+    _ = try server.world.join("#legacy", worldIdFromClient(observer_id));
+    _ = try server.world.join("#witness", worldIdFromClient(observer_id));
+    const loser = server.rx().clients.get(ids[0]).?;
+    const survivor = server.rx().clients.get(ids[1]).?;
+    const expired_now = stale_member_ttl_ms + 2;
+    if (pending) {
+        try links[0].sendNickChange("OldNick", "NewNick", .{ .username = "old", .host = "legacy.test" }, 102);
+        const wire = try alloc.dupe(u8, links[0].outbound());
+        defer alloc.free(wire);
+        links[0].clearOutbound();
+        try links[1].feed(wire, 1, 100);
+        _ = try links[1].peer.pruneStaleMembers(expired_now, stale_member_ttl_ms);
+        try std.testing.expect(links[1].peer.identity_transition_order.items.len >= 3);
+    }
+    const pending_before = links[1].peer.identity_transition_order.items.len;
+    loser.closing = true;
+    loser.s2s_dedup = true;
+    loser.s2s_dedup_drain_deadline_ms = server.nowMs() +| 5_000;
+    const held = "retained-legacy-final-flight";
+    try rawAppendToConn(loser, held);
+    resetTestSendQ(target);
+    resetTestSendQ(observer);
+    if (pending) {
+        server.drainIdentityTransitions(loser, &links[1]);
+        // An active sibling cannot attest ownership of the retained loser.
+        server.drainIdentityTransitions(survivor, &links[1]);
+        // Dedup alone revokes admission before closing is assigned. A late
+        // receive must not parse bytes or consume the pending transition queue.
+        loser.closing = false;
+        const feed_seq = server.s2s_feed_seq;
+        server.driveS2s(loser, &links[1], "late-retired-input");
+        server.drainIdentityTransitions(loser, &links[1]);
+        try std.testing.expectEqual(feed_seq, server.s2s_feed_seq);
+        loser.closing = true;
+    } else {
+        server.pruneStaleMeshMembers(expired_now);
+    }
+    try std.testing.expect(server.world.isMember("#legacy", worldIdFromClient(target_id)));
+    try std.testing.expectEqual(@as(usize, 0), observer.send_len);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(pending_before, links[1].peer.identity_transition_order.items.len);
+    if (!pending) try std.testing.expectEqual(@as(usize, 2), links[1].channelMembers("#legacy").len);
+    try std.testing.expectEqualStrings(held, loser.send_buf[loser.send_offset..loser.send_len]);
+    // The same expired/pending work on an active control still publishes and
+    // performs the genuine legacy PART. A blanket disabled maintenance passes
+    // neither this control nor the local membership assertion below.
+    if (pending) {
+        try links[2].sendNickChange("OldNick", "NewNick", .{ .username = "old", .host = "legacy.test" }, 102);
+        const wire = try alloc.dupe(u8, links[2].outbound());
+        defer alloc.free(wire);
+        links[2].clearOutbound();
+        try links[3].feed(wire, @intCast(stale_member_ttl_ms + 10), 101);
+        _ = try links[3].peer.pruneStaleMembers(stale_member_ttl_ms * 2 + 20, stale_member_ttl_ms);
+        server.drainIdentityTransitions(survivor, &links[3]);
+        try expectContains(observer.send_buf[0..observer.send_len], "NICK NewNick");
+    } else {
+        server.pruneStaleMeshMembers(stale_member_ttl_ms * 2 + 20);
+    }
+    try std.testing.expect(!survivor.closing);
+    try std.testing.expect(!server.world.isMember("#legacy", worldIdFromClient(target_id)));
+    try expectContains(observer.send_buf[0..observer.send_len], "PART #legacy");
+    try std.testing.expectEqualStrings(held, loser.send_buf[loser.send_offset..loser.send_len]);
+    try std.testing.expectEqual(pending_before, links[1].peer.identity_transition_order.items.len);
+}
+
+test "same-IP mesh dial retiring plaintext roster expiration cannot publish or fold legacy PART" {
+    try expectRetiringPlainMaintenance(false);
+}
+test "same-IP mesh dial retiring plaintext pending identity cannot publish NICK PART or fold legacy state" {
+    try expectRetiringPlainMaintenance(true);
+}
+
+test "same-IP mesh dial unknown inbound peer cannot claim another configured endpoint" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const pair = try alloc.create(SessionReplayTestPair);
+    defer alloc.destroy(pair);
+    pair.* = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    const specs = [_][]const u8{"127.0.0.1:65042"};
+    const server = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_connect = &specs,
+    });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    server.mesh_dials[0].addr = try sockaddrForHost("127.0.0.1", 65042, 2_000);
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const inbound = server.rx().clients.get(id).?;
+    inbound.token = try tokenFromId(id);
+    inbound.s2s_secured = &pair.a;
+    defer inbound.s2s_secured = null;
+    inbound.peer_addr = .{ .ipv4 = .{ 127, 0, 0, 1 } };
+    try std.testing.expect(pair.a.established());
+    try std.testing.expect(!inbound.s2s_initiator);
+    // The configured peer is absent. A different authenticated node happened
+    // to dial us from that IP; neither its source IP nor ephemeral source port
+    // proves which listening endpoint it owns.
+    try std.testing.expect(!server.meshPeerLinkedByDial(&server.mesh_dials[0]));
+}
+
+test "same-IP mesh dial binding requires the full secured key despite equal peer names" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const pairs = try alloc.alloc(SessionReplayTestPair, 2);
+    defer alloc.free(pairs);
+    pairs[0] = try SessionReplayTestPair.initWithSeeds(alloc, 0xd1, 0xd2);
+    defer pairs[0].deinit();
+    pairs[1] = try SessionReplayTestPair.initWithSeeds(alloc, 0xd1, 0xd3);
+    defer pairs[1].deinit();
+    const specs = [_][]const u8{"127.0.0.1:65042"};
+    const server = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "zz-local.test",
+        .mesh_connect = &specs,
+    });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const outbound_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const outbound = server.rx().clients.get(outbound_id).?;
+    outbound.token = try tokenFromId(outbound_id);
+    outbound.s2s_secured = &pairs[0].a;
+    outbound.s2s_initiator = true;
+    outbound.s2s_dial_target_known = true;
+    outbound.s2s_connect_addr = try sockaddrForHost("127.0.0.1", 65042, 2_000);
+    outbound.recv_armed = true;
+    const inbound_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const inbound = server.rx().clients.get(inbound_id).?;
+    inbound.token = try tokenFromId(inbound_id);
+    inbound.s2s_secured = &pairs[1].a;
+    inbound.recv_armed = true;
+    defer {
+        for ([_]client_model.ClientId{ outbound_id, inbound_id }) |id| {
+            if (server.rx().clients.get(id)) |conn| {
+                conn.s2s_secured = null;
+                conn.recv_armed = false;
+            }
+        }
+    }
+    server.mesh_dials[0].addr = outbound.s2s_connect_addr;
+    server.mesh_dials[0].token = outbound.token;
+    try std.testing.expectEqualStrings(pairs[0].a.remoteName(), pairs[1].a.remoteName());
+    try std.testing.expect(!Server.sameS2sPeer(outbound, inbound));
+    try std.testing.expect(!server.resolveS2sCollision(outbound, pairs[0].a.remoteName()));
+    try std.testing.expect(!outbound.closing and !inbound.closing);
+    try std.testing.expect(!outbound.s2s_dedup and !inbound.s2s_dedup);
+    server.transferMeshDialBinding(outbound, inbound);
+    try std.testing.expect(!inbound.s2s_dial_target_known);
+    try std.testing.expectEqualDeep(outbound.token, server.mesh_dials[0].token.?);
+
+    // The same name plus the same authenticated key is a reciprocal link.
+    // Its inbound survivor inherits the complete port, role stays responder.
+    inbound.s2s_secured = &pairs[0].a;
+    try std.testing.expect(server.resolveS2sCollision(outbound, pairs[0].a.remoteName()));
+    try std.testing.expect(outbound.closing and outbound.s2s_dedup);
+    try std.testing.expect(!inbound.closing and !inbound.s2s_initiator);
+    try std.testing.expect(inbound.s2s_dial_target_known);
+    try std.testing.expectEqualDeep(outbound.s2s_connect_addr, inbound.s2s_connect_addr);
+    try std.testing.expectEqualDeep(inbound.token, server.mesh_dials[0].token.?);
+    try std.testing.expect(server.meshPeerLinkedByDial(&server.mesh_dials[0]));
+    server.mesh_dials[0].addr.?.port = std.mem.nativeToBig(u16, 65043);
+    try std.testing.expect(!server.meshPeerLinkedByDial(&server.mesh_dials[0]));
+}
+
+test "same-IP mesh dial malformed carried endpoint is refused before slot or dial mutation" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const pair = try alloc.create(SessionReplayTestPair);
+    defer alloc.destroy(pair);
+    pair.* = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    const specs = [_][]const u8{"127.0.0.1:65042"};
+    const server = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_connect = &specs,
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "session-replay-secret",
+    });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const listener = server.reactors[0].listener_fd;
+    const conn = try alloc.create(ConnState);
+    defer alloc.destroy(conn);
+    conn.* = ConnState.init(listener);
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    try std.testing.expect(server.sealSecuredLink(conn, &pair.a, &pieces, &blobs));
+    var snap = try s2s_snapshot.decode(pieces.items[0].bytes, s2s_snapshot.schema_version);
+    var addr = try sockaddrForHost("127.0.0.1", 65042, 2_000);
+    const before = server.rx().clients.len();
+    snap.connect_addr = std.mem.asBytes(&addr)[0..1];
+    try std.testing.expect(server.adoptInheritedS2sLink(snap, false) == null);
+    addr.family = posix.AF.INET;
+    snap.connect_addr = std.mem.asBytes(&addr);
+    try std.testing.expect(server.adoptInheritedS2sLink(snap, false) == null);
+    addr.family = posix.AF.INET6;
+    addr.port = 0;
+    try std.testing.expect(server.adoptInheritedS2sLink(snap, false) == null);
+    try std.testing.expectEqual(before, server.rx().clients.len());
+    try std.testing.expect(server.mesh_dials[0].token == null);
+    try std.testing.expect(server.mesh_dials[0].addr == null);
+    _ = try server.boundPort(); // false preserves the carried descriptor.
 }
 
 test "GAP-O7 handshake and anti-entropy stalls open a breaker and an unsigned frame stays refused" {
@@ -106842,6 +108426,38 @@ fn countMeshLogDetail(server: *const LinuxServer, detail: []const u8) usize {
     return n;
 }
 
+fn dumpMeshDialProofForTest(server: *Server) void {
+    server.world.lockWrite();
+    defer server.world.unlockWrite();
+    for (server.reactors) |*reactor| {
+        var it = reactor.clients.iterator();
+        while (it.next()) |entry| {
+            const conn = entry.value;
+            if (conn.s2s == null and conn.s2s_secured == null) continue;
+            var bound = false;
+            for (server.mesh_dials) |dial| {
+                if (dial.token) |token| {
+                    if (token.slot == conn.token.slot and token.gen == conn.token.gen) bound = true;
+                }
+            }
+            std.debug.print("mesh proof node={s} shard={d} fd={d} token={d}/{d} peer={s} initiator={} known={} target_port={d} bound={} dedup={} closing={} connect={} recv={} send={} backlog={d}\n", .{
+                server.serverName(),                               reactor.shard_id,   conn.fd,                    conn.token.slot,                                                                                       conn.token.gen,
+                Server.establishedPeerName(conn) orelse "pending", conn.s2s_initiator, conn.s2s_dial_target_known, if (conn.s2s_dial_target_known) std.mem.bigToNative(u16, conn.s2s_connect_addr.port) else @as(u16, 0), bound,
+                conn.s2s_dedup,                                    conn.closing,       conn.connect_armed,         conn.recv_armed,                                                                                       conn.send_armed,
+                connSendBacklog(conn),
+            });
+            var others = reactor.clients.iterator();
+            while (others.next()) |other| {
+                if (other.value == conn or (other.value.s2s == null and other.value.s2s_secured == null)) continue;
+                std.debug.print("mesh proof identity tokens={d}/{d},{d}/{d} same_full_peer={}\n", .{
+                    conn.token.slot,                       conn.token.gen, other.value.token.slot, other.value.token.gen,
+                    Server.sameS2sPeer(conn, other.value),
+                });
+            }
+        }
+    }
+}
+
 fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
@@ -106944,8 +108560,14 @@ fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
             try expectMeshPeerVisible(&c1, "node2.test", 8);
             try expectMeshPeerVisible(&c2, "node1.test", 8);
         }
-        try std.testing.expectEqual(node1_collapses, countMeshLogDetail(&node1, "duplicate link collapsed"));
-        try std.testing.expectEqual(node2_collapses, countMeshLogDetail(&node2, "duplicate link collapsed"));
+        const final1 = countMeshLogDetail(&node1, "duplicate link collapsed");
+        const final2 = countMeshLogDetail(&node2, "duplicate link collapsed");
+        if (final1 != node1_collapses or final2 != node2_collapses) {
+            dumpMeshDialProofForTest(&node1);
+            dumpMeshDialProofForTest(&node2);
+        }
+        try std.testing.expectEqual(node1_collapses, final1);
+        try std.testing.expectEqual(node2_collapses, final2);
     } else return error.SkipZigTest;
 }
 
@@ -107817,9 +109439,21 @@ const LiveUpgradeTestNode = struct {
             for (capture.state_fds[0..capture.state_fd_count]) |fd| closeFd(fd);
         };
 
-        var successor = try Server.init(self.allocator, successor_config);
+        // Linux exec closes the predecessor's CLOEXEC S2S listeners before the
+        // successor rebinds that configured port. Model that same boundary only
+        // after capture and join; every carried client/peer fd remains held.
+        for (self.server.reactors) |*reactor| {
+            closeFd(reactor.s2s_listener_fd);
+            reactor.s2s_listener_fd = -1;
+            closeFd(reactor.s2s_listener_companion_fd);
+            reactor.s2s_listener_companion_fd = -1;
+        }
+        const successor = try createTestServer(self.allocator, successor_config);
         var successor_owned = true;
-        errdefer if (successor_owned) successor.deinit();
+        errdefer if (successor_owned) {
+            successor.deinit();
+            self.allocator.destroy(successor);
+        };
         successor.config.resume_arena_fd = capture.arena_fd;
         successor.config.inherited_state_fds = capture.state_fds[0..capture.state_fd_count];
         successor.config.inherited_state_fd_manifest_present = true;
@@ -107832,7 +109466,8 @@ const LiveUpgradeTestNode = struct {
         // The capture seam set every transferred predecessor ConnState fd to -1,
         // so destroying its rings/stores cannot close successor-owned sockets.
         self.server.deinit();
-        self.server.* = successor;
+        self.allocator.destroy(self.server);
+        self.server = successor;
         successor_owned = false;
         try self.start();
         return .{
@@ -107983,8 +109618,9 @@ fn expectLiveSessionToken(
 }
 
 fn resumeLiveMeshSession(client: *LiveClient, command: []const u8) !void {
+    // Retain bootstrap bytes when the attachment notice spans retry/read boundaries.
+    client.reset();
     for (0..100) |_| {
-        client.reset();
         try writeAllFd(client.fd, command);
         const deadline = platform.monotonicMillis() + 250;
         while (platform.monotonicMillis() < deadline) {
@@ -107995,6 +109631,70 @@ fn resumeLiveMeshSession(client: *LiveClient, command: []const u8) !void {
         testSleepMs(20);
     }
     return error.TestTimeout;
+}
+
+test "same-IP mesh dial session resume retains JOIN received before a retry" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const command = "SESSION RESUME :retry-token\r\n";
+    const join = ":Device!nova@localhost JOIN #helix-mesh\r\n";
+    const attached = ":fixture NOTICE Device :attached to retry-token\r\n";
+    const ScriptedPeer = struct {
+        fd: linux.fd_t,
+        failure: ?anyerror = null,
+        requests: usize = 0,
+
+        fn receiveRequest(self: *@This()) !void {
+            var request: [command.len]u8 = undefined;
+            var received: usize = 0;
+            const deadline = platform.monotonicMillis() + 5_000;
+            while (received < request.len) {
+                if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+                var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
+                if (try posix.poll(&fds, 50) == 0) continue;
+                if ((fds[0].revents & posix.POLL.IN) == 0) continue;
+                const n = try readFd(self.fd, request[received..]);
+                if (n == 0) return error.ConnectionReset;
+                received += n;
+            }
+            try std.testing.expectEqualStrings(command, &request);
+            self.requests += 1;
+        }
+
+        fn script(self: *@This()) !void {
+            try self.receiveRequest();
+            try writeAllFd(self.fd, join);
+            // The second actual request proves the client's first deadline has
+            // expired. Only then release the attachment reply; no timing sleep
+            // can accidentally merge JOIN and ATTACHED into the first attempt.
+            try self.receiveRequest();
+            try writeAllFd(self.fd, attached);
+        }
+
+        fn run(self: *@This()) void {
+            self.script() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+
+    const sockets = try sameIPTestSocketPair();
+    defer closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+    const client = try std.testing.allocator.create(LiveClient);
+    defer std.testing.allocator.destroy(client);
+    client.* = .{ .fd = sockets[0] };
+    var peer = ScriptedPeer{ .fd = sockets[1] };
+    var thread = try std.Thread.spawn(.{}, ScriptedPeer.run, .{&peer});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    try resumeLiveMeshSession(client, command);
+    thread.join();
+    joined = true;
+    if (peer.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 2), peer.requests);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), join));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), attached));
 }
 
 fn expectNoUpgradeTopologyChurn(clients: []const *LiveClient) !void {
@@ -108099,6 +109799,306 @@ fn expectSharedUpgradeMarker(clients: []const *LiveClient, author_index: ?usize,
         try client.readAvailable();
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), needle));
     }
+}
+
+const SameIPPeerProof = struct {
+    fd: linux.fd_t,
+    token: RingFdToken,
+    initiator: bool,
+    target: ?posix.sockaddr.in6,
+    bound: bool,
+    collapses: usize,
+
+    fn read(server: *Server, public_key: [32]u8) ?SameIPPeerProof {
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        var peers = server.reactors[0].clients.iterator();
+        var result: ?SameIPPeerProof = null;
+        while (peers.next()) |entry| {
+            const conn = entry.value;
+            if (conn.closing or conn.s2s_dedup) continue;
+            const link = conn.s2s_secured orelse continue;
+            if (!link.established()) continue;
+            const key = link.peerNodeKey() orelse continue;
+            if (!std.mem.eql(u8, &key, &public_key)) continue;
+            if (result != null) return null; // more than one live route is a failure
+            var bound = false;
+            for (server.mesh_dials) |dial| {
+                const token = dial.token orelse continue;
+                if (token.slot == conn.token.slot and token.gen == conn.token.gen) bound = true;
+            }
+            result = .{
+                .fd = conn.fd,
+                .token = conn.token,
+                .initiator = conn.s2s_initiator,
+                .target = if (conn.s2s_dial_target_known) conn.s2s_connect_addr else null,
+                .bound = bound,
+                .collapses = countMeshLogDetail(server, "duplicate link collapsed"),
+            };
+        }
+        return result;
+    }
+
+    fn wait(server: *Server, public_key: [32]u8) !SameIPPeerProof {
+        const deadline = platform.monotonicMillis() + 20_000;
+        while (platform.monotonicMillis() < deadline) {
+            if (read(server, public_key)) |proof| return proof;
+            testSleepMs(10);
+        }
+        return error.TestTimeout;
+    }
+
+    fn pauseDial(server: *Server, pause: bool) void {
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        for (server.mesh_dials) |*dial| {
+            dial.retry_not_before_ms = if (pause) platform.monotonicMillis() + 60_000 else 0;
+            dial.last_attempt_ms = 0;
+        }
+        server.wakeReactor();
+    }
+
+    fn closePeer(server: *Server, public_key: [32]u8) !void {
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        current_reactor = &server.reactors[0];
+        defer current_reactor = null;
+        var peers = server.reactors[0].clients.iterator();
+        while (peers.next()) |entry| {
+            const link = entry.value.s2s_secured orelse continue;
+            const key = link.peerNodeKey() orelse continue;
+            if (!std.mem.eql(u8, &key, &public_key)) continue;
+            server.requestS2sClose(entry.value, "same-IP test partition");
+            return;
+        }
+        return error.TestUnexpectedResult;
+    }
+
+    fn expectMembers(client: *LiveClient, names: []const []const u8) !void {
+        const deadline = platform.monotonicMillis() + 20_000;
+        while (platform.monotonicMillis() < deadline) {
+            client.reset();
+            try writeAllFd(client.fd, "NAMES #same-ip\r\n");
+            try recvUntil(client, " 366 ", 200);
+            const bytes = client.written();
+            var ready = true;
+            for (names) |name| {
+                if (std.mem.indexOf(u8, bytes, name) == null) ready = false;
+            }
+            if (ready) return;
+            testSleepMs(20);
+        }
+        std.debug.print("same-IP final NAMES response: {s}\n", .{client.written()});
+        return error.TestTimeout;
+    }
+};
+
+test "threaded server: same-IP mesh dial partition heals after inbound binding and sequential Helix" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const cross_process_lock = if (builtin.os.tag == .linux) try acquireHeavyMeshAcceptanceTestLock() else -1;
+    defer if (cross_process_lock >= 0) closeFd(cross_process_lock);
+    const ports = try reserveThreeLoopbackPorts();
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    var tmp_c = std.testing.tmpDir(.{});
+    defer tmp_c.cleanup();
+    var store_a = try services_mod.OroStore.open(alloc, std.testing.io, tmp_a.dir, "same-ip-a.wal");
+    defer store_a.deinit();
+    var store_b = try services_mod.OroStore.open(alloc, std.testing.io, tmp_b.dir, "same-ip-b.wal");
+    defer store_b.deinit();
+    var store_c = try services_mod.OroStore.open(alloc, std.testing.io, tmp_c.dir, "same-ip-c.wal");
+    defer store_c.deinit();
+    var services_a = services_mod.Services.init(&store_a, null);
+    var services_b = services_mod.Services.init(&store_b, null);
+    var services_c = services_mod.Services.init(&store_c, null);
+    var id_a = try node_identity.fromSeed(@as([32]u8, @splat(0xe1)), "same-ip-redial-test");
+    defer id_a.deinit();
+    var id_b = try node_identity.fromSeed(@as([32]u8, @splat(0xe2)), "same-ip-redial-test");
+    defer id_b.deinit();
+    var id_c = try node_identity.fromSeed(@as([32]u8, @splat(0xe3)), "same-ip-redial-test");
+    defer id_c.deinit();
+    const root_a = std.fmt.bytesToHex(id_a.sign_kp.public_key, .lower);
+    const root_b = std.fmt.bytesToHex(id_b.sign_kp.public_key, .lower);
+    const root_c = std.fmt.bytesToHex(id_c.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &root_a, &root_b, &root_c };
+    const roots_a = [_][]const u8{ &root_b, &root_c };
+    const roots_b = [_][]const u8{ &root_a, &root_c };
+    const roots_c = [_][]const u8{ &root_a, &root_b };
+    var a_spec_buf: [32]u8 = undefined;
+    var b_spec_buf: [32]u8 = undefined;
+    const dial_a = [_][]const u8{try std.fmt.bufPrint(&a_spec_buf, "127.0.0.1:{d}", .{ports[0]})};
+    const dial_b = [_][]const u8{try std.fmt.bufPrint(&b_spec_buf, "127.0.0.1:{d}", .{ports[1]})};
+    const config_a = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = ports[0],
+        .node_id = id_a.shortId(),
+        .node_identity = &id_a,
+        .crypto_io = std.testing.io,
+        .server_name = "zz-redial-a.test",
+        .mesh_pass = "same-ip-secret",
+        .mesh_trust_roots = &roots_a,
+        .require_secured = true,
+        .mesh_connect = &dial_b,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roots,
+        .account_services = &services_a,
+        .sasl_checker = test_dm_relay_checker,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+    };
+    var config_b = config_a;
+    config_b.s2s_port = ports[1];
+    config_b.node_id = id_b.shortId();
+    config_b.node_identity = &id_b;
+    config_b.server_name = "aa-redial-b.test";
+    config_b.mesh_connect = &dial_a;
+    config_b.mesh_trust_roots = &roots_b;
+    config_b.account_services = &services_b;
+    var config_c = config_a;
+    config_c.s2s_port = ports[2];
+    config_c.node_id = id_c.shortId();
+    config_c.node_identity = &id_c;
+    config_c.server_name = "cc-redial-c.test";
+    config_c.mesh_connect = &dial_a;
+    config_c.mesh_trust_roots = &roots_c;
+    config_c.account_services = &services_c;
+    var a = try LiveUpgradeTestNode.init(alloc, config_a);
+    defer a.deinit();
+    var b = try LiveUpgradeTestNode.init(alloc, config_b);
+    defer b.deinit();
+    // Both listeners exist before their reciprocal boot dials run.
+    try a.start();
+    try b.start();
+    const live = try alloc.alloc(LiveClient, 3);
+    defer alloc.free(live);
+    live[0] = .{ .fd = try connectLoopback(try a.server.boundPort()) };
+    defer closeFd(live[0].fd);
+    live[1] = .{ .fd = try connectLoopback(try b.server.boundPort()) };
+    defer closeFd(live[1].fd);
+    const caps = "echo-message message-tags server-time";
+    try saslPlainPreludeWithCaps(live[0].fd, "nova", "pw", caps);
+    try writeAllFd(live[0].fd, "NICK DialA\r\nUSER a 0 * :Dial A\r\n");
+    try recvUntil(&live[0], " 001 DialA ", 200);
+    try saslPlainPreludeWithCaps(live[1].fd, "nova", "pw", caps);
+    try writeAllFd(live[1].fd, "NICK DialB\r\nUSER b 0 * :Dial B\r\n");
+    try recvUntil(&live[1], " 001 DialB ", 200);
+    try expectMeshPeerVisible(&live[0], config_b.server_name, 80);
+    // Wait through several actual periodic dials. B has the smaller name, so
+    // A's managed endpoint must follow the B->A authenticated inbound survivor.
+    const settle_deadline = platform.monotonicMillis() + 20_000;
+    var before_b = try SameIPPeerProof.wait(a.server, id_b.sign_kp.public_key);
+    while (before_b.initiator or !before_b.bound or before_b.target == null) {
+        if (platform.monotonicMillis() >= settle_deadline) return error.TestTimeout;
+        testSleepMs(20);
+        before_b = try SameIPPeerProof.wait(a.server, id_b.sign_kp.public_key);
+    }
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, ports[1]), before_b.target.?.port);
+    var c = try LiveUpgradeTestNode.init(alloc, config_c);
+    defer c.deinit();
+    try c.start();
+    live[2] = .{ .fd = try connectLoopback(try c.server.boundPort()) };
+    defer closeFd(live[2].fd);
+    try saslPlainPreludeWithCaps(live[2].fd, "kazu", "pw", caps);
+    try writeAllFd(live[2].fd, "NICK DialC\r\nUSER c 0 * :Dial C\r\n");
+    try recvUntil(&live[2], " 001 DialC ", 200);
+    try expectMeshPeersVisible(&live[0], &.{ config_b.server_name, config_c.server_name }, 80);
+    try expectMeshPeerVisible(&live[1], config_a.server_name, 80);
+    try expectMeshPeerVisible(&live[2], config_a.server_name, 80);
+    const before_c = try SameIPPeerProof.wait(a.server, id_c.sign_kp.public_key);
+    try std.testing.expect(!before_c.initiator and before_c.target == null and !before_c.bound);
+    try std.testing.expect(SameIPPeerProof.read(b.server, id_c.sign_kp.public_key) == null);
+    try std.testing.expect(SameIPPeerProof.read(c.server, id_b.sign_kp.public_key) == null);
+    for (live) |*client| {
+        client.reset();
+        try writeAllFd(client.fd, "JOIN #same-ip\r\n");
+        try recvUntil(client, " 366 ", 200);
+    }
+    const clients = [_]*LiveClient{ &live[0], &live[1], &live[2] };
+    try SameIPPeerProof.expectMembers(clients[0], &.{ "DialA", "DialB", "DialC" });
+    try SameIPPeerProof.expectMembers(clients[1], &.{ "DialA", "DialB" });
+    try SameIPPeerProof.expectMembers(clients[2], &.{ "DialA", "DialC" });
+    try expectSharedUpgradeMessage(&clients, 1, "#same-ip", "before-same-ip-upgrades");
+
+    var adopted_b = before_b;
+    if (comptime builtin.os.tag == .linux) {
+        // Linux's in-process seam uses the production safe-point seal and full
+        // transactional adoption. Native Helix uses its separate process/fd
+        // handoff acceptance campaign; its socket partition proof below still
+        // runs here without a platform skip.
+        const summary_a = try a.upgrade(config_a);
+        try std.testing.expectEqual(@as(usize, 2), summary_a.s2s_preserved);
+        adopted_b = try SameIPPeerProof.wait(a.server, id_b.sign_kp.public_key);
+        const adopted_c = try SameIPPeerProof.wait(a.server, id_c.sign_kp.public_key);
+        try std.testing.expectEqual(before_b.fd, adopted_b.fd);
+        try std.testing.expectEqual(before_c.fd, adopted_c.fd);
+        try std.testing.expect(!adopted_b.initiator and adopted_b.bound);
+        try std.testing.expectEqualDeep(before_b.target.?, adopted_b.target.?);
+        try std.testing.expect(!adopted_c.initiator and adopted_c.target == null and !adopted_c.bound);
+        const b_before_a = try SameIPPeerProof.wait(b.server, id_a.sign_kp.public_key);
+        const summary_b = try b.upgrade(config_b);
+        try std.testing.expectEqual(@as(usize, 1), summary_b.s2s_preserved);
+        const b_after_a = try SameIPPeerProof.wait(b.server, id_a.sign_kp.public_key);
+        try std.testing.expectEqual(b_before_a.fd, b_after_a.fd);
+    }
+    try expectSharedUpgradeMessage(&clients, 2, "#same-ip", "after-same-ip-upgrades");
+    testSleepMs(1_000);
+    const stable_b = try SameIPPeerProof.wait(a.server, id_b.sign_kp.public_key);
+    try std.testing.expectEqual(adopted_b.fd, stable_b.fd);
+    try std.testing.expectEqual(adopted_b.collapses, stable_b.collapses);
+
+    // Partition just A-B; C remains inbound on the SAME source IP. Hold both
+    // configured dials, then permit only A's periodic dial to heal. B cannot
+    // hide the regression by dialing A from the other side.
+    SameIPPeerProof.pauseDial(a.server, true);
+    SameIPPeerProof.pauseDial(b.server, true);
+    try SameIPPeerProof.closePeer(a.server, id_b.sign_kp.public_key);
+    const down_deadline = platform.monotonicMillis() + 20_000;
+    while (SameIPPeerProof.read(a.server, id_b.sign_kp.public_key) != null or
+        SameIPPeerProof.read(b.server, id_a.sign_kp.public_key) != null)
+    {
+        if (platform.monotonicMillis() >= down_deadline) return error.TestTimeout;
+        testSleepMs(10);
+    }
+    try std.testing.expectEqual(before_c.fd, (try SameIPPeerProof.wait(a.server, id_c.sign_kp.public_key)).fd);
+    try expectSharedUpgradeMessage(&.{ &live[0], &live[2] }, 1, "#same-ip", "during-same-ip-partition");
+    live[1].reset();
+    try writeAllFd(live[1].fd, "PING :isolated-b-still-connected\r\n");
+    try recvUntil(&live[1], "isolated-b-still-connected", 200);
+    SameIPPeerProof.pauseDial(a.server, false);
+    const healed_b = try SameIPPeerProof.wait(a.server, id_b.sign_kp.public_key);
+    try std.testing.expect(healed_b.initiator and healed_b.bound);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, ports[1]), healed_b.target.?.port);
+    try std.testing.expectEqual(before_c.fd, (try SameIPPeerProof.wait(a.server, id_c.sign_kp.public_key)).fd);
+    try expectMeshPeersVisible(&live[0], &.{ config_b.server_name, config_c.server_name }, 80);
+    try SameIPPeerProof.expectMembers(clients[0], &.{ "DialA", "DialB", "DialC" });
+    try SameIPPeerProof.expectMembers(clients[1], &.{ "DialA", "DialB" });
+    try SameIPPeerProof.expectMembers(clients[2], &.{ "DialA", "DialC" });
+    try expectSharedUpgradeMessage(&clients, 1, "#same-ip", "after-same-ip-heal-b-to-c");
+    try expectSharedUpgradeMessage(&clients, 2, "#same-ip", "after-same-ip-heal-c-to-b");
+    SameIPPeerProof.pauseDial(b.server, false);
+    // B's formerly unknown inbound endpoint gets one authenticated probe when
+    // its configured dial resumes. That reciprocal collapse may choose a new
+    // physical route; thereafter both bindings prevent repeated dial churn.
+    const reciprocal_deadline = platform.monotonicMillis() + 20_000;
+    var final_b = try SameIPPeerProof.wait(a.server, id_b.sign_kp.public_key);
+    while (final_b.initiator or !final_b.bound) {
+        if (platform.monotonicMillis() >= reciprocal_deadline) return error.TestTimeout;
+        testSleepMs(20);
+        final_b = try SameIPPeerProof.wait(a.server, id_b.sign_kp.public_key);
+    }
+    testSleepMs(1_000);
+    const settled_b = try SameIPPeerProof.wait(a.server, id_b.sign_kp.public_key);
+    try std.testing.expectEqual(final_b.fd, settled_b.fd);
+    try std.testing.expectEqual(final_b.collapses, settled_b.collapses);
+    try expectSharedUpgradeMessage(&clients, 0, "#same-ip", "after-reciprocal-probe-settled");
+    try std.testing.expect(SameIPPeerProof.read(b.server, id_c.sign_kp.public_key) == null);
+    try std.testing.expect(SameIPPeerProof.read(c.server, id_b.sign_kp.public_key) == null);
 }
 
 test "threaded server: four-client reusable session and MARKREAD survive sequential Helix upgrades across secured mesh" {
@@ -108237,18 +110237,21 @@ test "threaded server: four-client reusable session and MARKREAD survive sequent
     try writeAllFd(fd_d, "NICK DeviceD\r\nUSER nova 0 * :Helix local sibling\r\n");
     try recvUntil(clients[1], " 001 DeviceD ", 300);
     try resumeLiveMeshSession(clients[1], resume_command);
+    try recvUntil(clients[1], "JOIN #helix-mesh", 300);
     try expectContains(clients[1].written(), "JOIN #helix-mesh");
 
     try saslPlainPreludeWithCaps(fd_b, "nova", "pw", caps);
     try writeAllFd(fd_b, "NICK DeviceB\r\nUSER nova 0 * :Helix remote sibling B\r\n");
     try recvUntil(clients[2], " 001 DeviceB ", 300);
     try resumeLiveMeshSession(clients[2], resume_command);
+    try recvUntil(clients[2], "JOIN #helix-mesh", 300);
     try expectContains(clients[2].written(), "JOIN #helix-mesh");
 
     try saslPlainPreludeWithCaps(fd_c, "nova", "pw", caps);
     try writeAllFd(fd_c, "NICK DeviceC\r\nUSER nova 0 * :Helix remote sibling C\r\n");
     try recvUntil(clients[3], " 001 DeviceC ", 300);
     try resumeLiveMeshSession(clients[3], resume_command);
+    try recvUntil(clients[3], "JOIN #helix-mesh", 300);
     try expectContains(clients[3].written(), "JOIN #helix-mesh");
 
     try expectSharedUpgradeMessage(&clients, 0, "#helix-mesh", "before-either-upgrade");
@@ -108343,6 +110346,7 @@ test "threaded server: four-client reusable session and MARKREAD survive sequent
     try writeAllFd(fd_e, "NICK DeviceE\r\nUSER nova 0 * :Helix post-upgrade sibling E\r\n");
     try recvUntil(&extra, " 001 DeviceE ", 300);
     try resumeLiveMeshSession(&extra, fresh_resume);
+    try recvUntil(&extra, "JOIN #helix-mesh", 300);
     try expectContains(extra.written(), "JOIN #helix-mesh");
     try expectNoUpgradeTopologyChurn(&clients);
     const all_clients = [_]*LiveClient{

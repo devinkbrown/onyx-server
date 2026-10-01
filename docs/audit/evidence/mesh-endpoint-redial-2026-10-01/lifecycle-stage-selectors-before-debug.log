@@ -1,0 +1,65 @@
+test-mod
++- run test 72 pass, 4 fail (76 total)
+error: 'daemon.server.test.same-IP mesh dial retiring peer cannot credit endpoint breaker' failed:
+       expected 3, found 0
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x16787c4 in expectEqualInner__anon_192515 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x284a08a in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106532:9: 0x284a4eb in expectRetiringSelectorUsesActivePeer (root.zig)
+               try std.testing.expectEqual(@as(u32, 3), server.mesh_dials[0].backoff_failures);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:106546:5: 0x28527e9 in test.same-IP mesh dial retiring peer cannot credit endpoint breaker (root.zig)
+           try expectRetiringSelectorUsesActivePeer(.dial_credit);
+           ^
+error: 'daemon.server.test.same-IP mesh dial SQUIT selects active survivor before retained loser' failed:
+       expected 1, found 0
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x16787c4 in expectEqualInner__anon_192515 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x28486a2 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106521:9: 0x2848b03 in expectRetiringSelectorUsesActivePeer (root.zig)
+               try std.testing.expectEqual(survivor.token.slot, victim.token.slot);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:106550:5: 0x284dca9 in test.same-IP mesh dial SQUIT selects active survivor before retained loser (root.zig)
+           try expectRetiringSelectorUsesActivePeer(.squit);
+           ^
+error: 'daemon.server.test.same-IP mesh dial mid-turn retirement stops MODE publication' failed:
+       expected 12, found 28
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x167883a in expectEqualInner__anon_192526 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x167d74f in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106654:13: 0x167d87b in expectRetirementStopsLaterFrameFamilies (root.zig)
+                   try std.testing.expectEqual(before_flags, server.channelModeFlagBits("#retiring-turn"));
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106665:5: 0x2845e29 in test.same-IP mesh dial mid-turn retirement stops MODE publication (root.zig)
+           try expectRetirementStopsLaterFrameFamilies(.mode);
+           ^
+error: 'daemon.server.test.same-IP mesh dial mid-turn retirement stops SEARCH encoding' failed:
+       expected 7, found 8
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x1677a33 in expectEqualInner__anon_192327 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x167db54 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106657:13: 0x167dc80 in expectRetirementStopsLaterFrameFamilies (root.zig)
+                   try std.testing.expectEqual(before_counter, pair.a.exportOuter().send_counter);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106669:5: 0x2845289 in test.same-IP mesh dial mid-turn retirement stops SEARCH encoding (root.zig)
+           try expectRetirementStopsLaterFrameFamilies(.search);
+           ^
+failed command: ./.zig-cache/o/1fbd4b06815eece366eef98e090a32a4/test --cache-dir=./.zig-cache --seed=0x67b2172 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 72/76 tests passed (4 failed)
+test-mod transitive failure
++- run test 72 pass, 4 fail (76 total)
+   +- compile test Debug native success 6s MaxRSS:554M
+      +- options cached

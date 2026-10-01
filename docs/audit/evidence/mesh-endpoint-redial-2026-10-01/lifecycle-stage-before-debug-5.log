@@ -1,0 +1,37 @@
+test-mod
++- run test 72 pass, 2 fail (74 total)
+error: 'daemon.server.test.same-IP mesh dial mid-turn retirement stops MODE publication' failed:
+       expected 12, found 28
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x167883a in expectEqualInner__anon_192533 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x167d74f in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106582:13: 0x167d87b in expectRetirementStopsLaterFrameFamilies (root.zig)
+                   try std.testing.expectEqual(before_flags, server.channelModeFlagBits("#retiring-turn"));
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106593:5: 0x2845e29 in test.same-IP mesh dial mid-turn retirement stops MODE publication (root.zig)
+           try expectRetirementStopsLaterFrameFamilies(.mode);
+           ^
+error: 'daemon.server.test.same-IP mesh dial mid-turn retirement stops SEARCH encoding' failed:
+       expected 7, found 8
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x1677a33 in expectEqualInner__anon_192334 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x167db54 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:106585:13: 0x167dc80 in expectRetirementStopsLaterFrameFamilies (root.zig)
+                   try std.testing.expectEqual(before_counter, pair.a.exportOuter().send_counter);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:106597:5: 0x2845289 in test.same-IP mesh dial mid-turn retirement stops SEARCH encoding (root.zig)
+           try expectRetirementStopsLaterFrameFamilies(.search);
+           ^
+failed command: ./.zig-cache/o/1e0a76c4187bbbc2ce43d34907617090/test --cache-dir=./.zig-cache --seed=0x44794662 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 72/74 tests passed (2 failed)
+test-mod transitive failure
++- run test 72 pass, 2 fail (74 total)
+   +- compile test Debug native success 6s MaxRSS:555M
+      +- options cached

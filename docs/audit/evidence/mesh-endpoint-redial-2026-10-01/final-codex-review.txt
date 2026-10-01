@@ -1,0 +1,27 @@
+One blocking finding remains.
+
+- **HIGH — immediate drain teardown can invalidate the active receive caller.** [progressS2sDedupDrain](/home/kain/onyx-server/src/daemon/server.zig:52248) calls `closeConn` immediately when output is empty and no SEND is armed. During `handleRecv`, RECV ownership has already been cleared; with no CONNECT outstanding, this can destroy the link and free the slot. Collision resolution returns from the link driver, but [driveClientBytes](/home/kain/onyx-server/src/daemon/server.zig:10221) still returns `true`, and [handleRecv](/home/kain/onyx-server/src/daemon/server.zig:10529) then accesses `conn` again. The terminal SEND-submission-error branch has the same lifetime issue. Propagate a “freed” result or re-fetch the exact generation after driving. Add coverage through `handleRecv` with zero pending output and no other armed operation; the new responder socket tests retain RECV/SEND ownership and therefore mask this case.
+
+Other reviewed properties appear supported by source: exact endpoint matching, full secured-key reciprocal transfer, unchanged handshake direction, CONNECT address protection, strict adopted address validation, and dial publication after the adoption commit. Drain completion requires an empty retained suffix/backlog **and** released SEND ownership; merely queuing SEND does not satisfy it. Timer retry/expiry and incomplete-drain Helix refusal are present.
+
+Evidence limits:
+
+- The socketpair tests inspect actual transmitted plaintext/ciphertext and retained secured suffixes. They do not comprehensively force partial SEND, overflow, SQ pressure, or every fault path.
+- The same-IP topology test uses **Linux-only in-process Helix** and checks preserved peer fds. Its socket close/reheal portion also targets OpenBSD. Its final stability waits are one second, not two retry intervals.
+- The Python probe performs **native fork/exec**, retains original client sockets and reusable tokens, compares msgid/time, and checks cumulative delivery counts. Its [22-second diagnostic-count check](/home/kain/onyx-server/tools/openbsd_session_smoke.py:575) covers two nominal retry intervals. `--same-ip-reciprocal` requires `--skip-partition`; this campaign supplies no partition evidence or direct preserved S2S-fd identity proof.
+- Full far-nickname routing is not established as repaired.
+
+SHA-256 at **start and end were identical**:
+
+```text
+src/daemon/server.zig
+2923dc2c10aed3e023444c7235b1363d2d0f3817df138da74a7f6e2a4ed440e3
+
+src/daemon/helix/s2s_snapshot.zig
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+73406834a9cebd5ea73b582027dd55310ec5de62ae953a5d1bc13f224d6c5eba
+```
+
+Read-only source review only: no edits, tests, agents, credential reads, or VM operations. Runtime acceptance remains for the parent’s gates.

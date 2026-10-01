@@ -1,0 +1,114 @@
+--- dfcd/src/daemon/server.zig
++++ join-final/src/daemon/server.zig
+@@ -108836,8 +108836,9 @@
+ }
+
+ fn resumeLiveMeshSession(client: *LiveClient, command: []const u8) !void {
++    // Retain bootstrap bytes when the attachment notice spans retry/read boundaries.
++    client.reset();
+     for (0..100) |_| {
+-        client.reset();
+         try writeAllFd(client.fd, command);
+         const deadline = platform.monotonicMillis() + 250;
+         while (platform.monotonicMillis() < deadline) {
+@@ -108848,6 +108849,70 @@
+         testSleepMs(20);
+     }
+     return error.TestTimeout;
++}
++
++test "same-IP mesh dial session resume retains JOIN received before a retry" {
++    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
++    const command = "SESSION RESUME :retry-token\r\n";
++    const join = ":Device!nova@localhost JOIN #helix-mesh\r\n";
++    const attached = ":fixture NOTICE Device :attached to retry-token\r\n";
++    const ScriptedPeer = struct {
++        fd: linux.fd_t,
++        failure: ?anyerror = null,
++        requests: usize = 0,
++
++        fn receiveRequest(self: *@This()) !void {
++            var request: [command.len]u8 = undefined;
++            var received: usize = 0;
++            const deadline = platform.monotonicMillis() + 5_000;
++            while (received < request.len) {
++                if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
++                var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
++                if (try posix.poll(&fds, 50) == 0) continue;
++                if ((fds[0].revents & posix.POLL.IN) == 0) continue;
++                const n = try readFd(self.fd, request[received..]);
++                if (n == 0) return error.ConnectionReset;
++                received += n;
++            }
++            try std.testing.expectEqualStrings(command, &request);
++            self.requests += 1;
++        }
++
++        fn script(self: *@This()) !void {
++            try self.receiveRequest();
++            try writeAllFd(self.fd, join);
++            // The second actual request proves the client's first deadline has
++            // expired. Only then release the attachment reply; no timing sleep
++            // can accidentally merge JOIN and ATTACHED into the first attempt.
++            try self.receiveRequest();
++            try writeAllFd(self.fd, attached);
++        }
++
++        fn run(self: *@This()) void {
++            self.script() catch |err| {
++                self.failure = err;
++            };
++        }
++    };
++
++    const sockets = try sameIPTestSocketPair();
++    defer closeFd(sockets[0]);
++    defer closeFd(sockets[1]);
++    const client = try std.testing.allocator.create(LiveClient);
++    defer std.testing.allocator.destroy(client);
++    client.* = .{ .fd = sockets[0] };
++    var peer = ScriptedPeer{ .fd = sockets[1] };
++    var thread = try std.Thread.spawn(.{}, ScriptedPeer.run, .{&peer});
++    var joined = false;
++    defer if (!joined) thread.join();
++
++    try resumeLiveMeshSession(client, command);
++    thread.join();
++    joined = true;
++    if (peer.failure) |err| return err;
++    try std.testing.expectEqual(@as(usize, 2), peer.requests);
++    try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), join));
++    try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), attached));
+ }
+
+ fn expectNoUpgradeTopologyChurn(clients: []const *LiveClient) !void {
+@@ -109390,18 +109455,21 @@
+     try writeAllFd(fd_d, "NICK DeviceD\r\nUSER nova 0 * :Helix local sibling\r\n");
+     try recvUntil(clients[1], " 001 DeviceD ", 300);
+     try resumeLiveMeshSession(clients[1], resume_command);
++    try recvUntil(clients[1], "JOIN #helix-mesh", 300);
+     try expectContains(clients[1].written(), "JOIN #helix-mesh");
+
+     try saslPlainPreludeWithCaps(fd_b, "nova", "pw", caps);
+     try writeAllFd(fd_b, "NICK DeviceB\r\nUSER nova 0 * :Helix remote sibling B\r\n");
+     try recvUntil(clients[2], " 001 DeviceB ", 300);
+     try resumeLiveMeshSession(clients[2], resume_command);
++    try recvUntil(clients[2], "JOIN #helix-mesh", 300);
+     try expectContains(clients[2].written(), "JOIN #helix-mesh");
+
+     try saslPlainPreludeWithCaps(fd_c, "nova", "pw", caps);
+     try writeAllFd(fd_c, "NICK DeviceC\r\nUSER nova 0 * :Helix remote sibling C\r\n");
+     try recvUntil(clients[3], " 001 DeviceC ", 300);
+     try resumeLiveMeshSession(clients[3], resume_command);
++    try recvUntil(clients[3], "JOIN #helix-mesh", 300);
+     try expectContains(clients[3].written(), "JOIN #helix-mesh");
+
+     try expectSharedUpgradeMessage(&clients, 0, "#helix-mesh", "before-either-upgrade");
+@@ -109496,6 +109564,7 @@
+     try writeAllFd(fd_e, "NICK DeviceE\r\nUSER nova 0 * :Helix post-upgrade sibling E\r\n");
+     try recvUntil(&extra, " 001 DeviceE ", 300);
+     try resumeLiveMeshSession(&extra, fresh_resume);
++    try recvUntil(&extra, "JOIN #helix-mesh", 300);
+     try expectContains(extra.written(), "JOIN #helix-mesh");
+     try expectNoUpgradeTopologyChurn(&clients);
+     const all_clients = [_]*LiveClient{

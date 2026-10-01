@@ -1,0 +1,16 @@
+test-mod
++- run test 71 pass, 1 fail (72 total)
+error: 'daemon.server.test.same-IP mesh dial receive caller observes zero-output loser retirement by exact generation' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x1743da9 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/server.zig:106240:13: 0x1795345 in test.same-IP mesh dial receive caller observes zero-output loser retirement by exact generation (root.zig)
+                   try std.testing.expect(!try server.driveClientBytes(id, conn, hello));
+                   ^
+failed command: ./.zig-cache/o/0a782324aef81ff4263a31af1c798af2/test --cache-dir=./.zig-cache --seed=0x13a18836 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 71/72 tests passed (1 failed)
+test-mod transitive failure
++- run test 71 pass, 1 fail (72 total)
+   +- compile test Debug native success 5s MaxRSS:623M
+      +- options cached

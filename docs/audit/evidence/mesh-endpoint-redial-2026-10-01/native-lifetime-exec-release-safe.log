@@ -1,0 +1,19 @@
+ARTIFACT native daemon sha256=7db04094a2d900c8a25410216260a68639ab44ce0ed44863460cc9da3872ada9
+PASS OpenBSD three pinned nodes: one IP, distinct ports, reciprocal dials, stack 8192 KiB; secured A-B-C line, degrees 1/2/1
+PASS REGISTER: separate durable account stores on all three native nodes
+WAIT MiddleAttachment: SESSION REDIRECT while the signed replica converges
+PASS PLAIN SASL before NICK + SESSIONTOKEN + four reusable same-token physical attachments across all nodes
+PASS before-upgrade: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+SKIP partition: this run isolates sequential Helix/session acceptance
+PASS same-IP endpoint bindings: no new dial across two periodic redial intervals before upgrades
+PASS native fork/exec COMMIT on node 1: predecessor exited, secured line recovered
+PASS after-node-1: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS native fork/exec COMMIT on node 2: predecessor exited, secured line recovered
+PASS after-node-2: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS native fork/exec COMMIT on node 3: predecessor exited, secured line recovered
+PASS after-node-3: 4 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS same-IP endpoint bindings: no new dial across two periodic redial intervals after all three native upgrades
+PASS fifth-far-resume: 5 original shared attachments, independent channel/direct participation; one equal msgid/time per recipient
+PASS cumulative delivery oracle: 47 accepted events, 225 exact recipient deliveries through final finite drain
+PASS cold restart: stored account/password and issued opaque SESSION-TOKEN authenticate from durable WAL
+CLEANUP fixture PIDs: zero; loopback/PF baseline restored; private configs/WAL/logs retained at /tmp/onyx-session-native/5ea244e5b07fa615

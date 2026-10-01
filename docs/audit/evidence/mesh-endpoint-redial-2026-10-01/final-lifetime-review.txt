@@ -1,0 +1,27 @@
+**Blocking finding — MEDIUM: collision losers remain eligible for routing during drain.** [requestS2sDedupDrain](/home/kain/onyx-server/src/daemon/server.zig:52204) retains an established link while closing. [MESSAGE_V2 replay](/home/kain/onyx-server/src/daemon/server.zig:13062) and [ACK_CONFIRM selection](/home/kain/onyx-server/src/daemon/server.zig:12875) omit closing/dedup exclusion. The [flush helper](/home/kain/onyx-server/src/daemon/server.zig:19351) returns success for empty output before checking closing, so selectors can append fresh ciphertext to the loser. Subsequent failure returns without trying the survivor; drain may transmit that fresh ciphertext over the retiring socket. Exclude closing/dedup connections before encoding or selecting routes. Add coverage with the loser preceding the survivor and its drain still incomplete.
+
+**Coverage gap:** [stable_dials](/home/kain/onyx-server/tools/openbsd_session_smoke.py:575) establishes its baseline after all upgrades. Its 22-second observation checks two normal retry intervals, but permits dial growth during the upgrades themselves. Capture settled counts before upgrades and compare after each if claiming uninterrupted S2S preservation.
+
+Other reviewed paths support exact endpoint matching, full-key secured transfer, unchanged handshake direction and CONNECT storage, strict adopted size/family/nonzero-port rejection, and post-commit dial publication. Drain completion depends on SEND completion plus empty retained/queued output; queuing alone does not qualify. I found no additional blocking issue in partial SEND/overflow handling, SQ retry, expiry, exact-generation teardown, immediate-drive retirement, or Helix drain refusal.
+
+Coverage distinctions and limitations:
+
+- Socketpair tests exercise actual wire delivery/EOF, retained secured suffixes, racing RECV, and stale-generation rejection.
+- Same-IP threaded tests use Linux-only in-process Helix; native socket close/reheal runs separately.
+- Python exercises native fork/exec, persistent client sockets/tokens, equal msgid/time, and cumulative delivery counts. `--same-ip-reciprocal` requires `--skip-partition`.
+- No tests or probes were run. Forced short SEND, overflow, SQ-pressure and fault combinations remain runtime verification obligations. Full far-nickname routing is not established.
+
+Exact SHA-256 hashes were identical at start and end:
+
+```text
+src/daemon/server.zig
+3be5417b595d456c2676eb2ffff0accbb188cb3a5a81e09cff11913b1ae4c834
+
+src/daemon/helix/s2s_snapshot.zig
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+73406834a9cebd5ea73b582027dd55310ec5de62ae953a5d1bc13f224d6c5eba
+```
+
+Read-only source review only; no files changed, agents spawned, credentials read, or VMs operated. Runtime acceptance remains with the parent’s gates.

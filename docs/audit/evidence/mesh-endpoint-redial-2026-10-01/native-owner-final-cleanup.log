@@ -1,0 +1,9 @@
+PASS_owned_artifacts_removed_and_fixture_PIDs_zero
+Shutdown NOW!
+shutdown: [pid 53048]
+Connection to 127.0.0.1 closed by remote host.
+Owned QEMU2070321 absent: True
+Loopback port2225: closed
+Loopback port2223: reachable
+Loopback port2222: reachable
+Guest image retained: /tmp/onyx-openbsd-79-codex/runtime.qcow2

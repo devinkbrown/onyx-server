@@ -1,0 +1,10 @@
+test-mod
++- run test w
+GAP-P0c branch=listx remote topic
+failed command: ./.zig-cache/o/708a3e188fa2710e3072beead5bd4148/test --cache-dir=./.zig-cache --seed=0x2b1ee5b0 --listen=-
+
+Build Summary: 4/4 steps succeeded; 132/132 tests passed
+test-mod success
++- run test 132 pass (132 total) 15s MaxRSS:452M
+   +- compile test ReleaseSafe native success 6m MaxRSS:2G
+      +- options cached

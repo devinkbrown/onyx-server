@@ -1,0 +1,39 @@
+{
+  "source_sha256": "63bf1cb095faf88d1fb7dd575d273a340d393e81dfd1a5fe51bc4d0d40ef1aff",
+  "zig": "0.17.0-dev.1282+c0f9b51d8",
+  "target": "x86_64-openbsd",
+  "native_os": "OpenBSD7.9 amd64",
+  "stack_KiB": 8192,
+  "artifacts": {
+    "debug": {
+      "daemon": "17f174a9c40038a0c795f960b582476828fcc78e7553ac2df3b2aed30695f9a1",
+      "runners": {
+        "onyx-server-cli-tests": "06f231e0e91ab8e904eadf852f28dd651b99538de5adc304999ea51c6567c8fc",
+        "onyx-server-daemon-tests": "cb6493f8a436cad6ec1bc6938c248a1c66e69ff8e93fa062eaa5ba622212970c",
+        "onyx-server-module-tests": "ea8a933d0818ce739d3cc7307811d4883e92664e5c80acfc5bd26ddfca9e35d9"
+      },
+      "native_module": "108/109 passed,1Linux-onlyskip,zero failures",
+      "selected_daemon_tests": 0,
+      "cli_imports": 2,
+      "exec": "all3exec,47events225deliveries,no dial growth,coldauth pass",
+      "exec_receipt": "native-owner-final-exec-debug.log",
+      "release_safe_equality": null
+    },
+    "release-safe": {
+      "daemon": "f982f91c8f97e2a24ccc8aba5ab4511ad6e36c0b2190d2ae9fe4d0612f22a364",
+      "runners": {
+        "onyx-server-cli-tests": "0bc22cd0a33e2d97b1a292bc279d9c4f74c839f79dca98caad3803aa6daab84f",
+        "onyx-server-daemon-tests": "6d7b97f1f03accecc286e948eb9a6bb4f5207f7632e84c4e8444324a1e6bd2c1",
+        "onyx-server-module-tests": "a431e5bb4908ca7f0606c552d9355703bc58ad9d073e5729432e33aaf8390a01"
+      },
+      "native_module": "108/109 passed,1Linux-onlyskip,zero failures",
+      "selected_daemon_tests": 0,
+      "cli_imports": 2,
+      "exec": "all3exec,47events225deliveries,no dial growth,coldauth pass",
+      "exec_receipt": "native-stage-final-exec-release-safe.log",
+      "release_safe_equality": "native-owner-release-safe-artifact-equality.txt"
+    }
+  },
+  "cleanup_receipt": "native-owner-final-cleanup.log",
+  "deployment": false
+}

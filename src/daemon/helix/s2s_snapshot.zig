@@ -47,7 +47,7 @@
 //!                                                                  bit1 ACK confirm
 //!                                                         schema + ACK support)
 //!   [u16 len][remote_name]
-//!   [u16 len][connect_addr] raw sockaddr.in6 of the dial target (initiator only)
+//!   [u16 len][connect_addr] raw sockaddr.in6 of a proven dial target (either direction)
 //!   [u32 len][rec_inbuf]    partial inbound record buffered at export
 //!   [u32 len][pending_out]  sealed records queued but not yet on the wire
 //!   [u32 roster_count][u32 roster_len][roster]   (v4+) the converged remote-
@@ -123,9 +123,12 @@ pub const Snapshot = struct {
     caps: u8 = 0,
     caps_ext: u8 = 0,
     remote_name: []const u8 = &.{},
-    /// Raw `posix.sockaddr.in6` bytes of the dial target (initiator links only),
-    /// so the successor's `[mesh].connect` sweep recognizes the preserved link and
-    /// does NOT dial a duplicate. Empty on responder (accepted) links.
+    /// Raw `posix.sockaddr.in6` bytes of a proven dial target. An authenticated
+    /// reciprocal inbound survivor may inherit the completed outbound target;
+    /// this association does not change its handshake initiator direction.
+    /// The successor's `[mesh].connect` sweep uses it to recognize preserved
+    /// links. Empty when no completed outbound endpoint is known, including
+    /// ordinary accepted links without reciprocal endpoint provenance.
     connect_addr: []const u8 = &.{},
 
     rec_inbuf: []const u8 = &.{},

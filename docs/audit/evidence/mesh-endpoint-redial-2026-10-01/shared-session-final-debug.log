@@ -1,0 +1,5 @@
+Build Summary: 4/4 steps succeeded; 72/72 tests passed
+test-mod success
++- run test 72 pass (72 total) 2s MaxRSS:168M
+   +- compile test Debug native success 12s MaxRSS:595M
+      +- options cached

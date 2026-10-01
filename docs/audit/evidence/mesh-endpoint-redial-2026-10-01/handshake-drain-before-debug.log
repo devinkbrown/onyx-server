@@ -1,0 +1,62 @@
+test-mod
++- run test 71 pass, 2 fail (73 total)
+error: 'daemon.server.test.same-IP mesh dial plaintext responder loser delivers its final handshake before close' failed:
+       slices differ. first difference occurs at index 0 (0x0)
+
+       ============ expected this output: =============  len: 116 (0x74)
+
+       01 28 00 00 00 53 32 50  48 02 01 00 00 00 00 00  .(...S2PH.......
+       00 00 E8 03 00 00 00 00  00 00 0E 00 61 61 61 2D  ............aaa-
+       6C 6F 63 61 6C 2E 74 65  73 74 00 00 0A 02 10 00  local.test..␊...
+       00 00 53 42 53 54 01 01  09 00 00 00 00 00 00 00  ..SBST..␉.......
+       00 00 14 2D 00 00 00 02  02 0E 00 61 61 61 2D 6C  ...-.......aaa-l
+       6F 63 61 6C 2E 74 65 73  74 19 00 53 45 52 56 45  ocal.test..SERVE
+       52 20 4C 49 4E 4B 20 7A  7A 7A 2D 70 65 65 72 2E  R LINK zzz-peer.
+       74 65 73 74                                       test
+
+       ============= instead found this: ==============  len: 0 (0x0)
+
+
+       ================================================
+
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:378:5: 0x16e253d in expectEqualSlices__anon_196090 (std.zig)
+           return error.TestExpectedEqual;
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:105902:5: 0x2aa04e2 in test.same-IP mesh dial plaintext responder loser delivers its final handshake before close (root.zig)
+           try std.testing.expectEqualSlices(u8, expected, wire[0..n]);
+           ^
+error: 'daemon.server.test.same-IP mesh dial secured responder loser retains armed ciphertext until send completion' failed:
+       slices differ. first difference occurs at index 0 (0x0)
+
+       ============ expected this output: =============  len: 168 (0xA8)
+
+       A4 00 00 00 BD 4E 70 AA  37 EC DF 36 5C 7C ED 90  .....Np.7..6\|..
+       E0 F0 AE 32 46 9C C7 61  13 08 3B 68 35 17 8A F3  ...2F..a..;h5...
+       1F AE 2F 5C F3 81 CE 2D  FB C4 7E 90 8A 0A FE 78  ../\...-..~..␊.x
+       C3 A9 6E CB E8 4A 2D 22  2C 81 33 A4 71 DD 4A 1D  ..n..J-",.3.q.J.
+       40 50 70 40 6E 23 0D 31  B5 7F 9A 6C 7C B7 38 BA  @Pp@n#␍1...l|.8.
+       FD 9E 4A BA 2A E6 52 58  0E 6E DB A6 74 9B 61 BE  ..J.*.RX.n..t.a.
+       F8 64 F1 32 AB D0 B0 9B  D2 1C 6B 58 00 EA 53 E6  .d.2......kX..S.
+       E6 35 9A D5 F7 FB 8C 12  80 2F 61 C7 30 53 C0 C7  .5......./a.0S..
+       C4 63 D2 EA 82 BD E5 1F  79 2B 86 14 77 05 23 14  .c......y+..w.#.
+       FA ED E4 39 5E 93 C8 71  C5 89 CF 6E 74 49 F1 CA  ...9^..q...ntI..
+       BB 92 BB D1 CD EF C4 26                           .......&
+
+       ============= instead found this: ==============  len: 0 (0x0)
+
+
+       ================================================
+
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:378:5: 0x16e253d in expectEqualSlices__anon_196090 (std.zig)
+           return error.TestExpectedEqual;
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:105961:5: 0x16e7952 in test.same-IP mesh dial secured responder loser retains armed ciphertext until send completion (root.zig)
+           try std.testing.expectEqualSlices(u8, expected, wire[0..n]);
+           ^
+failed command: ./.zig-cache/o/dd3d759108efe79ee91d97cbe30a9bfa/test --cache-dir=./.zig-cache --seed=0x334fdb15 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 71/73 tests passed (2 failed)
+test-mod transitive failure
++- run test 71 pass, 2 fail (73 total)
+   +- compile test Debug native success 6s MaxRSS:601M
+      +- options cached

@@ -10,6 +10,10 @@ baseline and the temporary packet-filter policy are restored on exit. The guest
 binary is copied and pinned before use. All fixture processes and forwards are
 stopped on exit; credentials and protocol transcripts are never printed. This
 deliberately exercises configured SRM1 multi-attachment issuance.
+
+--same-ip-reciprocal uses existing 127.0.0.1 with distinct ports and reciprocal
+dials, at the normal 8 MiB stack limit. It requires --skip-partition: the
+default address-based PF partition cannot isolate peers sharing one address.
 """
 
 import argparse
@@ -158,7 +162,8 @@ class Fixture:
         self.pf_active = False
         self.pf_original_hash = None
         self.pf_original_rules = None
-        self.hosts = ("127.0.0.31", "127.0.0.32", "127.0.0.33")
+        self.hosts = (("127.0.0.1",) * 3 if args.same_ip_reciprocal else
+                      ("127.0.0.31", "127.0.0.32", "127.0.0.33"))
         self.alias_baseline = None
         self.owned_aliases = []
         self.account = "nativesession"
@@ -188,6 +193,10 @@ class Fixture:
     def setup_aliases(self):
         self.alias_baseline = self.loopback_addresses()
         present = {line.split()[1] for line in self.alias_baseline}
+        if self.args.same_ip_reciprocal:
+            if "127.0.0.1" not in present:
+                raise RuntimeError("standard loopback address absent")
+            return
         if any(host in present for host in self.hosts):
             raise RuntimeError("a private fixture loopback alias is already owned")
         for host in self.hosts:
@@ -215,7 +224,8 @@ class Fixture:
     def boot(self, index):
         config = shlex.quote(self.configs[index])
         log = shlex.quote(f"{self.directory}/node{index + 1}.log")
-        self.remote(f"ulimit -s 65536; nohup {self.binary} {config} </dev/null >>{log} 2>&1 &")
+        stack_kib = 8192 if self.args.same_ip_reciprocal else 65536
+        self.remote(f"ulimit -s {stack_kib} || exit 1; nohup {self.binary} {config} </dev/null >>{log} 2>&1 &")
         # Bring up the downstream listener before its upstream node dials it.
         # A forwarded host socket alone proves only SSH accepted the channel.
         deadline = time.monotonic() + 15
@@ -245,9 +255,8 @@ class Fixture:
         if digest != self.args.expected_sha256:
             raise RuntimeError("native artifact differs from required build digest")
         print("ARTIFACT native daemon sha256=" + digest, flush=True)
-        # Distinct addresses model the deployed three-host topology. The
-        # existing same-IP inbound dial heuristic cannot distinguish peers
-        # that share an address but listen on different S2S ports.
+        # Default aliases model separate hosts. The reciprocal mode exercises
+        # endpoint bindings when all peers share one address.
         self.setup_aliases()
         for node, host in enumerate(self.hosts):
             for offset in (0, 1, 3, 4):
@@ -261,7 +270,9 @@ class Fixture:
         for i, key in enumerate(keys):
             base = 33500 + i * 10
             neighbors = (1,) if i != 1 else (0, 2)
-            connections = [f"{self.hosts[i + 1]}:{33513 if i == 0 else 33523}"] if i < 2 else []
+            connections = ([f"{self.hosts[n]}:{33503 + n * 10}" for n in neighbors]
+                           if self.args.same_ip_reciprocal else
+                           [f"{self.hosts[i + 1]}:{33513 if i == 0 else 33523}"] if i < 2 else [])
             seed = key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
                                      serialization.NoEncryption()).hex()
             config = f'''[node]
@@ -316,7 +327,9 @@ secret = "{mesh_pass}"
         for i in (2, 1, 0):
             self.boot(i)
         self.health()
-        print("PASS OpenBSD three distinct pinned nodes: secured A-B-C line, degrees 1/2/1", flush=True)
+        topology = ("one IP, distinct ports, reciprocal dials, stack 8192 KiB"
+                    if self.args.same_ip_reciprocal else "three distinct addresses")
+        print(f"PASS OpenBSD three pinned nodes: {topology}; secured A-B-C line, degrees 1/2/1", flush=True)
 
     def health(self, degrees=(1, 2, 1), timeout=45):
         deadline = time.monotonic() + timeout
@@ -559,6 +572,35 @@ secret = "{mesh_pass}"
             time.sleep(.2)
         raise TimeoutError(f"node {node + 1}: native Helix COMMIT absent")
 
+    def dial_counts(self):
+        # Return only controlled counters, never private daemon log contents.
+        result = []
+        for node in range(3):
+            log = shlex.quote(f"{self.directory}/node{node + 1}.log")
+            count = self.remote("awk '/\\(dial initiated\\)/ {n++} END {print n+0}' " + log)
+            if not count.isdigit():
+                raise RuntimeError("fixture dial counter malformed")
+            result.append(int(count))
+        return tuple(result)
+
+    def stable_dials(self, phase, expected=None):
+        # Two complete ten-second retry intervals must pass without a dial.
+        before = self.dial_counts()
+        if sum(before) < 4:
+            raise RuntimeError("reciprocal dial diagnostics absent")
+        if expected is not None and before != expected:
+            raise RuntimeError("configured dial churn during sequential Helix")
+        deadline = time.monotonic() + 22
+        while time.monotonic() < deadline:
+            self.health()
+            for client in self.clients:
+                client.pump()
+            time.sleep(.2)
+        if self.dial_counts() != before:
+            raise RuntimeError("configured dial churn " + phase)
+        print("PASS same-IP endpoint bindings: no new dial across two periodic redial intervals " + phase, flush=True)
+        return before
+
     def stop(self, node):
         for pid in self.pids(node):
             self.remote("kill -TERM " + pid)
@@ -643,12 +685,18 @@ secret = "{mesh_pass}"
             print("SKIP partition: this run isolates sequential Helix/session acceptance", flush=True)
         else:
             self.partition(attached, observer, local)
+        settled_dials = (self.stable_dials("before upgrades")
+                         if self.args.same_ip_reciprocal else None)
         for node in range(3):
             self.upgrade(node)
+            if settled_dials is not None and self.dial_counts() != settled_dials:
+                raise RuntimeError(f"configured dial churn during node {node + 1} Helix")
             for client in attached:
                 if client.tokens()[0] != local:
                     raise RuntimeError("local group token changed across sequential Helix")
             self.participation(attached, observer, f"after-node-{node + 1}")
+        if self.args.same_ip_reciprocal:
+            self.stable_dials("after all three native upgrades", settled_dials)
         fifth = self.client(2, "LaterFarAttachment")
         fifth.resume(portable)
         attached.append(fifth)
@@ -690,6 +738,8 @@ def main():
                         help="add far-only nickname convergence and separate-recipient DM coverage")
     parser.add_argument("--skip-partition", action="store_true",
                         help="isolate sequential Helix evidence; default includes actual B-C partition")
+    parser.add_argument("--same-ip-reciprocal", action="store_true",
+                        help="use one IP and reciprocal dials; requires --skip-partition")
     parser.add_argument("--binary", choices=("/tmp/onyx-full-native/onyx-server", "/tmp/onyx-session-native/onyx-server"),
                         default="/tmp/onyx-full-native/onyx-server")
     args = parser.parse_args()
@@ -697,6 +747,8 @@ def main():
         parser.error("required build digest must be lowercase SHA-256")
     if not 1024 <= args.local_base <= 65510 or not 1 <= args.ssh_port <= 65535:
         parser.error("invalid loopback port range")
+    if args.same_ip_reciprocal and not args.skip_partition:
+        parser.error("--same-ip-reciprocal requires --skip-partition; PF cannot isolate shared-IP peers")
     fixture = Fixture(args)
     try:
         fixture.run()

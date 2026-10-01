@@ -1,0 +1,6 @@
+OWNED_ARTIFACT_DIRS_REMOVED
+8192
+Shutdown NOW!
+shutdown: [pid 46642]
+Connection to 127.0.0.1 closed by remote host.
+HOST_VERIFY owned QEMU PID absent; owned SSH 2225 closed; existing SSH 2223 and 2222 reachable. Guest image retained.

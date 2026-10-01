@@ -1,0 +1,23 @@
+No blocking production defect found in the reviewed delta. Two actionable findings remain:
+
+- **MEDIUM — claimed signed-membership fixture is absent.** [server.zig:106500](/home/kain/onyx-server/src/daemon/server.zig:106500) directly inserts roster rows with `applyMembership` and manually sets `account_trusted`. Neighbor trust roots are configured, and MESSAGE_V2/E2EEGROUP records are signed, but membership does not traverse secured admission. Feed signed membership and assert home/account/membership preconditions before the rejection tests. This is a coverage discrepancy, not a demonstrated runtime failure.
+- **LOW — INFO still counts retiring peers.** [server.zig:52020](/home/kain/onyx-server/src/daemon/server.zig:52020) counts every established link, including closing/dedup losers. Apply the same exclusion as LINKS/topology to avoid inflated active-peer reporting during draining.
+
+The inspected endpoint matching, full-key secured transfer, CONNECT storage protection, adopted-address rejection, and post-commit publication appear consistent. Drain completion checks retained output, backlog and SEND ownership; queuing SEND alone does not complete retirement. The immediate-drive caller rechecks the exact generation. I found no additional live routing/roster-authority selector admitting a retiring loser, beyond the INFO reporting issue.
+
+The Python probe uses appended logs for comparable cumulative dial counts, a 22-second baseline, unchanged counts after each exec, and another 22-second window afterward. Evidence remains distinct: Linux in-process Helix; Linux/OpenBSD socket close/reheal; native fork/exec with `--skip-partition`. None establishes full far-nickname routing repair.
+
+Exact SHA-256 values **at start and end were identical**:
+
+```text
+src/daemon/server.zig
+b060677639a5f6f63c83dada6ebe7254f7fbb6a83a31e7d61b942cebabe2c187
+
+src/daemon/helix/s2s_snapshot.zig
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+```
+
+Static review only: no edits, tests, agents, credential access or VM operations. Runtime acceptance and all gates remain with the parent.

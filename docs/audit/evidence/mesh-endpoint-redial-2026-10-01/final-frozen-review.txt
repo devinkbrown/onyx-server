@@ -1,0 +1,24 @@
+No blocking finding in the reviewed delta. This is a source review, not runtime acceptance; the parent must run all gates.
+
+- Endpoint suppression requires a proven complete target. Secured reciprocal transfer compares the full authenticated key and preserves direction/CONNECT storage ownership. [server.zig:52162](/home/kain/onyx-server/src/daemon/server.zig:52162)
+- Adoption rejects wrong address size/family and zero ports before slot allocation. Dial publication occurs after the whole adoption commits. [validation](/home/kain/onyx-server/src/daemon/server.zig:31398), [publication](/home/kain/onyx-server/src/daemon/server.zig:31618)
+- Retirement waits for retained output, backlog, and SEND ownership to clear; queuing SEND does not count as transmission. Completion handling preserves partial tails/refills overflow, faults terminate, and the timer retries or expires drains. Immediate-drive teardown checks the exact generation before caller reuse. [drain](/home/kain/onyx-server/src/daemon/server.zig:52216), [completion](/home/kain/onyx-server/src/daemon/server.zig:10547), [caller check](/home/kain/onyx-server/src/daemon/server.zig:10271)
+- MESSAGE_V2, secured/plain fanout, and adjacent E2EEGROUP selectors exclude closing/dedup links. Empty flush success validates the live connection; lifecycle flushing remains available for retained output. Tests place the loser before its survivor. [flush guard](/home/kain/onyx-server/src/daemon/server.zig:19353), [tests](/home/kain/onyx-server/src/daemon/server.zig:106309)
+- Helix refuses an incomplete process-local drain. [server.zig:27698](/home/kain/onyx-server/src/daemon/server.zig:27698)
+
+The Python probe uses appended logs for comparable cumulative dial counters, requires a settled 22-second baseline, checks unchanged counts after each native exec, and repeats the 22-second window afterward. Original socket/token participation and cumulative equal-msgid/time delivery checks remain. [probe](/home/kain/onyx-server/tools/openbsd_session_smoke.py:586)
+
+Limitations: no tests, agents, credentials, or VM operations were used. Added socket tests exercise real wire delivery but do not deterministically force every partial-SEND, overflow, SQ-pressure, allocation-failure, or stream-error case. Linux in-process Helix, native socket close/reheal, and native fork/exec with `--skip-partition` are distinct evidence. Full far-nickname routing is not established.
+
+Exact SHA-256 hashes were identical at start and end:
+
+```text
+src/daemon/server.zig
+a08b0e8aa2089c5e09ce3501b72a618cff1af92c852e8bc4f07caffbca20ac1b
+
+src/daemon/helix/s2s_snapshot.zig
+c1c6f64baab27cb24d67d40d26284897ca4080798c5001b15ce046a5373b1a37
+
+tools/openbsd_session_smoke.py
+c99301dfdead9e88f75fd53f49f23472c1fa8b0dc2775ea07bc75b681dbd7cff
+```

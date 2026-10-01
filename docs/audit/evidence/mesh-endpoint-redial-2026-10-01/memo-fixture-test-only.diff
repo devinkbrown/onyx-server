@@ -1,0 +1,27 @@
+--- a08b/server.zig
++++ dfcd/server.zig
+@@ -63515,7 +63515,8 @@
+     peer.overflow_allocator = alloc;
+     peer.token = try tokenFromId(id);
+     peer.s2s_secured = link;
+-    peer.closing = true;
++    // Capture queued ciphertext without pretending this eligible peer is closing.
++    peer.test_sendq_capture = true;
+     link_owned_by_server = true;
+     try std.testing.expect(link.established());
+
+@@ -63525,8 +63526,12 @@
+     const delivered = conn.send_buf[0..conn.send_len];
+     try std.testing.expect(std.mem.indexOf(u8, delivered, "usr2 offline") != null);
+     try std.testing.expectEqual(@as(usize, 0), second.memo.pending("carol").len);
+-    try std.testing.expect(link.outbound().len != 0);
+-    try pair.b.feed(link.outbound(), 90);
++    const pushed_wire = try copyTestSendQ(alloc, peer);
++    defer alloc.free(pushed_wire);
++    try std.testing.expect(pushed_wire.len != 0);
++    try std.testing.expectEqual(@as(usize, 0), link.outbound().len);
++    try std.testing.expect(!peer.closing and !peer.s2s_dedup);
++    try pair.b.feed(pushed_wire, 90);
+     const pushes = try pair.b.takeMemoPushes();
+     defer {
+         for (pushes) |payload| alloc.free(payload);

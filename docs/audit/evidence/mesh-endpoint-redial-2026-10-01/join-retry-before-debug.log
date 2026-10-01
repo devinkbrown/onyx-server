@@ -1,0 +1,20 @@
+test-mod
++- run test 71 pass, 1 fail (72 total)
+error: 'daemon.server.test.same-IP mesh dial session resume retains JOIN received before a retry' failed:
+       expected 1, found 0
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:111:17: 0x143a7f9 in expectEqualInner__anon_190410 (std.zig)
+                       return error.TestExpectedEqual;
+                       ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:75:5: 0x143af98 in expectEqual (root.zig)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:108913:5: 0x143b0a4 in test.same-IP mesh dial session resume retains JOIN received before a retry (root.zig)
+           try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), join));
+           ^
+failed command: ./.zig-cache/o/7883b18b37abb0dff89eb38c3a22109c/test --cache-dir=./.zig-cache --seed=0xbcc7d72b --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 71/72 tests passed (1 failed)
+test-mod transitive failure
++- run test 71 pass, 1 fail (72 total)
+   +- compile test Debug native success 11s MaxRSS:378M
+      +- options cached

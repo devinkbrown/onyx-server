@@ -1,0 +1,59 @@
+**A single `ConnState.isActiveMeshPeer()` predicate is the right root-cause fix at this scope.** It is sufficient for connection-backed authority if all consumers use it and retained-state exceptions are explicit. The evidence does not justify a lifecycle enum, revocation index, or deleting rosters at retirement.
+
+The defect is that protocol establishment outlives routing eligibility. Retaining an established link for output drainage is necessary; treating that retained link as authoritative is not. The missed [stale-prune path](/home/kain/onyx-server/src/daemon/server.zig:7221) demonstrates why repeating guards across individual methods remains fragile.
+
+Implement the predicate on `ConnState`, without adding stored state:
+
+```zig
+fn isActiveMeshPeer(self: *const ConnState) bool {
+    if (self.closing or self.s2s_dedup) return false;
+    if (self.s2s_secured) |link| return link.established();
+    if (self.s2s) |link| return link.established();
+    return false;
+}
+```
+
+Check slot occupancy before calling it. Keep capability, origin, exact-link identity, endpoint and liveness checks as additional requirements. Do not incorporate wall-clock liveness, allocation, or publication into this predicate.
+
+Collision resolution already sets `s2s_dedup` before requesting drainage; that assignment becomes the immediate authority-revocation point, including when `closing` has not yet been set. Keep the existing serialization and exact-generation lifetime rules.
+
+**Apply it systematically at these boundaries:**
+
+| Consumers | Required change |
+|---|---|
+| Live routing and fanout | Replace duplicated eligibility guards throughout relay, ACK/ACK_CONFIRM, replay, membership/mode/topic/property announcements, search, oper, memo, media and session broadcasts. |
+| Roster authority | Gate home/account/status/membership lookups, nick claims, WHOIS, NAMES, LIST, topic/secrecy and user counts. Representative boundaries: [home/account](/home/kain/onyx-server/src/daemon/server.zig:11908), [membership authority](/home/kain/onyx-server/src/daemon/server.zig:37109). |
+| Maintenance | Gate resync, stale pruning, RTT probes, session route rebind/reconciliation and new replay/burst work. Preserve secured-prune exclusion separately. |
+| Direct application-output helpers | Gate before encoding new records, retaining exact-pointer checks: [secured output](/home/kain/onyx-server/src/daemon/server.zig:19357), [E2EE ACK](/home/kain/onyx-server/src/daemon/server.zig:40722). |
+| Derived active views | Use it in INFO, LINKS, topology, peer-name collection and published-peer construction. |
+| Transition publication | Pass the owning connection into [drainIdentityTransitions](/home/kain/onyx-server/src/daemon/server.zig:18364), and gate before consuming/publishing transitions or folding legacy membership. This closes the shared side-effect boundary, not merely its current prune caller. |
+
+For inbound processing, permit handshake progression while unestablished. Reject retired connections before feeding new bytes, then require active eligibility after collision resolution and before application drains. Do not place an establishment requirement ahead of the handshake.
+
+**Keep these exemptions explicit:**
+
+- [Collision resolution](/home/kain/onyx-server/src/daemon/server.zig:52281) must inspect retired predecessors to transfer endpoint bindings. **Do not silently redefine `establishedPeerName()` as active-only:** collision resolution currently depends on its broader meaning. Separate raw protocol identity from active-peer selection.
+- [Drain progression](/home/kain/onyx-server/src/daemon/server.zig:52227), `flushMeshBurstStage`, SEND completion, cancellation and final teardown must retain access to closing connections. They move already-owned bytes and release storage; they must not author new application records.
+- [Netsplit cleanup](/home/kain/onyx-server/src/daemon/server.zig:15887) must inspect a genuinely dropped connection’s retained roster. Dedup teardown suppresses that operation through its existing reason flag.
+- `clearDroppedPeerRouteOrigin`, deinitialization and candidate `discardIdentityTransitions` remain cleanup operations.
+- [Helix sealing](/home/kain/onyx-server/src/daemon/server.zig:27699) must continue detecting and refusing pending drains. Filtering them out would hide unfinished custody.
+- Independently accepted signed session/relay stores retain their own acceptance, expiry and custody rules. Losing one transport must not revoke their accepted objects; subsequent transmission selects an active route.
+
+Deleting rosters would erase information needed by cleanup and conflate transport retirement with membership revocation. An enum would require changing many close/adopt transitions without itself preventing ungated reads. A separate revocation index adds synchronization and potentially fallible work to an allocation-free revocation decision.
+
+Two derived-state details need explicit treatment:
+
+- [Published peer replacement](/home/kain/onyx-server/src/daemon/server.zig:52389) preserves its old snapshot on OOM. Preserve that atomicity. For reciprocal collapse, the survivor has the same authenticated full key, so retaining that peer identity does not inherently retain loser authority. Verify this distinction; cached peer identity must never select the retired physical connection.
+- `s2s_links_active` currently counts establishment until final close ([stats](/home/kain/onyx-server/src/daemon/server_stats.zig:221)). Decide explicitly whether it remains a protocol-established transport gauge or becomes an eligible-route gauge. A predicate does not automatically update cached counters.
+
+**Close the audit with a consumer inventory, not another guard count.** Search production code for `s2s`, `s2s_secured`, `.established()`, roster/route reads, transition drains and published-peer consumers. Classify each containing function as active authority, handshake, custody/cleanup, or independent accepted state. Trace callers of link-only helpers. Every active consumer must reach the shared predicate; every exemption needs a concrete reason. The existing 45/22 method counts cannot establish completeness.
+
+Meaningful causal tests should prove:
+
+1. A real reciprocal collision revokes the loser immediately while retained HELLO/ciphertext still drains, with no new application encoding.
+2. A loser-first roster containing higher-priority stale claims cannot override a divergent survivor; reverse slot order too.
+3. Expired membership plus pending PART/QUIT/NICK transitions on the loser produce neither client output nor local legacy membership changes. The same maintenance operation on an active control connection must produce the expected effects.
+4. Signed membership traverses actual secured admission. Assert home/account/membership preconditions and a successful active control before testing rejection.
+5. Backpressure, deadline expiry, genuine netsplit, Helix refusal and allocation failures preserve existing custody and atomicity guarantees.
+
+I read both prior reviews and the current delta. HEAD was `d9991c00`; the final source hash read was still `b0606776…`. This is a design assessment, not final acceptance. No edits, tests, agents, credentials or VM operations were used.
