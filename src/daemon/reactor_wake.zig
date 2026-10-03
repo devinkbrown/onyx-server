@@ -78,6 +78,9 @@ pub const ReactorWake = struct {
     /// Close the underlying eventfd. Idempotent only if not called twice.
     pub fn deinit(self: *ReactorWake) void {
         if (comptime builtin.os.tag != .linux) {
+            // Windows has no socketpair/eventfd mapping yet; init() already
+            // reports ReactorWakeUnsupported there, so this is unreachable.
+            if (comptime builtin.os.tag == .windows) return;
             _ = std.c.close(self.handle);
             _ = std.c.close(self.write_handle);
             self.handle = -1;
@@ -101,6 +104,9 @@ pub const ReactorWake = struct {
     /// failed wake must never propagate up the foreign reactor's hot path.
     pub fn wake(self: ReactorWake) void {
         if (comptime builtin.os.tag != .linux) {
+            // Windows has no socketpair/eventfd mapping yet; init() already
+            // reports ReactorWakeUnsupported there, so this is unreachable.
+            if (comptime builtin.os.tag == .windows) return;
             const byte = [_]u8{1};
             while (std.c.send(self.write_handle, &byte, 1, std.c.MSG.NOSIGNAL) < 0) {
                 if (std.c._errno().* != @as(c_int, @intFromEnum(std.posix.E.INTR))) break;
@@ -123,6 +129,9 @@ pub const ReactorWake = struct {
     /// `EAGAIN` is tolerated — a spurious drain (counter already zero) is benign.
     pub fn drain(self: ReactorWake) void {
         if (comptime builtin.os.tag != .linux) {
+            // Windows has no socketpair/eventfd mapping yet; init() already
+            // reports ReactorWakeUnsupported there, so this is unreachable.
+            if (comptime builtin.os.tag == .windows) return;
             var bytes: [512]u8 = undefined;
             // Bound work under continuous producers; remaining bytes preserve
             // level readiness when the owning reactor rearms its poll.
@@ -225,6 +234,8 @@ test "multiple wakes coalesce into a single drainable counter" {
 }
 
 test "drain on an empty eventfd is a tolerated no-op" {
+    // eventfd/socketpair wake has no Winsock mapping yet.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var w = ReactorWake.init() catch return error.SkipZigTest;
     defer w.deinit();
 

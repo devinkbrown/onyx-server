@@ -488,6 +488,8 @@ fn mkAddr(last: u8, port: u16) TransportAddress {
 }
 
 test "NativeMediaTransport: pump learns sender + forwards an cadence frame to the receiver" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     try nmt.start(loopback_be, 0);
@@ -573,6 +575,8 @@ test "NativeMediaTransport: MAC flag off preserves untagged datagram behavior" {
 }
 
 test "NativeMediaTransport: media never crosses channels" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     try nmt.start(loopback_be, 0);
@@ -599,6 +603,8 @@ test "NativeMediaTransport: media never crosses channels" {
 }
 
 test "NativeMediaTransport: setSelection drops higher layers over the wire" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     try nmt.start(loopback_be, 0);
@@ -657,6 +663,8 @@ test "NativeMediaTransport: unregister drops the channel and frees its index" {
 }
 
 test "NativeMediaTransport: register enforces runtime participant cap" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.initConfig(testing.allocator, 2);
     defer nmt.deinit();
 
@@ -701,6 +709,8 @@ const TestFeedbackCtx = struct {
 };
 
 test "NativeMediaTransport: pump bridges a native frame to a WebRTC member as RTP" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
 
@@ -736,6 +746,8 @@ test "NativeMediaTransport: pump bridges a native frame to a WebRTC member as RT
 }
 
 test "NativeMediaTransport: pump accepts authenticated native feedback envelope" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     const root = @as([16]u8, @splat(0x4B));
@@ -776,6 +788,8 @@ test "NativeMediaTransport: pump accepts authenticated native feedback envelope"
 }
 
 test "NativeMediaTransport: pump rejects native feedback with a bad tag" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     const root = @as([16]u8, @splat(0x4B));

@@ -97,6 +97,9 @@ pub const ChallengeServer = struct {
     pub fn initWithConfig(store: *http01.TokenStore, port: u16, config: Config) ListenerError!ChallengeServer {
         const fd = try socketTcp();
         errdefer closeFd(fd);
+        // socketTcp already reports SocketUnavailable on Windows; stop
+        // analysis here so the libc-linked calls below are never instantiated.
+        if (comptime builtin.os.tag == .windows) return error.SocketUnavailable;
 
         var yes: u32 = 1;
         _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
@@ -109,28 +112,29 @@ pub const ChallengeServer = struct {
             return error.BindFailed;
         if (posix.errno(sys.listen(fd, config.listen_backlog)) != .SUCCESS)
             return error.ListenFailed;
-        if (comptime builtin.os.tag != .linux) {
-            @import("os_runtime.zig").setNonblocking(fd) catch return error.ListenFailed;
-        }
+        const current_flags = sys.fcntl(fd, posix.F.GETFL, @as(if (builtin.os.tag == .linux) usize else c_int, 0));
+        if (posix.errno(current_flags) != .SUCCESS) return error.ListenFailed;
+        var owned_flags: posix.O = @bitCast(@as(u32, @intCast(current_flags)));
+        owned_flags.NONBLOCK = true;
+        const flag_arg: if (builtin.os.tag == .linux) usize else c_int = @intCast(@as(u32, @bitCast(owned_flags)));
+        if (posix.errno(sys.fcntl(fd, posix.F.SETFL, flag_arg)) != .SUCCESS) return error.ListenFailed;
 
         // Receive timeout so a blocked accept4 wakes periodically to re-check the
         // stop flag. Closing the listener from another thread does NOT reliably
         // wake accept4, so this poll is how shutdown actually terminates.
-        const poll_ms = if (builtin.os.tag == .linux) config.accept_poll_ms else @max(config.accept_poll_ms, 1);
+        const poll_ms = @min(@max(config.accept_poll_ms, 1), std.math.maxInt(c_int));
         const tv = sys.timeval{
             .sec = @intCast(poll_ms / 1000),
             .usec = @intCast((poll_ms % 1000) * 1000),
         };
         const timeout_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
-        if (comptime builtin.os.tag != .linux) {
-            if (posix.errno(timeout_rc) != .SUCCESS) return error.TimeoutSetupFailed;
-        }
+        if (posix.errno(timeout_rc) != .SUCCESS) return error.TimeoutSetupFailed;
 
         return .{
             .store = store,
             .listen_fd = fd,
             .port = try boundPort(fd),
-            .conn_read_timeout_sec = if (builtin.os.tag == .linux) config.conn_read_timeout_sec else @max(config.conn_read_timeout_sec, 1),
+            .conn_read_timeout_sec = @max(config.conn_read_timeout_sec, 1),
         };
     }
 
@@ -139,16 +143,21 @@ pub const ChallengeServer = struct {
         self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     }
 
-    /// Signal stop, unblock the accept loop by closing the listener, and join.
+    /// Stop and join while the numeric listener FD still denotes this owner.
+    /// Poll/read/write operations are finite and stop-aware; close follows join.
     pub fn shutdown(self: *ChallengeServer) void {
         self.stop_flag.store(true, .release);
-        if (comptime builtin.os.tag == .linux) closeFd(self.listen_fd);
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
-        if (comptime builtin.os.tag != .linux) closeFd(self.listen_fd);
-        self.listen_fd = -1;
+        // This listener never opens on Windows (`socketTcp` refuses and the
+        // portable server stays plaintext-only); gate at comptime so
+        // `refAllDecls` test builds compile. Byte-identical elsewhere.
+        if (comptime builtin.os.tag != .windows) {
+            if (self.listen_fd >= 0) closeFd(self.listen_fd);
+            self.listen_fd = -1;
+        }
     }
 
     fn acceptLoop(self: *ChallengeServer) void {
@@ -194,31 +203,36 @@ pub const ChallengeServer = struct {
 // BSD accept timeout is explicit: listener SO_RCVTIMEO is configuration,
 // poll bounds the wait, and nonblocking accept cannot hang after stale readiness.
 fn acceptSocket(fd: posix.fd_t) if (builtin.os.tag == .linux) usize else c_int {
-    if (comptime builtin.os.tag == .linux) return sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
     var tv: sys.timeval = undefined;
     var len: posix.socklen_t = @sizeOf(@TypeOf(tv));
-    if (sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), &len) != 0) return -1;
+    const timeout = sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), &len);
+    if (posix.errno(timeout) != .SUCCESS or len != @sizeOf(@TypeOf(tv))) return acceptAgain();
     const millis = @max(@as(i64, 1), tv.sec * 1000 + @divTrunc(tv.usec, 1000));
     var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
     const rc = sys.poll(&pollfds, 1, @intCast(@min(millis, std.math.maxInt(c_int))));
-    if (rc < 0) return -1;
-    if (rc == 0) {
-        sys._errno().* = @intFromEnum(posix.E.AGAIN);
+    if (posix.errno(rc) != .SUCCESS or rc == 0) return acceptAgain();
+    const accepted = sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
+    if (posix.errno(accepted) != .SUCCESS) return accepted;
+    if (comptime builtin.os.tag == .linux) return accepted;
+    if (comptime builtin.os.tag != .linux) {
+        // BSD may inherit listener nonblocking state. Request readers use a
+        // verified SO_RCVTIMEO on a blocking accepted socket.
+        const old = sys.fcntl(accepted, posix.F.GETFL, @as(c_int, 0));
+        if (old >= 0) {
+            var flags: posix.O = @bitCast(@as(u32, @intCast(old)));
+            flags.NONBLOCK = false;
+            if (sys.fcntl(accepted, posix.F.SETFL, @as(c_int, @intCast(@as(u32, @bitCast(flags))))) == 0) return accepted;
+        }
+        const saved = sys._errno().*;
+        _ = sys.close(accepted);
+        sys._errno().* = saved;
         return -1;
     }
-    const accepted = sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
-    if (accepted < 0) return -1;
-    // BSD may inherit listener nonblocking state. Request readers use a
-    // verified SO_RCVTIMEO on a blocking accepted socket.
-    const old = sys.fcntl(accepted, posix.F.GETFL, @as(c_int, 0));
-    if (old >= 0) {
-        var flags: posix.O = @bitCast(@as(u32, @intCast(old)));
-        flags.NONBLOCK = false;
-        if (sys.fcntl(accepted, posix.F.SETFL, @as(usize, @as(u32, @bitCast(flags)))) == 0) return accepted;
-    }
-    const saved = sys._errno().*;
-    _ = sys.close(accepted);
-    sys._errno().* = saved;
+}
+
+fn acceptAgain() if (builtin.os.tag == .linux) usize else c_int {
+    if (comptime builtin.os.tag == .linux) return @bitCast(-@as(isize, @intFromEnum(posix.E.AGAIN)));
+    sys._errno().* = @intFromEnum(posix.E.AGAIN);
     return -1;
 }
 
@@ -244,6 +258,8 @@ fn boundPort(fd: sys.fd_t) ListenerError!u16 {
 }
 
 fn closeFd(fd: sys.fd_t) void {
+    // No libc-linked close on Windows; unreachable there (see gate above).
+    if (comptime builtin.os.tag == .windows) return;
     _ = sys.close(fd);
 }
 
@@ -279,6 +295,7 @@ fn parseDurationMs(text: []const u8) !u32 {
 // ---------------------------------------------------------------------------
 
 test "ChallengeServer serves a stored token over loopback" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var store = http01.TokenStore.init(allocator);
     defer store.deinit();
@@ -309,6 +326,7 @@ test "ChallengeServer serves a stored token over loopback" {
 }
 
 test "ChallengeServer returns 404 for unknown token" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var store = http01.TokenStore.init(allocator);
     defer store.deinit();
@@ -367,6 +385,7 @@ test "Config.applyToml leaves defaults when keys absent" {
 }
 
 test "initWithConfig honors a custom backlog and read timeout" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var store = http01.TokenStore.init(allocator);
     defer store.deinit();

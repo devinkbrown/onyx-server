@@ -39,6 +39,21 @@ const v4mapped_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
 
 pub const Error = error{ SocketUnavailable, BindFailed, AddrLookupFailed };
 
+/// IPV6_V6ONLY option name for the native-pair path. `std.posix.system.IPV6`
+/// is `void` on macOS, where only the libc headers carry it
+/// (`std.c.IPV6.V6ONLY` = 27, matching the BSDs); Linux uses 26 via
+/// `std.os.linux.IPV6` in `bind` above and never calls this.
+fn ipv6V6Only() comptime_int {
+    // IPV6_V6ONLY is 27 on macOS (XNU in6.h) and the BSDs, 26 on Linux
+    // (which never calls this: `bind` uses `std.os.linux.IPV6` directly).
+    // Neither `std.posix.system.IPV6` nor `std.c.IPV6` covers Apple targets in
+    // Zig 0.17 (both are `void` there), so the macOS value is spelled out.
+    // `comptime_int` keeps the original implicit coercion to each libc's
+    // `setsockopt`/`getsockopt` option-name parameter type.
+    if (builtin.os.tag == .macos) return 27;
+    return sys.IPV6.V6ONLY;
+}
+
 pub const DualStackUdpSocket = struct {
     fd: sys.fd_t,
     ipv4_fd: sys.fd_t = -1,
@@ -86,8 +101,9 @@ pub const DualStackUdpSocket = struct {
     fn bindNative(bind_addr: BindAddr, port: u16) Error!DualStackUdpSocket {
         const flags = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
         if (bind_addr == .v4_mapped) {
-            const fd = sys.socket(posix.AF.INET, flags, posix.IPPROTO.UDP);
-            if (posix.errno(fd) != .SUCCESS) return error.SocketUnavailable;
+            const raw_fd = sys.socket(posix.AF.INET, flags, posix.IPPROTO.UDP);
+            if (posix.errno(raw_fd) != .SUCCESS) return error.SocketUnavailable;
+            const fd: posix.fd_t = @intCast(raw_fd);
             errdefer _ = sys.close(fd);
             var addr = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(bind_addr.v4_mapped) };
             if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)))) != .SUCCESS) return error.BindFailed;
@@ -96,18 +112,20 @@ pub const DualStackUdpSocket = struct {
         // OpenBSD deliberately has no IPv4-mapped IPv6 sockets. Bind a native
         // socket per family at one port; each attempt publishes both or neither.
         for (0..16) |_| {
-            const fd = sys.socket(posix.AF.INET6, flags, posix.IPPROTO.UDP);
-            if (posix.errno(fd) != .SUCCESS) return error.SocketUnavailable;
+            const raw_fd = sys.socket(posix.AF.INET6, flags, posix.IPPROTO.UDP);
+            if (posix.errno(raw_fd) != .SUCCESS) return error.SocketUnavailable;
+            const fd: posix.fd_t = @intCast(raw_fd);
             var owner = DualStackUdpSocket{ .fd = fd };
             errdefer owner.deinit();
             const one: c_int = 1;
-            if (posix.errno(sys.setsockopt(fd, posix.IPPROTO.IPV6, sys.IPV6.V6ONLY, std.mem.asBytes(&one), @sizeOf(c_int))) != .SUCCESS) return error.BindFailed;
+            if (posix.errno(sys.setsockopt(fd, posix.IPPROTO.IPV6, ipv6V6Only(), std.mem.asBytes(&one), @sizeOf(c_int))) != .SUCCESS) return error.BindFailed;
             var addr = sys.sockaddr.in6{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = bind_addr.toBytes(), .scope_id = 0 };
             if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)))) != .SUCCESS) return error.BindFailed;
             if (bind_addr == .loopback_v6) return owner;
             const chosen = try owner.localPort();
-            const fd4 = sys.socket(posix.AF.INET, flags, posix.IPPROTO.UDP);
-            if (posix.errno(fd4) != .SUCCESS) return error.SocketUnavailable;
+            const raw_fd4 = sys.socket(posix.AF.INET, flags, posix.IPPROTO.UDP);
+            if (posix.errno(raw_fd4) != .SUCCESS) return error.SocketUnavailable;
+            const fd4: posix.fd_t = @intCast(raw_fd4);
             owner.ipv4_fd = fd4;
             var addr4 = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, chosen), .addr = 0 };
             const bound = sys.bind(fd4, @ptrCast(&addr4), @sizeOf(@TypeOf(addr4)));
@@ -387,6 +405,8 @@ test "toSockaddrIn6 drops a TransportAddress with an unexpected ip_len" {
 }
 
 test "dualstack socket: bind on [::], ephemeral port, clean shutdown, v4 receive" {
+    // `bindNative` has no Windows support (`SOCK_CLOEXEC`); skip there.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     // The server binds [::]:0 (dual-stack). An IPv4 loopback client must reach it
     // as a v4-mapped source surfaced as an ipv4 TransportAddress.
     var server = DualStackUdpSocket.bind(.any, 0) catch return error.SkipZigTest;
@@ -435,6 +455,8 @@ test "dualstack socket: bind on [::], ephemeral port, clean shutdown, v4 receive
 }
 
 test "dualstack socket: IPv6 loopback receive (skips if no v6 loopback)" {
+    // `bindNative` has no Windows support (`SOCK_CLOEXEC`); skip there.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var server = DualStackUdpSocket.bind(.any, 0) catch return error.SkipZigTest;
     defer server.deinit();
     server.setRecvTimeoutMs(2000);

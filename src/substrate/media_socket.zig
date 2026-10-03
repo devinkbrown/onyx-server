@@ -55,12 +55,18 @@ pub const MediaSocket = struct {
     }
 
     pub fn deinit(self: *MediaSocket) void {
+        // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
+        // bind() already reports SocketUnavailable on Windows.
+        if (comptime builtin.os.tag == .windows) return;
         _ = sys.close(self.fd);
         self.* = undefined;
     }
 
     /// The bound local UDP port (host byte order).
     pub fn localPort(self: *const MediaSocket) Error!u16 {
+        // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
+        // bind() already reports SocketUnavailable on Windows.
+        if (comptime builtin.os.tag == .windows) return error.AddrLookupFailed;
         var storage: posix.sockaddr.storage = undefined;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         if (posix.errno(sys.getsockname(self.fd, @ptrCast(&storage), &len)) != .SUCCESS)
@@ -82,6 +88,9 @@ pub const MediaSocket = struct {
 
     /// Send `bytes` to an IPv4 destination. Non-IPv4 addresses are dropped.
     pub fn sendTo(self: *MediaSocket, dest: TransportAddress, bytes: []const u8) void {
+        // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
+        // bind() already reports SocketUnavailable on Windows.
+        if (comptime builtin.os.tag == .windows) return;
         if (dest.ip_len != 4) return;
         var sa = sys.sockaddr.in{
             .port = std.mem.nativeToBig(u16, dest.port),
@@ -94,6 +103,9 @@ pub const MediaSocket = struct {
 
     /// Receive one datagram into `buf`. Returns null on timeout/error/non-IPv4.
     pub fn recvFrom(self: *MediaSocket, buf: []u8) ?Received {
+        // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
+        // bind() already reports SocketUnavailable on Windows.
+        if (comptime builtin.os.tag == .windows) return null;
         if (comptime builtin.os.tag != .linux) {
             var pfd = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
             const ready = sys.poll(&pfd, 1, @intCast(@min(self.recv_timeout_ms, std.math.maxInt(c_int))));
@@ -175,6 +187,8 @@ const testing = std.testing;
 const stun = @import("../proto/stun.zig");
 
 test "loopback STUN binding round-trip binds the peer and answers" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     var mt = MediaTransport.init(testing.allocator);
     defer mt.deinit();
@@ -236,6 +250,8 @@ fn reflectorThread(sock: *MediaSocket) void {
 }
 
 test "queryReflexive learns the reflexive address from a STUN server" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var server = try MediaSocket.bind(loopback_be, 0);
     defer server.deinit();
     server.setRecvTimeoutMs(2000);

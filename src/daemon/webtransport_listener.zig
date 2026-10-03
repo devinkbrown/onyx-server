@@ -1371,6 +1371,8 @@ const TestServerKeys = struct {
 };
 
 test "WebTransportListener: bind, port, and clean re-startable shutdown" {
+    // Live UDP sockets; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var keys: TestServerKeys = undefined;
     try keys.init();
     var lst = WebTransportListener.init(testing.allocator, .{
@@ -1462,6 +1464,8 @@ test "WebTransportListener: native IPv6 QUIC/H3/WT bridges IRC with mandatory PR
 }
 
 fn exerciseLiveBridge(ipv6: bool, proxy: bool) !void {
+    // Live UDP/QUIC bridge; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     // End-to-end over the DUAL-STACK socket: `lst.start` now binds an AF_INET6
     // socket with IPV6_V6ONLY=0, and the client below is a plain IPv4 loopback
     // `MediaSocket`. So this also proves the full QUIC/H3/WT handshake + IRC

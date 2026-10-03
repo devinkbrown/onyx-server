@@ -14449,6 +14449,8 @@ pub const LinuxServer = struct {
     }
 
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
+        // Windows HANDLEs are not i32 fds; connection teardown stays POSIX-only.
+        if (comptime builtin.os.tag == .windows) return error.Unsupported;
         const id = idFromToken(token);
         if (self.rx().clients.get(id)) |conn| {
             // A racing RECV (including cancellation at a Helix safe point) must
@@ -32257,6 +32259,8 @@ pub const LinuxServer = struct {
     /// Record `fault`, then replace the operator file with tracelog lines.
     /// An empty path does nothing. IO errors are swallowed so a dump cannot fault.
     fn flushFlightRecorder(self: *LinuxServer, category: tracelog.Category, fault: []const u8) void {
+        // The fault dump uses raw POSIX fds; unsupported where fds are HANDLEs.
+        if (comptime builtin.os.tag == .windows) return;
         const path = self.config.flight_recorder_path;
         if (path.len == 0) return;
         self.traceLog(.fatal, category, fault);
@@ -58673,19 +58677,22 @@ test "secured collision scan passes stale loser before resolving viable route" {
 }
 
 test "client active gauge follows physical slot ownership through close and refusal" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
-    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
-    defer server.deinit();
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
     current_reactor = &server.reactors[0];
 
-    var live_pair: [2]linux.fd_t = undefined;
-    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &live_pair)) != .SUCCESS)
+    var live_pair: [2]i32 = undefined;
+    if (posix.errno(socket_system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &live_pair)) != .SUCCESS)
         return error.SkipZigTest;
     defer closeFd(live_pair[1]);
     const live_id = try server.rx().clients.alloc(ConnState.init(live_pair[0]));
@@ -62404,7 +62411,9 @@ fn sockaddrIn6FromV4(addr4: [4]u8, port: u16) posix.sockaddr.in6 {
 const socket_system = if (builtin.os.tag == .openbsd) posix.system else linux;
 
 fn socketTcp() ServerError!linux.fd_t {
-    const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC |
+    // Winsock has no CLOEXEC flag.
+    const flags = posix.SOCK.STREAM |
+        (if (comptime builtin.os.tag == .windows) 0 else posix.SOCK.CLOEXEC) |
         (if (builtin.os.tag == .openbsd) posix.SOCK.NONBLOCK else 0);
     const rc = socket_system.socket(posix.AF.INET, flags, posix.IPPROTO.TCP);
     switch (posix.errno(rc)) {
@@ -62416,7 +62425,9 @@ fn socketTcp() ServerError!linux.fd_t {
 }
 
 fn socketTcp6() ServerError!linux.fd_t {
-    const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC |
+    // Winsock has no CLOEXEC flag.
+    const flags = posix.SOCK.STREAM |
+        (if (comptime builtin.os.tag == .windows) 0 else posix.SOCK.CLOEXEC) |
         (if (builtin.os.tag == .openbsd) posix.SOCK.NONBLOCK else 0);
     const rc = socket_system.socket(posix.AF.INET6, flags, posix.IPPROTO.TCP);
     switch (posix.errno(rc)) {
@@ -62865,6 +62876,8 @@ fn saslPlainPreludeWithCaps(fd: linux.fd_t, account: []const u8, password: []con
 }
 
 fn enrollTestMediaIdentity(server: *Server, account: []const u8, label: []const u8, seed_byte: u8) !std.crypto.sign.Ed25519.KeyPair {
+    // Media identity enrollment writes the full-server prop store; no portable equivalent exists.
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
     const Ed25519 = std.crypto.sign.Ed25519;
     const key_pair = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(seed_byte)));
     const public_key = key_pair.public_key.toBytes();
@@ -62904,6 +62917,7 @@ fn encodeTestMediaHandshake(
 }
 
 test "media E2EE handshake transcript ASCII-folds channel bytes without Unicode rewriting" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const Ed25519 = std.crypto.sign.Ed25519;
     const identity = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x79)));
     const attachment: [Server.media_e2ee_attachment_bytes]u8 = @splat(0xa5);
@@ -69169,6 +69183,7 @@ test "UPGRADE exact cancels target operation kind and generation" {
 }
 
 test "UPGRADE TLS ticket-key capsule allocation failure is fatal to the seal" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
     defer pieces.deinit(std.testing.allocator);
@@ -69366,6 +69381,7 @@ test "UPGRADE successor rejects noncanonical TLS ticket wrapper and disabled aut
 }
 
 test "UPGRADE unmanaged mesh re-dial hint allocation failure is fatal to continuity" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
     defer pieces.deinit(std.testing.allocator);
@@ -70651,6 +70667,7 @@ test "periodic timer tick re-mints live oper grants inside the TTL" {
 }
 
 test "zero oper grant refresh marker is due below the normal interval" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     try std.testing.expect(Server.operGrantRefreshDue(0, 1));
     try std.testing.expect(!Server.operGrantRefreshDue(1, 2));
     try std.testing.expect(Server.operGrantRefreshDue(1, 1 + Server.oper_grant_refresh_interval_ms));
@@ -70941,7 +70958,9 @@ test "emitLabeledIssuer: capture overflow fails closed without a partial line" {
 }
 
 test "threaded server: a labeled WHOIS is reframed under the @label via SerpentRegistry" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -70949,7 +70968,7 @@ test "threaded server: a labeled WHOIS is reframed under the @label via SerpentR
     const port = try server.boundPort();
 
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -77481,7 +77500,9 @@ test "exploit: WEBAUTHN RENAME rejects a CRLF-smuggled label (no poison stored, 
     const cred_id_b64 = try waBindTestCred(&services, "kain", "kain-key-01", "phone", &id_buf);
 
     const origins = [_][]const u8{"https://chat.example"};
-    var server = Server.init(std.testing.allocator, .{
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .account_services = &services,
@@ -77493,7 +77514,7 @@ test "exploit: WEBAUTHN RENAME rejects a CRLF-smuggled label (no poison stored, 
         else => return err,
     };
     defer server.deinit();
-    const cid = try addTestLocalClient(&server, "kain", "kain");
+    const cid = try addTestLocalClient(server, "kain", "kain");
     const conn = server.connFor(cid).?;
 
     // A label carrying CR/LF and a forged trailing IRC command. The handler
@@ -77530,7 +77551,9 @@ test "exploit: WEBAUTHN REGISTER rejects a control-byte label before arming a ch
     _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
 
     const origins = [_][]const u8{"https://chat.example"};
-    var server = Server.init(std.testing.allocator, .{
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .account_services = &services,
@@ -77542,7 +77565,7 @@ test "exploit: WEBAUTHN REGISTER rejects a control-byte label before arming a ch
         else => return err,
     };
     defer server.deinit();
-    const cid = try addTestLocalClient(&server, "kain", "kain");
+    const cid = try addTestLocalClient(server, "kain", "kain");
     const conn = server.connFor(cid).?;
     try std.testing.expect(conn.webauthn_pending.kind == .none);
 
@@ -77572,7 +77595,9 @@ test "exploit: WEBAUTHN RENAME cannot relabel another account's passkey (ownersh
     const victim_cred = try waBindTestCred(&services, "mallory", "mallory-key-01", "mallory-key", &id_buf);
 
     const origins = [_][]const u8{"https://chat.example"};
-    var server = Server.init(std.testing.allocator, .{
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .account_services = &services,
@@ -77585,7 +77610,7 @@ test "exploit: WEBAUTHN RENAME cannot relabel another account's passkey (ownersh
     };
     defer server.deinit();
     // The attacker is logged in as kain and targets mallory's credential id.
-    const cid = try addTestLocalClient(&server, "kain", "kain");
+    const cid = try addTestLocalClient(server, "kain", "kain");
     const conn = server.connFor(cid).?;
 
     conn.send_len = 0;
@@ -77614,7 +77639,9 @@ test "exploit: webauthnReply drops a CRLF-bearing body (Event-Spine render firew
     _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
 
     const origins = [_][]const u8{"https://chat.example"};
-    var server = Server.init(std.testing.allocator, .{
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .account_services = &services,
@@ -77626,7 +77653,7 @@ test "exploit: webauthnReply drops a CRLF-bearing body (Event-Spine render firew
         else => return err,
     };
     defer server.deinit();
-    const cid = try addTestLocalClient(&server, "kain", "kain");
+    const cid = try addTestLocalClient(server, "kain", "kain");
     const conn = server.connFor(cid).?;
 
     // Even if a future caller forgot the input-boundary guard and handed a body
@@ -85043,6 +85070,7 @@ test "threaded server: login defers autojoin and restores only after exact SESSI
 }
 
 test "threaded server: session-sync fresh login defers autojoin until SESSION TOKEN" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var cfg = operTestConfig(0);
     cfg.sasl_checker = test_dm_relay_checker;
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
@@ -88182,14 +88210,16 @@ test "threaded server: migration staging isolates equal nonces from different pe
 test "threaded server: session migration restore cannot switch the authenticated account" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
+    const server = try alloc.create(Server);
+    defer alloc.destroy(server);
+    server.initInPlace(alloc, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
     server.pending_migrations = session_migrate.PendingMigrations.init(alloc);
 
-    const claimant_id = try addTestLocalClient(&server, "alice-live", "alice");
+    const claimant_id = try addTestLocalClient(server, "alice-live", "alice");
     const claimant = server.connFor(claimant_id).?;
     const token: session_migrate.Token = @splat(0x33);
     const malicious_snapshot = try (migration_relay.Snapshot{
@@ -89029,6 +89059,7 @@ test "threaded server: STATS m reports per-command usage to an oper" {
 }
 
 test "threaded server: OROWASM reports ABI budgets and plugin registrations to opers" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var cfg = operTestConfig(0);
     cfg.wasm_max_plugin_bytes = 4096;
     cfg.wasm_max_memory_bytes = 128 * 1024;
@@ -89105,6 +89136,7 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
 }
 
 test "threaded server: SASL oper elevation persists inactive OCG1 compatibility record" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -89605,7 +89637,9 @@ test "threaded server: REGISTER star uses current nick and ACCOUNTSET rejects li
     defer store.deinit();
     var services = services_mod.Services.init(&store, null);
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -89613,7 +89647,7 @@ test "threaded server: REGISTER star uses current nick and ACCOUNTSET rejects li
     const port = try server.boundPort();
 
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -92575,6 +92609,7 @@ test "shared full server: OpenBSD inherited wildcard listener claims require the
 }
 
 test "shared full server: native bot staging is allocation-failure atomic" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 2 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -93073,7 +93108,9 @@ test "threaded server: implicit-TLS client handshakes + registers over the wire"
         });
         const chain = [_][]const u8{der};
 
-        var server = Server.init(alloc, .{
+        const server = try alloc.create(Server);
+        defer alloc.destroy(server);
+        server.initInPlace(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
             .tls_port = 0,
@@ -93088,7 +93125,7 @@ test "threaded server: implicit-TLS client handshakes + registers over the wire"
         const plain_port = try server.boundPort();
 
         var run = std.atomic.Value(bool).init(true);
-        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
         defer {
             run.store(false, .release);
             if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
@@ -93324,7 +93361,9 @@ test "threaded server: tagged PRIVMSG to a userspace-TLS member seals one TLS re
         });
         const chain = [_][]const u8{der};
 
-        var server = Server.init(alloc, .{
+        const server = try alloc.create(Server);
+        defer alloc.destroy(server);
+        server.initInPlace(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
             .tls_port = 0,
@@ -93339,8 +93378,8 @@ test "threaded server: tagged PRIVMSG to a userspace-TLS member seals one TLS re
         const plain_port = try server.boundPort();
 
         var run = std.atomic.Value(bool).init(true);
-        const thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
-        defer stopThreadedServer(&server, &run, thr);
+        const thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
+        defer stopThreadedServer(server, &run, thr);
 
         // Recipient A: a userspace-TLS member that negotiates server-time +
         // message-tags, so a relayed channel PRIVMSG carries a non-empty
@@ -93442,7 +93481,9 @@ test "threaded server: implicit-TLS raw public key negotiates and registers" {
         });
         const chain = [_][]const u8{der};
 
-        var server = Server.init(alloc, .{
+        const server = try alloc.create(Server);
+        defer alloc.destroy(server);
+        server.initInPlace(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
             .tls_port = 0,
@@ -93458,7 +93499,7 @@ test "threaded server: implicit-TLS raw public key negotiates and registers" {
         const plain_port = try server.boundPort();
 
         var run = std.atomic.Value(bool).init(true);
-        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
         defer {
             run.store(false, .release);
             if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
@@ -93563,7 +93604,9 @@ test "threaded server: mTLS client cert binds CertFP for SASL EXTERNAL (WHOIS 27
         proto_certfp.computeHex(client_der, &expected_fp);
 
         const chain = [_][]const u8{server_der};
-        var server = Server.init(alloc, .{
+        const server = try alloc.create(Server);
+        defer alloc.destroy(server);
+        server.initInPlace(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
             .tls_port = 0,
@@ -93579,7 +93622,7 @@ test "threaded server: mTLS client cert binds CertFP for SASL EXTERNAL (WHOIS 27
         const plain_port = try server.boundPort();
 
         var run = std.atomic.Value(bool).init(true);
-        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
         defer {
             run.store(false, .release);
             if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
@@ -93658,7 +93701,9 @@ test "threaded server: mTLS client cert binds CertFP for SASL EXTERNAL (WHOIS 27
 test "threaded server: ws upgrade + framed registration (plain testing mode)" {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
-        var server = Server.init(alloc, .{
+        const server = try alloc.create(Server);
+        defer alloc.destroy(server);
+        server.initInPlace(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
             .ws_enabled = true,
@@ -93673,7 +93718,7 @@ test "threaded server: ws upgrade + framed registration (plain testing mode)" {
         const plain_port = try server.boundPort();
 
         var run = std.atomic.Value(bool).init(true);
-        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
         defer {
             run.store(false, .release);
             if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
@@ -93787,7 +93832,9 @@ test "threaded server: wss listener — TLS handshake, upgrade, framed welcome" 
         });
         const chain = [_][]const u8{der};
 
-        var server = Server.init(alloc, .{
+        const server = try alloc.create(Server);
+        defer alloc.destroy(server);
+        server.initInPlace(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
             .tls_port = 0,
@@ -93804,7 +93851,7 @@ test "threaded server: wss listener — TLS handshake, upgrade, framed welcome" 
         const plain_port = try server.boundPort();
 
         var run = std.atomic.Value(bool).init(true);
-        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+        var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
         defer {
             run.store(false, .release);
             if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
@@ -93935,18 +93982,22 @@ test "threaded server: wss listener — TLS handshake, upgrade, framed welcome" 
 }
 
 test "WebSocket preframed media bytes bypass IRC text framing" {
-    var ws = WsState{ .phase = .open };
+    const ws = try std.testing.allocator.create(WsState);
+    defer std.testing.allocator.destroy(ws);
+    ws.* = .{ .phase = .open };
     var conn = ConnState{};
-    conn.ws = &ws;
+    conn.ws = ws;
 
     var frame_buf: [32]u8 = undefined;
     const frame = try websocket.encodeFrame(WsState.max_media_frame, .{ .opcode = .binary }, "abc", &frame_buf);
     try appendSecuredToConn(&conn, frame);
     try std.testing.expectEqualSlices(u8, frame, conn.send_buf[0..conn.send_len]);
 
-    var text_ws = WsState{ .phase = .open };
-    var text_conn = ConnState{};
-    text_conn.ws = &text_ws;
+    const text_ws = try std.testing.allocator.create(WsState);
+    defer std.testing.allocator.destroy(text_ws);
+    text_ws.* = .{ .phase = .open };
+    var text_conn = ConnState{ .overflow_allocator = std.testing.allocator };
+    text_conn.ws = text_ws;
     try appendToConn(&text_conn, "PING :1\r\n");
     const decoded = try websocket.decodeFrame(128, .server_to_client, text_conn.send_buf[0..text_conn.send_len], &.{});
     try std.testing.expectEqual(websocket.Opcode.text, decoded.frame.opcode);
@@ -93954,9 +94005,11 @@ test "WebSocket preframed media bytes bypass IRC text framing" {
 }
 
 test "WebSocket handshake retains negotiated application protocol in live state" {
-    var ws = WsState{};
+    const ws = try std.testing.allocator.create(WsState);
+    defer std.testing.allocator.destroy(ws);
+    ws.* = .{};
     var conn = ConnState{};
-    conn.ws = &ws;
+    conn.ws = ws;
     const pipelined = "next-frame";
     const request =
         "GET /irc HTTP/1.1\r\n" ++
@@ -93968,7 +94021,7 @@ test "WebSocket handshake retains negotiated application protocol in live state"
         "Sec-WebSocket-Protocol: text.ircv3.net\r\n\r\n" ++
         pipelined;
 
-    const rest = wsDriveHandshake(&conn, &ws, request) orelse return error.TestUnexpectedResult;
+    const rest = wsDriveHandshake(&conn, ws, request) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(WsState.Phase.open, ws.phase);
     try std.testing.expectEqual(websocket.Subprotocol.ircv3_text, ws.subprotocol.?);
     try std.testing.expectEqualStrings(pipelined, rest);
@@ -93977,15 +94030,19 @@ test "WebSocket handshake retains negotiated application protocol in live state"
 
 test "text.ircv3.net binary application frame closes 1002 before media routing" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
 
-    var ws = WsState{ .phase = .open, .subprotocol = .ircv3_text };
+    const ws = try std.testing.allocator.create(WsState);
+    defer std.testing.allocator.destroy(ws);
+    ws.* = .{ .phase = .open, .subprotocol = .ircv3_text };
     var conn = ConnState{};
-    conn.ws = &ws;
+    conn.ws = ws;
     var frame_buf: [64]u8 = undefined;
     const frame = try websocket.encodeFrame(
         WsState.max_media_frame,
@@ -94003,7 +94060,9 @@ test "text.ircv3.net binary application frame closes 1002 before media routing" 
 
 test "fragmented binary aggregate over 4 MiB closes 1009 without routing" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -94035,7 +94094,9 @@ test "fragmented binary aggregate over 4 MiB closes 1009 without routing" {
 
 test "single binary frame declaring over 4 MiB closes 1009 from its header" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -94065,7 +94126,9 @@ test "single binary frame declaring over 4 MiB closes 1009 from its header" {
 test "coalesced Deframer buffer overflow closes 1009 instead of abnormally" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -94099,7 +94162,9 @@ test "coalesced Deframer buffer overflow closes 1009 instead of abnormally" {
 
 test "malformed WebSocket frame closes 1002 instead of abnormally" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -94121,7 +94186,9 @@ test "malformed WebSocket frame closes 1002 instead of abnormally" {
 
 test "custom and legacy empty binary opening fragments begin reassembly" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -94154,7 +94221,9 @@ test "custom and legacy empty binary opening fragments begin reassembly" {
 test "coalesced feed preserves pending binary opening-frame identity" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -94203,7 +94272,9 @@ test "coalesced feed preserves pending binary opening-frame identity" {
 test "coalesced feed preserves pending final-continuation identity" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -94255,15 +94326,19 @@ test "coalesced feed preserves pending final-continuation identity" {
 
 test "text.ircv3.net rejects CRLF batched text before routing a line" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
 
-    var ws = WsState{ .phase = .open, .subprotocol = .ircv3_text };
+    const ws = try std.testing.allocator.create(WsState);
+    defer std.testing.allocator.destroy(ws);
+    ws.* = .{ .phase = .open, .subprotocol = .ircv3_text };
     var conn = ConnState{};
-    conn.ws = &ws;
+    conn.ws = ws;
     var first_buf: [64]u8 = undefined;
     const first = try websocket.encodeFrame(
         WsState.max_frame,
@@ -94489,6 +94564,7 @@ test "threaded server: utf8only advertised and invalid PRIVMSG rejected" {
 }
 
 test "OroWasm message_pre_deliver hook can stop delivery" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var cfg = Config{ .host = "127.0.0.1", .port = 0 };
     var guard_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
     std.crypto.hash.Blake3.hash(wasm_bridge.testing.stop_hook_wasm, &guard_digest, .{});
@@ -94532,12 +94608,14 @@ fn assertNoInjectedWireLine(captured: []const u8) !void {
 
 test "exploit: failReply rejects CRLF-smuggled command (notice branch, fail-closed)" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
-    const id = try addTestLocalClient(&server, "victim", null);
+    const id = try addTestLocalClient(server, "victim", null);
     const conn = server.connFor(id).?;
 
     // No standard-replies cap => failReply takes the NOTICE branch.
@@ -94555,12 +94633,14 @@ test "exploit: failReply rejects CRLF-smuggled command (notice branch, fail-clos
 
 test "exploit: failReply rejects CRLF-smuggled fields (standard-replies branch)" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
-    const id = try addTestLocalClient(&server, "victim", null);
+    const id = try addTestLocalClient(server, "victim", null);
     const conn = server.connFor(id).?;
     conn.session.addCap(.standard_replies); // FAIL ... :reason\r\n branch (appendToConn)
 
@@ -94585,12 +94665,14 @@ test "exploit: failReply rejects CRLF-smuggled fields (standard-replies branch)"
 
 test "exploit: noticeTo rejects CRLF-smuggled text (fail-closed)" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
-    const id = try addTestLocalClient(&server, "victim", null);
+    const id = try addTestLocalClient(server, "victim", null);
     const conn = server.connFor(id).?;
 
     var cap_buf: [default_reply_bytes]u8 = undefined;
@@ -94606,12 +94688,14 @@ test "exploit: noticeTo rejects CRLF-smuggled text (fail-closed)" {
 
 test "exploit: control-byte-free FAIL reply is still emitted byte-for-byte" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
-    const id = try addTestLocalClient(&server, "victim", null);
+    const id = try addTestLocalClient(server, "victim", null);
     const conn = server.connFor(id).?;
     conn.session.addCap(.standard_replies);
 
@@ -94642,12 +94726,14 @@ test "exploit: control-byte-free FAIL reply is still emitted byte-for-byte" {
 
 test "exploit: emitReplyLine drops CRLF-smuggled reflected fields (all sinks, fail-closed)" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
-    const id = try addTestLocalClient(&server, "victim", null);
+    const id = try addTestLocalClient(server, "victim", null);
     const conn = server.connFor(id).?;
 
     // One hostile line per representative inline sink, each carrying a smuggled
@@ -94683,12 +94769,14 @@ test "exploit: emitReplyLine drops CRLF-smuggled reflected fields (all sinks, fa
 
 test "exploit: emitReplyLine emits control-byte-free reply lines byte-for-byte" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
-    const id = try addTestLocalClient(&server, "victim", null);
+    const id = try addTestLocalClient(server, "victim", null);
     const conn = server.connFor(id).?;
 
     // Legitimate single-line replies are unchanged (byte-identical passthrough).
@@ -94709,12 +94797,14 @@ test "exploit: emitReplyLine emits control-byte-free reply lines byte-for-byte" 
 
 test "exploit: SHUN list drops a CRLF-smuggled stored reason (oper handler, end-to-end)" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
-    const id = try addTestLocalClient(&server, "operator", null);
+    const id = try addTestLocalClient(server, "operator", null);
     const conn = server.connFor(id).?;
     try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.initMany(&.{.client_moderate}), "ircop", "oper");
 
@@ -94766,12 +94856,14 @@ test "exploit: SHUN list drops a CRLF-smuggled stored reason (oper handler, end-
 
 test "exploit: fantasyReply drops CRLF-smuggled external-feed content (broadcast + relay sink)" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
-    const id = try addTestLocalClient(&server, "victim", null);
+    const id = try addTestLocalClient(server, "victim", null);
     const conn = server.connFor(id).?;
     _ = try server.world.join("#room", worldIdFromClient(id));
 
@@ -94886,12 +94978,14 @@ test "exploit: processLine survives adversarial-but-wellformed lines without pan
 
 test "exploit: OPER command grants no operator status (SASL-only elevation, fail-closed)" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
-    const id = try addTestLocalClient(&server, "attacker", null);
+    const id = try addTestLocalClient(server, "attacker", null);
     const conn = server.connFor(id).?;
     try std.testing.expect(!conn.session.isOper());
 
@@ -94940,7 +95034,11 @@ test "exploit: channel PRIVMSG with mIRC colour admits under active MESSAGE_V2 a
     const roots = [_][]const u8{&peer_root};
     const roster = [_][]const u8{ &local_root, &peer_root };
 
-    var server = Server.init(allocator, .{
+    const server = try allocator.create(Server);
+
+    defer allocator.destroy(server);
+
+    server.initInPlace(allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = identity.shortId(),
@@ -94960,8 +95058,8 @@ test "exploit: channel PRIVMSG with mIRC colour admits under active MESSAGE_V2 a
     try std.testing.expect(server.authoredRelayV2Configured());
     try std.testing.expect(!server.hasEstablishedPeer());
 
-    const sender_id = try addTestLocalClient(&server, "ColorSender", "color-sender");
-    const member_id = try addTestLocalClient(&server, "ColorMember", "color-member");
+    const sender_id = try addTestLocalClient(server, "ColorSender", "color-sender");
+    const member_id = try addTestLocalClient(server, "ColorMember", "color-member");
     const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
     const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
     sender.overflow_allocator = allocator;
@@ -95019,7 +95117,11 @@ test "exploit: channel PRIVMSG #root durably admits with mesh peer configured bu
     const roots = [_][]const u8{&peer_root};
     const roster = [_][]const u8{ &local_root, &peer_root };
 
-    var server = Server.init(allocator, .{
+    const server = try allocator.create(Server);
+
+    defer allocator.destroy(server);
+
+    server.initInPlace(allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = identity.shortId(),
@@ -95040,8 +95142,8 @@ test "exploit: channel PRIVMSG #root durably admits with mesh peer configured bu
     try std.testing.expectEqual(@as(usize, 2), server.relay_v2_required_nodes.len);
     try std.testing.expect(!server.hasEstablishedPeer());
 
-    const sender_id = try addTestLocalClient(&server, "RootSender", "root-sender");
-    const member_id = try addTestLocalClient(&server, "RootMember", "root-member");
+    const sender_id = try addTestLocalClient(server, "RootSender", "root-sender");
+    const member_id = try addTestLocalClient(server, "RootMember", "root-member");
     const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
     const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
     sender.overflow_allocator = allocator;
@@ -95106,7 +95208,11 @@ test "exploit: channel PRIVMSG ADS1 soft-fail after durable admit still delivers
     const roots = [_][]const u8{&peer_root};
     const roster = [_][]const u8{ &local_root, &peer_root };
 
-    var server = Server.init(allocator, .{
+    const server = try allocator.create(Server);
+
+    defer allocator.destroy(server);
+
+    server.initInPlace(allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = identity.shortId(),
@@ -95126,8 +95232,8 @@ test "exploit: channel PRIVMSG ADS1 soft-fail after durable admit still delivers
     try std.testing.expect(server.authoredRelayV2Configured());
 
     // Third arg is account name → reusable session (ADS1 reserve on admit).
-    const sender_id = try addTestLocalClient(&server, "AdmitSender", "admit-sender");
-    const member_id = try addTestLocalClient(&server, "AdmitMember", "admit-member");
+    const sender_id = try addTestLocalClient(server, "AdmitSender", "admit-sender");
+    const member_id = try addTestLocalClient(server, "AdmitMember", "admit-member");
     const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
     const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
     sender.overflow_allocator = allocator;
@@ -95203,7 +95309,11 @@ test "exploit: channel PRIVMSG durable admit capacity fails closed with TEMPORAR
     const roots = [_][]const u8{&peer_root};
     const roster = [_][]const u8{ &local_root, &peer_root };
 
-    var server = Server.init(allocator, .{
+    const server = try allocator.create(Server);
+
+    defer allocator.destroy(server);
+
+    server.initInPlace(allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .node_id = identity.shortId(),
@@ -95222,8 +95332,8 @@ test "exploit: channel PRIVMSG durable admit capacity fails closed with TEMPORAR
     current_reactor = &server.reactors[0];
     try std.testing.expect(server.authoredRelayV2Configured());
 
-    const sender_id = try addTestLocalClient(&server, "FailSender", "fail-sender");
-    const member_id = try addTestLocalClient(&server, "FailMember", "fail-member");
+    const sender_id = try addTestLocalClient(server, "FailSender", "fail-sender");
+    const member_id = try addTestLocalClient(server, "FailMember", "fail-member");
     const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
     const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
     sender.overflow_allocator = allocator;
@@ -95288,7 +95398,11 @@ test "exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without au
     const roots = [_][]const u8{&peer_root};
     const roster = [_][]const u8{ &local_root, &peer_root };
 
-    var server = Server.init(allocator, .{
+    const server = try allocator.create(Server);
+
+    defer allocator.destroy(server);
+
+    server.initInPlace(allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .num_shards = 2,
@@ -95315,13 +95429,13 @@ test "exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without au
 
     // Create one exact-token sender sibling and recipient sibling on shard 1.
     // A fallthrough bug would therefore enqueue real cross-reactor delivery.
-    const sender_id = try addTestLocalClient(&server, "DmFailSender", "dm-fail-sender");
-    const target_id = try addTestLocalClient(&server, "DmFailTarget", "dm-fail-target");
+    const sender_id = try addTestLocalClient(server, "DmFailSender", "dm-fail-sender");
+    const target_id = try addTestLocalClient(server, "DmFailTarget", "dm-fail-target");
     const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
     const target = server.connFor(target_id) orelse return error.TestUnexpectedResult;
     current_reactor = &server.reactors[1];
-    const sender_sibling_id = try addTestLocalClient(&server, "DmFailSenderAttach", "dm-fail-sender");
-    const target_sibling_id = try addTestLocalClient(&server, "DmFailTargetAttach", "dm-fail-target");
+    const sender_sibling_id = try addTestLocalClient(server, "DmFailSenderAttach", "dm-fail-sender");
+    const target_sibling_id = try addTestLocalClient(server, "DmFailTargetAttach", "dm-fail-target");
     const sender_sibling = server.connFor(sender_sibling_id) orelse return error.TestUnexpectedResult;
     const target_sibling = server.connFor(target_sibling_id) orelse return error.TestUnexpectedResult;
     server.world.unregisterNick(worldIdFromClient(sender_sibling_id));
@@ -95431,7 +95545,7 @@ test "exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without au
             try std.testing.expectEqual(self.ads1_len, other.ads1_len);
         }
     };
-    var before = try AuthoritySnapshot.capture(&server, allocator);
+    var before = try AuthoritySnapshot.capture(server, allocator);
     defer before.deinit();
 
     sender.send_len = 0;
@@ -95447,7 +95561,7 @@ test "exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without au
     try std.testing.expectEqual(@as(usize, 0), target_sibling.send_len);
     var pending: [4]reactor_fabric.DeliverMsg = undefined;
     try std.testing.expectEqual(@as(usize, 0), server.fabric.?.drain(1, &pending));
-    var after_privmsg = try AuthoritySnapshot.capture(&server, allocator);
+    var after_privmsg = try AuthoritySnapshot.capture(server, allocator);
     defer after_privmsg.deinit();
     try before.expectEqual(&after_privmsg);
 
@@ -95467,7 +95581,7 @@ test "exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without au
     try std.testing.expectEqual(@as(usize, 0), sender_sibling.send_len);
     try std.testing.expectEqual(@as(usize, 0), target_sibling.send_len);
     try std.testing.expectEqual(@as(usize, 0), server.fabric.?.drain(1, &pending));
-    var after_notice = try AuthoritySnapshot.capture(&server, allocator);
+    var after_notice = try AuthoritySnapshot.capture(server, allocator);
     defer after_notice.deinit();
     try before.expectEqual(&after_notice);
 
@@ -95493,14 +95607,18 @@ test "exploit: oversized color-formatted PRIVMSG does not brick channel chat" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try allocator.create(Server);
+
+    defer allocator.destroy(server);
+
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
 
-    const sender_id = try addTestLocalClient(&server, "ColorSender", null);
-    const member_id = try addTestLocalClient(&server, "ColorMember", null);
+    const sender_id = try addTestLocalClient(server, "ColorSender", null);
+    const member_id = try addTestLocalClient(server, "ColorMember", null);
     const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
     const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
     sender.overflow_allocator = allocator;
@@ -95563,14 +95681,18 @@ test "exploit: PRIVMSG flood does not permanently brick channel chat" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    const server = try allocator.create(Server);
+
+    defer allocator.destroy(server);
+
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
 
-    const flooder_id = try addTestLocalClient(&server, "Flooder", null);
-    const member_id = try addTestLocalClient(&server, "QuietMember", null);
+    const flooder_id = try addTestLocalClient(server, "Flooder", null);
+    const member_id = try addTestLocalClient(server, "QuietMember", null);
     const flooder = server.connFor(flooder_id) orelse return error.TestUnexpectedResult;
     const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
     flooder.overflow_allocator = allocator;
@@ -95640,7 +95762,7 @@ test "exploit: PRIVMSG flood does not permanently brick channel chat" {
     // Echo is off by default; member won't see their own line. Deliver to a
     // third observer would be ideal — use flooder's buffer only if not closed
     // for delivery. Re-check via a fresh observer.
-    const observer_id = try addTestLocalClient(&server, "Observer", null);
+    const observer_id = try addTestLocalClient(server, "Observer", null);
     const observer = server.connFor(observer_id) orelse return error.TestUnexpectedResult;
     observer.overflow_allocator = allocator;
     _ = try server.world.join("#flood-room", worldIdFromClient(observer_id));
@@ -96738,6 +96860,7 @@ test "threaded server: media user modes block transmit and hide automatic presen
 }
 
 test "threaded server: re-handshake detaches superseded attachment and same-nick leave preserves sibling" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -96890,6 +97013,7 @@ test "threaded server: re-handshake detaches superseded attachment and same-nick
 }
 
 test "threaded server: same-nick disconnect detaches crypto attachment before final leave" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -96984,16 +97108,20 @@ test "threaded server: same-nick disconnect detaches crypto attachment before fi
 }
 
 test "threaded server: PART and KICK retire physical media before channel membership" {
-    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const server = createTestServer(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
-    defer server.deinit();
-    const identity = try enrollTestMediaIdentity(&server, "admin", "membership-retire", 0x75);
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    const identity = try enrollTestMediaIdentity(server, "admin", "membership-retire", 0x75);
     const port = try server.boundPort();
 
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -97101,6 +97229,7 @@ test "threaded server: PART and KICK retire physical media before channel member
 }
 
 test "threaded server: mid-call NICK retires old media authority before identity mutation" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -97200,6 +97329,7 @@ test "threaded server: mid-call NICK retires old media authority before identity
 }
 
 test "threaded server: account logout and replacement retire old physical media authority" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-media-account-transition.wal");
@@ -97349,6 +97479,7 @@ test "threaded server: account logout and replacement retire old physical media 
 }
 
 test "threaded server: authenticated call participants relay bounded opaque E2EE signaling" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -97527,7 +97658,9 @@ test "WS media admission binds a valid participant MAC to its own stream and act
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
-    var server = Server.init(std.testing.allocator, .{
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .tls_port = 0,
@@ -97545,12 +97678,12 @@ test "WS media admission binds a valid participant MAC to its own stream and act
     };
     current_reactor = &server.reactors[0];
 
-    const sender_id = try addTestLocalClient(&server, "Alice", "alice");
-    const receiver_id = try addTestLocalClient(&server, "Bob", "bob");
+    const sender_id = try addTestLocalClient(server, "Alice", "alice");
+    const receiver_id = try addTestLocalClient(server, "Bob", "bob");
     current_reactor = &server.reactors[1];
-    const custom_id = try addTestLocalClient(&server, "Custom", "custom");
-    const text_id = try addTestLocalClient(&server, "TextOnly", "text-only");
-    const handshake_id = try addTestLocalClient(&server, "Handshaking", "handshaking");
+    const custom_id = try addTestLocalClient(server, "Custom", "custom");
+    const text_id = try addTestLocalClient(server, "TextOnly", "text-only");
+    const handshake_id = try addTestLocalClient(server, "Handshaking", "handshaking");
     current_reactor = &server.reactors[0];
     const sender = server.connFor(sender_id).?;
     const receiver = server.connFor(receiver_id).?;
@@ -97876,7 +98009,9 @@ test "GAP-V2 a rejected browser media frame returns numeric 404" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
-    var server = Server.init(std.testing.allocator, .{
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .tls_port = 0,
@@ -97890,8 +98025,8 @@ test "GAP-V2 a rejected browser media frame returns numeric 404" {
     defer server.deinit();
     current_reactor = &server.reactors[0];
 
-    const sender_id = try addTestLocalClient(&server, "browser", "browser");
-    const peer_id = try addTestLocalClient(&server, "listener", "listener");
+    const sender_id = try addTestLocalClient(server, "browser", "browser");
+    const peer_id = try addTestLocalClient(server, "listener", "listener");
     const sender = server.connFor(sender_id).?;
     const peer = server.connFor(peer_id).?;
     sender.session.registration.registered = true;
@@ -98019,7 +98154,9 @@ test "MEDIA WS OFFER suppresses unroutable NATIVE/TRANSPORT; non-WS still gets U
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
 
-    var server = Server.init(std.testing.allocator, .{
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .tls_port = 0,
@@ -98035,8 +98172,8 @@ test "MEDIA WS OFFER suppresses unroutable NATIVE/TRANSPORT; non-WS still gets U
     if (server.media_plane.port == 0 or server.native_media.port == 0) return error.SkipZigTest;
     current_reactor = &server.reactors[0];
 
-    const ws_id = try addTestLocalClient(&server, "Browser", "browser");
-    const native_id = try addTestLocalClient(&server, "Desktop", "desktop");
+    const ws_id = try addTestLocalClient(server, "Browser", "browser");
+    const native_id = try addTestLocalClient(server, "Desktop", "desktop");
     const ws_conn = server.connFor(ws_id).?;
     const native_conn = server.connFor(native_id).?;
     ws_conn.session.registration.registered = true;
@@ -98090,10 +98227,13 @@ test "MEDIA WS OFFER suppresses unroutable NATIVE/TRANSPORT; non-WS still gets U
 }
 
 test "threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs legacy srtp)" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var cfg = multiOperTestConfig(0);
     cfg.media_enabled = true;
     cfg.media_dtls_srtp = true; // opt-in DTLS-SRTP keying on
-    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -98103,7 +98243,7 @@ test "threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs
     if (server.media_plane.port == 0) return error.SkipZigTest;
     const port = try server.boundPort();
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -98157,14 +98297,16 @@ test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails close
     var cfg = multiOperTestConfig(0);
     cfg.media_enabled = true;
     cfg.media_dtls_srtp = false; // DTLS-SRTP disabled (default)
-    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
     defer server.deinit();
     const port = try server.boundPort();
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -98201,6 +98343,7 @@ test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails close
 }
 
 test "threaded server: MEDIA ANSWER provisions transport and native leg" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var cfg = multiOperTestConfig(0);
     cfg.media_enabled = true;
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
@@ -113770,7 +113913,9 @@ test "REHASH cert hot-reload: invalid cert path keeps current certs and errors" 
 test "REHASH cert hot-reload: not configured when TLS is absent" {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const allocator = std.testing.allocator;
-        var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        const server = try allocator.create(Server);
+        defer allocator.destroy(server);
+        server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
         };

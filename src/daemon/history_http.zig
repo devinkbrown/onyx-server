@@ -9,6 +9,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const sys = if (builtin.os.tag == .openbsd) std.posix.system else linux;
+// Pollfd element type must match `sys` above: libc's on OpenBSD,
+// Linux's everywhere else (`posix.pollfd` differs from it on macOS).
+// Both branches resolve on every target, so this container-level `if`
+// stays valid cross-platform. This listener backend only runs on
+// linux/openbsd (live tests skip elsewhere).
+const sys_pollfd = if (builtin.os.tag == .openbsd) posix.pollfd else linux.pollfd;
 const runtime = @import("os_runtime.zig");
 const native_network = @import("native_network.zig");
 const platform = @import("../substrate/platform.zig");
@@ -306,7 +312,7 @@ pub const HttpsListener = struct {
                 },
                 .INTR => continue,
                 .AGAIN => {
-                    var polls = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                    var polls = [_]sys_pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
                     const ready = sys.poll(&polls, 1, @intCast(@min(remaining, 50)));
                     if (posix.errno(ready) == .INTR) continue;
                     if (posix.errno(ready) != .SUCCESS or polls[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return false;
@@ -331,7 +337,7 @@ pub const HttpsListener = struct {
             if (raw.items.len > 64 * 1024) return error.Closed;
             const rc = if (comptime builtin.os.tag == .openbsd) blk: {
                 if (self.stop_flag.load(.acquire) or platform.monotonicMillis() >= self.request_deadline) return error.Closed;
-                var polls = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+                var polls = [_]sys_pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
                 const ready = sys.poll(&polls, 1, 50);
                 if (posix.errno(ready) == .INTR) continue;
                 if (posix.errno(ready) != .SUCCESS) return error.Closed;
@@ -441,6 +447,9 @@ fn refuseAll(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) error{Denied}
 }
 
 test "GAP-P12 a public history bind is refused and loopback sockets listen" {
+    // Live loopback listeners: this backend issues raw Linux syscalls except
+    // on OpenBSD, so only linux/openbsd can execute it.
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const empty: []const []const u8 = &.{};
     const reader = Reader{ .ptr = undefined, .readFn = refuseAll };
     const cfg = tls_server.Config{ .cert_chain = empty };

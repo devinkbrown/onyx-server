@@ -860,6 +860,8 @@ const srtp = @import("../proto/srtp.zig");
 const srtcp = @import("../proto/srtcp.zig");
 
 test "MediaPlane: threaded pump answers a STUN check and binds the peer" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     try plane.start(loopback_be, 0);
@@ -965,6 +967,8 @@ test "MediaPlane: DTLS off leaves the pump with no terminator and no fingerprint
 }
 
 test "MediaPlane: DTLS-enabled pump demultiplexes a ClientHello into a HelloVerifyRequest" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     plane.dtls_enabled = true;
@@ -1011,6 +1015,8 @@ test "MediaPlane: DTLS-SRTP on but dtls13 off leaves the 1.3 engine down (1.2-on
 }
 
 test "DTLS-SRTP GAP-V1 hold-off: dtls13 off still answers a DTLS 1.2 ClientHello" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     try testing.expect(dtls13_server.browser_interop_caveat_held);
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
@@ -1046,6 +1052,8 @@ test "DTLS-SRTP GAP-V1 hold-off: dtls13 off still answers a DTLS 1.2 ClientHello
 }
 
 test "MediaPlane: version seam routes a DTLS 1.3 ClientHello to the 1.3 engine (HRR)" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     plane.dtls_enabled = true;
@@ -1126,6 +1134,8 @@ const RtcpCaptureSink = struct {
 };
 
 test "MediaPlane: RTCP feedback sink receives canonical feedback for a bound WebRTC peer" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     try plane.start(loopback_be, 0);
@@ -1154,6 +1164,8 @@ test "MediaPlane: RTCP feedback sink receives canonical feedback for a bound Web
 }
 
 test "MediaPlane: cross-thread RTCP egress is direct when DTLS is off and queued when on" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var capture = try MediaSocket.bind(loopback_be, 0);
     defer capture.deinit();
     capture.setRecvTimeoutMs(2000);
@@ -1265,6 +1277,8 @@ fn dtlsHandshakeClient(client: *MediaSocket, server_addr: TransportAddress, seed
 }
 
 test "MediaPlane e2e: DTLS-SRTP media forwards A->B, decrypted then re-encrypted per peer" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     plane.dtls_enabled = true;
@@ -1313,6 +1327,8 @@ test "MediaPlane e2e: DTLS-SRTP media forwards A->B, decrypted then re-encrypted
 }
 
 test "MediaPlane e2e: queued RTCP egress is SRTCP protected for DTLS recipient" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     plane.dtls_enabled = true;

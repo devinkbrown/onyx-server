@@ -394,35 +394,36 @@ fn fileKey(k: []const u8, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
-/// Blocking read of a small file via raw syscalls (fetcher-thread safe), or null.
+/// Finite regular-cache acquisition. NONBLOCK prevents a configured FIFO from
+/// trapping shutdown/pause before type validation; the held descriptor, not an
+/// earlier pathname stat, supplies the regular-file proof.
 fn readFileZ(path: [*:0]const u8, buf: []u8) ?[]u8 {
-    if (comptime @import("builtin").os.tag != .linux) {
-        const native = @import("os_runtime.zig");
-        const fd = native.openReadZ(path) catch return null;
-        defer native.close(fd);
-        var total: usize = 0;
-        while (total < buf.len) {
-            const count = native.read(fd, buf[total..]) catch |err| switch (err) {
-                error.Interrupted => continue,
-                else => return null,
-            };
-            if (count == 0) break;
-            total += count;
-        }
-        return buf[0..total];
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return null;
+    const sys = posix.system;
+    const flags: posix.O = .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true };
+    const raw = if (comptime builtin.os.tag == .linux)
+        sys.open(path, flags, 0)
+    else
+        sys.open(path, flags, @as(posix.mode_t, 0));
+    if (posix.errno(raw) != .SUCCESS) return null;
+    const fd: posix.fd_t = @intCast(raw);
+    defer _ = sys.close(fd);
+    if (comptime builtin.os.tag == .linux) {
+        var stat: linux.Statx = std.mem.zeroes(linux.Statx);
+        if (posix.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat)) != .SUCCESS or !stat.mask.TYPE or (stat.mode & posix.S.IFMT) != posix.S.IFREG) return null;
+    } else {
+        var stat: posix.Stat = undefined;
+        if (posix.errno(sys.fstat(fd, &stat)) != .SUCCESS or (stat.mode & posix.S.IFMT) != posix.S.IFREG) return null;
     }
-    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
-    if (posix.errno(rc) != .SUCCESS) return null;
-    const fd: linux.fd_t = @intCast(rc);
-    defer _ = linux.close(fd);
     var total: usize = 0;
     while (total < buf.len) {
-        const r = linux.read(fd, buf[total..].ptr, buf.len - total);
-        switch (posix.errno(r)) {
+        const result = sys.read(fd, buf[total..].ptr, buf.len - total);
+        switch (posix.errno(result)) {
             .SUCCESS => {
-                const got: usize = @intCast(r);
-                if (got == 0) break;
-                total += got;
+                const count: usize = @intCast(result);
+                if (count == 0) break;
+                total += count;
             },
             .INTR => continue,
             else => return null,

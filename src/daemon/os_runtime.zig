@@ -103,7 +103,15 @@ pub fn shutdownBoth(fd: Fd) void {
     _ = sys.shutdown(fd, posix.SHUT.RDWR);
 }
 
+extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+
 pub fn sleepMillis(ms: u64) void {
+    // Windows libc exposes neither `timespec` nor `nanosleep` here (and this
+    // std has no thread sleep outside `Io`); call Win32 `Sleep` directly.
+    if (comptime builtin.os.tag == .windows) {
+        Sleep(@intCast(@min(ms, std.math.maxInt(u32))));
+        return;
+    }
     var remaining: sys.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast(ms % 1000 * std.time.ns_per_ms) };
     while (true) {
         var next: sys.timespec = undefined;

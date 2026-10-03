@@ -49,7 +49,8 @@ pub fn setBlocking(fd: i32) Error!void {
     if (posix.errno(old_flags) != .SUCCESS) return error.ConnectFailed;
     var options: posix.O = @bitCast(@as(u32, @intCast(old_flags)));
     options.NONBLOCK = false;
-    if (posix.errno(sys.fcntl(fd, posix.F.SETFL, @as(c_int, @intCast(@as(u32, @bitCast(options)))))) != .SUCCESS) return error.ConnectFailed;
+    const arg: if (@import("builtin").os.tag == .linux) usize else c_int = @intCast(@as(u32, @bitCast(options)));
+    if (posix.errno(sys.fcntl(fd, posix.F.SETFL, arg)) != .SUCCESS) return error.ConnectFailed;
 }
 pub fn waitWritable(fd: i32, timeout_ms: u31) Error!void {
     const deadline = platform.monotonicMillis() + timeout_ms;
@@ -79,7 +80,7 @@ pub fn setTimeout(fd: i32, ms: u31) Error!void {
 pub fn writeAll(fd: i32, bytes: []const u8) Error!void {
     var offset: usize = 0;
     while (offset < bytes.len) {
-        const rc = sys.send(fd, bytes[offset..].ptr, bytes.len - offset, posix.MSG.NOSIGNAL);
+        const rc = sys.sendto(fd, bytes[offset..].ptr, bytes.len - offset, posix.MSG.NOSIGNAL, null, 0);
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return error.ConnectionClosed;
