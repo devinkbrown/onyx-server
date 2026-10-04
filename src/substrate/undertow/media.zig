@@ -112,6 +112,13 @@ pub const ParticipantId = struct {
     }
 };
 
+/// Validate count before slicing and require the exact canonical spelling/tail.
+pub fn validateParticipantId(id: ParticipantId) error{InvalidSnapshot}!void {
+    if (id.len == 0 or id.len > max_participant_id_bytes) return error.InvalidSnapshot;
+    const canonical = ParticipantId.init(id.bytes[0..id.len]) catch return error.InvalidSnapshot;
+    if (!std.meta.eql(id, canonical)) return error.InvalidSnapshot;
+}
+
 pub const Participant = struct {
     id: ParticipantId = .{},
     joined: KindSet = .{},
@@ -139,6 +146,38 @@ pub fn Session(comptime max_participants: usize) type {
 
         participants: [max_participants]Participant = undefined,
         len: usize = 0,
+
+        /// Source-owned canonical used-prefix DTO. Unused live storage may be
+        /// undefined; capture never reads it and the DTO zeroes its tail.
+        pub const Snapshot = struct {
+            participants: [max_participants]Participant = @splat(.{}),
+            len: usize = 0,
+
+            pub fn validate(self: *const Snapshot) error{InvalidSnapshot}!void {
+                if (self.len > max_participants) return error.InvalidSnapshot;
+                for (self.participants[0..self.len], 0..) |entry, i| {
+                    try validateParticipantId(entry.id);
+                    if (entry.joined.bits == 0 or (entry.joined.bits | entry.muted.bits | entry.speaking.bits) & ~@as(u8, 7) != 0 or
+                        entry.speaking.bits & ~entry.joined.bits != 0 or entry.speaking.bits & entry.muted.bits != 0) return error.InvalidSnapshot;
+                    // Muting a kind not joined is supported by setMuted.
+                    for (self.participants[0..i]) |prior| if (prior.id.eql(&entry.id)) return error.InvalidSnapshot;
+                }
+                for (self.participants[self.len..]) |entry| if (!std.meta.eql(entry, Participant{})) return error.InvalidSnapshot;
+            }
+        };
+
+        pub fn capture(self: *const Self) error{InvalidSnapshot}!Snapshot {
+            if (self.len > max_participants) return error.InvalidSnapshot;
+            var snapshot: Snapshot = .{ .len = self.len };
+            @memcpy(snapshot.participants[0..self.len], self.participants[0..self.len]);
+            try snapshot.validate();
+            return snapshot;
+        }
+
+        pub fn prepareRestore(snapshot: *const Snapshot) error{InvalidSnapshot}!Self {
+            try snapshot.validate();
+            return .{ .participants = snapshot.participants, .len = snapshot.len };
+        }
 
         pub fn init() Self {
             return .{};
@@ -996,4 +1035,42 @@ test "applyTomlAbr overlays media.abr and changes abrHint thresholds" {
     });
     try std.testing.expectEqual(AbrAction.increase, hint.action);
     try std.testing.expectEqual(@as(u32, 2000), hint.target_bitrate_kbps);
+}
+
+test "active media DTO native session preserves exact roster modes and swap removal" {
+    const testing = std.testing;
+    const S = Session(4);
+    var old = S.init();
+    const a = try ParticipantId.init("A");
+    const b = try ParticipantId.init("B");
+    const c = try ParticipantId.init("C");
+    try old.join(a, .voice);
+    try old.join(b, .video);
+    try old.join(c, .voice);
+    try old.join(a, .screen);
+    try old.setMuted(a, .video, true); // accepted unjoined-kind state
+    try old.setSpeaking(a, .voice, true);
+    try old.leaveAll(b);
+    const carry = try old.capture();
+    var candidate = try S.prepareRestore(&carry);
+    try testing.expectEqualDeep(carry, try candidate.capture());
+    try testing.expectEqualDeep(try old.forwardSet(a, .voice, .{ .require_speaking = true }), try candidate.forwardSet(a, .voice, .{ .require_speaking = true }));
+    try candidate.join(b, .screen);
+    try testing.expectEqual(@as(usize, 2), old.count());
+    var bad = carry;
+    bad.len = 5;
+    try testing.expectError(error.InvalidSnapshot, S.prepareRestore(&bad));
+    bad = carry;
+    bad.participants[1].id = a;
+    try testing.expectError(error.InvalidSnapshot, S.prepareRestore(&bad));
+    bad = carry;
+    bad.participants[0].id.bytes[63] = 1;
+    try testing.expectError(error.InvalidSnapshot, S.prepareRestore(&bad));
+    bad = carry;
+    bad.participants[0].speaking.bits = 8;
+    try testing.expectError(error.InvalidSnapshot, S.prepareRestore(&bad));
+    bad = carry;
+    bad.participants[3].joined.bits = 1;
+    try testing.expectError(error.InvalidSnapshot, S.prepareRestore(&bad));
+    try testing.expectEqualDeep(carry, try old.capture());
 }

@@ -6,6 +6,128 @@ const std = @import("std");
 const builtin = @import("builtin");
 const onyx_server = @import("onyx_server");
 const delegated_credential_cli = @import("daemon/delegated_credential_cli.zig");
+const native_service = onyx_server.daemon.native_service;
+const service_helper = onyx_server.daemon.native_service_helper;
+
+/// Own the original PEM decode container as well as every DER allocation.
+/// Companion workers borrow items until their stop/join completes; main keeps
+/// this owner in the enclosing scope and destroys it after those workers.
+const OwnedTrustAnchors = struct {
+    allocator: std.mem.Allocator,
+    anchors: std.ArrayList([]u8),
+
+    fn load(allocator: std.mem.Allocator, text: []const u8) !OwnedTrustAnchors {
+        return .{ .allocator = allocator, .anchors = try onyx_server.daemon.acme_cli.loadTrustAnchors(allocator, text) };
+    }
+
+    fn items(self: *const OwnedTrustAnchors) []const []const u8 {
+        return self.anchors.items;
+    }
+
+    fn deinit(self: *OwnedTrustAnchors) void {
+        for (self.anchors.items) |der| self.allocator.free(der);
+        self.anchors.deinit(self.allocator);
+        self.anchors = .empty;
+    }
+};
+
+const anchor_ownership_test_pem =
+    "-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n" ++
+    "-----BEGIN CERTIFICATE-----\nMAMCAQE=\n-----END CERTIFICATE-----\n";
+
+fn testTrustAnchorAllocationPath(allocator: std.mem.Allocator, disabled_after_load: bool) !void {
+    var owner = try OwnedTrustAnchors.load(allocator, anchor_ownership_test_pem);
+    defer owner.deinit();
+    try std.testing.expectEqual(@as(usize, 2), owner.items().len);
+    // A late disabled branch owns the successfully decoded bundle too.
+    if (disabled_after_load) return;
+    // Exercise OOM after both DER allocations and the original list exist.
+    const consumer = try allocator.create(u8);
+    defer allocator.destroy(consumer);
+    consumer.* = owner.items()[1][4];
+    try std.testing.expectEqual(@as(u8, 1), consumer.*);
+    try std.testing.expectEqualSlices(u8, &.{ 0x30, 3, 2, 1, 0 }, owner.items()[0]);
+}
+
+test "managed anchors: late disabled and consumer allocation failures free DER and the original container" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testTrustAnchorAllocationPath, .{true});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testTrustAnchorAllocationPath, .{false});
+}
+
+test "managed anchors: empty and malformed bundles remain allocation-free" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var empty = try OwnedTrustAnchors.load(failing.allocator(), "no certificate blocks");
+    defer empty.deinit();
+    var malformed = try OwnedTrustAnchors.load(failing.allocator(), "-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n");
+    defer malformed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.items().len);
+    try std.testing.expectEqual(@as(usize, 0), malformed.items().len);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+const TrustAnchorBorrowFixture = if (builtin.is_test) struct {
+    io: std.Io,
+    anchors: []const []const u8,
+    entered: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+    observed: bool = false,
+
+    fn run(self: *@This()) void {
+        self.entered.set(self.io);
+        self.release.waitUncancelable(self.io);
+        self.observed = self.anchors.len == 2 and
+            std.mem.eql(u8, self.anchors[0], &.{ 0x30, 3, 2, 1, 0 }) and
+            std.mem.eql(u8, self.anchors[1], &.{ 0x30, 3, 2, 1, 1 });
+    }
+} else void;
+
+test "managed anchors: real borrowed reader joins before its owner frees DER" {
+    var tracked = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var owner = try OwnedTrustAnchors.load(tracked.allocator(), anchor_ownership_test_pem);
+    defer owner.deinit();
+    var borrow: TrustAnchorBorrowFixture = .{ .io = std.testing.io, .anchors = owner.items() };
+    const thread = try std.Thread.spawn(.{}, TrustAnchorBorrowFixture.run, .{&borrow});
+    var joined = false;
+    defer if (!joined) {
+        borrow.release.set(borrow.io);
+        thread.join();
+    };
+    borrow.entered.waitUncancelable(borrow.io);
+    try std.testing.expect(tracked.allocated_bytes > tracked.freed_bytes);
+    borrow.release.set(borrow.io);
+    thread.join();
+    joined = true;
+    try std.testing.expect(borrow.observed);
+    owner.deinit();
+    try std.testing.expectEqual(tracked.allocated_bytes, tracked.freed_bytes);
+}
+
+/// Commit the actual loaded source and each resolved value, rather than reopening
+/// a config after the root launcher has accepted its preflight. Framing keeps
+/// different names/value partitions distinct without retaining secret text.
+const ManagedConfigCommitment = struct {
+    hash: std.crypto.hash.sha2.Sha256,
+    fn init() ManagedConfigCommitment {
+        var result: ManagedConfigCommitment = .{ .hash = .init(.{}) };
+        result.hash.update("onyx/native-service/config-v2\x00");
+        result.record(0, "build", onyx_server.version_full);
+        return result;
+    }
+    fn record(self: *ManagedConfigCommitment, kind: u8, name: []const u8, value: []const u8) void {
+        self.hash.update(&.{kind});
+        var lengths: [16]u8 = undefined;
+        std.mem.writeInt(u64, lengths[0..8], name.len, .little);
+        std.mem.writeInt(u64, lengths[8..16], value.len, .little);
+        self.hash.update(&lengths);
+        self.hash.update(name);
+        self.hash.update(value);
+    }
+    fn finish(self: *ManagedConfigCommitment) native_service.Digest {
+        var result: native_service.Digest = undefined;
+        self.hash.final(&result);
+        return result;
+    }
+};
 
 /// Shared context for the config-string resolver. Both `env:NAME` and
 /// `@file:path` indirection run through a single `?*anyopaque` ctx, so it
@@ -17,6 +139,7 @@ const ResolverCtx = struct {
     path_allocator: std.mem.Allocator,
     file_paths: std.ArrayList([]u8) = .empty,
     record_paths: bool = true,
+    managed_commitment: ?*ManagedConfigCommitment = null,
 
     fn deinit(self: *ResolverCtx) void {
         for (self.file_paths.items) |path| self.path_allocator.free(path);
@@ -30,6 +153,7 @@ const ResolverCtx = struct {
 fn envLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror![]const u8 {
     const rc: *ResolverCtx = @ptrCast(@alignCast(ctx orelse return error.EnvironmentVariableNotFound));
     const value = rc.environ_map.get(name) orelse return error.EnvironmentVariableNotFound;
+    if (rc.managed_commitment) |commitment| commitment.record(2, name, value);
     return allocator.dupe(u8, value);
 }
 
@@ -45,7 +169,9 @@ fn fileLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8) 
             try rc.file_paths.append(rc.path_allocator, owned);
         }
     }
-    return std.Io.Dir.cwd().readFileAlloc(rc.io, path, allocator, .limited(1 << 20));
+    const value = try std.Io.Dir.cwd().readFileAlloc(rc.io, path, allocator, .limited(1 << 20));
+    if (rc.managed_commitment) |commitment| commitment.record(3, path, value);
+    return value;
 }
 
 fn validateTlsChain(chain: []const []const u8) anyerror!void {
@@ -55,6 +181,119 @@ fn validateTlsChain(chain: []const []const u8) anyerror!void {
     // ships leaf + intermediates, never a self-signed root, and its intermediate
     // may use a key type the server does not sign with). See validateServerChainAt.
     try onyx_server.crypto.x509_verify.validateServerChainAt(chain, now_unix);
+}
+
+/// Preflight uses the same parsed boot projection without creating the node
+/// keyfile, opening a WAL, binding a socket, or reparsing resolved config data.
+fn validateManagedBootPlan(allocator: std.mem.Allocator, io: std.Io, loaded: *const onyx_server.daemon.config_boot.Loaded, config_path: []const u8) !void {
+    const boot = onyx_server.daemon.config_boot;
+    if (boot.portableTransportError(builtin.os.tag, loaded.parsed) != null) return error.UnsupportedManagedTransport;
+    if (loaded.parsed.meshCloakSecretMissing()) return error.MissingMeshCloakSecret;
+    if (boot.configCheckError(loaded.io, loaded.tls.ktls) != null) return error.InvalidManagedIoPolicy;
+    if (boot.unsecuredMeshPeerError(loaded.parsed.mesh.connect.len, loaded.parsed.mesh.require_secured) != null) return error.UnsecuredManagedMesh;
+    if (loaded.parsed.node.secret_key) |secret| {
+        var identity = try onyx_server.daemon.node_identity.fromConfig(secret, loaded.parsed.mesh.realm);
+        defer identity.deinit();
+    }
+    if (loaded.parsed.mesh.relay_v2_activation_epoch != 0 and loaded.parsed.node.secret_key == null) {
+        const key_path = try onyx_server.daemon.node_keyfile.derivePath(allocator, config_path);
+        defer allocator.free(key_path);
+        try onyx_server.daemon.node_keyfile.validateExistingPublicKey(allocator, io, std.Io.Dir.cwd(), key_path, loaded.parsed.mesh.realm, loaded.parsed.node.public_key orelse return error.MissingNodePublicKey);
+    }
+    if (loaded.ocg2.enabled) {
+        if (!boot.ocg2RuntimeModeSupported(loaded.ocg2.mode)) return error.UnsupportedManagedOcg2Mode;
+        var identity = if (loaded.parsed.node.secret_key) |secret|
+            try onyx_server.daemon.node_identity.fromConfig(secret, loaded.parsed.mesh.realm)
+        else identity_blk: {
+            const key_path = try onyx_server.daemon.node_keyfile.derivePath(allocator, config_path);
+            defer allocator.free(key_path);
+            var seed = try onyx_server.daemon.node_keyfile.loadExisting(allocator, io, std.Io.Dir.cwd(), key_path);
+            defer std.crypto.secureZero(u8, &seed);
+            break :identity_blk try onyx_server.daemon.node_identity.fromSeed(seed, loaded.parsed.mesh.realm);
+        };
+        defer identity.deinit();
+        _ = try boot.validateOcg2LocalIdentity(loaded.ocg2, &identity);
+    }
+}
+
+test "managed boot: config commitment frames actual source and resolved values" {
+    var first = ManagedConfigCommitment.init();
+    first.record(1, "/etc/onyx-server.toml", "key = env:KEY");
+    first.record(2, "KEY", "abc");
+    var equal = ManagedConfigCommitment.init();
+    equal.record(1, "/etc/onyx-server.toml", "key = env:KEY");
+    equal.record(2, "KEY", "abc");
+    try std.testing.expectEqualSlices(u8, &first.finish(), &equal.finish());
+    var changed = ManagedConfigCommitment.init();
+    changed.record(1, "/etc/onyx-server.toml", "key = env:KEY");
+    changed.record(2, "KEY", "abd");
+    try std.testing.expect(!std.mem.eql(u8, &first.finish(), &changed.finish()));
+    var split = ManagedConfigCommitment.init();
+    split.record(1, "a", "bc");
+    var joined = ManagedConfigCommitment.init();
+    joined.record(1, "ab", "c");
+    try std.testing.expect(!std.mem.eql(u8, &split.finish(), &joined.finish()));
+}
+
+test "managed boot: leaf identity refuses another same-family signing key" {
+    const ed = std.crypto.sign.Ed25519;
+    const pair = try ed.KeyPair.generateDeterministic(@splat(0x31));
+    const other = try ed.KeyPair.generateDeterministic(@splat(0x32));
+    var der: [4096]u8 = undefined;
+    const leaf = try onyx_server.proto.x509_selfsign.buildSelfSigned(&der, .{ .common_name = "managed.test", .not_before = 1700000000, .not_after = 1900000000, .serial = &.{1}, .key_pair = pair });
+    try validateTlsIdentity(&.{leaf}, pair, null, null);
+    try std.testing.expectError(error.TlsKeyMismatch, validateTlsIdentity(&.{leaf}, other, null, null));
+    try std.testing.expectError(error.TlsKeyMismatch, validateTlsIdentity(&.{leaf}, null, null, null));
+    const ec = onyx_server.crypto.ecdsa_p256.KeyPair.generate(std.testing.io);
+    const ec_other = onyx_server.crypto.ecdsa_p256.KeyPair.generate(std.testing.io);
+    const ec_leaf = try onyx_server.proto.x509_selfsign.buildSelfSignedEcdsaP256(&der, .{ .common_name = "managed.test", .not_before = 1700000000, .not_after = 1900000000, .serial = &.{2}, .key_pair = ec });
+    try validateTlsIdentity(&.{ec_leaf}, null, ec, null);
+    try std.testing.expectError(error.TlsKeyMismatch, validateTlsIdentity(&.{ec_leaf}, null, ec_other, null));
+    try std.testing.expectError(error.TlsKeyMismatch, validateTlsIdentity(&.{ec_leaf}, pair, ec, null));
+}
+
+test "managed boot: parsed preflight refuses mesh policy without creating state" {
+    var loaded = try onyx_server.daemon.config_boot.loadFromText(std.testing.allocator, "[node]\nid=1\n[listen]\nirc=6680\ns2s=0\n", .{ .port = 6680 }, .{});
+    defer loaded.deinit(std.testing.allocator);
+    try validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml");
+    loaded.parsed.listen.s2s = 7000;
+    try std.testing.expectError(error.MissingMeshCloakSecret, validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml"));
+    loaded.parsed.listen.s2s = 0;
+    loaded.tls.ktls = .txrx;
+    try std.testing.expectError(error.InvalidManagedIoPolicy, validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml"));
+}
+
+test "managed boot: configured invalid node key refuses before cold mutation" {
+    var loaded = try onyx_server.daemon.config_boot.loadFromText(std.testing.allocator, "[node]\nid=1\nsecret_key=\"bad\"\n[listen]\nirc=6680\ns2s=0\n", .{ .port = 6680 }, .{});
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectError(error.BadSeed, validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml"));
+}
+
+/// Key family equality alone cannot prove a configured private key belongs to
+/// the loaded leaf. Compare the parsed public material before granting launch.
+fn validateTlsIdentity(
+    chain: []const []const u8,
+    signing_key: ?std.crypto.sign.Ed25519.KeyPair,
+    ecdsa_key: ?onyx_server.crypto.ecdsa_p256.KeyPair,
+    rsa_key: ?onyx_server.crypto.rsa_sign.PrivateKey,
+) !void {
+    if (chain.len == 0) return error.EmptyCertificateChain;
+    const leaf = try onyx_server.crypto.x509.parse(chain[0]);
+    const key = try onyx_server.crypto.x509.extractPublicKey(leaf.spki_der);
+    switch (key) {
+        .ed25519 => |public| {
+            const private = signing_key orelse return error.TlsKeyMismatch;
+            if (ecdsa_key != null or rsa_key != null or !std.mem.eql(u8, public, &private.public_key.toBytes())) return error.TlsKeyMismatch;
+        },
+        .ecdsa_p256 => |public| {
+            const private = ecdsa_key orelse return error.TlsKeyMismatch;
+            if (signing_key != null or rsa_key != null or !std.mem.eql(u8, public, &private.public_key.toUncompressedSec1())) return error.TlsKeyMismatch;
+        },
+        .rsa => |public| {
+            const private = rsa_key orelse return error.TlsKeyMismatch;
+            if (signing_key != null or ecdsa_key != null or !std.mem.eql(u8, public.modulus, private.n) or !std.mem.eql(u8, public.exponent, private.e)) return error.TlsKeyMismatch;
+        },
+    }
 }
 
 const LoadedEchKeys = struct {
@@ -135,6 +374,7 @@ fn installOpenBsdSandbox(
     runtime: onyx_server.daemon.server.Config,
     parsed: ?*const onyx_server.daemon.config_format.Config,
     resolver_ctx: *ResolverCtx,
+    managed_context: ?*const native_service.Context,
 ) !void {
     var plan = onyx_server.daemon.openbsd_sandbox.Plan{ .allocator = allocator, .io = io };
     defer plan.deinit();
@@ -142,6 +382,7 @@ fn installOpenBsdSandbox(
     try plan.addDirectory("/usr", "rx");
     try plan.addDirectory("/tmp", "rwc");
     try plan.addDirectory("/dev", "r");
+    if (managed_context != null) try plan.addNativeServiceNamespace();
     try plan.addExecutable(runtime.exe_path orelse return error.MissingExecutablePath);
     if (runtime.config_path) |path| try plan.addFile(path, true);
     for (resolver_ctx.file_paths.items) |path| try plan.addFile(path, false);
@@ -192,6 +433,17 @@ pub fn main(init: std.process.Init) !void {
     var srv_cfg = onyx_server.daemon.server.Config{ .port = 6680 };
     var native_incoming: ?onyx_server.daemon.helix.native_bootstrap.Incoming = null;
     defer if (native_incoming) |*incoming| incoming.deinit();
+    // Outer lifetime custody survives Server and every companion cleanup. The
+    // Prelude admits only a root-created channel; it cannot publish readiness.
+    var managed_prelude: ?*service_helper.ManagedPrelude = null;
+    defer if (comptime builtin.os.tag == .openbsd) {
+        if (managed_prelude) |prelude| prelude.deinit();
+    };
+    var managed_spec: ?service_helper.ServiceSpec = null;
+    var managed_incoming: ?native_service.Incoming = null;
+    defer if (managed_incoming) |*incoming| incoming.deinit();
+    var managed_commitment = ManagedConfigCommitment.init();
+    var managed_config_digest: ?native_service.Digest = null;
     var native_driver = onyx_server.daemon.helix.native_bootstrap.Driver{ .allocator = allocator, .config_path = null, .environ = init.minimal.environ };
     var native_executable: ?[:0]u8 = null;
     defer if (native_executable) |path| allocator.free(path);
@@ -236,7 +488,20 @@ pub fn main(init: std.process.Init) !void {
         // predecessor executes the exact already-open target image with this
         // flag and refuses a hot handoff unless the complete token matches.
         // This branch must stay ahead of all config, socket, and daemon setup.
-        if (std.mem.eql(u8, first, onyx_server.daemon.helix.native_process.candidate_arg)) {
+        if (std.mem.eql(u8, first, service_helper.activation_arg)) {
+            if (comptime builtin.os.tag == .openbsd) {
+                if (!std.mem.eql(u8, args.next() orelse return error.InvalidManagedActivation, service_helper.managed_arg)) return error.InvalidManagedActivation;
+                const fd_text = args.next() orelse return error.InvalidManagedActivation;
+                if (!std.mem.eql(u8, fd_text, "3") or args.next() != null) return error.InvalidManagedActivation;
+                managed_prelude = service_helper.receiveManaged(allocator, init.io, 3, try std.math.add(i64, onyx_server.substrate.platform.monotonicMillis(), 30_000)) catch |err| {
+                    onyx_server.daemon.os_runtime.close(3);
+                    return err;
+                };
+                managed_spec = managed_prelude.?.spec();
+                if (!std.mem.eql(u8, srv_cfg.exe_path orelse return error.MissingExecutablePath, managed_spec.?.executable.bytes())) return error.ManagedExecutableMismatch;
+                config_path_arg = managed_spec.?.config.bytes();
+            } else return error.Unsupported;
+        } else if (std.mem.eql(u8, first, onyx_server.daemon.helix.native_process.candidate_arg)) {
             if (comptime builtin.os.tag == .openbsd) {
                 const fd = try std.fmt.parseInt(i32, args.next() orelse return error.InvalidNativeCandidate, 10);
                 const parent_pid = try std.fmt.parseInt(i32, args.next() orelse return error.InvalidNativeCandidate, 10);
@@ -604,7 +869,15 @@ pub fn main(init: std.process.Init) !void {
         };
         if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20))) |text| {
             defer allocator.free(text); // string fields are duped by the parser
+            if (managed_prelude != null) {
+                managed_commitment.record(1, path, text);
+                resolver_ctx.managed_commitment = &managed_commitment;
+            }
             if (onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
+                if (managed_prelude != null) {
+                    managed_config_digest = managed_commitment.finish();
+                    resolver_ctx.managed_commitment = null;
+                }
                 if (onyx_server.daemon.config_boot.portableTransportError(builtin.os.tag, loaded.parsed)) |why| {
                     std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
                     std.process.exit(1);
@@ -662,6 +935,204 @@ pub fn main(init: std.process.Init) !void {
             srv_cfg.inherited_state_fds = incoming.state_fds;
             srv_cfg.inherited_state_fd_manifest_present = true;
             srv_cfg.inherited_state_fd_manifest_valid = true;
+        }
+    }
+
+    // Implicit-TLS client listener: when `[tls] enabled`, load the configured
+    // cert/key (or mint a self-signed bootstrap leaf) and stand up the TLS
+    // listener. The chain bytes + signing key live for the server's lifetime
+    // (server.Config borrows them). No STARTTLS — this is a separate TLS port.
+    var tls_loaded: ?onyx_server.daemon.tls_certs.Loaded = null;
+    defer if (tls_loaded) |*t| t.deinit(allocator);
+    var tls12_loaded: ?onyx_server.daemon.tls_certs.Tls12 = null;
+    defer if (tls12_loaded) |*t| t.deinit(allocator);
+    // [[tls.sni]] additional certs: each entry's on-disk cert+key is loaded with
+    // the SAME loader as the default cert. The loaded material must outlive the
+    // server (each `tls_server.SniCert` borrows its chain bytes and aliases any
+    // RSA key storage), so the loads live on main's frame and free at process
+    // exit — mirroring `tls_loaded`. `tls_sni_certs` is the selection list handed
+    // to the listener; the array itself is freed here, its contents borrow above.
+    var tls_sni_loaded: std.ArrayList(onyx_server.daemon.tls_certs.Loaded) = .empty;
+    defer {
+        for (tls_sni_loaded.items) |*s| s.deinit(allocator);
+        tls_sni_loaded.deinit(allocator);
+    }
+    var tls_sni_certs: []onyx_server.crypto.tls_server.SniCert = &.{};
+    defer if (tls_sni_certs.len != 0) allocator.free(tls_sni_certs);
+    var tls_ech_loaded: ?LoadedEchKeys = null;
+    defer if (tls_ech_loaded) |*e| e.deinit(allocator);
+    if (held) |h| {
+        if (h.tls.enabled) {
+            if (onyx_server.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
+                .enabled = true,
+                .cert_path = h.tls.cert_path,
+                .key_path = h.tls.key_path,
+                .dns_name = h.tls.dns_name,
+            })) |loaded| tls_material: {
+                validateTlsChain(loaded.cert_chain) catch |err| {
+                    var rejected = loaded;
+                    rejected.deinit(allocator);
+                    if (managed_prelude != null or native_incoming != null) return err;
+                    std.debug.print("onyx-server: TLS certificate validation failed ({s}); TLS disabled\n", .{@errorName(err)});
+                    break :tls_material;
+                };
+                tls_loaded = loaded;
+                // [[tls.sni]] additional SNI-selectable certificates: load each
+                // entry's cert+key with the SAME loader as the default cert, retain
+                // the material for the server's lifetime, and hand the listener the
+                // selection list. A malformed/expired entry fails TLS bring-up
+                // wholesale (fail-fast) — reached BEFORE any `srv_cfg.tls_*` field is
+                // wired, so TLS stays fully disabled rather than half-configured,
+                // consistent with the default cert's validation-failure path.
+                if (h.tls.sni.len != 0) {
+                    // The load loop lives in `daemon/tls_sni_load` so its four
+                    // key-material error paths are unit-tested under
+                    // `std.testing.allocator`. Ownership is unchanged: each entry
+                    // is retained in `tls_sni_loaded` (freed at process exit by the
+                    // defer above), the returned list is freed here, and on ANY
+                    // error the helper frees its partial list + deinits the
+                    // just-loaded entry, so we simply fail-fast into `break`.
+                    const built = onyx_server.daemon.tls_sni_load.buildSniCerts(
+                        allocator,
+                        init.io,
+                        h.tls.sni,
+                        h.tls.dns_name,
+                        &tls_sni_loaded,
+                        validateTlsChain,
+                        onyx_server.daemon.tls_sni_load.default_loader,
+                    ) catch |err| {
+                        if (managed_prelude != null or native_incoming != null) return err;
+                        std.debug.print("onyx-server: [[tls.sni]] certificate setup failed ({s}); TLS disabled\n", .{@errorName(err)});
+                        break :tls_material;
+                    };
+                    tls_sni_certs = built;
+                    std.debug.print("onyx-server: {d} SNI certificate(s) loaded\n", .{tls_sni_certs.len});
+                }
+                if (h.tls.ech_keys.len != 0) {
+                    tls_ech_loaded = loadTlsEchKeys(allocator, init.io, h.tls.ech_keys) catch |err| {
+                        if (managed_prelude != null or native_incoming != null) return err;
+                        std.debug.print("onyx-server: [[tls.ech_keys]] load failed ({s}); TLS disabled\n", .{@errorName(err)});
+                        break :tls_material;
+                    };
+                    var probe = onyx_server.crypto.tls_server.Server.init(allocator, .{
+                        .cert_chain = tls_loaded.?.cert_chain,
+                        .signing_key = tls_loaded.?.signing_key,
+                        .ecdsa_p256_signing_key = tls_loaded.?.ecdsa_p256_signing_key,
+                        .rsa_signing_key = tls_loaded.?.rsa_signing_key,
+                        .sni_certs = tls_sni_certs,
+                        .ech_keys = tls_ech_loaded.?.keys,
+                    }) catch |err| {
+                        if (managed_prelude != null or native_incoming != null) return err;
+                        std.debug.print("onyx-server: [[tls.ech_keys]] validation failed ({s}); TLS disabled\n", .{@errorName(err)});
+                        break :tls_material;
+                    };
+                    probe.deinit();
+                    std.debug.print("onyx-server: {d} ECH key(s) loaded\n", .{tls_ech_loaded.?.keys.len});
+                }
+                srv_cfg.tls_port = h.tls.port;
+                srv_cfg.tls_cert_chain = tls_loaded.?.cert_chain;
+                srv_cfg.tls_signing_key = tls_loaded.?.signing_key;
+                srv_cfg.tls_rsa_signing_key = tls_loaded.?.rsa_signing_key;
+                srv_cfg.tls_ecdsa_signing_key = tls_loaded.?.ecdsa_p256_signing_key;
+                srv_cfg.tls_sni_certs = tls_sni_certs;
+                if (tls_ech_loaded) |e| srv_cfg.tls_ech_keys = e.keys;
+                srv_cfg.tls_raw_public_key = h.tls.raw_public_key;
+                srv_cfg.tls_request_client_cert = h.tls.request_client_cert;
+                srv_cfg.tls_enable_resumption = h.tls.enable_resumption;
+                srv_cfg.tls_early_data_max_size = h.tls.early_data_max_size;
+                std.debug.print("onyx-server: TLS listener enabled on port {d}\n", .{h.tls.port});
+                // kTLS offload (roadmap 3.1): activate kernel record crypto only
+                // when the operator opted in via `[tls] ktls` AND the running
+                // kernel offers the TLS ULP. `tx` offloads server→client encryption;
+                // `txrx` additionally offloads client→server decryption.
+                const ktls_capable = onyx_server.daemon.ktls.probeUlpSupport();
+                const ktls_offload = onyx_server.daemon.config_boot.resolveKtlsOffload(h.tls.ktls, ktls_capable);
+                srv_cfg.tls_ktls_tx = ktls_offload.tx;
+                srv_cfg.tls_ktls_rx = ktls_offload.rx;
+                if (ktls_offload.footgun) |msg| {
+                    std.debug.print("onyx-server: {s}\n", .{msg});
+                } else if (h.tls.ktls != .off) {
+                    if (ktls_capable) {
+                        std.debug.print("onyx-server: kTLS TX offload ACTIVE (tx) — TLS 1.3 record crypto runs in the kernel\n", .{});
+                    } else {
+                        std.debug.print("onyx-server: kTLS {s} requested but this kernel has no TLS ULP — TLS stays in userspace\n", .{@tagName(h.tls.ktls)});
+                    }
+                } else if (ktls_capable) {
+                    std.debug.print("onyx-server: kTLS-capable kernel detected (TLS ULP present); set [tls] ktls=tx to offload server→client encryption\n", .{});
+                } else {
+                    std.debug.print("onyx-server: kTLS unavailable on this kernel (no TLS ULP); TLS stays in userspace\n", .{});
+                }
+                if (h.tls.enable_tls12) {
+                    if (tls_loaded.?.key_kind == .ecdsa_p256) {
+                        // The loaded ECDSA-P256 leaf serves the 1.2 leg natively.
+                        srv_cfg.tls12_cert_chain = tls_loaded.?.cert_chain;
+                        srv_cfg.tls12_signing_key = tls_loaded.?.ecdsa_p256_signing_key;
+                        std.debug.print("onyx-server: hardened TLS 1.2 also accepted (ECDSA-P256 leaf)\n", .{});
+                    } else if (tls_loaded.?.key_kind == .rsa) {
+                        srv_cfg.tls12_cert_chain = tls_loaded.?.cert_chain;
+                        std.debug.print("onyx-server: hardened TLS 1.2 also accepted (RSA leg)\n", .{});
+                    } else {
+                        if (onyx_server.daemon.tls_certs.bootstrapTls12(allocator, init.io, h.tls.dns_name)) |t12| {
+                            tls12_loaded = t12;
+                            srv_cfg.tls12_cert_chain = tls12_loaded.?.cert_chain;
+                            srv_cfg.tls12_signing_key = tls12_loaded.?.key;
+                            std.debug.print("onyx-server: hardened TLS 1.2 also accepted (ECDSA-P256 leg)\n", .{});
+                        } else |err| {
+                            if (managed_prelude != null or native_incoming != null) return err;
+                            std.debug.print("onyx-server: TLS 1.2 bootstrap failed ({s}); 1.3-only\n", .{@errorName(err)});
+                        }
+                    }
+                }
+            } else |err| {
+                if (managed_prelude != null or native_incoming != null) return err;
+                std.debug.print("onyx-server: TLS cert error ({s}); TLS disabled\n", .{@errorName(err)});
+            }
+        }
+    }
+
+    // Native secure-WebSocket (wss) browser listener (`[listen] ws`): rides the
+    // SAME cert chain + signing key loaded for the implicit-TLS listener above,
+    // so the leg is genuine wss under the daemon's real certificate. Browsers
+    // require wss on the production page, so a cert-less ws port is refused
+    // unless the testing-only `[listen] ws_plain` flag is set.
+    if (srv_cfg.ws_enabled) {
+        if (srv_cfg.tls_cert_chain.len != 0) {
+            std.debug.print("onyx-server: WebSocket (wss) listener enabled on port {d}\n", .{srv_cfg.ws_port});
+        } else if (srv_cfg.ws_allow_plain) {
+            std.debug.print("onyx-server: WebSocket listener on port {d} WITHOUT TLS ([listen] ws_plain testing mode)\n", .{srv_cfg.ws_port});
+        } else {
+            if (managed_prelude != null or native_incoming != null) return error.ManagedWebSocketWithoutTls;
+            srv_cfg.ws_enabled = false;
+            std.debug.print("onyx-server: [listen] ws ignored — no TLS certificate loaded (enable [tls]; browsers require wss)\n", .{});
+        }
+    }
+
+    if (comptime builtin.os.tag == .openbsd) {
+        if (managed_prelude) |prelude| {
+            const loaded = if (held) |*h| h else return error.MissingManagedConfig;
+            try validateManagedBootPlan(allocator, init.io, loaded, srv_cfg.config_path.?);
+            if (srv_cfg.tls_cert_chain.len != 0) {
+                try validateTlsIdentity(srv_cfg.tls_cert_chain, srv_cfg.tls_signing_key, srv_cfg.tls_ecdsa_signing_key, srv_cfg.tls_rsa_signing_key);
+                for (srv_cfg.tls_sni_certs) |cert| try validateTlsIdentity(cert.cert_chain, cert.signing_key, cert.ecdsa_p256_signing_key, cert.rsa_signing_key);
+                if (srv_cfg.tls12_cert_chain.len != 0) try validateTlsIdentity(srv_cfg.tls12_cert_chain, null, srv_cfg.tls12_signing_key, if (srv_cfg.tls12_signing_key == null) srv_cfg.tls_rsa_signing_key else null);
+                var probe = try onyx_server.crypto.tls_server.Server.init(allocator, .{
+                    .cert_chain = srv_cfg.tls_cert_chain,
+                    .signing_key = srv_cfg.tls_signing_key,
+                    .ecdsa_p256_signing_key = srv_cfg.tls_ecdsa_signing_key,
+                    .rsa_signing_key = srv_cfg.tls_rsa_signing_key,
+                    .sni_certs = srv_cfg.tls_sni_certs,
+                    .ech_keys = srv_cfg.tls_ech_keys,
+                });
+                probe.deinit();
+            }
+            const ports = onyx_server.daemon.config_boot.listenerSetFromParsed(loaded.parsed);
+            try prelude.reportLoaded(.{ .config_commitment = managed_config_digest orelse return error.MissingManagedConfig, .listener_ports = .{ ports.irc, ports.tls, ports.ws, ports.webtransport, ports.s2s, ports.media, ports.native_media } });
+            if (prelude.purpose() == .preflight) {
+                try prelude.finishPreflight();
+                return;
+            }
+            managed_incoming = try prelude.receiveBootstrap();
+            try managed_incoming.?.state.context.validateExecutedContext(allocator, init.io);
         }
     }
 
@@ -1204,168 +1675,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Implicit-TLS client listener: when `[tls] enabled`, load the configured
-    // cert/key (or mint a self-signed bootstrap leaf) and stand up the TLS
-    // listener. The chain bytes + signing key live for the server's lifetime
-    // (server.Config borrows them). No STARTTLS — this is a separate TLS port.
-    var tls_loaded: ?onyx_server.daemon.tls_certs.Loaded = null;
-    defer if (tls_loaded) |*t| t.deinit(allocator);
-    var tls12_loaded: ?onyx_server.daemon.tls_certs.Tls12 = null;
-    defer if (tls12_loaded) |*t| t.deinit(allocator);
-    // [[tls.sni]] additional certs: each entry's on-disk cert+key is loaded with
-    // the SAME loader as the default cert. The loaded material must outlive the
-    // server (each `tls_server.SniCert` borrows its chain bytes and aliases any
-    // RSA key storage), so the loads live on main's frame and free at process
-    // exit — mirroring `tls_loaded`. `tls_sni_certs` is the selection list handed
-    // to the listener; the array itself is freed here, its contents borrow above.
-    var tls_sni_loaded: std.ArrayList(onyx_server.daemon.tls_certs.Loaded) = .empty;
-    defer {
-        for (tls_sni_loaded.items) |*s| s.deinit(allocator);
-        tls_sni_loaded.deinit(allocator);
-    }
-    var tls_sni_certs: []onyx_server.crypto.tls_server.SniCert = &.{};
-    defer if (tls_sni_certs.len != 0) allocator.free(tls_sni_certs);
-    var tls_ech_loaded: ?LoadedEchKeys = null;
-    defer if (tls_ech_loaded) |*e| e.deinit(allocator);
-    if (held) |h| {
-        if (h.tls.enabled) {
-            if (onyx_server.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
-                .enabled = true,
-                .cert_path = h.tls.cert_path,
-                .key_path = h.tls.key_path,
-                .dns_name = h.tls.dns_name,
-            })) |loaded| tls_material: {
-                validateTlsChain(loaded.cert_chain) catch |err| {
-                    var rejected = loaded;
-                    rejected.deinit(allocator);
-                    std.debug.print("onyx-server: TLS certificate validation failed ({s}); TLS disabled\n", .{@errorName(err)});
-                    break :tls_material;
-                };
-                tls_loaded = loaded;
-                // [[tls.sni]] additional SNI-selectable certificates: load each
-                // entry's cert+key with the SAME loader as the default cert, retain
-                // the material for the server's lifetime, and hand the listener the
-                // selection list. A malformed/expired entry fails TLS bring-up
-                // wholesale (fail-fast) — reached BEFORE any `srv_cfg.tls_*` field is
-                // wired, so TLS stays fully disabled rather than half-configured,
-                // consistent with the default cert's validation-failure path.
-                if (h.tls.sni.len != 0) {
-                    // The load loop lives in `daemon/tls_sni_load` so its four
-                    // key-material error paths are unit-tested under
-                    // `std.testing.allocator`. Ownership is unchanged: each entry
-                    // is retained in `tls_sni_loaded` (freed at process exit by the
-                    // defer above), the returned list is freed here, and on ANY
-                    // error the helper frees its partial list + deinits the
-                    // just-loaded entry, so we simply fail-fast into `break`.
-                    const built = onyx_server.daemon.tls_sni_load.buildSniCerts(
-                        allocator,
-                        init.io,
-                        h.tls.sni,
-                        h.tls.dns_name,
-                        &tls_sni_loaded,
-                        validateTlsChain,
-                        onyx_server.daemon.tls_sni_load.default_loader,
-                    ) catch |err| {
-                        std.debug.print("onyx-server: [[tls.sni]] certificate setup failed ({s}); TLS disabled\n", .{@errorName(err)});
-                        break :tls_material;
-                    };
-                    tls_sni_certs = built;
-                    std.debug.print("onyx-server: {d} SNI certificate(s) loaded\n", .{tls_sni_certs.len});
-                }
-                if (h.tls.ech_keys.len != 0) {
-                    tls_ech_loaded = loadTlsEchKeys(allocator, init.io, h.tls.ech_keys) catch |err| {
-                        std.debug.print("onyx-server: [[tls.ech_keys]] load failed ({s}); TLS disabled\n", .{@errorName(err)});
-                        break :tls_material;
-                    };
-                    var probe = onyx_server.crypto.tls_server.Server.init(allocator, .{
-                        .cert_chain = tls_loaded.?.cert_chain,
-                        .signing_key = tls_loaded.?.signing_key,
-                        .ecdsa_p256_signing_key = tls_loaded.?.ecdsa_p256_signing_key,
-                        .rsa_signing_key = tls_loaded.?.rsa_signing_key,
-                        .sni_certs = tls_sni_certs,
-                        .ech_keys = tls_ech_loaded.?.keys,
-                    }) catch |err| {
-                        std.debug.print("onyx-server: [[tls.ech_keys]] validation failed ({s}); TLS disabled\n", .{@errorName(err)});
-                        break :tls_material;
-                    };
-                    probe.deinit();
-                    std.debug.print("onyx-server: {d} ECH key(s) loaded\n", .{tls_ech_loaded.?.keys.len});
-                }
-                srv_cfg.tls_port = h.tls.port;
-                srv_cfg.tls_cert_chain = tls_loaded.?.cert_chain;
-                srv_cfg.tls_signing_key = tls_loaded.?.signing_key;
-                srv_cfg.tls_rsa_signing_key = tls_loaded.?.rsa_signing_key;
-                srv_cfg.tls_ecdsa_signing_key = tls_loaded.?.ecdsa_p256_signing_key;
-                srv_cfg.tls_sni_certs = tls_sni_certs;
-                if (tls_ech_loaded) |e| srv_cfg.tls_ech_keys = e.keys;
-                srv_cfg.tls_raw_public_key = h.tls.raw_public_key;
-                srv_cfg.tls_request_client_cert = h.tls.request_client_cert;
-                srv_cfg.tls_enable_resumption = h.tls.enable_resumption;
-                srv_cfg.tls_early_data_max_size = h.tls.early_data_max_size;
-                std.debug.print("onyx-server: TLS listener enabled on port {d}\n", .{h.tls.port});
-                // kTLS offload (roadmap 3.1): activate kernel record crypto only
-                // when the operator opted in via `[tls] ktls` AND the running
-                // kernel offers the TLS ULP. `tx` offloads server→client encryption;
-                // `txrx` additionally offloads client→server decryption.
-                const ktls_capable = onyx_server.daemon.ktls.probeUlpSupport();
-                const ktls_offload = onyx_server.daemon.config_boot.resolveKtlsOffload(h.tls.ktls, ktls_capable);
-                srv_cfg.tls_ktls_tx = ktls_offload.tx;
-                srv_cfg.tls_ktls_rx = ktls_offload.rx;
-                if (ktls_offload.footgun) |msg| {
-                    std.debug.print("onyx-server: {s}\n", .{msg});
-                } else if (h.tls.ktls != .off) {
-                    if (ktls_capable) {
-                        std.debug.print("onyx-server: kTLS TX offload ACTIVE (tx) — TLS 1.3 record crypto runs in the kernel\n", .{});
-                    } else {
-                        std.debug.print("onyx-server: kTLS {s} requested but this kernel has no TLS ULP — TLS stays in userspace\n", .{@tagName(h.tls.ktls)});
-                    }
-                } else if (ktls_capable) {
-                    std.debug.print("onyx-server: kTLS-capable kernel detected (TLS ULP present); set [tls] ktls=tx to offload server→client encryption\n", .{});
-                } else {
-                    std.debug.print("onyx-server: kTLS unavailable on this kernel (no TLS ULP); TLS stays in userspace\n", .{});
-                }
-                if (h.tls.enable_tls12) {
-                    if (tls_loaded.?.key_kind == .ecdsa_p256) {
-                        // The loaded ECDSA-P256 leaf serves the 1.2 leg natively.
-                        srv_cfg.tls12_cert_chain = tls_loaded.?.cert_chain;
-                        srv_cfg.tls12_signing_key = tls_loaded.?.ecdsa_p256_signing_key;
-                        std.debug.print("onyx-server: hardened TLS 1.2 also accepted (ECDSA-P256 leaf)\n", .{});
-                    } else if (tls_loaded.?.key_kind == .rsa) {
-                        srv_cfg.tls12_cert_chain = tls_loaded.?.cert_chain;
-                        std.debug.print("onyx-server: hardened TLS 1.2 also accepted (RSA leg)\n", .{});
-                    } else {
-                        if (onyx_server.daemon.tls_certs.bootstrapTls12(allocator, init.io, h.tls.dns_name)) |t12| {
-                            tls12_loaded = t12;
-                            srv_cfg.tls12_cert_chain = tls12_loaded.?.cert_chain;
-                            srv_cfg.tls12_signing_key = tls12_loaded.?.key;
-                            std.debug.print("onyx-server: hardened TLS 1.2 also accepted (ECDSA-P256 leg)\n", .{});
-                        } else |err| {
-                            std.debug.print("onyx-server: TLS 1.2 bootstrap failed ({s}); 1.3-only\n", .{@errorName(err)});
-                        }
-                    }
-                }
-            } else |err| {
-                std.debug.print("onyx-server: TLS cert error ({s}); TLS disabled\n", .{@errorName(err)});
-            }
-        }
-    }
-
-    // Native secure-WebSocket (wss) browser listener (`[listen] ws`): rides the
-    // SAME cert chain + signing key loaded for the implicit-TLS listener above,
-    // so the leg is genuine wss under the daemon's real certificate. Browsers
-    // require wss on the production page, so a cert-less ws port is refused
-    // unless the testing-only `[listen] ws_plain` flag is set.
-    if (srv_cfg.ws_enabled) {
-        if (srv_cfg.tls_cert_chain.len != 0) {
-            std.debug.print("onyx-server: WebSocket (wss) listener enabled on port {d}\n", .{srv_cfg.ws_port});
-        } else if (srv_cfg.ws_allow_plain) {
-            std.debug.print("onyx-server: WebSocket listener on port {d} WITHOUT TLS ([listen] ws_plain testing mode)\n", .{srv_cfg.ws_port});
-        } else {
-            srv_cfg.ws_enabled = false;
-            std.debug.print("onyx-server: [listen] ws ignored — no TLS certificate loaded (enable [tls]; browsers require wss)\n", .{});
-        }
-    }
-
     // IRCv3 STS: when an operator enables `[sts]` AND a TLS listener is live,
     // build the advertised wire value so each session's `sts` cap is offered.
     // STS without a live TLS port would strand clients, so require both.
@@ -1414,7 +1723,7 @@ pub fn main(init: std.process.Init) !void {
         if (native_incoming != null) {
             resolver_ctx.record_paths = false;
             try onyx_server.daemon.kernel_other.pledgeInheritedRuntime();
-        } else try installOpenBsdSandbox(allocator, init.io, srv_cfg, if (held) |*h| &h.parsed else null, &resolver_ctx);
+        } else try installOpenBsdSandbox(allocator, init.io, srv_cfg, if (held) |*h| &h.parsed else null, &resolver_ctx, if (managed_incoming) |*incoming| &incoming.state.context else null);
     } else if (comptime builtin.os.tag == .linux or builtin.os.tag == .freebsd or builtin.os.tag == .windows) {
         onyx_server.daemon.server.installDaemonKernelSandbox(srv_cfg.config_path) catch |err| {
             std.debug.print("onyx-server: fatal — kernel sandbox: {s}\n", .{@errorName(err)});
@@ -1476,6 +1785,8 @@ pub fn main(init: std.process.Init) !void {
     // status_request. Needs a real cert file (self-signed bootstrap leaves have
     // no AIA responder URL, so the worker simply no-ops there).
     const OcspStapleService = if ((builtin.os.tag == .linux or builtin.os.tag == .openbsd)) onyx_server.daemon.ocsp_staple.Service else void;
+    var ocsp_trust_anchors: ?OwnedTrustAnchors = null;
+    defer if (ocsp_trust_anchors) |*owner| owner.deinit();
     var ocsp_staple: ?*OcspStapleService = null;
     defer if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd)) {
         if (ocsp_staple) |s| {
@@ -1497,9 +1808,10 @@ pub fn main(init: std.process.Init) !void {
                 };
                 if (bundle_text) |text| {
                     defer allocator.free(text);
-                    if (onyx_server.daemon.acme_cli.loadTrustAnchors(allocator, text)) |anchors| {
-                        trust_anchors = anchors.items;
-                        std.debug.print("onyx-server: [ocsp] using daemon trust store {s} ({d} anchors)\n", .{ h.parsed.acme.ca_bundle_path, anchors.items.len });
+                    if (OwnedTrustAnchors.load(allocator, text)) |anchors| {
+                        ocsp_trust_anchors = anchors;
+                        trust_anchors = ocsp_trust_anchors.?.items();
+                        std.debug.print("onyx-server: [ocsp] using daemon trust store {s} ({d} anchors)\n", .{ h.parsed.acme.ca_bundle_path, trust_anchors.len });
                     } else |err| {
                         if (native_incoming != null) return err;
                         std.debug.print("onyx-server: [ocsp] trust store parse failed ({s}); HTTPS responder fetches fail closed\n", .{@errorName(err)});
@@ -1523,6 +1835,8 @@ pub fn main(init: std.process.Init) !void {
     // Offline DMs (memo) nudge the recipient's browser through their push
     // service — payloads are RFC 8291-encrypted end-to-end to the browser.
     const WebpushWorker = if ((builtin.os.tag == .linux or builtin.os.tag == .openbsd)) onyx_server.daemon.webpush.Worker else void;
+    var webpush_trust_anchors: ?OwnedTrustAnchors = null;
+    defer if (webpush_trust_anchors) |*owner| owner.deinit();
     var webpush_worker: ?*WebpushWorker = null;
     var webpush_resolver: ?*onyx_server.daemon.acme_runner.SystemResolver = null;
     defer if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd)) {
@@ -1546,12 +1860,14 @@ pub fn main(init: std.process.Init) !void {
                     break :webpush_blk;
                 };
                 defer allocator.free(bundle_text);
-                const anchors = onyx_server.daemon.acme_cli.loadTrustAnchors(allocator, bundle_text) catch |err| {
+                webpush_trust_anchors = OwnedTrustAnchors.load(allocator, bundle_text) catch |err| {
                     if (native_incoming != null) return err;
                     std.debug.print("onyx-server: [webpush] trust anchors failed ({s}); web push disabled\n", .{@errorName(err)});
                     break :webpush_blk;
                 };
                 const vapid = webpush_vapid orelse {
+                    webpush_trust_anchors.?.deinit();
+                    webpush_trust_anchors = null;
                     std.debug.print("onyx-server: [webpush] no VAPID key; web push disabled\n", .{});
                     break :webpush_blk;
                 };
@@ -1569,10 +1885,10 @@ pub fn main(init: std.process.Init) !void {
                     .vapid = vapid.key_pair,
                     .subject = h.parsed.webpush.subject,
                     .resolver = resolver.resolver(),
-                    .trust_anchors = anchors.items,
+                    .trust_anchors = webpush_trust_anchors.?.items(),
                 };
                 webpush_worker = w;
-                std.debug.print("onyx-server: web push live ({d} trust anchors; VAPID {s})\n", .{ anchors.items.len, srv_cfg.webpush_vapid_pub });
+                std.debug.print("onyx-server: web push live ({d} trust anchors; VAPID {s})\n", .{ webpush_trust_anchors.?.items().len, srv_cfg.webpush_vapid_pub });
             } else {
                 std.debug.print("onyx-server: [webpush] enabled but {s}\n", .{onyx_server.daemon.webpush.portable_disable_reason});
             }
@@ -1691,4 +2007,30 @@ pub fn main(init: std.process.Init) !void {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         if (srv.runtimeFailure()) |err| return err;
     }
+}
+
+// Public test vector shared with x509_selfsign's RSA certificate controls.
+test "managed boot: RSA leaf binds exact unsigned modulus and exponent" {
+    const Decode = struct {
+        fn bytes(comptime hex: []const u8) [hex.len / 2]u8 {
+            var result: [hex.len / 2]u8 = undefined;
+            _ = std.fmt.hexToBytes(&result, hex) catch unreachable;
+            return result;
+        }
+    };
+    const rsa_n = Decode.bytes("a0bd1304a87f0a69b8ef18eaa1da15522c221b1e9b1efaee23bea1faa7eaaefe1e09eba390ec9334aea9457530d40c6a6b89c039865e98dd9d7491ea57288debf370f796fe05904a589027272fc9bd803fcf9d228c5552da7ff4f2a25c1606b3a4794f4ffa5bd94ab2150026dbcd31c4f4a5755d449a7aaf41861ff069fa455563cb22de14114aff8085fc3d3c07bc929d761f6449c1a13975738c9876319599f88bd3676230802d76b7292ad0759dad8fc70ee18fded69e32216a7f52833f1138caa7f90307c236500c3aa1a6cd082097fc3e28609b8d33514f16d6687bed504aee82775a41e4b125eba9ca544dc375c29c19d20f10900301eea8e68be3b3d7");
+    const rsa_e = Decode.bytes("010001");
+    const rsa_d = Decode.bytes("12036e6cb0b76002de1b49770e01632f4ccbdbaf2fe2266be6ac97f97fb4f0bc80c04adc8f42bbf284fa6a52ca50913da1e4939abec0be2fe3d3eb0050993662716b410bf656c84754aa7f00c8bdba93735340805d2ab8b8cceb35ffd50310e833eff65ff7a630714b08c876125eea0b710153e84a6667865978fefe51da1ec7d7cfc1afb96c4223b187b49cb6305be1a2eccbb8d07ed016bc257908bec7daf322658bda2dc4abd3671ffa6919da8b86ecbefa2658c3c01bacee5c9cff02f1cbac3f05feb2d68c61ef9a5427f73edb1949f776350bd63475c3cb78c5605b094d5043756e894bf538e811903212b6990a75153e261a36630657f8b91dfdadf45d");
+    const private: onyx_server.crypto.rsa_sign.PrivateKey = .{ .n = &rsa_n, .e = &rsa_e, .d = &rsa_d };
+    var der: [4096]u8 = undefined;
+    const leaf = try onyx_server.proto.x509_selfsign.buildSelfSignedRsa(&der, .{ .common_name = "managed-rsa.test", .not_before = 1700000000, .not_after = 1900000000, .serial = &.{3}, .public_modulus = private.n, .public_exponent = private.e, .private_key = private });
+    try validateTlsIdentity(&.{leaf}, null, null, private);
+    var wrong = private;
+    var different_modulus = rsa_n;
+    different_modulus[10] ^= 1;
+    wrong.n = &different_modulus;
+    try std.testing.expectError(error.TlsKeyMismatch, validateTlsIdentity(&.{leaf}, null, null, wrong));
+    wrong = private;
+    wrong.e = &.{ 1, 0, 3 };
+    try std.testing.expectError(error.TlsKeyMismatch, validateTlsIdentity(&.{leaf}, null, null, wrong));
 }

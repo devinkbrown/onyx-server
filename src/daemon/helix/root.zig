@@ -21,6 +21,7 @@ pub const native_exchange = @import("native_exchange.zig");
 pub const native_manifest = @import("native_manifest.zig");
 pub const native_process = @import("native_process.zig");
 pub const native_bootstrap = @import("native_bootstrap.zig");
+pub const native_service_snapshot = @import("native_service_snapshot.zig");
 
 // State-migration capsules (one schema per resumable subsystem).
 pub const conn_capsule = @import("conn_capsule.zig");
@@ -78,6 +79,7 @@ test {
     _ = native_manifest;
     _ = native_process;
     _ = native_bootstrap;
+    _ = native_service_snapshot;
     std.testing.refAllDecls(@This());
     _ = thread_snapshot;
     _ = schedule_snapshot;
@@ -93,11 +95,13 @@ test "section 10 drops unused memo away and ratelimit codecs" {
     try std.testing.expectEqual(@as(u8, 1), @intFromEnum(capsule.CapsuleKind.clients));
     try std.testing.expectEqual(@as(u8, 17), @intFromEnum(capsule.CapsuleKind.handoff_manifest));
     try std.testing.expectEqual(capsule.CapsuleKind.handoff_manifest, try capsule.CapsuleKind.fromByte(17));
-    try std.testing.expectError(error.UnknownKind, capsule.CapsuleKind.fromByte(18));
-    try std.testing.expectEqual(@as(usize, 17), @typeInfo(capsule.CapsuleKind).@"enum".field_names.len);
+    try std.testing.expectEqual(@as(u8, 18), @intFromEnum(capsule.CapsuleKind.native_service));
+    try std.testing.expectEqual(capsule.CapsuleKind.native_service, try capsule.CapsuleKind.fromByte(18));
+    try std.testing.expectError(error.UnknownKind, capsule.CapsuleKind.fromByte(19));
+    try std.testing.expectEqual(@as(usize, 18), @typeInfo(capsule.CapsuleKind).@"enum".field_names.len);
 
     std.debug.print(
-        "section 10 branch=stop maintaining memo_capsule away_capsule and ratelimit_capsule; CapsuleKind stays 1 through 17; ban_capsule stays\n",
+        "section 10 branch=stop maintaining memo_capsule away_capsule and ratelimit_capsule; CapsuleKind 1 through 18 includes strict native service; ban_capsule stays\n",
         .{},
     );
 }

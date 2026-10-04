@@ -75,6 +75,7 @@ pub const metrics = @import("metrics.zig");
 pub const minhash = @import("minhash.zig");
 pub const multipath = @import("multipath.zig");
 pub const native_feedback = @import("native_feedback.zig");
+pub const media_capability = @import("media_capability.zig");
 pub const native_media_plane = @import("native_media_plane.zig");
 pub const object_pool = @import("object_pool.zig");
 pub const pacing = @import("pacing.zig");
@@ -218,6 +219,7 @@ test {
     _ = minhash;
     _ = multipath;
     _ = native_feedback;
+    _ = media_capability;
     _ = native_media_plane;
     _ = object_pool;
     _ = pacing;

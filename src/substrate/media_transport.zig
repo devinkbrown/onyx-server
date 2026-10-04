@@ -92,6 +92,19 @@ fn ufragKey(ufrag: []const u8) ?UfragKey {
     return key;
 }
 
+fn validateAddress(addr: TransportAddress) !void {
+    if (addr.ip_len != 0 and addr.ip_len != 4 and addr.ip_len != 16) return error.InvalidSnapshot;
+    for (addr.ip[addr.ip_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+}
+
+fn snapshotBaseBytes(endpoints: usize, ufrags: usize, addresses: usize, ssrcs: usize, groups: usize) !usize {
+    if (endpoints > std.math.maxInt(u32) or ufrags > endpoints or addresses > endpoints or ssrcs > endpoints or groups > std.math.maxInt(u32)) return error.Capacity;
+    var bytes: usize = @sizeOf(MediaTransport.Snapshot);
+    inline for (.{ .{ endpoints, @sizeOf(MediaTransport.SnapshotEndpoint) }, .{ ufrags, @sizeOf(MediaTransport.UfragIndex) }, .{ addresses, @sizeOf(MediaTransport.AddressIndex) }, .{ ssrcs, @sizeOf(MediaTransport.SsrcIndex) }, .{ groups, @sizeOf(MediaTransport.SnapshotGroup) } }) |pair|
+        bytes = std.math.add(usize, bytes, std.math.mul(usize, pair[0], pair[1]) catch return error.Capacity) catch return error.Capacity;
+    return bytes;
+}
+
 pub const MediaTransport = struct {
     allocator: std.mem.Allocator,
     /// Composite "channel\x00participant" -> Endpoint.
@@ -106,6 +119,212 @@ pub const MediaTransport = struct {
     /// distributed to every participant; dropped when the call empties.
     group_keys: std.StringHashMapUnmanaged([group_key_len]u8) = .empty,
 
+    pub const SnapshotLimits = struct { max_endpoints: usize, max_groups: usize, max_bytes: usize };
+    pub const SnapshotEndpoint = struct {
+        key: []u8,
+        ufrag: UfragKey,
+        pwd: [pwd_len]u8,
+        remote: ?TransportAddress,
+        max_spatial: u8,
+        ssrc: u32,
+        rx_packets: u64,
+        rx_bytes: u64,
+        rtx: rtp_nack.RetransmitBuffer.Snapshot,
+    };
+    pub const UfragIndex = struct { key: UfragKey, endpoint: usize };
+    pub const AddressIndex = struct { key: AddrKey, endpoint: usize };
+    pub const SsrcIndex = struct { key: u32, endpoint: usize };
+    pub const SnapshotGroup = struct { channel: []u8, key: [group_key_len]u8 };
+    /// Includes the EXACT accepted secondary maps, including missing best-effort
+    /// indexes. Restoration never grants a route merely from Endpoint.remote.
+    pub const Snapshot = struct {
+        allocator: std.mem.Allocator,
+        endpoints: []SnapshotEndpoint,
+        ufrags: []UfragIndex,
+        addresses: []AddressIndex,
+        ssrcs: []SsrcIndex,
+        groups: []SnapshotGroup,
+
+        pub fn deinit(self: *Snapshot) void {
+            for (self.endpoints) |*row| {
+                self.allocator.free(row.key);
+                row.rtx.deinit();
+                std.crypto.secureZero(u8, &row.ufrag);
+                std.crypto.secureZero(u8, &row.pwd);
+            }
+            for (self.groups) |*row| {
+                self.allocator.free(row.channel);
+                std.crypto.secureZero(u8, &row.key);
+            }
+            self.allocator.free(self.endpoints);
+            self.allocator.free(self.ufrags);
+            self.allocator.free(self.addresses);
+            self.allocator.free(self.ssrcs);
+            self.allocator.free(self.groups);
+            self.* = undefined;
+        }
+
+        fn endpointIndex(self: *const Snapshot, key: []const u8) !usize {
+            var lo: usize = 0;
+            var hi = self.endpoints.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                switch (std.mem.order(u8, self.endpoints[mid].key, key)) {
+                    .eq => return mid,
+                    .lt => lo = mid + 1,
+                    .gt => hi = mid,
+                }
+            }
+            return error.InvalidSnapshot;
+        }
+
+        pub fn validate(self: *const Snapshot, limits: SnapshotLimits) !void {
+            if (self.endpoints.len > limits.max_endpoints or self.groups.len > limits.max_groups or self.ufrags.len > self.endpoints.len or self.addresses.len > self.endpoints.len or self.ssrcs.len > self.endpoints.len) return error.Capacity;
+            var bytes = try snapshotBaseBytes(self.endpoints.len, self.ufrags.len, self.addresses.len, self.ssrcs.len, self.groups.len);
+            for (self.endpoints, 0..) |row, i| {
+                if (row.key.len > 256 or std.mem.indexOfScalar(u8, row.key, 0) == null or (i != 0 and std.mem.order(u8, self.endpoints[i - 1].key, row.key) != .lt)) return error.InvalidSnapshot;
+                for (row.ufrag) |byte| if (std.mem.indexOfScalar(u8, ufrag_alphabet, byte) == null) return error.InvalidSnapshot;
+                for (row.pwd) |byte| if (std.mem.indexOfScalar(u8, ufrag_alphabet, byte) == null) return error.InvalidSnapshot;
+                if (row.remote) |remote| try validateAddress(remote);
+                try row.rtx.validate(rtx_capacity, limits.max_bytes);
+                bytes = std.math.add(usize, bytes, row.key.len) catch return error.Capacity;
+                bytes = std.math.add(usize, bytes, std.math.mul(usize, row.rtx.packets.len, @sizeOf(rtp_nack.RetransmitBuffer.Snapshot.Packet)) catch return error.Capacity) catch return error.Capacity;
+                for (row.rtx.packets) |packet| bytes = std.math.add(usize, bytes, packet.bytes.len) catch return error.Capacity;
+            }
+            for (self.ufrags, 0..) |row, i| {
+                if (row.endpoint >= self.endpoints.len or !std.mem.eql(u8, &row.key, &self.endpoints[row.endpoint].ufrag) or (i != 0 and std.mem.order(u8, &self.ufrags[i - 1].key, &row.key) != .lt)) return error.InvalidSnapshot;
+            }
+            for (self.addresses, 0..) |row, i| {
+                if (row.endpoint >= self.endpoints.len or (i != 0 and std.mem.order(u8, &self.addresses[i - 1].key, &row.key) != .lt)) return error.InvalidSnapshot;
+                const remote = self.endpoints[row.endpoint].remote orelse return error.InvalidSnapshot;
+                if (!std.mem.eql(u8, &row.key, &addrKey(remote))) return error.InvalidSnapshot;
+            }
+            for (self.ssrcs, 0..) |row, i| {
+                if (row.endpoint >= self.endpoints.len or row.key == 0 or self.endpoints[row.endpoint].ssrc != row.key or (i != 0 and self.ssrcs[i - 1].key >= row.key)) return error.InvalidSnapshot;
+            }
+            for (self.groups, 0..) |row, i| {
+                if (i != 0 and std.mem.order(u8, self.groups[i - 1].channel, row.channel) != .lt) return error.InvalidSnapshot;
+                bytes = std.math.add(usize, bytes, row.channel.len) catch return error.Capacity;
+            }
+            if (bytes > limits.max_bytes) return error.Capacity;
+        }
+    };
+
+    pub fn capture(self: *const MediaTransport, allocator: std.mem.Allocator, limits: SnapshotLimits) !Snapshot {
+        if (self.endpoints.count() > limits.max_endpoints or self.group_keys.count() > limits.max_groups) return error.Capacity;
+        // Preflight aggregate bytes from live borrowed storage before allocating.
+        var bytes = try snapshotBaseBytes(self.endpoints.count(), self.by_ufrag.count(), self.by_addr.count(), self.by_ssrc.count(), self.group_keys.count());
+        var pre = self.endpoints.iterator();
+        while (pre.next()) |row| {
+            bytes = std.math.add(usize, bytes, row.key_ptr.len) catch return error.Capacity;
+            bytes = std.math.add(usize, bytes, std.math.mul(usize, row.value_ptr.rtx.packets.items.len, @sizeOf(rtp_nack.RetransmitBuffer.Snapshot.Packet)) catch return error.Capacity) catch return error.Capacity;
+            for (row.value_ptr.rtx.packets.items) |packet| bytes = std.math.add(usize, bytes, packet.bytes.len) catch return error.Capacity;
+        }
+        var pg = self.group_keys.keyIterator();
+        while (pg.next()) |key| bytes = std.math.add(usize, bytes, key.len) catch return error.Capacity;
+        if (bytes > limits.max_bytes) return error.Capacity;
+        const endpoints = try allocator.alloc(SnapshotEndpoint, self.endpoints.count());
+        errdefer allocator.free(endpoints);
+        var initialized: usize = 0;
+        errdefer for (endpoints[0..initialized]) |*row| {
+            allocator.free(row.key);
+            row.rtx.deinit();
+            std.crypto.secureZero(u8, &row.ufrag);
+            std.crypto.secureZero(u8, &row.pwd);
+        };
+        var it = self.endpoints.iterator();
+        while (it.next()) |row| {
+            const key = try allocator.dupe(u8, row.key_ptr.*);
+            errdefer allocator.free(key);
+            const rtx = try row.value_ptr.rtx.capture(allocator, limits.max_bytes);
+            endpoints[initialized] = .{ .key = key, .ufrag = row.value_ptr.ufrag, .pwd = row.value_ptr.pwd, .remote = row.value_ptr.remote, .max_spatial = row.value_ptr.max_spatial, .ssrc = row.value_ptr.ssrc, .rx_packets = row.value_ptr.rx_packets, .rx_bytes = row.value_ptr.rx_bytes, .rtx = rtx };
+            initialized += 1;
+        }
+        std.mem.sort(SnapshotEndpoint, endpoints, {}, struct {
+            fn less(_: void, a: SnapshotEndpoint, b: SnapshotEndpoint) bool {
+                return std.mem.order(u8, a.key, b.key) == .lt;
+            }
+        }.less);
+        const ufrags = try allocator.alloc(UfragIndex, self.by_ufrag.count());
+        errdefer allocator.free(ufrags);
+        const addresses = try allocator.alloc(AddressIndex, self.by_addr.count());
+        errdefer allocator.free(addresses);
+        const ssrcs = try allocator.alloc(SsrcIndex, self.by_ssrc.count());
+        errdefer allocator.free(ssrcs);
+        const groups = try allocator.alloc(SnapshotGroup, self.group_keys.count());
+        errdefer allocator.free(groups);
+        var group_count: usize = 0;
+        errdefer for (groups[0..group_count]) |*row| {
+            allocator.free(row.channel);
+            std.crypto.secureZero(u8, &row.key);
+        };
+        var snapshot: Snapshot = .{ .allocator = allocator, .endpoints = endpoints, .ufrags = ufrags, .addresses = addresses, .ssrcs = ssrcs, .groups = groups };
+        var ui = self.by_ufrag.iterator();
+        var i: usize = 0;
+        while (ui.next()) |row| : (i += 1) ufrags[i] = .{ .key = row.key_ptr.*, .endpoint = try self.snapshotOwnedIndex(&snapshot, row.value_ptr.*) };
+        var ai = self.by_addr.iterator();
+        i = 0;
+        while (ai.next()) |row| : (i += 1) addresses[i] = .{ .key = row.key_ptr.*, .endpoint = try self.snapshotOwnedIndex(&snapshot, row.value_ptr.*) };
+        var si = self.by_ssrc.iterator();
+        i = 0;
+        while (si.next()) |row| : (i += 1) ssrcs[i] = .{ .key = row.key_ptr.*, .endpoint = try self.snapshotOwnedIndex(&snapshot, row.value_ptr.*) };
+        std.mem.sort(UfragIndex, ufrags, {}, struct {
+            fn less(_: void, a: UfragIndex, b: UfragIndex) bool {
+                return std.mem.order(u8, &a.key, &b.key) == .lt;
+            }
+        }.less);
+        std.mem.sort(AddressIndex, addresses, {}, struct {
+            fn less(_: void, a: AddressIndex, b: AddressIndex) bool {
+                return std.mem.order(u8, &a.key, &b.key) == .lt;
+            }
+        }.less);
+        std.mem.sort(SsrcIndex, ssrcs, {}, struct {
+            fn less(_: void, a: SsrcIndex, b: SsrcIndex) bool {
+                return a.key < b.key;
+            }
+        }.less);
+        var gi = self.group_keys.iterator();
+        while (gi.next()) |row| {
+            groups[group_count] = .{ .channel = try allocator.dupe(u8, row.key_ptr.*), .key = row.value_ptr.* };
+            group_count += 1;
+        }
+        std.mem.sort(SnapshotGroup, groups, {}, struct {
+            fn less(_: void, a: SnapshotGroup, b: SnapshotGroup) bool {
+                return std.mem.order(u8, a.channel, b.channel) == .lt;
+            }
+        }.less);
+        try snapshot.validate(limits);
+        return snapshot;
+    }
+
+    fn snapshotOwnedIndex(self: *const MediaTransport, snapshot: *const Snapshot, key: []const u8) !usize {
+        const owned = self.endpoints.getKey(key) orelse return error.InvalidSnapshot;
+        if (owned.ptr != key.ptr or owned.len != key.len) return error.InvalidSnapshot;
+        return snapshot.endpointIndex(key);
+    }
+
+    pub fn prepareRestore(allocator: std.mem.Allocator, snapshot: *const Snapshot, limits: SnapshotLimits) !MediaTransport {
+        try snapshot.validate(limits);
+        var candidate = init(allocator);
+        errdefer candidate.deinit();
+        try candidate.endpoints.ensureTotalCapacity(allocator, @intCast(snapshot.endpoints.len));
+        try candidate.by_ufrag.ensureTotalCapacity(allocator, @intCast(snapshot.ufrags.len));
+        try candidate.by_addr.ensureTotalCapacity(allocator, @intCast(snapshot.addresses.len));
+        try candidate.by_ssrc.ensureTotalCapacity(allocator, @intCast(snapshot.ssrcs.len));
+        try candidate.group_keys.ensureTotalCapacity(allocator, @intCast(snapshot.groups.len));
+        for (snapshot.endpoints) |row| {
+            const key = try allocator.dupe(u8, row.key);
+            errdefer allocator.free(key);
+            const rtx = try rtp_nack.RetransmitBuffer.prepareRestore(allocator, &row.rtx, rtx_capacity, limits.max_bytes);
+            candidate.endpoints.putAssumeCapacity(key, .{ .ufrag = row.ufrag, .pwd = row.pwd, .remote = row.remote, .max_spatial = row.max_spatial, .ssrc = row.ssrc, .rx_packets = row.rx_packets, .rx_bytes = row.rx_bytes, .rtx = rtx });
+        }
+        for (snapshot.ufrags) |row| candidate.by_ufrag.putAssumeCapacity(row.key, candidate.endpoints.getKey(snapshot.endpoints[row.endpoint].key).?);
+        for (snapshot.addresses) |row| candidate.by_addr.putAssumeCapacity(row.key, candidate.endpoints.getKey(snapshot.endpoints[row.endpoint].key).?);
+        for (snapshot.ssrcs) |row| candidate.by_ssrc.putAssumeCapacity(row.key, candidate.endpoints.getKey(snapshot.endpoints[row.endpoint].key).?);
+        for (snapshot.groups) |row| candidate.group_keys.putAssumeCapacity(try allocator.dupe(u8, row.channel), row.key);
+        return candidate;
+    }
+
     pub fn init(allocator: std.mem.Allocator) MediaTransport {
         return .{ .allocator = allocator };
     }
@@ -115,13 +334,18 @@ pub const MediaTransport = struct {
         while (it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
             e.value_ptr.rtx.deinit();
+            std.crypto.secureZero(u8, &e.value_ptr.ufrag);
+            std.crypto.secureZero(u8, &e.value_ptr.pwd);
         }
         self.endpoints.deinit(self.allocator);
         self.by_ufrag.deinit(self.allocator);
         self.by_addr.deinit(self.allocator);
         self.by_ssrc.deinit(self.allocator);
-        var gk = self.group_keys.keyIterator();
-        while (gk.next()) |k| self.allocator.free(k.*);
+        var gk = self.group_keys.iterator();
+        while (gk.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            std.crypto.secureZero(u8, entry.value_ptr);
+        }
         self.group_keys.deinit(self.allocator);
         self.* = undefined;
     }
@@ -267,6 +491,52 @@ pub const MediaTransport = struct {
         return n;
     }
 
+    /// A complete traversal borrowed from one immutable endpoint topology.
+    /// The caller must hold its registry exclusion from begin through the last
+    /// chunk; neither this iterator nor its borrowed names may escape that cut.
+    /// Chunk size bounds stack storage, never the number of eligible recipients.
+    pub const ForwardCursor = struct {
+        iterator: std.StringHashMapUnmanaged(Endpoint).Iterator,
+        channel: []const u8,
+        sender: []const u8,
+        spatial: u8,
+        visited: usize = 0,
+        delivered: usize = 0,
+
+        pub fn nextChunk(self: *ForwardCursor, out: []TransportAddress) usize {
+            var count: usize = 0;
+            while (count < out.len) {
+                const entry = self.iterator.next() orelse break;
+                self.visited += 1;
+                const key = entry.key_ptr.*;
+                const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
+                if (!std.mem.eql(u8, key[0..sep], self.channel) or
+                    std.mem.eql(u8, key[sep + 1 ..], self.sender) or
+                    self.spatial > entry.value_ptr.max_spatial) continue;
+                out[count] = entry.value_ptr.remote orelse continue;
+                count += 1;
+                self.delivered += 1;
+            }
+            return count;
+        }
+    };
+
+    /// Admit/meter/cache the source once, then capture one complete traversal.
+    /// Must be called under the same exclusion used for every nextChunk call.
+    pub fn beginForwardFromSource(self: *MediaTransport, source: TransportAddress, packet: []const u8, ssrc: u32, seq: ?u16) ?ForwardCursor {
+        const key = self.by_addr.get(addrKey(source)) orelse return null;
+        const ep = self.endpoints.getPtr(key) orelse return null;
+        const sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
+        ep.rx_packets += 1;
+        ep.rx_bytes += packet.len;
+        if (ssrc != 0 and ep.ssrc == 0) {
+            ep.ssrc = ssrc;
+            self.by_ssrc.put(self.allocator, ssrc, key) catch {};
+        }
+        if (seq) |sequence| ep.rtx.onSent(sequence, packet) catch {};
+        return .{ .iterator = self.endpoints.iterator(), .channel = key[0..sep], .sender = key[sep + 1 ..], .spatial = rtpSpatialLayer(packet) };
+    }
+
     /// Convert an ICE transport address into a STUN address (null if the IP
     /// length is neither 4 nor 16 octets).
     fn toStunAddress(a: TransportAddress) ?stun.Address {
@@ -332,18 +602,8 @@ pub const MediaTransport = struct {
     /// time it is seen, and indexed for NACK source resolution. `seq` non-null
     /// (RTP only) caches the packet for retransmission.
     pub fn forwardFromSource(self: *MediaTransport, source: TransportAddress, packet: []const u8, ssrc: u32, seq: ?u16, out: []TransportAddress) usize {
-        const key = self.by_addr.get(addrKey(source)) orelse return 0;
-        if (self.endpoints.getPtr(key)) |ep| {
-            ep.rx_packets += 1;
-            ep.rx_bytes += packet.len;
-            if (ssrc != 0 and ep.ssrc == 0) {
-                ep.ssrc = ssrc;
-                self.by_ssrc.put(self.allocator, ssrc, key) catch {};
-            }
-            if (seq) |s| ep.rtx.onSent(s, packet) catch {};
-        }
-        const sep = std.mem.indexOfScalar(u8, key, 0) orelse return 0;
-        return self.forwardTargets(key[0..sep], key[sep + 1 ..], rtpSpatialLayer(packet), out);
+        var cursor = self.beginForwardFromSource(source, packet, ssrc, seq) orelse return 0;
+        return cursor.nextChunk(out);
     }
 
     /// Spatial layer from the one-byte RTP extension. No extension, a short
@@ -758,4 +1018,144 @@ test "remove drops the endpoint and its ufrag index" {
     mt.remove("#c", "alice");
     try testing.expect(mt.get("#c", "alice") == null);
     try testing.expect(mt.byServerUfrag(&ufrag) == null);
+}
+
+fn mediaTransportDtoSweep(allocator: std.mem.Allocator) !void {
+    var old = MediaTransport.init(testing.allocator);
+    defer old.deinit();
+    var random = std.Random.DefaultPrng.init(0xDA70);
+    _ = try old.allocate("#call", "source", random.random());
+    _ = try old.allocate("#call", "receiver", random.random());
+    const source = testAddr(1, 9100);
+    try testing.expect(old.bindRemote("#call", "source", source));
+    try testing.expect(old.bindRemote("#call", "receiver", testAddr(2, 9101)));
+    try testing.expect(old.setReceiverSpatial("#call", "receiver", 1));
+    const group = old.ensureGroupKey("#call", random.random());
+    var packet: [16]u8 = @splat(0);
+    packet[0] = 0x80;
+    packet[1] = 96;
+    std.mem.writeInt(u16, packet[2..4], 65535, .big);
+    std.mem.writeInt(u32, packet[8..12], 0xFA70, .big);
+    @memcpy(packet[12..], "real");
+    var targets: [8]TransportAddress = undefined;
+    try testing.expectEqual(@as(usize, 1), old.forwardFromSource(source, &packet, 0xFA70, 65535, &targets));
+    // A missing best-effort demux row is genuine negative routing state.
+    const receiver = old.get("#call", "receiver").?;
+    _ = old.by_ufrag.remove(receiver.ufrag);
+    const missing = receiver.ufrag;
+    const limits: MediaTransport.SnapshotLimits = .{ .max_endpoints = 8, .max_groups = 8, .max_bytes = 1 << 20 };
+    const old_key = old.endpoints.getKey("#call\x00source").?.ptr;
+    const old_packet = old.get("#call", "source").?.rtx.lookup(65535).?.ptr;
+    var before = try old.capture(testing.allocator, limits);
+    defer before.deinit();
+    defer {
+        std.debug.assert(old.endpoints.getKey("#call\x00source").?.ptr == old_key and old.get("#call", "source").?.rtx.lookup(65535).?.ptr == old_packet);
+        var current = old.capture(testing.allocator, limits) catch unreachable;
+        defer current.deinit();
+        testing.expectEqualDeep(before.endpoints, current.endpoints) catch unreachable;
+        testing.expectEqualDeep(before.groups, current.groups) catch unreachable;
+        testing.expectEqualDeep(before.ufrags, current.ufrags) catch unreachable;
+        testing.expectEqualDeep(before.addresses, current.addresses) catch unreachable;
+        testing.expectEqualDeep(before.ssrcs, current.ssrcs) catch unreachable;
+    }
+    var carry = old.capture(allocator, limits) catch |err| {
+        var retry = try old.capture(testing.allocator, limits);
+        defer retry.deinit();
+        return err;
+    };
+    defer carry.deinit();
+    var candidate = MediaTransport.prepareRestore(allocator, &carry, limits) catch |err| {
+        var retry = try MediaTransport.prepareRestore(testing.allocator, &carry, limits);
+        defer retry.deinit();
+        return err;
+    };
+    defer candidate.deinit();
+    try testing.expect(candidate.byServerUfrag(&missing) == null);
+    try testing.expectEqualStrings("#call", candidate.channelForSource(source).?);
+    try testing.expectEqualSlices(u8, &group, &candidate.group_keys.get("#call").?);
+    var cached: [128]u8 = undefined;
+    const size = candidate.copyRetransmit(0xFA70, 65535, &cached) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &packet, cached[0..size]);
+    try testing.expectEqual(@as(u64, 1), candidate.get("#call", "source").?.rx_packets);
+    try testing.expectEqual(@as(u8, 1), candidate.get("#call", "receiver").?.max_spatial);
+    // The legacy best-effort onSent path intentionally swallows its own OOM;
+    // keep the capture/restore failure sweep restricted to fallible DTO work.
+    // Exercise future mutation on a separate real restored owner whose backend
+    // is not the injected capture/restore failure index.
+    var continuation = try MediaTransport.prepareRestore(testing.allocator, &carry, limits);
+    defer continuation.deinit();
+    std.mem.writeInt(u16, packet[2..4], 0, .big);
+    try testing.expectEqual(@as(usize, 1), continuation.forwardFromSource(source, &packet, 0xFA70, 0, &targets));
+    try testing.expectEqual(@as(?i64, 65536), continuation.get("#call", "source").?.rtx.newest_ext_seq);
+}
+
+test "active media DTO transport complete ICE indexes group secrets NACK and all allocation rollback" {
+    try testing.checkAllAllocationFailures(testing.allocator, mediaTransportDtoSweep, .{});
+}
+
+test "active media DTO transport malformed selectors and aggregate bounds refuse before allocation" {
+    var old = MediaTransport.init(testing.allocator);
+    defer old.deinit();
+    var random = std.Random.DefaultPrng.init(0xDA71);
+    _ = try old.allocate("#call", "source", random.random());
+    const source = testAddr(1, 9200);
+    try testing.expect(old.bindRemote("#call", "source", source));
+    const limits: MediaTransport.SnapshotLimits = .{ .max_endpoints = 8, .max_groups = 8, .max_bytes = 1 << 20 };
+    var carry = try old.capture(testing.allocator, limits);
+    defer carry.deinit();
+    var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const selected = carry.addresses[0].endpoint;
+    carry.addresses[0].endpoint = carry.endpoints.len;
+    try testing.expectError(error.InvalidSnapshot, MediaTransport.prepareRestore(fail.allocator(), &carry, limits));
+    carry.addresses[0].endpoint = selected;
+    const saved = carry.endpoints[0].pwd[0];
+    carry.endpoints[0].pwd[0] = '!';
+    try testing.expectError(error.InvalidSnapshot, MediaTransport.prepareRestore(fail.allocator(), &carry, limits));
+    carry.endpoints[0].pwd[0] = saved;
+    try testing.expectError(error.Capacity, MediaTransport.prepareRestore(fail.allocator(), &carry, .{ .max_endpoints = 0, .max_groups = 8, .max_bytes = limits.max_bytes }));
+    try testing.expectError(error.Capacity, MediaTransport.prepareRestore(fail.allocator(), &carry, .{ .max_endpoints = 8, .max_groups = 8, .max_bytes = 1 }));
+    try testing.expectEqual(@as(usize, 0), fail.alloc_index);
+}
+
+test "active media dispatch complete traversal chunks every eligible endpoint once and meters source once" {
+    var prng = std.Random.DefaultPrng.init(0xCA11);
+    var mt = MediaTransport.init(testing.allocator);
+    defer mt.deinit();
+    _ = try mt.allocate("#all", "sender", prng.random());
+    const source = testAddr(1, 6001);
+    try testing.expect(mt.bindRemote("#all", "sender", source));
+    for (0..130) |i| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "receiver-{d}", .{i});
+        _ = try mt.allocate("#all", name, prng.random());
+        try testing.expect(mt.bindRemote("#all", name, testAddr(2, @intCast(7000 + i))));
+    }
+    _ = try mt.allocate("#all", "unbound", prng.random());
+    _ = try mt.allocate("#foreign", "bound", prng.random());
+    try testing.expect(mt.bindRemote("#foreign", "bound", testAddr(3, 9000)));
+    const packet = [_]u8{ 0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 99 };
+    var cursor = mt.beginForwardFromSource(source, &packet, 99, 1) orelse return error.TestUnexpectedResult;
+    var empty_chunk: [0]TransportAddress = .{};
+    try testing.expectEqual(@as(usize, 0), cursor.nextChunk(&empty_chunk));
+    var targets: [17]TransportAddress = undefined;
+    var seen: [130]bool = @splat(false);
+    while (true) {
+        const count = cursor.nextChunk(&targets);
+        if (count == 0) break;
+        for (targets[0..count]) |address| {
+            try testing.expect(address.port >= 7000 and address.port < 7130);
+            const index = address.port - 7000;
+            try testing.expect(!seen[index]);
+            seen[index] = true;
+        }
+    }
+    for (seen) |present| try testing.expect(present);
+    try testing.expectEqual(mt.endpoints.count(), cursor.visited);
+    try testing.expectEqual(@as(usize, 130), cursor.delivered);
+    const sender = mt.get("#all", "sender").?;
+    try testing.expectEqual(@as(u64, 1), sender.rx_packets);
+    try testing.expectEqual(@as(u64, packet.len), sender.rx_bytes);
+    try testing.expectEqual(@as(usize, 1), sender.rtx.packets.items.len);
+    try testing.expect(mt.beginForwardFromSource(testAddr(9, 9999), &packet, 99, 1) == null);
+    try testing.expectEqual(@as(u64, 1), sender.rx_packets);
 }

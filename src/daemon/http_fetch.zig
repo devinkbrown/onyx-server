@@ -19,6 +19,7 @@ const posix = std.posix;
 const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
 const tls_client = @import("../crypto/tls_client.zig");
+const tls_client_failure = @import("tls_client_failure.zig");
 const tls12_client = @import("../crypto/tls12_client.zig");
 const sct = @import("../crypto/sct.zig");
 const http1 = @import("../proto/http1_client.zig");
@@ -122,19 +123,18 @@ pub fn get(
     }
 
     // Try TLS 1.3 first (the preferred client). Many RSS/CDN hosts still serve
-    // TLS 1.2 only (or trip the 1.3 client), so on any handshake/transport
-    // failure fall back to the hardened TLS 1.2 client on a *fresh* connection
-    // (the failed handshake consumed the first socket). `ResponseTooLarge` means
-    // 1.3 actually worked — don't retry that.
+    // TLS 1.2 only, so a failed handshake may retry on a fresh connection.
+    // Once the handshake succeeds, preserve every subsequent failure. A failed
+    // request write may have transmitted a prefix and must never replay a POST.
     {
         const fd = try connectAddr(addr, opts.connect_timeout_ms);
         defer closeFd(fd);
         try setRecvTimeout(fd, opts.recv_timeout_ms);
-        if (getTls(allocator, fd, host, request_bytes, opts)) |resp| {
+        var application_phase = false;
+        if (getTls(allocator, fd, host, request_bytes, opts, &application_phase)) |resp| {
             return resp;
-        } else |err| switch (err) {
-            error.ResponseTooLarge => return err,
-            else => {},
+        } else |err| {
+            if (application_phase or err == error.ResponseTooLarge) return err;
         }
     }
     const fd2 = try connectAddr(addr, opts.connect_timeout_ms);
@@ -230,7 +230,10 @@ fn getTls12(
     var read_buf: [max_tls_record]u8 = undefined;
     while (!tc.handshakeDone()) {
         const n = try readSome(fd, &read_buf);
-        switch (try tc.feed(read_buf[0..n])) {
+        switch (tc.feed(read_buf[0..n]) catch |err| {
+            tls_client_failure.sendFatal(fd, &tc, err);
+            return err;
+        }) {
             .need_more => {},
             .bytes_to_send => |out| {
                 defer allocator.free(out);
@@ -255,7 +258,10 @@ fn getTls12(
             const rec = pending.items[0..rec_len];
             const pt = tc.decrypt(rec) catch |err| switch (err) {
                 error.TlsAlert => break :read_loop, // close_notify ends the stream
-                else => return err,
+                else => {
+                    tls_client_failure.sendFatal(fd, &tc, err);
+                    return err;
+                },
             };
             defer allocator.free(pt);
             if (plaintext.items.len + pt.len > opts.max_response_bytes) return error.ResponseTooLarge;
@@ -280,6 +286,7 @@ fn getTls(
     host: []const u8,
     request_bytes: []const u8,
     opts: Options,
+    application_phase: *bool,
 ) Error![]u8 {
     var tc = try tls_client.Client.init(allocator, .{
         .server_name = host,
@@ -303,7 +310,10 @@ fn getTls(
     var read_buf: [max_tls_record]u8 = undefined;
     while (!tc.handshakeDone()) {
         const n = try readSome(fd, &read_buf);
-        switch (try tc.feed(read_buf[0..n])) {
+        switch (tc.feed(read_buf[0..n]) catch |err| {
+            tls_client_failure.sendFatal(fd, &tc, err);
+            return err;
+        }) {
             .need_more => {},
             .bytes_to_send => |out| {
                 defer allocator.free(out);
@@ -311,6 +321,7 @@ fn getTls(
             },
         }
     }
+    application_phase.* = true;
     {
         const record = try tc.encrypt(request_bytes);
         defer allocator.free(record);
@@ -328,7 +339,10 @@ fn getTls(
             const rec = pending.items[0..rec_len];
             const read = tc.decryptApp(rec) catch |err| switch (err) {
                 error.TlsAlert => break :read_loop, // close_notify ends the stream
-                else => return err,
+                else => {
+                    tls_client_failure.sendFatal(fd, &tc, err);
+                    return err;
+                },
             };
             switch (read) {
                 .application_data => |pt| {
@@ -796,4 +810,102 @@ test "http_fetch native DNS UDP transport binds replies to query identity" {
         joined = true;
         try std.testing.expect(worker.ok);
     }
+}
+
+test "TLS client fatal transport: http_fetch socket writer preserves control custody" {
+    // Unix-socketpair proof; no `socketpair` on Windows.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try tls_client_failure.testFatalTransportProof(true, writeAll);
+}
+
+test "TLS client fatal transport: HTTP POST response failure never opens a fallback connection" {
+    // Live listener plus raw-fd writes; Windows HANDLEs cannot compile it.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const runtime = @import("os_runtime.zig");
+    const metrics = @import("metrics_http.zig");
+    const tls_server = @import("../crypto/tls_server.zig");
+    var snapshot = metrics.MetricsSnapshot.init(a);
+    defer snapshot.deinit();
+    var listener = try metrics.MetricsServer.init(&snapshot, 0);
+    defer listener.shutdown();
+    const peer = try tls_client_failure.TestPeer.init(a);
+    defer peer.deinit();
+    peer.server.deinit();
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x7c));
+    peer.server = try tls_server.Server.init(a, .{ .cert_chain = &peer.chain, .signing_key = kp });
+    const Worker = struct {
+        listener: i32,
+        peer: *tls_client_failure.TestPeer,
+        request_seen: bool = false,
+        alert_seen: bool = false,
+        fallback_seen: bool = false,
+        failure: ?anyerror = null,
+
+        fn readable(fd: i32, ms: i32) !bool {
+            var polls = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+            const rc = sys.poll(&polls, 1, ms);
+            if (posix.errno(rc) != .SUCCESS) return error.TestUnexpectedResult;
+            return rc > 0;
+        }
+
+        fn record(fd: i32, buffer: []u8) ![]u8 {
+            try tls_client_failure.testReadExact(fd, buffer[0..5]);
+            const n = 5 + @as(usize, std.mem.readInt(u16, buffer[3..5], .big));
+            if (n > buffer.len) return error.TestUnexpectedResult;
+            try tls_client_failure.testReadExact(fd, buffer[5..n]);
+            return buffer[0..n];
+        }
+
+        fn run(self: *@This()) void {
+            self.exchange() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn exchange(self: *@This()) !void {
+            if (!try readable(self.listener, 2000)) return error.TestUnexpectedResult;
+            const rc = sys.accept(self.listener, null, null);
+            if (posix.errno(rc) != .SUCCESS) return error.TestUnexpectedResult;
+            const fd: i32 = @intCast(rc);
+            defer runtime.close(fd);
+            try setBlocking(fd);
+            try setRecvTimeout(fd, 1000);
+            var buffer: [max_tls_record]u8 = undefined;
+            const engine = &self.peer.server;
+            while (!engine.handshakeDone()) {
+                switch (try engine.feed(try record(fd, &buffer))) {
+                    .bytes_to_send => |bytes| {
+                        defer std.testing.allocator.free(bytes);
+                        try writeAll(fd, bytes);
+                    },
+                    .need_more => {},
+                }
+            }
+            const request = try engine.decrypt(try record(fd, &buffer));
+            defer std.testing.allocator.free(request);
+            self.request_seen = std.mem.startsWith(u8, request, "POST /once HTTP/1.1\r\n") and std.mem.endsWith(u8, request, "once");
+            const malformed = try engine.encrypt("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+            defer std.testing.allocator.free(malformed);
+            malformed[malformed.len - 1] ^= 1; // authenticated response must fail
+            try writeAll(fd, malformed);
+            const alert = try record(fd, &buffer);
+            try tls_client_failure.testExpectAlert(engine, alert, 20);
+            self.alert_seen = true;
+            self.fallback_seen = try readable(self.listener, 250);
+        }
+    };
+    var worker = Worker{ .listener = listener.listen_fd, .peer = peer };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) thread.join();
+    const request = "POST /once HTTP/1.1\r\nHost: irc.test\r\nContent-Length: 4\r\n\r\nonce";
+    const result = get(a, "127.0.0.1", listener.port, true, request, .{ .insecure_skip_verify = true, .recv_timeout_ms = 1000 });
+    defer if (result) |bytes| a.free(bytes) else |_| {};
+    thread.join();
+    joined = true;
+    if (worker.failure) |err| return err;
+    try std.testing.expectError(error.RecordAuthenticationFailed, result);
+    try std.testing.expect(worker.request_seen and worker.alert_seen);
+    try std.testing.expect(!worker.fallback_seen);
 }

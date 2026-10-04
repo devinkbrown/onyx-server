@@ -31,6 +31,7 @@ fn nativeToBigU32(v: u32) u32 {
 }
 
 pub const Error = error{ SocketUnavailable, BindFailed, AddrLookupFailed };
+pub const SendDisposition = enum { sent, would_block, socket_error, invalid_destination };
 
 pub const MediaSocket = struct {
     fd: sys.fd_t,
@@ -42,7 +43,7 @@ pub const MediaSocket = struct {
         // Use each target's native socket ABI. Linux retains its blocking UDP
         // path; OpenBSD uses nonblocking reads after finite readiness polls.
         if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
-            const rc = sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | (if (builtin.os.tag == .linux) @as(u32, 0) else posix.SOCK.NONBLOCK), posix.IPPROTO.UDP);
+            const rc = sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.UDP);
             if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
             const fd: sys.fd_t = @intCast(rc);
             errdefer _ = sys.close(fd);
@@ -78,12 +79,27 @@ pub const MediaSocket = struct {
     /// Bound a blocking recv with a timeout so the pump loop can re-check a stop
     /// flag (and tests never hang).
     pub fn setRecvTimeoutMs(self: *MediaSocket, ms: u32) void {
-        if (comptime builtin.os.tag != .linux) {
-            self.recv_timeout_ms = @max(ms, 1);
-            return;
-        }
-        const tv = sys.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
-        _ = sys.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+        // Source-owned local poll policy, never mutation of shared socket state.
+        self.recv_timeout_ms = @min(@max(ms, 1), std.math.maxInt(c_int));
+    }
+
+    pub fn capture(self: *const MediaSocket) !Snapshot {
+        var result = try observeSocket(self.fd);
+        result.recv_timeout_ms = self.recv_timeout_ms;
+        try result.validate();
+        return result;
+    }
+    /// Consumes one authenticated received duplicate on entry. Kernel identity
+    /// is a read-only observation; actual OFD lineage is joined by the manifest.
+    pub fn initInherited(fd: posix.fd_t, snapshot: *const Snapshot) !MediaSocket {
+        // No Winsock mapping yet; custody cannot be validated on Windows.
+        if (comptime builtin.os.tag == .windows) return error.InvalidSocket;
+        errdefer _ = sys.close(fd);
+        try snapshot.validate();
+        var actual = try observeSocket(fd);
+        actual.recv_timeout_ms = snapshot.recv_timeout_ms;
+        if (!std.meta.eql(actual, snapshot.*)) return error.SocketMismatch;
+        return .{ .fd = fd, .recv_timeout_ms = snapshot.recv_timeout_ms };
     }
 
     /// Send `bytes` to an IPv4 destination. Non-IPv4 addresses are dropped.
@@ -96,7 +112,23 @@ pub const MediaSocket = struct {
             .port = std.mem.nativeToBig(u16, dest.port),
             .addr = @bitCast(dest.ip[0..4].*),
         };
-        _ = sys.sendto(self.fd, bytes.ptr, bytes.len, 0, @ptrCast(&sa), @sizeOf(sys.sockaddr.in));
+        _ = sys.sendto(self.fd, bytes.ptr, bytes.len, posix.MSG.DONTWAIT, @ptrCast(&sa), @sizeOf(sys.sockaddr.in));
+    }
+
+    /// Source-owned nonblocking datagram attempt with explicit terminal outcome.
+    /// UDP has no partial-write retry; a short result is a socket failure.
+    pub fn trySendTo(self: *MediaSocket, dest: TransportAddress, bytes: []const u8) SendDisposition {
+        // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
+        // bind() already reports SocketUnavailable on Windows.
+        if (comptime builtin.os.tag == .windows) return .socket_error;
+        if (dest.ip_len != 4 or dest.port == 0) return .invalid_destination;
+        var address = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, dest.port), .addr = @bitCast(dest.ip[0..4].*) };
+        const rc = sys.sendto(self.fd, bytes.ptr, bytes.len, posix.MSG.DONTWAIT, @ptrCast(&address), @sizeOf(sys.sockaddr.in));
+        return switch (posix.errno(rc)) {
+            .SUCCESS => if (@as(usize, @intCast(rc)) == bytes.len) .sent else .socket_error,
+            .AGAIN => .would_block,
+            else => .socket_error,
+        };
     }
 
     pub const Received = struct { data: []u8, from: TransportAddress };
@@ -106,14 +138,14 @@ pub const MediaSocket = struct {
         // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
         // bind() already reports SocketUnavailable on Windows.
         if (comptime builtin.os.tag == .windows) return null;
-        if (comptime builtin.os.tag != .linux) {
+        {
             var pfd = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
             const ready = sys.poll(&pfd, 1, @intCast(@min(self.recv_timeout_ms, std.math.maxInt(c_int))));
             if (ready <= 0 or pfd[0].revents & posix.POLL.IN == 0) return null;
         }
         var sa: sys.sockaddr.in = undefined;
         var slen: posix.socklen_t = @sizeOf(sys.sockaddr.in);
-        const rc = sys.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&sa), &slen);
+        const rc = sys.recvfrom(self.fd, buf.ptr, buf.len, posix.MSG.DONTWAIT, @ptrCast(&sa), &slen);
         if (posix.errno(rc) != .SUCCESS) return null;
         const n: usize = @intCast(rc);
         if (slen != @sizeOf(sys.sockaddr.in) or sa.family != posix.AF.INET or n > buf.len) return null;
@@ -277,4 +309,78 @@ test "isStun demultiplexes STUN from RTP" {
     try testing.expect(MediaSocket.isStun(0x00)); // STUN binding request type hi byte
     try testing.expect(!MediaSocket.isStun(0x80)); // RTP version 2
     try testing.expect(!MediaSocket.isStun(0x90)); // RTP with extension
+}
+
+pub const Snapshot = struct {
+    device: u64,
+    inode: u64,
+    address_be: u32,
+    port: u16,
+    recv_timeout_ms: u32,
+    pub fn validate(self: *const Snapshot) !void {
+        if (self.port == 0 or self.recv_timeout_ms == 0 or self.recv_timeout_ms > std.math.maxInt(c_int)) return error.InvalidSocket;
+    }
+};
+fn identityBits(value: anytype) u64 {
+    return @intCast(@as(@Int(.unsigned, @bitSizeOf(@TypeOf(value))), @bitCast(value)));
+}
+fn observeSocket(fd: posix.fd_t) !Snapshot {
+    // No Winsock mapping yet; custody cannot be validated on Windows.
+    if (comptime builtin.os.tag == .windows) return error.InvalidSocket;
+    var typ: u32 = 0;
+    var len: posix.socklen_t = @sizeOf(u32);
+    if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.TYPE, @ptrCast(&typ), &len)) != .SUCCESS or len != @sizeOf(u32) or typ != posix.SOCK.DGRAM) return error.InvalidSocket;
+    const raw = sys.fcntl(fd, posix.F.GETFL, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
+    if (posix.errno(raw) != .SUCCESS or !@as(posix.O, @bitCast(@as(u32, @intCast(raw)))).NONBLOCK) return error.InvalidSocket;
+    const flags = sys.fcntl(fd, posix.F.GETFD, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
+    if (posix.errno(flags) != .SUCCESS or (flags & posix.FD_CLOEXEC) == 0) return error.InvalidSocket;
+    var address: posix.sockaddr.storage = undefined;
+    len = @sizeOf(posix.sockaddr.storage);
+    if (posix.errno(sys.getsockname(fd, @ptrCast(&address), &len)) != .SUCCESS or address.family != posix.AF.INET or len != @sizeOf(posix.sockaddr.in)) return error.InvalidSocket;
+    const addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&address));
+    var result: Snapshot = .{ .device = 0, .inode = 0, .address_be = addr.addr, .port = std.mem.bigToNative(u16, addr.port), .recv_timeout_ms = 250 };
+    if (comptime builtin.os.tag == .linux) {
+        var st: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
+        if (posix.errno(std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .TYPE = true, .INO = true }, &st)) != .SUCCESS or !st.mask.TYPE or !st.mask.INO or (st.mode & posix.S.IFMT) != posix.S.IFSOCK) return error.InvalidSocket;
+        result.device = (@as(u64, st.dev_major) << 32) | st.dev_minor;
+        result.inode = st.ino;
+    } else {
+        var st: posix.Stat = undefined;
+        if (posix.errno(sys.fstat(fd, &st)) != .SUCCESS or (st.mode & posix.S.IFMT) != posix.S.IFSOCK) return error.InvalidSocket;
+        result.device = identityBits(st.dev);
+        result.inode = identityBits(st.ino);
+    }
+    try result.validate();
+    return result;
+}
+
+test "companion runtime media socket inherited UDP custody is validation-only" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var old = try MediaSocket.bind(loopback_be, 0);
+    defer old.deinit();
+    old.setRecvTimeoutMs(17);
+    var carry = try old.capture();
+    const flags = sys.fcntl(old.fd, posix.F.GETFL, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
+    const duplicate = sys.fcntl(old.fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
+    try testing.expect(posix.errno(duplicate) == .SUCCESS);
+    var adopted = try MediaSocket.initInherited(@intCast(duplicate), &carry);
+    try testing.expectEqual(@as(u32, 17), adopted.recv_timeout_ms);
+    adopted.deinit();
+    try testing.expectEqual(flags, sys.fcntl(old.fd, posix.F.GETFL, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0)));
+    try testing.expectEqualDeep(carry, try old.capture());
+    const rejected = sys.fcntl(old.fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
+    try testing.expect(posix.errno(rejected) == .SUCCESS);
+    carry.inode ^= 1;
+    try testing.expectError(error.SocketMismatch, MediaSocket.initInherited(@intCast(rejected), &carry));
+    carry.inode ^= 1;
+    try testing.expect(posix.errno(sys.fcntl(@intCast(rejected), posix.F.GETFD, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0))) != .SUCCESS);
+    try testing.expectEqualDeep(carry, try old.capture());
+    var client = try MediaSocket.bind(loopback_be, 0);
+    defer client.deinit();
+    const destination = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, carry.port);
+    client.sendTo(destination, "queued datagram");
+    var bytes: [128]u8 = undefined;
+    const received = old.recvFrom(&bytes) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("queued datagram", received.data);
 }

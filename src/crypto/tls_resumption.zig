@@ -28,7 +28,7 @@ const sealed_magic_v3: u8 = 3;
 /// tickets still open; they carry a null lifetime and are not resumed once
 /// the acceptor has a clock.
 const sealed_magic: u8 = 4;
-const stored_magic = [_]u8{ 'O', 'T', 'S', '1' };
+const stored_magic = [_]u8{ 'O', 'T', 'S', '2' };
 const sealed_aad = "onyx tls13 session ticket v1";
 
 pub const Error = error{
@@ -56,6 +56,9 @@ pub const OpenedTicket = struct {
 };
 
 pub const StoredSession = struct {
+    /// Original handshake's peer receive bound. OTS2 requires it before 0-RTT;
+    /// OTS1 caches cannot silently acquire a larger guessed send allowance.
+    peer_record_size_limit: u16,
     suite: u16,
     ticket_lifetime: u32,
     ticket_age_add: u32,
@@ -291,10 +294,11 @@ pub fn openTicket(
 
 /// Serialize a client-side resumable session snapshot.
 pub fn encodeStoredSession(allocator: Allocator, session: StoredSession) Error![]u8 {
+    if (session.peer_record_size_limit < 64) return error.BadSession;
     if (session.ticket.len > std.math.maxInt(u16)) return error.TicketTooLarge;
     if (session.psk.len == 0 or session.psk.len > max_hash_len) return error.PskTooLarge;
 
-    var out = try allocator.alloc(u8, stored_magic.len + 2 + 4 + 4 + 2 + session.ticket.len + 4 + 1 + session.psk.len);
+    var out = try allocator.alloc(u8, stored_magic.len + 2 + 4 + 4 + 2 + session.ticket.len + 4 + 2 + 1 + session.psk.len);
     errdefer allocator.free(out);
     var off: usize = 0;
     @memcpy(out[off..][0..stored_magic.len], &stored_magic);
@@ -311,6 +315,8 @@ pub fn encodeStoredSession(allocator: Allocator, session: StoredSession) Error![
     off += session.ticket.len;
     std.mem.writeInt(u32, out[off..][0..4], session.max_early_data_size, .big);
     off += 4;
+    std.mem.writeInt(u16, out[off..][0..2], session.peer_record_size_limit, .big);
+    off += 2;
     out[off] = @intCast(session.psk.len);
     off += 1;
     @memcpy(out[off..][0..session.psk.len], session.psk);
@@ -332,26 +338,22 @@ pub fn decodeStoredSession(bytes: []const u8) Error!StoredSession {
     off += 4;
     const age_add = std.mem.readInt(u32, bytes[off..][0..4], .big);
     off += 4;
-    const ticket_len = std.mem.readInt(u16, bytes[off..][0..2], .big);
+    const ticket_len: usize = std.mem.readInt(u16, bytes[off..][0..2], .big);
     off += 2;
     if (bytes.len - off < ticket_len + 1) return error.BadSession;
     const ticket = bytes[off .. off + ticket_len];
     off += ticket_len;
-    var max_early_data_size: u32 = 0;
-    const remaining_after_ticket = bytes.len - off;
-    if (remaining_after_ticket >= 4 + 1) {
-        const candidate_psk_len = bytes[off + 4];
-        if (candidate_psk_len != 0 and candidate_psk_len <= max_hash_len and
-            remaining_after_ticket == 4 + 1 + @as(usize, candidate_psk_len))
-        {
-            max_early_data_size = std.mem.readInt(u32, bytes[off..][0..4], .big);
-            off += 4;
-        }
-    }
+    if (bytes.len - off < 4 + 2 + 1) return error.BadSession;
+    const max_early_data_size = std.mem.readInt(u32, bytes[off..][0..4], .big);
+    off += 4;
+    const peer_record_size_limit = std.mem.readInt(u16, bytes[off..][0..2], .big);
+    off += 2;
+    if (peer_record_size_limit < 64) return error.BadSession;
     const psk_len = bytes[off];
     off += 1;
     if (psk_len == 0 or psk_len > max_hash_len or bytes.len - off != psk_len) return error.BadSession;
     return .{
+        .peer_record_size_limit = peer_record_size_limit,
         .suite = suite,
         .ticket_lifetime = lifetime,
         .ticket_age_add = age_add,
@@ -364,6 +366,7 @@ pub fn decodeStoredSession(bytes: []const u8) Error!StoredSession {
 test "stored client session round-trips" {
     const allocator = std.testing.allocator;
     const encoded = try encodeStoredSession(allocator, .{
+        .peer_record_size_limit = 64,
         .suite = 0x1301,
         .ticket_lifetime = 86_400,
         .ticket_age_add = 0x1122_3344,
@@ -493,4 +496,22 @@ test "openTicketWithRotation accepts current and previous keys, rejects retired"
     // After a SECOND rotation A is fully retired (current = B, previous = none):
     // the A-ticket no longer opens.
     try std.testing.expectError(error.BadTicket, openTicketWithRotation(allocator, key_b, null, ticket_a));
+}
+
+test "TLS record limit: OTS2 requires prior bound at every prefix and rejects OTS1" {
+    const a = std.testing.allocator;
+    const encoded = try encodeStoredSession(a, .{ .peer_record_size_limit = 65535, .suite = 0x1301, .ticket_lifetime = 3600, .ticket_age_add = 7, .ticket = "ticket", .psk = &(@as([32]u8, @splat(0x42))) });
+    defer a.free(encoded);
+    for (0..encoded.len) |len| try std.testing.expectError(error.BadSession, decodeStoredSession(encoded[0..len]));
+    const parsed = try decodeStoredSession(encoded);
+    try std.testing.expectEqual(@as(u16, 65535), parsed.peer_record_size_limit);
+    const invalid = try a.dupe(u8, encoded);
+    defer a.free(invalid);
+    invalid[3] = '1';
+    try std.testing.expectError(error.BadSession, decodeStoredSession(invalid));
+    invalid[3] = '2';
+    const bound_offset = 4 + 2 + 4 + 4 + 2 + 6 + 4;
+    std.mem.writeInt(u16, invalid[bound_offset..][0..2], 63, .big);
+    try std.testing.expectError(error.BadSession, decodeStoredSession(invalid));
+    try std.testing.expectError(error.BadSession, encodeStoredSession(a, .{ .peer_record_size_limit = 63, .suite = 0x1301, .ticket_lifetime = 1, .ticket_age_add = 0, .ticket = "x", .psk = "x" }));
 }

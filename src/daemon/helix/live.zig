@@ -88,7 +88,7 @@ pub fn appendHandoffManifest(
 }
 
 /// Allocation-free successor verification over already-decoded capsules. The
-/// manifest must occur exactly once, as the canonical final v1 capsule, and all
+/// manifest must occur exactly once, as the canonical final v2 capsule, and all
 /// preceding capsules must use the one-field StatePiece representation.
 pub fn verifyHandoffManifest(capsules: []const capsule.Capsule) handoff_manifest.Error!void {
     if (capsules.len == 0) return error.MissingManifest;
@@ -968,7 +968,7 @@ test "whole handoff manifest round-trips arena and rejects every completeness mu
     const manifest_not_last = [_]capsule.Capsule{ caps[0], caps[1], caps[3], caps[2] };
     try std.testing.expectError(error.ManifestNotLast, verifyHandoffManifest(&manifest_not_last));
     var wrong_manifest_header = caps[3];
-    wrong_manifest_header.header.max_supported = 2;
+    wrong_manifest_header.header.max_supported = 3;
     const wrong_outer = [_]capsule.Capsule{ caps[0], caps[1], caps[2], wrong_manifest_header };
     try std.testing.expectError(error.WrongManifestHeader, verifyHandoffManifest(&wrong_outer));
     var noncanonical_manifest = caps[3];

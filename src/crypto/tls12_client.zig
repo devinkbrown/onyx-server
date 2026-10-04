@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 
 const tls12 = @import("tls12.zig");
 const tls_record = @import("tls_record.zig");
+const tls_alert = @import("../proto/tls_alert.zig");
 const tls_resumption = @import("tls_resumption.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
@@ -80,6 +81,8 @@ pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     BadHandshake,
     BadSignature,
     BadState,
+    RecordOverflow,
+    InvalidRecordSizeLimit,
     CertificateNameMismatch,
     CertificateRevoked,
     DowngradeDetected,
@@ -103,6 +106,8 @@ pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
 };
 
 pub const Options = struct {
+    /// Maximum protected TLSPlaintext.fragment this client accepts (RFC 8449).
+    receive_record_size_limit: u16 = tls_record.record_size_limit_max12,
     server_name: []const u8,
     trust_anchors: []const []const u8,
     alpn_protocols: []const []const u8 = &.{},
@@ -216,7 +221,11 @@ pub const Client = struct {
     /// RFC 8449 record_size_limit advertised by the server (max
     /// TLSPlaintext.fragment it accepts). Default 2^14+1 = unrestricted; outbound
     /// records are fragmented to honor a smaller value (see `encrypt`).
-    peer_record_size_limit: usize = tls_record.max_plaintext_len + 1,
+    peer_record_size_limit: usize = tls_record.max_plaintext_len,
+    receive_record_size_limit: u16 = tls_record.record_size_limit_max12,
+    record_size_limit_negotiated: bool = false,
+    read_failed: bool = false,
+    alert_taken: bool = false,
 
     // ---- RFC 5077 stateless session resumption (opt-in) ----
     /// When true the ClientHello advertises an (empty) SessionTicket extension so
@@ -270,6 +279,7 @@ pub const Client = struct {
     require_crl: bool = false,
 
     pub fn init(allocator: Allocator, options: Options) Error!Client {
+        if (options.receive_record_size_limit < tls_record.record_size_limit_min or options.receive_record_size_limit > tls_record.record_size_limit_max12) return error.BadHandshake;
         var random: [32]u8 = undefined;
         try osEntropy(&random);
         const name = try allocator.dupe(u8, options.server_name);
@@ -278,6 +288,7 @@ pub const Client = struct {
         errdefer if (crl_copy) |d| allocator.free(d);
         return .{
             .allocator = allocator,
+            .receive_record_size_limit = options.receive_record_size_limit,
             .server_name = name,
             .trust_anchors = options.trust_anchors,
             .alpn_protocols = options.alpn_protocols,
@@ -343,11 +354,25 @@ pub const Client = struct {
     }
 
     pub fn feed(self: *Client, received: []const u8) Error!FeedResult {
-        if (self.state == .idle or self.state == .connected) return error.BadState;
+        if (self.read_failed or self.state == .idle or self.state == .connected) return error.BadState;
+        errdefer self.read_failed = true;
         try self.recv_buf.appendSlice(self.allocator, received);
 
         while (true) {
             const rec = (try tls12.completeRecord(self.recv_buf.items)) orelse return .need_more;
+            if (rec.content_type == .alert) {
+                const encrypted = switch (self.state) {
+                    .wait_server_finished, .wait_resumed_server_finished => true,
+                    else => false,
+                };
+                if (encrypted) {
+                    const opened = try tls12.openRecordAlloc(self.allocator, self.selected_suite orelse return error.BadState, &self.keys.server_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
+                    defer self.allocator.free(opened.plaintext);
+                    if (self.record_size_limit_negotiated and opened.plaintext.len > self.receive_record_size_limit) return error.RecordOverflow;
+                    _ = tls_alert.parse(opened.plaintext) catch return error.BadRecord;
+                } else _ = tls_alert.parse(rec.fragment) catch return error.BadRecord;
+                return error.TlsAlert;
+            }
             switch (self.state) {
                 .wait_server_flight => {
                     if (rec.content_type == .alert) return error.TlsAlert;
@@ -427,8 +452,9 @@ pub const Client = struct {
                     const suite = self.selected_suite orelse return error.BadState;
                     if (rec.content_type != .handshake) return error.BadHandshake;
                     const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.server_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
-                    self.hs_read_seq += 1;
                     defer self.allocator.free(opened.plaintext);
+                    if (opened.plaintext.len > tls_record.max_plaintext_len or (self.record_size_limit_negotiated and opened.plaintext.len > self.receive_record_size_limit)) return error.RecordOverflow;
+                    self.hs_read_seq += 1;
                     if (opened.content_type != .handshake) return error.BadHandshake;
                     var off: usize = 0;
                     const msg = try parseHandshake(opened.plaintext, &off);
@@ -447,8 +473,9 @@ pub const Client = struct {
                     const suite = self.selected_suite orelse return error.BadState;
                     if (rec.content_type != .handshake) return error.BadHandshake;
                     const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.server_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
-                    self.hs_read_seq += 1;
                     defer self.allocator.free(opened.plaintext);
+                    if (opened.plaintext.len > tls_record.max_plaintext_len or (self.record_size_limit_negotiated and opened.plaintext.len > self.receive_record_size_limit)) return error.RecordOverflow;
+                    self.hs_read_seq += 1;
                     if (opened.content_type != .handshake) return error.BadHandshake;
                     var off: usize = 0;
                     const msg = try parseHandshake(opened.plaintext, &off);
@@ -472,7 +499,7 @@ pub const Client = struct {
     }
 
     pub fn handshakeDone(self: *const Client) bool {
-        return self.state == .connected;
+        return self.state == .connected and !self.read_failed;
     }
 
     pub fn pendingBytes(self: *const Client) []const u8 {
@@ -552,40 +579,68 @@ pub const Client = struct {
     }
 
     pub fn encrypt(self: *Client, appdata: []const u8) Error![]u8 {
-        if (self.state != .connected) return error.BadState;
+        if (self.read_failed or self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
         const limit = tls_record.recordContentLimit12(self.peer_record_size_limit);
-        if (appdata.len <= limit) {
-            const seq = try tls12.reserveAppSeq(self.app_write_seq);
-            const out = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, seq, .application_data, appdata);
-            self.app_write_seq += 1;
-            return out;
-        }
-        // RFC 8449: fragment application data to the server's smaller record limit,
-        // one record per fragment, concatenated (seq bumped per record).
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(self.allocator);
+        const count = @max(@as(usize, 1), appdata.len / limit + @intFromBool(appdata.len % limit != 0));
+        if (count > std.math.maxInt(u64) - self.app_write_seq) return error.SequenceExhausted;
+        const overhead = 5 + suite.explicitNonceLen() + suite.tagLen();
+        const extra = std.math.mul(usize, count, overhead) catch return error.PlaintextTooLong;
+        const wire_len = std.math.add(usize, appdata.len, extra) catch return error.PlaintextTooLong;
+        const out = try self.allocator.alloc(u8, wire_len);
+        errdefer self.allocator.free(out);
         var off: usize = 0;
-        while (off < appdata.len) {
+        var written: usize = 0;
+        for (0..count) |index| {
             const n = @min(limit, appdata.len - off);
-            const seq = try tls12.reserveAppSeq(self.app_write_seq);
-            const rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, seq, .application_data, appdata[off .. off + n]);
-            defer self.allocator.free(rec);
-            try buf.appendSlice(self.allocator, rec);
-            self.app_write_seq += 1;
+            const record = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.app_write_seq + @as(u64, @intCast(index)), .application_data, appdata[off..][0..n]);
+            defer self.allocator.free(record);
+            @memcpy(out[written..][0..record.len], record);
+            written += record.len;
             off += n;
         }
-        return buf.toOwnedSlice(self.allocator);
+        std.debug.assert(written == out.len);
+        self.app_write_seq += @intCast(count);
+        return out;
+    }
+
+    /// At most one owned fatal software alert from the current TX epoch.
+    /// Callers attempt the returned bytes before closing, then free them.
+    pub fn takeAlert(self: *Client, failure: Error) ?[]u8 {
+        if (self.alert_taken) return null;
+        const body = tls_record.fatalAlertBytes(failure) orelse return null;
+        self.read_failed = true;
+        self.alert_taken = true;
+        if (self.state == .connected or self.hs_write_seq != 0) {
+            const suite = self.selected_suite orelse return null;
+            const seq = if (self.state == .connected) self.app_write_seq else self.hs_write_seq;
+            _ = tls12.reserveAppSeq(seq) catch return null;
+            const record = tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, seq, .alert, &body) catch return null;
+            if (self.state == .connected) self.app_write_seq = seq + 1 else self.hs_write_seq = seq + 1;
+            return record;
+        }
+        return tls12.writePlainRecord(self.allocator, .alert, &body) catch null;
     }
 
     pub fn decrypt(self: *Client, record: []const u8) Error![]u8 {
-        if (self.state != .connected) return error.BadState;
+        if (self.read_failed or self.state != .connected) return error.BadState;
+        return self.decryptCandidate(record) catch |err| {
+            if (err != error.OutOfMemory) self.read_failed = true;
+            return err;
+        };
+    }
+
+    fn decryptCandidate(self: *Client, record: []const u8) Error![]u8 {
         const suite = self.selected_suite orelse return error.BadState;
         const seq = try tls12.reserveAppSeq(self.app_read_seq);
         const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.server_write, seq, record);
-        self.app_read_seq += 1;
         errdefer self.allocator.free(opened.plaintext);
-        if (opened.content_type == .alert) return error.TlsAlert;
+        if (opened.plaintext.len > tls_record.max_plaintext_len or (self.record_size_limit_negotiated and opened.plaintext.len > self.receive_record_size_limit)) return error.RecordOverflow;
+        self.app_read_seq += 1;
+        if (opened.content_type == .alert) {
+            _ = tls_alert.parse(opened.plaintext) catch return error.BadRecord;
+            return error.TlsAlert;
+        }
         if (opened.content_type != .application_data) return error.BadHandshake;
         return opened.plaintext;
     }
@@ -628,7 +683,7 @@ pub const Client = struct {
         // servers bind the session and lets us validate the server's echo.
         try writeExtension(self.allocator, &exts, 0xff01, &.{0x00});
         try self.writeAlpnExtension(&exts);
-        try writeRecordSizeLimitExtension(self.allocator, &exts);
+        try writeRecordSizeLimitExtension(self.allocator, &exts, self.receive_record_size_limit);
         try self.writeSessionTicketExtension(&exts);
         // RFC 6066 status_request: status_type=ocsp, empty responder_id_list,
         // empty request_extensions. Always offered so a must-staple leaf can
@@ -758,6 +813,7 @@ pub const Client = struct {
         if (!self.ems_negotiated) return;
         const suite = self.selected_suite orelse return error.BadState;
         const serialized = try tls_resumption.encodeStoredSession(self.allocator, .{
+            .peer_record_size_limit = @intCast(self.peer_record_size_limit),
             .suite = @intFromEnum(suite),
             .ticket_lifetime = lifetime,
             .ticket_age_add = 0,
@@ -845,13 +901,15 @@ pub const Client = struct {
                     if (body.len != 1 or body[0] != 0) return error.BadHandshake;
                 },
                 0x001c => {
+                    if (self.record_size_limit_negotiated) return error.InvalidRecordSizeLimit;
                     // RFC 8449 record_size_limit: a 2-byte value in [64, 2^14+1];
                     // anything else is illegal_parameter. Store it so our outbound
                     // records honor the server's limit.
-                    if (body.len != 2) return error.BadHandshake;
+                    if (body.len != 2) return error.InvalidRecordSizeLimit;
                     const limit = std.mem.readInt(u16, body[0..2], .big);
-                    if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.BadHandshake;
+                    if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max12) return error.InvalidRecordSizeLimit;
                     self.peer_record_size_limit = limit;
+                    self.record_size_limit_negotiated = true;
                 },
                 0x002b => return error.ProtocolVersion, // supported_versions would select TLS 1.3.
                 // Harmless acknowledgements of extensions we offered: an empty
@@ -1017,10 +1075,11 @@ pub const Client = struct {
         defer self.allocator.free(ccs);
         try out.appendSlice(self.allocator, ccs);
         const fin_rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.hs_write_seq, .handshake, fin.items);
-        self.hs_write_seq += 1;
         defer self.allocator.free(fin_rec);
         try out.appendSlice(self.allocator, fin_rec);
-        return out.toOwnedSlice(self.allocator);
+        const owned = try out.toOwnedSlice(self.allocator);
+        self.hs_write_seq += 1;
+        return owned;
     }
 
     /// Client Certificate (RFC 5246 §7.4.6): certificate_list<0..2^24-1>, each
@@ -1093,10 +1152,11 @@ pub const Client = struct {
         defer self.allocator.free(ccs);
         try out.appendSlice(self.allocator, ccs);
         const fin_rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.hs_write_seq, .handshake, fin.items);
-        self.hs_write_seq += 1;
         defer self.allocator.free(fin_rec);
         try out.appendSlice(self.allocator, fin_rec);
-        return out.toOwnedSlice(self.allocator);
+        const owned = try out.toOwnedSlice(self.allocator);
+        self.hs_write_seq += 1;
+        return owned;
     }
 };
 
@@ -1128,9 +1188,9 @@ fn writeSupportedVersionsExtension(allocator: Allocator, out: *std.ArrayList(u8)
 /// accept (the protocol max — our recv path handles full-size records). The
 /// server, if it supports the extension, echoes its own limit and we fragment
 /// outbound records to honor it.
-fn writeRecordSizeLimitExtension(allocator: Allocator, out: *std.ArrayList(u8)) Error!void {
+fn writeRecordSizeLimitExtension(allocator: Allocator, out: *std.ArrayList(u8), limit: u16) Error!void {
     var body: [2]u8 = undefined;
-    std.mem.writeInt(u16, &body, tls_record.record_size_limit_max, .big);
+    std.mem.writeInt(u16, &body, limit, .big);
     try writeExtension(allocator, out, 0x001c, &body);
 }
 
@@ -1519,19 +1579,8 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
 }
 
 fn osEntropy(buf: []u8) Error!void {
-    switch (builtin.os.tag) {
-        .linux => {
-            var filled: usize = 0;
-            while (filled < buf.len) {
-                const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
-                const signed: isize = @bitCast(rc);
-                if (signed < 0 or rc == 0) return error.EntropyUnavailable;
-                filled += rc;
-            }
-        },
-        .openbsd => @import("random.zig").fillOsEntropy(buf) catch return error.EntropyUnavailable,
-        else => return error.EntropyUnavailable,
-    }
+    // Central CSPRNG root covers every target (Linux, OpenBSD, Windows, macOS).
+    @import("random.zig").fillOsEntropy(buf) catch return error.EntropyUnavailable;
 }
 
 const testing = std.testing;
@@ -1633,15 +1682,15 @@ test "TLS 1.2 client rejects an out-of-range server record_size_limit (RFC 8449)
     // ServerHello extension bytes carrying record_size_limit (0x001c). 63 is one
     // below the legal minimum of 64; anything out of [64, 2^14+1] is rejected.
     const too_small = [_]u8{ 0x00, 0x1c, 0x00, 0x02, 0x00, 0x3f };
-    try std.testing.expectError(error.BadHandshake, client.parseServerExtensions(&too_small));
+    try std.testing.expectError(error.InvalidRecordSizeLimit, client.parseServerExtensions(&too_small));
 
     // 0x4002 = 16386 — one above the maximum (2^14+1 = 16385).
     const too_large = [_]u8{ 0x00, 0x1c, 0x00, 0x02, 0x40, 0x02 };
-    try std.testing.expectError(error.BadHandshake, client.parseServerExtensions(&too_large));
+    try std.testing.expectError(error.InvalidRecordSizeLimit, client.parseServerExtensions(&too_large));
 
     // A wrong-length body (1 byte) is rejected too.
     const bad_len = [_]u8{ 0x00, 0x1c, 0x00, 0x01, 0x40 };
-    try std.testing.expectError(error.BadHandshake, client.parseServerExtensions(&bad_len));
+    try std.testing.expectError(error.InvalidRecordSizeLimit, client.parseServerExtensions(&bad_len));
 
     // A valid value is accepted and drives outbound fragmentation.
     const ok = [_]u8{ 0x00, 0x1c, 0x00, 0x02, 0x00, 0x40 }; // 64
@@ -2338,4 +2387,116 @@ test "exploit: TLS 1.2 CertificateStatus body must be status_type=ocsp" {
     try std.testing.expectError(error.BadCertificate, parseCertificateStatusOcsp(&[_]u8{ 1, 0, 0, 0 }));
     const ok = [_]u8{ 1, 0, 0, 0x03, 0x30, 0x01, 0x00 };
     try std.testing.expectEqualSlices(u8, ok[4..], try parseCertificateStatusOcsp(&ok));
+}
+
+fn recordLimitConnectedClient12(a: Allocator) !Client {
+    var client = try Client.init(a, .{ .server_name = "test", .trust_anchors = &.{}, .receive_record_size_limit = 64 });
+    client.state = .connected;
+    client.selected_suite = .tls_ecdhe_ecdsa_with_aes_128_gcm_sha256;
+    client.peer_record_size_limit = 64;
+    client.record_size_limit_negotiated = true;
+    return client;
+}
+
+test "TLS record limit: TLS12 client fragmented TX OOM and exhaustion are atomic" {
+    const a = std.testing.allocator;
+    const payload: [250]u8 = @splat(0x61);
+    var failures: usize = 0;
+    for (0..32) |index| {
+        var client = try recordLimitConnectedClient12(a);
+        defer client.deinit();
+        var reference = try recordLimitConnectedClient12(a);
+        defer reference.deinit();
+        const expected = try reference.encrypt(&payload);
+        defer a.free(expected);
+        var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        client.allocator = fault.allocator();
+        defer client.allocator = a;
+        const wire = client.encrypt(&payload) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            try std.testing.expectEqual(@as(u64, 0), client.app_write_seq);
+            client.allocator = a;
+            const retry = try client.encrypt(&payload);
+            defer a.free(retry);
+            try std.testing.expectEqualSlices(u8, expected, retry);
+            continue;
+        };
+        a.free(wire);
+        try std.testing.expect(failures >= 3);
+        client.allocator = a;
+        client.app_write_seq = std.math.maxInt(u64) - 2;
+        try std.testing.expectError(error.SequenceExhausted, client.encrypt(&payload));
+        try std.testing.expectEqual(std.math.maxInt(u64) - 2, client.app_write_seq);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "TLS record limit: TLS12 receive overflow returns fatal22 in current TX epoch" {
+    const a = std.testing.allocator;
+    var client = try recordLimitConnectedClient12(a);
+    defer client.deinit();
+    const payload: [65]u8 = @splat(0x62);
+    const wire = try tls12.sealRecordAlloc(a, client.selected_suite.?, &client.keys.server_write, 0, .application_data, &payload);
+    defer a.free(wire);
+    try std.testing.expectError(error.RecordOverflow, client.decrypt(wire));
+    try std.testing.expectEqual(@as(u64, 0), client.app_read_seq);
+    try std.testing.expectError(error.BadState, client.decrypt(wire));
+    const alert = client.takeAlert(error.RecordOverflow).?;
+    defer a.free(alert);
+    const opened = try tls12.openRecordAlloc(a, client.selected_suite.?, &client.keys.client_write, 0, alert);
+    defer a.free(opened.plaintext);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 22 }, opened.plaintext);
+    try std.testing.expect(client.takeAlert(error.RecordOverflow) == null);
+    try std.testing.expectError(error.BadState, client.encrypt("late"));
+    var before = try Client.init(a, .{ .server_name = "test", .trust_anchors = &.{} });
+    defer before.deinit();
+    const plain = before.takeAlert(error.InvalidRecordSizeLimit).?;
+    defer a.free(plain);
+    try std.testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 47 }, plain);
+}
+
+test "TLS record limit: TLS12 corrupted AEAD tag emits fatal20 without accepting record" {
+    const a = std.testing.allocator;
+    var client = try recordLimitConnectedClient12(a);
+    defer client.deinit();
+    const wire = try tls12.sealRecordAlloc(a, client.selected_suite.?, &client.keys.server_write, 0, .application_data, "protected");
+    defer a.free(wire);
+    wire[wire.len - 1] ^= 1;
+    try std.testing.expectError(error.AeadAuthFailed, client.decrypt(wire));
+    try std.testing.expectEqual(@as(u64, 0), client.app_read_seq);
+    const alert = client.takeAlert(error.AeadAuthFailed).?;
+    defer a.free(alert);
+    const opened = try tls12.openRecordAlloc(a, client.selected_suite.?, &client.keys.client_write, 0, alert);
+    defer a.free(opened.plaintext);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 20 }, opened.plaintext);
+}
+
+test "TLS record limit: output custody TLS12 Finished OOM preserves pre-CCS epoch" {
+    const a = std.testing.allocator;
+    var failures: usize = 0;
+    for (0..32) |index| {
+        var client = try recordLimitConnectedClient12(a);
+        defer client.deinit();
+        client.state = .wait_resumed_server_finished;
+        var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        client.allocator = fault.allocator();
+        defer client.allocator = a;
+        const wire = client.buildResumedClientFlight() catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            try std.testing.expectEqual(@as(u64, 0), client.hs_write_seq);
+            client.allocator = a;
+            const alert = client.takeAlert(error.BadHandshake).?;
+            defer a.free(alert);
+            try std.testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 50 }, alert);
+            continue;
+        };
+        a.free(wire);
+        try std.testing.expect(failures >= 3);
+        try std.testing.expectEqual(@as(u64, 1), client.hs_write_seq);
+        return;
+    }
+    return error.TestUnexpectedResult;
 }

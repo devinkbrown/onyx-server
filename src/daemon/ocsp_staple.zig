@@ -17,6 +17,8 @@
 //! own leaf is logged CRITICAL and never stapled.
 
 const std = @import("std");
+const runtime_pause = @import("runtime_pause.zig");
+pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 const dlog = @import("dlog.zig");
 const linux = std.os.linux;
 
@@ -179,6 +181,9 @@ pub const Service = struct {
     trust_anchors: []const []const u8 = &.{},
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
+    runtime: runtime_pause.WorkerState = .{},
+    next_check_ms: i64 = 0,
+    completed_checks: u64 = 0,
 
     // Bookkeeping so a fresh, still-valid staple isn't re-fetched every wake.
     last_serial: [max_serial_len]u8 = undefined,
@@ -209,7 +214,7 @@ pub const Service = struct {
     }
 
     pub fn start(self: *Service) void {
-        if (self.thread != null) return;
+        if (self.thread != null or self.runtime.view != null) return;
         self.stop_flag.store(false, .release);
         self.thread = std.Thread.spawn(.{}, worker, .{self}) catch |err| {
             dlog.log("onyx-server: ocsp stapler start failed ({s}); stapling disabled\n", .{@errorName(err)});
@@ -219,19 +224,107 @@ pub const Service = struct {
     }
 
     pub fn stop(self: *Service) void {
+        self.runtime.requireDetached() catch @panic("managed stop requires Runtime Control join and source detach");
         self.stop_flag.store(true, .release);
+        self.runtime.wakeForStop();
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
     }
 
+    pub fn prepareColdResources(self: *Service, io: std.Io) !void {
+        if (io.userdata != self.io.userdata or io.vtable != self.io.vtable) return error.IoMismatch;
+        if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        try validateOptions(self.opts);
+        try self.runtime.pause.bindIo(io);
+    }
+    pub fn validateDormantRegistration(self: *Service, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime.validateRegistration(control, view, slot, .ocsp, 0, self, dormant_spawn_options);
+    }
+    pub fn prepareDormantWorker(self: *Service, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime.validatePreparation(control, view, slot, .ocsp, 0, self, dormant_spawn_options);
+        if (self.thread != null) return error.AlreadyStarted;
+        try validateOptions(self.opts);
+        self.stop_flag.store(false, .release);
+        try self.runtime.prepare(control, view, slot, .ocsp, 0, Service, self, worker, dormant_spawn_options);
+    }
+    /// Signals this owner only. Runtime Control owns all actual joins.
+    pub fn requestStopAndWake(self: *Service) void {
+        self.stop_flag.store(true, .release);
+        self.runtime.wakeForStop();
+    }
+    pub fn detachAfterJoined(self: *Service) !void {
+        try self.runtime.detachAfterJoined();
+    }
+    pub fn requireParked(self: *Service) !void {
+        try self.runtime.requireParked();
+    }
+    pub fn requireActivated(self: *Service) !void {
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+        try self.runtime.requireActivated();
+    }
+    pub fn requestPause(self: *Service, epoch: u64) !runtime_pause.Token {
+        return self.runtime.pause.request(epoch);
+    }
+    pub fn awaitPaused(self: *Service, token: runtime_pause.Token, deadline: std.Io.Clock.Timestamp) !void {
+        try self.runtime.pause.awaitPaused(token, deadline);
+    }
+    pub fn resumePaused(self: *Service, token: runtime_pause.Token) !void {
+        try self.runtime.pause.resumePaused(token);
+    }
+    pub fn capturePaused(self: *Service, token: runtime_pause.Token) !Snapshot {
+        if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+        try self.runtime.pause.requirePaused(token);
+        return self.captureCut(.paused);
+    }
+    pub fn captureUnstarted(self: *Service) !Snapshot {
+        if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
+        return self.captureCut(.unstarted);
+    }
+    fn captureCut(self: *Service, execution: Execution) !Snapshot {
+        if (self.last_serial_len > max_serial_len) return error.InvalidSnapshot;
+        var serial: [max_serial_len]u8 = @splat(0);
+        @memcpy(serial[0..self.last_serial_len], self.last_serial[0..self.last_serial_len]);
+        return .{ .config_digest = try configDigest(self.tls, self.opts, self.trust_anchors), .last_serial = serial, .last_serial_len = @intCast(self.last_serial_len), .next_refresh_unix = self.next_refresh_unix, .fail_count = self.fail_count, .next_retry_unix = self.next_retry_unix, .warned_no_issuer = self.warned_no_issuer, .warned_no_aia = self.warned_no_aia, .next_check_ms = self.next_check_ms, .completed_checks = self.completed_checks, .captured_monotonic_ms = platform.monotonicMillis(), .execution = execution };
+    }
+    /// Server-owned current/pending DER and publication generation MUST be
+    /// joined separately. This row preserves the scheduler; it never fabricates
+    /// a staple or claims the reactor has consumed a pending publication.
+    pub fn restoreSnapshot(self: *Service, snapshot: *const Snapshot) !void {
+        if (self.thread != null or self.runtime.view != null or self.runtime.pause.request_epoch != 0) return error.NotQuiescent;
+        try snapshot.validate(self.tls, self.opts, self.trust_anchors);
+        self.last_serial = snapshot.last_serial;
+        self.last_serial_len = snapshot.last_serial_len;
+        self.next_refresh_unix = snapshot.next_refresh_unix;
+        self.fail_count = snapshot.fail_count;
+        self.next_retry_unix = snapshot.next_retry_unix;
+        self.warned_no_issuer = snapshot.warned_no_issuer;
+        self.warned_no_aia = snapshot.warned_no_aia;
+        self.next_check_ms = snapshot.next_check_ms;
+        self.completed_checks = snapshot.completed_checks;
+    }
     fn worker(self: *Service) void {
-        // Fetch promptly at startup, then on the check interval.
-        self.checkOnce();
+        self.runtime.markEntered();
+        defer self.runtime.markExited();
         while (!self.stop_flag.load(.acquire)) {
-            if (!sleepInterruptible(self.opts.check_interval_ms, &self.stop_flag)) break;
+            // All checkOnce allocations have been freed and its Server outcome
+            // has been handed off before arrival. Reactor consumption is a
+            // separate final graph barrier, not inferred from this arrival.
+            self.runtime.pause.boundary();
+            if (self.stop_flag.load(.acquire)) break;
+            const now = platform.monotonicMillis();
+            if (now < self.next_check_ms) {
+                sleepMs(@intCast(@min(self.next_check_ms - now, wake_poll_ms)));
+                continue;
+            }
+            if (self.completed_checks == std.math.maxInt(u64)) {
+                self.stop_flag.store(true, .release);
+                break;
+            }
             self.checkOnce();
+            self.completed_checks += 1;
+            self.next_check_ms = platform.monotonicMillis() +| @as(i64, @intCast(self.opts.check_interval_ms));
         }
     }
 
@@ -319,8 +412,17 @@ pub const Service = struct {
             .keep => return false,
             .publish => |owned| {
                 self.recordPublished(owned, leaf.serial_der, now);
-                self.server.publishOcspStaple(owned);
-                return true;
+                // `publishOcspStaple` exists only on the full (linux/openbsd)
+                // server, which takes ownership of the DER. Elsewhere this
+                // Service is unwired (`void` in main): free the body here so
+                // it cannot leak, and report failure so the caller backs off.
+                const full_server = @import("builtin").os.tag == .linux or @import("builtin").os.tag == .openbsd;
+                if (comptime full_server) {
+                    self.server.publishOcspStaple(owned);
+                    return true;
+                }
+                self.allocator.free(owned);
+                return false;
             },
         }
     }
@@ -641,4 +743,106 @@ test "tls ocsp fetch uses the daemon trust store and a bad certificate keeps the
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+pub const Execution = enum(u8) { unstarted = 0, paused = 1 };
+pub const Snapshot = struct {
+    config_digest: [32]u8,
+    last_serial: [max_serial_len]u8,
+    last_serial_len: u8,
+    next_refresh_unix: i64,
+    fail_count: u32,
+    next_retry_unix: i64,
+    warned_no_issuer: bool,
+    warned_no_aia: bool,
+    next_check_ms: i64,
+    completed_checks: u64,
+    captured_monotonic_ms: i64,
+    execution: Execution,
+    pub fn validate(self: *const Snapshot, tls: *const config_format.Config.Tls, opts: Options, anchors: []const []const u8) !void {
+        try validateOptions(opts);
+        if (self.last_serial_len > max_serial_len or self.next_check_ms < 0 or self.captured_monotonic_ms < 0) return error.InvalidSnapshot;
+        for (self.last_serial[self.last_serial_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+        if (!std.mem.eql(u8, &self.config_digest, &try configDigest(tls, opts, anchors))) return error.ConfigMismatch;
+    }
+};
+fn validateOptions(opts: Options) !void {
+    if (opts.check_interval_ms == 0 or opts.check_interval_ms > std.math.maxInt(i64) or
+        opts.min_refresh_seconds <= 0 or opts.max_refresh_seconds < opts.min_refresh_seconds or opts.skew_seconds < 0 or
+        opts.connect_timeout_ms == 0 or opts.recv_timeout_ms == 0 or opts.max_response_bytes == 0) return error.InvalidConfig;
+}
+pub fn configDigest(tls: *const config_format.Config.Tls, opts: Options, anchors: []const []const u8) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("onyx/companion/ocsp/config/1");
+    try runtime_pause.hashOptional(&hash, tls.cert_path);
+    try runtime_pause.hashConfigValue(&hash, opts);
+    try runtime_pause.hashConfigValue(&hash, std.math.cast(u32, anchors.len) orelse return error.Capacity);
+    for (anchors) |der| try runtime_pause.hashBytes(&hash, der);
+    return hash.finalResult();
+}
+
+test "companion runtime ocsp real retained worker preserves scheduler backoff and serial" {
+    // No certificate path: the actual checkOnce returns before touching Server.
+    // This proves scheduler/pause custody, not a successful DER publication.
+    var server: server_mod.Server = undefined;
+    const tls: config_format.Config.Tls = .{};
+    var service = Service.init(std.testing.allocator, std.testing.io, &server, &tls, .{});
+    service.last_serial = @splat(0);
+    service.last_serial[0] = 13;
+    service.last_serial_len = 1;
+    service.fail_count = 5;
+    service.next_retry_unix = 1710000007;
+    service.next_refresh_unix = 1710000021;
+    service.warned_no_aia = true;
+    try service.prepareColdResources(std.testing.io);
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .ocsp, .instance = 0, .owner_identity = &service }};
+    const gate = runtime_pause.start_gate.create(std.testing.allocator, std.testing.io, &specs) catch |err| {
+        service.stop();
+        return err;
+    };
+    defer {
+        service.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        service.detachAfterJoined() catch unreachable;
+        service.stop();
+        gate.control.destroyJoined();
+    }
+    const token = try service.requestPause(1);
+    try service.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.ocsp, 0, &service));
+    try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    gate.control.releaseAll();
+    try service.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try service.requireActivated();
+    var carry = try service.capturePaused(token);
+    try std.testing.expectEqual(@as(u32, 5), carry.fail_count);
+    try std.testing.expectEqual(@as(i64, 1710000007), carry.next_retry_unix);
+    try std.testing.expectEqual(@as(i64, 1710000021), carry.next_refresh_unix);
+    try std.testing.expectEqual(@as(u8, 13), carry.last_serial[0]);
+    try std.testing.expect(carry.warned_no_aia);
+    var restored = Service.init(std.testing.allocator, std.testing.io, &server, &tls, .{});
+    try restored.restoreSnapshot(&carry);
+    try std.testing.expectEqual(carry.next_retry_unix, restored.next_retry_unix);
+    try std.testing.expectEqual(carry.last_serial_len, restored.last_serial_len);
+    carry.last_serial[23] = 1;
+    try std.testing.expectError(error.InvalidSnapshot, restored.restoreSnapshot(&carry));
+    carry.last_serial[23] = 0;
+    const wrong_tls: config_format.Config.Tls = .{ .cert_path = "changed.pem" };
+    try std.testing.expectError(error.ConfigMismatch, carry.validate(&wrong_tls, .{}, &.{}));
+    try service.resumePaused(token);
+    // Request the next epoch only once the actual worker has departed epoch1.
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    const next = while (true) {
+        const result = service.requestPause(2) catch |err| {
+            if (err != error.Busy) return err;
+            if (std.Io.Clock.Timestamp.now(std.testing.io, .awake).raw.nanoseconds >= deadline.raw.nanoseconds) return error.TestUnexpectedResult;
+            std.Thread.yield() catch {};
+            continue;
+        };
+        break result;
+    };
+    try service.awaitPaused(next, deadline);
+    const after = try service.capturePaused(next);
+    try std.testing.expectEqual(@as(usize, 1), gate.view.inspect().spawned);
+    try std.testing.expectEqual(@as(u32, 5), after.fail_count);
+    try std.testing.expectEqual(@as(i64, 1710000007), after.next_retry_unix);
 }

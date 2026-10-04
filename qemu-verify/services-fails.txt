@@ -1,0 +1,20 @@
+daemon.delivery_authority.test.delivery authority: genuine Core factory registers original private context Store and Services mutex and refuses tampered placement without WAL mutation
+daemon.server.test.managed leased core: bound prepare allocation failures retain original WAL and refund the actual World and Services custody
+daemon.server.test.managed leased core: real other caller holding fresh World refuses before retained Services mutex and joins before cold cancellation
+daemon.server.test.managed core: original policy and install seals normalize before actual Services and live IRC
+daemon.server.test.MARKREAD atomic live dispatch isolates guests and publishes once to physical account attachments
+daemon.server.test.MARKREAD live write short write and sync faults publish no runtime position or account notification
+daemon.server.test.TOTP atomic live handlers sweep persistence allocations and same-code retry
+daemon.server.test.TOTP atomic live handlers reject record and WAL admission with retry
+daemon.server.test.TOTP atomic live handlers ambiguous prepared IO denies authentication and cold replay is coherent
+daemon.server.test.TOTP atomic live handlers successful enable and disable survive cold WAL reopen
+daemon.server.test.TOTP atomic live SASL token authority survives rejected policy and is revoked on enable and disable
+daemon.server.test.TOTP atomic live poisoned services refuse in-flight cached SCRAM through entry and completion gates
+daemon.server.test.TOTP atomic RESETPASS live handler rejects password admission without success
+daemon.server.test.SESSIONTOKEN live dispatch issues Unix expiry and survives durable cold reopen
+daemon.server.test.same-IP mesh dial retiring roster cannot supply stale trusted account authority
+daemon.server.test.webpush consumer: original dead outcome survives every staging OOM and prunes all actual accounts
+daemon.server.test.webpush consumer: real IRC oper receives one maintenance notice while all accounts reconcile
+daemon.configured_runtime.test.configured runtime: seeded original Webpush outputs survive Store OOM with real graph custody then prune every account and never queue after cold reopen
+daemon.helix.session_migration_dst.test.session migration round-trip preserves a same-account shared-token attachment group
+daemon.helix.session_migration_dst.test.session migration round-trip rejects cross-account shared-token authority

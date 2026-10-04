@@ -21,17 +21,19 @@ const geo_fetch = @import("../proto/geo_fetch.zig");
 const weather_units = @import("../proto/weather_units.zig");
 const news_sources = @import("../proto/news_sources.zig");
 const platform = @import("../substrate/platform.zig");
+pub const runtime_pause = @import("runtime_pause.zig");
+pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 
-const max_key = 80;
-const max_loc = 64;
-const max_desc = 48;
-const max_headline = 180;
-const max_headlines = 5;
-const weather_slots = 64;
-const news_slots = 64;
-const job_capacity = 128;
+pub const max_key = 80;
+pub const max_loc = 64;
+pub const max_desc = 48;
+pub const max_headline = 180;
+pub const max_headlines = 5;
+pub const weather_slots = 64;
+pub const news_slots = 64;
+pub const job_capacity = 128;
 
-const State = enum { empty, pending, ready };
+pub const State = enum(u8) { empty, pending, ready };
 
 pub const Options = struct {
     weather_ttl_ms: i64 = 10 * 60 * 1000, // weather cache TTL 600s
@@ -82,7 +84,7 @@ const NewsEntry = struct {
     }
 };
 
-const JobKind = enum { weather, news };
+pub const JobKind = enum(u8) { weather, news };
 
 const Job = struct {
     kind: JobKind,
@@ -105,8 +107,12 @@ pub const Service = struct {
     allocator: std.mem.Allocator,
     opts: Options,
     mutex: std.atomic.Mutex = .unlocked,
+    producers: runtime_pause.ProducerState = .{},
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
+    runtime: runtime_pause.WorkerState = .{},
+    lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    lazy_pause_epoch: u64 = 0,
 
     weather: [weather_slots]WeatherEntry = @splat(WeatherEntry{}),
     news: [news_slots]NewsEntry = @splat(NewsEntry{}),
@@ -119,16 +125,203 @@ pub const Service = struct {
         return .{ .allocator = allocator, .opts = opts };
     }
 
+    pub fn prepareColdResources(self: *Service, io: std.Io) !void {
+        lockSpin(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        _ = try optionsDigest(self.opts);
+        try self.runtime.pause.bindIo(io);
+    }
+    pub fn validateDormantRegistration(self: *Service, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime.validateRegistration(control, view, slot, .geo, 0, self, dormant_spawn_options);
+    }
+    pub fn prepareDormantWorker(self: *Service, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime.validatePreparation(control, view, slot, .geo, 0, self, dormant_spawn_options);
+        lockSpin(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.thread != null) return error.AlreadyStarted;
+        if (!self.opts.weather_enabled and !self.opts.news_enabled) return error.NotConfigured;
+        self.stop_flag.store(false, .release);
+        try self.runtime.prepare(control, view, slot, .geo, 0, Service, self, worker, dormant_spawn_options);
+    }
+    /// Signals this owner only. Runtime Control owns all actual joins.
+    pub fn requestStopAndWake(self: *Service) void {
+        self.stop_flag.store(true, .release);
+        self.runtime.wakeForStop();
+    }
+    pub fn detachAfterJoined(self: *Service) !void {
+        try self.runtime.detachAfterJoined();
+    }
+    pub fn requireParked(self: *Service) !void {
+        try self.runtime.requireParked();
+    }
+    pub fn requireActivated(self: *Service) !void {
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+        try self.runtime.requireActivated();
+    }
+    pub fn fenceProducers(self: *Service) !runtime_pause.ProducerFence {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.producers.freezeLocked();
+    }
+    pub fn requireProducersFrozen(self: *Service, fence: runtime_pause.ProducerFence) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        try self.producers.requireLocked(fence);
+    }
+    pub fn resumeProducers(self: *Service, fence: runtime_pause.ProducerFence) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        try self.producers.resumeLocked(fence);
+    }
+    pub fn inspectFrozen(self: *Service, fence: runtime_pause.ProducerFence, token: ?runtime_pause.Token) !struct { execution: Execution, queued: usize } {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        try self.producers.requireLocked(fence);
+        return .{ .execution = try self.requireCaptureCut(token), .queued = self.job_count };
+    }
+    pub fn requestPause(self: *Service, epoch: u64) !runtime_pause.Token {
+        lockSpin(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        const token = try self.runtime.pause.request(epoch);
+        self.lazy_pause_epoch = epoch; // same lock as actual lazy Thread creation
+        return token;
+    }
+    pub fn pauseExecution(self: *Service, token: runtime_pause.Token) !Execution {
+        lockSpin(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        try self.runtime.pause.requireRequested(token);
+        if (self.lazy_pause_epoch != token.epoch) return error.InvalidToken;
+        return if (self.thread != null or self.runtime.view != null) .paused else .unstarted;
+    }
+    pub fn awaitPaused(self: *Service, token: runtime_pause.Token, deadline: std.Io.Clock.Timestamp) !void {
+        if (try self.pauseExecution(token) == .unstarted) return error.NotRunning;
+        try self.runtime.pause.awaitPaused(token, deadline);
+    }
+    pub fn resumePaused(self: *Service, token: runtime_pause.Token) !void {
+        lockSpin(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        try self.runtime.pause.resumePaused(token);
+        if (self.lazy_pause_epoch == token.epoch) self.lazy_pause_epoch = 0;
+    }
+    pub fn capturePaused(self: *Service, allocator: std.mem.Allocator, token: runtime_pause.Token, max_bytes: usize) !Snapshot {
+        return self.captureCut(allocator, token, null, max_bytes);
+    }
+    pub fn captureUnstarted(self: *Service, allocator: std.mem.Allocator, max_bytes: usize) !Snapshot {
+        return self.captureCut(allocator, null, null, max_bytes);
+    }
+    fn requireCaptureCut(self: *Service, token: ?runtime_pause.Token) !Execution {
+        if (token) |actual| {
+            if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+            try self.runtime.pause.requirePaused(actual);
+            return .paused;
+        }
+        if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
+        return .unstarted;
+    }
+    /// Source-issued producer fence is rechecked under the exact data lock
+    /// used for capture; no unlocked empty-queue observation grants custody.
+    pub fn captureFrozen(self: *Service, allocator: std.mem.Allocator, fence: runtime_pause.ProducerFence, token: ?runtime_pause.Token, max_bytes: usize) !Snapshot {
+        try self.requireProducersFrozen(fence);
+        return self.captureCut(allocator, token, fence, max_bytes);
+    }
+    fn captureCut(self: *Service, allocator: std.mem.Allocator, token: ?runtime_pause.Token, fence: ?runtime_pause.ProducerFence, max_bytes: usize) !Snapshot {
+        lockSpin(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        const execution = try self.requireCaptureCut(token);
+        const digest = try optionsDigest(self.opts);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (fence) |proof| try self.producers.requireLocked(proof);
+        if (self.job_count > job_capacity) return error.InvalidState;
+        const bytes = @sizeOf(Snapshot) + weather_slots * @sizeOf(WeatherCarry) + news_slots * @sizeOf(NewsCarry) + self.job_count * @sizeOf(JobCarry);
+        if (bytes > max_bytes) return error.Capacity;
+        const weather = try allocator.alloc(WeatherCarry, weather_slots);
+        errdefer allocator.free(weather);
+        const news = try allocator.alloc(NewsCarry, news_slots);
+        errdefer allocator.free(news);
+        const jobs = try allocator.alloc(JobCarry, self.job_count);
+        errdefer allocator.free(jobs);
+        for (&self.weather, weather) |entry, *out| {
+            if (entry.key_len > max_key or entry.loc_len > max_loc or entry.desc_len > max_desc) return error.InvalidState;
+            out.* = .{ .state = entry.state, .key_len = @intCast(entry.key_len), .loc_len = @intCast(entry.loc_len), .desc_len = @intCast(entry.desc_len), .temp_c_bits = @bitCast(entry.temp_c), .wind_kph_bits = @bitCast(entry.wind_kph), .fetched_ms = entry.fetched_ms };
+            @memcpy(out.key[0..entry.key_len], entry.key_buf[0..entry.key_len]);
+            @memcpy(out.location[0..entry.loc_len], entry.loc_buf[0..entry.loc_len]);
+            @memcpy(out.description[0..entry.desc_len], entry.desc_buf[0..entry.desc_len]);
+        }
+        for (&self.news, news) |entry, *out| {
+            if (entry.key_len > max_key or entry.count > max_headlines) return error.InvalidState;
+            out.* = .{ .state = entry.state, .key_len = @intCast(entry.key_len), .count = @intCast(entry.count), .fetched_ms = entry.fetched_ms };
+            @memcpy(out.key[0..entry.key_len], entry.key_buf[0..entry.key_len]);
+            var off: usize = 0;
+            for (entry.lens[0..entry.count], 0..) |len, i| {
+                if (len > max_headline or off + len > entry.text.len) return error.InvalidState;
+                out.lens[i] = len;
+                @memcpy(out.text[off..][0..len], entry.text[off..][0..len]);
+                off += len;
+            }
+        }
+        for (jobs, 0..) |*out, i| {
+            const job = self.jobs[(self.job_head + i) % job_capacity];
+            if (job.key_len > max_key) return error.InvalidState;
+            out.* = .{ .kind = job.kind, .key_len = @intCast(job.key_len) };
+            @memcpy(out.key[0..job.key_len], job.key_buf[0..job.key_len]);
+        }
+        const result: Snapshot = .{ .allocator = allocator, .weather = weather, .news = news, .jobs = jobs, .options_digest = digest, .execution = execution, .captured_monotonic_ms = platform.monotonicMillis() };
+        try result.validate(self.opts, max_bytes);
+        return result;
+    }
+    pub fn restoreSnapshot(self: *Service, snapshot: *const Snapshot, max_bytes: usize) !void {
+        lockSpin(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.thread != null or self.runtime.view != null or self.runtime.pause.request_epoch != 0) return error.AlreadyStarted;
+        try snapshot.validate(self.opts, max_bytes);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        for (snapshot.weather, &self.weather) |entry, *out| {
+            out.* = .{ .state = entry.state, .key_len = entry.key_len, .loc_len = entry.loc_len, .desc_len = entry.desc_len, .temp_c = @bitCast(entry.temp_c_bits), .wind_kph = @bitCast(entry.wind_kph_bits), .fetched_ms = entry.fetched_ms };
+            @memcpy(out.key_buf[0..entry.key_len], entry.key[0..entry.key_len]);
+            @memcpy(out.loc_buf[0..entry.loc_len], entry.location[0..entry.loc_len]);
+            @memcpy(out.desc_buf[0..entry.desc_len], entry.description[0..entry.desc_len]);
+        }
+        for (snapshot.news, &self.news) |entry, *out| {
+            out.* = .{ .state = entry.state, .key_len = entry.key_len, .count = entry.count, .lens = entry.lens, .fetched_ms = entry.fetched_ms };
+            @memcpy(out.key_buf[0..entry.key_len], entry.key[0..entry.key_len]);
+            var off: usize = 0;
+            for (entry.lens[0..entry.count]) |len| off += len;
+            @memcpy(out.text[0..off], entry.text[0..off]);
+        }
+        for (snapshot.jobs, 0..) |job, i| {
+            self.jobs[i] = .{ .kind = job.kind, .key_len = job.key_len };
+            @memcpy(self.jobs[i].key_buf[0..job.key_len], job.key[0..job.key_len]);
+        }
+        self.job_head = 0;
+        self.job_count = snapshot.jobs.len;
+        self.job_tail = snapshot.jobs.len % job_capacity;
+    }
+
     /// Spawn the fetcher thread. Safe to call once; a failure leaves the service
     /// usable but inert (requests just never become ready).
     pub fn start(self: *Service) void {
-        if (self.thread != null) return;
+        lockSpin(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.thread != null or self.runtime.view != null or self.lazy_pause_epoch != 0) return;
+        // Publish the actual lazy worker under the same producer exclusion.
+        // A fence cannot return between checking frozen and assigning Thread.
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.producers.frozen) return;
         self.stop_flag.store(false, .release);
         self.thread = std.Thread.spawn(.{}, worker, .{self}) catch null;
     }
 
     pub fn stop(self: *Service) void {
+        self.runtime.requireDetached() catch @panic("managed stop requires Runtime Control join and source detach");
+        lockSpin(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
         self.stop_flag.store(true, .release);
+        self.runtime.wakeForStop();
+        self.lazy_pause_epoch = 0;
         if (self.thread) |t| {
             t.join();
             self.thread = null;
@@ -246,6 +439,7 @@ pub const Service = struct {
     /// Enqueue a fetch job for `k` unless one is already queued or the matching
     /// entry is already pending. Caller holds the mutex.
     fn enqueue(self: *Service, kind: JobKind, k: []const u8) void {
+        if (self.producers.frozen or self.stop_flag.load(.acquire)) return;
         // Mark the target entry pending so repeated requests don't pile up.
         switch (kind) {
             .weather => _ = self.reserveWeather(k),
@@ -268,7 +462,11 @@ pub const Service = struct {
     }
 
     fn worker(self: *Service) void {
+        self.runtime.markEntered();
+        defer self.runtime.markExited();
         while (!self.stop_flag.load(.acquire)) {
+            self.runtime.pause.boundary();
+            if (self.stop_flag.load(.acquire)) break;
             const job = self.takeJob() orelse {
                 sleepMs(100); // low-rate work: poll for jobs, observe the stop flag
                 continue;
@@ -567,4 +765,273 @@ test "ready news entry returns its headlines" {
     try std.testing.expectEqual(@as(usize, 2), got.len);
     try std.testing.expectEqualStrings("First", got[0]);
     try std.testing.expectEqualStrings("Second", got[1]);
+}
+
+pub const Execution = enum(u8) { unstarted, paused };
+pub const WeatherCarry = struct {
+    state: State = .empty,
+    key: [max_key]u8 = @splat(0),
+    key_len: u16 = 0,
+    location: [max_loc]u8 = @splat(0),
+    loc_len: u16 = 0,
+    description: [max_desc]u8 = @splat(0),
+    desc_len: u16 = 0,
+    temp_c_bits: u64 = 0,
+    wind_kph_bits: u64 = 0,
+    fetched_ms: i64 = 0,
+};
+pub const NewsCarry = struct {
+    state: State = .empty,
+    key: [max_key]u8 = @splat(0),
+    key_len: u16 = 0,
+    text: [max_headline * max_headlines]u8 = @splat(0),
+    lens: [max_headlines]u16 = @splat(0),
+    count: u8 = 0,
+    fetched_ms: i64 = 0,
+};
+pub const JobCarry = struct {
+    kind: JobKind,
+    key: [max_key]u8 = @splat(0),
+    key_len: u16 = 0,
+};
+pub const Snapshot = struct {
+    allocator: std.mem.Allocator,
+    weather: []WeatherCarry,
+    news: []NewsCarry,
+    jobs: []JobCarry,
+    options_digest: [32]u8,
+    execution: Execution,
+    captured_monotonic_ms: i64,
+    pub fn deinit(self: *Snapshot) void {
+        self.allocator.free(self.weather);
+        self.allocator.free(self.news);
+        self.allocator.free(self.jobs);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const Snapshot, opts: Options, max_bytes: usize) !void {
+        if (self.weather.len != weather_slots or self.news.len != news_slots or self.jobs.len > job_capacity) return error.InvalidState;
+        if (!std.mem.eql(u8, &self.options_digest, &try optionsDigest(opts))) return error.ConfigMismatch;
+        const bytes = @sizeOf(Snapshot) + weather_slots * @sizeOf(WeatherCarry) + news_slots * @sizeOf(NewsCarry) + self.jobs.len * @sizeOf(JobCarry);
+        if (bytes > max_bytes) return error.Capacity;
+        for (self.weather, 0..) |entry, i| {
+            try validateKey(&entry.key, entry.key_len, entry.state == .empty);
+            if (entry.loc_len > max_loc or entry.desc_len > max_desc) return error.InvalidState;
+            if (!std.mem.allEqual(u8, entry.location[entry.loc_len..], 0) or !std.mem.allEqual(u8, entry.description[entry.desc_len..], 0)) return error.InvalidState;
+            if (entry.state == .empty and (entry.loc_len != 0 or entry.desc_len != 0 or entry.temp_c_bits != 0 or entry.wind_kph_bits != 0 or entry.fetched_ms != 0)) return error.InvalidState;
+            if (entry.state != .empty) for (self.weather[0..i]) |prior| {
+                if (prior.state != .empty and std.mem.eql(u8, entry.key[0..entry.key_len], prior.key[0..prior.key_len])) return error.InvalidState;
+            };
+        }
+        for (self.news, 0..) |entry, i| {
+            try validateKey(&entry.key, entry.key_len, entry.state == .empty);
+            if (entry.count > max_headlines) return error.InvalidState;
+            var off: usize = 0;
+            for (entry.lens[0..entry.count]) |len| {
+                if (len > max_headline) return error.InvalidState;
+                off += len;
+            }
+            if (!std.mem.allEqual(u16, entry.lens[entry.count..], 0) or !std.mem.allEqual(u8, entry.text[off..], 0)) return error.InvalidState;
+            if (entry.state == .empty and (entry.count != 0 or entry.fetched_ms != 0)) return error.InvalidState;
+            if (entry.state != .empty) for (self.news[0..i]) |prior| {
+                if (prior.state != .empty and std.mem.eql(u8, entry.key[0..entry.key_len], prior.key[0..prior.key_len])) return error.InvalidState;
+            };
+        }
+        for (self.jobs, 0..) |job, i| {
+            try validateKey(&job.key, job.key_len, false);
+            for (self.jobs[0..i]) |prior| if (prior.kind == job.kind and std.mem.eql(u8, prior.key[0..prior.key_len], job.key[0..job.key_len])) return error.InvalidState;
+        }
+    }
+};
+fn validateKey(key: *const [max_key]u8, len: usize, empty: bool) !void {
+    if (len > max_key or (empty and len != 0) or (!empty and len == 0)) return error.InvalidState;
+    if (!std.mem.allEqual(u8, key[len..], 0)) return error.InvalidState;
+}
+pub fn optionsDigest(opts: Options) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("onyx/companion/geo-config/v1");
+    var numbers: [16]u8 = undefined;
+    std.mem.writeInt(i64, numbers[0..8], opts.weather_ttl_ms, .big);
+    std.mem.writeInt(i64, numbers[8..16], opts.news_ttl_ms, .big);
+    hash.update(&numbers);
+    hash.update(&.{ @intFromBool(opts.weather_enabled), @intFromBool(opts.news_enabled), @intFromBool(opts.news_insecure_tls), opts.max_headlines });
+    try runtime_pause.hashBytes(&hash, opts.news_cache_dir);
+    return hash.finalResult();
+}
+
+fn geoCaptureAllocation(allocator: std.mem.Allocator, service: *Service, token: runtime_pause.Token) !void {
+    var snapshot = try service.capturePaused(allocator, token, 1024 * 1024);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.jobs.len);
+    try std.testing.expectEqual(@as(u8, 2), snapshot.news[0].count);
+}
+
+test "companion runtime GEO unstarted lazy membership is fenced without invented arrival" {
+    var service = Service.init(std.testing.allocator, .{});
+    try service.prepareColdResources(std.testing.io);
+    defer service.stop();
+    var loc: [max_loc]u8 = undefined;
+    var desc: [max_desc]u8 = undefined;
+    try std.testing.expect(service.getWeather("New York", &loc, &desc) == null);
+    const token = try service.requestPause(1);
+    try std.testing.expectEqual(Execution.unstarted, try service.pauseExecution(token));
+    service.start(); // actual lazy entry is blocked under the same lifecycle gate
+    try std.testing.expect(service.thread == null);
+    try std.testing.expectError(error.NotRunning, service.awaitPaused(token, std.Io.Clock.Timestamp.now(std.testing.io, .awake)));
+    var snapshot = try service.captureUnstarted(std.testing.allocator, 1024 * 1024);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(Execution.unstarted, snapshot.execution);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.jobs.len);
+    try std.testing.expectEqual(State.pending, snapshot.weather[0].state);
+    try service.resumePaused(token);
+    try std.testing.expectEqual(@as(u64, 0), service.lazy_pause_epoch);
+}
+
+test "companion runtime GEO real gated pause carries all caches news FIFO and OOM retry" {
+    var service = Service.init(std.testing.allocator, .{});
+    try service.prepareColdResources(std.testing.io);
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .geo, .instance = 0, .owner_identity = &service }};
+    const gate = runtime_pause.start_gate.create(std.testing.allocator, std.testing.io, &specs) catch |err| {
+        service.stop();
+        return err;
+    };
+    defer {
+        service.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        service.detachAfterJoined() catch unreachable;
+        service.stop();
+        gate.control.destroyJoined();
+    }
+    service.enqueue(.weather, "oslo");
+    service.storeNews("src:bbc", &.{ "first title", "second title" });
+    service.enqueue(.news, "src:bbc");
+    const token = try service.requestPause(1);
+    try service.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.geo, 0, &service));
+    try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try std.testing.expectError(error.NotPrepared, service.requireActivated());
+    gate.control.releaseAll();
+    try service.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try service.requireActivated();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, geoCaptureAllocation, .{ &service, token });
+    var snapshot = try service.capturePaused(std.testing.allocator, token, 1024 * 1024);
+    defer snapshot.deinit();
+    var restored = Service.init(std.testing.allocator, .{});
+    defer restored.stop();
+    try restored.restoreSnapshot(&snapshot, 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 2), restored.job_count);
+    try std.testing.expectEqualStrings("oslo", restored.jobs[0].key());
+    try std.testing.expectEqualStrings("src:bbc", restored.jobs[1].key());
+    try std.testing.expectEqual(@as(usize, 2), restored.news[0].count);
+    try std.testing.expectEqualSlices(u8, "first titlesecond title", restored.news[0].text[0.."first titlesecond title".len]);
+    snapshot.news[0].count = max_headlines + 1;
+    try std.testing.expectError(error.InvalidState, restored.restoreSnapshot(&snapshot, 1024 * 1024));
+    try std.testing.expectEqual(@as(usize, 2), restored.news[0].count);
+    snapshot.news[0].count = 2;
+    snapshot.options_digest[0] ^= 1;
+    try std.testing.expectError(error.ConfigMismatch, restored.restoreSnapshot(&snapshot, 1024 * 1024));
+    snapshot.options_digest[0] ^= 1;
+    try std.testing.expectError(error.Capacity, service.capturePaused(std.testing.allocator, token, 1));
+    try std.testing.expectEqual(@as(usize, 2), service.job_count);
+}
+
+fn cacheReadChildExit(code: u8) noreturn {
+    if (comptime @import("builtin").os.tag == .linux) std.os.linux.exit_group(code) else std.posix.system._exit(code);
+}
+fn cacheReadChildWait(pid: std.posix.pid_t, status: *i32, nohang: bool) !bool {
+    const options: u32 = if (nohang) std.posix.W.NOHANG else 0;
+    if (comptime @import("builtin").os.tag == .linux) {
+        const result = std.os.linux.wait4(pid, status, options, null);
+        return switch (std.posix.errno(result)) {
+            .SUCCESS => result != 0,
+            .INTR => false,
+            else => error.TestUnexpectedResult,
+        };
+    } else {
+        const result = std.posix.system.waitpid(pid, status, @intCast(options));
+        if (result < 0) {
+            if (std.posix.errno(result) == .INTR) return false;
+            return error.TestUnexpectedResult;
+        }
+        return result != 0;
+    }
+}
+test "companion runtime geo cache regular control and FIFO finite refusal" {
+    // Fork/exec-based child reads; no `fork` on Windows.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const control = try tmp.dir.createFile(std.testing.io, "cache-control", .{});
+    try control.writePositionalAll(std.testing.io, "actual regular", 0);
+    control.close(std.testing.io);
+    var fifo_buf: [256]u8 = undefined;
+    const fifo_path = try std.fmt.bufPrint(&fifo_buf, ".zig-cache/tmp/{s}/cache-fifo", .{tmp.sub_path});
+    const made = try std.process.run(std.testing.allocator, std.testing.io, .{ .argv = &.{ "mkfifo", fifo_path } });
+    defer std.testing.allocator.free(made.stdout);
+    defer std.testing.allocator.free(made.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, made.term);
+    for ([_][]const u8{ "cache-control", "cache-fifo" }, 0..) |name, index| {
+        var path_buf: [256]u8 = undefined;
+        const printed = try std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+        path_buf[printed.len] = 0;
+        const path = path_buf[0..printed.len :0];
+        const pid: std.posix.pid_t = if (comptime @import("builtin").os.tag == .linux) block: {
+            const result = std.os.linux.fork();
+            if (std.posix.errno(result) != .SUCCESS) return error.TestUnexpectedResult;
+            break :block @intCast(result);
+        } else std.posix.system.fork();
+        if (pid < 0) return error.TestUnexpectedResult;
+        if (pid == 0) {
+            // The function is raw syscall-only; no inherited std.Io/thread locks.
+            var buf: [64]u8 = undefined;
+            const actual = readFileZ(path, &buf);
+            if (index == 0) {
+                const bytes = actual orelse cacheReadChildExit(12);
+                if (!std.mem.eql(u8, bytes, "actual regular")) cacheReadChildExit(13);
+            } else if (actual != null) cacheReadChildExit(14);
+            cacheReadChildExit(0);
+        }
+        var reaped = false;
+        defer if (!reaped) cacheReadKillReap(pid);
+        const deadline = platform.monotonicMillis() + 2000;
+        var status: i32 = 0;
+        while (!(try cacheReadChildWait(pid, &status, true))) {
+            if (platform.monotonicMillis() >= deadline) return error.TestUnexpectedResult;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+        reaped = true;
+        try std.testing.expectEqual(@as(i32, 0), status);
+    }
+}
+
+fn cacheReadKillReap(pid: std.posix.pid_t) void {
+    _ = std.posix.system.kill(pid, std.posix.SIG.KILL);
+    var status: i32 = 0;
+    while (true) {
+        const done = cacheReadChildWait(pid, &status, false) catch return;
+        if (done) return;
+    }
+}
+
+test "companion runtime producer fence GEO carries accepted lazy FIFO and prevents late worker start" {
+    var service = Service.init(std.testing.allocator, .{});
+    try service.prepareColdResources(std.testing.io);
+    defer service.stop();
+    var loc: [max_loc]u8 = undefined;
+    var desc: [max_desc]u8 = undefined;
+    try std.testing.expect(service.getWeather("New York", &loc, &desc) == null);
+    const fence = try service.fenceProducers();
+    try std.testing.expect(service.getWeather("London", &loc, &desc) == null);
+    service.start();
+    try std.testing.expect(service.thread == null);
+    try std.testing.expect(service.findWeather("london") == null);
+    const cut = try service.inspectFrozen(fence, null);
+    try std.testing.expectEqual(Execution.unstarted, cut.execution);
+    try std.testing.expectEqual(@as(usize, 1), cut.queued);
+    var snapshot = try service.captureFrozen(std.testing.allocator, fence, null, 1024 * 1024);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.jobs.len);
+    try service.resumeProducers(fence);
+    try std.testing.expect(service.getWeather("London", &loc, &desc) == null);
+    const next = try service.fenceProducers();
+    try std.testing.expectError(error.InvalidProducerFence, service.inspectFrozen(fence, null));
+    try std.testing.expectEqual(@as(usize, 2), (try service.inspectFrozen(next, null)).queued);
 }

@@ -80,6 +80,9 @@
 //!     prepend a PROXY v1 line carrying the QUIC peer's address.
 
 const std = @import("std");
+const runtime_pause = @import("runtime_pause.zig");
+pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
+const platform = @import("../substrate/platform.zig");
 const dlog = @import("dlog.zig");
 const builtin = @import("builtin");
 const sys = if (builtin.os.tag == .windows) std.os.linux else std.posix.system;
@@ -242,6 +245,7 @@ pub const WebTransportListener = struct {
 
     socket: ?DualStackUdpSocket = null,
     thread: ?std.Thread = null,
+    runtime: runtime_pause.WorkerState = .{},
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bound local UDP port (0 until started).
     port: u16 = 0,
@@ -271,6 +275,7 @@ pub const WebTransportListener = struct {
     }
 
     pub fn deinit(self: *WebTransportListener) void {
+        self.runtime.requireDetached() catch @panic("managed worker must join and detach before deinit");
         self.shutdown();
         // Tear down any connections that survived (shutdown joins the pump first,
         // so nothing races us here).
@@ -281,6 +286,7 @@ pub const WebTransportListener = struct {
         var it = self.by_cid.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.by_cid.deinit(self.allocator);
+        if (self.retry_secret) |*key| std.crypto.secureZero(u8, std.mem.asBytes(key));
         self.* = undefined;
     }
 
@@ -299,7 +305,7 @@ pub const WebTransportListener = struct {
 
     fn startAddress(self: *WebTransportListener, address: DualStackUdpSocket.BindAddr, port: u16) Error!void {
         if (comptime builtin.os.tag == .windows) return error.BindFailed;
-        if (self.socket != null) return error.AlreadyStarted;
+        if (self.socket != null or self.runtime.view != null) return error.AlreadyStarted;
         var sock = DualStackUdpSocket.bind(address, port) catch return error.BindFailed;
         self.port = sock.localPort() catch {
             sock.deinit();
@@ -316,9 +322,149 @@ pub const WebTransportListener = struct {
         };
     }
 
+    pub fn prepareColdResources(self: *WebTransportListener, io: std.Io, address: DualStackUdpSocket.BindAddr, port: u16) !void {
+        if (self.socket != null or self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        try self.validatePolicy();
+        try validateTls(self.tls);
+        try self.runtime.pause.bindIo(io);
+        var socket = try DualStackUdpSocket.bind(address, port);
+        errdefer socket.deinit();
+        socket.setRecvTimeoutMs(recv_timeout_ms);
+        const actual_port = try socket.localPort();
+        _ = try socket.capture();
+        // NEW cold identity is prepared fallibly before READY. Inherited restore
+        // never calls this and never replaces an existing Retry/reset secret.
+        var seed: [64]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        if (self.retry_secret == null) {
+            try platform.fillOsEntropy(&seed);
+            self.retry_secret = quic_retry.Secret.fromSeed(seed);
+        }
+        self.socket = socket;
+        self.port = actual_port;
+    }
+    pub fn prepareInheritedResources(self: *WebTransportListener, io: std.Io) !void {
+        if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        const socket = if (self.socket) |*sock| sock else return error.NotPrepared;
+        _ = try socket.capture();
+        try self.runtime.pause.bindIo(io);
+    }
+    pub fn validateDormantRegistration(self: *WebTransportListener, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime.validateRegistration(control, view, slot, .webtransport, 0, self, dormant_spawn_options);
+    }
+    pub fn prepareDormantWorker(self: *WebTransportListener, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime.validatePreparation(control, view, slot, .webtransport, 0, self, dormant_spawn_options);
+        if (self.thread != null) return error.AlreadyStarted;
+        try self.validatePolicy();
+        const socket = if (self.socket) |*sock| sock else return error.NotPrepared;
+        _ = try socket.capture();
+        self.stop_flag.store(false, .release);
+        try self.runtime.prepare(control, view, slot, .webtransport, 0, WebTransportListener, self, pumpLoop, dormant_spawn_options);
+    }
+    /// Signals this owner only. Runtime Control owns all actual joins.
+    pub fn requestStopAndWake(self: *WebTransportListener) void {
+        self.stop_flag.store(true, .release);
+        self.runtime.wakeForStop();
+    }
+    pub fn detachAfterJoined(self: *WebTransportListener) !void {
+        try self.runtime.detachAfterJoined();
+    }
+    pub fn requireParked(self: *WebTransportListener) !void {
+        try self.runtime.requireParked();
+    }
+    /// Validate the configured cold owner while its actual worker is parked.
+    /// Observation only: neither captures a fake unstarted/paused execution nor
+    /// grants current readiness, mutates a shared descriptor or releases Gate.
+    pub fn requirePreparedConfiguration(self: *WebTransportListener, expected_tls: TlsConfig, expected: Policy) !void {
+        try self.runtime.requireParked();
+        if (self.stop_flag.load(.acquire) or self.runtime.entered.load(.acquire) or self.runtime.exited.load(.acquire)) return error.NotPrepared;
+        try self.validatePolicy();
+        try validateTls(expected_tls);
+        if (!std.mem.eql(u8, &try tlsDigest(self.tls), &try tlsDigest(expected_tls))) return error.ConfigMismatch;
+        const actual: Policy = .{
+            .irc_port = self.irc_port,
+            .send_proxy_header = self.send_proxy_header,
+            .echo_wt_datagrams = self.echo_wt_datagrams,
+            .max_connections = self.max_connections,
+            .retry_policy = self.retry_policy,
+            .retry_load_threshold = self.retry_load_threshold,
+            .reset_rate_per_s = self.reset_rate_per_s,
+            .reset_burst = self.reset_burst,
+        };
+        if (!std.meta.eql(actual, expected)) return error.ConfigMismatch;
+        const socket = if (self.socket) |*sock| sock else return error.NotPrepared;
+        _ = try socket.capture();
+    }
+    pub fn requireActivated(self: *WebTransportListener) !void {
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+        try self.runtime.requireActivated();
+    }
+    pub fn requestPause(self: *WebTransportListener, epoch: u64) !runtime_pause.Token {
+        return self.runtime.pause.request(epoch);
+    }
+    pub fn awaitPaused(self: *WebTransportListener, token: runtime_pause.Token, deadline: std.Io.Clock.Timestamp) !void {
+        try self.runtime.pause.awaitPaused(token, deadline);
+    }
+    pub fn resumePaused(self: *WebTransportListener, token: runtime_pause.Token) !void {
+        try self.runtime.pause.resumePaused(token);
+    }
+    pub fn capturePaused(self: *WebTransportListener, token: runtime_pause.Token) !Snapshot {
+        if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+        try self.runtime.pause.requirePaused(token);
+        return self.captureIdle(.paused);
+    }
+    pub fn captureUnstarted(self: *WebTransportListener) !Snapshot {
+        if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
+        return self.captureIdle(.unstarted);
+    }
+    // All pump-owned state is read at actual arrival; configured callback/TLS
+    // storage and IRC target ownership are supplied by the whole runtime cut.
+    fn captureIdle(self: *WebTransportListener, execution: Execution) !Snapshot {
+        if (self.by_cid.count() != 0) return error.ActiveQuicContinuityUnsupported;
+        for (self.conns.items) |conn| if (conn != null) return error.ActiveQuicContinuityUnsupported;
+        try self.validatePolicy();
+        const socket = if (self.socket) |*sock| sock else return error.NotPrepared;
+        const carry: Snapshot = .{ .socket = try socket.capture(), .tls_digest = try tlsDigest(self.tls), .irc_port = self.irc_port, .send_proxy_header = self.send_proxy_header, .echo_wt_datagrams = self.echo_wt_datagrams, .max_connections = self.max_connections, .retry_policy = self.retry_policy, .retry_load_threshold = self.retry_load_threshold, .retry_secret = self.retry_secret, .token_replay = self.token_replay, .scid_counter = self.scid_counter, .reset_tokens = self.reset_tokens, .reset_last_refill_ns = self.reset_last_refill_ns, .reset_rate_per_s = self.reset_rate_per_s, .reset_burst = self.reset_burst, .execution = execution };
+        try carry.validate(self.tls);
+        return carry;
+    }
+    fn validatePolicy(self: *const WebTransportListener) !void {
+        if (self.irc_port == 0 or self.max_connections == 0 or self.retry_load_threshold == 0 or !std.math.isFinite(self.reset_rate_per_s) or self.reset_rate_per_s <= 0 or self.reset_burst == 0 or !std.math.isFinite(self.reset_tokens) or self.reset_tokens < 0 or self.reset_tokens > @as(f64, @floatFromInt(self.reset_burst))) return error.InvalidConfig;
+    }
+    /// Both transferred socket references are consumed on entry. This function
+    /// performs no entropy, bind, connect, flag/option mutation or packet read.
+    pub fn initInherited(allocator: std.mem.Allocator, tls: TlsConfig, fd: posix.fd_t, ipv4_fd: ?posix.fd_t, carry: *const Snapshot) !WebTransportListener {
+        carry.validate(tls) catch |err| {
+            _ = sys.close(fd);
+            if (ipv4_fd) |other| if (other != fd) {
+                _ = sys.close(other);
+            };
+            return err;
+        };
+        const socket = try DualStackUdpSocket.initInherited(fd, ipv4_fd, &carry.socket);
+        var owner = init(allocator, tls, carry.irc_port);
+        owner.socket = socket;
+        owner.port = carry.socket.primary.port;
+        owner.send_proxy_header = carry.send_proxy_header;
+        owner.echo_wt_datagrams = carry.echo_wt_datagrams;
+        owner.max_connections = carry.max_connections;
+        owner.retry_policy = carry.retry_policy;
+        owner.retry_load_threshold = carry.retry_load_threshold;
+        owner.retry_secret = carry.retry_secret;
+        owner.token_replay = carry.token_replay;
+        owner.scid_counter = carry.scid_counter;
+        owner.reset_tokens = carry.reset_tokens;
+        owner.reset_last_refill_ns = carry.reset_last_refill_ns;
+        owner.reset_rate_per_s = carry.reset_rate_per_s;
+        owner.reset_burst = carry.reset_burst;
+        return owner;
+    }
+
     /// Signal the pump to stop, join it, and close the UDP socket. Idempotent.
     pub fn shutdown(self: *WebTransportListener) void {
+        self.runtime.requireDetached() catch @panic("managed stop requires Runtime Control join and source detach");
         self.stop_flag.store(true, .release);
+        self.runtime.wakeForStop();
         if (self.thread) |t| {
             t.join();
             self.thread = null;
@@ -334,8 +480,12 @@ pub const WebTransportListener = struct {
     // -----------------------------------------------------------------------
 
     fn pumpLoop(self: *WebTransportListener) void {
+        self.runtime.markEntered();
+        defer self.runtime.markExited();
         var buf: [recv_buf_len]u8 = undefined;
         while (!self.stop_flag.load(.acquire)) {
+            self.runtime.pause.boundary();
+            if (self.stop_flag.load(.acquire)) break;
             const sock = if (self.socket) |*s| s else return;
             if (sock.recvFrom(&buf)) |got| {
                 self.handleDatagram(got.data, got.from);
@@ -482,8 +632,9 @@ pub const WebTransportListener = struct {
 
         // A fresh server SCID (the connection-id the client will address next).
         var scid: [8]u8 = undefined;
+        if (self.scid_counter == std.math.maxInt(u64)) return;
         std.mem.writeInt(u64, scid[0..8], self.scid_counter, .big);
-        self.scid_counter +%= 1;
+        self.scid_counter += 1;
 
         // Retry's DCID = the client's SCID (so the client recognises the reply).
         var out: [quic_retry.retry_packet_max]u8 = undefined;
@@ -843,8 +994,9 @@ pub const WebTransportListener = struct {
 
         // Mint a unique server SCID (8 bytes: counter || marker).
         var scid: [8]u8 = undefined;
+        if (self.scid_counter == std.math.maxInt(u64)) return null;
         std.mem.writeInt(u64, scid[0..8], self.scid_counter, .big);
-        self.scid_counter +%= 1;
+        self.scid_counter += 1;
 
         const conn = self.allocator.create(Connection) catch return null;
         errdefer self.allocator.destroy(conn);
@@ -1356,7 +1508,11 @@ const TestServerKeys = struct {
     cert_chain: [1][]const u8,
 
     fn init(self: *TestServerKeys) !void {
-        self.kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
+        try self.initSeed(0x37);
+    }
+
+    fn initSeed(self: *TestServerKeys, seed: u8) !void {
+        self.kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(seed)));
         self.cert = try x509_selfsign.buildSelfSigned(&self.cert_buf, .{
             .common_name = "wt.test",
             .not_before = 1_704_067_200,
@@ -1756,6 +1912,8 @@ const PolicyFixture = struct {
 };
 
 test "version negotiation — an Initial with version 0xff000099 yields a VN listing v1 and no connection" {
+    // Live UDP sockets; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.never);
     defer fx.deinit();
@@ -1785,6 +1943,8 @@ test "version negotiation — an Initial with version 0xff000099 yields a VN lis
 }
 
 test "retry — a tokenless Initial under .always policy is answered with a Retry and no connection" {
+    // Live UDP sockets; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.always);
     defer fx.deinit();
@@ -1812,6 +1972,8 @@ test "retry — a tokenless Initial under .always policy is answered with a Retr
 }
 
 test "retry — a client returning a valid token is address-validated immediately (no 3x cap)" {
+    // Live UDP sockets; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.always);
     defer fx.deinit();
@@ -1857,6 +2019,8 @@ test "retry — a client returning a valid token is address-validated immediatel
 }
 
 test "retry — a token from a different client IP is rejected" {
+    // Live UDP sockets; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.always);
     defer fx.deinit();
@@ -1880,6 +2044,8 @@ test "retry — a token from a different client IP is rejected" {
 }
 
 test "retry policy .never mints a connection directly (default fast path unaffected)" {
+    // Live UDP sockets; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.never);
     defer fx.deinit();
@@ -1914,6 +2080,8 @@ fn buildShortHeaderDatagram(out: []u8, dcid: [8]u8, body_len: usize) []const u8 
 }
 
 test "stateless reset — an unknown short-header DCID yields a reset carrying the HMAC-derived token" {
+    // Live UDP sockets; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.never);
     defer fx.deinit();
@@ -1944,6 +2112,8 @@ test "stateless reset — an unknown short-header DCID yields a reset carrying t
 }
 
 test "stateless reset — a too-small datagram yields nothing (never amplify)" {
+    // Live UDP sockets; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.never);
     defer fx.deinit();
@@ -1962,6 +2132,8 @@ test "stateless reset — a too-small datagram yields nothing (never amplify)" {
 }
 
 test "stateless reset — the emit is rate-limited (token bucket)" {
+    // Live UDP sockets; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.never);
     defer fx.deinit();
@@ -2240,3 +2412,216 @@ test "WebTransportListener: native bridge write failure retires a broken peer wi
     try testing.expect(!setNonBlocking(-1));
     try testing.expect(!writeAllFd(-1, "invalid-peer"));
 }
+
+pub const Execution = enum(u8) { unstarted = 0, paused = 1 };
+pub const Snapshot = struct {
+    socket: dualstack_udp.Snapshot,
+    tls_digest: [32]u8,
+    irc_port: u16,
+    send_proxy_header: bool,
+    echo_wt_datagrams: bool,
+    max_connections: usize,
+    retry_policy: RetryPolicy,
+    retry_load_threshold: usize,
+    retry_secret: ?quic_retry.Secret,
+    token_replay: quic_retry.ReplayCache,
+    scid_counter: u64,
+    reset_tokens: f64,
+    reset_last_refill_ns: u64,
+    reset_rate_per_s: f64,
+    reset_burst: u32,
+    execution: Execution,
+    pub fn deinit(self: *Snapshot) void {
+        if (self.retry_secret) |*secret_key| std.crypto.secureZero(u8, std.mem.asBytes(secret_key));
+        self.* = undefined;
+    }
+    pub fn validateConfiguration(self: *const Snapshot, tls: TlsConfig, expected: Policy) !void {
+        try self.validate(tls);
+        const actual: Policy = .{ .irc_port = self.irc_port, .send_proxy_header = self.send_proxy_header, .echo_wt_datagrams = self.echo_wt_datagrams, .max_connections = self.max_connections, .retry_policy = self.retry_policy, .retry_load_threshold = self.retry_load_threshold, .reset_rate_per_s = self.reset_rate_per_s, .reset_burst = self.reset_burst };
+        if (!std.meta.eql(actual, expected)) return error.ConfigMismatch;
+    }
+    pub fn validate(self: *const Snapshot, tls: TlsConfig) !void {
+        try self.socket.validate();
+        try validateTls(tls);
+        if (!std.mem.eql(u8, &self.tls_digest, &try tlsDigest(tls))) return error.ConfigMismatch;
+        if (self.irc_port == 0 or self.max_connections == 0 or self.retry_load_threshold == 0 or self.token_replay.next >= quic_retry.ReplayCache.capacity or !std.math.isFinite(self.reset_rate_per_s) or self.reset_rate_per_s <= 0 or self.reset_burst == 0 or !std.math.isFinite(self.reset_tokens) or self.reset_tokens < 0 or self.reset_tokens > @as(f64, @floatFromInt(self.reset_burst))) return error.InvalidSnapshot;
+        for (self.token_replay.entries, self.token_replay.valid, 0..) |entry, valid, i| {
+            if (!valid) {
+                for (entry) |byte| if (byte != 0) return error.InvalidSnapshot;
+            } else {
+                if (self.retry_secret == null) return error.InvalidSnapshot;
+                for (self.token_replay.entries[0..i], self.token_replay.valid[0..i]) |prior, used| {
+                    if (used and std.mem.eql(u8, &entry, &prior)) return error.InvalidSnapshot;
+                }
+            }
+        }
+    }
+};
+fn tlsDigest(tls: TlsConfig) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("onyx/companion/webtransport/tls-config/1");
+    try hashTlsValue(&hash, tls);
+    return hash.finalResult();
+}
+/// Validate possession against the actual configured leaf before dormancy.
+/// Chain policy/expiry and shared certificate owner remain whole-runtime joins.
+fn validateTls(tls: TlsConfig) !void {
+    const x509 = @import("../crypto/x509.zig");
+    if (tls.cert_chain.len == 0) return error.InvalidConfig;
+    for (tls.cert_chain) |der| _ = try x509.parse(der);
+    const certificate = try x509.parse(tls.cert_chain[0]);
+    const public = try x509.extractPublicKey(certificate.spki_der);
+    const challenge = "onyx/webtransport/configured-key-possession/1";
+    switch (tls.signing_key) {
+        .ed25519 => |key| {
+            if (public != .ed25519 or !std.mem.eql(u8, public.ed25519, &key.public_key.bytes)) return error.ConfigMismatch;
+            const sig = try key.sign(challenge, null);
+            try sig.verify(challenge, key.public_key);
+        },
+        .ecdsa_p256 => |key| {
+            if (public != .ecdsa_p256 or !std.mem.eql(u8, public.ecdsa_p256, &key.public_key.toUncompressedSec1())) return error.ConfigMismatch;
+            const sig = try key.sign(challenge, null);
+            try sig.verify(challenge, key.public_key);
+        },
+        .rsa => |key| {
+            const rsa_sign = @import("../crypto/rsa_sign.zig");
+            const rsa_verify = @import("../crypto/rsa_verify.zig");
+            if (public != .rsa or !std.mem.eql(u8, key.n, public.rsa.modulus) or !std.mem.eql(u8, key.e, public.rsa.exponent) or key.n.len > 1024) return error.ConfigMismatch;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(challenge, &digest, .{});
+            var signature: [1024]u8 = undefined;
+            defer std.crypto.secureZero(u8, &signature);
+            const encoded = try rsa_sign.signPkcs1v15(key, .sha256, &digest, &signature);
+            if (!rsa_verify.verifyPkcs1v15(.{ .n = key.n, .e = key.e }, .sha256, &digest, encoded)) return error.ConfigMismatch;
+        },
+    }
+}
+
+fn hashTlsValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) !void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.size != .slice) @compileError("TLS pin refuses raw pointers");
+            if (p.child == u8) return runtime_pause.hashBytes(hash, value);
+            try runtime_pause.hashConfigValue(hash, std.math.cast(u32, value.len) orelse return error.Capacity);
+            for (value) |inner| try hashTlsValue(hash, inner);
+        },
+        .array => for (value) |inner| try hashTlsValue(hash, inner),
+        .optional => {
+            try runtime_pause.hashConfigValue(hash, value != null);
+            if (value) |inner| try hashTlsValue(hash, inner);
+        },
+        .@"struct" => |info| inline for (info.field_names) |name| try hashTlsValue(hash, @field(value, name)),
+        .@"union" => |info| {
+            const tag = std.meta.activeTag(value);
+            try runtime_pause.hashConfigValue(hash, @intFromEnum(tag));
+            inline for (info.field_names) |name| if (tag == @field(info.tag_type.?, name)) try hashTlsValue(hash, @field(value, name));
+        },
+        else => try runtime_pause.hashConfigValue(hash, value),
+    }
+}
+
+test "companion runtime webtransport real pump preserves Retry replay reset state and active guard" {
+    // Live UDP sockets; no Windows datagram backend here.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var keys: TestServerKeys = undefined;
+    try keys.init();
+    const tls: TlsConfig = .{ .cert_chain = &keys.cert_chain, .signing_key = .{ .ed25519 = keys.kp } };
+    var owner = WebTransportListener.init(testing.allocator, tls, 6667);
+    defer owner.deinit();
+    owner.retry_policy = .always;
+    owner.send_proxy_header = true;
+    try owner.prepareColdResources(testing.io, .loopback_v6, 0);
+    owner.scid_counter = 18;
+    owner.reset_tokens = 3.5;
+    owner.reset_last_refill_ns = nowNs();
+    const from = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, 9999);
+    var token_bytes: [256]u8 = undefined;
+    const signed_len = try quic_retry.Token.seal(&token_bytes, &owner.retry_secret.?, from.bytes(), "cid-old", nowNs());
+    var cid: [quic_packet.max_connection_id_len]u8 = undefined;
+    try testing.expectEqualSlices(u8, "cid-old", owner.acceptToken(token_bytes[0..signed_len], from, &cid).?);
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .webtransport, .instance = 0, .owner_identity = &owner }};
+    const gate = try runtime_pause.start_gate.create(testing.allocator, testing.io, &specs);
+    defer {
+        owner.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        owner.detachAfterJoined() catch unreachable;
+        gate.control.destroyJoined();
+    }
+    const pause = try owner.requestPause(1);
+    try owner.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.webtransport, 0, &owner));
+    try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    const expected_policy: Policy = .{ .irc_port = 6667, .send_proxy_header = true, .echo_wt_datagrams = false, .max_connections = default_max_connections, .retry_policy = .always, .retry_load_threshold = default_retry_load_threshold, .reset_rate_per_s = default_reset_rate_per_s, .reset_burst = default_reset_burst };
+    try owner.requirePreparedConfiguration(tls, expected_policy);
+    var wrong_policy = expected_policy;
+    wrong_policy.send_proxy_header = false;
+    try testing.expectError(error.ConfigMismatch, owner.requirePreparedConfiguration(tls, wrong_policy));
+    var other_keys: TestServerKeys = undefined;
+    try other_keys.initSeed(0x38);
+    const other_tls: TlsConfig = .{ .cert_chain = &other_keys.cert_chain, .signing_key = .{ .ed25519 = other_keys.kp } };
+    // Independently valid matching certificate/key, but a foreign owner policy.
+    try validateTls(other_tls);
+    try testing.expectError(error.ConfigMismatch, owner.requirePreparedConfiguration(other_tls, expected_policy));
+    // Configuration checks observe the actual held socket without changing it.
+    try testing.expectEqual(false, owner.runtime.entered.load(.acquire));
+    try owner.requirePreparedConfiguration(tls, expected_policy);
+    gate.control.releaseAll();
+    try owner.awaitPaused(pause, std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try owner.requireActivated();
+    var carry = try owner.capturePaused(pause);
+    defer carry.deinit();
+    var configured: Policy = .{ .irc_port = 6667, .send_proxy_header = true, .echo_wt_datagrams = false, .max_connections = default_max_connections, .retry_policy = .always, .retry_load_threshold = default_retry_load_threshold, .reset_rate_per_s = default_reset_rate_per_s, .reset_burst = default_reset_burst };
+    try carry.validateConfiguration(tls, configured);
+    configured.send_proxy_header = false;
+    try testing.expectError(error.ConfigMismatch, carry.validateConfiguration(tls, configured));
+    const arg: if (builtin.os.tag == .linux) usize else c_int = 0;
+    const duplicate = sys.fcntl(owner.socket.?.fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), arg);
+    try testing.expect(posix.errno(duplicate) == .SUCCESS);
+    var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    if (carry.socket.primary.inode == 0) {
+        try testing.expectError(error.UnverifiableSocketIdentity, WebTransportListener.initInherited(fail.allocator(), tls, @intCast(duplicate), null, &carry));
+        try testing.expect(posix.errno(sys.fcntl(@intCast(duplicate), posix.F.GETFD, arg)) != .SUCCESS);
+        var unchanged = try owner.capturePaused(pause);
+        defer unchanged.deinit();
+        try testing.expectEqualDeep(carry, unchanged);
+        try testing.expectEqual(@as(u64, 18), owner.scid_counter);
+        try testing.expectEqual(@as(f64, 3.5), owner.reset_tokens);
+        try testing.expect(owner.acceptToken(token_bytes[0..signed_len], from, &cid) == null);
+    } else {
+        var successor = try WebTransportListener.initInherited(fail.allocator(), tls, @intCast(duplicate), null, &carry);
+        defer successor.deinit();
+        var same = try successor.captureUnstarted();
+        defer same.deinit();
+        try testing.expectEqualDeep(carry.token_replay, same.token_replay);
+        try testing.expectEqualDeep(carry.retry_secret, same.retry_secret);
+        try testing.expectEqual(@as(u64, 18), successor.scid_counter);
+        try testing.expectEqual(@as(f64, 3.5), successor.reset_tokens);
+        try testing.expect(successor.acceptToken(token_bytes[0..signed_len], from, &cid) == null);
+    }
+    try testing.expectEqual(@as(usize, 0), fail.alloc_index);
+    var tampered = carry;
+    defer tampered.deinit();
+    tampered.token_replay.next = quic_retry.ReplayCache.capacity;
+    try testing.expectError(error.InvalidSnapshot, tampered.validate(tls));
+    tampered = carry;
+    tampered.tls_digest[0] ^= 1;
+    const bad = sys.fcntl(owner.socket.?.fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), arg);
+    try testing.expect(posix.errno(bad) == .SUCCESS);
+    try testing.expectError(error.ConfigMismatch, WebTransportListener.initInherited(testing.allocator, tls, @intCast(bad), null, &tampered));
+    try testing.expect(posix.errno(sys.fcntl(@intCast(bad), posix.F.GETFD, arg)) != .SUCCESS);
+    // Genuine local connection construction, not a fake non-null pointer.
+    _ = owner.createConnection("cid-new", from, .{ .original_dcid = "cid-new" }) orelse return error.TestUnexpectedResult;
+    try testing.expectError(error.ActiveQuicContinuityUnsupported, owner.capturePaused(pause));
+    try owner.resumePaused(pause);
+}
+
+pub const Policy = struct {
+    irc_port: u16,
+    send_proxy_header: bool,
+    echo_wt_datagrams: bool,
+    max_connections: usize,
+    retry_policy: RetryPolicy,
+    retry_load_threshold: usize,
+    reset_rate_per_s: f64,
+    reset_burst: u32,
+};

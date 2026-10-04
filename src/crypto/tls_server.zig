@@ -84,6 +84,7 @@ fn effectiveTicketLifetimeSeconds(configured: u32) u32 {
 
 const HashAlg = enum { sha256, sha384 };
 const tls_record = @import("tls_record.zig");
+const tls_alert = @import("../proto/tls_alert.zig");
 const tls_keyshare = @import("../proto/tls_keyshare.zig");
 const supported_groups = @import("../proto/supported_groups.zig");
 const cert_compression = @import("../proto/cert_compression.zig");
@@ -138,6 +139,8 @@ const hello_retry_request_random = [_]u8{
 pub const Error = error{
     BadState,
     BadRecord,
+    RecordAuthenticationFailed,
+    TlsAlert,
     BadHandshake,
     UnsupportedGroup,
     UnsupportedCipherSuite,
@@ -180,6 +183,8 @@ pub const Error = error{
 var builtin_0rtt_replay: tls_resumption.ReplayGuard = .{};
 
 pub const Config = struct {
+    /// Negotiated maximum authenticated TLSInnerPlaintext, including type and padding.
+    receive_record_size_limit: u16 = tls_record.record_size_limit_max,
     /// DER certificates, leaf first. The leaf SPKI must match the configured
     /// signing key used for CertificateVerify.
     cert_chain: []const []const u8,
@@ -397,6 +402,9 @@ pub const AlertLevel = enum(u8) { warning = 1, fatal = 2 };
 /// The subset of RFC 8446 §6 AlertDescription codes this server maps handshake
 /// errors to. Non-exhaustive: only the codes we actually emit are named.
 pub const AlertDescription = enum(u8) {
+    bad_record_mac = 20,
+    record_overflow = 22,
+    illegal_parameter = 47,
     handshake_failure = 40,
     decode_error = 50,
     decrypt_error = 51,
@@ -413,8 +421,11 @@ pub const AlertDescription = enum(u8) {
 /// merged `TlsConn` error set without coupling to it.
 pub fn alertDescriptionForError(err: anyerror) ?AlertDescription {
     return switch (err) {
-        error.OutOfMemory => null,
+        error.OutOfMemory, error.TlsAlert => null,
         error.ProtocolVersion => .protocol_version,
+        error.RecordAuthenticationFailed, error.AeadAuthFailed => .bad_record_mac,
+        error.RecordOverflow, error.CiphertextTooLong => .record_overflow,
+        error.InvalidRecordSizeLimit => .illegal_parameter,
         error.MissingExtension => .missing_extension,
         error.UnsupportedGroup, error.UnsupportedCipherSuite => .handshake_failure,
         // RFC 8446 §4.2.3: opt-in cert-chain algorithm policy refused the chain.
@@ -427,7 +438,7 @@ pub fn alertDescriptionForError(err: anyerror) ?AlertDescription {
         error.NoCertificate, error.NoSigningKey, error.LeafKeyMismatch => .internal_error,
         // Malformed handshake bytes or a wrong first-record content type: the peer
         // sent something we couldn't decode.
-        error.BadHandshake, error.BadRecord => .decode_error,
+        error.BadHandshake, error.BadRecord, error.BadRecordHeader => .decode_error,
         // Any other parse/negotiation failure: a generic fatal handshake_failure.
         else => .handshake_failure,
     };
@@ -587,6 +598,8 @@ pub const Server = struct {
     hrr_suite: ?CipherSuite = null,
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
+    /// Hot-restored ALPN owns its lifetime independently of successor config.
+    owned_selected_alpn: ?[]u8 = null,
     resumed: bool = false,
     early_data_offered: bool = false,
     early_data_accepted: bool = false,
@@ -625,6 +638,10 @@ pub const Server = struct {
     /// Post-handshake records the server must send back (a KeyUpdate reply when
     /// the client requested one). Drained by the caller via `takePendingSend`.
     post_handshake_send: std.ArrayList(u8) = .empty,
+    post_handshake_recv: [5]u8 = @splat(0),
+    post_handshake_recv_len: u3 = 0,
+    read_failed: bool = false,
+    alert_taken: bool = false,
     /// Decrypted accepted 0-RTT application bytes. Ownership transfers through
     /// `takeEarlyData`; bytes are accumulated before the handshake completes.
     early_data_buf: std.ArrayList(u8) = .empty,
@@ -667,6 +684,8 @@ pub const Server = struct {
     early_read_seq: u64 = 0,
     app_read_seq: u64 = 0,
     app_write_seq: u64 = 0,
+    app_write_generation: u64 = 0,
+    app_write_active: ?u64 = null,
     /// RFC 8449 record_size_limit advertised by the peer: the max TLSInnerPlaintext
     /// length it will accept. Default 2^14+1 = "no restriction beyond the protocol
     /// max". Outbound application records are fragmented to honor it.
@@ -678,6 +697,10 @@ pub const Server = struct {
     /// ClientHello is authoritative. Emitting it unconditionally made strict
     /// clients (BoringSSL/Chrome) abort the handshake as an unexpected extension.
     record_size_limit_offered: bool = false,
+    receive_record_size_limit: u16 = tls_record.record_size_limit_max,
+    /// Initial flight committed before a coalesced early-data failure. Retain
+    /// its exact wire until terminal output takes custody or peer abort disposes it.
+    failed_flight: ?[]u8 = null,
     /// The client offered the status_request extension (wants an OCSP staple).
     /// When true AND `config.ocsp_staple` is non-empty, the leaf CertificateEntry
     /// carries the staple.
@@ -746,6 +769,7 @@ pub const Server = struct {
     ech_inner_random: [32]u8 = @splat(0),
 
     pub fn init(allocator: Allocator, config: Config) Error!Server {
+        if (config.receive_record_size_limit < tls_record.record_size_limit_min or config.receive_record_size_limit > tls_record.record_size_limit_max) return error.InvalidRecordSizeLimit;
         if (config.cert_chain.len == 0) return error.NoCertificate;
         const default_key = activeSigningKey(config) orelse return error.NoSigningKey;
         // Fail fast when the configured signing key's type can't match the leaf it
@@ -804,6 +828,7 @@ pub const Server = struct {
         return .{
             .allocator = allocator,
             .config = config,
+            .receive_record_size_limit = config.receive_record_size_limit,
             .ticket_key = ticket_key,
             .state = .wait_client_hello,
             .request_client_cert = config.request_client_cert,
@@ -814,6 +839,9 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        std.debug.assert(self.app_write_active == null);
+        if (self.owned_selected_alpn) |bytes| self.allocator.free(bytes);
+        if (self.failed_flight) |flight| self.allocator.free(flight);
         self.x25519_pair.wipe();
         secureZero(&self.p256_pair.secret);
         secureZero(&self.ticket_key);
@@ -845,7 +873,7 @@ pub const Server = struct {
     }
 
     pub fn handshakeDone(self: *const Server) bool {
-        return self.state == .connected;
+        return self.state == .connected and !self.read_failed;
     }
 
     /// A fatal TLS alert (RFC 8446 §6) to send for the handshake error `err`
@@ -867,23 +895,43 @@ pub const Server = struct {
     ///
     /// Caller owns the returned buffer.
     pub fn takeAlert(self: *Server, err: anyerror) ?[]u8 {
-        switch (self.state) {
-            .wait_client_hello, .wait_second_client_hello => return alertRecordForError(self.allocator, err),
-            .wait_client_cert, .wait_client_cert_verify, .wait_client_finished => {
-                const suite = self.selected_suite orelse return null;
-                const seq = tls_record.reserveAppSeq(self.app_write_seq) catch return null;
-                const rec = alertRecordEncrypted(self.allocator, err, suite, &self.server_app_keys, seq) orelse return null;
-                self.app_write_seq += 1;
-                return rec;
-            },
-            .idle, .connected => return null,
-        }
+        if (self.alert_taken or self.app_write_active != null) return null;
+        _ = alertDescriptionForError(err) orelse return null;
+        self.alert_taken = true;
+        self.read_failed = true;
+        const encrypted = switch (self.state) {
+            .wait_client_hello, .wait_second_client_hello => false,
+            .wait_client_cert, .wait_client_cert_verify, .wait_client_finished, .connected => true,
+            .idle => return null,
+        };
+        const seq = if (encrypted) tls_record.reserveAppSeq(self.app_write_seq) catch return null else 0;
+        const record = if (encrypted)
+            alertRecordEncrypted(self.allocator, err, self.selected_suite orelse return null, &self.server_app_keys, seq) orelse return null
+        else
+            alertRecordForError(self.allocator, err) orelse return null;
+        defer self.allocator.free(record);
+        const prefix = self.failed_flight orelse &.{};
+        const prefix_len = std.math.add(usize, prefix.len, self.post_handshake_send.items.len) catch return null;
+        const total = std.math.add(usize, prefix_len, record.len) catch return null;
+        const owned = self.allocator.alloc(u8, total) catch return null;
+        @memcpy(owned[0..prefix.len], prefix);
+        @memcpy(owned[prefix.len..][0..self.post_handshake_send.items.len], self.post_handshake_send.items);
+        @memcpy(owned[prefix_len..], record);
+        self.discardPendingOutput();
+        if (encrypted) self.app_write_seq = seq + 1;
+        return owned;
+    }
+
+    fn discardPendingOutput(self: *Server) void {
+        if (self.failed_flight) |flight| self.allocator.free(flight);
+        self.failed_flight = null;
+        self.post_handshake_send.clearRetainingCapacity();
     }
 
     /// RFC 8446 section 7.5 TLS exporter. Valid only after the handshake
     /// reaches connected state.
     pub fn exportKeyingMaterial(self: *const Server, label: []const u8, context: []const u8, out: []u8) Error!void {
-        if (self.state != .connected) return error.BadState;
+        if (self.read_failed or self.state != .connected) return error.BadState;
         if (!self.exporter_master_secret_ready) return error.BadState;
         switch (self.hashAlg()) {
             .sha256 => try self.exportKeyingMaterialT(Sha256, label, context, out),
@@ -942,6 +990,9 @@ pub const Server = struct {
     /// TX offload parameters for a connected TLS 1.3 session, or null before the
     /// handshake completes (kTLS can only be attached post-handshake).
     pub fn ktlsTxParams(self: *const Server) ?KtlsTxParams {
+        // Kernel recordization cannot honor a smaller negotiated plaintext cap.
+        if (tls_record.recordContentLimit(self.peer_record_size_limit) != tls_record.max_plaintext_len) return null;
+        if (self.read_failed or self.app_write_active != null) return null;
         if (self.state != .connected) return null;
         const suite = self.selected_suite orelse return null;
         const cipher: KtlsCipher = switch (suite) {
@@ -963,7 +1014,8 @@ pub const Server = struct {
     /// kernel `crypto_info` is direction-agnostic). Null before the handshake.
     /// `key` aliases the live traffic key — exposed only for the offload path.
     pub fn ktlsRxParams(self: *const Server) ?KtlsTxParams {
-        if (self.state != .connected) return null;
+        if (self.record_size_limit_offered and self.receive_record_size_limit != tls_record.record_size_limit_max) return null;
+        if (self.read_failed or self.app_write_active != null or self.state != .connected) return null;
         const suite = self.selected_suite orelse return null;
         const cipher: KtlsCipher = switch (suite) {
             .tls_aes_128_gcm_sha256 => .aes_128_gcm,
@@ -978,26 +1030,131 @@ pub const Server = struct {
         };
     }
 
-    /// Advance ONLY the client→server (RX) traffic secret and re-derive the RX
-    /// (client) application keys — the RX equivalent of the `applyKeyUpdate` the
-    /// engine performs when it decrypts a peer KeyUpdate in userspace — WITHOUT
-    /// re-entering the handshake and WITHOUT touching the server→client (TX)
-    /// secret/keys. This is the engine half of a kTLS RX-key rotation: when a conn
-    /// is RX-offloaded the kernel (not this engine) consumes the peer's KeyUpdate
-    /// record, so the engine's `client_app_secret` would otherwise go stale; the
-    /// daemon calls this on the demuxed KeyUpdate to (a) get the fresh RX
-    /// `crypto_info` (advanced key/iv, record seq **0** per RFC 8446 §5.3 — the
-    /// sequence resets on a key change) to re-install on the kernel via a second
-    /// `setsockopt(TLS_RX)`, and (b) keep the engine in lockstep so a later Helix
-    /// USR2 `exportResume` carries the CORRECT (advanced) `client_app_secret`.
-    /// Only the RX direction moves, so the TX offload/state is untouched. Returns
-    /// `error.BadState` unless the session is connected TLS 1.3.
+    pub const KernelDirection = enum { rx, tx };
+
+    /// A turn-local rekey candidate. Kernel installation precedes commit(); no
+    /// engine state changes if deriving or installing the candidate fails.
+    pub const PreparedKernelKey = struct {
+        owner: *Server,
+        direction: KernelDirection,
+        original_secret: [max_hash_len]u8,
+        original_seq: u64,
+        secret: [max_hash_len]u8,
+        keys: TrafficKeys,
+        suite: CipherSuite,
+
+        pub fn deinit(self: *PreparedKernelKey) void {
+            secureZero(&self.original_secret);
+            secureZero(&self.secret);
+            self.keys.wipe();
+        }
+        pub fn params(self: *const PreparedKernelKey) KtlsTxParams {
+            return .{ .cipher = switch (self.suite) {
+                .tls_aes_128_gcm_sha256 => .aes_128_gcm,
+                .tls_aes_256_gcm_sha384 => .aes_256_gcm,
+                .tls_chacha20_poly1305_sha256 => .chacha20_poly1305,
+            }, .key = self.keys.key[0..self.suite.keyLen()], .iv = self.keys.iv, .seq = 0 };
+        }
+        pub fn commit(self: *PreparedKernelKey) void {
+            const owner = self.owner;
+            const secret = if (self.direction == .rx) &owner.client_app_secret else &owner.server_app_secret;
+            const seq = if (self.direction == .rx) &owner.app_read_seq else &owner.app_write_seq;
+            std.debug.assert(owner.state == .connected and !owner.read_failed and owner.app_write_active == null and
+                std.mem.eql(u8, secret, &self.original_secret) and seq.* == self.original_seq);
+            secret.* = self.secret;
+            if (self.direction == .rx) owner.client_app_keys = self.keys else owner.server_app_keys = self.keys;
+            seq.* = 0;
+            if (self.direction == .rx) {
+                owner.post_handshake_recv_len = 0;
+                @memset(&owner.post_handshake_recv, 0);
+            }
+        }
+    };
+
+    pub fn prepareKernelKeyUpdate(self: *Server, direction: KernelDirection) Error!PreparedKernelKey {
+        if (self.read_failed or self.app_write_active != null or self.state != .connected) return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        const secret = if (direction == .rx) self.client_app_secret else self.server_app_secret;
+        const seq = if (direction == .rx) self.app_read_seq else self.app_write_seq;
+        if (direction == .tx) _ = try tls_record.reserveAppSeq(seq);
+        var prepared: PreparedKernelKey = .{ .owner = self, .direction = direction, .original_secret = secret, .original_seq = seq, .secret = secret, .keys = if (direction == .rx) self.client_app_keys else self.server_app_keys, .suite = suite };
+        errdefer prepared.deinit();
+        try self.applyKeyUpdate(&prepared.secret, &prepared.keys);
+        return prepared;
+    }
+
+    pub const PreparedKeyUpdateReply = struct {
+        key: PreparedKernelKey,
+        allocator: Allocator,
+        ciphertext: ?[]u8,
+
+        pub fn deinit(self: *PreparedKeyUpdateReply) void {
+            if (self.ciphertext) |owned| self.allocator.free(owned);
+            self.key.deinit();
+        }
+        pub fn bytes(self: *const PreparedKeyUpdateReply) []const u8 {
+            return self.ciphertext.?;
+        }
+        pub fn commit(self: *PreparedKeyUpdateReply) void {
+            self.key.commit();
+        }
+        pub fn takeBytes(self: *PreparedKeyUpdateReply) []u8 {
+            const owned = self.ciphertext.?;
+            self.ciphertext = null;
+            return owned;
+        }
+    };
+
+    /// Prepare full software reply custody before a kernel RX read may consume
+    /// the final request. Aborting this candidate leaves the TX epoch untouched.
+    pub fn prepareKeyUpdateReply(self: *Server) Error!PreparedKeyUpdateReply {
+        var key = try self.prepareKernelKeyUpdate(.tx);
+        errdefer key.deinit();
+        const suite = self.selected_suite orelse return error.BadState;
+        const ciphertext = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, key.original_seq, .handshake, &.{ 24, 0, 0, 1, 0 });
+        return .{ .key = key, .allocator = self.allocator, .ciphertext = ciphertext };
+    }
+
+    /// Legacy turn-local users: caller must own the corresponding syscall cut.
     pub fn advanceRxKeyForKtls(self: *Server) Error!KtlsTxParams {
-        if (self.state != .connected) return error.BadState;
-        _ = self.selected_suite orelse return error.BadState;
-        try self.applyKeyUpdate(&self.client_app_secret, &self.client_app_keys);
-        self.app_read_seq = 0;
+        // Eligibility is fallible policy validation, so it must precede the
+        // no-fail secret/sequence cut. A low receive bound stays in userspace.
+        if (self.ktlsRxParams() == null) return error.BadState;
+        var prepared = try self.prepareKernelKeyUpdate(.rx);
+        defer prepared.deinit();
+        prepared.commit();
         return self.ktlsRxParams() orelse error.BadState;
+    }
+
+    /// Authenticate a control completion WITHOUT admission, sequence movement,
+    /// key rotation or reply sealing. Exact wire remains adapter-owned on hold.
+    pub fn requestedKeyUpdate(self: *const Server, record: []const u8) Error!bool {
+        if (self.read_failed or self.app_write_active != null or self.state != .connected) return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        const seq = try tls_record.reserveAppSeq(self.app_read_seq);
+        const opened = try openRecordAlloc(self.allocator, suite, &self.client_app_keys, seq, record);
+        defer self.allocator.free(opened.content);
+        if (self.record_size_limit_offered and opened.inner_len > self.receive_record_size_limit) return error.RecordOverflow;
+        if (opened.content_type != .handshake) return false;
+        const total = @as(usize, self.post_handshake_recv_len) + opened.content.len;
+        if (total > 5 or opened.content.len == 0) return error.BadHandshake;
+        var candidate: [5]u8 = @splat(0);
+        @memcpy(candidate[0..self.post_handshake_recv_len], self.post_handshake_recv[0..self.post_handshake_recv_len]);
+        @memcpy(candidate[self.post_handshake_recv_len..][0..opened.content.len], opened.content);
+        const header = [_]u8{ 24, 0, 0, 1 };
+        if (!std.mem.eql(u8, candidate[0..@min(total, 4)], header[0..@min(total, 4)])) return error.BadHandshake;
+        if (total < 5) return false;
+        if (candidate[4] > 1) return error.BadHandshake;
+        return candidate[4] == 1;
+    }
+
+    /// Kernel TX owns reply emission. Admit userspace RX's authenticated request
+    /// with only an RX rekey; the adapter installs/commits TX after typed custody.
+    pub fn acceptRequestedWithKernelTx(self: *Server, record: []const u8) Error!void {
+        if (!try self.requestedKeyUpdate(record)) return error.BadHandshake;
+        var prepared = try self.prepareKernelKeyUpdate(.rx);
+        defer prepared.deinit();
+        prepared.commit();
     }
 
     /// True when the current handshake accepted a PSK ticket and used the
@@ -1019,6 +1176,15 @@ pub const Server = struct {
     }
 
     pub fn feed(self: *Server, received: []const u8) Error!FeedResult {
+        if (self.read_failed or self.app_write_active != null) return error.BadState;
+        return self.feedCandidate(received) catch |err| {
+            self.read_failed = true;
+            if (err == error.TlsAlert) self.discardPendingOutput();
+            return err;
+        };
+    }
+
+    fn feedCandidate(self: *Server, received: []const u8) Error!FeedResult {
         if (self.state == .idle or self.state == .connected) return error.BadState;
         try self.recv_buf.appendSlice(self.allocator, received);
 
@@ -1030,6 +1196,10 @@ pub const Server = struct {
                 consumePrefix(&self.recv_buf, rec.wire_len);
             }
             const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
+            if (rec.content_type == .alert) {
+                _ = tls_alert.parse(rec.fragment) catch return error.BadRecord;
+                return error.TlsAlert;
+            }
             if (rec.content_type != .handshake) return error.BadRecord;
             var off: usize = 0;
             const msg = try parseHandshake(rec.fragment, &off);
@@ -1046,11 +1216,10 @@ pub const Server = struct {
             const ch_body = if (inner) |b| b[4..] else msg.body;
             try self.appendTranscript(ch_raw);
             const reply = try self.buildServerFlight(ch_body, ch_raw);
-            // `skipRejectedEarlyRecords`/`processAcceptedEarlyRecords` can now
-            // fail closed (F3) AFTER `reply` is already built — free it on
-            // that path instead of leaking; the two successful returns below
-            // both hand `reply` to the caller, so this never double-frees.
-            errdefer self.allocator.free(reply);
+            // Coalesced early-data validation can fail after the initial TX
+            // flight committed. Retain that exact prefix for terminal custody;
+            // successful returns transfer it directly to the caller.
+            errdefer self.failed_flight = reply;
             consumePrefix(&self.recv_buf, rec.wire_len);
             if (self.hrr_sent) {
                 // We emitted a HelloRetryRequest; await ClientHello2. 0-RTT is
@@ -1058,6 +1227,7 @@ pub const Server = struct {
                 self.state = .wait_second_client_hello;
                 return .{ .bytes_to_send = reply };
             }
+            self.state = if (self.request_client_cert and !self.resumed) .wait_client_cert else .wait_client_finished;
             if (self.early_data_accepted) {
                 try self.processAcceptedEarlyRecords();
             } else if (self.early_data_offered) {
@@ -1065,7 +1235,6 @@ pub const Server = struct {
             }
             // mTLS expects Certificate -> CertificateVerify -> Finished; otherwise
             // just the client Finished.
-            self.state = if (self.request_client_cert and !self.resumed) .wait_client_cert else .wait_client_finished;
             return .{ .bytes_to_send = reply };
         }
 
@@ -1077,6 +1246,10 @@ pub const Server = struct {
                 consumePrefix(&self.recv_buf, rec.wire_len);
             }
             const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
+            if (rec.content_type == .alert) {
+                _ = tls_alert.parse(rec.fragment) catch return error.BadRecord;
+                return error.TlsAlert;
+            }
             if (rec.content_type != .handshake) return error.BadRecord;
             var off: usize = 0;
             const msg = try parseHandshake(rec.fragment, &off);
@@ -1113,7 +1286,7 @@ pub const Server = struct {
             }
             if (rec.content_type != .application_data) return error.BadRecord;
             const opened = openRecordAlloc(self.allocator, suite, &self.client_hs_keys, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]) catch |err| {
-                if (self.early_data_offered and !self.early_data_accepted and err == error.BadRecord) {
+                if (self.early_data_offered and !self.early_data_accepted and err == error.RecordAuthenticationFailed) {
                     // A record that fails to decrypt under the handshake
                     // traffic key while a 0-RTT offer was rejected is treated
                     // as rejected early data arriving late (RFC 8446 §4.2.10)
@@ -1129,7 +1302,12 @@ pub const Server = struct {
             };
             self.hs_read_seq += 1;
             defer self.allocator.free(opened.content);
+            if (self.record_size_limit_offered and opened.inner_len > self.receive_record_size_limit) return error.RecordOverflow;
             consumePrefix(&self.recv_buf, rec.wire_len);
+            if (opened.content_type == .alert) {
+                _ = tls_alert.parse(opened.content) catch return error.BadRecord;
+                return error.TlsAlert;
+            }
             if (opened.content_type != .handshake) return error.BadRecord;
             // RFC 8446 §5.1: zero-length handshake fragments MUST NOT be sent;
             // receiving one is fatal rather than an ignorable no-op.
@@ -1185,7 +1363,7 @@ pub const Server = struct {
                 self.state = .wait_client_finished;
             },
             .wait_client_finished => {
-                if (msg.typ != .finished) return error.BadHandshake;
+                if (msg.typ != .finished or off != self.client_flight.items.len) return error.BadHandshake;
                 if (!self.finishedVerify(&self.client_hs_secret, msg.body)) return error.FinishedMismatch;
                 try self.appendTranscript(msg.raw);
                 try self.deriveResumptionMasterSecret();
@@ -1268,55 +1446,195 @@ pub const Server = struct {
         return error.BadHandshake;
     }
 
-    pub fn encrypt(self: *Server, appdata: []const u8) Error![]u8 {
-        if (self.state != .connected) return error.BadState;
+    /// An exclusive TX-only preparation. The owner must stay in place and the
+    /// handle must not be copied or survive an owner turn/Helix capture. Ciphertext
+    /// is owned by this handle until taken after commit. Commit is valid only
+    /// after the caller has reserved custody for the complete bytes() slice.
+    pub const PreparedAppWrite = struct {
+        owner: *Server,
+        allocator: Allocator,
+        generation: u64,
+        original_seq: u64,
+        next_seq: u64,
+        suite: CipherSuite,
+        peer_limit: usize,
+        ciphertext: ?[]u8,
+        done: bool = false,
+
+        pub fn bytes(self: *const PreparedAppWrite) []const u8 {
+            return self.ciphertext orelse &.{};
+        }
+
+        pub fn canCommit(self: *const PreparedAppWrite) bool {
+            return !self.done and self.owner.app_write_active == self.generation and
+                self.owner.state == .connected and self.owner.app_write_seq == self.original_seq and
+                self.owner.selected_suite == self.suite and self.owner.peer_record_size_limit == self.peer_limit;
+        }
+
+        pub fn commit(self: *PreparedAppWrite) void {
+            std.debug.assert(self.canCommit());
+            self.owner.app_write_seq = self.next_seq;
+            self.owner.app_write_active = null;
+            self.done = true;
+        }
+
+        pub fn takeBytes(self: *PreparedAppWrite) []u8 {
+            std.debug.assert(self.done);
+            const owned = self.ciphertext orelse unreachable;
+            self.ciphertext = null;
+            return owned;
+        }
+
+        pub fn abort(self: *PreparedAppWrite) void {
+            if (!self.done and self.owner.app_write_active == self.generation) {
+                self.owner.app_write_active = null;
+            }
+            self.done = true;
+            if (self.ciphertext) |owned| self.allocator.free(owned);
+            self.ciphertext = null;
+        }
+
+        pub fn deinit(self: *PreparedAppWrite) void {
+            self.abort();
+        }
+    };
+
+    /// Stage a complete batch using local sequence numbers. Each input keeps its
+    /// record boundary, then fragments further at the negotiated peer limit.
+    /// Empty inputs emit an empty application record; an empty batch emits none.
+    /// Allocation/sequence exhaustion leaves the live TX epoch unchanged.
+    pub fn prepareAppWrite(self: *Server, chunks: []const []const u8) Error!PreparedAppWrite {
+        if (self.read_failed) return error.BadState;
+        if (self.state != .connected or self.app_write_active != null) return error.BadState;
+        if (self.app_write_generation == std.math.maxInt(u64)) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
         const limit = tls_record.recordContentLimit(self.peer_record_size_limit);
-        if (appdata.len <= limit) {
-            const seq = try tls_record.reserveAppSeq(self.app_write_seq);
-            const out = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .application_data, appdata);
-            self.app_write_seq += 1;
-            return out;
+        var records: u64 = 0;
+        for (chunks) |chunk| {
+            const count: u64 = if (chunk.len == 0) 1 else @intCast(1 + (chunk.len - 1) / limit);
+            records = std.math.add(u64, records, count) catch return error.SequenceExhausted;
         }
-        // RFC 8449: the peer advertised a smaller record_size_limit — fragment the
-        // application data into multiple records, each within its limit, and
-        // return them concatenated (one record per fragment, seq bumped per record).
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(self.allocator);
-        var off: usize = 0;
-        while (off < appdata.len) {
-            const n = @min(limit, appdata.len - off);
-            const seq = try tls_record.reserveAppSeq(self.app_write_seq);
-            const rec = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .application_data, appdata[off .. off + n]);
-            defer self.allocator.free(rec);
-            try buf.appendSlice(self.allocator, rec);
-            self.app_write_seq += 1;
-            off += n;
-        }
-        return buf.toOwnedSlice(self.allocator);
+        if (records > std.math.maxInt(u64) - self.app_write_seq) return error.SequenceExhausted;
+        var seq = self.app_write_seq;
+        const ciphertext = if (chunks.len == 1 and chunks[0].len <= limit) blk: {
+            const reserved = try tls_record.reserveAppSeq(seq);
+            const out = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, reserved, .application_data, chunks[0]);
+            seq += 1;
+            break :blk out;
+        } else blk: {
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(self.allocator);
+            for (chunks) |chunk| {
+                var off: usize = 0;
+                while (true) {
+                    const n = @min(limit, chunk.len - off);
+                    const reserved = try tls_record.reserveAppSeq(seq);
+                    const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, reserved, .application_data, chunk[off..][0..n]);
+                    defer self.allocator.free(record);
+                    try buf.appendSlice(self.allocator, record);
+                    seq += 1;
+                    off += n;
+                    if (off == chunk.len) break;
+                }
+            }
+            break :blk try buf.toOwnedSlice(self.allocator);
+        };
+        self.app_write_generation += 1;
+        self.app_write_active = self.app_write_generation;
+        return .{
+            .owner = self,
+            .allocator = self.allocator,
+            .generation = self.app_write_generation,
+            .original_seq = self.app_write_seq,
+            .next_seq = seq,
+            .suite = suite,
+            .peer_limit = self.peer_record_size_limit,
+            .ciphertext = ciphertext,
+        };
     }
 
+    pub fn encrypt(self: *Server, appdata: []const u8) Error![]u8 {
+        var prepared = try self.prepareAppWrite(&.{appdata});
+        defer prepared.deinit();
+        prepared.commit();
+        return prepared.takeBytes();
+    }
+
+    pub const ControlPolicy = enum { software_reply, hold_requested, kernel_reply };
+    pub const Decrypted = union(enum) { plaintext: []u8, held_request, kernel_reply };
+
     pub fn decrypt(self: *Server, record: []const u8) Error![]u8 {
-        if (self.state != .connected) return error.BadState;
+        return switch (try self.decryptWithControlPolicy(record, .software_reply)) {
+            .plaintext => |owned| owned,
+            .held_request, .kernel_reply => unreachable,
+        };
+    }
+
+    /// One authentication per incoming record. A held request returns without
+    /// admission; a kernel reply rotates only RX and leaves TX with its owner.
+    pub fn decryptWithControlPolicy(self: *Server, record: []const u8, policy: ControlPolicy) Error!Decrypted {
+        if (self.read_failed or self.app_write_active != null or self.state != .connected) return error.BadState;
+        return self.decryptCandidate(record, policy) catch |err| {
+            if (err != error.OutOfMemory) self.read_failed = true;
+            if (err == error.TlsAlert) self.discardPendingOutput();
+            return err;
+        };
+    }
+
+    fn decryptCandidate(self: *Server, record: []const u8, policy: ControlPolicy) Error!Decrypted {
         const suite = self.selected_suite orelse return error.BadState;
         const seq = try tls_record.reserveAppSeq(self.app_read_seq);
         const opened = try openRecordAlloc(self.allocator, suite, &self.client_app_keys, seq, record);
-        self.app_read_seq += 1;
         errdefer self.allocator.free(opened.content);
+        if (self.record_size_limit_offered and opened.inner_len > self.receive_record_size_limit) return error.RecordOverflow;
+        if (self.post_handshake_recv_len != 0 and opened.content_type != .handshake and opened.content_type != .alert) return error.BadHandshake;
+        if (opened.content_type == .alert) {
+            _ = tls_alert.parse(opened.content) catch return error.BadRecord;
+            return error.TlsAlert;
+        }
         if (opened.content_type == .handshake) {
-            // On error the function-scoped errdefer frees opened.content; on
-            // success free it here (no application bytes to return).
-            try self.handlePostHandshake(opened.content);
+            const total = @as(usize, self.post_handshake_recv_len) + opened.content.len;
+            if (opened.content.len == 0 or total > 5) return error.BadHandshake;
+            var candidate: [5]u8 = @splat(0);
+            @memcpy(candidate[0..self.post_handshake_recv_len], self.post_handshake_recv[0..self.post_handshake_recv_len]);
+            @memcpy(candidate[self.post_handshake_recv_len..][0..opened.content.len], opened.content);
+            const header = [_]u8{ 24, 0, 0, 1 };
+            if (!std.mem.eql(u8, candidate[0..@min(total, 4)], header[0..@min(total, 4)]) or (total == 5 and candidate[4] > 1)) return error.BadHandshake;
+            if (total == 5 and candidate[4] == 1 and policy == .hold_requested) {
+                self.allocator.free(opened.content);
+                return .held_request;
+            }
+            if (total == 5 and candidate[4] == 1 and policy == .kernel_reply) {
+                var prepared = try self.prepareKernelKeyUpdate(.rx);
+                defer prepared.deinit();
+                prepared.commit();
+                self.allocator.free(opened.content);
+                return .kernel_reply;
+            }
+            const empty = try self.allocator.alloc(u8, 0);
+            errdefer self.allocator.free(empty);
+            try self.handlePostHandshake(opened.content, seq + 1);
             self.allocator.free(opened.content);
-            return self.allocator.alloc(u8, 0);
+            return .{ .plaintext = empty };
         }
         if (opened.content_type != .application_data) return error.BadRecord;
-        return opened.content;
+        self.app_read_seq = seq + 1;
+        return .{ .plaintext = opened.content };
     }
 
-    /// Take ownership of any queued post-handshake bytes the caller must write to
-    /// the socket (a KeyUpdate reply). Returns null when nothing is queued.
     pub fn takePendingSend(self: *Server) Error!?[]u8 {
+        if (self.failed_flight) |flight| {
+            if (self.post_handshake_send.items.len == 0) {
+                self.failed_flight = null;
+                return flight;
+            }
+            const total = std.math.add(usize, flight.len, self.post_handshake_send.items.len) catch return error.BadRecord;
+            const owned = try self.allocator.alloc(u8, total);
+            @memcpy(owned[0..flight.len], flight);
+            @memcpy(owned[flight.len..], self.post_handshake_send.items);
+            self.discardPendingOutput();
+            return owned;
+        }
         if (self.post_handshake_send.items.len == 0) return null;
         return try self.post_handshake_send.toOwnedSlice(self.allocator);
     }
@@ -1325,6 +1643,7 @@ pub const Server = struct {
     /// owns) and rotates the server→client application keys. When `request_peer`
     /// is true the client is asked to update its keys in return.
     pub fn initiateKeyUpdate(self: *Server, request_peer: bool) Error![]u8 {
+        if (self.app_write_active != null) return error.BadState;
         if (self.state != .connected) return error.BadState;
         const request: KeyUpdateRequest = if (request_peer) .requested else .not_requested;
         return self.buildKeyUpdateRecord(request);
@@ -1340,19 +1659,45 @@ pub const Server = struct {
         suite: u16,
         client_app_secret: [max_hash_len]u8,
         server_app_secret: [max_hash_len]u8,
-        exporter_master_secret: [max_hash_len]u8 = @splat(0),
-        exporter_master_secret_ready: bool = false,
+        exporter_master_secret: [max_hash_len]u8,
+        exporter_master_secret_ready: bool,
         app_read_seq: u64,
         app_write_seq: u64,
+        peer_record_size_limit_raw: u16,
+        local_receive_policy: u16,
+        record_size_limit_negotiated: bool,
+        selected_alpn: []const u8,
+        ku_prefix_len: u3,
+        ku_prefix: [4]u8,
     };
 
-    /// Capture the connected-state snapshot for a Helix live upgrade. Only valid
-    /// once the handshake completed; the secrets in the returned struct are key
-    /// material — the caller must treat the bytes as sensitive.
-    pub fn exportResume(self: *const Server) Error!ResumeState {
-        if (self.state != .connected) return error.BadState;
+    /// Canonical connected state. No configuration or key heuristic fills a
+    /// missing field; exhausted counters remain an explicit legal state.
+    pub fn validateResumeState(st: ResumeState) Error!void {
+        const suite = try CipherSuite.fromWire(st.suite);
+        if (!st.exporter_master_secret_ready or st.peer_record_size_limit_raw < 64 or
+            st.local_receive_policy < 64 or st.local_receive_policy > tls_record.record_size_limit_max or
+            st.selected_alpn.len > 255 or st.ku_prefix_len > 4) return error.BadState;
+        if (!st.record_size_limit_negotiated and st.peer_record_size_limit_raw != tls_record.record_size_limit_max) return error.BadState;
+        const hlen = suite.hashLen();
+        for (st.client_app_secret[hlen..]) |byte| if (byte != 0) return error.BadState;
+        for (st.server_app_secret[hlen..]) |byte| if (byte != 0) return error.BadState;
+        for (st.exporter_master_secret[hlen..]) |byte| if (byte != 0) return error.BadState;
+        const header = [_]u8{ 24, 0, 0, 1 };
+        if (!std.mem.eql(u8, st.ku_prefix[0..st.ku_prefix_len], header[0..st.ku_prefix_len])) return error.BadState;
+        for (st.ku_prefix[st.ku_prefix_len..]) |byte| if (byte != 0) return error.BadState;
+    }
+
+    /// Paired capture retains the original pending ciphertext without consuming
+    /// it. The adapter must include this view in its prepared output inventory.
+    pub const Capture = struct { state: ResumeState, pending_send: []const u8 };
+
+    pub fn captureWithPending(self: *const Server) Error!Capture {
+        if (self.failed_flight != null or self.read_failed or self.app_write_active != null or self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        return .{
+        var prefix: [4]u8 = @splat(0);
+        @memcpy(prefix[0..self.post_handshake_recv_len], self.post_handshake_recv[0..self.post_handshake_recv_len]);
+        const st: ResumeState = .{
             .suite = @intFromEnum(suite),
             .client_app_secret = self.client_app_secret,
             .server_app_secret = self.server_app_secret,
@@ -1360,16 +1705,33 @@ pub const Server = struct {
             .exporter_master_secret_ready = self.exporter_master_secret_ready,
             .app_read_seq = self.app_read_seq,
             .app_write_seq = self.app_write_seq,
+            .peer_record_size_limit_raw = @intCast(self.peer_record_size_limit),
+            .local_receive_policy = self.receive_record_size_limit,
+            .record_size_limit_negotiated = self.record_size_limit_offered,
+            .selected_alpn = self.selected_alpn orelse &.{},
+            .ku_prefix_len = self.post_handshake_recv_len,
+            .ku_prefix = prefix,
         };
+        try validateResumeState(st);
+        return .{ .state = st, .pending_send = self.post_handshake_send.items };
     }
 
-    /// Successor side of a Helix live upgrade: rebuild a CONNECTED server from an
-    /// exported `ResumeState`. Traffic keys are re-derived from the carried
-    /// application secrets, so the record stream continues seamlessly (including
-    /// later KeyUpdates). The handshake machinery is never re-entered.
+    pub fn exportResume(self: *const Server) Error!ResumeState {
+        const captured = try self.captureWithPending();
+        if (captured.pending_send.len != 0) return error.BadState;
+        return captured.state;
+    }
+
+    /// Restore policy for this connection from authenticated state. The supplied
+    /// config controls only new handshakes and cannot reinterpret an old record.
     pub fn resumeConnected(allocator: Allocator, config: Config, st: ResumeState) Error!Server {
+        try validateResumeState(st);
         var self = try Server.init(allocator, config);
         errdefer self.deinit();
+        if (st.selected_alpn.len != 0) {
+            self.owned_selected_alpn = try allocator.dupe(u8, st.selected_alpn);
+            self.selected_alpn = self.owned_selected_alpn;
+        }
         const suite = try CipherSuite.fromWire(st.suite);
         self.selected_suite = suite;
         self.client_app_secret = st.client_app_secret;
@@ -1380,59 +1742,84 @@ pub const Server = struct {
         try deriveTrafficKeys(suite, self.server_app_secret[0..suite.hashLen()], &self.server_app_keys);
         self.app_read_seq = st.app_read_seq;
         self.app_write_seq = st.app_write_seq;
+        self.peer_record_size_limit = st.peer_record_size_limit_raw;
+        self.receive_record_size_limit = st.local_receive_policy;
+        self.record_size_limit_offered = st.record_size_limit_negotiated;
+        @memcpy(self.post_handshake_recv[0..4], &st.ku_prefix);
+        self.post_handshake_recv_len = st.ku_prefix_len;
         self.state = .connected;
         return self;
     }
 
-    /// Process a decrypted post-handshake handshake fragment. A KeyUpdate rotates
-    /// the client→server application keys and, when update_requested, queues our
-    /// own KeyUpdate(update_not_requested) reply and rotates the server→client
-    /// keys (RFC 8446 §4.6.3). FAIL-CLOSED: a zero-length fragment (prohibited,
-    /// RFC 8446 §5.1), any handshake type other than KeyUpdate (a client has no
-    /// other legal post-handshake message toward us — we never send a
-    /// post-handshake CertificateRequest), or trailing partial bytes (no
-    /// cross-record post-handshake reassembly exists, so they would otherwise be
-    /// silently lost) all abort the connection, as does a record coalescing more
-    /// than `max_post_handshake_msgs_per_record` messages (KeyUpdate flood).
-    fn handlePostHandshake(self: *Server, fragment: []const u8) Error!void {
+    /// A single bounded KU may span records, but its completion is the last
+    /// byte of its record. Stage reply custody before either key epoch changes.
+    fn handlePostHandshake(self: *Server, fragment: []const u8, next_seq: u64) Error!void {
         if (fragment.len == 0) return error.BadHandshake;
-        var off: usize = 0;
-        var seen: usize = 0;
-        while (parseHandshakeMaybe(fragment, &off)) |msg| {
-            seen += 1;
-            if (seen > max_post_handshake_msgs_per_record) return error.BadHandshake;
-            if (msg.typ != .key_update) return error.BadHandshake;
-            if (msg.body.len != 1) return error.BadHandshake;
-            const request = msg.body[0];
-            if (request != @intFromEnum(KeyUpdateRequest.not_requested) and
-                request != @intFromEnum(KeyUpdateRequest.requested))
-            {
-                return error.BadHandshake;
-            }
-            try self.applyKeyUpdate(&self.client_app_secret, &self.client_app_keys);
-            self.app_read_seq = 0;
-            if (request == @intFromEnum(KeyUpdateRequest.requested)) {
-                const reply = try self.buildKeyUpdateRecord(.not_requested);
-                defer self.allocator.free(reply);
-                try self.post_handshake_send.appendSlice(self.allocator, reply);
-            }
+        const total = @as(usize, self.post_handshake_recv_len) + fragment.len;
+        if (total > 5) return error.BadHandshake;
+        var candidate: [5]u8 = @splat(0);
+        @memcpy(candidate[0..self.post_handshake_recv_len], self.post_handshake_recv[0..self.post_handshake_recv_len]);
+        @memcpy(candidate[self.post_handshake_recv_len..][0..fragment.len], fragment);
+        if (candidate[0] != @intFromEnum(HandshakeType.key_update)) return error.BadHandshake;
+        const header = [_]u8{ 24, 0, 0, 1 };
+        if (!std.mem.eql(u8, candidate[0..@min(total, 4)], header[0..@min(total, 4)])) return error.BadHandshake;
+        if (total < 5) {
+            self.post_handshake_recv = candidate;
+            self.post_handshake_recv_len = @intCast(total);
+            self.app_read_seq = next_seq;
+            return;
         }
-        if (off != fragment.len) return error.BadHandshake;
+        if (candidate[4] > 1) return error.BadHandshake;
+        var rx_secret = self.client_app_secret;
+        defer secureZero(&rx_secret);
+        var rx_keys = self.client_app_keys;
+        defer rx_keys.wipe();
+        var tx_secret = self.server_app_secret;
+        defer secureZero(&tx_secret);
+        var tx_keys = self.server_app_keys;
+        defer tx_keys.wipe();
+        try self.applyKeyUpdate(&rx_secret, &rx_keys);
+        var reply: ?[]u8 = null;
+        defer if (reply) |owned| self.allocator.free(owned);
+        if (candidate[4] == @intFromEnum(KeyUpdateRequest.requested)) {
+            const suite = self.selected_suite orelse return error.BadState;
+            const seq = try tls_record.reserveAppSeq(self.app_write_seq);
+            const reply_hs = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 0 };
+            reply = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .handshake, &reply_hs);
+            try self.applyKeyUpdate(&tx_secret, &tx_keys);
+            try self.post_handshake_send.ensureUnusedCapacity(self.allocator, reply.?.len);
+        }
+        // Allocation-free acceptance, including retained response and epochs.
+        if (reply) |owned| {
+            self.post_handshake_send.appendSliceAssumeCapacity(owned);
+            self.server_app_secret = tx_secret;
+            self.server_app_keys = tx_keys;
+            self.app_write_seq = 0;
+        }
+        self.client_app_secret = rx_secret;
+        self.client_app_keys = rx_keys;
+        self.app_read_seq = 0;
+        self.post_handshake_recv_len = 0;
+        @memset(&self.post_handshake_recv, 0);
     }
 
     /// Build one KeyUpdate record sealed under the *current* server send keys,
     /// then rotate the server→client application keys so subsequent records use
     /// the new keys.
     fn buildKeyUpdateRecord(self: *Server, request: KeyUpdateRequest) Error![]u8 {
+        if (self.read_failed) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        var hs: std.ArrayList(u8) = .empty;
-        defer hs.deinit(self.allocator);
-        try writeHandshake(self.allocator, &hs, .key_update, &[_]u8{@intFromEnum(request)});
+        const hs = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, @intFromEnum(request) };
         const seq = try tls_record.reserveAppSeq(self.app_write_seq);
-        const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .handshake, hs.items);
+        const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .handshake, &hs);
         errdefer self.allocator.free(record);
-        self.app_write_seq += 1;
-        try self.applyKeyUpdate(&self.server_app_secret, &self.server_app_keys);
+        var secret = self.server_app_secret;
+        defer secureZero(&secret);
+        var keys = self.server_app_keys;
+        defer keys.wipe();
+        try self.applyKeyUpdate(&secret, &keys);
+        self.server_app_secret = secret;
+        self.server_app_keys = keys;
         self.app_write_seq = 0;
         return record;
     }
@@ -1477,8 +1864,8 @@ pub const Server = struct {
         // for a classical group or 64 for the X25519MLKEM768 hybrid.
         try self.deriveHandshakeKeys(shared.buf[0..shared.len]);
 
-        // Encrypted flight: EncryptedExtensions, Certificate, CertificateVerify,
-        // Finished — concatenated into one handshake payload, sealed once.
+        // The transcript owns one contiguous message flight. RFC 8449 applies
+        // the peer's limit to every protected fragment, including handshake.
         var flight: std.ArrayList(u8) = .empty;
         defer flight.deinit(self.allocator);
         try self.writeEncryptedExtensions(&flight);
@@ -1496,14 +1883,13 @@ pub const Server = struct {
         const sh_record = try writePlainRecord(self.allocator, .handshake, sh_hs.items);
         defer self.allocator.free(sh_record);
         const ccs = [_]u8{ @intFromEnum(tls_record.ContentType.change_cipher_spec), 0x03, 0x03, 0x00, 0x01, 0x01 };
-        const enc_record = try sealRecordAlloc(self.allocator, suite, &self.server_hs_keys, self.hs_write_seq, .handshake, flight.items);
-        defer self.allocator.free(enc_record);
-        self.hs_write_seq += 1;
-
-        var out = try self.allocator.alloc(u8, sh_record.len + ccs.len + enc_record.len);
+        const encrypted = try sealRecordBatchAlloc(self.allocator, suite, &self.server_hs_keys, self.hs_write_seq, .handshake, flight.items, self.peer_record_size_limit);
+        defer self.allocator.free(encrypted.bytes);
+        const out = try self.allocator.alloc(u8, sh_record.len + ccs.len + encrypted.bytes.len);
         @memcpy(out[0..sh_record.len], sh_record);
         @memcpy(out[sh_record.len..][0..ccs.len], &ccs);
-        @memcpy(out[sh_record.len + ccs.len ..], enc_record);
+        @memcpy(out[sh_record.len + ccs.len ..], encrypted.bytes);
+        self.hs_write_seq = encrypted.next_seq;
         return out;
     }
 
@@ -1791,10 +2177,11 @@ pub const Server = struct {
                     };
                 },
                 .record_size_limit => {
+                    if (offered_record_size_limit) return error.InvalidRecordSizeLimit;
                     // RFC 8449: 2-byte value in [64, 2^14+1]; else illegal_parameter.
-                    if (ext.data.len != 2) return error.BadHandshake;
+                    if (ext.data.len != 2) return error.InvalidRecordSizeLimit;
                     const limit = std.mem.readInt(u16, ext.data[0..2], .big);
-                    if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.BadHandshake;
+                    if (limit < tls_record.record_size_limit_min) return error.InvalidRecordSizeLimit;
                     self.peer_record_size_limit = limit;
                     offered_record_size_limit = true;
                 },
@@ -1923,6 +2310,7 @@ pub const Server = struct {
                     // refused. The replay check runs LAST (after the window) so a
                     // stale-age attempt does not consume a binder-ring slot.
                     if (offered_early_data and
+                        self.receive_record_size_limit == tls_record.record_size_limit_max and
                         self.accepted_early_data_limit > 0 and
                         self.accepted_age_within_window)
                     {
@@ -2257,8 +2645,8 @@ pub const Server = struct {
         if (self.ech_offered and !self.ech_accepted and self.config.ech_retry_config_list.len != 0) {
             try ext_builder.add(ech.extension_type, self.config.ech_retry_config_list);
         }
-        // RFC 8449 §4: advertise the max TLSInnerPlaintext we accept (full-size
-        // records — our recv path handles them), but ONLY as a response to the
+        // RFC 8449 §4: advertise the copied local TLSInnerPlaintext policy,
+        // including type and padding, but ONLY as a response to the
         // client's own `record_size_limit` offer. RFC 8446 §4.2 forbids sending
         // an extension the peer did not solicit, and strict clients (BoringSSL/
         // Chrome, which does not offer it in its WebSocket ClientHello) abort the
@@ -2266,7 +2654,7 @@ pub const Server = struct {
         // happens on our send path (see `encrypt`) regardless of whether we echo.
         if (self.record_size_limit_offered) {
             var rsl_buf: [2]u8 = undefined;
-            std.mem.writeInt(u16, &rsl_buf, tls_record.record_size_limit_max, .big);
+            std.mem.writeInt(u16, &rsl_buf, self.receive_record_size_limit, .big);
             try ext_builder.addTyped(.record_size_limit, &rsl_buf);
         }
         try self.emit(out, .encrypted_extensions, try ext_builder.finish());
@@ -2763,6 +3151,10 @@ pub const Server = struct {
         defer secureZero(psk[0..psk_len]);
 
         const lifetime = effectiveTicketLifetimeSeconds(self.config.ticket_lifetime_seconds);
+        // The frozen sealed-ticket format has no prior local receive bound.
+        // Restrict early grants to the default-policy lineage; custom sessions
+        // still mint valid 1-RTT tickets without an early-data grant.
+        const early_limit: u32 = if (self.receive_record_size_limit == tls_record.record_size_limit_max) self.config.max_early_data_size else 0;
         const sealed = try tls_resumption.sealTicket(
             self.allocator,
             self.ticket_key,
@@ -2771,7 +3163,7 @@ pub const Server = struct {
             psk[0..psk_len],
             &ticket_nonce,
             if (self.config.now_unix_seconds) |s| s * 1000 else 0,
-            self.config.max_early_data_size,
+            early_limit,
             // Seal the SAME ticket_age_add the NewSessionTicket advertises so any
             // node holding the ticket key can later un-obfuscate the client's
             // reported obfuscated_ticket_age for the §8.2–8.3 freshness window.
@@ -2781,7 +3173,7 @@ pub const Server = struct {
         defer self.allocator.free(sealed);
 
         var ticket_ext_storage: [16]u8 = undefined;
-        const ticket_extensions = try buildTicketExtensions(&ticket_ext_storage, self.config.max_early_data_size);
+        const ticket_extensions = try buildTicketExtensions(&ticket_ext_storage, early_limit);
 
         var ticket_body_buf: [512]u8 = undefined;
         const ticket_body = try tls_session_ticket.encode(&ticket_body_buf, .{
@@ -2795,11 +3187,11 @@ pub const Server = struct {
         var hs: std.ArrayList(u8) = .empty;
         defer hs.deinit(self.allocator);
         try writeHandshake(self.allocator, &hs, .new_session_ticket, ticket_body);
-        const seq = try tls_record.reserveAppSeq(self.app_write_seq);
-        const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .handshake, hs.items);
-        defer self.allocator.free(record);
-        self.app_write_seq += 1;
-        try self.post_handshake_send.appendSlice(self.allocator, record);
+        const encrypted = try sealRecordBatchAlloc(self.allocator, suite, &self.server_app_keys, self.app_write_seq, .handshake, hs.items, self.peer_record_size_limit);
+        defer self.allocator.free(encrypted.bytes);
+        try self.post_handshake_send.ensureUnusedCapacity(self.allocator, encrypted.bytes.len);
+        self.post_handshake_send.appendSliceAssumeCapacity(encrypted.bytes);
+        self.app_write_seq = encrypted.next_seq;
     }
 
     fn deriveTicketPskT(self: *Server, comptime KS: type, ticket_nonce: []const u8, out: *[max_hash_len]u8) Error!usize {
@@ -3018,7 +3410,7 @@ const KeyUpdateRequest = enum(u8) {
 const HandshakeMsg = struct { typ: HandshakeType, body: []const u8, raw: []const u8 };
 
 const PlainRecord = struct { content_type: tls_record.ContentType, fragment: []const u8, wire_len: usize };
-const OpenedRecord = struct { content_type: tls_record.ContentType, content: []u8 };
+const OpenedRecord = struct { content_type: tls_record.ContentType, content: []u8, inner_len: usize };
 
 const certificate_verify_context = "TLS 1.3, server CertificateVerify";
 const client_certificate_verify_context = "TLS 1.3, client CertificateVerify";
@@ -3280,19 +3672,8 @@ fn findPskExtensionBodyOffset(client_hello_raw: []const u8) Error!usize {
 }
 
 fn osEntropy(buf: []u8) Error!void {
-    switch (builtin.os.tag) {
-        .linux => {
-            var filled: usize = 0;
-            while (filled < buf.len) {
-                const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
-                const signed: isize = @bitCast(rc);
-                if (signed < 0 or rc == 0) return error.BadState;
-                filled += rc;
-            }
-        },
-        .openbsd => @import("random.zig").fillOsEntropy(buf) catch return error.BadState,
-        else => return error.BadState,
-    }
+    // Central CSPRNG root covers every target (Linux, OpenBSD, Windows, macOS).
+    @import("random.zig").fillOsEntropy(buf) catch return error.BadState;
 }
 
 fn secureZero(buf: []u8) void {
@@ -3328,10 +3709,33 @@ fn completePlainRecord(buf: []const u8) Error!?PlainRecord {
     if (buf.len < tls_record.record_header_len) return null;
     const typ = tls_record.ContentType.fromWire(buf[0]) orelse return error.BadRecord;
     const len = std.mem.readInt(u16, buf[3..5], .big);
-    if (len > tls_record.max_ciphertext_len) return error.BadRecord;
+    if (len > tls_record.max_ciphertext_len) return error.RecordOverflow;
     const total = tls_record.record_header_len + @as(usize, len);
     if (buf.len < total) return null;
     return .{ .content_type = typ, .fragment = buf[5..total], .wire_len = total };
+}
+
+const SealedBatch = struct { bytes: []u8, next_seq: u64 };
+
+/// Protect all fragments with local nonce state. No caller state is changed on
+/// allocation/seal failure, including failure on a later fragment.
+fn sealRecordBatchAlloc(allocator: Allocator, suite: CipherSuite, keys: *const TrafficKeys, first_seq: u64, typ: tls_record.ContentType, plaintext: []const u8, peer_limit: usize) Error!SealedBatch {
+    const layout = try tls_record.protectedBatchLayout(plaintext.len, peer_limit, suite.tagLen(), first_seq);
+    const out = try allocator.alloc(u8, layout.wire_len);
+    errdefer allocator.free(out);
+    const limit = tls_record.recordContentLimit(peer_limit);
+    var offset: usize = 0;
+    var written: usize = 0;
+    for (0..layout.records) |index| {
+        const n = @min(limit, plaintext.len - offset);
+        const record = try sealRecordAlloc(allocator, suite, keys, first_seq + @as(u64, @intCast(index)), typ, plaintext[offset..][0..n]);
+        defer allocator.free(record);
+        @memcpy(out[written..][0..record.len], record);
+        offset += n;
+        written += record.len;
+    }
+    std.debug.assert(written == out.len and offset == plaintext.len);
+    return .{ .bytes = out, .next_seq = layout.next_seq };
 }
 
 fn sealRecordAlloc(allocator: Allocator, suite: CipherSuite, keys: *const TrafficKeys, seq: u64, typ: tls_record.ContentType, plaintext: []const u8) Error![]u8 {
@@ -3369,7 +3773,7 @@ fn sealRecordAlloc(allocator: Allocator, suite: CipherSuite, keys: *const Traffi
 
 fn openRecordAlloc(allocator: Allocator, suite: CipherSuite, keys: *const TrafficKeys, seq: u64, record: []const u8) Error!OpenedRecord {
     const parsed = try tls_record.parseCiphertext(record);
-    if (parsed.encrypted_record.len < suite.tagLen()) return error.BadRecord;
+    if (parsed.encrypted_record.len < suite.tagLen()) return error.RecordAuthenticationFailed;
     const clen = parsed.encrypted_record.len - suite.tagLen();
     const inner = try allocator.alloc(u8, clen);
     errdefer allocator.free(inner);
@@ -3379,23 +3783,23 @@ fn openRecordAlloc(allocator: Allocator, suite: CipherSuite, keys: *const Traffi
         .tls_aes_128_gcm_sha256 => {
             const key = keys.key[0..Aes128Gcm.key_length].*;
             const tag = parsed.encrypted_record[clen..][0..Aes128Gcm.tag_length].*;
-            Aes128Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.BadRecord;
+            Aes128Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
         },
         .tls_aes_256_gcm_sha384 => {
             const key = keys.key[0..Aes256Gcm.key_length].*;
             const tag = parsed.encrypted_record[clen..][0..Aes256Gcm.tag_length].*;
-            Aes256Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.BadRecord;
+            Aes256Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
         },
         .tls_chacha20_poly1305_sha256 => {
             const key = keys.key[0..ChaCha20Poly1305.key_length].*;
             const tag = parsed.encrypted_record[clen..][0..ChaCha20Poly1305.tag_length].*;
-            ChaCha20Poly1305.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.BadRecord;
+            ChaCha20Poly1305.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
         },
     }
     const opened = try tls_record.decodeInnerPlaintext(inner);
     const content = try allocator.dupe(u8, opened.content);
     allocator.free(inner);
-    return .{ .content_type = opened.content_type, .content = content };
+    return .{ .content_type = opened.content_type, .content = content, .inner_len = clen };
 }
 
 fn deriveTrafficKeys(suite: CipherSuite, secret_bytes: []const u8, out: *TrafficKeys) Error!void {
@@ -3715,6 +4119,7 @@ test "loopback: ECH — server opens the ClientHelloInner and both derive off th
     defer server.deinit();
     var client = try tls_client.Client.init(alloc, .{
         .server_name = "irc.test",
+        .receive_record_size_limit = 64,
         .trust_anchors = &.{der},
         .ech_config_list = ech_list,
     });
@@ -3743,6 +4148,8 @@ test "loopback: ECH — server opens the ClientHelloInner and both derive off th
 
     _ = try server.feed(cfin);
     try std.testing.expect(server.handshakeDone());
+    try std.testing.expectEqual(@as(usize, 64), server.peer_record_size_limit);
+    try std.testing.expect(client.record_size_limit_negotiated);
 
     // Application data flows over the keys derived from the inner transcript.
     const s2c = try server.encrypt("hello ech client");
@@ -6049,6 +6456,7 @@ test "loopback: TLS 1.3 PSK-DHE resumption rejects 0-RTT when sealed ticket limi
 
     const decoded = try tls_resumption.decodeStoredSession(stored);
     const forged = try tls_resumption.encodeStoredSession(alloc, .{
+        .peer_record_size_limit = 16385,
         .suite = decoded.suite,
         .ticket_lifetime = decoded.ticket_lifetime,
         .ticket_age_add = decoded.ticket_age_add,
@@ -6616,7 +7024,7 @@ test "loopback: server HelloRetryRequest recovers a client that withheld key_sha
 
     var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
     defer server.deinit();
-    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .receive_record_size_limit = 64, .trust_anchors = &.{der} });
     defer client.deinit();
     // Advertise all groups but send an empty key_share, so the server must HRR.
     client.offerNoSharesForTest();
@@ -6657,6 +7065,8 @@ test "loopback: server HelloRetryRequest recovers a client that withheld key_sha
     try std.testing.expect(client.handshakeDone());
     _ = try server.feed(cfin);
     try std.testing.expect(server.handshakeDone());
+    try std.testing.expectEqual(@as(usize, 64), server.peer_record_size_limit);
+    try std.testing.expect(client.record_size_limit_negotiated);
 
     // Application data flows both ways over the post-HRR keys.
     const s2c = try server.encrypt("hrr ok");
@@ -6993,63 +7403,31 @@ test "takeAlert seals an ENCRYPTED fatal alert for post-ServerHello handshake er
     }
 }
 
-test "TLS 1.3 post-handshake: server rejects non-KeyUpdate messages, empty and truncated fragments (fail-closed)" {
-    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+test "TLS 1.3 post-handshake: server rejects non-KU messages, empty and invalid lengths (fail-closed)" {
     const allocator = std.testing.allocator;
-    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x71)));
     var cert_buf: [1024]u8 = undefined;
-    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
-        .common_name = "ph.test",
-        .not_before = 1_704_067_200,
-        .not_after = 4_102_444_800,
-        .serial = &.{0x02},
-        .key_pair = kp,
-        .dns_names = &.{"ph.test"},
-    });
-    var server = try Server.init(allocator, .{ .cert_chain = &.{der}, .signing_key = kp });
-    defer server.deinit();
-    server.state = .connected;
-    server.selected_suite = .tls_aes_128_gcm_sha256;
-    server.client_app_keys.key[0..Aes128Gcm.key_length].* = @as([Aes128Gcm.key_length]u8, @splat(0x5A));
-    server.client_app_keys.iv = @as([12]u8, @splat(0xA5));
-
-    // 1. A client may only send KeyUpdate post-handshake; a NewSessionTicket
-    //    from the client is unexpected_message (RFC 8446 §4.6.1/§5.1) — fatal.
-    var nst_body_buf: [32]u8 = undefined;
-    const nst_body = try tls_session_ticket.encode(&nst_body_buf, .{
-        .ticket_lifetime = 1,
-        .ticket_age_add = 0,
-        .ticket_nonce = "",
-        .ticket = &.{0xaa},
-        .extensions = "",
-    });
-    var nst: std.ArrayList(u8) = .empty;
-    defer nst.deinit(allocator);
-    try writeHandshake(allocator, &nst, .new_session_ticket, nst_body);
-    const nst_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 0, .handshake, nst.items);
-    defer allocator.free(nst_rec);
-    try std.testing.expectError(error.BadHandshake, server.decrypt(nst_rec));
-
-    // 2. A zero-length handshake fragment MUST NOT be sent (RFC 8446 §5.1).
-    const empty_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 1, .handshake, "");
-    defer allocator.free(empty_rec);
-    try std.testing.expectError(error.BadHandshake, server.decrypt(empty_rec));
-
-    // 3. Truncated trailing handshake bytes are fatal, never silently dropped.
-    const truncated = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0 };
-    const trunc_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 2, .handshake, &truncated);
-    defer allocator.free(trunc_rec);
-    try std.testing.expectError(error.BadHandshake, server.decrypt(trunc_rec));
-
-    // 4. A well-formed KeyUpdate still rotates cleanly after the rejects above.
-    var ku: std.ArrayList(u8) = .empty;
-    defer ku.deinit(allocator);
-    try writeHandshake(allocator, &ku, .key_update, &[_]u8{@intFromEnum(KeyUpdateRequest.not_requested)});
-    const ku_rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 3, .handshake, ku.items);
-    defer allocator.free(ku_rec);
-    const out = try server.decrypt(ku_rec);
-    defer allocator.free(out);
-    try std.testing.expectEqual(@as(usize, 0), out.len);
+    const fixture = try exploitServerFixture(&cert_buf, 0x72);
+    const invalid = [_][]const u8{ &.{ @intFromEnum(HandshakeType.new_session_ticket), 0, 0, 0 }, "", &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 2 } };
+    for (invalid) |fragment| {
+        var server = try Server.init(allocator, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+        defer server.deinit();
+        server.state = .connected;
+        server.selected_suite = .tls_aes_128_gcm_sha256;
+        const rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 0, .handshake, fragment);
+        defer allocator.free(rec);
+        try std.testing.expectError(error.BadHandshake, server.decrypt(rec));
+        try std.testing.expectError(error.BadState, server.decrypt(rec));
+    }
+    var healthy = try Server.init(allocator, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+    defer healthy.deinit();
+    healthy.state = .connected;
+    healthy.selected_suite = .tls_aes_128_gcm_sha256;
+    const ku = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 0 };
+    const rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &healthy.client_app_keys, 0, .handshake, &ku);
+    defer allocator.free(rec);
+    const plain = try healthy.decrypt(rec);
+    defer allocator.free(plain);
+    try std.testing.expectEqual(@as(usize, 0), plain.len);
 }
 
 test "exploit: TLS 1.3 post-handshake coalesced KeyUpdate flood in one record is rejected" {
@@ -7058,7 +7436,7 @@ test "exploit: TLS 1.3 post-handshake coalesced KeyUpdate flood in one record is
     // HKDF-Expand-Label derivations and, when update_requested, an AEAD-sealed
     // reply appended to our egress queue. Uncapped that is a CPU multiplier and
     // a ~5x bandwidth amplifier bought with one record. The per-record cap must
-    // reject the flood while still accepting a legitimately coalesced batch.
+    // reject a key transition followed by another old-key message.
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const allocator = std.testing.allocator;
     const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x72)));
@@ -7109,18 +7487,20 @@ test "exploit: TLS 1.3 post-handshake coalesced KeyUpdate flood in one record is
         try std.testing.expectError(error.BadHandshake, server.decrypt(rec));
     }
 
-    // A maximal legitimate batch still succeeds: the cap bounds abuse without
-    // breaking RFC 8446 §5.1 coalescing, and every reply is queued for send.
+    // Eight valid successive key epochs preserve progress and every reply.
     {
         var server = try connected.open(allocator, der, kp);
         defer server.deinit();
-        var frag = try Fragment.build(allocator, max_post_handshake_msgs_per_record);
-        defer frag.deinit(allocator);
-        const rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, 0, .handshake, frag.items);
-        defer allocator.free(rec);
-        const out = try server.decrypt(rec);
-        defer allocator.free(out);
-        try std.testing.expectEqual(@as(usize, 0), out.len);
+        for (0..max_post_handshake_msgs_per_record) |_| {
+            var frag = try Fragment.build(allocator, 1);
+            defer frag.deinit(allocator);
+            const rec = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &server.client_app_keys, server.app_read_seq, .handshake, frag.items);
+            defer allocator.free(rec);
+            const out = try server.decrypt(rec);
+            defer allocator.free(out);
+            try std.testing.expectEqual(@as(usize, 0), out.len);
+            try std.testing.expectEqual(@as(u64, 0), server.app_read_seq);
+        }
         try std.testing.expect(server.post_handshake_send.items.len > 0);
     }
 }
@@ -7711,6 +8091,14 @@ test "loopback: post-handshake KeyUpdate rotates keys both directions" {
 }
 
 test "mTLS: server requests + verifies a client cert and exposes its leaf DER" {
+    try authenticatedMtlsRecordLimitProof(tls_record.record_size_limit_max, false);
+}
+
+test "TLS record limit: actual authenticated mTLS negotiates64 in both directions" {
+    try authenticatedMtlsRecordLimitProof(64, false);
+}
+
+fn authenticatedMtlsRecordLimitProof(receive_limit: u16, wrong_key: bool) !void {
     const tls_client = @import("tls_client.zig");
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const sign = @import("sign.zig");
@@ -7744,11 +8132,11 @@ test "mTLS: server requests + verifies a client cert and exposes its leaf DER" {
         .key_pair = client_kp,
     });
 
-    var server = try Server.init(alloc, .{ .cert_chain = &.{server_der}, .signing_key = server_kp, .request_client_cert = true });
+    var server = try Server.init(alloc, .{ .cert_chain = &.{server_der}, .signing_key = server_kp, .request_client_cert = true, .receive_record_size_limit = receive_limit });
     defer server.deinit();
-    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{server_der} });
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{server_der}, .receive_record_size_limit = receive_limit });
     defer client.deinit();
-    client.setClientCertForTest(client_der, client_sign);
+    client.setClientCertForTest(client_der, if (wrong_key) try sign.KeyPair.fromSeed(@as([32]u8, @splat(0x45))) else client_sign);
 
     const ch = try client.start();
     defer alloc.free(ch);
@@ -7762,8 +8150,18 @@ test "mTLS: server requests + verifies a client cert and exposes its leaf DER" {
         .need_more => return error.TestUnexpectedResult,
     };
     defer alloc.free(cflight);
+    try std.testing.expectEqual(@as(usize, receive_limit), client.peer_record_size_limit);
+    try std.testing.expect(client.record_size_limit_negotiated);
+    try expectProtectedRecordLimit(sflight, server.selected_suite.?.tagLen(), receive_limit);
+    try expectProtectedRecordLimit(cflight, server.selected_suite.?.tagLen(), receive_limit);
     try std.testing.expect(client.handshakeDone());
 
+    if (wrong_key) {
+        try std.testing.expectError(error.BadHandshake, server.feed(cflight));
+        try std.testing.expect(!server.handshakeDone());
+        try std.testing.expect(server.clientCertDer() == null);
+        return;
+    }
     _ = try server.feed(cflight);
     try std.testing.expect(server.handshakeDone());
 
@@ -8391,7 +8789,7 @@ test "exploit: a record declaring more than 2^14+256 is rejected at the framing 
 
     // Only the 5-byte header is sent; the oversize declaration alone must fail.
     const header = [_]u8{ 22, 0x03, 0x03, 0xFF, 0xFF };
-    try std.testing.expectError(error.BadRecord, server.feed(&header));
+    try std.testing.expectError(error.RecordOverflow, server.feed(&header));
 }
 
 test "exploit: a change_cipher_spec flood cannot hold a pre-handshake connection open" {
@@ -8667,6 +9065,7 @@ test "GAP-K10 a second 0-RTT flight is rejected without a ReplayGuard" {
     const v2 = try tls_resumption.sealLegacyV2(alloc, ticket_key, nonce, decoded.suite, decoded.psk, "n", 1_704_067_200_000, 4096);
     defer alloc.free(v2);
     const legacy = try tls_resumption.encodeStoredSession(alloc, .{
+        .peer_record_size_limit = 16385,
         .suite = decoded.suite,
         .ticket_lifetime = decoded.ticket_lifetime,
         .ticket_age_add = 0,
@@ -8791,28 +9190,689 @@ test "GAP-K13 an application record after the last sequence fails closed" {
     defer alloc.free(got_c);
     try std.testing.expectEqualStrings("nonce-zero", got_c);
 
-    server.app_write_seq = last;
-    try std.testing.expectError(error.SequenceExhausted, server.encrypt("wrap"));
-    try std.testing.expectEqual(last, server.app_write_seq);
-    try std.testing.expectError(error.SequenceExhausted, server.encrypt("wrap"));
-
-    client.app_read_seq = last;
-    try std.testing.expectError(error.SequenceExhausted, client.decrypt(s2c));
-    try std.testing.expectEqual(last, client.app_read_seq);
-
     const c2s = try client.encrypt("nonce-zero-c");
     defer alloc.free(c2s);
     const got_s = try server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("nonce-zero-c", got_s);
 
+    server.app_write_seq = last;
+    try std.testing.expectError(error.SequenceExhausted, server.encrypt("wrap"));
+    try std.testing.expectEqual(last, server.app_write_seq);
+    try std.testing.expectError(error.SequenceExhausted, server.encrypt("wrap"));
+
     client.app_write_seq = last;
     try std.testing.expectError(error.SequenceExhausted, client.encrypt("wrap"));
     try std.testing.expectEqual(last, client.app_write_seq);
+
+    client.app_read_seq = last;
+    try std.testing.expectError(error.SequenceExhausted, client.decrypt(s2c));
+    try std.testing.expectEqual(last, client.app_read_seq);
 
     server.app_read_seq = last;
     try std.testing.expectError(error.SequenceExhausted, server.decrypt(c2s));
     try std.testing.expectEqual(last, server.app_read_seq);
 
     std.debug.print("GAP-K13 branch=an application record after the last sequence fails closed\n", .{});
+}
+
+fn negotiatedMinimumRecordLimitProof(ticket_only: bool, aes256: bool) !void {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6d)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x6d, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .enable_session_tickets = true });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der}, .receive_record_size_limit = 64 });
+    defer client.deinit();
+    if (aes256) client.offerOnlyAes256ForTest();
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const flight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(flight);
+    try std.testing.expectEqual(@as(usize, 64), server.peer_record_size_limit);
+    try std.testing.expect(server.record_size_limit_offered);
+    if (!ticket_only) try expectProtectedRecordLimit(flight, server.selected_suite.?.tagLen(), 64);
+    const fin = switch (try client.feed(flight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(fin);
+    _ = try server.feed(fin);
+    try std.testing.expect(server.handshakeDone() and client.handshakeDone());
+    const tickets = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(tickets);
+    try expectProtectedRecordLimit(tickets, server.selected_suite.?.tagLen(), 64);
+    var off: usize = 0;
+    var records: usize = 0;
+    while (off < tickets.len) {
+        const n = 5 + @as(usize, std.mem.readInt(u16, tickets[off..][3..5], .big));
+        try std.testing.expectEqual(tls_client.AppRead.control, try client.decryptApp(tickets[off..][0..n]));
+        off += n;
+        records += 1;
+    }
+    try std.testing.expect(records > 1);
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+    _ = try tls_resumption.decodeStoredSession(stored);
+    var resumed_server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .enable_session_tickets = true, .ticket_key = server.ticketKey() });
+    defer resumed_server.deinit();
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der}, .receive_record_size_limit = 64 });
+    defer resumed_client.deinit();
+    if (aes256) resumed_client.offerOnlyAes256ForTest();
+    try resumed_client.setSessionTicket(stored, 0);
+    const resumed_ch = try resumed_client.start();
+    defer alloc.free(resumed_ch);
+    const resumed_flight = switch (try resumed_server.feed(resumed_ch)) {
+        .bytes_to_send => |wire| wire,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(resumed_flight);
+    try expectProtectedRecordLimit(resumed_flight, resumed_server.selected_suite.?.tagLen(), 64);
+    const resumed_fin = switch (try resumed_client.feed(resumed_flight)) {
+        .bytes_to_send => |wire| wire,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(resumed_fin);
+    _ = try resumed_server.feed(resumed_fin);
+    try std.testing.expect(resumed_server.resumed and resumed_server.handshakeDone() and resumed_client.handshakeDone());
+    const payload: [250]u8 = @splat(0x41);
+    const wire = try server.encrypt(&payload);
+    defer alloc.free(wire);
+    try expectProtectedRecordLimit(wire, server.selected_suite.?.tagLen(), 64);
+    var gathered: std.ArrayList(u8) = .empty;
+    defer gathered.deinit(alloc);
+    off = 0;
+    while (off < wire.len) {
+        const n = 5 + @as(usize, std.mem.readInt(u16, wire[off..][3..5], .big));
+        const opened = try client.decrypt(wire[off..][0..n]);
+        defer alloc.free(opened);
+        try gathered.appendSlice(alloc, opened);
+        off += n;
+    }
+    try std.testing.expectEqualSlices(u8, &payload, gathered.items);
+}
+
+fn expectProtectedRecordLimit(wire: []const u8, tag_len: usize, limit: usize) !void {
+    var off: usize = 0;
+    var protected: usize = 0;
+    while (off < wire.len) {
+        try std.testing.expect(wire.len - off >= 5);
+        const n: usize = std.mem.readInt(u16, wire[off..][3..5], .big);
+        try std.testing.expect(wire.len - off >= 5 + n);
+        if (wire[off] == @intFromEnum(tls_record.ContentType.application_data)) {
+            try std.testing.expect(n > tag_len);
+            if (n - tag_len > limit) std.debug.print("TLS record limit causal wire inner={d} limit={d}\n", .{ n - tag_len, limit });
+            try std.testing.expect(n - tag_len <= limit);
+            protected += 1;
+        }
+        off += 5 + n;
+    }
+    try std.testing.expect(protected > 0);
+}
+
+test "TLS record limit: negotiated64 protected server handshake and application records" {
+    for ([_]bool{ false, true }) |aes256| try negotiatedMinimumRecordLimitProof(false, aes256);
+}
+
+test "TLS record limit: negotiated64 NewSessionTicket reassembles across protected records" {
+    for ([_]bool{ false, true }) |aes256| try negotiatedMinimumRecordLimitProof(true, aes256);
+}
+
+fn recordLimitConnectedServer(a: Allocator, config: Config) !Server {
+    var server = try Server.init(a, config);
+    errdefer server.deinit();
+    server.state = .connected;
+    server.selected_suite = .tls_aes_128_gcm_sha256;
+    // Explicit synthetic connected fixture; canonical inactive SHA256 tails
+    // and exporter readiness must match the current mandatory resume schema.
+    server.client_app_secret = @splat(0);
+    server.server_app_secret = @splat(0);
+    @memset(server.client_app_secret[0..32], 0x5a);
+    @memset(server.server_app_secret[0..32], 0xa5);
+    server.exporter_master_secret = @splat(0);
+    server.exporter_master_secret_ready = true;
+    try deriveTrafficKeys(.tls_aes_128_gcm_sha256, server.client_app_secret[0..32], &server.client_app_keys);
+    try deriveTrafficKeys(.tls_aes_128_gcm_sha256, server.server_app_secret[0..32], &server.server_app_keys);
+    return server;
+}
+
+test "TLS record limit: server fragmented KU preserves epoch and carries exact incomplete hot prefix" {
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x73);
+    const ku = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 1 };
+    for (1..ku.len) |split| {
+        var server = try recordLimitConnectedServer(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+        defer server.deinit();
+        const old_rx = server.client_app_keys;
+        const old_tx = server.server_app_keys;
+        const prefix = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_rx, 0, .handshake, ku[0..split]);
+        defer a.free(prefix);
+        const tail = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_rx, 1, .handshake, ku[split..]);
+        defer a.free(tail);
+        const empty = try server.decrypt(prefix);
+        defer a.free(empty);
+        try std.testing.expectEqual(@as(u64, 1), server.app_read_seq);
+        try std.testing.expectEqualDeep(old_rx, server.client_app_keys);
+        const partial = try server.exportResume();
+        try std.testing.expectEqual(@as(u3, @intCast(split)), partial.ku_prefix_len);
+        try std.testing.expectEqualSlices(u8, ku[0..split], partial.ku_prefix[0..split]);
+        const done = try server.decrypt(tail);
+        defer a.free(done);
+        try std.testing.expectEqual(@as(u64, 0), server.app_read_seq);
+        try std.testing.expectEqual(@as(u64, 0), server.app_write_seq);
+        try std.testing.expect(server.post_handshake_send.items.len > 0);
+        try std.testing.expectError(error.BadState, server.exportResume());
+        const reply = (try server.takePendingSend()).?;
+        defer a.free(reply);
+        const opened = try openRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_tx, 0, reply);
+        defer a.free(opened.content);
+        try std.testing.expectEqualSlices(u8, &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 0 }, opened.content);
+        _ = try server.exportResume();
+        const app = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &server.client_app_keys, 0, .application_data, "new key");
+        defer a.free(app);
+        const got = try server.decrypt(app);
+        defer a.free(got);
+        try std.testing.expectEqualStrings("new key", got);
+    }
+}
+
+test "TLS record limit: server KU final-fragment OOM preserves prefix and exact reply retry" {
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x74);
+    var failures: usize = 0;
+    for (0..32) |index| {
+        var server = try recordLimitConnectedServer(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+        defer server.deinit();
+        const old_rx = server.client_app_keys;
+        const old_tx = server.server_app_keys;
+        const prefix = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_rx, 0, .handshake, &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 1 });
+        defer a.free(prefix);
+        const tail = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_rx, 1, .handshake, &.{1});
+        defer a.free(tail);
+        const empty = try server.decrypt(prefix);
+        defer a.free(empty);
+        var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        server.allocator = fault.allocator();
+        defer server.allocator = a;
+        const done = server.decrypt(tail) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            try std.testing.expect(!server.read_failed);
+            try std.testing.expectEqual(@as(u64, 1), server.app_read_seq);
+            try std.testing.expectEqual(@as(u64, 0), server.app_write_seq);
+            try std.testing.expectEqualDeep(old_rx, server.client_app_keys);
+            try std.testing.expectEqualDeep(old_tx, server.server_app_keys);
+            try std.testing.expectEqual(@as(u3, 4), server.post_handshake_recv_len);
+            try std.testing.expectEqual(@as(usize, 0), server.post_handshake_send.items.len);
+            server.allocator = a;
+            const retry = try server.decrypt(tail);
+            defer a.free(retry);
+            const reply = (try server.takePendingSend()).?;
+            defer a.free(reply);
+            const expected = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_tx, 0, .handshake, &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 0 });
+            defer a.free(expected);
+            try std.testing.expectEqualSlices(u8, expected, reply);
+            continue;
+        };
+        a.free(done);
+        try std.testing.expect(failures >= 3);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "TLS record limit: raw future peer limit is retained and effective kTLS TX capacity is checked" {
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x75);
+    for ([_]u16{ 64, 16384, 16385, 65535 }) |limit| {
+        var server = try recordLimitConnectedServer(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+        defer server.deinit();
+        const tls_client = @import("tls_client.zig");
+        var client = try tls_client.Client.init(a, .{ .server_name = "flood.test", .trust_anchors = &.{} });
+        defer client.deinit();
+        const hello = try client.start();
+        defer a.free(hello);
+        const at = std.mem.indexOf(u8, hello, &.{ 0, 28, 0, 2, 0x40, 1 }) orelse return error.TestUnexpectedResult;
+        std.mem.writeInt(u16, hello[at + 4 ..][0..2], limit, .big);
+        _ = try server.processClientHello(hello[9..], hello[5..]);
+        try std.testing.expectEqual(@as(usize, limit), server.peer_record_size_limit);
+        try std.testing.expectEqual(limit >= 16385, server.ktlsTxParams() != null);
+        const payload: [17000]u8 = @splat(0x62);
+        const wire = try server.encrypt(&payload);
+        defer a.free(wire);
+        try expectProtectedRecordLimit(wire, 16, @min(@as(usize, limit), 16385));
+    }
+}
+
+test "TLS record limit: connected server emits fatal22 in application epoch once" {
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x76);
+    var server = try recordLimitConnectedServer(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+    defer server.deinit();
+    server.app_write_seq = 7;
+    const keys = server.server_app_keys;
+    const wire = server.takeAlert(error.RecordOverflow).?;
+    defer a.free(wire);
+    const opened = try openRecordAlloc(a, .tls_aes_128_gcm_sha256, &keys, 7, wire);
+    defer a.free(opened.content);
+    try std.testing.expectEqual(tls_record.ContentType.alert, opened.content_type);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 22 }, opened.content);
+    try std.testing.expectEqual(@as(u64, 8), server.app_write_seq);
+    try std.testing.expect(server.takeAlert(error.RecordOverflow) == null);
+    try std.testing.expectError(error.BadState, server.encrypt("late"));
+}
+
+test "TLS record limit: server authenticated tag failure emits fatal20 and retains nonce" {
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x77);
+    var server = try recordLimitConnectedServer(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+    defer server.deinit();
+    const wire = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &server.client_app_keys, 0, .application_data, "protected");
+    defer a.free(wire);
+    wire[wire.len - 1] ^= 1;
+    try std.testing.expectError(error.RecordAuthenticationFailed, server.decrypt(wire));
+    try std.testing.expectEqual(@as(u64, 0), server.app_read_seq);
+    const alert = server.takeAlert(error.RecordAuthenticationFailed).?;
+    defer a.free(alert);
+    const opened = try openRecordAlloc(a, .tls_aes_128_gcm_sha256, &server.server_app_keys, 0, alert);
+    defer a.free(opened.content);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 20 }, opened.content);
+}
+
+test "TLS record limit: peer fatal closes connected server without response" {
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x78);
+    var server = try recordLimitConnectedServer(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+    defer server.deinit();
+    const wire = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &server.client_app_keys, 0, .alert, &.{ 2, 20 });
+    defer a.free(wire);
+    const tx_before = server.app_write_seq;
+    try std.testing.expectError(error.TlsAlert, server.decrypt(wire));
+    try std.testing.expect(!server.handshakeDone());
+    try std.testing.expect(server.takeAlert(error.TlsAlert) == null);
+    try std.testing.expectEqual(tx_before, server.app_write_seq);
+    try std.testing.expectError(error.BadState, server.encrypt("late"));
+}
+
+test "TLS record limit: peer fatal closes server in actual handshake epoch without response" {
+    const tls_client = @import("tls_client.zig");
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x79);
+    var server = try Server.init(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(a, .{ .server_name = "irc.test", .trust_anchors = &.{fixture.der} });
+    defer client.deinit();
+    const hello = try client.start();
+    defer a.free(hello);
+    const flight = switch (try server.feed(hello)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer a.free(flight);
+    try std.testing.expectEqual(State.wait_client_finished, server.state);
+    const wire = try sealRecordAlloc(a, server.selected_suite.?, &server.client_hs_keys, 0, .alert, &.{ 2, 20 });
+    defer a.free(wire);
+    const tx_before = server.hs_write_seq;
+    try std.testing.expectError(error.TlsAlert, server.feed(wire));
+    try std.testing.expect(server.read_failed);
+    try std.testing.expect(server.takeAlert(error.TlsAlert) == null);
+    try std.testing.expectEqual(tx_before, server.hs_write_seq);
+}
+
+test "TLS record limit: peer fatal interrupts partial server KU without response" {
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x7a);
+    var server = try recordLimitConnectedServer(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+    defer server.deinit();
+    const prefix = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &server.client_app_keys, 0, .handshake, &.{ 24, 0, 0 });
+    defer a.free(prefix);
+    const empty = try server.decrypt(prefix);
+    a.free(empty);
+    try std.testing.expectEqual(@as(u3, 3), server.post_handshake_recv_len);
+    const fatal = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &server.client_app_keys, 1, .alert, &.{ 2, 20 });
+    defer a.free(fatal);
+    try std.testing.expectError(error.TlsAlert, server.decrypt(fatal));
+    try std.testing.expect(server.takeAlert(error.TlsAlert) == null);
+    try std.testing.expectEqual(@as(u64, 0), server.app_write_seq);
+}
+
+test "TLS record limit: engine retains initial flight after coalesced rejected early-data failure" {
+    const tls_client = @import("tls_client.zig");
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x7b);
+    var server = try Server.init(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(a, .{ .server_name = "irc.test", .trust_anchors = &.{fixture.der} });
+    defer client.deinit();
+    const stored = try tls_resumption.encodeStoredSession(a, .{ .peer_record_size_limit = 16385, .suite = 0x1301, .ticket_lifetime = 3600, .ticket_age_add = 0, .ticket = "unknown ticket", .psk = &(@as([32]u8, @splat(0x59))), .max_early_data_size = 1 });
+    defer a.free(stored);
+    try client.setSessionTicket(stored, 0);
+    try client.setEarlyData("x");
+    const hello = try client.start();
+    defer a.free(hello);
+    const length = max_rejected_early_data_bytes + tls_record.record_header_len;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(a);
+    try input.appendSlice(a, hello);
+    var discarded: usize = 0;
+    while (discarded <= length) {
+        const record = [_]u8{ 23, 3, 3, 0, 0 };
+        try input.appendSlice(a, &record);
+        discarded += record.len;
+    }
+    try std.testing.expectError(error.BadRecord, server.feed(input.items));
+    try std.testing.expect(server.hs_write_seq != 0);
+    const terminal = server.takeAlert(error.BadRecord).?;
+    defer a.free(terminal);
+    // ServerHello and the committed encrypted flight must precede the fatal.
+    try std.testing.expectEqual(@as(u8, 22), terminal[0]);
+    const sh_len = (try completePlainRecord(terminal)).?.wire_len;
+    const ccs_len = (try completePlainRecord(terminal[sh_len..])).?.wire_len;
+    var at = sh_len + ccs_len;
+    var sequence: u64 = 0;
+    while (at < terminal.len) {
+        const len = (try completePlainRecord(terminal[at..])).?.wire_len;
+        const keys = if (sequence < server.hs_write_seq) &server.server_hs_keys else &server.server_app_keys;
+        const seq = if (sequence < server.hs_write_seq) sequence else 0;
+        const opened = try openRecordAlloc(a, server.selected_suite.?, keys, seq, terminal[at..][0..len]);
+        defer a.free(opened.content);
+        if (at + len == terminal.len) {
+            try std.testing.expectEqual(tls_record.ContentType.alert, opened.content_type);
+            try std.testing.expectEqualSlices(u8, &.{ 2, 50 }, opened.content);
+        } else try std.testing.expectEqual(tls_record.ContentType.handshake, opened.content_type);
+        at += len;
+        sequence += 1;
+    }
+}
+
+test "TLS record limit: actual mTLS64 rejects wrong CertificateVerify key" {
+    try authenticatedMtlsRecordLimitProof(64, true);
+}
+
+test "TLS record limit: local receive policy checks padding refuses kTLS RX and carries exact hot policy" {
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x7c);
+    const config = Config{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp, .receive_record_size_limit = 64 };
+    var server = try recordLimitConnectedServer(a, config);
+    defer server.deinit();
+    server.record_size_limit_offered = true;
+    try std.testing.expect(server.ktlsRxParams() == null);
+    const rx_before = server.client_app_secret;
+    try std.testing.expectError(error.BadState, server.advanceRxKeyForKtls());
+    try std.testing.expectEqualSlices(u8, &rx_before, &server.client_app_secret);
+    const low_policy = try server.exportResume();
+    try std.testing.expectEqual(@as(u16, 64), low_policy.local_receive_policy);
+    var ordinary = try recordLimitConnectedServer(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+    defer ordinary.deinit();
+    const snapshot = try ordinary.exportResume();
+    var resumed = try Server.resumeConnected(a, config, snapshot);
+    defer resumed.deinit();
+    try std.testing.expectEqual(@as(u16, 16385), resumed.receive_record_size_limit);
+    const suite = server.selected_suite.?;
+    var inner_buf: [65]u8 = undefined;
+    const inner = try tls_record.encodeInnerPlaintext(.application_data, "x", 63, &inner_buf);
+    const wire = try a.alloc(u8, 5 + inner.len + Aes128Gcm.tag_length);
+    defer a.free(wire);
+    const aad = tls_record.makeAdditionalData(@intCast(inner.len + Aes128Gcm.tag_length));
+    @memcpy(wire[0..5], &aad);
+    var tag: [Aes128Gcm.tag_length]u8 = undefined;
+    Aes128Gcm.encrypt(wire[5..][0..inner.len], &tag, inner, &aad, tls_record.deriveNonce(server.client_app_keys.iv, 0), server.client_app_keys.key[0..Aes128Gcm.key_length].*);
+    @memcpy(wire[5 + inner.len ..], &tag);
+    try std.testing.expectError(error.RecordOverflow, server.decrypt(wire));
+    const alert = server.takeAlert(error.RecordOverflow).?;
+    defer a.free(alert);
+    const opened = try openRecordAlloc(a, suite, &server.server_app_keys, 0, alert);
+    defer a.free(opened.content);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 22 }, opened.content);
+}
+
+fn localPolicyTicketProof(minted_limit: u16, resumed_limit: u16) !void {
+    const tls_client = @import("tls_client.zig");
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x7d);
+    const ticket_key: tls_resumption.TicketKey = @splat(0x6c);
+    const config = Config{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp, .receive_record_size_limit = minted_limit, .enable_session_tickets = true, .ticket_key = ticket_key, .now_unix_seconds = 1_735_689_600, .max_early_data_size = 1024 };
+    var server = try Server.init(a, config);
+    defer server.deinit();
+    var client = try tls_client.Client.init(a, .{ .server_name = "exploit.test", .trust_anchors = &.{fixture.der} });
+    defer client.deinit();
+    const hello = try client.start();
+    defer a.free(hello);
+    const flight = switch (try server.feed(hello)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer a.free(flight);
+    const finished = switch (try client.feed(flight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer a.free(finished);
+    _ = try server.feed(finished);
+    const tickets = (try server.takePendingSend()).?;
+    defer a.free(tickets);
+    _ = try client.decryptApp(tickets);
+    const stored = client.takeSessionTicket().?;
+    defer a.free(stored);
+    const saved = try tls_resumption.decodeStoredSession(stored);
+    try std.testing.expectEqual(minted_limit, saved.peer_record_size_limit);
+    const expected_grant: u32 = if (minted_limit == tls_record.record_size_limit_max) 1024 else 0;
+    try std.testing.expectEqual(expected_grant, saved.max_early_data_size);
+    const opened_ticket = try tls_resumption.openTicket(a, ticket_key, saved.ticket);
+    defer a.free(opened_ticket.plain);
+    try std.testing.expectEqual(expected_grant, opened_ticket.opened.max_early_data_size);
+    var resume_config = config;
+    resume_config.receive_record_size_limit = resumed_limit;
+    resume_config.enable_session_tickets = false;
+    var guard = tls_resumption.ReplayGuard{};
+    resume_config.replay_guard = &guard;
+    var successor = try Server.init(a, resume_config);
+    defer successor.deinit();
+    var resume_client = try tls_client.Client.init(a, .{ .server_name = "exploit.test", .trust_anchors = &.{fixture.der} });
+    defer resume_client.deinit();
+    try resume_client.setSessionTicket(stored, 0);
+    if (expected_grant != 0) try resume_client.setEarlyData("prior-policy early");
+    const resumed_hello = try resume_client.start();
+    defer a.free(resumed_hello);
+    const resumed_flight = switch (try successor.feed(resumed_hello)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer a.free(resumed_flight);
+    try std.testing.expect(successor.acceptedSessionTicket());
+    const accepted = minted_limit == tls_record.record_size_limit_max and resumed_limit == tls_record.record_size_limit_max;
+    try std.testing.expectEqual(accepted, successor.earlyDataAccepted());
+    if (try successor.takeEarlyData()) |early| {
+        defer a.free(early);
+        try std.testing.expect(accepted);
+        try std.testing.expectEqualStrings("prior-policy early", early);
+    } else try std.testing.expect(!accepted);
+    const resumed_finished = switch (try resume_client.feed(resumed_flight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer a.free(resumed_finished);
+    _ = try successor.feed(resumed_finished);
+    try std.testing.expect(successor.handshakeDone() and resume_client.handshakeDone());
+    try std.testing.expectEqual(@as(usize, resumed_limit), resume_client.peer_record_size_limit);
+}
+
+test "TLS record limit: local ticket policy low to default remains 1RTT only" {
+    try localPolicyTicketProof(64, 16385);
+}
+
+test "TLS record limit: local ticket policy default to low rejects early but resumes" {
+    try localPolicyTicketProof(16385, 64);
+}
+
+test "TLS record limit: local ticket policy default to default retains early data" {
+    try localPolicyTicketProof(16385, 16385);
+}
+
+/// A scripted peer constructs a valid signed transcript using the same crypto
+/// primitives, but chooses record boundaries independently. It can decline
+/// the extension or violate it while EE is fragmented; production never uses
+/// these deliberately noncompliant record boundaries.
+fn scriptedEncryptedExtensionsProof(echo: bool, oversized: bool) !void {
+    const tls_client = @import("tls_client.zig");
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x7e);
+    const alpn: [90]u8 = @splat('a');
+    var server = try Server.init(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp, .alpn_protocols = &.{&alpn} });
+    defer server.deinit();
+    var client = try tls_client.Client.init(a, .{ .server_name = "exploit.test", .trust_anchors = &.{fixture.der}, .receive_record_size_limit = 64, .alpn_protocols = &.{&alpn} });
+    defer client.deinit();
+    const hello = try client.start();
+    defer a.free(hello);
+    const rec = (try completePlainRecord(hello)).?;
+    var offset: usize = 0;
+    const msg = try parseHandshake(rec.fragment, &offset);
+    try std.testing.expectEqual(msg.raw.len, offset);
+    try server.appendTranscript(msg.raw);
+    const shared = switch (try server.processClientHello(msg.body, msg.raw)) {
+        .proceed => |s| s,
+        .retry => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(server.record_size_limit_offered);
+    var sh: std.ArrayList(u8) = .empty;
+    defer sh.deinit(a);
+    try server.writeServerHello(&sh);
+    try server.appendTranscript(sh.items);
+    try server.deriveHandshakeKeys(shared.buf[0..shared.len]);
+    server.record_size_limit_offered = echo;
+    var messages: std.ArrayList(u8) = .empty;
+    defer messages.deinit(a);
+    try server.writeEncryptedExtensions(&messages);
+    const ee_len = messages.items.len;
+    try std.testing.expect(ee_len > 100);
+    try server.writeCertificate(&messages);
+    try server.writeCertificateVerify(&messages);
+    try server.writeServerFinished(&messages);
+    try server.deriveApplicationKeys();
+    const plain_sh = try writePlainRecord(a, .handshake, sh.items);
+    defer a.free(plain_sh);
+    const limit: usize = if (!echo) 16385 else if (oversized) 100 else 64;
+    const encrypted = try sealRecordBatchAlloc(a, server.selected_suite.?, &server.server_hs_keys, 0, .handshake, messages.items, limit);
+    defer a.free(encrypted.bytes);
+    const ccs = [_]u8{ 20, 3, 3, 0, 1, 1 };
+    const flight = try std.mem.concat(a, u8, &.{ plain_sh, &ccs, encrypted.bytes });
+    defer a.free(flight);
+    server.hs_write_seq = encrypted.next_seq;
+    server.state = .wait_client_finished;
+    if (echo and oversized) {
+        // Record one authenticates 100 inner bytes, but EE is incomplete until
+        // record two. Its later valid echo must reject the prior oversized part.
+        try std.testing.expectError(error.RecordOverflow, client.feed(flight));
+        try std.testing.expect(client.record_size_limit_negotiated);
+        try std.testing.expectEqual(@as(usize, 100), client.pre_extensions_max_inner_len);
+        return;
+    }
+    const finished = switch (try client.feed(flight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer a.free(finished);
+    _ = try server.feed(finished);
+    try std.testing.expect(client.handshakeDone() and server.handshakeDone());
+    try std.testing.expectEqual(echo, client.record_size_limit_negotiated);
+    try std.testing.expectEqualSlices(u8, &alpn, client.selected_alpn.?);
+}
+
+test "TLS record limit: full authenticated no-echo flight uses protocol receive bound" {
+    try scriptedEncryptedExtensionsProof(false, false);
+}
+
+test "TLS record limit: fragmented EE echo retroactively rejects oversized authenticated prefix" {
+    try scriptedEncryptedExtensionsProof(true, true);
+    try scriptedEncryptedExtensionsProof(true, false);
+}
+
+test "TLS record limit: full authenticated future-high offer preserves raw limit and refuses old hot" {
+    const tls_client = @import("tls_client.zig");
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x7f);
+    for ([_]u16{ 64, 65535 }) |raw| {
+        var server = try Server.init(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+        defer server.deinit();
+        var client = try tls_client.Client.init(a, .{ .server_name = "exploit.test", .trust_anchors = &.{fixture.der} });
+        defer client.deinit();
+        // The high offer models a future peer. Set it before ClientHello bytes
+        // and transcript exist; the server still performs the complete handshake.
+        client.receive_record_size_limit = raw;
+        const hello = try client.start();
+        defer a.free(hello);
+        const flight = switch (try server.feed(hello)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer a.free(flight);
+        const finished = switch (try client.feed(flight)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer a.free(finished);
+        _ = try server.feed(finished);
+        try std.testing.expect(client.handshakeDone() and server.handshakeDone());
+        try std.testing.expectEqual(@as(usize, raw), server.peer_record_size_limit);
+        const resumed_policy = try server.exportResume();
+        try std.testing.expectEqual(raw, resumed_policy.peer_record_size_limit_raw);
+        const payload: [17000]u8 = @splat(0x6f);
+        const wire = try server.encrypt(&payload);
+        defer a.free(wire);
+        try expectProtectedRecordLimit(wire, server.selected_suite.?.tagLen(), @min(@as(usize, raw), 16385));
+        var gathered: std.ArrayList(u8) = .empty;
+        defer gathered.deinit(a);
+        var at: usize = 0;
+        while (at < wire.len) {
+            const len = (try completePlainRecord(wire[at..])).?.wire_len;
+            const opened = try client.decrypt(wire[at..][0..len]);
+            defer a.free(opened);
+            try gathered.appendSlice(a, opened);
+            at += len;
+        }
+        try std.testing.expectEqualSlices(u8, &payload, gathered.items);
+    }
+}
+
+test "TLS record limit: malformed protected alert cannot suppress fatal decoding error" {
+    const a = std.testing.allocator;
+    var cert: [1024]u8 = undefined;
+    const fixture = try exploitServerFixture(&cert, 0x80);
+    var server = try recordLimitConnectedServer(a, .{ .cert_chain = &.{fixture.der}, .signing_key = fixture.kp });
+    defer server.deinit();
+    const wire = try sealRecordAlloc(a, server.selected_suite.?, &server.client_app_keys, 0, .alert, &.{ 3, 20 });
+    defer a.free(wire);
+    try std.testing.expectError(error.BadRecord, server.decrypt(wire));
+    const fatal = server.takeAlert(error.BadRecord).?;
+    defer a.free(fatal);
+    const opened = try openRecordAlloc(a, server.selected_suite.?, &server.server_app_keys, 0, fatal);
+    defer a.free(opened.content);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 50 }, opened.content);
 }

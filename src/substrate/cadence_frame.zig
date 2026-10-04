@@ -278,10 +278,51 @@ pub fn nativeMediaMacTag(
     deriveNativeMediaMacKey(stream_prf_key, channel, participant, &key);
     defer std.crypto.secureZero(u8, key[0..]);
 
-    const full = crypto_hash.HmacSha256.create(&key, frame_bytes);
+    return nativeMediaMacTagWithKey(&key, frame_bytes);
+}
+
+/// Tag exact frame bytes using an already source-selected key. This primitive
+/// performs no key derivation, endpoint admission or direction selection.
+pub fn nativeMediaMacTagWithKey(
+    key: *const [MAC_KEY_BYTES]u8,
+    frame_bytes: []const u8,
+) [MAC_TAG_BYTES]u8 {
+    const full = crypto_hash.HmacSha256.create(key, frame_bytes);
     var tag: [MAC_TAG_BYTES]u8 = undefined;
     @memcpy(tag[0..], full[0..MAC_TAG_BYTES]);
     return tag;
+}
+
+/// Verify exactly one frame and one tag with the source-selected key. As in the
+/// legacy verifier, frame semantic decoding remains a separate required step.
+pub fn verifyNativeMediaMacWithKey(
+    key: *const [MAC_KEY_BYTES]u8,
+    datagram: []const u8,
+) MacError![]const u8 {
+    const frame_len = try encodedFrameLen(datagram);
+    if (datagram.len == frame_len) return error.MissingTag;
+    if (datagram.len != frame_len + MAC_TAG_BYTES) return error.TrailingBytes;
+    const frame_bytes = datagram[0..frame_len];
+    const expected = nativeMediaMacTagWithKey(key, frame_bytes);
+    if (!constantTimeTagEql(&expected, datagram[frame_len..])) return error.BadTag;
+    return frame_bytes;
+}
+
+/// Append a tag without changing the exact encoded frame. Every fallible check
+/// precedes output writes; this helper never falls back to an untagged frame.
+pub fn appendNativeMediaMacWithKey(
+    key: *const [MAC_KEY_BYTES]u8,
+    frame_datagram: []const u8,
+    out: []u8,
+) MacError![]const u8 {
+    const frame_len = try encodedFrameLen(frame_datagram);
+    if (frame_datagram.len != frame_len) return error.TrailingBytes;
+    const total = frame_len + MAC_TAG_BYTES;
+    if (out.len < total) return error.BufferTooSmall;
+    @memcpy(out[0..frame_len], frame_datagram);
+    const tag = nativeMediaMacTagWithKey(key, out[0..frame_len]);
+    @memcpy(out[frame_len..total], &tag);
+    return out[0..total];
 }
 
 pub fn constantTimeTagEql(a: []const u8, b: []const u8) bool {
@@ -1156,4 +1197,65 @@ test "GapRange.len wrapping" {
     // 1 -% 0xFFFFFFFE = 3 in wrapping u32 arithmetic.
     const g = GapRange{ .start = 0xFFFF_FFFE, .end = 1 };
     try testing.expectEqual(@as(u32, 3), g.len());
+}
+
+test "native media MAC32 helper preserves legacy bytes and shared KAT" {
+    var root: [16]u8 = undefined;
+    for (&root, 0..) |*byte, i| byte.* = @intCast(i);
+    var key: [MAC_KEY_BYTES]u8 = undefined;
+    deriveNativeMediaMacKey(&root, "#call", "alice", &key);
+    defer std.crypto.secureZero(u8, &key);
+    const frame = testFrame(64, 0x1122_3344, 7, 9000, true, .cadencevox_audio, "voice");
+    var frame_buf: [128]u8 = undefined;
+    const n = try encode(frame, &frame_buf);
+    var legacy_buf: [128]u8 = undefined;
+    var direct_buf: [128]u8 = undefined;
+    const legacy = try appendNativeMediaMac(&root, "#call", "alice", frame_buf[0..n], &legacy_buf);
+    const direct = try appendNativeMediaMacWithKey(&key, frame_buf[0..n], &direct_buf);
+    try testing.expectEqualSlices(u8, legacy, direct);
+    const tag = nativeMediaMacTagWithKey(&key, frame_buf[0..n]);
+    try testing.expectEqualSlices(u8, &hexBytes("5f274db2216a610c62affc09a34eebc9"), &tag);
+    try testing.expectEqualSlices(u8, frame_buf[0..n], try verifyNativeMediaMacWithKey(&key, legacy));
+    try testing.expectEqualSlices(u8, frame_buf[0..n], try verifyNativeMediaMac(&root, "#call", "alice", direct));
+}
+
+test "native media MAC32 helper rejects wrong key payload tag and incomplete suffix" {
+    const key = @as([MAC_KEY_BYTES]u8, @splat(0xA7));
+    const wrong = @as([MAC_KEY_BYTES]u8, @splat(0xA6));
+    var frame_buf: [128]u8 = undefined;
+    const n = try encode(testFrame(64, 73, 9, 10, false, .cadencevis_video, "payload"), &frame_buf);
+    var tagged_buf: [128]u8 = undefined;
+    const tagged = try appendNativeMediaMacWithKey(&key, frame_buf[0..n], &tagged_buf);
+    try testing.expectError(error.BadTag, verifyNativeMediaMacWithKey(&wrong, tagged));
+    var altered = tagged_buf;
+    altered[MIN_FRAME_WIRE_BYTES] ^= 1;
+    try testing.expectError(error.BadTag, verifyNativeMediaMacWithKey(&key, altered[0..tagged.len]));
+    altered = tagged_buf;
+    altered[tagged.len - 1] ^= 1;
+    try testing.expectError(error.BadTag, verifyNativeMediaMacWithKey(&key, altered[0..tagged.len]));
+    try testing.expectError(error.Truncated, verifyNativeMediaMacWithKey(&key, frame_buf[0 .. n - 1]));
+    try testing.expectError(error.MissingTag, verifyNativeMediaMacWithKey(&key, frame_buf[0..n]));
+    for (1..MAC_TAG_BYTES) |suffix| {
+        try testing.expectError(error.TrailingBytes, verifyNativeMediaMacWithKey(&key, tagged[0 .. n + suffix]));
+    }
+    tagged_buf[tagged.len] = 0;
+    try testing.expectError(error.TrailingBytes, verifyNativeMediaMacWithKey(&key, tagged_buf[0 .. tagged.len + 1]));
+}
+
+test "native media MAC32 helper refusal preserves output and allows exact retry" {
+    const key = @as([MAC_KEY_BYTES]u8, @splat(0xC2));
+    var frame_buf: [128]u8 = undefined;
+    const n = try encode(testFrame(65, 81, 19, 20, false, .raw, "body"), &frame_buf);
+    var out = @as([128]u8, @splat(0xD4));
+    const before = out;
+    try testing.expectError(error.BufferTooSmall, appendNativeMediaMacWithKey(&key, frame_buf[0..n], out[0 .. n + MAC_TAG_BYTES - 1]));
+    try testing.expectEqualSlices(u8, &before, &out);
+    try testing.expectError(error.Truncated, appendNativeMediaMacWithKey(&key, frame_buf[0 .. n - 1], &out));
+    try testing.expectEqualSlices(u8, &before, &out);
+    frame_buf[n] = 0;
+    try testing.expectError(error.TrailingBytes, appendNativeMediaMacWithKey(&key, frame_buf[0 .. n + 1], &out));
+    try testing.expectEqualSlices(u8, &before, &out);
+    const tagged = try appendNativeMediaMacWithKey(&key, frame_buf[0..n], &out);
+    try testing.expectEqualSlices(u8, frame_buf[0..n], try verifyNativeMediaMacWithKey(&key, tagged));
+    try testing.expectEqualSlices(u8, before[tagged.len..], out[tagged.len..]);
 }

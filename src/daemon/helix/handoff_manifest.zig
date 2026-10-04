@@ -15,7 +15,7 @@
 //!
 //! Wire layout (all integers big-endian):
 //!   magic(4) version(u8) piece_count(u32) table_len(u8)
-//!   16 * { kind(u8), count(u32) } digest(BLAKE3-256)
+//!   17 * { kind(u8), count(u32) } digest(BLAKE3-256)
 //!
 //! The digest transcript is: domain, version, then for every ordered piece
 //! `{index, schema, kind, version, min, max, ordinal, length, bytes}`, followed
@@ -24,19 +24,21 @@
 const std = @import("std");
 
 pub const magic = [_]u8{ 'H', 'H', 'M', '1' };
-pub const version: u8 = 1;
+pub const version: u8 = 2;
 pub const field_ordinal: u32 = 1;
 
-/// v1 commits the data-capsule registry that existed immediately before the
-/// manifest kind itself was added. Kind 17 is the manifest and is never hashed
-/// as a data piece.
-pub const first_data_kind: u8 = 1;
-pub const last_data_kind: u8 = 16;
-pub const data_kind_count: usize = last_data_kind - first_data_kind + 1;
+/// Exact v2 table. Kind 17 is the manifest and never hashes itself; kind 18
+/// is native service state. No live legacy table or unknown kind is accepted.
+pub const data_kinds = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18 };
+pub const data_kind_count: usize = data_kinds.len;
+fn kindIndex(kind: u8) Error!usize {
+    for (data_kinds, 0..) |candidate, index| if (candidate == kind) return index;
+    return error.InvalidKind;
+}
 
 const digest_len = std.crypto.hash.Blake3.digest_length;
-const checksum_domain = "onyx:helix:whole-handoff:v1\x00";
-const counts_domain = "onyx:helix:whole-handoff:counts:v1\x00";
+const checksum_domain = "onyx:helix:whole-handoff:v2\x00";
+const counts_domain = "onyx:helix:whole-handoff:counts:v2\x00";
 
 /// magic + version + piece_count + table_len + (kind + count)*N + digest.
 pub const encoded_len: usize = magic.len + 1 + 4 + 1 + data_kind_count * (1 + 4) + digest_len;
@@ -99,9 +101,7 @@ pub const Accumulator = struct {
 
     pub fn add(self: *Accumulator, piece: PieceView) Error!void {
         const header = piece.header;
-        if (header.kind < first_data_kind or header.kind > last_data_kind) {
-            return error.InvalidKind;
-        }
+        const kind_index = try kindIndex(header.kind);
         if (header.min_supported > header.version or header.version > header.max_supported) {
             return error.InvalidHeaderRange;
         }
@@ -122,7 +122,7 @@ pub const Accumulator = struct {
         self.hasher.update(piece.bytes);
 
         self.piece_count += 1;
-        self.kind_counts[header.kind - first_data_kind] += 1;
+        self.kind_counts[kind_index] += 1;
     }
 
     pub fn snapshot(self: Accumulator) Manifest {
@@ -131,7 +131,7 @@ pub const Accumulator = struct {
         hashU32(&hasher, self.piece_count);
         hasher.update(&.{@intCast(data_kind_count)});
         for (self.kind_counts, 0..) |count, i| {
-            hasher.update(&.{@intCast(i + first_data_kind)});
+            hasher.update(&.{data_kinds[i]});
             hashU32(&hasher, count);
         }
         var digest: [digest_len]u8 = undefined;
@@ -159,7 +159,7 @@ pub fn encodeManifest(manifest: Manifest, out: []u8) Error![]const u8 {
     writeU32(out, &pos, manifest.piece_count);
     writeByte(out, &pos, @intCast(data_kind_count));
     for (manifest.kind_counts, 0..) |count, i| {
-        writeByte(out, &pos, @intCast(i + first_data_kind));
+        writeByte(out, &pos, data_kinds[i]);
         writeU32(out, &pos, count);
     }
     writeBytes(out, &pos, &manifest.digest);
@@ -179,7 +179,7 @@ pub fn decode(bytes: []const u8) Error!Manifest {
     var kind_counts: [data_kind_count]u32 = undefined;
     var count_sum: u64 = 0;
     for (&kind_counts, 0..) |*count, i| {
-        if (readByte(bytes, &pos) != i + first_data_kind) return error.NonCanonicalKindTable;
+        if (readByte(bytes, &pos) != data_kinds[i]) return error.NonCanonicalKindTable;
         count.* = readU32(bytes, &pos);
         count_sum += count.*;
     }
@@ -313,6 +313,25 @@ test "mixed ordered pieces commit exact headers bytes count and per-kind counts"
     try verifyPieces(wire, &pieces);
 }
 
+test "native Helix service carry: whole manifest v2 commits kind18 excludes17 and refuses old schema" {
+    const original = [_]PieceView{ samplePiece(1, 0x4843_4c54, "alice"), samplePiece(18, 0x484e_5356, "service") };
+    var bytes: [encoded_len]u8 = undefined;
+    const wire = try manifestFor(&original, &bytes);
+    const parsed = try decode(wire);
+    try std.testing.expectEqual(@as(u32, 1), parsed.kind_counts[16]);
+    try verifyPieces(wire, &original);
+    try std.testing.expectError(error.CountMismatch, verifyPieces(wire, original[0..1]));
+    var old_version = bytes;
+    old_version[magic.len] = 1;
+    try std.testing.expectError(error.BadVersion, decode(&old_version));
+    var old_table = bytes;
+    old_table[magic.len + 1 + 4 + 1 + 16 * 5] = 17;
+    try std.testing.expectError(error.NonCanonicalKindTable, decode(&old_table));
+    var accumulator = Accumulator.init();
+    try std.testing.expectError(error.InvalidKind, accumulator.add(samplePiece(17, 1, "self")));
+    try std.testing.expectError(error.InvalidKind, accumulator.add(samplePiece(19, 1, "unknown")));
+}
+
 test "drop duplicate reorder payload bitflip and wrong header all fail closed" {
     const original = [_]PieceView{
         samplePiece(1, 0x4843_4c54, "alice"),
@@ -392,7 +411,7 @@ test "exhaustive handoff manifest single-mutation campaign fails closed" {
     var payloads: [data_kind_count][2]u8 = undefined;
     var pieces: [data_kind_count]PieceView = undefined;
     for (&pieces, 0..) |*item, i| {
-        const kind: u8 = @intCast(i + first_data_kind);
+        const kind = data_kinds[i];
         payloads[i] = .{ kind, kind ^ 0xa5 };
         item.* = .{
             .header = .{

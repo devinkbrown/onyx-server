@@ -1,0 +1,520 @@
+test-services
++- run test 515 pass, 85 skip, 20 fail (620 total)
+error: 'daemon.delivery_authority.test.delivery authority: genuine Core factory registers original private context Store and Services mutex and refuses tampered placement without WAL mutation' failed:
+       delivery authority: 2 closed Services factory allocation failures with same-context retry
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x19ccc6a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:57009:9: 0x19cf1d1 in createLeasedCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, leased);
+               ^
+       /home/kain/onyx-server/src/daemon/delivery_authority.zig:2296:5: 0x19d0b0c in leasedLeafCore (root.zig)
+           return server_mod.ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, .{
+           ^
+       /home/kain/onyx-server/src/daemon/delivery_authority.zig:2310:18: 0x19e9c99 in test.delivery authority: genuine Core factory registers original private context Store and Services mutex and refuses tampered placement without WAL mutation (root.zig)
+           const core = try leasedLeafCore(tmp.dir, "core-leaf.wal", .provision, &identity, &resolver);
+                        ^
+error: 'daemon.server.test.managed leased core: bound prepare allocation failures retain original WAL and refund the actual World and Services custody' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x19ccc6a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:57009:9: 0x19cf1d1 in createLeasedCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, leased);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:58332:18: 0x39b7914 in test.managed leased core: bound prepare allocation failures retain original WAL and refund the actual World and Services custody (root.zig)
+           const core = try ManagedCore.createLeasedCold(failing.allocator(), std.testing.io, managedLeasedTestInputs(&identity, storage.name), .{ .mode = .provision, .storage = storage }, binding);
+                        ^
+error: 'daemon.server.test.managed leased core: real other caller holding fresh World refuses before retained Services mutex and joins before cold cancellation' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x19ccc6a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:57009:9: 0x19cf1d1 in createLeasedCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, leased);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:58390:18: 0x39ae0aa in test.managed leased core: real other caller holding fresh World refuses before retained Services mutex and joins before cold cancellation (root.zig)
+           const core = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, managedLeasedTestInputs(&identity, storage.name), .{ .mode = .provision, .storage = storage }, binding);
+                        ^
+error: 'daemon.server.test.managed core: original policy and install seals normalize before actual Services and live IRC' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x19ccc6a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:56999:9: 0x38a551c in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:58860:21: 0x38b2e7c in initWithInputs (root.zig)
+               self.core = try ManagedCore.createCold(a, std.testing.io, inputs, .{ .rdns = resolver, .dnsbl = null, .mail = null, .webpush = null });
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:58935:5: 0x38b838d in test.managed core: original policy and install seals normalize before actual Services and live IRC (root.zig)
+           try fixture.initWithInputs(.{
+           ^
+error: 'daemon.server.test.MARKREAD atomic live dispatch isolates guests and publishes once to physical account attachments' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3260084 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:69088:5: 0x3883953 in readMarkerServerForTest (root.zig)
+           return createTestServer(allocator, .{
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:69146:20: 0x3887e64 in test.MARKREAD atomic live dispatch isolates guests and publishes once to physical account attachments (root.zig)
+           const server = try readMarkerServerForTest(alloc, &services, &identity);
+                          ^
+error: 'daemon.server.test.MARKREAD live write short write and sync faults publish no runtime position or account notification' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3260084 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:69088:5: 0x3883953 in readMarkerServerForTest (root.zig)
+           return createTestServer(allocator, .{
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:69456:28: 0x3884813 in test.MARKREAD live write short write and sync faults publish no runtime position or account notification (root.zig)
+                   const server = try readMarkerServerForTest(alloc, &services, &identity);
+                                  ^
+error: 'daemon.server.test.TOTP atomic live handlers sweep persistence allocations and same-code retry' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:76862:5: 0x38540c2 in totpAtomicServerForTest (root.zig)
+           try server.initInPlace(std.testing.allocator, .{
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:76916:28: 0x387446d in test.TOTP atomic live handlers sweep persistence allocations and same-code retry (root.zig)
+                   const server = try totpAtomicServerForTest(&services);
+                                  ^
+error: 'daemon.server.test.TOTP atomic live handlers reject record and WAL admission with retry' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:76862:5: 0x38540c2 in totpAtomicServerForTest (root.zig)
+           try server.initInPlace(std.testing.allocator, .{
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:76987:28: 0x3871351 in test.TOTP atomic live handlers reject record and WAL admission with retry (root.zig)
+                   const server = try totpAtomicServerForTest(&services);
+                                  ^
+error: 'daemon.server.test.TOTP atomic live handlers ambiguous prepared IO denies authentication and cold replay is coherent' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:76862:5: 0x38540c2 in totpAtomicServerForTest (root.zig)
+           try server.initInPlace(std.testing.allocator, .{
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:77044:32: 0x386a6e0 in test.TOTP atomic live handlers ambiguous prepared IO denies authentication and cold replay is coherent (root.zig)
+                       const server = try totpAtomicServerForTest(&services);
+                                      ^
+error: 'daemon.server.test.TOTP atomic live handlers successful enable and disable survive cold WAL reopen' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:76862:5: 0x38540c2 in totpAtomicServerForTest (root.zig)
+           try server.initInPlace(std.testing.allocator, .{
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:77145:24: 0x3867d5c in test.TOTP atomic live handlers successful enable and disable survive cold WAL reopen (root.zig)
+               const server = try totpAtomicServerForTest(&services);
+                              ^
+error: 'daemon.server.test.TOTP atomic live SASL token authority survives rejected policy and is revoked on enable and disable' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:76862:5: 0x38540c2 in totpAtomicServerForTest (root.zig)
+           try server.initInPlace(std.testing.allocator, .{
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:77223:20: 0x3864e2d in test.TOTP atomic live SASL token authority survives rejected policy and is revoked on enable and disable (root.zig)
+           const server = try totpAtomicServerForTest(&services);
+                          ^
+error: 'daemon.server.test.TOTP atomic live poisoned services refuse in-flight cached SCRAM through entry and completion gates' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:76862:5: 0x38540c2 in totpAtomicServerForTest (root.zig)
+           try server.initInPlace(std.testing.allocator, .{
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:77291:20: 0x385ed48 in test.TOTP atomic live poisoned services refuse in-flight cached SCRAM through entry and completion gates (root.zig)
+           const server = try totpAtomicServerForTest(&services);
+                          ^
+error: 'daemon.server.test.TOTP atomic RESETPASS live handler rejects password admission without success' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:76862:5: 0x38540c2 in totpAtomicServerForTest (root.zig)
+           try server.initInPlace(std.testing.allocator, .{
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:77372:24: 0x385a7b0 in test.TOTP atomic RESETPASS live handler rejects password admission without success (root.zig)
+               const server = try totpAtomicServerForTest(&services);
+                              ^
+error: 'daemon.server.test.SESSIONTOKEN live dispatch issues Unix expiry and survives durable cold reopen' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3260084 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:90249:24: 0x380191f in test.SESSIONTOKEN live dispatch issues Unix expiry and survives durable cold reopen (root.zig)
+               const server = try createTestServer(allocator, .{
+                              ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot supply stale trusted account authority' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3260084 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x371b723 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x3742285 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115003:5: 0x3742389 in test.same-IP mesh dial retiring roster cannot supply stale trusted account authority (root.zig)
+           try expectRetiringRosterUsesSurvivor(.account);
+           ^
+error: 'daemon.server.test.webpush consumer: original dead outcome survives every staging OOM and prunes all actual accounts' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3260084 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:128387:20: 0x3573d21 in test.webpush consumer: original dead outcome survives every staging OOM and prunes all actual accounts (root.zig)
+           const server = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .account_services = &services, .crypto_io = std.testing.io });
+                          ^
+error: 'daemon.server.test.webpush consumer: real IRC oper receives one maintenance notice while all accounts reconcile' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x325fe84 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3260084 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:128530:20: 0x3262775 in test.webpush consumer: real IRC oper receives one maintenance notice while all accounts reconcile (root.zig)
+           const server = try createTestServer(allocator, config);
+                          ^
+error: 'daemon.configured_runtime.test.configured runtime: seeded original Webpush outputs survive Store OOM with real graph custody then prune every account and never queue after cold reopen' failed:
+       webpush reconciliation: 73 allocator failures including 9 synced-prefix retries
+       TOTP atomic enable: 7 induced allocation failures, retries, and cold reopens
+       TOTP atomic disable: 5 induced allocation failures, retries, and cold reopens
+       TOTP atomic replace: 7 induced allocation failures, retries, and cold reopens
+       TOTP atomic revoke: 3 induced allocation failures, retries, and cold reopens
+       TOTP atomic rotate: 11 induced allocation failures, retries, and cold reopens
+       TOTP atomic reset: 9 induced allocation failures, retries, and cold reopens
+       GAP-D7 branch=a failed pending-address write issues no verification token; live mail stays off
+       GAP-P0b branch=cap onyx/2fa=IDENTIFY before AUTHENTICATE
+       GAP-P0b branch=oauth refuses unknown account unless oauth_auto_provision
+       account authority allocation census: complete=20, nested=2; every index swept in dedicated tests
+       account authority acyclic allocation census: 35; every index swept
+       account authority bounded reassembly allocation census: 27; every index swept
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x19a0e1e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x19a1efb in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x19a2234 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x19a4375 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x19adda1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x19ccc6a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:56999:9: 0x38a551c in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, null);
+               ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:482:14: 0x3abd1a0 in createColdImpl (root.zig)
+           b.core = try server_mod.ManagedCore.createCold(allocator, io, inputs.core, .{
+                    ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:121:9: 0x3abf5fe in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, deadline, if (builtin.is_test) null else {});
+               ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:1790:25: 0x3ad9cb0 in test.configured runtime: seeded original Webpush outputs survive Store OOM with real graph custody then prune every account and never queue after cold reopen (root.zig)
+               const runtime = try Runtime.createCold(std.testing.allocator, std.testing.io, runtimeWebpushInputs(&store, pair, &public_key), testDeadline());
+                               ^
+error: 'daemon.helix.session_migration_dst.test.session migration round-trip preserves a same-account shared-token attachment group' failed:
+       /home/kain/onyx-server/src/daemon/helix/handoff.zig:118:17: 0x329fce7 in socketPair (root.zig)
+               else => return error.SocketPairFailed,
+                       ^
+       /home/kain/onyx-server/src/daemon/helix/session_migration_dst.zig:248:19: 0x3dc7621 in roundTrip (root.zig)
+           var sockets = try handoff.socketPair();
+                         ^
+       /home/kain/onyx-server/src/daemon/helix/session_migration_dst.zig:397:21: 0x3dd540d in test.session migration round-trip preserves a same-account shared-token attachment group (root.zig)
+           const outcome = try roundTrip(std.testing.allocator, &capsules, &live);
+                           ^
+error: 'daemon.helix.session_migration_dst.test.session migration round-trip rejects cross-account shared-token authority' failed:
+       expected error.DuplicateToken, found error.SocketPairFailed
+       /home/kain/onyx-server/src/daemon/helix/handoff.zig:118:17: 0x329fce7 in socketPair (root.zig)
+               else => return error.SocketPairFailed,
+                       ^
+       /home/kain/onyx-server/src/daemon/helix/session_migration_dst.zig:248:19: 0x3dc7621 in roundTrip (root.zig)
+           var sockets = try handoff.socketPair();
+                         ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:64:13: 0x3dc722a in expectError__anon_751858 (std.zig)
+                   return error.TestUnexpectedError;
+                   ^
+       /home/kain/onyx-server/src/daemon/helix/session_migration_dst.zig:416:5: 0x3dc7412 in test.session migration round-trip rejects cross-account shared-token authority (root.zig)
+           try std.testing.expectError(
+           ^
+failed command: ./.zig-cache/o/c1e4cc176bab79183784fac94a61f820/test --cache-dir=./.zig-cache --seed=0x2e35a9c7 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 515/620 tests passed (85 skipped, 20 failed)
+test-services transitive failure
++- run test 515 pass, 85 skip, 20 fail (620 total)
+

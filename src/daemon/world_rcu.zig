@@ -1174,6 +1174,79 @@ pub const MembershipSet = struct {
         }
     };
 
+    /// One immutable root replacement for a disjoint, unique mixed edit.
+    /// The outer graph owner keeps the retirement reservation at a stable address.
+    pub const StagedEdit = struct {
+        set: *Self,
+        reservation: *ebr.Participant.RetireReservation,
+        old_box: *Published,
+        new_box: *Published,
+        active: bool = true,
+
+        pub fn commit(self: *StagedEdit) void {
+            std.debug.assert(self.active);
+            self.set.published.store(self.new_box, .release);
+            self.set.retireBoxReserved(self.reservation, self.old_box);
+            self.active = false;
+            self.set.writer_lock.unlock();
+        }
+
+        pub fn abort(self: *StagedEdit) void {
+            if (!self.active) return;
+            self.new_box.map.release(self.set.allocator);
+            self.set.allocator.destroy(self.new_box);
+            self.active = false;
+            self.set.writer_lock.unlock();
+        }
+    };
+
+    /// Empty/empty is an inert no-op. Null otherwise means a predecessor
+    /// precondition failed. Invalid duplicate/overlapping ids are rejected.
+    /// Every operation reads the same captured root; scratch roots never publish.
+    pub fn stageEditReserved(
+        self: *Self,
+        reservation: *ebr.Participant.RetireReservation,
+        removals: []const ClientId,
+        additions: []const ClientId,
+    ) !?StagedEdit {
+        for (removals, 0..) |id, i| {
+            for (removals[0..i]) |prior| if (ClientIdContext.eql(undefined, id, prior)) return error.InvalidEdit;
+            for (additions) |added| if (ClientIdContext.eql(undefined, id, added)) return error.InvalidEdit;
+        }
+        for (additions, 0..) |id, i| {
+            for (additions[0..i]) |prior| if (ClientIdContext.eql(undefined, id, prior)) return error.InvalidEdit;
+        }
+        if (removals.len == 0 and additions.len == 0) return null;
+        self.writer_lock.lock();
+        errdefer self.writer_lock.unlock();
+        const old_box = self.published.load(.acquire);
+        for (removals) |id| if (old_box.map.get(id) == null) {
+            self.writer_lock.unlock();
+            return null;
+        };
+        for (additions) |id| if (old_box.map.get(id) != null) {
+            self.writer_lock.unlock();
+            return null;
+        };
+        std.debug.assert(reservation.active and reservation.remaining != 0);
+        var map = old_box.map;
+        map.retain();
+        errdefer map.release(self.allocator);
+        for (removals) |id| {
+            const next = try map.remove(self.allocator, id);
+            map.release(self.allocator);
+            map = next;
+        }
+        for (additions) |id| {
+            const next = try map.put(self.allocator, id, {});
+            map.release(self.allocator);
+            map = next;
+        }
+        const box = try self.allocator.create(Published);
+        box.* = .{ .map = map };
+        return .{ .set = self, .reservation = reservation, .old_box = old_box, .new_box = box };
+    }
+
     /// Stage one absent id without publishing it. Returns null when already
     /// present. The caller must commit or abort a returned value.
     pub fn stageAddReserved(
@@ -1634,4 +1707,129 @@ test "THREADED: concurrent readers vs writer, no UAF, no leak, correct final" {
     // currently-published snapshots; std.testing.allocator asserts no leak.
     writer.unregister();
     for (0..reader_count) |i| reader_parts[i].unregister();
+}
+
+test "World compound membership mixed edit captures one root aborts and retains pinned predecessor" {
+    const a = testing.allocator;
+    var domain = ebr.Domain.init(a);
+    defer domain.deinit();
+    const writer = try domain.register();
+    defer writer.unregister();
+    const reader = try domain.register();
+    defer reader.unregister();
+    const source = cid(0, 1, 1);
+    const keeper = cid(0, 2, 1);
+    const foreign = cid(0, 3, 1);
+    var set = try MembershipSet.initFromSlice(a, &domain, &.{ source, foreign });
+    defer {
+        set.deinit();
+        quiesce(&domain);
+    }
+    var reservation = try writer.reserveRetireCapacity(1);
+    defer if (reservation.active) reservation.finish();
+    try testing.expectError(error.InvalidEdit, set.stageEditReserved(&reservation, &.{ source, source }, &.{}));
+    try testing.expectError(error.InvalidEdit, set.stageEditReserved(&reservation, &.{source}, &.{source}));
+    try testing.expectError(error.InvalidEdit, set.stageEditReserved(&reservation, &.{}, &.{ keeper, keeper }));
+    try testing.expect((try set.stageEditReserved(&reservation, &.{}, &.{})) == null);
+    try testing.expect((try set.stageEditReserved(&reservation, &.{keeper}, &.{})) == null);
+    try testing.expect((try set.stageEditReserved(&reservation, &.{}, &.{source})) == null);
+    const old = set.published.load(.acquire);
+    var aborted = (try set.stageEditReserved(&reservation, &.{source}, &.{keeper})).?;
+    try testing.expectEqual(old, set.published.load(.acquire));
+    aborted.abort();
+    aborted.abort();
+    try testing.expectEqual(old, set.published.load(.acquire));
+    var guard = reader.pin();
+    var stage = (try set.stageEditReserved(&reservation, &.{source}, &.{keeper})).?;
+    try testing.expect(old.map.get(source) != null and old.map.get(keeper) == null);
+    stage.commit();
+    try testing.expect(set.published.load(.acquire).map.get(source) == null and set.published.load(.acquire).map.get(keeper) != null);
+    try testing.expect(set.published.load(.acquire).map.get(foreign) != null);
+    // Finish the writer pin; only the old reader guards this predecessor.
+    reservation.finish();
+    try testing.expect(domain.advance());
+    try testing.expect(!domain.advance());
+    try testing.expect(old.map.get(source) != null and old.map.get(keeper) == null);
+    guard.unpin();
+    reservation = try writer.reserveRetireCapacity(2);
+    var remove = (try set.stageEditReserved(&reservation, &.{keeper}, &.{})).?;
+    remove.commit();
+    try testing.expectEqual(@as(usize, 1), set.published.load(.acquire).map.count());
+    var add = (try set.stageEditReserved(&reservation, &.{}, &.{source})).?;
+    add.commit();
+    try testing.expectEqual(@as(usize, 2), set.published.load(.acquire).map.count());
+    try testing.expect(set.published.load(.acquire).map.get(foreign) != null);
+}
+
+test "World compound membership mixed edit exhaustive OOM keeps original root and commits allocation free" {
+    var index: usize = 0;
+    while (index < 1000) : (index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var domain = ebr.Domain.init(failing.allocator());
+        defer domain.deinit();
+        const p = try domain.register();
+        defer p.unregister();
+        const source = cid(0, 1, 1);
+        const keeper = cid(0, 2, 1);
+        var set = try MembershipSet.initFromSlice(failing.allocator(), &domain, &.{source});
+        defer {
+            failing.fail_index = std.math.maxInt(usize);
+            set.deinit();
+            quiesce(&domain);
+        }
+        var reservation = try p.reserveRetireCapacity(1);
+        defer reservation.finish();
+        const old = set.published.load(.acquire);
+        failing.fail_index = failing.alloc_index + index;
+        var stage = set.stageEditReserved(&reservation, &.{source}, &.{keeper}) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(old, set.published.load(.acquire));
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = (try set.stageEditReserved(&reservation, &.{source}, &.{keeper})).?;
+            const allocations = failing.allocations;
+            failing.fail_index = failing.alloc_index;
+            retry.commit();
+            try testing.expectEqual(allocations, failing.allocations);
+            try testing.expect(set.published.load(.acquire).map.get(source) == null and set.published.load(.acquire).map.get(keeper) != null);
+            continue;
+        };
+        const allocations = failing.allocations;
+        failing.fail_index = failing.alloc_index;
+        stage.?.commit();
+        try testing.expectEqual(allocations, failing.allocations);
+        try testing.expect(!failing.has_induced_failure);
+        try testing.expect(index > 0);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "World compound membership many ID mixed edit publishes only final union" {
+    const a = testing.allocator;
+    var domain = ebr.Domain.init(a);
+    defer domain.deinit();
+    const p = try domain.register();
+    defer p.unregister();
+    const removals = [_]ClientId{ cid(0, 1, 1), cid(0, 2, 1), cid(0, 3, 1) };
+    const additions = [_]ClientId{ cid(1, 1, 1), cid(1, 2, 1), cid(1, 3, 1) };
+    const foreign = cid(2, 1, 1);
+    var set = try MembershipSet.initFromSlice(a, &domain, &.{ removals[0], removals[1], removals[2], foreign });
+    defer {
+        set.deinit();
+        quiesce(&domain);
+    }
+    var reservation = try p.reserveRetireCapacity(1);
+    defer reservation.finish();
+    const old = set.published.load(.acquire);
+    var stage = (try set.stageEditReserved(&reservation, &removals, &additions)).?;
+    for (removals) |id| try testing.expect(old.map.get(id) != null);
+    for (additions) |id| try testing.expect(old.map.get(id) == null);
+    try testing.expectEqual(old, set.published.load(.acquire));
+    stage.commit();
+    const final = set.published.load(.acquire);
+    for (removals) |id| try testing.expect(final.map.get(id) == null);
+    for (additions) |id| try testing.expect(final.map.get(id) != null);
+    try testing.expect(final.map.get(foreign) != null);
+    try testing.expectEqual(@as(usize, 4), final.map.count());
+    try testing.expectEqual(@as(usize, 0), reservation.remaining);
 }

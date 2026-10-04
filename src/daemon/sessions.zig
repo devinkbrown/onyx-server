@@ -337,6 +337,262 @@ pub const TokenIndexComplexity = struct {
     group_row_visits: usize = 0,
 };
 
+/// Current lifecycle selectors additionally pin the attached state. The legacy
+/// DROP selector remains unchanged for existing callers and checkpoint formats.
+pub const LifecycleSelector = struct {
+    account: []const u8,
+    exact: ExactSelector,
+    attached: bool,
+};
+
+pub const LifecycleError = BootstrapAttachError || error{
+    Busy,
+    InvalidRequest,
+    OverlappingIntent,
+    StaleSelector,
+    MissingRow,
+    AlreadyAttached,
+    AmbiguousPhysicalBinding,
+    TokenCollisionExhausted,
+    AttachmentCollisionExhausted,
+    TooManyPendingChannels,
+    ProjectionConflict,
+    GenerationExhausted,
+    CandidateLimitExceeded,
+    InvalidTicket,
+};
+
+pub const LifecycleRemoval = enum { physical_close, logout, untrack, garbage_collect, reserved_drop, account_revocation, cap_eviction, claimant_replacement, token_rebind };
+pub const LifecycleSnapshot = union(enum) { keep, clear, replace: []const u8 };
+pub const LifecycleCap = union(enum) { fail, untracked, evict_detached, evict_exact: LifecycleSelector };
+pub const LifecycleAdmissionKind = union(enum) {
+    fresh,
+    join_existing: Token,
+    /// This is a caller-authenticated grant, not authentication by SessionStore.
+    adopt_verified: struct { token: Token, portable: bool },
+    no_row,
+    sentinel,
+};
+pub const LifecycleAdmission = struct {
+    account: []const u8,
+    client: ClientId,
+    signon_ms: i64,
+    kind: LifecycleAdmissionKind,
+    cap: LifecycleCap = .fail,
+    /// Explicit OLD pristine sentinel replacement only. A legacy nonzero token
+    /// with missing attachment identity cannot be upgraded by this API.
+    replace_sentinel: ?LifecycleSelector = null,
+};
+pub const LifecycleRequest = struct {
+    request_id: u64,
+    intent: union(enum) {
+        admit: LifecycleAdmission,
+        detach: struct { source: LifecycleSelector, snapshot: LifecycleSnapshot = .keep },
+        remove: struct { source: LifecycleSelector, reason: LifecycleRemoval },
+        remove_account: []const u8,
+        reconnect: struct {
+            source: LifecycleSelector,
+            claimant_client: ClientId,
+            claimant: ?LifecycleSelector = null,
+            /// A pristine provisional claimant needs no authority retirement;
+            /// any other claimant requires this explicit outer obligation.
+            retire_claimant: bool = false,
+            consume_snapshot: bool = true,
+        },
+        rebind: struct {
+            source: LifecycleSelector,
+            target_account: []const u8,
+            target_token: Token,
+            kind: TokenBindKind,
+            /// Changing token retires, never retags, attachment receive work.
+            retire_attachment_work: bool = false,
+        },
+    },
+};
+pub const LifecycleDropPermit = struct { source: LifecycleSelector, owner: DropReservationId };
+pub const LifecycleObservation = struct { account: []const u8, client: ClientId, expected: ?LifecycleSelector = null };
+pub const LifecycleLimits = struct {
+    max_operations: usize = 4096,
+    max_discovery_rows: usize = 4 * 1024 * 1024,
+    max_candidate_rows: usize = 1024 * 1024,
+    max_payload_bytes: usize = 256 * 1024 * 1024,
+    max_preview_bytes: usize = 256 * 1024 * 1024,
+    /// Sum of owned account-key bytes plus fixed token bytes queried by the
+    /// private candidate indexes. Overflow or excess rejects before publication.
+    max_candidate_lookup_work: usize = 64 * 1024 * 1024,
+};
+pub const LifecycleBatchSpec = struct {
+    io: std.Io,
+    operations: []const LifecycleRequest,
+    drop_permits: []const LifecycleDropPermit = &.{},
+    /// Named, no-mutation observation is the only accepted empty batch.
+    observation_only: ?LifecycleObservation = null,
+    limits: LifecycleLimits = .{},
+};
+
+/// Complete immutable row image. Account text is ticket-owned, snapshot bytes
+/// are immutable under the retained lock, and journals are inline values.
+pub const LifecycleRow = struct {
+    account: []const u8,
+    client: ClientId,
+    token: Token,
+    attachment_id: ?AttachmentId,
+    signon_ms: i64,
+    attached: bool,
+    snapshot: ?[]const u8,
+    portable_resume: bool,
+    replica_dirty: bool,
+    replica_projection_dirty: bool,
+    attachment_replica_dirty: bool,
+    attachment_replica_projection_dirty: bool,
+    drop_reservation: DropReservationId,
+    group_journal: LocalChannelProjectionSet,
+    attachment_journal: LocalChannelProjectionSet,
+};
+pub const LifecycleAdmissionResult = struct {
+    request_id: u64,
+    account: []const u8,
+    client: ClientId,
+    result: union(enum) {
+        tracked: struct { token: Token, attachment_id: ?AttachmentId },
+        untracked: enum { explicit, accounts_capacity, sessions_capacity },
+    },
+};
+pub const LifecyclePhysicalReason = enum { admission, detach, removal, reconnect_source, reconnect_target, rebind, group_propagation };
+pub const LifecyclePhysicalFacts = struct {
+    account: []const u8,
+    client: ClientId,
+    token: Token,
+    attachment_id: ?AttachmentId,
+    signon_ms: i64,
+    attached: bool,
+    portable_resume: bool,
+    has_snapshot: bool,
+    replica_dirty: bool,
+    replica_projection_dirty: bool,
+    attachment_replica_dirty: bool,
+    attachment_replica_projection_dirty: bool,
+    drop_reservation: DropReservationId,
+    group_journal: LocalChannelProjectionSet,
+    attachment_journal: LocalChannelProjectionSet,
+};
+pub const LifecycleAffectedPhysical = struct {
+    client: ClientId,
+    before: ?LifecyclePhysicalFacts,
+    after: ?LifecyclePhysicalFacts,
+    historical_only: bool = false,
+    reason: LifecyclePhysicalReason,
+};
+pub const LifecycleRetiredAttachment = struct { row: LifecycleRow, reason: LifecycleRemoval, attachment_work_retired: bool };
+pub const LifecycleRemap = struct { token: Token, attachment_id: AttachmentId, old_client: ClientId, new_client: ClientId };
+pub const LifecycleTokenDelta = struct {
+    token: Token,
+    account: []const u8,
+    old_rows: usize,
+    final_rows: usize,
+    old_attached: usize,
+    final_attached: usize,
+    old_portable: usize,
+    final_portable: usize,
+    old_journal: LocalChannelProjectionSet,
+    final_journal: LocalChannelProjectionSet,
+};
+pub const LifecycleCounts = struct {
+    replica: usize = 0,
+    projection: usize = 0,
+    attachment_replica: usize = 0,
+    attachment_projection: usize = 0,
+    group_journal: usize = 0,
+    attachment_journal: usize = 0,
+};
+pub const LifecycleComplexity = struct {
+    discovery_row_visits: usize = 0,
+    /// Rows cloned into affected lists; the additional fields count subsequent
+    /// actual traversals so this metric cannot hide a per-token census.
+    candidate_row_visits: usize = 0,
+    operation_row_visits: usize = 0,
+    group_source_row_visits: usize = 0,
+    closure_row_visits: usize = 0,
+    proof_row_reads: usize = 0,
+    final_mapping_row_visits: usize = 0,
+    quota_rows_checked: usize = 0,
+    normalization_row_visits: usize = 0,
+    index_row_visits: usize = 0,
+    preview_row_visits: usize = 0,
+    copied_payload_bytes: usize = 0,
+    candidate_key_lookups: usize = 0,
+    candidate_group_lookups: usize = 0,
+    candidate_key_lookup_work: usize = 0,
+    candidate_group_lookup_work: usize = 0,
+};
+pub const LifecyclePreview = struct {
+    before: []const LifecycleRow = &.{},
+    after: []const LifecycleRow = &.{},
+    affected_physical: []const LifecycleAffectedPhysical = &.{},
+    admissions: []const LifecycleAdmissionResult = &.{},
+    retired_attachments: []const LifecycleRetiredAttachment = &.{},
+    remaps: []const LifecycleRemap = &.{},
+    token_groups: []const LifecycleTokenDelta = &.{},
+    final_accounts: usize = 0,
+    final_rows: usize = 0,
+    counts: LifecycleCounts = .{},
+    projection_generation: u64 = 0,
+    complexity: LifecycleComplexity = .{},
+};
+
+/// Linear lock-owning ticket. Until finish/abort ONLY preview may be read; do
+/// not reenter SessionStore, copy ownership, dispatch asynchronously, or cross
+/// a hot safe point. Validate before the outer durable cut. Commit is trusted
+/// and void; all allocations and quota/proof decisions precede validation.
+pub const PreparedLifecycleBatch = struct {
+    owned: ?*LifecycleOwned,
+
+    pub fn preview(self: *const PreparedLifecycleBatch) *const LifecyclePreview {
+        const o = self.owned orelse unreachable;
+        std.debug.assert(o.state == .prepared or o.state == .validated or o.state == .committed);
+        return &o.preview_value;
+    }
+    pub fn validateForCut(self: *PreparedLifecycleBatch) LifecycleError!void {
+        const o = self.owned orelse return error.InvalidTicket;
+        if ((o.state != .prepared and o.state != .validated) or
+            o.store.active_lifecycle != o or o.store.next_lifecycle_serial != o.serial or
+            (o.handle != null and o.handle.? != self)) return error.InvalidTicket;
+        if (!std.mem.eql(u8, &o.seal, &o.candidateDigest()) or
+            !std.mem.eql(u8, &o.predecessor, &o.oldDigest())) return error.InvalidTicket;
+        o.handle = self;
+        o.state = .validated;
+    }
+    pub fn commit(self: *PreparedLifecycleBatch) void {
+        const o = self.owned orelse unreachable;
+        std.debug.assert(o.state == .validated and o.handle == self and o.store.active_lifecycle == o);
+        o.publish();
+        o.state = .committed;
+    }
+    pub fn finish(self: *PreparedLifecycleBatch) void {
+        const o = self.owned orelse unreachable;
+        std.debug.assert(o.state == .committed and o.handle == self and o.store.active_lifecycle == o);
+        o.store.active_lifecycle = null;
+        o.state = .finished;
+        o.store.lock.unlockExclusive();
+    }
+    pub fn abort(self: *PreparedLifecycleBatch) void {
+        const o = self.owned orelse return;
+        if (o.state == .aborted or o.state == .finished) return;
+        std.debug.assert((o.state == .prepared or o.state == .validated) and o.store.active_lifecycle == o);
+        std.debug.assert(o.handle == null or o.handle == self);
+        o.store.active_lifecycle = null;
+        o.state = .aborted;
+        o.store.lock.unlockExclusive();
+    }
+    pub fn deinit(self: *PreparedLifecycleBatch) void {
+        const o = self.owned orelse return;
+        if (o.state == .prepared or o.state == .validated) self.abort();
+        if (o.state == .committed) self.finish();
+        self.owned = null;
+        o.destroy();
+    }
+};
+
 /// Authority used to bind one already-tracked attachment to a reusable token.
 /// `join_existing` requires that the exact account already contains a row with
 /// the target token. `adopt_verified` is reserved for callers that established
@@ -964,6 +1220,1136 @@ pub const PreparedAttachmentRebind = struct {
     }
 };
 
+const LifecycleAccount = struct {
+    key: []const u8,
+    display: []u8,
+    key_owned: bool,
+    old: ?SessionList,
+    final: SessionList = .{},
+    published: bool = false,
+    retired_key: bool = false,
+    remove_when_empty: bool = false,
+};
+const LifecycleOldBinding = struct { account: []const u8, index: usize, duplicates: bool = false };
+const LifecycleGroup = struct {
+    token: Token,
+    portable: bool = false,
+    was_portable: bool = false,
+    dirty: bool = false,
+    projection: bool = false,
+    journal: LocalChannelProjectionSet = .{},
+    changed: bool = false,
+    closure_included: bool = false,
+    old_owner: ?[]const u8 = null,
+    old_dirty: bool = false,
+    old_projection: bool = false,
+    old_journal: LocalChannelProjectionSet = .{},
+    reserved_client: ?ClientId = null,
+    reserved_count: usize = 0,
+};
+const LifecycleIndex = struct { token: Token, entry: TokenIndexEntry = .{} };
+const LifecycleFoldIndex = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8));
+
+fn lifecycleFold(a: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u8 {
+    const copy = try a.dupe(u8, text);
+    for (copy) |*c| c.* = std.ascii.toLower(c.*);
+    return copy;
+}
+
+fn lifecycleRow(account: []const u8, s: Session) LifecycleRow {
+    return .{
+        .account = account,
+        .client = s.client,
+        .token = s.token,
+        .attachment_id = s.attachment_id,
+        .signon_ms = s.signon_ms,
+        .attached = s.attached,
+        .snapshot = s.snapshot,
+        .portable_resume = s.portable_resume,
+        .replica_dirty = s.replica_dirty,
+        .replica_projection_dirty = s.replica_projection_dirty,
+        .attachment_replica_dirty = s.attachment_replica_dirty,
+        .attachment_replica_projection_dirty = s.attachment_replica_projection_dirty,
+        .drop_reservation = s.drop_reservation,
+        .group_journal = if (s.local_channel_projections) |p| p.* else .{},
+        .attachment_journal = if (s.attachment_channel_projections) |p| p.* else .{},
+    };
+}
+
+fn lifecycleFacts(row: LifecycleRow) LifecyclePhysicalFacts {
+    return .{ .account = row.account, .client = row.client, .token = row.token, .attachment_id = row.attachment_id, .signon_ms = row.signon_ms, .attached = row.attached, .portable_resume = row.portable_resume, .has_snapshot = row.snapshot != null, .replica_dirty = row.replica_dirty, .replica_projection_dirty = row.replica_projection_dirty, .attachment_replica_dirty = row.attachment_replica_dirty, .attachment_replica_projection_dirty = row.attachment_replica_projection_dirty, .drop_reservation = row.drop_reservation, .group_journal = row.group_journal, .attachment_journal = row.attachment_journal };
+}
+
+/// Equal generation is an authenticated state conflict, not a tie broken by
+/// request/list order. Validate the bounded journal before taking any slice.
+fn lifecycleMerge(out: *LocalChannelProjectionSet, add: LocalChannelProjectionSet) LifecycleError!void {
+    if (add.len > local_channel_projection_capacity) return error.ProjectionConflict;
+    for (add.items[0..add.len], 0..) |p, i| {
+        if (p.channel_len == 0 or p.channel_len > local_channel_name_capacity or p.generation == 0)
+            return error.ProjectionConflict;
+        if (i != 0 and localChannelOrder(add.items[i - 1].channel(), p.channel()) != .lt)
+            return error.ProjectionConflict;
+        if (localProjectionIndex(out, p.channel())) |index| {
+            const old = out.items[index];
+            if (p.generation == old.generation and
+                (p.present != old.present or p.member_mode_bits != old.member_mode_bits))
+                return error.ProjectionConflict;
+            if (p.generation > old.generation or (p.generation == old.generation and
+                std.mem.order(u8, p.channel(), old.channel()) == .lt)) out.items[index] = p;
+        } else try localProjectionUpsert(out, p);
+    }
+    out.revision = @max(out.revision, add.revision);
+}
+
+/// Fully owned payloads ONLY for the affected exact lists. OLD lists remain
+/// borrowed while prepared and move into this retirement ledger on commit.
+/// This bounded alternative deliberately copies affected snapshots/journals;
+/// copied_payload_bytes and candidate_row_visits expose that cost to callers.
+const LifecycleOwned = struct {
+    store: *SessionStore,
+    allocation: std.mem.Allocator,
+    serial: u64,
+    limits: LifecycleLimits,
+    handle: ?*PreparedLifecycleBatch = null,
+    state: enum { prepared, validated, committed, finished, aborted } = .prepared,
+    accounts: std.ArrayListUnmanaged(LifecycleAccount) = .empty,
+    groups: std.ArrayListUnmanaged(LifecycleGroup) = .empty,
+    indexes: std.ArrayListUnmanaged(LifecycleIndex) = .empty,
+    before: std.ArrayListUnmanaged(LifecycleRow) = .empty,
+    after: std.ArrayListUnmanaged(LifecycleRow) = .empty,
+    admissions: std.ArrayListUnmanaged(LifecycleAdmissionResult) = .empty,
+    retired: std.ArrayListUnmanaged(LifecycleRetiredAttachment) = .empty,
+    remaps: std.ArrayListUnmanaged(LifecycleRemap) = .empty,
+    physical: std.ArrayListUnmanaged(LifecycleAffectedPhysical) = .empty,
+    deltas: std.ArrayListUnmanaged(LifecycleTokenDelta) = .empty,
+    reasons: std.AutoHashMapUnmanaged(ClientId, LifecyclePhysicalReason) = .empty,
+    removed_reasons: std.AutoHashMapUnmanaged(ClientId, LifecycleRemoval) = .empty,
+    final_lookup: std.AutoHashMapUnmanaged(ClientId, struct { account: usize, row: usize }) = .empty,
+    final_lookup_ready: bool = false,
+    preview_value: LifecyclePreview = .{},
+    predecessor: [32]u8 = @splat(0),
+    seal: [32]u8 = @splat(0),
+    total_old_rows: usize = 0,
+    payload_bytes: usize = 0,
+    preview_bytes: usize = 0,
+    observation_client: ?ClientId = null,
+    old_bindings: std.AutoHashMapUnmanaged(ClientId, LifecycleOldBinding) = .empty,
+    account_lookup: std.StringHashMapUnmanaged(usize) = .empty,
+    group_lookup: std.AutoHashMapUnmanaged(Token, usize) = .empty,
+    lookup_budget_exhausted: bool = false,
+
+    fn allocator(self: *LifecycleOwned) std.mem.Allocator {
+        return self.allocation;
+    }
+
+    fn charge(self: *LifecycleOwned, bytes: usize) LifecycleError!void {
+        self.payload_bytes = std.math.add(usize, self.payload_bytes, bytes) catch return error.CandidateLimitExceeded;
+        if (self.payload_bytes > self.limits.max_payload_bytes) return error.CandidateLimitExceeded;
+        self.preview_value.complexity.copied_payload_bytes = self.payload_bytes;
+    }
+
+    fn chargePreview(self: *LifecycleOwned, bytes: usize) LifecycleError!void {
+        self.preview_bytes = std.math.add(usize, self.preview_bytes, bytes) catch return error.CandidateLimitExceeded;
+        if (self.preview_bytes > self.limits.max_preview_bytes) return error.CandidateLimitExceeded;
+    }
+    fn appendView(self: *LifecycleOwned, comptime T: type, list: *std.ArrayListUnmanaged(T), value: T) LifecycleError!void {
+        try self.chargePreview(@sizeOf(T));
+        try list.append(self.allocator(), value);
+    }
+
+    fn copySession(self: *LifecycleOwned, old: Session) LifecycleError!Session {
+        if (old.local_channel_projections) |journal| {
+            var checked: LocalChannelProjectionSet = .{};
+            try lifecycleMerge(&checked, journal.*);
+        }
+        if (old.attachment_channel_projections) |journal| {
+            var checked: LocalChannelProjectionSet = .{};
+            try lifecycleMerge(&checked, journal.*);
+        }
+        var s = old;
+        s.snapshot = null;
+        s.local_channel_projections = null;
+        s.attachment_channel_projections = null;
+        errdefer freeSessionOwned(self.allocator(), &s);
+        if (old.snapshot) |bytes| {
+            try self.charge(bytes.len);
+            s.snapshot = try self.allocator().dupe(u8, bytes);
+        }
+        if (old.local_channel_projections) |p| {
+            try self.charge(@sizeOf(LocalChannelProjectionSet));
+            s.local_channel_projections = try self.allocator().create(LocalChannelProjectionSet);
+            s.local_channel_projections.?.* = p.*;
+        }
+        if (old.attachment_channel_projections) |p| {
+            try self.charge(@sizeOf(LocalChannelProjectionSet));
+            s.attachment_channel_projections = try self.allocator().create(LocalChannelProjectionSet);
+            s.attachment_channel_projections.?.* = p.*;
+        }
+        return s;
+    }
+
+    fn chargeLookup(self: *LifecycleOwned, key: bool, bytes: usize) void {
+        const metric = &self.preview_value.complexity;
+        const work = if (key) &metric.candidate_key_lookup_work else &metric.candidate_group_lookup_work;
+        const count = if (key) &metric.candidate_key_lookups else &metric.candidate_group_lookups;
+        work.* = std.math.add(usize, work.*, bytes) catch {
+            self.lookup_budget_exhausted = true;
+            return;
+        };
+        count.* = std.math.add(usize, count.*, 1) catch {
+            self.lookup_budget_exhausted = true;
+            return;
+        };
+        const total = std.math.add(usize, metric.candidate_key_lookup_work, metric.candidate_group_lookup_work) catch {
+            self.lookup_budget_exhausted = true;
+            return;
+        };
+        if (total > self.limits.max_candidate_lookup_work) self.lookup_budget_exhausted = true;
+    }
+
+    fn checkLookupBudget(self: *const LifecycleOwned) LifecycleError!void {
+        if (self.lookup_budget_exhausted) return error.CandidateLimitExceeded;
+    }
+
+    fn accountIndex(self: *LifecycleOwned, key: []const u8) ?usize {
+        const bytes = std.math.add(usize, key.len, 1) catch {
+            self.lookup_budget_exhausted = true;
+            return null;
+        };
+        self.chargeLookup(true, bytes);
+        return self.account_lookup.get(key);
+    }
+
+    fn addAccount(self: *LifecycleOwned, key: []const u8) LifecycleError!usize {
+        const existing = self.accountIndex(key);
+        try self.checkLookupBudget();
+        if (existing) |i| return i;
+        try self.account_lookup.ensureUnusedCapacity(self.allocator(), 1);
+        const old = self.store.accounts.getEntry(key);
+        try self.chargePreview(std.math.add(usize, key.len, @sizeOf(LifecycleAccount)) catch return error.CandidateLimitExceeded);
+        if (old == null) try self.chargePreview(key.len);
+        const display = try self.allocator().dupe(u8, key);
+        errdefer self.allocator().free(display);
+        const candidate_key = if (old) |entry| entry.key_ptr.* else try self.allocator().dupe(u8, key);
+        errdefer if (old == null) self.allocator().free(candidate_key);
+        try self.accounts.append(self.allocator(), .{
+            .key = candidate_key,
+            .display = display,
+            .key_owned = old == null,
+            .old = if (old) |entry| entry.value_ptr.* else null,
+        });
+        const index = self.accounts.items.len - 1;
+        self.account_lookup.putAssumeCapacityNoClobber(candidate_key, index);
+        return index;
+    }
+
+    fn group(self: *LifecycleOwned, token: Token) LifecycleError!*LifecycleGroup {
+        std.debug.assert(!tokenIsSentinel(token));
+        self.chargeLookup(false, @sizeOf(Token) + 1);
+        try self.checkLookupBudget();
+        if (self.group_lookup.get(token)) |index| return &self.groups.items[index];
+        try self.group_lookup.ensureUnusedCapacity(self.allocator(), 1);
+        try self.groups.append(self.allocator(), .{ .token = token });
+        const index = self.groups.items.len - 1;
+        self.group_lookup.putAssumeCapacityNoClobber(token, index);
+        return &self.groups.items[index];
+    }
+
+    fn oldRow(self: *LifecycleOwned, loc: AttachmentLocator) LifecycleError!*const Session {
+        self.preview_value.complexity.proof_row_reads += 1;
+        const binding = self.old_bindings.get(loc.client) orelse return error.InvalidRequest;
+        if (binding.duplicates) return error.AmbiguousPhysicalBinding;
+        if (!std.mem.eql(u8, binding.account, loc.account)) return error.InvalidRequest;
+        return &self.store.accounts.getPtr(binding.account).?.items.items[binding.index];
+    }
+
+    fn includeGroup(self: *LifecycleOwned, token: Token) LifecycleError!void {
+        if (tokenIsSentinel(token)) return;
+        const g = try self.group(token);
+        if (g.closure_included) return;
+        g.closure_included = true;
+        if (self.store.token_index.get(token)) |entry| {
+            if (entry.rows.items.len == 0) return error.InvalidRequest;
+            g.old_owner = entry.rows.items[0].account;
+            var portable: usize = 0;
+            var dirty: usize = 0;
+            var projection: usize = 0;
+            var seen: std.AutoHashMapUnmanaged(ClientId, void) = .empty;
+            defer seen.deinit(self.allocator());
+            for (entry.rows.items) |loc| {
+                self.preview_value.complexity.group_source_row_visits += 1;
+                if (!std.ascii.eqlIgnoreCase(g.old_owner.?, loc.account)) return error.TokenAccountMismatch;
+                const unique = try seen.getOrPut(self.allocator(), loc.client);
+                if (unique.found_existing) return error.AmbiguousPhysicalBinding;
+                const row = try self.oldRow(loc);
+                if (!std.mem.eql(u8, &row.token, &token)) return error.InvalidRequest;
+                if (row.portable_resume) portable += 1;
+                if (row.replica_dirty) dirty += 1;
+                if (row.replica_projection_dirty) projection += 1;
+                if (row.drop_reservation != 0) {
+                    g.reserved_count += 1;
+                    g.reserved_client = row.client;
+                }
+                g.portable = g.portable or row.portable_resume;
+                g.dirty = g.dirty or row.replica_dirty;
+                g.projection = g.projection or row.replica_projection_dirty;
+                if (row.local_channel_projections) |journal| try lifecycleMerge(&g.journal, journal.*);
+                if (row.attachment_channel_projections) |journal| {
+                    var checked: LocalChannelProjectionSet = .{};
+                    try lifecycleMerge(&checked, journal.*);
+                }
+                _ = try self.addAccount(loc.account);
+            }
+            // A completed journal retains its cache revision after row-owned
+            // empty sets are freed. Preserve that legitimate empty CAS clock.
+            if (g.journal.len == 0 and entry.local_projections.len == 0) g.journal = entry.local_projections;
+            if (!std.meta.eql(g.journal, entry.local_projections)) return error.ProjectionConflict;
+            if (portable != entry.portable_rows or dirty != entry.dirty_rows or
+                projection != entry.projection_dirty_rows or g.reserved_count != entry.drop_reserved_rows)
+                return error.InvalidRequest;
+        }
+        g.was_portable = g.portable;
+        g.old_dirty = g.dirty;
+        g.old_projection = g.projection;
+        g.old_journal = g.journal;
+    }
+
+    fn source(self: *LifecycleOwned, clients: *const std.AutoHashMapUnmanaged(ClientId, LifecycleOldBinding), sel: LifecycleSelector) LifecycleError!Session {
+        const loc = clients.get(sel.exact.client) orelse return error.MissingRow;
+        if (loc.duplicates) return error.AmbiguousPhysicalBinding;
+        if (!std.mem.eql(u8, loc.account, sel.account)) return error.StaleSelector;
+        self.preview_value.complexity.proof_row_reads += 1;
+        const s = self.store.accounts.get(loc.account).?.items.items[loc.index];
+        if (!sessionMatchesExact(s, sel.exact) or s.attached != sel.attached) return error.StaleSelector;
+        return s;
+    }
+
+    fn permit(spec: LifecycleBatchSpec, account: []const u8, s: Session) bool {
+        for (spec.drop_permits) |p| {
+            if (p.owner != 0 and p.owner == s.drop_reservation and std.mem.eql(u8, p.source.account, account) and
+                p.source.attached == s.attached and sessionMatchesExact(s, p.source.exact)) return true;
+        }
+        return false;
+    }
+
+    fn checkReservation(self: *LifecycleOwned, spec: LifecycleBatchSpec, account: []const u8, row: Session) LifecycleError!void {
+        if (row.drop_reservation != 0 and !permit(spec, account, row)) return error.SessionDropReserved;
+        if (tokenIsSentinel(row.token)) return;
+        try self.includeGroup(row.token);
+        const g = try self.group(row.token);
+        // OLD group custody is checked once, not rescanned for every sibling.
+        if (g.reserved_count > 1 or (g.reserved_count == 1 and
+            (g.reserved_client.? != row.client or !permit(spec, account, row)))) return error.SessionDropReserved;
+    }
+
+    fn target(self: *LifecycleOwned, account: []const u8, token: Token, kind: TokenBindKind) LifecycleError!void {
+        if (tokenIsSentinel(token)) return error.InvalidToken;
+        try self.includeGroup(token);
+        const g = try self.group(token);
+        if (g.old_owner) |owner| {
+            if (!std.ascii.eqlIgnoreCase(account, owner)) return error.TokenAccountMismatch;
+            if (g.reserved_count != 0) return error.SessionDropReserved;
+        } else if (kind == .join_existing) return error.InvalidToken;
+    }
+
+    fn claim(claims: *std.AutoHashMapUnmanaged(ClientId, void), a: std.mem.Allocator, client: ClientId) LifecycleError!void {
+        const entry = try claims.getOrPut(a, client);
+        if (entry.found_existing) return error.OverlappingIntent;
+    }
+
+    fn build(self: *LifecycleOwned, spec: LifecycleBatchSpec) LifecycleError!void {
+        if (spec.operations.len > spec.limits.max_operations) return error.CandidateLimitExceeded;
+        if ((spec.operations.len == 0) != (spec.observation_only != null)) return error.InvalidRequest;
+        var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer ids.deinit(self.allocator());
+        const clients = &self.old_bindings;
+        var claims: std.AutoHashMapUnmanaged(ClientId, void) = .empty;
+        defer claims.deinit(self.allocator());
+        var folded: LifecycleFoldIndex = .empty;
+        defer {
+            var groups = folded.iterator();
+            while (groups.next()) |group_entry| {
+                self.allocator().free(group_entry.key_ptr.*);
+                group_entry.value_ptr.deinit(self.allocator());
+            }
+            folded.deinit(self.allocator());
+        }
+        var removed_accounts: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var keys = removed_accounts.keyIterator();
+            while (keys.next()) |key| self.allocator().free(key.*);
+            removed_accounts.deinit(self.allocator());
+        }
+        for (spec.operations) |op| if (op.intent == .remove_account) {
+            const key = try lifecycleFold(self.allocator(), op.intent.remove_account);
+            const result = removed_accounts.getOrPut(self.allocator(), key) catch |err| {
+                self.allocator().free(key);
+                return err;
+            };
+            if (result.found_existing) {
+                self.allocator().free(key);
+                return error.OverlappingIntent;
+            }
+        };
+        for (spec.operations) |op| {
+            if (op.intent == .remove_account) continue;
+            const account = switch (op.intent) {
+                .admit => |a| a.account,
+                .detach => |d| d.source.account,
+                .remove => |r| r.source.account,
+                .reconnect => |r| r.source.account,
+                .rebind => |r| r.source.account,
+                else => unreachable,
+            };
+            const key = try lifecycleFold(self.allocator(), account);
+            defer self.allocator().free(key);
+            if (removed_accounts.contains(key)) return error.OverlappingIntent;
+            if (op.intent == .rebind) {
+                const target_key = try lifecycleFold(self.allocator(), op.intent.rebind.target_account);
+                defer self.allocator().free(target_key);
+                if (removed_accounts.contains(target_key)) return error.OverlappingIntent;
+            }
+        }
+        // Exactly one global physical discovery. No request/token repeats it.
+        var it = self.store.accounts.iterator();
+        while (it.next()) |entry| {
+            const folded_key = try lifecycleFold(self.allocator(), entry.key_ptr.*);
+            const alias = folded.getOrPut(self.allocator(), folded_key) catch |err| {
+                self.allocator().free(folded_key);
+                return err;
+            };
+            if (alias.found_existing) self.allocator().free(folded_key) else alias.value_ptr.* = .empty;
+            try alias.value_ptr.append(self.allocator(), entry.key_ptr.*);
+            for (entry.value_ptr.items.items, 0..) |s, index| {
+                self.total_old_rows = std.math.add(usize, self.total_old_rows, 1) catch return error.CandidateLimitExceeded;
+                if (self.total_old_rows > spec.limits.max_discovery_rows) return error.CandidateLimitExceeded;
+                const loc = try clients.getOrPut(self.allocator(), s.client);
+                if (loc.found_existing) loc.value_ptr.duplicates = true else loc.value_ptr.* = .{ .account = entry.key_ptr.*, .index = index };
+            }
+        }
+        self.preview_value.complexity.discovery_row_visits = self.total_old_rows;
+        for (spec.drop_permits, 0..) |p, i| {
+            if (p.owner == 0) return error.InvalidRequest;
+            const s = try self.source(clients, p.source);
+            if (s.drop_reservation != p.owner) return error.SessionDropReserved;
+            for (spec.drop_permits[0..i]) |old| if (old.source.exact.client == p.source.exact.client) return error.OverlappingIntent;
+        }
+        // First pass is OLD-only proof and closure discovery; no candidate edits.
+        for (spec.operations) |op| {
+            const unique = try ids.getOrPut(self.allocator(), op.request_id);
+            if (unique.found_existing) return error.OverlappingIntent;
+            switch (op.intent) {
+                .admit => |ad| {
+                    if (ad.account.len == 0) return error.InvalidRequest;
+                    try claim(&claims, self.allocator(), ad.client);
+                    if (ad.replace_sentinel) |sel| {
+                        if (sel.exact.client != ad.client or !std.mem.eql(u8, sel.account, ad.account)) return error.InvalidRequest;
+                        const old = try self.source(clients, sel);
+                        if (!old.attached or !tokenIsSentinel(old.token) or old.attachment_id != null or !lifecyclePristine(old)) return error.InvalidRequest;
+                        try self.checkReservation(spec, sel.account, old);
+                    } else if (clients.contains(ad.client)) return error.AmbiguousPhysicalBinding;
+                    _ = try self.addAccount(ad.account);
+                    switch (ad.kind) {
+                        .join_existing => |token| try self.target(ad.account, token, .join_existing),
+                        .adopt_verified => |grant| try self.target(ad.account, grant.token, .{ .adopt_verified = grant.portable }),
+                        else => {},
+                    }
+                    if (ad.cap == .evict_exact) {
+                        const victim = try self.source(clients, ad.cap.evict_exact);
+                        if (victim.attached or !std.mem.eql(u8, ad.cap.evict_exact.account, ad.account)) return error.InvalidRequest;
+                        try self.checkReservation(spec, ad.account, victim);
+                        try claim(&claims, self.allocator(), victim.client);
+                    }
+                    if (ad.cap == .evict_exact or ad.cap == .evict_detached) {
+                        if (self.store.accounts.get(ad.account)) |old| for (old.items.items) |row| {
+                            if (!row.attached) try self.includeGroup(row.token);
+                        };
+                    }
+                },
+                .remove_account => |account| {
+                    if (account.len == 0) return error.InvalidRequest;
+                    const folded_key = try lifecycleFold(self.allocator(), account);
+                    defer self.allocator().free(folded_key);
+                    const aliases = folded.get(folded_key) orelse return error.MissingRow;
+                    for (aliases.items) |key| {
+                        _ = try self.addAccount(key);
+                        for (self.store.accounts.get(key).?.items.items) |s| {
+                            if (clients.get(s.client).?.duplicates) return error.AmbiguousPhysicalBinding;
+                            try claim(&claims, self.allocator(), s.client);
+                            try self.checkReservation(spec, key, s);
+                            try self.includeGroup(s.token);
+                        }
+                    }
+                },
+                else => {
+                    const sel = switch (op.intent) {
+                        .detach => |d| d.source,
+                        .remove => |r| r.source,
+                        .reconnect => |r| r.source,
+                        .rebind => |r| r.source,
+                        else => unreachable,
+                    };
+                    const s = try self.source(clients, sel);
+                    try claim(&claims, self.allocator(), s.client);
+                    try self.checkReservation(spec, sel.account, s);
+                    _ = try self.addAccount(sel.account);
+                    try self.includeGroup(s.token);
+                    switch (op.intent) {
+                        .detach => if (!s.attached) return error.AlreadyAttached,
+                        .remove => |r| if (r.reason == .reserved_drop and (s.drop_reservation == 0 or !permit(spec, sel.account, s))) return error.SessionDropReserved,
+                        .reconnect => |r| {
+                            if (s.attached) return error.AlreadyAttached;
+                            if (tokenIsSentinel(s.token) or s.attachment_id == null or s.attachment_id.?.isZero()) return error.InvalidAttachmentId;
+                            try claim(&claims, self.allocator(), r.claimant_client);
+                            if (r.claimant) |sel_target| {
+                                if (sel_target.exact.client != r.claimant_client or !std.ascii.eqlIgnoreCase(sel.account, sel_target.account)) return error.InvalidRequest;
+                                const claimant = try self.source(clients, sel_target);
+                                try self.checkReservation(spec, sel_target.account, claimant);
+                                if (!claimant.attached) return error.InvalidRequest;
+                                if (!lifecyclePristine(claimant) and !r.retire_claimant) return error.InvalidRequest;
+                                _ = try self.addAccount(sel_target.account);
+                                try self.includeGroup(claimant.token);
+                            } else if (clients.contains(r.claimant_client)) return error.AmbiguousPhysicalBinding;
+                        },
+                        .rebind => |r| {
+                            if (!s.attached or s.attachment_id == null or s.attachment_id.?.isZero()) return error.InvalidAttachmentId;
+                            if (std.mem.eql(u8, &s.token, &r.target_token) and !std.ascii.eqlIgnoreCase(sel.account, r.target_account)) return error.TokenAccountMismatch;
+                            try self.target(r.target_account, r.target_token, r.kind);
+                            _ = try self.addAccount(r.target_account);
+                            if (!std.mem.eql(u8, &s.token, &r.target_token) and lifecycleAttachmentWork(s) and !r.retire_attachment_work) return error.InvalidRequest;
+                        },
+                        else => {},
+                    }
+                },
+            }
+        }
+        if (spec.observation_only) |observe| {
+            self.observation_client = observe.client;
+            if (observe.expected) |expected| {
+                if (expected.exact.client != observe.client or !std.mem.eql(u8, observe.account, expected.account)) return error.InvalidRequest;
+                _ = try self.source(clients, expected);
+            } else if (clients.contains(observe.client)) return error.AmbiguousPhysicalBinding;
+            _ = try self.addAccount(observe.account);
+        }
+        // Include folded display aliases once; they remain distinct map keys.
+        const requested_count = self.accounts.items.len;
+        for (0..requested_count) |i| {
+            const folded_key = try lifecycleFold(self.allocator(), self.accounts.items[i].key);
+            defer self.allocator().free(folded_key);
+            if (folded.get(folded_key)) |aliases| for (aliases.items) |key| {
+                _ = try self.addAccount(key);
+            };
+        }
+        // Every token whose exact list is rebuilt gets one indexed OLD proof.
+        // Folded aliases were already discovered; no global registry pass repeats.
+        var closure_index: usize = 0;
+        while (closure_index < self.accounts.items.len) : (closure_index += 1) {
+            if (self.accounts.items[closure_index].old) |old| for (old.items.items) |row| {
+                self.preview_value.complexity.closure_row_visits += 1;
+                try self.includeGroup(row.token);
+            };
+        }
+        var candidate_rows: usize = 0;
+        for (self.accounts.items) |*a| {
+            if (a.old) |old| {
+                candidate_rows = std.math.add(usize, candidate_rows, old.items.items.len) catch return error.CandidateLimitExceeded;
+                if (candidate_rows > self.limits.max_candidate_rows) return error.CandidateLimitExceeded;
+                try a.final.items.ensureTotalCapacity(self.allocator(), old.items.items.len);
+                for (old.items.items) |s| {
+                    if (clients.get(s.client).?.duplicates) return error.AmbiguousPhysicalBinding;
+                    if (s.attachment_id) |attachment| {
+                        if (attachment.isZero()) return error.InvalidAttachmentId;
+                        const loc = self.store.attachment_index.get(attachment.raw) orelse return error.InvalidRequest;
+                        if (loc.client != s.client or !std.mem.eql(u8, loc.account, a.key)) return error.InvalidRequest;
+                    }
+                    a.final.items.appendAssumeCapacity(try self.copySession(s));
+                    self.preview_value.complexity.candidate_row_visits += 1;
+                }
+            }
+        }
+        // Apply all proved destructive/replacement operations before admission.
+        // This is candidate-only normalization, never sequential live commits.
+        for (spec.operations) |op| switch (op.intent) {
+            .detach => |d| {
+                const s = self.finalRow(d.source.account, d.source.exact.client).?;
+                switch (d.snapshot) {
+                    .keep => {},
+                    .clear => freeSnapshot(self.allocator(), s),
+                    .replace => |bytes| {
+                        try self.charge(bytes.len);
+                        const copy = try self.allocator().dupe(u8, bytes);
+                        freeSnapshot(self.allocator(), s);
+                        s.snapshot = copy;
+                    },
+                }
+                s.attached = false;
+                try self.reasons.put(self.allocator(), s.client, .detach);
+            },
+            .remove => |r| try self.removeFinal(r.source.account, r.source.exact.client, r.reason),
+            .remove_account => |name| {
+                for (self.accounts.items) |*a| {
+                    if (!std.ascii.eqlIgnoreCase(name, a.key)) continue;
+                    a.remove_when_empty = true;
+                    while (a.final.items.items.len != 0) try self.removeFinalAt(a, a.final.items.items.len - 1, .account_revocation);
+                }
+            },
+            .reconnect => |r| {
+                if (r.claimant) |c| try self.removeFinal(c.account, c.exact.client, .claimant_replacement);
+                const s = self.finalRow(r.source.account, r.source.exact.client).?;
+                const attachment = s.attachment_id.?;
+                try self.appendView(LifecycleRemap, &self.remaps, .{ .token = s.token, .attachment_id = attachment, .old_client = s.client, .new_client = r.claimant_client });
+                try self.reasons.put(self.allocator(), s.client, .reconnect_source);
+                s.client = r.claimant_client;
+                s.attached = true;
+                s.drop_reservation = 0;
+                if (r.consume_snapshot) freeSnapshot(self.allocator(), s);
+                try self.reasons.put(self.allocator(), s.client, .reconnect_target);
+            },
+            .rebind => |r| {
+                const source_row = self.finalRow(r.source.account, r.source.exact.client).?;
+                const old_token = source_row.token;
+                const old_group = if (!tokenIsSentinel(old_token)) (try self.group(old_token)).* else LifecycleGroup{ .token = old_token };
+                const g = try self.group(r.target_token);
+                g.portable = g.portable or old_group.was_portable or (r.kind == .adopt_verified and r.kind.adopt_verified);
+                g.dirty = g.dirty or old_group.old_dirty;
+                g.projection = g.projection or old_group.old_projection;
+                try lifecycleMerge(&g.journal, old_group.old_journal);
+                g.changed = true;
+                source_row.token = r.target_token;
+                source_row.drop_reservation = 0;
+                if (!std.mem.eql(u8, &old_token, &r.target_token)) {
+                    source_row.attachment_replica_dirty = false;
+                    source_row.attachment_replica_projection_dirty = false;
+                    if (source_row.attachment_channel_projections) |p| self.allocator().destroy(p);
+                    source_row.attachment_channel_projections = null;
+                }
+                if (!std.mem.eql(u8, r.source.account, r.target_account)) {
+                    const source_account = &self.accounts.items[self.accountIndex(r.source.account).?];
+                    const index = self.finalIndex(source_account, r.source.exact.client).?;
+                    const moved = source_account.final.items.orderedRemove(index);
+                    source_account.remove_when_empty = true;
+                    const dest = &self.accounts.items[self.accountIndex(r.target_account).?];
+                    dest.final.items.append(self.allocator(), moved) catch |err| {
+                        var rollback_owned = moved;
+                        freeSessionOwned(self.allocator(), &rollback_owned);
+                        return err;
+                    };
+                }
+                try self.reasons.put(self.allocator(), r.source.exact.client, .rebind);
+            },
+            .admit => |ad| if (ad.replace_sentinel) |sel| try self.removeFinal(sel.account, sel.exact.client, .untrack),
+        };
+        for (spec.operations) |op| if (op.intent == .admit) try self.admit(spec, op.request_id, op.intent.admit, &claims);
+        try self.normalize();
+        for (self.accounts.items, 0..) |a, ai| for (a.final.items.items, 0..) |row, ri| {
+            self.preview_value.complexity.final_mapping_row_visits += 1;
+            const loc = try self.final_lookup.getOrPut(self.allocator(), row.client);
+            if (loc.found_existing) return error.AmbiguousPhysicalBinding;
+            loc.value_ptr.* = .{ .account = ai, .row = ri };
+        };
+        self.final_lookup_ready = true;
+        try self.makeIndexes();
+        try self.makePreview();
+        try self.checkLookupBudget();
+        try self.reserveMaps();
+    }
+
+    fn finalRow(self: *LifecycleOwned, account: []const u8, client: ClientId) ?*Session {
+        if (self.final_lookup_ready) {
+            const loc = self.final_lookup.get(client) orelse return null;
+            const a = &self.accounts.items[loc.account];
+            if (!std.mem.eql(u8, a.key, account)) return null;
+            return &a.final.items.items[loc.row];
+        }
+        const a = &self.accounts.items[self.accountIndex(account) orelse return null];
+        for (a.final.items.items) |*row| {
+            self.preview_value.complexity.operation_row_visits += 1;
+            if (row.client == client) return row;
+        }
+        return null;
+    }
+
+    fn finalIndex(self: *LifecycleOwned, account: *const LifecycleAccount, client: ClientId) ?usize {
+        for (account.final.items.items, 0..) |row, index| {
+            self.preview_value.complexity.operation_row_visits += 1;
+            if (row.client == client) return index;
+        }
+        return null;
+    }
+
+    fn removeFinal(self: *LifecycleOwned, account: []const u8, client: ClientId, reason: LifecycleRemoval) LifecycleError!void {
+        const a = &self.accounts.items[self.accountIndex(account).?];
+        const index = self.finalIndex(a, client) orelse return error.OverlappingIntent;
+        try self.removeFinalAt(a, index, reason);
+    }
+
+    fn removeFinalAt(self: *LifecycleOwned, a: *LifecycleAccount, index: usize, reason: LifecycleRemoval) LifecycleError!void {
+        const client = a.final.items.items[index].client;
+        a.remove_when_empty = true;
+        try self.removed_reasons.put(self.allocator(), client, reason);
+        try self.reasons.put(self.allocator(), client, .removal);
+        var s = a.final.items.orderedRemove(index);
+        freeSessionOwned(self.allocator(), &s);
+    }
+
+    fn finalAccountCount(self: *const LifecycleOwned) usize {
+        var count: usize = self.store.accounts.count();
+        for (self.accounts.items) |a| {
+            if (a.old != null and a.final.items.items.len == 0 and a.remove_when_empty) count -= 1;
+            if (a.old == null and a.final.items.items.len != 0) count += 1;
+        }
+        return count;
+    }
+
+    fn mintedToken(self: *LifecycleOwned, io: std.Io) LifecycleError!Token {
+        var nonzero = false;
+        for (0..attachment_mint_attempts) |_| {
+            var token: Token = undefined;
+            io.random(&token);
+            if (tokenIsSentinel(token)) continue;
+            nonzero = true;
+            if (self.store.token_index.contains(token)) continue;
+            self.chargeLookup(false, @sizeOf(Token) + 1);
+            try self.checkLookupBudget();
+            var duplicate = self.group_lookup.contains(token);
+            for (self.admissions.items) |ad| if (ad.result == .tracked and std.mem.eql(u8, &ad.result.tracked.token, &token)) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) return token;
+        }
+        return if (nonzero) error.TokenCollisionExhausted else error.ZeroEntropy;
+    }
+
+    fn mintedAttachment(self: *LifecycleOwned, io: std.Io) LifecycleError!AttachmentId {
+        for (0..attachment_mint_attempts) |_| {
+            const attachment = try AttachmentId.mint(io);
+            if (self.store.attachment_index.contains(attachment.raw)) continue;
+            var duplicate = false;
+            for (self.admissions.items) |ad| if (ad.result == .tracked and ad.result.tracked.attachment_id != null and ad.result.tracked.attachment_id.?.eql(attachment)) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) return attachment;
+        }
+        return error.AttachmentCollisionExhausted;
+    }
+
+    fn admit(self: *LifecycleOwned, spec: LifecycleBatchSpec, id: u64, ad: LifecycleAdmission, claims: *std.AutoHashMapUnmanaged(ClientId, void)) LifecycleError!void {
+        const a = &self.accounts.items[self.accountIndex(ad.account).?];
+        if (ad.kind == .no_row) {
+            try self.appendView(LifecycleAdmissionResult, &self.admissions, .{ .request_id = id, .account = a.display, .client = ad.client, .result = .{ .untracked = .explicit } });
+            return;
+        }
+        const accounts_full = a.final.items.items.len == 0 and (a.old == null or a.remove_when_empty) and self.finalAccountCount() >= self.store.cfg.max_accounts;
+        var sessions_full = a.final.items.items.len >= self.store.cfg.max_sessions_per_account;
+        if (sessions_full and (ad.cap == .evict_detached or ad.cap == .evict_exact)) {
+            var victim: ?Session = null;
+            if (a.old) |old| for (old.items.items) |s| {
+                self.preview_value.complexity.operation_row_visits += 1;
+                const exact_victim = ad.cap == .evict_exact and sessionMatchesExact(s, ad.cap.evict_exact.exact);
+                if (s.attached or (claims.contains(s.client) and !exact_victim) or self.removed_reasons.contains(s.client)) continue;
+                if (ad.cap == .evict_exact and !sessionMatchesExact(s, ad.cap.evict_exact.exact)) continue;
+                if (victim == null or lifecycleVictimLess(s, victim.?)) victim = s;
+            };
+            if (victim) |s| {
+                try self.checkReservation(spec, a.key, s);
+                if (ad.cap != .evict_exact) try claim(claims, self.allocator(), s.client);
+                try self.removeFinal(a.key, s.client, .cap_eviction);
+                sessions_full = false;
+            }
+        }
+        if (accounts_full or sessions_full) {
+            if (ad.cap == .untracked) {
+                try self.appendView(LifecycleAdmissionResult, &self.admissions, .{ .request_id = id, .account = a.display, .client = ad.client, .result = .{ .untracked = if (accounts_full) .accounts_capacity else .sessions_capacity } });
+                return;
+            }
+            return if (accounts_full) error.TooManyAccounts else error.TooManySessions;
+        }
+        const token: Token = switch (ad.kind) {
+            .fresh => try self.mintedToken(spec.io),
+            .join_existing => |t| t,
+            .adopt_verified => |g| g.token,
+            .sentinel => @splat(0),
+            .no_row => unreachable,
+        };
+        const attachment: ?AttachmentId = if (ad.kind == .sentinel) null else try self.mintedAttachment(spec.io);
+        if (ad.kind == .fresh) _ = try self.group(token);
+        if (ad.kind == .adopt_verified) (try self.group(token)).portable = (try self.group(token)).portable or ad.kind.adopt_verified.portable;
+        const new = Session{ .client = ad.client, .token = token, .attachment_id = attachment, .signon_ms = ad.signon_ms };
+        try a.final.items.append(self.allocator(), new);
+        try self.reasons.put(self.allocator(), ad.client, .admission);
+        try self.appendView(LifecycleAdmissionResult, &self.admissions, .{ .request_id = id, .account = a.display, .client = ad.client, .result = .{ .tracked = .{ .token = token, .attachment_id = attachment } } });
+    }
+
+    fn normalize(self: *LifecycleOwned) LifecycleError!void {
+        // Generation assignment is canonical as well as merge provenance;
+        // permutation of independent OLD-proved intents cannot change clocks.
+        std.mem.sort(LifecycleGroup, self.groups.items, {}, struct {
+            fn less(_: void, left: LifecycleGroup, right: LifecycleGroup) bool {
+                return std.mem.order(u8, &left.token, &right.token) == .lt;
+            }
+        }.less);
+        for (self.groups.items, 0..) |g, index| self.group_lookup.putAssumeCapacity(g.token, index);
+        var generation = self.store.next_local_projection_generation;
+        for (self.groups.items) |*g| {
+            if (g.changed and !g.journal.isEmpty()) {
+                generation = @max(generation, g.journal.revision);
+                for (g.journal.slice()) |p| generation = @max(generation, p.generation);
+                generation = std.math.add(u64, generation, 1) catch return error.GenerationExhausted;
+                g.journal.revision = generation;
+            }
+        }
+        var groups: std.AutoHashMapUnmanaged(Token, usize) = .empty;
+        defer groups.deinit(self.allocator());
+        for (self.groups.items, 0..) |g, i| try groups.put(self.allocator(), g.token, i);
+        for (self.accounts.items) |*a| for (a.final.items.items) |*s| {
+            self.preview_value.complexity.normalization_row_visits += 1;
+            const index = groups.get(s.token) orelse continue;
+            const g = &self.groups.items[index];
+            s.portable_resume = g.portable;
+            s.replica_dirty = g.dirty;
+            s.replica_projection_dirty = g.projection;
+            const reason = self.reasons.get(s.client);
+            if (g.portable and s.attachment_id != null and (!g.was_portable or
+                (reason != null and (reason.? == .admission or reason.? == .rebind)))) s.attachment_replica_dirty = true;
+            if (!g.journal.isEmpty()) {
+                if (s.local_channel_projections == null) {
+                    try self.charge(@sizeOf(LocalChannelProjectionSet));
+                    s.local_channel_projections = try self.allocator().create(LocalChannelProjectionSet);
+                }
+                s.local_channel_projections.?.* = g.journal;
+            }
+        };
+
+        self.preview_value.projection_generation = generation;
+        if (self.finalAccountCount() > self.store.cfg.max_accounts) return error.TooManyAccounts;
+        var rows: usize = 0;
+        for (self.accounts.items) |a| {
+            self.preview_value.complexity.quota_rows_checked += a.final.items.items.len;
+            if (a.final.items.items.len > self.store.cfg.max_sessions_per_account) return error.TooManySessions;
+            rows = std.math.add(usize, rows, a.final.items.items.len) catch return error.CandidateLimitExceeded;
+        }
+        if (rows > self.limits.max_candidate_rows) return error.CandidateLimitExceeded;
+    }
+
+    fn makeIndexes(self: *LifecycleOwned) LifecycleError!void {
+        var tokens: std.AutoHashMapUnmanaged(Token, usize) = .empty;
+        defer tokens.deinit(self.allocator());
+        for (self.accounts.items) |a| {
+            if (a.old) |old| for (old.items.items) |row| {
+                self.preview_value.complexity.index_row_visits += 1;
+                if (!tokenIsSentinel(row.token)) try tokens.put(self.allocator(), row.token, 0);
+            };
+            for (a.final.items.items) |row| {
+                self.preview_value.complexity.index_row_visits += 1;
+                if (!tokenIsSentinel(row.token)) try tokens.put(self.allocator(), row.token, 0);
+            }
+        }
+        var it = tokens.iterator();
+        while (it.next()) |t| {
+            t.value_ptr.* = self.indexes.items.len;
+            try self.indexes.append(self.allocator(), .{ .token = t.key_ptr.* });
+            const index = &self.indexes.items[self.indexes.items.len - 1].entry;
+            if (self.store.token_index.get(t.key_ptr.*)) |old| index.local_projections.revision = old.local_projections.revision;
+            if (self.store.token_index.get(t.key_ptr.*)) |old| for (old.rows.items) |loc| {
+                if (self.accountIndex(loc.account) != null) continue;
+                self.preview_value.complexity.index_row_visits += 1;
+                const row = try self.oldRow(loc);
+                try lifecycleIndexAppend(index, self.allocator(), loc.account, row.*);
+            };
+        }
+        // One final-row traversal, rather than one candidate census per token.
+        for (self.accounts.items) |a| for (a.final.items.items) |row| {
+            self.preview_value.complexity.index_row_visits += 1;
+            if (tokenIsSentinel(row.token)) continue;
+            const index = &self.indexes.items[tokens.get(row.token).?].entry;
+            try lifecycleIndexAppend(index, self.allocator(), a.key, row);
+        };
+        for (self.indexes.items) |*i| {
+            const index = &i.entry;
+            std.mem.sort(AttachmentLocator, index.rows.items, {}, struct {
+                fn less(_: void, a: AttachmentLocator, b: AttachmentLocator) bool {
+                    const order = std.mem.order(u8, a.account, b.account);
+                    return if (order == .eq) a.client < b.client else order == .lt;
+                }
+            }.less);
+            if (index.rows.items.len != 0) {
+                const account = index.rows.items[0].account;
+                for (index.rows.items) |loc| if (!std.ascii.eqlIgnoreCase(account, loc.account)) return error.TokenAccountMismatch;
+            }
+        }
+    }
+
+    fn makePreview(self: *LifecycleOwned) LifecycleError!void {
+        var counts = LifecycleCounts{
+            .replica = self.store.dirty_replica_rows,
+            .projection = self.store.dirty_projection_rows,
+            .attachment_replica = self.store.dirty_attachment_replica_rows,
+            .attachment_projection = self.store.dirty_attachment_projection_rows,
+            .group_journal = self.store.dirty_local_projection_rows,
+            .attachment_journal = self.store.dirty_attachment_local_projection_rows,
+        };
+        var final_rows = self.total_old_rows;
+        for (self.accounts.items) |a| {
+            if (a.old) |old| {
+                final_rows -= old.items.items.len;
+                for (old.items.items) |s| {
+                    self.preview_value.complexity.preview_row_visits += 1;
+                    try lifecycleAdjustCounts(&counts, s, false);
+                    try self.appendView(LifecycleRow, &self.before, lifecycleRow(a.display, s));
+                }
+            }
+            final_rows = std.math.add(usize, final_rows, a.final.items.items.len) catch return error.CandidateLimitExceeded;
+            for (a.final.items.items) |s| {
+                self.preview_value.complexity.preview_row_visits += 1;
+                try lifecycleAdjustCounts(&counts, s, true);
+                try self.appendView(LifecycleRow, &self.after, lifecycleRow(a.display, s));
+            }
+        }
+        const Less = struct {
+            fn less(_: void, a: LifecycleRow, b: LifecycleRow) bool {
+                if (a.client != b.client) return a.client < b.client;
+                return std.mem.order(u8, a.account, b.account) == .lt;
+            }
+        };
+        std.mem.sort(LifecycleRow, self.before.items, {}, Less.less);
+        std.mem.sort(LifecycleRow, self.after.items, {}, Less.less);
+        // A touched closure must have exact physical identities even if legacy
+        // display aliases made an ambiguous row outside an explicit selector.
+        for (self.before.items, 0..) |row, i| if (i != 0 and self.before.items[i - 1].client == row.client) return error.AmbiguousPhysicalBinding;
+        for (self.after.items, 0..) |row, i| if (i != 0 and self.after.items[i - 1].client == row.client) return error.AmbiguousPhysicalBinding;
+        for (self.before.items) |row| {
+            const after = lifecycleFindRow(self.after.items, row.client);
+            const reason = self.reasons.get(row.client) orelse .group_propagation;
+            const live = row.attached or (after != null and after.?.attached);
+            if (live or reason == .reconnect_source) {
+                try self.appendView(LifecycleAffectedPhysical, &self.physical, .{ .client = row.client, .before = lifecycleFacts(row), .after = if (after) |r| lifecycleFacts(r) else null, .historical_only = !live, .reason = reason });
+            }
+            if (after == null or !std.mem.eql(u8, &row.token, &after.?.token) or
+                !std.meta.eql(row.attachment_id, after.?.attachment_id))
+            {
+                // Runtime remapping retains the exact attachment; it is not a
+                // revoke merely because its OLD client id no longer occurs.
+                var remapped = false;
+                for (self.remaps.items) |r| if (r.old_client == row.client) {
+                    remapped = true;
+                    break;
+                };
+                if (!remapped) try self.appendView(LifecycleRetiredAttachment, &self.retired, .{ .row = row, .reason = self.removed_reasons.get(row.client) orelse .token_rebind, .attachment_work_retired = row.attachment_replica_dirty or row.attachment_replica_projection_dirty or !row.attachment_journal.isEmpty() });
+            }
+        }
+        for (self.after.items) |row| if (row.attached and lifecycleFindRow(self.before.items, row.client) == null) {
+            try self.appendView(LifecycleAffectedPhysical, &self.physical, .{ .client = row.client, .before = null, .after = lifecycleFacts(row), .reason = self.reasons.get(row.client) orelse .group_propagation });
+        };
+        for (self.admissions.items) |ad| if (ad.result == .untracked) {
+            if (lifecycleFindRow(self.before.items, ad.client) == null)
+                try self.appendView(LifecycleAffectedPhysical, &self.physical, .{ .client = ad.client, .before = null, .after = null, .reason = .admission });
+        };
+        if (self.observation_client) |client| {
+            if (lifecycleFindRow(self.before.items, client) == null and lifecycleFindRow(self.after.items, client) == null)
+                try self.appendView(LifecycleAffectedPhysical, &self.physical, .{ .client = client, .before = null, .after = null, .reason = .admission });
+        }
+        std.mem.sort(LifecycleAffectedPhysical, self.physical.items, {}, struct {
+            fn less(_: void, a: LifecycleAffectedPhysical, b: LifecycleAffectedPhysical) bool {
+                return a.client < b.client;
+            }
+        }.less);
+        for (self.indexes.items) |index| {
+            var delta = LifecycleTokenDelta{ .token = index.token, .account = "", .old_rows = 0, .final_rows = index.entry.rows.items.len, .old_attached = 0, .final_attached = 0, .old_portable = 0, .final_portable = index.entry.portable_rows, .old_journal = .{}, .final_journal = index.entry.local_projections };
+            if (self.store.token_index.get(index.token)) |old| {
+                delta.old_rows = old.rows.items.len;
+                delta.old_portable = old.portable_rows;
+                delta.old_journal = old.local_projections;
+                for (old.rows.items) |loc| {
+                    if ((try self.oldRow(loc)).attached) delta.old_attached += 1;
+                    if (self.accountIndex(loc.account)) |i| delta.account = self.accounts.items[i].display;
+                }
+            }
+            for (index.entry.rows.items) |loc| {
+                self.preview_value.complexity.preview_row_visits += 1;
+                const row = if (self.accountIndex(loc.account) != null) self.finalRow(loc.account, loc.client).? else (try self.oldRow(loc));
+                if (row.attached) delta.final_attached += 1;
+                if (self.accountIndex(loc.account)) |i| delta.account = self.accounts.items[i].display;
+            }
+            try self.appendView(LifecycleTokenDelta, &self.deltas, delta);
+        }
+        self.preview_value.before = self.before.items;
+        self.preview_value.after = self.after.items;
+        self.preview_value.affected_physical = self.physical.items;
+        self.preview_value.admissions = self.admissions.items;
+        self.preview_value.retired_attachments = self.retired.items;
+        self.preview_value.remaps = self.remaps.items;
+        self.preview_value.token_groups = self.deltas.items;
+        self.preview_value.final_accounts = self.finalAccountCount();
+        self.preview_value.final_rows = final_rows;
+        self.preview_value.counts = counts;
+    }
+
+    fn reserveMaps(self: *LifecycleOwned) LifecycleError!void {
+        const max_accounts = @max(self.store.accounts.count(), self.preview_value.final_accounts);
+        const max_rows = @max(self.total_old_rows, self.preview_value.final_rows);
+        if (max_accounts > std.math.maxInt(u32) or max_rows > std.math.maxInt(u32)) return error.CandidateLimitExceeded;
+        try self.store.accounts.ensureTotalCapacity(@intCast(max_accounts));
+        try self.store.attachment_index.ensureTotalCapacity(@intCast(max_rows));
+        try self.store.token_index.ensureTotalCapacity(@intCast(max_rows));
+    }
+
+    fn oldDigest(self: *LifecycleOwned) [32]u8 {
+        var h = std.crypto.hash.Blake3.init(.{});
+        for (self.accounts.items) |a| {
+            std.hash.autoHashStrat(&h, a.key, .DeepRecursive);
+            const old = self.store.accounts.get(a.key);
+            if (old) |list| {
+                for (list.items.items) |row| {
+                    std.hash.autoHashStrat(&h, lifecycleRow(a.display, row), .DeepRecursive);
+                    if (row.attachment_id) |id| std.hash.autoHashStrat(&h, self.store.attachment_index.get(id.raw), .DeepRecursive);
+                }
+            }
+            std.hash.autoHash(&h, old != null);
+        }
+        const s = self.store;
+        for (self.indexes.items) |i| {
+            const entry = s.token_index.get(i.token);
+            std.hash.autoHash(&h, entry != null);
+            if (entry) |e| std.hash.autoHashStrat(&h, .{ i.token, e.rows.items, e.portable_rows, e.dirty_rows, e.projection_dirty_rows, e.drop_reserved_rows, e.local_projections }, .DeepRecursive);
+        }
+        std.hash.autoHashStrat(&h, .{ s.cfg, s.accounts.count(), s.attachment_index.count(), s.token_index.count(), s.dirty_replica_rows, s.dirty_projection_rows, s.dirty_attachment_replica_rows, s.dirty_attachment_projection_rows, s.dirty_local_projection_rows, s.dirty_attachment_local_projection_rows, s.next_local_projection_generation, s.dirty_scan_cursor, s.projection_scan_cursor, s.attachment_replica_scan_cursor, s.attachment_projection_scan_cursor, s.local_projection_scan_cursor, s.attachment_local_projection_scan_cursor }, .DeepRecursive);
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        return digest;
+    }
+
+    fn candidateDigest(self: *LifecycleOwned) [32]u8 {
+        var h = std.crypto.hash.Blake3.init(.{});
+        for (self.accounts.items) |a| {
+            std.hash.autoHashStrat(&h, .{ a.key, a.display, a.key_owned, a.published, a.retired_key, a.remove_when_empty }, .DeepRecursive);
+            for (a.final.items.items) |s| std.hash.autoHashStrat(&h, lifecycleRow(a.display, s), .DeepRecursive);
+        }
+        for (self.indexes.items) |i| std.hash.autoHashStrat(&h, .{ i.token, i.entry.rows.items, i.entry.portable_rows, i.entry.dirty_rows, i.entry.projection_dirty_rows, i.entry.drop_reserved_rows, i.entry.local_projections }, .DeepRecursive);
+        std.hash.autoHashStrat(&h, self.preview_value, .DeepRecursive);
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        return digest;
+    }
+
+    fn publish(self: *LifecycleOwned) void {
+        const s = self.store;
+        // Remove every old locator before any emptied account key can retire.
+        for (self.indexes.items) |index| if (s.token_index.fetchRemove(index.token)) |old| {
+            var entry = old.value;
+            entry.deinit(s.allocator);
+        };
+        for (self.accounts.items) |a| if (a.old) |old| for (old.items.items) |row| {
+            if (row.attachment_id) |id| std.debug.assert(s.attachment_index.remove(id.raw));
+        };
+        for (self.accounts.items) |*a| {
+            if (a.old != null) {
+                const old = s.accounts.fetchRemove(a.key).?;
+                a.old = old.value;
+                a.retired_key = a.final.items.items.len == 0 and a.remove_when_empty;
+            }
+        }
+        for (self.accounts.items) |*a| {
+            if (a.final.items.items.len != 0 or (a.old != null and !a.remove_when_empty)) {
+                s.accounts.putAssumeCapacityNoClobber(a.key, a.final);
+                a.published = true;
+                a.key_owned = false;
+                for (a.final.items.items) |row| if (row.attachment_id) |id| {
+                    s.attachment_index.putAssumeCapacityNoClobber(id.raw, .{ .account = a.key, .client = row.client });
+                };
+            }
+        }
+        for (self.indexes.items) |*index| if (index.entry.rows.items.len != 0) {
+            s.token_index.putAssumeCapacityNoClobber(index.token, index.entry);
+            index.entry = .{};
+        };
+        const c = self.preview_value.counts;
+        s.dirty_replica_rows = c.replica;
+        s.dirty_projection_rows = c.projection;
+        s.dirty_attachment_replica_rows = c.attachment_replica;
+        s.dirty_attachment_projection_rows = c.attachment_projection;
+        s.dirty_local_projection_rows = c.group_journal;
+        s.dirty_attachment_local_projection_rows = c.attachment_journal;
+        s.next_local_projection_generation = self.preview_value.projection_generation;
+        // Cursors contain values, never storage pointers. Keeping the old value
+        // is intentional: sorted wraparound scans select its next surviving key.
+    }
+
+    fn destroy(self: *LifecycleOwned) void {
+        const a = self.allocator();
+        const committed = self.state == .finished or self.state == .committed;
+        for (self.accounts.items) |*account| {
+            if (!account.published) account.final.deinit(a);
+            if (committed) {
+                if (account.old) |*old| old.deinit(a);
+                if (account.retired_key) a.free(account.key);
+            }
+            if (account.key_owned) a.free(account.key);
+            a.free(account.display);
+        }
+        for (self.indexes.items) |*index| index.entry.deinit(a);
+        self.accounts.deinit(a);
+        self.groups.deinit(a);
+        self.indexes.deinit(a);
+        self.before.deinit(a);
+        self.after.deinit(a);
+        self.admissions.deinit(a);
+        self.retired.deinit(a);
+        self.remaps.deinit(a);
+        self.physical.deinit(a);
+        self.deltas.deinit(a);
+        self.reasons.deinit(a);
+        self.removed_reasons.deinit(a);
+        self.final_lookup.deinit(a);
+        self.old_bindings.deinit(a);
+        self.account_lookup.deinit(a);
+        self.group_lookup.deinit(a);
+        a.destroy(self);
+    }
+};
+
+fn lifecycleFindRow(rows: []const LifecycleRow, client: ClientId) ?LifecycleRow {
+    var lo: usize = 0;
+    var hi = rows.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (rows[mid].client < client) lo = mid + 1 else hi = mid;
+    }
+    return if (lo < rows.len and rows[lo].client == client) rows[lo] else null;
+}
+fn lifecyclePristine(s: Session) bool {
+    return s.snapshot == null and !s.portable_resume and !s.replica_dirty and !s.replica_projection_dirty and
+        !lifecycleAttachmentWork(s) and (s.local_channel_projections == null or s.local_channel_projections.?.isEmpty());
+}
+fn lifecycleAttachmentWork(s: Session) bool {
+    return s.attachment_replica_dirty or s.attachment_replica_projection_dirty or
+        (s.attachment_channel_projections != null and !s.attachment_channel_projections.?.isEmpty());
+}
+fn lifecycleVictimLess(a: Session, b: Session) bool {
+    if (a.signon_ms != b.signon_ms) return a.signon_ms < b.signon_ms;
+    if ((a.attachment_id == null) != (b.attachment_id == null)) return a.attachment_id == null;
+    if (a.attachment_id) |id| {
+        const order = std.mem.order(u8, &id.raw, &b.attachment_id.?.raw);
+        if (order != .eq) return order == .lt;
+    }
+    return a.client < b.client;
+}
+fn lifecycleIndexAppend(entry: *TokenIndexEntry, a: std.mem.Allocator, account: []const u8, s: Session) LifecycleError!void {
+    try entry.rows.append(a, .{ .account = account, .client = s.client });
+    if (s.portable_resume) entry.portable_rows += 1;
+    if (s.replica_dirty) entry.dirty_rows += 1;
+    if (s.replica_projection_dirty) entry.projection_dirty_rows += 1;
+    if (s.drop_reservation != 0) entry.drop_reserved_rows += 1;
+    if (s.local_channel_projections) |p| try lifecycleMerge(&entry.local_projections, p.*);
+}
+fn lifecycleAdjustCounts(c: *LifecycleCounts, s: Session, add: bool) LifecycleError!void {
+    const flags = .{ s.replica_dirty, s.replica_projection_dirty, s.attachment_replica_dirty, s.attachment_replica_projection_dirty, s.local_channel_projections != null and !s.local_channel_projections.?.isEmpty(), s.attachment_channel_projections != null and !s.attachment_channel_projections.?.isEmpty() };
+    inline for (.{ "replica", "projection", "attachment_replica", "attachment_projection", "group_journal", "attachment_journal" }, 0..) |name, i| {
+        if (flags[i]) @field(c, name) = if (add) std.math.add(usize, @field(c, name), 1) catch return error.CandidateLimitExceeded else std.math.sub(usize, @field(c, name), 1) catch return error.InvalidRequest;
+    }
+}
+
 pub const SessionStore = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
@@ -1007,6 +2393,30 @@ pub const SessionStore = struct {
     /// unreachable, but skipping zero keeps the invariant total even under a
     /// synthetic overflow test.
     next_local_projection_generation: u64 = 0,
+    /// Ephemeral linear-owner guards; never serialized or used as credentials.
+    next_lifecycle_serial: u64 = 0,
+    active_lifecycle: ?*LifecycleOwned = null,
+
+    /// Synchronous World -> SessionStore transaction member. No disk I/O or
+    /// external authority checks occur here. Every request is admitted from
+    /// OLD, and one normalized FINAL candidate owns the entire RAM cut.
+    pub fn prepareLifecycleBatch(self: *SessionStore, spec: LifecycleBatchSpec) LifecycleError!PreparedLifecycleBatch {
+        if (!self.lock.tryLockExclusive()) return error.Busy;
+        var retained = false;
+        defer if (!retained) self.lock.unlockExclusive();
+        if (self.active_lifecycle != null) return error.Busy;
+        if (self.next_lifecycle_serial == std.math.maxInt(u64)) return error.GenerationExhausted;
+        self.next_lifecycle_serial += 1;
+        const o = try self.allocator.create(LifecycleOwned);
+        o.* = .{ .store = self, .allocation = self.allocator, .serial = self.next_lifecycle_serial, .limits = spec.limits };
+        errdefer o.destroy();
+        try o.build(spec);
+        o.predecessor = o.oldDigest();
+        o.seal = o.candidateDigest();
+        self.active_lifecycle = o;
+        retained = true;
+        return .{ .owned = o };
+    }
 
     pub fn init(allocator: std.mem.Allocator) SessionStore {
         return initWithConfig(allocator, .{});
@@ -4040,6 +5450,708 @@ fn tokenNumber(value: u64) Token {
     var raw: Token = @splat(0);
     std.mem.writeInt(u64, raw[8..16], value, .big);
     return raw;
+}
+
+fn lifecycleSelector(account: []const u8, s: Session) LifecycleSelector {
+    return .{ .account = account, .exact = .{ .client = s.client, .token = s.token, .signon_ms = s.signon_ms, .attachment_id = s.attachment_id }, .attached = s.attached };
+}
+
+test "Session lifecycle batch owns mixed candidate and commits without allocation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.initWithConfig(failing.allocator(), .{ .max_accounts = 3, .max_sessions_per_account = 4 });
+    defer s.deinit();
+    const a = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const b = try s.attachWithAttachment("Alice", 2, tok(1), aid(2), 20);
+    _ = try s.attachWithAttachment("Bob", 3, tok(3), aid(3), 30);
+    try testing.expect(s.markDetachedWithSnapshot("Bob", 3, "ghost-restore"));
+    const ghost = s.findDetachedAttachmentSessionInAccount("Bob", tok(3), aid(3)).?;
+    var input = try testing.allocator.dupe(u8, "new-snapshot");
+    const operations = [_]LifecycleRequest{
+        .{ .request_id = 1, .intent = .{ .detach = .{ .source = lifecycleSelector("Alice", a), .snapshot = .{ .replace = input } } } },
+        .{ .request_id = 2, .intent = .{ .remove = .{ .source = lifecycleSelector("Alice", b), .reason = .logout } } },
+        .{ .request_id = 3, .intent = .{ .reconnect = .{ .source = lifecycleSelector("Bob", ghost), .claimant_client = 4 } } },
+        .{ .request_id = 4, .intent = .{ .admit = .{ .account = "Carol", .client = 5, .signon_ms = 40, .kind = .fresh } } },
+    };
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &operations });
+    defer ticket.deinit();
+    @memset(input, 0);
+    testing.allocator.free(input);
+    input = &.{};
+    const p = ticket.preview();
+    try testing.expectEqual(@as(usize, 3), p.before.len);
+    try testing.expectEqual(@as(usize, 3), p.after.len);
+    try testing.expectEqual(@as(usize, 1), p.remaps.len);
+    try testing.expectEqual(@as(usize, 1), p.retired_attachments.len);
+    try testing.expectEqualStrings("new-snapshot", lifecycleFindRow(p.after, 1).?.snapshot.?);
+    try testing.expect(p.admissions[0].result.tracked.attachment_id != null);
+    try testing.expect(!tokenIsSentinel(p.admissions[0].result.tracked.token));
+    try testing.expectEqual(@as(usize, 3), p.complexity.discovery_row_visits);
+    try testing.expectError(error.Busy, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &operations }));
+    try ticket.validateForCut();
+    failing.fail_index = failing.alloc_index;
+    ticket.commit();
+    ticket.finish();
+    try testing.expect(!s.containsClient("Alice", 2));
+    try testing.expect(s.clientHasAttachment("Bob", 4, tok(3), aid(3)));
+    try testing.expect(!s.containsClient("Bob", 3));
+    try expectTokenIndexCoherent(&s);
+    ticket.deinit();
+}
+
+test "Session lifecycle batch snapshot copy OOM leaves OLD attached and exact retry succeeds" {
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var s = SessionStore.init(failing.allocator());
+        defer s.deinit();
+        const old = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+        const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .detach = .{ .source = lifecycleSelector("Alice", old), .snapshot = .{ .replace = "complete-new-image" } } } }};
+        failing.fail_index = failing.alloc_index + index;
+        var ticket = s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expect(s.findAttachmentSessionInAccount("Alice", tok(1), aid(1)).?.attached);
+            try testing.expect(s.active_lifecycle == null);
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+            defer retry.deinit();
+            try retry.validateForCut();
+            retry.commit();
+            retry.finish();
+            continue;
+        };
+        defer ticket.deinit();
+        try ticket.validateForCut();
+        ticket.commit();
+        ticket.finish();
+        try testing.expect(!s.findAttachmentSessionInAccount("Alice", tok(1), aid(1)).?.attached);
+        try testing.expect(index > 5);
+        break;
+    }
+}
+
+test "Session lifecycle batch immutable OLD proof refuses joining a newly created token" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const ops = [_]LifecycleRequest{
+        .{ .request_id = 1, .intent = .{ .admit = .{ .account = "Alice", .client = 1, .signon_ms = 1, .kind = .{ .adopt_verified = .{ .token = tok(9), .portable = false } } } } },
+        .{ .request_id = 2, .intent = .{ .admit = .{ .account = "Alice", .client = 2, .signon_ms = 2, .kind = .{ .join_existing = tok(9) } } } },
+    };
+    try testing.expectError(error.InvalidToken, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    try testing.expectEqual(@as(u32, 0), s.accounts.count());
+}
+
+fn lifecycleCanonical(store: *SessionStore) ![32]u8 {
+    store.lock.lockShared();
+    defer store.lock.unlockShared();
+    var h = std.crypto.hash.Blake3.init(.{});
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keys.deinit(testing.allocator);
+    var iter = store.accounts.keyIterator();
+    while (iter.next()) |key| try keys.append(testing.allocator, key.*);
+    std.mem.sort([]const u8, keys.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    for (keys.items) |key| {
+        std.hash.autoHashStrat(&h, key, .DeepRecursive);
+        for (store.accounts.get(key).?.items.items) |row| std.hash.autoHashStrat(&h, lifecycleRow(key, row), .DeepRecursive);
+    }
+    var tokens: std.ArrayListUnmanaged(Token) = .empty;
+    defer tokens.deinit(testing.allocator);
+    var token_it = store.token_index.keyIterator();
+    while (token_it.next()) |t| try tokens.append(testing.allocator, t.*);
+    std.mem.sort(Token, tokens.items, {}, struct {
+        fn less(_: void, a: Token, b: Token) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.less);
+    for (tokens.items) |t| {
+        const e = store.token_index.get(t).?;
+        std.hash.autoHashStrat(&h, .{ t, e.rows.items, e.portable_rows, e.dirty_rows, e.projection_dirty_rows, e.drop_reserved_rows, e.local_projections }, .DeepRecursive);
+    }
+    var attachments: std.ArrayListUnmanaged([16]u8) = .empty;
+    defer attachments.deinit(testing.allocator);
+    var attachment_it = store.attachment_index.keyIterator();
+    while (attachment_it.next()) |id| try attachments.append(testing.allocator, id.*);
+    std.mem.sort([16]u8, attachments.items, {}, struct {
+        fn less(_: void, a: [16]u8, b: [16]u8) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.less);
+    for (attachments.items) |id| std.hash.autoHashStrat(&h, .{ id, store.attachment_index.get(id).? }, .DeepRecursive);
+    std.hash.autoHashStrat(&h, .{ store.cfg, store.dirty_replica_rows, store.dirty_projection_rows, store.dirty_attachment_replica_rows, store.dirty_attachment_projection_rows, store.dirty_local_projection_rows, store.dirty_attachment_local_projection_rows, store.dirty_scan_cursor, store.projection_scan_cursor, store.attachment_replica_scan_cursor, store.attachment_projection_scan_cursor, store.local_projection_scan_cursor, store.attachment_local_projection_scan_cursor, store.next_local_projection_generation }, .DeepRecursive);
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    return digest;
+}
+
+fn lifecycleMixedFixture(s: *SessionStore) ![7]LifecycleRequest {
+    const first = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const sibling = try s.attachWithAttachment("Alice", 2, tok(1), aid(2), 20);
+    const binding = try s.attachWithAttachment("ALICE", 3, tok(3), aid(3), 30);
+    _ = try s.attachWithAttachment("Bob", 4, tok(4), aid(4), 40);
+    _ = try s.attachWithAttachment("Carol", 5, tok(5), aid(5), 50);
+    _ = try s.attachWithAttachment("Carol", 6, tok(5), aid(6), 60);
+    try testing.expect(s.markDetachedWithSnapshot("Bob", 4, "OLD exact ghost snapshot"));
+    try testing.expect(s.markDetachedWithSnapshot("Carol", 6, "OLD retired snapshot"));
+    const ghost = s.findDetachedAttachmentSessionInAccount("Bob", tok(4), aid(4)).?;
+    try testing.expect(s.markPortableResumeIssued("Alice", 1));
+    try testing.expect(s.markPortableResumeIssued("ALICE", 3));
+    try testing.expect(s.markTokenReplicaDirty(tok(1)));
+    try testing.expect(s.markTokenReplicaProjectionDirty(tok(1)));
+    try testing.expect(s.markAttachmentReplicaDirty(tok(3), aid(3)));
+    try testing.expect(s.markAttachmentReplicaProjectionDirty(tok(3), aid(3)));
+    _ = try s.armTokenLocalChannelProjection(tok(1), "#group", true, 1);
+    _ = try s.armTokenLocalChannelProjection(tok(3), "#source", false, 0);
+    _ = try s.armAttachmentLocalChannelProjection(tok(3), aid(3), "#exact", true, 2);
+    s.dirty_scan_cursor = tok(1);
+    s.projection_scan_cursor = tok(1);
+    s.attachment_replica_scan_cursor = .{ .token = tok(3), .attachment_id = aid(3) };
+    s.attachment_projection_scan_cursor = s.attachment_replica_scan_cursor;
+    var group_cursor: [1]LocalChannelProjectionWork = undefined;
+    var attachment_cursor: [1]AttachmentLocalChannelProjectionWork = undefined;
+    try testing.expectEqual(@as(usize, 1), s.dirtyLocalProjectionsInto(&group_cursor).len);
+    try testing.expectEqual(@as(usize, 1), s.dirtyAttachmentLocalProjectionsInto(&attachment_cursor).len);
+    return .{
+        .{ .request_id = 1, .intent = .{ .detach = .{ .source = lifecycleSelector("Alice", first), .snapshot = .{ .replace = "NEW exact snapshot" } } } },
+        .{ .request_id = 2, .intent = .{ .remove = .{ .source = lifecycleSelector("Alice", sibling), .reason = .logout } } },
+        .{ .request_id = 3, .intent = .{ .reconnect = .{ .source = lifecycleSelector("Bob", ghost), .claimant_client = 40 } } },
+        .{ .request_id = 4, .intent = .{ .rebind = .{ .source = lifecycleSelector("ALICE", binding), .target_account = "Alice", .target_token = tok(1), .kind = .join_existing, .retire_attachment_work = true } } },
+        .{ .request_id = 5, .intent = .{ .remove_account = "cArOl" } },
+        .{ .request_id = 6, .intent = .{ .admit = .{ .account = "Dan", .client = 7, .signon_ms = 70, .kind = .fresh } } },
+        .{ .request_id = 7, .intent = .{ .admit = .{ .account = "Alice", .client = 8, .signon_ms = 80, .kind = .{ .join_existing = tok(1) } } } },
+    };
+}
+
+test "Session lifecycle batch every mixed allocation aborts canonical OLD and retries one nofail cut" {
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var s = SessionStore.initWithConfig(failing.allocator(), .{ .max_accounts = 4, .max_sessions_per_account = 4 });
+        defer s.deinit();
+        const ops = try lifecycleMixedFixture(&s);
+        const old = try lifecycleCanonical(&s);
+        failing.fail_index = failing.alloc_index + index;
+        var ticket = s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(old, try lifecycleCanonical(&s));
+            try testing.expect(s.active_lifecycle == null);
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+            defer retry.deinit();
+            retry.abort();
+            try testing.expectEqual(old, try lifecycleCanonical(&s));
+            retry.deinit();
+            retry = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+            try retry.validateForCut();
+            failing.fail_index = failing.alloc_index;
+            retry.commit();
+            retry.finish();
+            try testing.expect(s.clientHasAttachment("Alice", 3, tok(1), aid(3)));
+            try testing.expect(s.clientHasAttachment("Bob", 40, tok(4), aid(4)));
+            try testing.expect(!s.accounts.contains("Carol"));
+            try expectTokenIndexCoherent(&s);
+            try expectLifecycleCountsAndAttachments(&s);
+            continue;
+        };
+        defer ticket.deinit();
+        const p = ticket.preview();
+        try testing.expectEqual(@as(usize, 6), p.before.len);
+        try testing.expectEqual(@as(usize, 5), p.after.len);
+        try testing.expectEqual(@as(usize, 3), p.final_accounts);
+        var final_token_retirements: usize = 0;
+        for (p.token_groups) |d| if (d.old_rows != 0 and d.final_rows == 0) {
+            final_token_retirements += 1;
+        };
+        try testing.expectEqual(@as(usize, 2), final_token_retirements);
+        try testing.expectEqual(@as(usize, 4), p.retired_attachments.len);
+        try testing.expect(p.retired_attachments[1].row.snapshot != null or p.retired_attachments[2].row.snapshot != null or p.retired_attachments[3].row.snapshot != null);
+        try ticket.validateForCut();
+        failing.fail_index = failing.alloc_index;
+        ticket.commit();
+        ticket.finish();
+        try expectTokenIndexCoherent(&s);
+        try expectLifecycleCountsAndAttachments(&s);
+        try testing.expect(index > 30);
+        std.debug.print("Session lifecycle mixed allocation sweep: {d} failures before success\n", .{index});
+        break;
+    }
+}
+
+test "Session lifecycle batch folded account removal has complete capacity above 64" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 129 });
+    defer s.deinit();
+    for (0..129) |i| _ = try s.attachWithAttachment(if (i % 2 == 0) "Alice" else "ALICE", @intCast(i + 1), tok(1), aidNumber(i + 1), @intCast(i));
+    _ = try s.attachWithAttachment("Unrelated", 1000, tok(2), aid(2), 1);
+    const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .remove_account = "aLiCe" } }};
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    const p = ticket.preview();
+    try testing.expectEqual(@as(usize, 129), p.before.len);
+    try testing.expectEqual(@as(usize, 129), p.retired_attachments.len);
+    try testing.expectEqual(@as(usize, 129), p.affected_physical.len);
+    try testing.expectEqual(@as(usize, 1), p.token_groups.len);
+    try testing.expectEqual(@as(usize, 130), p.complexity.discovery_row_visits);
+    try testing.expectEqual(@as(usize, 129), p.complexity.candidate_row_visits);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try testing.expect(s.clientHasAttachment("Unrelated", 1000, tok(2), aid(2)));
+    try testing.expectEqual(@as(u32, 1), s.accounts.count());
+    try expectTokenIndexCoherent(&s);
+}
+
+test "Session lifecycle batch final account and per-list replacement quotas apply once" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_accounts = 1, .max_sessions_per_account = 1 });
+    defer s.deinit();
+    const old = try s.attachWithAttachment("OLD", 1, tok(1), aid(1), 10);
+    const ops = [_]LifecycleRequest{
+        .{ .request_id = 1, .intent = .{ .admit = .{ .account = "NEW", .client = 2, .signon_ms = 20, .kind = .fresh } } },
+        .{ .request_id = 2, .intent = .{ .remove = .{ .source = lifecycleSelector("OLD", old), .reason = .logout } } },
+    };
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try testing.expectEqual(@as(u32, 1), s.accounts.count());
+    try testing.expect(s.accounts.contains("NEW"));
+    try expectTokenIndexCoherent(&s);
+}
+
+const LifecycleRandom = struct {
+    blocks: []const Token,
+    calls: usize = 0,
+    fn random(userdata: ?*anyopaque, out: []u8) void {
+        const self: *@This() = @ptrCast(@alignCast(userdata.?));
+        const block = self.blocks[@min(self.calls, self.blocks.len - 1)];
+        self.calls += 1;
+        std.debug.assert(out.len == 16);
+        @memcpy(out, &block);
+    }
+};
+
+test "Session lifecycle batch entropy and global collisions cannot select capacity fallback" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 1 });
+    defer s.deinit();
+    _ = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    var vtable = testing.io.vtable.*;
+    vtable.random = LifecycleRandom.random;
+    var rng = LifecycleRandom{ .blocks = &.{@splat(0)} };
+    const io = std.Io{ .userdata = &rng, .vtable = &vtable };
+    var ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .admit = .{ .account = "Bob", .client = 2, .signon_ms = 20, .kind = .fresh, .cap = .untracked } } }};
+    const old = try lifecycleCanonical(&s);
+    try testing.expectError(error.ZeroEntropy, s.prepareLifecycleBatch(.{ .io = io, .operations = &ops }));
+    try testing.expectEqual(@as(usize, 4), rng.calls);
+    rng = .{ .blocks = &.{tok(1)} };
+    ops[0].intent.admit.account = "Alice";
+    // No saturation while minting: replace capacity with an explicit removal.
+    s.cfg.max_sessions_per_account = 2;
+    try testing.expectError(error.TokenCollisionExhausted, s.prepareLifecycleBatch(.{ .io = io, .operations = &ops }));
+    try testing.expectEqual(@as(usize, 4), rng.calls);
+    rng = .{ .blocks = &.{aid(1).raw} };
+    ops[0].intent.admit.kind = .{ .join_existing = tok(1) };
+    try testing.expectError(error.AttachmentCollisionExhausted, s.prepareLifecycleBatch(.{ .io = io, .operations = &ops }));
+    try testing.expectEqual(@as(usize, 4), rng.calls);
+    s.cfg.max_sessions_per_account = 1;
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    const fresh = [_]LifecycleRequest{
+        .{ .request_id = 2, .intent = .{ .admit = .{ .account = "Bob", .client = 2, .signon_ms = 20, .kind = .fresh } } },
+        .{ .request_id = 3, .intent = .{ .admit = .{ .account = "Bob", .client = 3, .signon_ms = 30, .kind = .fresh } } },
+    };
+    s.cfg.max_sessions_per_account = 4;
+    rng = .{ .blocks = &.{ tok(2), aid(2).raw, tok(2) } };
+    try testing.expectError(error.TokenCollisionExhausted, s.prepareLifecycleBatch(.{ .io = io, .operations = &fresh }));
+    try testing.expect(!s.accounts.contains("Bob"));
+}
+
+test "Session lifecycle batch only named final capacity admits explicit untracked facts" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_accounts = 1, .max_sessions_per_account = 1 });
+    defer s.deinit();
+    const row = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    var ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .admit = .{ .account = "Alice", .client = 2, .signon_ms = 20, .kind = .fresh, .cap = .untracked } } }};
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    try testing.expectEqual(@as(usize, 2), ticket.preview().affected_physical.len);
+    try testing.expectEqual(.sessions_capacity, ticket.preview().admissions[0].result.untracked);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    ticket.deinit();
+    try testing.expect(!s.containsClient("Alice", 2));
+    ops[0].intent.admit.account = "Bob";
+    ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    try testing.expectEqual(.accounts_capacity, ticket.preview().admissions[0].result.untracked);
+    ticket.abort();
+    ticket.deinit();
+    ops[0].intent.admit.kind = .{ .adopt_verified = .{ .token = tok(1), .portable = true } };
+    try testing.expectError(error.TokenAccountMismatch, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    ops[0].intent.admit.account = "Alice";
+    try testing.expectEqual(ReserveDropResult.reserved, s.reserveDrop("Alice", lifecycleSelector("Alice", row).exact, 99));
+    try testing.expectError(error.SessionDropReserved, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    try testing.expect(s.cancelDropReservation("Alice", lifecycleSelector("Alice", row).exact, 99));
+    ops[0].intent.admit.kind = .no_row;
+    ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    try testing.expectEqual(.explicit, ticket.preview().admissions[0].result.untracked);
+    ticket.deinit();
+    ops[0].intent.admit.account = "Bob";
+    ops[0].intent.admit.kind = .sentinel;
+    ops[0].intent.admit.cap = .fail;
+    try testing.expectError(error.TooManyAccounts, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+}
+
+test "Session lifecycle batch exact proofs overlap DROP owner and stale ticket fail before cut" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    var other = SessionStore.init(testing.allocator);
+    defer other.deinit();
+    const row = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const source = lifecycleSelector("Alice", row);
+    var ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .remove = .{ .source = source, .reason = .physical_close } } }};
+    const old = try lifecycleCanonical(&s);
+    ops[0].intent.remove.source.exact.signon_ms += 1;
+    try testing.expectError(error.StaleSelector, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    ops[0].intent.remove.source = source;
+    ops[0].intent.remove.source.attached = false;
+    try testing.expectError(error.StaleSelector, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    ops[0].intent.remove.source = source;
+    const overlap = [_]LifecycleRequest{ ops[0], .{ .request_id = 2, .intent = .{ .detach = .{ .source = source } } } };
+    try testing.expectError(error.OverlappingIntent, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &overlap }));
+    const account_overlap = [_]LifecycleRequest{ .{ .request_id = 2, .intent = .{ .remove_account = "ALICE" } }, ops[0] };
+    try testing.expectError(error.OverlappingIntent, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &account_overlap }));
+    const hidden = [_]LifecycleRequest{.{ .request_id = 2, .intent = .{ .admit = .{ .account = "Foreign", .client = 1, .signon_ms = 10, .kind = .fresh } } }};
+    try testing.expectError(error.AmbiguousPhysicalBinding, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &hidden }));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    try testing.expectEqual(ReserveDropResult.reserved, s.reserveDrop("Alice", source.exact, 91));
+    try testing.expectError(error.SessionDropReserved, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    var permits = [_]LifecycleDropPermit{.{ .source = source, .owner = 90 }};
+    try testing.expectError(error.SessionDropReserved, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops, .drop_permits = &permits }));
+    permits[0].owner = 91;
+    const reserved = try lifecycleCanonical(&s);
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops, .drop_permits = &permits });
+    ticket.abort();
+    ticket.deinit();
+    try testing.expectEqual(reserved, try lifecycleCanonical(&s));
+    ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops, .drop_permits = &permits });
+    defer ticket.deinit();
+    const owner = ticket.owned.?.store;
+    ticket.owned.?.store = &other;
+    try testing.expectError(error.InvalidTicket, ticket.validateForCut());
+    ticket.owned.?.store = owner;
+    const cached = ticket.owned.?.preview_value.final_rows;
+    ticket.owned.?.preview_value.final_rows += 1;
+    try testing.expectError(error.InvalidTicket, ticket.validateForCut());
+    ticket.owned.?.preview_value.final_rows = cached;
+    try ticket.validateForCut();
+    var borrowed_copy = ticket;
+    try testing.expectError(error.InvalidTicket, borrowed_copy.validateForCut());
+    ticket.commit();
+    ticket.finish();
+    try testing.expectError(error.InvalidTicket, ticket.validateForCut());
+    try testing.expect(!s.containsClient("Alice", 1));
+    try testing.expectEqual(@as(u32, 0), s.token_index.count());
+}
+
+test "Session lifecycle batch cap eviction is OLD detached deterministic and rollback atomic" {
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var s = SessionStore.initWithConfig(failing.allocator(), .{ .max_sessions_per_account = 3 });
+        defer s.deinit();
+        _ = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 100);
+        _ = try s.attachWithAttachment("Alice", 2, tok(2), aid(2), 10);
+        _ = try s.attachWithAttachment("Alice", 3, tok(3), aid(3), 10);
+        try testing.expect(s.markDetachedWithSnapshot("Alice", 2, "victim payload"));
+        try testing.expect(s.markDetached("Alice", 3));
+        const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .admit = .{ .account = "Alice", .client = 4, .signon_ms = 40, .kind = .fresh, .cap = .evict_detached } } }};
+        const old = try lifecycleCanonical(&s);
+        failing.fail_index = failing.alloc_index + index;
+        var ticket = s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(old, try lifecycleCanonical(&s));
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+            defer retry.deinit();
+            try retry.validateForCut();
+            retry.commit();
+            retry.finish();
+            try testing.expect(!s.containsClient("Alice", 2));
+            try testing.expect(s.containsClient("Alice", 3));
+            continue;
+        };
+        defer ticket.deinit();
+        try testing.expectEqual(@as(ClientId, 2), ticket.preview().retired_attachments[0].row.client);
+        for (ticket.preview().affected_physical) |effect| try testing.expect(effect.client != 2);
+        try ticket.validateForCut();
+        ticket.commit();
+        ticket.finish();
+        try expectTokenIndexCoherent(&s);
+        break;
+    }
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 1 });
+    defer s.deinit();
+    const live = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const ops = [_]LifecycleRequest{
+        .{ .request_id = 1, .intent = .{ .detach = .{ .source = lifecycleSelector("Alice", live) } } },
+        .{ .request_id = 2, .intent = .{ .admit = .{ .account = "Alice", .client = 2, .signon_ms = 20, .kind = .fresh, .cap = .evict_detached } } },
+    };
+    const old = try lifecycleCanonical(&s);
+    try testing.expectError(error.TooManySessions, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+}
+
+test "Session lifecycle batch exact reconnect preserves ghost authority at cap and folded keys" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 1 });
+    defer s.deinit();
+    _ = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const claimant = try s.attachWithAttachment("ALICE", 2, tok(2), aid(2), 20);
+    try testing.expect(s.markDetachedWithSnapshot("Alice", 1, "exact old snapshot"));
+    _ = try s.armAttachmentLocalChannelProjection(tok(1), aid(1), "#exact", true, 3);
+    const source = s.findDetachedAttachmentSessionInAccount("Alice", tok(1), aid(1)).?;
+    var ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .reconnect = .{ .source = lifecycleSelector("Alice", source), .claimant_client = 2, .claimant = lifecycleSelector("ALICE", claimant) } } }};
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    const p = ticket.preview();
+    const final = lifecycleFindRow(p.after, 2).?;
+    try testing.expectEqual(tok(1), final.token);
+    try testing.expect(final.attachment_id.?.eql(aid(1)));
+    try testing.expectEqual(@as(i64, 10), final.signon_ms);
+    try testing.expectEqual(@as(u8, 1), final.attachment_journal.len);
+    try testing.expect(final.snapshot == null);
+    try testing.expectEqualStrings("exact old snapshot", p.before[0].snapshot.?);
+    try testing.expectEqual(@as(usize, 1), p.retired_attachments.len);
+    try testing.expectEqual(@as(usize, 1), p.remaps.len);
+    try testing.expect(p.affected_physical[0].historical_only);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try testing.expect(s.clientHasAttachment("Alice", 2, tok(1), aid(1)));
+    try testing.expect(!s.accounts.contains("ALICE"));
+    try expectTokenIndexCoherent(&s);
+    ticket.deinit();
+    ops[0].intent.reconnect.source.exact.client = 2;
+    ops[0].intent.reconnect.source.attached = true;
+    ops[0].intent.reconnect.claimant = null;
+    ops[0].intent.reconnect.claimant_client = 3;
+    try testing.expectError(error.AlreadyAttached, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+}
+
+test "Session lifecycle batch journals union eight refuse nine and reject equal-generation contradiction" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const source = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    _ = try s.attachWithAttachment("Alice", 2, tok(2), aid(2), 20);
+    try testing.expect(s.markPortableResumeIssued("Alice", 1));
+    for (0..4) |i| {
+        var channel: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&channel, "#source{d}", .{i});
+        _ = try s.armTokenLocalChannelProjection(tok(1), text, true, 1);
+    }
+    for (0..4) |i| {
+        var channel: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&channel, "#target{d}", .{i});
+        _ = try s.armTokenLocalChannelProjection(tok(2), text, false, 0);
+    }
+    var ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .rebind = .{ .source = lifecycleSelector("Alice", source), .target_account = "Alice", .target_token = tok(2), .kind = .join_existing, .retire_attachment_work = true } } }};
+    const old = try lifecycleCanonical(&s);
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    try testing.expectEqual(@as(u8, 8), lifecycleFindRow(ticket.preview().after, 1).?.group_journal.len);
+    try testing.expect(lifecycleFindRow(ticket.preview().after, 2).?.portable_resume);
+    try testing.expect(lifecycleFindRow(ticket.preview().after, 2).?.attachment_replica_dirty);
+    ticket.abort();
+    ticket.deinit();
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    _ = try s.armTokenLocalChannelProjection(tok(1), "#ninth", true, 2);
+    const nine = try lifecycleCanonical(&s);
+    try testing.expectError(error.TooManyPendingChannels, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    try testing.expectEqual(nine, try lifecycleCanonical(&s));
+    // Same signed retry generation with conflicting payload is a corruption
+    // witness, never request-order-dependent membership authority.
+    s.lock.lockExclusive();
+    const left = s.accounts.getPtr("Alice").?.items.items[0].local_channel_projections.?;
+    const right = s.accounts.getPtr("Alice").?.items.items[1].local_channel_projections.?;
+    left.* = .{ .len = 1, .revision = 99 };
+    right.* = .{ .len = 1, .revision = 99 };
+    left.items[0] = .{ .generation = 99, .channel_len = 5, .present = true, .member_mode_bits = 1 };
+    right.items[0] = .{ .generation = 99, .channel_len = 5, .present = false };
+    @memcpy(left.items[0].channel_bytes[0..5], "#Same");
+    @memcpy(right.items[0].channel_bytes[0..5], "#same");
+    s.lock.unlockExclusive();
+    try testing.expectError(error.ProjectionConflict, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    ops[0].intent.rebind.kind = .{ .adopt_verified = true };
+    try testing.expectError(error.ProjectionConflict, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+}
+
+test "Session lifecycle batch newest folded journal and attachment retirement remain exact" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const source = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    _ = try s.attachWithAttachment("Alice", 2, tok(2), aid(2), 20);
+    const earlier = try s.armTokenLocalChannelProjection(tok(1), "#Case", false, 0);
+    const latest = try s.armTokenLocalChannelProjection(tok(2), "#case", true, 7);
+    _ = try s.armAttachmentLocalChannelProjection(tok(1), aid(1), "#old-exact", true, 3);
+    _ = try s.armAttachmentLocalChannelProjection(tok(2), aid(2), "#sibling-only", true, 4);
+    try testing.expect(s.markAttachmentReplicaProjectionDirty(tok(1), aid(1)));
+    var ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .rebind = .{ .source = lifecycleSelector("Alice", source), .target_account = "Alice", .target_token = tok(2), .kind = .join_existing } } }};
+    const old = try lifecycleCanonical(&s);
+    try testing.expectError(error.InvalidRequest, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    ops[0].intent.rebind.retire_attachment_work = true;
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    const p = ticket.preview();
+    try testing.expectEqual(@as(usize, 1), p.retired_attachments.len);
+    try testing.expect(p.retired_attachments[0].attachment_work_retired);
+    try testing.expectEqual(@as(u8, 1), p.retired_attachments[0].row.attachment_journal.len);
+    try testing.expectEqual(@as(u8, 0), lifecycleFindRow(p.after, 1).?.attachment_journal.len);
+    try testing.expectEqual(@as(u8, 1), lifecycleFindRow(p.after, 2).?.attachment_journal.len);
+    const merged = lifecycleFindRow(p.after, 1).?.group_journal;
+    try testing.expectEqual(@as(u8, 1), merged.len);
+    try testing.expectEqual(latest.generation, merged.items[0].generation);
+    try testing.expectEqual(@as(u8, 7), merged.items[0].member_mode_bits);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try testing.expect(!s.clearTokenLocalChannelProjection(tok(2), "#CASE", earlier.generation));
+    try testing.expectEqual(latest.generation, s.tokenLocalChannelProjection(tok(2), "#case").?.generation);
+    try testing.expect(s.attachmentLocalChannelProjection(tok(2), aid(2), "#sibling-only") != null);
+    try testing.expect(s.attachmentLocalChannelProjection(tok(2), aid(1), "#old-exact") == null);
+    try expectTokenIndexCoherent(&s);
+}
+
+test "Session lifecycle batch same token exact movement preserves attachment work and checked generations" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const row = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    _ = try s.armAttachmentLocalChannelProjection(tok(1), aid(1), "#exact", true, 1);
+    _ = try s.armTokenLocalChannelProjection(tok(1), "#group", true, 2);
+    var ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .rebind = .{ .source = lifecycleSelector("Alice", row), .target_account = "ALICE", .target_token = tok(1), .kind = .join_existing } } }};
+    s.next_local_projection_generation = std.math.maxInt(u64);
+    const old = try lifecycleCanonical(&s);
+    try testing.expectError(error.GenerationExhausted, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    s.next_local_projection_generation = 2;
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    try testing.expectEqual(@as(usize, 0), ticket.preview().retired_attachments.len);
+    try testing.expectEqual(@as(u8, 1), lifecycleFindRow(ticket.preview().after, 1).?.attachment_journal.len);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try testing.expect(s.clientHasAttachment("ALICE", 1, tok(1), aid(1)));
+    try testing.expect(s.attachmentLocalChannelProjection(tok(1), aid(1), "#exact") != null);
+    ticket.deinit();
+    s.next_lifecycle_serial = std.math.maxInt(u64);
+    try testing.expectError(error.GenerationExhausted, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &.{}, .observation_only = .{ .account = "ALICE", .client = 2 } }));
+    ops[0].intent.rebind.target_account = "Foreign";
+}
+
+test "Session lifecycle batch explicit sentinel replacement owns inputs and refuses reusable null IDs" {
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var s = SessionStore.initWithConfig(failing.allocator(), .{ .max_sessions_per_account = 1 });
+        defer s.deinit();
+        const old = try s.attach("Alice", 1, @splat(0), 10);
+        const account = try testing.allocator.dupe(u8, "Alice");
+        var ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .admit = .{ .account = account, .client = 1, .signon_ms = 20, .kind = .fresh, .replace_sentinel = lifecycleSelector(account, old) } } }};
+        const canonical = try lifecycleCanonical(&s);
+        failing.fail_index = failing.alloc_index + index;
+        var ticket = s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }) catch |err| {
+            testing.allocator.free(account);
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(canonical, try lifecycleCanonical(&s));
+            failing.fail_index = std.math.maxInt(usize);
+            ops[0].intent.admit.account = "Alice";
+            ops[0].intent.admit.replace_sentinel.?.account = "Alice";
+            var retry = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+            defer retry.deinit();
+            try retry.validateForCut();
+            retry.commit();
+            retry.finish();
+            continue;
+        };
+        defer ticket.deinit();
+        @memset(account, 0);
+        testing.allocator.free(account);
+        const result = ticket.preview().admissions[0].result.tracked;
+        try testing.expect(result.attachment_id != null);
+        try testing.expect(!tokenIsSentinel(result.token));
+        try ticket.validateForCut();
+        ticket.commit();
+        ticket.finish();
+        try testing.expect(s.clientHasAttachment("Alice", 1, result.token, result.attachment_id.?));
+        break;
+    }
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const legacy = try s.attach("Alice", 1, tok(1), 10);
+    var ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .admit = .{ .account = "Alice", .client = 1, .signon_ms = 20, .kind = .fresh, .replace_sentinel = lifecycleSelector("Alice", legacy) } } }};
+    try testing.expectError(error.InvalidRequest, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    ops[0].intent.admit.replace_sentinel.?.exact.signon_ms += 1;
+    try testing.expectError(error.StaleSelector, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    ops[0].intent.admit.replace_sentinel = lifecycleSelector("Alice", legacy);
+    ops[0].intent.admit.client = 2;
+    try testing.expectError(error.InvalidRequest, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+}
+
+test "Session lifecycle batch observes absence without pruning legacy empty keys and effects own retirement" {
+    var s = SessionStore.init(testing.allocator);
+    _ = try s.ensureAccount("Empty");
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &.{}, .observation_only = .{ .account = "Empty", .client = 1 } });
+    try testing.expectEqual(@as(usize, 1), ticket.preview().affected_physical.len);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    ticket.deinit();
+    try testing.expect(s.accounts.contains("Empty"));
+    _ = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    try testing.expect(s.markDetachedWithSnapshot("Alice", 1, "retained retirement bytes"));
+    const row = s.findDetachedAttachmentSessionInAccount("Alice", tok(1), aid(1)).?;
+    const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .remove = .{ .source = lifecycleSelector("Alice", row), .reason = .garbage_collect } } }};
+    ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    const retired = ticket.preview().retired_attachments;
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    // Recreate/remove the same display key, then even destroy the live store;
+    // ticket retirement owns the OLD key/list/snapshot independently.
+    _ = try s.attachWithAttachment("Alice", 2, tok(2), aid(2), 20);
+    s.deinit();
+    try testing.expectEqualStrings("Alice", retired[0].row.account);
+    try testing.expectEqualStrings("retained retirement bytes", retired[0].row.snapshot.?);
+    ticket.deinit();
+    ticket.deinit();
+}
+
+test "Session lifecycle batch bounded payload work excludes unrelated registry snapshots" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const payload = try testing.allocator.alloc(u8, 8192);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'x');
+    for (0..128) |i| {
+        var account: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&account, "Unrelated{d}", .{i});
+        _ = try s.attachWithAttachment(name, @intCast(i + 10), tokenNumber(i + 10), aidNumber(i + 10), 1);
+        try testing.expect(s.markDetachedWithSnapshot(name, @intCast(i + 10), payload));
+    }
+    _ = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    try testing.expect(s.markDetachedWithSnapshot("Alice", 1, "KEEP"));
+    const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .admit = .{ .account = "Alice", .client = 2, .signon_ms = 20, .kind = .{ .join_existing = tok(1) } } } }};
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops, .limits = .{ .max_payload_bytes = 4 } });
+    defer ticket.deinit();
+    const metric = ticket.preview().complexity;
+    try testing.expectEqual(@as(usize, 129), metric.discovery_row_visits);
+    try testing.expectEqual(@as(usize, 1), metric.candidate_row_visits);
+    try testing.expectEqual(@as(usize, 4), metric.copied_payload_bytes);
+    try testing.expectEqual(@as(usize, 2), metric.normalization_row_visits);
+    try testing.expectEqual(@as(usize, 5), metric.index_row_visits);
+    ticket.abort();
+    ticket.deinit();
+    const old = try lifecycleCanonical(&s);
+    try testing.expectError(error.CandidateLimitExceeded, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops, .limits = .{ .max_payload_bytes = 3 } }));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
 }
 
 fn expectTokenIndexCoherent(store: *SessionStore) !void {
@@ -7092,5 +9204,615 @@ test "SessionStore concurrent writers and readers preserve sessions" {
         const list = s.sessionsInto(acct, &out);
         try testing.expectEqual(@as(usize, iters), list.len);
         for (list) |session| try testing.expect(session.attached);
+    }
+}
+
+const LifecycleConcurrency = struct {
+    store: *SessionStore,
+    reader_entered: std.atomic.Value(bool) = .init(false),
+    reader_done: std.atomic.Value(bool) = .init(false),
+    writer_done: std.atomic.Value(bool) = .init(false),
+    failures: std.atomic.Value(u32) = .init(0),
+
+    fn reader(self: *@This()) void {
+        self.reader_entered.store(true, .release);
+        self.store.lock.lockShared();
+        defer self.store.lock.unlockShared();
+        const rows = self.store.accounts.get("Alice").?.items.items;
+        if (rows.len != 2 or rows[0].attached or rows[0].snapshot == null or
+            !std.mem.eql(u8, rows[0].snapshot.?, "NEW owned snapshot") or rows[1].attached)
+            _ = self.failures.fetchAdd(1, .monotonic);
+        self.reader_done.store(true, .release);
+    }
+    fn writer(self: *@This()) void {
+        if (!self.store.clearTokenReplicaDirty(tok(1))) _ = self.failures.fetchAdd(1, .monotonic);
+        self.writer_done.store(true, .release);
+    }
+};
+
+fn lifecycleAwait(flag: *const std.atomic.Value(bool)) !void {
+    for (0..1_000_000) |_| {
+        if (flag.load(.acquire)) return;
+        try std.Thread.yield();
+    }
+    return error.TestBarrierTimeout;
+}
+
+test "Session lifecycle batch readers and legacy writers wait for complete cut" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const first = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const second = try s.attachWithAttachment("Alice", 2, tok(2), aid(2), 20);
+    var old: [2]Session = undefined;
+    const before = s.sessionsInto("Alice", &old);
+    try testing.expectEqual(@as(usize, 2), before.len);
+    try testing.expect(before[0].attached and before[1].attached and before[0].snapshot == null);
+    const ops = [_]LifecycleRequest{
+        .{ .request_id = 1, .intent = .{ .detach = .{ .source = lifecycleSelector("Alice", first), .snapshot = .{ .replace = "NEW owned snapshot" } } } },
+        .{ .request_id = 2, .intent = .{ .detach = .{ .source = lifecycleSelector("Alice", second) } } },
+    };
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    var ctx = LifecycleConcurrency{ .store = &s };
+    var reader: ?std.Thread = null;
+    var writer: ?std.Thread = null;
+    // Every assertion/spawn/barrier failure releases custody before joining.
+    defer {
+        ticket.deinit();
+        if (reader) |thread| thread.join();
+        if (writer) |thread| thread.join();
+    }
+    reader = try std.Thread.spawn(.{}, LifecycleConcurrency.reader, .{&ctx});
+    writer = try std.Thread.spawn(.{}, LifecycleConcurrency.writer, .{&ctx});
+    try lifecycleAwait(&ctx.reader_entered);
+    var queued = false;
+    for (0..1_000_000) |_| {
+        if (s.lock.writers_waiting.load(.acquire) != 0) {
+            queued = true;
+            break;
+        }
+        try std.Thread.yield();
+    }
+    try testing.expect(queued); // Actual legacy lock waiter, not a sleep guess.
+    try testing.expect(!ctx.reader_done.load(.acquire) and !ctx.writer_done.load(.acquire));
+    try testing.expectError(error.Busy, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    try ticket.validateForCut();
+    ticket.commit();
+    try testing.expect(!ctx.reader_done.load(.acquire) and !ctx.writer_done.load(.acquire));
+    ticket.finish();
+    reader.?.join();
+    reader = null;
+    writer.?.join();
+    writer = null;
+    try testing.expect(ctx.reader_done.load(.acquire) and ctx.writer_done.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), ctx.failures.load(.acquire));
+    try expectTokenIndexCoherent(&s);
+}
+
+// This oracle exercises storage effects against the existing signed chronology;
+// it deliberately supplies outer auth/subject facts and does not activate daemon
+// routing or infer a presence subject from a reusable token/attachment.
+fn lifecycleOracleRecord(class: @import("../proto/mesh_presence_v2.zig").RoutingClass) @import("../proto/mesh_presence_v2.zig").Record {
+    const v2 = @import("../proto/mesh_presence_v2.zig");
+    return .{ .operation = .present, .origin = @splat(1), .guest = (v2.guestId(.{ .epoch = 1, .counter = 1 }) catch unreachable), .revision = 1, .routing_class = class, .class_revision = 1, .claim_hlc = 10, .claim_revision = 1, .issued_ms = 10, .expires_ms = 100, .nick = "Alice", .username = "u", .host = "h", .realname = "r", .server = "s", .description = "d" };
+}
+
+test "Session lifecycle batch physical effects obey independent v2 class and terminal chronology" {
+    const v2 = @import("../proto/mesh_presence_v2.zig");
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const one = lifecycleOracleRecord(.true_guest);
+    var two = one;
+    two.revision = 2;
+    two.routing_class = .authenticated_untracked;
+    two.class_revision = 2;
+    const absent = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .admit = .{ .account = "Alice", .client = 1, .signon_ms = 10, .kind = .no_row } } }};
+    var t = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &absent });
+    try testing.expectEqual(@as(usize, 1), t.preview().affected_physical.len);
+    try testing.expect(t.preview().affected_physical[0].after == null);
+    try testing.expect(try v2.consistentProgress(one, two));
+    try t.validateForCut();
+    t.commit();
+    t.finish();
+    t.deinit();
+    const fresh = [_]LifecycleRequest{.{ .request_id = 2, .intent = .{ .admit = .{ .account = "Alice", .client = 1, .signon_ms = 10, .kind = .fresh } } }};
+    t = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &fresh });
+    const exact = t.preview().affected_physical[0].after.?;
+    try testing.expect(exact.attached and !tokenIsSentinel(exact.token) and exact.attachment_id != null);
+    var three = two;
+    three.revision = 3;
+    three.routing_class = .exact_reusable_attachment;
+    three.class_revision = 3;
+    try testing.expect(try v2.consistentProgress(two, three));
+    try testing.expectEqual(one.claim_revision, three.claim_revision);
+    try t.validateForCut();
+    t.commit();
+    t.finish();
+    t.deinit();
+    const live = s.findAttachedTokenSessionInAccount("Alice", exact.token, 0).?;
+    const rekey = [_]LifecycleRequest{.{ .request_id = 3, .intent = .{ .rebind = .{ .source = lifecycleSelector("Alice", live), .target_account = "Alice", .target_token = tok(77), .kind = .{ .adopt_verified = false } } } }};
+    t = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &rekey });
+    defer t.deinit();
+    try testing.expect(!std.mem.eql(u8, &t.preview().affected_physical[0].before.?.token, &t.preview().affected_physical[0].after.?.token));
+    var same_class = three;
+    same_class.revision = 4;
+    try testing.expect(try v2.consistentProgress(three, same_class));
+    try testing.expectEqual(three.class_revision, same_class.class_revision);
+    t.abort();
+    t.deinit();
+    const detach = [_]LifecycleRequest{.{ .request_id = 4, .intent = .{ .detach = .{ .source = lifecycleSelector("Alice", live) } } }};
+    t = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &detach });
+    const physical = t.preview().affected_physical[0];
+    try testing.expect(physical.before.?.attached and !physical.after.?.attached);
+    var quit = three;
+    quit.operation = .quit;
+    quit.revision = 5;
+    try testing.expect(try v2.consistentProgress(three, quit));
+    try testing.expectEqual(three.class_revision, quit.class_revision);
+    var invalid_quit = quit;
+    invalid_quit.class_revision = invalid_quit.revision;
+    try testing.expectError(error.InvalidField, v2.consistentProgress(three, invalid_quit));
+    try t.validateForCut();
+    t.commit();
+    t.finish();
+    t.deinit();
+    const ghost = s.findDetachedAttachmentSessionInAccount("Alice", exact.token, exact.attachment_id.?).?;
+    const reconnect = [_]LifecycleRequest{.{ .request_id = 5, .intent = .{ .reconnect = .{ .source = lifecycleSelector("Alice", ghost), .claimant_client = 2 } } }};
+    t = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &reconnect });
+    try testing.expectEqual(@as(usize, 2), t.preview().affected_physical.len);
+    try testing.expectEqual(@as(ClientId, 1), t.preview().remaps[0].old_client);
+    try testing.expectEqual(@as(ClientId, 2), t.preview().remaps[0].new_client);
+    var claimant = lifecycleOracleRecord(.exact_reusable_attachment);
+    claimant.guest = try v2.guestId(.{ .epoch = 1, .counter = 2 }); // New physical subject, same stable attachment.
+    claimant.revision = 2;
+    var resurrection = quit;
+    resurrection.revision = 6;
+    resurrection.operation = .present;
+    try testing.expect(!try v2.consistentProgress(quit, resurrection));
+    try testing.expectError(error.InvalidField, v2.consistentProgress(quit, claimant));
+    t.abort();
+    t.deinit();
+    var logout = three;
+    logout.revision = 4;
+    logout.routing_class = .true_guest;
+    logout.class_revision = 4;
+    try testing.expect(try v2.consistentProgress(three, logout));
+    try testing.expectEqual(one.claim_hlc, logout.claim_hlc);
+    var nickname = logout;
+    nickname.revision = 5;
+    nickname.nick = "Renamed";
+    nickname.claim_hlc = 11;
+    nickname.claim_revision = 5;
+    try testing.expect(try v2.consistentProgress(logout, nickname));
+    try testing.expectEqual(logout.class_revision, nickname.class_revision);
+}
+
+test "Session lifecycle batch complete stale proof and reserved sibling refusal" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const first = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const sibling = try s.attachWithAttachment("ALICE", 2, tok(1), aid(2), 20);
+    var selector = lifecycleSelector("Alice", first);
+    var ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .remove = .{ .source = selector, .reason = .logout } } }};
+    const old = try lifecycleCanonical(&s);
+    selector.exact.token = tok(9);
+    ops[0].intent.remove.source = selector;
+    try testing.expectError(error.StaleSelector, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    selector = lifecycleSelector("Alice", first);
+    selector.exact.attachment_id = aid(9);
+    ops[0].intent.remove.source = selector;
+    try testing.expectError(error.StaleSelector, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    const sibling_selector = lifecycleSelector("ALICE", sibling);
+    try testing.expectEqual(ReserveDropResult.reserved, s.reserveDrop("ALICE", sibling_selector.exact, 7));
+    ops[0].intent.remove.source = lifecycleSelector("Alice", first);
+    const reserved = try lifecycleCanonical(&s);
+    try testing.expectError(error.SessionDropReserved, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops, .drop_permits = &.{.{ .source = sibling_selector, .owner = 7 }} }));
+    try testing.expectEqual(reserved, try lifecycleCanonical(&s));
+    try testing.expect(s.validateDropReservation("ALICE", sibling_selector.exact, 7));
+    try testing.expect(s.cancelDropReservation("ALICE", sibling_selector.exact, 7));
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    const locator = s.attachment_index.getPtr(aid(1).raw).?;
+    locator.client = 999; // Same map size must not evade exact-cut validation.
+    try testing.expectError(error.InvalidTicket, ticket.validateForCut());
+    locator.client = 1;
+    try ticket.validateForCut();
+    ticket.abort();
+}
+
+test "Session lifecycle batch final removal avoids detached cap eviction and preserves cursor fairness" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_accounts = 1, .max_sessions_per_account = 2 });
+    defer s.deinit();
+    const removed = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    _ = try s.attachWithAttachment("Alice", 2, tok(2), aid(2), 20);
+    try testing.expect(s.markDetachedWithSnapshot("Alice", 2, "keeper ghost"));
+    try testing.expect(s.markPortableResumeIssued("Alice", 1));
+    try testing.expect(s.markPortableResumeIssued("Alice", 2));
+    try testing.expect(s.markTokenReplicaDirty(tok(1)) and s.markTokenReplicaDirty(tok(2)));
+    try testing.expect(s.markTokenReplicaProjectionDirty(tok(1)) and s.markTokenReplicaProjectionDirty(tok(2)));
+    try testing.expect(s.markAttachmentReplicaDirty(tok(1), aid(1)) and s.markAttachmentReplicaDirty(tok(2), aid(2)));
+    try testing.expect(s.markAttachmentReplicaProjectionDirty(tok(1), aid(1)) and s.markAttachmentReplicaProjectionDirty(tok(2), aid(2)));
+    _ = try s.armTokenLocalChannelProjection(tok(1), "#removed", true, 1);
+    _ = try s.armTokenLocalChannelProjection(tok(2), "#surviving", false, 0);
+    _ = try s.armAttachmentLocalChannelProjection(tok(1), aid(1), "#removed", true, 1);
+    _ = try s.armAttachmentLocalChannelProjection(tok(2), aid(2), "#surviving", false, 0);
+    s.dirty_scan_cursor = tok(1);
+    s.projection_scan_cursor = tok(1);
+    s.attachment_replica_scan_cursor = .{ .token = tok(1), .attachment_id = aid(1) };
+    s.attachment_projection_scan_cursor = s.attachment_replica_scan_cursor;
+    s.local_projection_scan_cursor = .{ .token = tok(1), .projection = s.token_index.get(tok(1)).?.local_projections.items[0] };
+    s.attachment_local_projection_scan_cursor = .{ .token = tok(1), .attachment_id = aid(1), .projection = s.accounts.get("Alice").?.items.items[0].attachment_channel_projections.?.items[0] };
+    const ops = [_]LifecycleRequest{
+        .{ .request_id = 1, .intent = .{ .admit = .{ .account = "Alice", .client = 3, .signon_ms = 30, .kind = .fresh, .cap = .evict_detached } } },
+        .{ .request_id = 2, .intent = .{ .remove = .{ .source = lifecycleSelector("Alice", removed), .reason = .logout } } },
+    };
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    try testing.expectEqual(@as(usize, 1), ticket.preview().retired_attachments.len);
+    try testing.expectEqual(LifecycleRemoval.logout, ticket.preview().retired_attachments[0].reason);
+    try testing.expectEqualStrings("keeper ghost", lifecycleFindRow(ticket.preview().after, 2).?.snapshot.?);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    var tokens: [4]Token = undefined;
+    try testing.expectEqual(tok(2), s.dirtyPortableTokensInto(&tokens)[0]);
+    try testing.expectEqual(tok(2), s.dirtyProjectionTokensInto(&tokens)[0]);
+    var attachments: [4]AttachmentReplicaWork = undefined;
+    try testing.expectEqual(aid(2), s.dirtyPortableAttachmentsInto(&attachments)[0].attachment_id);
+    try testing.expectEqual(aid(2), s.dirtyAttachmentProjectionsInto(&attachments)[0].attachment_id);
+    var group_work: [4]LocalChannelProjectionWork = undefined;
+    try testing.expectEqual(tok(2), s.dirtyLocalProjectionsInto(&group_work)[0].token);
+    var attachment_work: [4]AttachmentLocalChannelProjectionWork = undefined;
+    try testing.expectEqual(aid(2), s.dirtyAttachmentLocalProjectionsInto(&attachment_work)[0].attachment_id);
+    try expectTokenIndexCoherent(&s);
+}
+
+test "Session lifecycle batch limits refuse entire plan and existing empty account remains capacity" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_accounts = 1, .max_sessions_per_account = 2 });
+    defer s.deinit();
+    const key = try testing.allocator.dupe(u8, "Alice");
+    try s.accounts.put(key, .{});
+    const old = try lifecycleCanonical(&s);
+    const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .admit = .{ .account = "Alice", .client = 1, .signon_ms = 10, .kind = .fresh } } }};
+    try testing.expectError(error.InvalidRequest, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &.{} }));
+    try testing.expectError(error.CandidateLimitExceeded, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops, .limits = .{ .max_operations = 0 } }));
+    try testing.expectError(error.CandidateLimitExceeded, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops, .limits = .{ .max_preview_bytes = 0 } }));
+    try testing.expectError(error.CandidateLimitExceeded, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops, .limits = .{ .max_candidate_rows = 0 } }));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    try testing.expectEqual(@as(usize, 1), ticket.preview().final_accounts);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try testing.expect(s.clientHasAttachment("Alice", 1, s.accounts.get("Alice").?.items.items[0].token, s.accounts.get("Alice").?.items.items[0].attachment_id.?));
+    const after = try lifecycleCanonical(&s);
+    ticket.deinit();
+    try testing.expectError(error.CandidateLimitExceeded, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops, .limits = .{ .max_discovery_rows = 0 } }));
+    try testing.expectEqual(after, try lifecycleCanonical(&s));
+}
+
+fn expectLifecycleCountsAndAttachments(s: *SessionStore) !void {
+    s.lock.lockShared();
+    defer s.lock.unlockShared();
+    var counts = LifecycleCounts{};
+    var attachments: usize = 0;
+    var rows = s.accounts.iterator();
+    while (rows.next()) |account| for (account.value_ptr.items.items) |row| {
+        // Independent cardinality assertions for each scheduler lane.
+        counts.replica += @intFromBool(row.replica_dirty);
+        counts.projection += @intFromBool(row.replica_projection_dirty);
+        counts.attachment_replica += @intFromBool(row.attachment_replica_dirty);
+        counts.attachment_projection += @intFromBool(row.attachment_replica_projection_dirty);
+        counts.group_journal += @intFromBool(row.local_channel_projections != null and row.local_channel_projections.?.len != 0);
+        counts.attachment_journal += @intFromBool(row.attachment_channel_projections != null and row.attachment_channel_projections.?.len != 0);
+        if (row.attachment_id) |id| {
+            attachments += 1;
+            const loc = s.attachment_index.get(id.raw).?;
+            try testing.expectEqual(row.client, loc.client);
+            try testing.expectEqualStrings(account.key_ptr.*, loc.account);
+        }
+    };
+    try testing.expectEqual(attachments, s.attachment_index.count());
+    try testing.expectEqual(counts.replica, s.dirty_replica_rows);
+    try testing.expectEqual(counts.projection, s.dirty_projection_rows);
+    try testing.expectEqual(counts.attachment_replica, s.dirty_attachment_replica_rows);
+    try testing.expectEqual(counts.attachment_projection, s.dirty_attachment_projection_rows);
+    try testing.expectEqual(counts.group_journal, s.dirty_local_projection_rows);
+    try testing.expectEqual(counts.attachment_journal, s.dirty_attachment_local_projection_rows);
+}
+
+test "Session lifecycle batch ambiguous aliases and dirty claimant require exact explicit replacement" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const first = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    _ = try s.attachWithAttachment("ALICE", 1, tok(2), aid(2), 20);
+    const duplicate = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .remove = .{ .source = lifecycleSelector("Alice", first), .reason = .logout } } }};
+    const old = try lifecycleCanonical(&s);
+    try testing.expectError(error.AmbiguousPhysicalBinding, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &duplicate }));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    try testing.expect(s.remove("ALICE", 1));
+    _ = try s.attachWithAttachment("Alice", 2, tok(2), aid(2), 20);
+    try testing.expect(s.markDetachedWithSnapshot("Alice", 1, "exact ghost snapshot"));
+    const ghost = s.findDetachedAttachmentSessionInAccount("Alice", tok(1), aid(1)).?;
+    const claimant = s.findAttachedTokenSessionInAccount("Alice", tok(2), 0).?;
+    _ = try s.armAttachmentLocalChannelProjection(tok(2), aid(2), "#claimant", true, 7);
+    var ops = [_]LifecycleRequest{.{ .request_id = 2, .intent = .{ .reconnect = .{ .source = lifecycleSelector("Alice", ghost), .claimant_client = 2, .claimant = lifecycleSelector("Alice", claimant) } } }};
+    const dirty = try lifecycleCanonical(&s);
+    try testing.expectError(error.InvalidRequest, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+    try testing.expectEqual(dirty, try lifecycleCanonical(&s));
+    ops[0].intent.reconnect.retire_claimant = true;
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    try testing.expectEqual(@as(usize, 1), ticket.preview().retired_attachments.len);
+    try testing.expectEqual(@as(u8, 1), ticket.preview().retired_attachments[0].row.attachment_journal.len);
+    try testing.expectEqualStrings("#claimant", ticket.preview().retired_attachments[0].row.attachment_journal.items[0].channel());
+    try testing.expectEqual(@as(usize, 1), ticket.preview().remaps.len);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try testing.expect(s.clientHasAttachment("Alice", 2, tok(1), aid(1)));
+    try expectTokenIndexCoherent(&s);
+    try expectLifecycleCountsAndAttachments(&s);
+}
+
+test "Session lifecycle batch preserves completed empty journal clock and explicit sentinel facts" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const live = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const armed = try s.armTokenLocalChannelProjection(tok(1), "#done", true, 1);
+    try testing.expect(s.clearTokenLocalChannelProjection(tok(1), "#done", armed.generation));
+    const revision = s.token_index.get(tok(1)).?.local_projections.revision;
+    try testing.expect(revision != 0);
+    try testing.expect(s.accounts.get("Alice").?.items.items[0].local_channel_projections == null);
+    const ops = [_]LifecycleRequest{
+        .{ .request_id = 1, .intent = .{ .detach = .{ .source = lifecycleSelector("Alice", live) } } },
+        .{ .request_id = 2, .intent = .{ .admit = .{ .account = "Bob", .client = 2, .signon_ms = 20, .kind = .sentinel } } },
+    };
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    const absence = lifecycleFindRow(ticket.preview().after, 2).?;
+    try testing.expect(tokenIsSentinel(absence.token) and absence.attachment_id == null and absence.attached);
+    try testing.expectEqual(@as(usize, 2), ticket.preview().affected_physical.len);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try testing.expectEqual(revision, s.token_index.get(tok(1)).?.local_projections.revision);
+    try testing.expect(!s.token_index.contains(tok(0)));
+    try expectTokenIndexCoherent(&s);
+    try expectLifecycleCountsAndAttachments(&s);
+    ticket.deinit();
+    const sentinel = s.accounts.get("Bob").?.items.items[0];
+    var changed = [_]LifecycleRequest{.{ .request_id = 3, .intent = .{ .admit = .{ .account = "Bob", .client = 2, .signon_ms = 30, .kind = .fresh, .replace_sentinel = lifecycleSelector("Bob", sentinel) } } }};
+    try testing.expect(s.markDetachedWithSnapshot("Bob", 2, "dirty sentinel"));
+    const old = try lifecycleCanonical(&s);
+    try testing.expectError(error.StaleSelector, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &changed }));
+    changed[0].intent.admit.replace_sentinel.?.attached = false;
+    try testing.expectError(error.InvalidRequest, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &changed }));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+}
+
+fn lifecycleSameTokenClaimantRetirement(pending: bool) !void {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const claimant = try s.attachWithAttachment("ALICE", 2, tok(1), aid(2), 20);
+    try testing.expect(s.markDetachedWithSnapshot("Alice", 1, "ghost snapshot"));
+    const ghost = s.findDetachedAttachmentSessionInAccount("Alice", tok(1), aid(1)).?;
+    if (pending) _ = try s.armAttachmentLocalChannelProjection(tok(1), aid(2), "#claimant work", true, 3);
+    const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .reconnect = .{ .source = lifecycleSelector("Alice", ghost), .claimant_client = 2, .claimant = lifecycleSelector("ALICE", claimant), .retire_claimant = pending } } }};
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    const p = ticket.preview();
+    try testing.expectEqual(@as(usize, 1), p.remaps.len);
+    try testing.expectEqual(aid(1), p.remaps[0].attachment_id);
+    try testing.expectEqual(@as(usize, 1), p.retired_attachments.len);
+    try testing.expectEqual(aid(2), p.retired_attachments[0].row.attachment_id.?);
+    try testing.expectEqual(LifecycleRemoval.claimant_replacement, p.retired_attachments[0].reason);
+    try testing.expectEqual(pending, p.retired_attachments[0].attachment_work_retired);
+    if (pending) try testing.expectEqualStrings("#claimant work", p.retired_attachments[0].row.attachment_journal.items[0].channel());
+    try testing.expectEqual(@as(usize, 1), p.token_groups.len);
+    try testing.expectEqual(@as(usize, 1), p.token_groups[0].final_rows);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try testing.expect(s.clientHasAttachment("Alice", 2, tok(1), aid(1)));
+    try expectLifecycleCountsAndAttachments(&s);
+}
+
+test "Session lifecycle batch causal same token pristine claimant still retires displaced stable attachment" {
+    try lifecycleSameTokenClaimantRetirement(false);
+}
+test "Session lifecycle batch causal same token claimant work retires separately from ghost remap" {
+    try lifecycleSameTokenClaimantRetirement(true);
+}
+
+fn lifecyclePermutation(reverse: bool) !struct { state: [32]u8, effects: [32]u8 } {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const x = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const y = try s.attachWithAttachment("Alice", 2, tok(2), aid(2), 20);
+    _ = try s.attachWithAttachment("Alice", 3, tok(3), aid(3), 30);
+    try testing.expect(s.markPortableResumeIssued("Alice", 1));
+    try testing.expect(s.markTokenReplicaDirty(tok(1)));
+    try testing.expect(s.markTokenReplicaProjectionDirty(tok(1)));
+    _ = try s.armTokenLocalChannelProjection(tok(1), "#x", true, 1);
+    _ = try s.armTokenLocalChannelProjection(tok(2), "#y", false, 0);
+    _ = try s.armTokenLocalChannelProjection(tok(3), "#z", true, 2);
+    const xy = LifecycleRequest{ .request_id = 1, .intent = .{ .rebind = .{ .source = lifecycleSelector("Alice", x), .target_account = "Alice", .target_token = tok(2), .kind = .join_existing, .retire_attachment_work = true } } };
+    const yz = LifecycleRequest{ .request_id = 2, .intent = .{ .rebind = .{ .source = lifecycleSelector("Alice", y), .target_account = "Alice", .target_token = tok(3), .kind = .join_existing, .retire_attachment_work = true } } };
+    const ops = if (reverse) [_]LifecycleRequest{ yz, xy } else [_]LifecycleRequest{ xy, yz };
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    const p = ticket.preview();
+    try testing.expect(!lifecycleFindRow(p.after, 2).?.portable_resume);
+    try testing.expect(!lifecycleFindRow(p.after, 3).?.replica_dirty);
+    try testing.expectEqual(@as(u8, 2), lifecycleFindRow(p.after, 3).?.group_journal.len);
+    var h = std.crypto.hash.Blake3.init(.{});
+    std.hash.autoHashStrat(&h, .{ p.before, p.after, p.affected_physical, p.retired_attachments, p.remaps, p.token_groups, p.final_accounts, p.final_rows, p.counts, p.projection_generation }, .DeepRecursive);
+    var effects: [32]u8 = undefined;
+    h.final(&effects);
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try expectTokenIndexCoherent(&s);
+    try expectLifecycleCountsAndAttachments(&s);
+    return .{ .state = try lifecycleCanonical(&s), .effects = effects };
+}
+
+test "Session lifecycle batch causal chained rebinds are immutable OLD proof and permutation equivalent" {
+    const forward = try lifecyclePermutation(false);
+    const reverse = try lifecyclePermutation(true);
+    try testing.expectEqual(forward.state, reverse.state);
+    try testing.expectEqual(forward.effects, reverse.effects);
+}
+
+test "Session lifecycle batch causal included sentinel rejects hidden foreign physical duplicate" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.attach("Alice", 1, tok(0), 10);
+    _ = try s.attach("Foreign", 1, tok(0), 20);
+    const old = try lifecycleCanonical(&s);
+    const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .admit = .{ .account = "Alice", .client = 2, .signon_ms = 30, .kind = .fresh } } }};
+    if (s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops })) |prepared| {
+        var ticket = prepared;
+        defer ticket.deinit();
+        return error.TestExpectedAmbiguousPhysicalRefusal;
+    } else |err| try testing.expectEqual(error.AmbiguousPhysicalBinding, err);
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+}
+
+test "Session lifecycle batch causal single operation distinct token closure has indexed lookup work" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 256 });
+    defer s.deinit();
+    for (0..129) |i| _ = try s.attachWithAttachment("Alice", @intCast(i + 1), tokenNumber(i + 1), aidNumber(i + 1), @intCast(i));
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &.{}, .observation_only = .{ .account = "Alice", .client = 999 } });
+    defer ticket.deinit();
+    const metric = ticket.preview().complexity;
+    std.debug.print("Session causal private indexed lookups: groups={d} keys={d}\n", .{ metric.candidate_group_lookups, metric.candidate_key_lookups });
+    try testing.expect(metric.candidate_group_lookups <= 3 * 129);
+    try testing.expectEqual(@as(usize, 129), metric.group_source_row_visits);
+}
+
+test "Session lifecycle batch private folded key index and checked lookup budgets are bounded" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_accounts = 256 });
+    defer s.deinit();
+    for (0..129) |i| {
+        var key: [8]u8 = "abcdefgh".*;
+        for (&key, 0..) |*char, bit| if (i & (@as(usize, 1) << @intCast(bit)) != 0) {
+            char.* = std.ascii.toUpper(char.*);
+        };
+        _ = try s.attachWithAttachment(&key, @intCast(i + 1), tok(1), aidNumber(i + 1), @intCast(i));
+    }
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &.{}, .observation_only = .{ .account = "abcdefgh", .client = 999 } });
+    defer ticket.deinit();
+    const p = ticket.preview();
+    try testing.expectEqual(@as(usize, 129), p.before.len);
+    try testing.expectEqual(@as(usize, 129), p.after.len);
+    try testing.expect(p.complexity.candidate_key_lookups <= 20 * 129);
+    try testing.expect(p.complexity.candidate_group_lookups <= 3 * 129);
+    const work = p.complexity.candidate_key_lookup_work + p.complexity.candidate_group_lookup_work;
+    try testing.expect(work > 0 and work < 64 * 1024);
+    ticket.abort();
+    ticket.deinit();
+    const old = try lifecycleCanonical(&s);
+    const spec = LifecycleBatchSpec{ .io = testing.io, .operations = &.{}, .observation_only = .{ .account = "abcdefgh", .client = 999 }, .limits = .{ .max_candidate_lookup_work = work - 1 } };
+    try testing.expectError(error.CandidateLimitExceeded, s.prepareLifecycleBatch(spec));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    var enough = spec;
+    enough.limits.max_candidate_lookup_work = work;
+    ticket = try s.prepareLifecycleBatch(enough);
+    try testing.expectEqual(work, ticket.preview().complexity.candidate_key_lookup_work + ticket.preview().complexity.candidate_group_lookup_work);
+    ticket.abort();
+    ticket.deinit();
+    var tiny = spec;
+    tiny.limits.max_candidate_lookup_work = 0;
+    try testing.expectError(error.CandidateLimitExceeded, s.prepareLifecycleBatch(tiny));
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+}
+
+test "Session lifecycle batch recursive seal validates caller independent nested snapshot contents" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const live = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .detach = .{ .source = lifecycleSelector("Alice", live), .snapshot = .{ .replace = "owned payload" } } } }};
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    const payload = ticket.owned.?.accounts.items[0].final.items.items[0].snapshot.?;
+    payload[0] = 'X';
+    try testing.expectError(error.InvalidTicket, ticket.validateForCut());
+    payload[0] = 'o';
+    try ticket.validateForCut();
+    ticket.abort();
+}
+
+test "Session lifecycle batch same token reconnect every allocation owns distinct retirement and retry" {
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var s = SessionStore.init(failing.allocator());
+        defer s.deinit();
+        _ = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+        const claimant = try s.attachWithAttachment("ALICE", 2, tok(1), aid(2), 20);
+        try testing.expect(s.markDetachedWithSnapshot("Alice", 1, "OLD ghost snapshot"));
+        _ = try s.armAttachmentLocalChannelProjection(tok(1), aid(2), "#claimant pending", true, 3);
+        const ghost = s.findDetachedAttachmentSessionInAccount("Alice", tok(1), aid(1)).?;
+        const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .reconnect = .{ .source = lifecycleSelector("Alice", ghost), .claimant_client = 2, .claimant = lifecycleSelector("ALICE", claimant), .retire_claimant = true } } }};
+        const old = try lifecycleCanonical(&s);
+        failing.fail_index = failing.alloc_index + index;
+        var ticket = s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(old, try lifecycleCanonical(&s));
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+            defer retry.deinit();
+            try testing.expectEqual(@as(usize, 1), retry.preview().retired_attachments.len);
+            try testing.expectEqual(aid(2), retry.preview().retired_attachments[0].row.attachment_id.?);
+            try testing.expectEqual(@as(usize, 1), retry.preview().remaps.len);
+            try retry.validateForCut();
+            failing.fail_index = failing.alloc_index;
+            retry.commit();
+            retry.finish();
+            try expectTokenIndexCoherent(&s);
+            try expectLifecycleCountsAndAttachments(&s);
+            continue;
+        };
+        defer ticket.deinit();
+        try ticket.validateForCut();
+        failing.fail_index = failing.alloc_index;
+        ticket.commit();
+        ticket.finish();
+        try testing.expect(s.clientHasAttachment("Alice", 2, tok(1), aid(1)));
+        try testing.expect(index > 20);
+        std.debug.print("Session same-token reconnect allocation sweep: {d} failures before success\n", .{index});
+        break;
+    }
+}
+
+test "Session lifecycle batch contradictory chained journal intents refuse every permutation before cut" {
+    for (0..2) |permutation| {
+        var s = SessionStore.init(testing.allocator);
+        defer s.deinit();
+        const x = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+        const y = try s.attachWithAttachment("Alice", 2, tok(2), aid(2), 20);
+        _ = try s.attachWithAttachment("Alice", 3, tok(3), aid(3), 30);
+        const first = try s.armTokenLocalChannelProjection(tok(1), "#same", true, 7);
+        _ = try s.armTokenLocalChannelProjection(tok(2), "#SAME", false, 0);
+        // Two individually coherent OLD groups with contradictory same-clock
+        // work cannot be merged by either compound request order.
+        s.lock.lockExclusive();
+        const conflicting = s.accounts.getPtr("Alice").?.items.items[1].local_channel_projections.?;
+        conflicting.revision = first.generation;
+        conflicting.items[0].generation = first.generation;
+        s.token_index.getPtr(tok(2)).?.local_projections = conflicting.*;
+        s.lock.unlockExclusive();
+        const xy = LifecycleRequest{ .request_id = 1, .intent = .{ .rebind = .{ .source = lifecycleSelector("Alice", x), .target_account = "Alice", .target_token = tok(2), .kind = .join_existing } } };
+        const yz = LifecycleRequest{ .request_id = 2, .intent = .{ .rebind = .{ .source = lifecycleSelector("Alice", y), .target_account = "Alice", .target_token = tok(3), .kind = .join_existing } } };
+        const ops = if (permutation == 0) [_]LifecycleRequest{ xy, yz } else [_]LifecycleRequest{ yz, xy };
+        const old = try lifecycleCanonical(&s);
+        try testing.expectError(error.ProjectionConflict, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops }));
+        try testing.expectEqual(old, try lifecycleCanonical(&s));
+        try testing.expect(s.active_lifecycle == null);
     }
 }

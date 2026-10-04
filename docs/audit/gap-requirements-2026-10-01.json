@@ -1,0 +1,1122 @@
+{
+  "source": "docs/ROADMAP-GAPS-2026-09.md",
+  "source_sha256": "afd2b731f046ab9bbe8166f0e58c68487663ac5dcd538d42698a6b0b7d752328",
+  "scope_note": "Complete extraction of primary GAP headings and moonshot GAP table rows, including audit additions. This is a requirements inventory, not completion evidence. The document cuts and conditional client/release work remain explicit. Current source and runtime evidence must be audited separately; stale document assertions do not establish missing or complete behavior. Global invariants, ordering/deployment rules and cross-repo contracts are retained verbatim in global_context; their historical status claims are not current verification.",
+  "goal": "Keep going with our goals from the document and close all gaps",
+  "primary_requirement_count": 92,
+  "document_cuts": [
+    {
+      "name": "`armor enc` openssl-compatible format",
+      "reason": "AEAD substrate only. Exit 3 stays.",
+      "source_line": 1215
+    },
+    {
+      "name": "TURN relay allocation",
+      "reason": "No sockets and no auth secret. `MEDIA TURN` fails `TURN_CUT`. `substrate/turn.zig` stays framing-only.",
+      "source_line": 1216
+    },
+    {
+      "name": "ECH with HelloRetryRequest",
+      "reason": "An accepted ECH inner that needs a retry fails `EchHrrUnsupported`. An ECH client fails `HelloRetryRequestUnsupported`. No ClientHello2 re-seal.",
+      "source_line": 1217
+    },
+    {
+      "name": "AES-GCM HPKE for ECH",
+      "reason": "`hpke.aead_id` stays ChaCha20-Poly1305 `0x0003`. Any other AEAD fails `UnsupportedEchSuite`.",
+      "source_line": 1218
+    },
+    {
+      "name": "x448, P-384, and P-521 key shares",
+      "reason": "The ClientHello offers X25519, P-256, and X25519MLKEM768 only. P-384 ECDSA certificate verify stays.",
+      "source_line": 1219
+    },
+    {
+      "name": "AES-CCM cipher suites",
+      "reason": "Named, and `isAllowed` is false. No caller.",
+      "source_line": 1220
+    },
+    {
+      "name": "brotli and zstd certificate compression",
+      "reason": "`pickSupported` returns zlib only.",
+      "source_line": 1221
+    },
+    {
+      "name": "`armor s_server`",
+      "reason": "Exit 3. No standalone listener socket.",
+      "source_line": 1222
+    },
+    {
+      "name": "`armor s_client -connect`",
+      "reason": "`run` returns `NotImplemented` after the client is built. `handshakeInMemory` stays.",
+      "source_line": 1223
+    },
+    {
+      "name": "In-daemon CRL and CT fetch",
+      "reason": "Callers pass DER. `require_crl` defaults false and `require_sct` defaults 0. No CDP or CT URL fetch.",
+      "source_line": 1224
+    },
+    {
+      "name": "`enforce_cert_signature_algorithms` on by default",
+      "reason": "The default stays off. The chain check runs only when the flag is set.",
+      "source_line": 1225
+    },
+    {
+      "name": "BoGo beyond the pinned 24/3 lane",
+      "reason": "`DisabledTests` names a reason per entry. A missing BoringSSL checkout is not a pass.",
+      "source_line": 1226
+    },
+    {
+      "name": "Delegated-credential mint and rotation",
+      "reason": "A presented credential is verified. Nothing mints or rotates one.",
+      "source_line": 1227
+    },
+    {
+      "name": "CLI Landlock, seccomp, pledge, and unveil",
+      "reason": "The armor CLI applies none. Daemon Linux landlock and seccomp stay on the GAP-X3 path. pledge and unveil are absent.",
+      "source_line": 1228
+    },
+    {
+      "name": "Full DTLS listener for IRC",
+      "reason": "Media-plane DTLS-SRTP is the DTLS this daemon has.",
+      "source_line": 1229
+    },
+    {
+      "name": "PQ hybrid certificates of our own design",
+      "reason": "1.x stays verify-only. No private hybrid profile (GAP-K5).",
+      "source_line": 1230
+    },
+    {
+      "name": "Adopting `substrate/io/ring.zig` as the server",
+      "reason": "Unfinished, and it is not the live ring.",
+      "source_line": 1231
+    },
+    {
+      "name": "Multishot recv, buf rings, `send_zc` inside 0.8",
+      "reason": "Helix buffer ownership. Separate project after GAP-X1.",
+      "source_line": 1232
+    },
+    {
+      "name": "XDP, BPF firewall, TPROXY, `SCHED_FIFO`",
+      "reason": "Not the IRC problem.",
+      "source_line": 1233
+    },
+    {
+      "name": "WEBIRC, identd, STARTTLS",
+      "reason": "Clean-room exclusions in the Codex contract.",
+      "source_line": 1234
+    },
+    {
+      "name": "Services as fake pseudoclient users",
+      "reason": "Services are real commands.",
+      "source_line": 1235
+    },
+    {
+      "name": "In-daemon CT-log gossip behaving as a CA",
+      "reason": "Operator-supplied pins, or GAP-K6's fetch, nothing smarter.",
+      "source_line": 1236
+    },
+    {
+      "name": "A second flood guard",
+      "reason": "`flood_guard.zig` replaced the earlier three. Extend it with GAP-D4's account axis.",
+      "source_line": 1237
+    },
+    {
+      "name": "A second WAL beside OroStore",
+      "reason": "GAP-D* writes the families.",
+      "source_line": 1238
+    },
+    {
+      "name": "Competitive clones of another network's bridge protocol",
+      "reason": "GAP-N3 if ever, from our wire, not from theirs.",
+      "source_line": 1239
+    }
+  ],
+  "requirements": [
+    {
+      "id": "GAP-D1",
+      "title": "Cold history",
+      "source_line": 189,
+      "source_end_line": 204,
+      "accept": "a killed-and-restarted node restores bounded channel and DM history\nfor every target that was inside the retention window, with the same msgids.\nSearch hits the restored rows. E2EE ciphertext is stored as ciphertext and is\nnot indexed as text. Restore is allocation-failure atomic. A USR2 of the same\nimage still round-trips.",
+      "specification": "**Size L.** Lotus (`src/proto/lotus.zig`) is an in-memory ring and performs no\nI/O. `CapsuleKind.history` carries that ring, plus the `SIDX` search checkpoint,\nacross Helix only (`helix/capsule.zig`, `helix/history_checkpoint.zig`). A cold\nrestart starts an empty `CHATHISTORY` and an empty `SEARCH`.\n\n**Accept:** a killed-and-restarted node restores bounded channel and DM history\nfor every target that was inside the retention window, with the same msgids.\nSearch hits the restored rows. E2EE ciphertext is stored as ciphertext and is\nnot indexed as text. Restore is allocation-failure atomic. A USR2 of the same\nimage still round-trips.\n\n**Home:** OroStore or a sibling WAL, `CapsuleKind.history` unchanged in meaning,\n`src/daemon/search_index.zig`.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-D2",
+      "title": "Offline memos die with the process",
+      "source_line": 205,
+      "source_end_line": 228,
+      "accept": "a memo sent to an offline account is delivered after a cold restart\nand after a USR2. `MARKREAD` for an account is the same marker after USR2 and\nis visible to that account's attachment on the other node (the mesh half is\nGAP-P16). The mailbox bounds stay. A mesh `MEMO_PUSH` hint still fires when\nthe account attaches on either node. WHOWAS either rides a real capsule or the\ncodec file is deleted so it stops claiming the upgrade path.",
+      "specification": "**Size M.** `src/daemon/memo.zig` says \"in-memory + bounded; a WAL/snapshot\nbacking can be layered later.\" `CapsuleKind` has no memo kind.\n`helix/memo_capsule.zig` is not maintained. Memos ride `memo_durable.zig` and\nthe OroStore `memos` family. `CapsuleKind` still has no memo kind.\n\nThe same pattern covers other codecs that describe themselves as the upgrade\npayload and are not sealed and not `CapsuleKind`s: `read_marker_capsule.zig`,\n`whowas_capsule.zig`, `chathistory_cursor_capsule.zig`,\n`bouncer_buffer_capsule.zig`, `account_capsule.zig`. `ratelimit_capsule.zig`\nis not maintained.\nRead markers are a process-local store. Bouncer rewind on `JOIN` uses that\nmarker. After USR2, offline memos are gone, `MARKREAD` positions reset, WHOWAS\nis empty, and connect throttles are zero. Channel text in Lotus still crosses\nHelix.\n\n**Accept:** a memo sent to an offline account is delivered after a cold restart\nand after a USR2. `MARKREAD` for an account is the same marker after USR2 and\nis visible to that account's attachment on the other node (the mesh half is\nGAP-P16). The mailbox bounds stay. A mesh `MEMO_PUSH` hint still fires when\nthe account attaches on either node. WHOWAS either rides a real capsule or the\ncodec file is deleted so it stops claiming the upgrade path.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-D3",
+      "title": "Gags, vhosts, and \"persistent\" RAM sets",
+      "source_line": 229,
+      "source_end_line": 239,
+      "accept": "`MODE +z` gags and granted vhosts are still in force after USR2 and\nafter cold start. Reconnect behavior stays as it is.",
+      "specification": "**Size M.** `gag_set.zig` documents a gag that survives reconnection and then\nsays the module performs no I/O. Nothing under `src/daemon/helix/` references\nit, so a USR2 drops the set. `guise.Registry` (vhosts) lives on `LinuxServer`\nwith no capsule kind and no OroStore family in use (`store.zig` `vhosts` is\ntest-only).\n\n**Accept:** `MODE +z` gags and granted vhosts are still in force after USR2 and\nafter cold start. Reconnect behavior stays as it is.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-D4",
+      "title": "Abuse state does not survive upgrade",
+      "source_line": 240,
+      "source_end_line": 259,
+      "accept": "three separate outcomes, shipped as separate slices if needed:\n\n1. An oper can ask why a live connection was throttled, shunned, DNSBL-marked,\n   or reputation-decayed, from current RAM (`WARD` already answers ward match;\n   this is the other engines).\n2. Shun, spamtrap, Koshi, and reputation rows survive USR2. Cold start reloads\n   them from a bounded store.\n3. A per-account score survives reconnect and is a different axis from the\n   per-connection token bucket. It never replaces the connection guard.",
+      "specification": "**Size L.** Flood buckets die with the connection by design\n(`flood_guard.zig`: \"a per-account abuse score that survived reconnects would\nbe a separate axis; this module does not model it\"). Reputation, clone tables,\ngags, shuns, spamtraps, and Koshi patterns are RAM. `ratelimit_capsule.zig`\nis not maintained, and it was not a `CapsuleKind`.\n`SPAMTRAP LIST` reports counts, not the recent trips. There is no oper dump of\nreputation rows, flood buckets, or the gag set.\n\n**Accept:** three separate outcomes, shipped as separate slices if needed:\n\n1. An oper can ask why a live connection was throttled, shunned, DNSBL-marked,\n   or reputation-decayed, from current RAM (`WARD` already answers ward match;\n   this is the other engines).\n2. Shun, spamtrap, Koshi, and reputation rows survive USR2. Cold start reloads\n   them from a bounded store.\n3. A per-account score survives reconnect and is a different axis from the\n   per-connection token bucket. It never replaces the connection guard.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-D5",
+      "title": "Credential and recovery splits",
+      "source_line": 260,
+      "source_end_line": 274,
+      "accept": "one restart story. A verify or reset token issued before a crash is\neither still valid until its TTL or explicitly invalidated and the user can\nrequest another. SCRAM and CertFP binds that the server advertised before the\ncrash still work after it. Pending enrollments may stay RAM if the accept says\nso.",
+      "specification": "**Size M.** PLAIN account records are in OroStore. Confirmed TOTP secrets are\nmirrored to `.props`. Pending TOTP enrollments, `REGISTER` verify tokens, and\n`RESETPASS` tokens are in-memory (`server.zig` on `reset_store`: \"in-memory\nonly, like `account_verifies`\"). SCRAM is documented as an in-memory companion\nof the PLAIN record (`services.zig`). CertFP bind has the same comment, with\n`durable_credential_props` as a third path.\n\n**Accept:** one restart story. A verify or reset token issued before a crash is\neither still valid until its TTL or explicitly invalidated and the user can\nrequest another. SCRAM and CertFP binds that the server advertised before the\ncrash still work after it. Pending enrollments may stay RAM if the accept says\nso.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-D6",
+      "title": "Backup covers the account snap, not the product",
+      "source_line": 275,
+      "source_end_line": 286,
+      "accept": "`onyx-server` can verify a backup set and restore it into a scratch\ndirectory. The set lists every family it includes and every family it\ndeliberately excludes. A restore drill is a documented command, not a hope.",
+      "specification": "**Size M.** `[backup]` copies the OroStore snapshot and the chanstats snapshot\n(`server.zig` backup path). It does not copy history, search, memos, vhosts,\nwebhook TSVs, or abuse tables. Webhooks persist only when `webhook_store_path`\nis set. Event Spine history persists only when `oper.event_history_path` is\nset; empty means process lifetime (`server.zig` ~1673).\n\n**Accept:** `onyx-server` can verify a backup set and restore it into a scratch\ndirectory. The set lists every family it includes and every family it\ndeliberately excludes. A restore drill is a documented command, not a hope.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-D7",
+      "title": "Mail and password reset are best-effort",
+      "source_line": 287,
+      "source_end_line": 299,
+      "accept": "a configured relay with a non-empty trust store delivers or records\na durable failure. Tokens are not issued when the pending-address write fails.\nLive mail stays off until that relay exists. This item does not enable mail on\nthe fleet by itself.",
+      "specification": "**Size M.** `mail_sender.zig` has no retry. Its TLS trust-anchor set is empty,\nso a verified session to a real relay needs `insecure_skip_verify`. Live nodes\nkeep mail disabled because no relay is configured\n(`release-v0.7.0-feature-activation.md`). `setAccountEmailPending` failure is\nswallowed after the RAM token exists.\n\n**Accept:** a configured relay with a non-empty trust store delivers or records\na durable failure. Tokens are not issued when the pending-address write fails.\nLive mail stays off until that relay exists. This item does not enable mail on\nthe fleet by itself.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-D8",
+      "title": "Web Push is lossy and Linux-only",
+      "source_line": 300,
+      "source_end_line": 311,
+      "accept": "overflow is a metric and an oper event, not a silent drop. The\nsubscription rows in `.props` stay. Delivery remains at-least-attempted, with\nthe drop counted. A portable backend (Wave 6) either implements the worker or\nkeeps the explicit disable.\n\n---",
+      "specification": "**Size S.** `webpush.zig` caps the queue (256) and drops on overflow. The\nnon-Linux build disables the worker.\n\n**Accept:** overflow is a metric and an oper event, not a silent drop. The\nsubscription rows in `.props` stay. Delivery remains at-least-attempted, with\nthe drop counted. A portable backend (Wave 6) either implements the worker or\nkeeps the explicit disable.\n\n---",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A1",
+      "title": "OCG2 projection and mint",
+      "source_line": 317,
+      "source_end_line": 333,
+      "accept": "`projection_enabled = true` boots, projects durable authority onto\nlive sessions, and rolls back to the previous image on failure. Every\ntransition is on the audit trail. `mint` stays available only on the configured\nauthority node, refuses a private key in TOML, and revokes mesh-wide. A DST\ncovers project across restart. Until that accept exists, the keys stay rejected\nat boot — that part is already right.",
+      "specification": "**Size XL.** `ocg2RuntimeModeSupported` returns true only for `disabled` and\n`observe` (`src/daemon/config_boot.zig`). `project` and `mint` are parsed and\nthen rejected so a restart cannot half-apply them. Observe restores a durable\nimage, checks a bounded reconciliation, and changes no privileges. The issuer\nmodule can mint permits in tests; the boot path cannot. Live config keeps OCG2\ndisabled. Today's operators are the config `OperRegistry` plus mesh\n`GRANT`/`REVOKE` (OCG1), optionally reloaded from `oper_grants_path`.\n\n**Accept:** `projection_enabled = true` boots, projects durable authority onto\nlive sessions, and rolls back to the previous image on failure. Every\ntransition is on the audit trail. `mint` stays available only on the configured\nauthority node, refuses a private key in TOML, and revokes mesh-wide. A DST\ncovers project across restart. Until that accept exists, the keys stay rejected\nat boot — that part is already right.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A2",
+      "title": "MESSAGE_V2 authoring is still compat, and \"durable\" means Helix",
+      "source_line": 334,
+      "source_end_line": 364,
+      "accept": "a seeded DST shows one accepted id across partition and USR2, with\nno duplicate delivery and no silent legacy fallthrough once the mode is\n`active`. A separate accept, GAP-D1's sibling, is a crash log: after power\nloss the owed hops are still owed, or the design states that power loss may\ndrop the tail and the client must tolerate it. Both live nodes then stage the\nsame epoch and roster and flip `relay_v2_authoring` to `active` in a\ndocumented order. Compat remains the default for a node that has not staged\nthe plan. New configs that set a mesh peer without `require_secured` fail\n`--check-config` or print a doctor warning (GAP-O4).",
+      "specification": "**Size L.** `relay_v2_activation.Mode` defaults to `compat`: peers receive and\nforward v2, and the node authors the legacy representation. `active` requires\na non-zero epoch and a full roster digest, and a node that has been active may\nnot hot-downgrade (`relay_v2_activation.zig`). The transactional admit path is\nimplemented (`docs/design/message-v2-exact-once.md`). That document's \"durable\"\nis a retransmit-until-ACK obligation that survives `USR2`. It is not a disk\nWAL. A cold restart of a node that already acknowledged upstream and still owes\na downstream hop drops the last copy, and it empties the replay watermarks, so\nthe next boot is not the same accepted set.\n\nRequired nodes for authoring are this node plus direct `[mesh].trust_roots`,\nnot \"every node that exists.\" An empty or colliding root set disables the\ndurable membership path. The activation roster is not a signed ready\ncertificate, and changing the roster after activation is not implemented.\n`require_secured` defaults false; v2 authoring, oper grants, and Event Spine\nv2 run on a Mooring `SecuredLink`. A plaintext peer still relays legacy\n`MESSAGE`. The live pair is secured. A fresh node is not, until someone sets\nthe flag.\n\n**Accept:** a seeded DST shows one accepted id across partition and USR2, with\nno duplicate delivery and no silent legacy fallthrough once the mode is\n`active`. A separate accept, GAP-D1's sibling, is a crash log: after power\nloss the owed hops are still owed, or the design states that power loss may\ndrop the tail and the client must tolerate it. Both live nodes then stage the\nsame epoch and roster and flip `relay_v2_authoring` to `active` in a\ndocumented order. Compat remains the default for a node that has not staged\nthe plan. New configs that set a mesh peer without `require_secured` fail\n`--check-config` or print a doctor warning (GAP-O4).",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A3",
+      "title": "Same-account nick coexistence is a session replica, not an identity prop",
+      "source_line": 365,
+      "source_end_line": 385,
+      "accept": "two honest attachments of one account appear under the real nick\non every other secured node, and a forged `account=` without the replica proof\nis UID-renamed. A compromised home node lying about its own users stays the\ndeferred residual, written down, not silently \"fixed\" by trusting props again.",
+      "specification": "**Size L.** `residenceTrusted` (`server.zig`) returns `trusted` only when the\npeer negotiated `SESSION_REPLICA_V2` and this node has a live local attachment\nof that same portable token whose signed origin entry binds account, nick, and\ntoken. The comment at that function is explicit: replicated `identity.key.*`\nand `identity.residence.*` props are retired as an account-authority source,\nbecause a Byzantine peer could publish both the key and a proof it signs.\nDisplay of an origin-authenticated account (WHOIS, oper prefix) is a wider\npath and stays `account_trusted = false` for collisions.\n\nSo two devices of one person, on two nodes, still UID-rename on a third node\nunless a session-replica proof for that exact token is live here. Enrolling an\nidentity key does not, by itself, close it. The blueprint's \"design only\"\nheader is stale. The blueprint's *product* accept is not met.\n\n**Accept:** two honest attachments of one account appear under the real nick\non every other secured node, and a forged `account=` without the replica proof\nis UID-renamed. A compromised home node lying about its own users stays the\ndeferred residual, written down, not silently \"fixed\" by trusting props again.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A4",
+      "title": "Event Spine replay is optional on disk",
+      "source_line": 386,
+      "source_end_line": 397,
+      "accept": "the reference config sets a path, boot reloads it, and a USR2 keeps\nit. An oper subscribed on one node can replay a bounded window of the other\nnode's signed events after that node restarts. Partition healing does not\nduplicate a signed id.",
+      "specification": "**Size S.** Mesh v2 forwarding is implemented. `event_history_path` empty means\nthe replay ring dies with the process. The oper console that shows another\nnode's flood verdicts is a client surface (Onyx C-03 / C-18) on top of a feed\nthe server already has.\n\n**Accept:** the reference config sets a path, boot reloads it, and a USR2 keeps\nit. An oper subscribed on one node can replay a bounded window of the other\nnode's signed events after that node restarts. Partition healing does not\nduplicate a signed id.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A5",
+      "title": "`defer_taskrun` cannot be enabled on the live boot",
+      "source_line": 398,
+      "source_end_line": 412,
+      "accept": "either the ring is created on the thread that will run it and the\nflag combination the kernel accepts is the one the config can express, with a\nregression test for the live four-reactor shape; or the flag is rejected at\n`--check-config` whenever `sqpoll` is on, with the kernel reason in the error.\nThe live nodes stay on the safe side until that test exists.",
+      "specification": "**Size M.** The flag parses and the ring probe fails closed. On the deployed\nfour-reactor image, rings are created before worker threads bind, so every\nreactor returned `InvalidThread`. The kernels also reject\n`SQPOLL | DEFER_TASKRUN | SINGLE_ISSUER` with `EINVAL`. Live config keeps\nSQPOLL on and `defer_taskrun` off\n(`release-v0.7.0-feature-activation.md`).\n\n**Accept:** either the ring is created on the thread that will run it and the\nflag combination the kernel accepts is the one the config can express, with a\nregression test for the live four-reactor shape; or the flag is rejected at\n`--check-config` whenever `sqpoll` is on, with the kernel reason in the error.\nThe live nodes stay on the safe side until that test exists.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A6",
+      "title": "kTLS RX rekey closes the connection",
+      "source_line": 413,
+      "source_end_line": 425,
+      "accept": "a TLS 1.3 peer can rekey in both directions while kTLS RX is on,\nwithout a reconnect, proven against the kernel. Until then `[tls] ktls` stays\n`tx` on the fleet, and `txrx` remains a documented footgun. TLS 1.2 kTLS stays\ncut under the modern-only posture unless a kernel round-trip proves it.",
+      "specification": "**Size M.** Live kTLS is `tx` on purpose. `tls_conn.rekeyKtlsRx` reinstalls\n`TLS_RX` for a KeyUpdate that does not ask for a reply. A KeyUpdate with\n`request_peer` closes: `LinuxServer.handleKtlsRxControl` has no `TLS_TX`\nreinstall and no server KeyUpdate reply. TLS 1.2 kTLS derivation is also\nunwritten (`tls_conn.zig`).\n\n**Accept:** a TLS 1.3 peer can rekey in both directions while kTLS RX is on,\nwithout a reconnect, proven against the kernel. Until then `[tls] ktls` stays\n`tx` on the fleet, and `txrx` remains a documented footgun. TLS 1.2 kTLS stays\ncut under the modern-only posture unless a kernel round-trip proves it.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A7",
+      "title": "New listeners have no Helix checkpoint",
+      "source_line": 426,
+      "source_end_line": 436,
+      "accept": "adding or removing a configured listener either adopts across USR2\nor `--check-config` / the upgrade command refuses with \"cold restart required\"\nbefore the signal is sent. The operator never discovers this from a failed\nadopt.",
+      "specification": "**Size M.** Turning on WebTransport `:4433` required a cold restart because\nHelix has no exact checkpoint for a listener that did not exist in the\npredecessor (`release-v0.7.0-feature-activation.md`).\n\n**Accept:** adding or removing a configured listener either adopts across USR2\nor `--check-config` / the upgrade command refuses with \"cold restart required\"\nbefore the signal is sent. The operator never discovers this from a failed\nadopt.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A8",
+      "title": "OCSP staple fetch does not verify the responder's TLS",
+      "source_line": 437,
+      "source_end_line": 447,
+      "accept": "the fetch uses the daemon trust store. A bad certificate fails the\nfetch and keeps the previous staple. Signature checks stay as they are. The\nfleet stays off while the leaves have no URI.",
+      "specification": "**Size S.** `ocsp_staple.fetchAndPublish` posts with\n`insecure_skip_verify = true`. The OCSP response signature is checked. The\nHTTPS transport is not. Live OCSP is off because the deployed leaves publish\nno responder URI.\n\n**Accept:** the fetch uses the daemon trust store. A bad certificate fails the\nfetch and keeps the previous staple. Signature checks stay as they are. The\nfleet stays off while the leaves have no URI.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A9",
+      "title": "Accounts, nick registrations, and channel registrations are node-local",
+      "source_line": 448,
+      "source_end_line": 462,
+      "accept": "an account registered on eshmaki can `IDENTIFY` on ircx.us, and a\nchannel registration's AKICK and access list are the same list on both, after\nanti-entropy, with a fail-closed rule when the two stores disagree. Password\nverifiers replicate as verifiers, not as plaintext. This is the largest\nproduct hole in the mesh, and it is independent of GAP-A3.",
+      "specification": "**Size XL.** OroStore on each node holds that node's accounts. No S2S services\nframe carries `REGISTER` / nick reg / channel reg. Device *keys* replicate as\nsigned entity props (`E2EEKEY` → `e2ee.device.*`). Key transparency stays\nnode-local. A client that already holds an `MTOKEN` can attach on the other\nnode without that node's password file. A fresh `SASL`/`IDENTIFY` on the other\nnode cannot see the account. Operators do not have one directory.\n\n**Accept:** an account registered on eshmaki can `IDENTIFY` on ircx.us, and a\nchannel registration's AKICK and access list are the same list on both, after\nanti-entropy, with a fail-closed rule when the two stores disagree. Password\nverifiers replicate as verifiers, not as plaintext. This is the largest\nproduct hole in the mesh, and it is independent of GAP-A3.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A10",
+      "title": "A partition longer than the attachment lease looks like a quit",
+      "source_line": 463,
+      "source_end_line": 475,
+      "accept": "a partitioned attachment stays logically present until the session\nTTL or an explicit detach, and it does not flap through `QUIT` and `JOIN` when\nthe lease refresh is merely late. A truly dead peer still converges. Liveness\nstays on the local clock, not on \"a newer HLC means dead.\"",
+      "specification": "**Size M.** A remote attachment suppresses the logical `QUIT`/`PART` only while\na live attachment lease is visible. The lease TTL is 90 seconds, refreshed\nabout every 30. A retained session offer is not enough. A partition longer\nthan the lease, or a peer that never negotiated attachment-lease v2, makes the\nhome node emit the logical quit while the other socket is still up.\n\n**Accept:** a partitioned attachment stays logically present until the session\nTTL or an explicit detach, and it does not flap through `QUIT` and `JOIN` when\nthe lease refresh is merely late. A truly dead peer still converges. Liveness\nstays on the local clock, not on \"a newer HLC means dead.\"",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-A11",
+      "title": "Ripple and Concord are libraries; the daemon re-bursts the world",
+      "source_line": 476,
+      "source_end_line": 504,
+      "accept": "either the daemon drives one gossip/repair tick from reactor 0,\nwith a DST where a partitioned 3-node mesh converges membership and nicks\nwithout a full world copy, or the architecture docs stop calling Ripple the\nlive failure detector and describe the 30-second re-burst as the mechanism,\nincluding its cost as the mesh grows. The two-node fleet's `links_active=1`\npath can stay the ping-timeout detector. Do not claim witnessed quorum on a\npair that cannot form one.\n\n---",
+      "specification": "**Size L.** `S2sPeer.tick` is what emits gossip and repair summaries. The\ndaemon timer calls `probeRtt` (`maybeProbeMeshPeerRtt` on the maintenance\nreactor). It does not call `tick`. `ripple.zig`'s witnessed-death machine and\n`ConcordSync` are not on the live loop. `NETHEALTH` fills every established\npeer as alive and then renders Ripple. `witness_quorum` floors at 2, so a\ntwo-node mesh cannot bury its only peer through that machine anyway. Indirect\ndeath and suspect/dead do not happen. Multi-hop registry entries are not\ngossiped.\n\nLive repair is a full World re-burst about every 30 seconds\n(`membership_resync_interval_ms`) plus `MEMBERSHIP_SYNC` on secured links.\n`nick_claim.zig` runs inside `convergence.zig`, which the daemon does not\nimport. The route table's rule is that a remote member cannot take a nick a\nlocal client holds, unless it is the same trusted account (GAP-A3). Two nodes\ncan each show their own local holder as the winner until the next resync. A\nlost `PART` on a secured link waits for the next authenticated sync.\n\n**Accept:** either the daemon drives one gossip/repair tick from reactor 0,\nwith a DST where a partitioned 3-node mesh converges membership and nicks\nwithout a full world copy, or the architecture docs stop calling Ripple the\nlive failure detector and describe the 30-second re-burst as the mechanism,\nincluding its cost as the mesh grows. The two-node fleet's `links_active=1`\npath can stay the ping-timeout detector. Do not claim witnessed quorum on a\npair that cannot form one.\n\n---",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O1",
+      "title": "Histograms",
+      "source_line": 511,
+      "source_end_line": 520,
+      "accept": "`/metrics` grows histograms for TLS handshake, `PRIVMSG` fan-out,\nMooring RTT, and media relay, merged on reactor 0. A dashboard can tell a\nslow node from a dead peer. Cardinality is bounded.",
+      "specification": "**Size M.** `hdr_histogram.zig`, `ddsketch.zig`, `tdigest.zig`, and\n`substrate/metrics.zig` are imported from `substrate/root.zig` only. No daemon\nfile records a latency bucket.\n\n**Accept:** `/metrics` grows histograms for TLS handshake, `PRIVMSG` fan-out,\nMooring RTT, and media relay, merged on reactor 0. A dashboard can tell a\nslow node from a dead peer. Cardinality is bounded.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O2",
+      "title": "Link health beyond up/down",
+      "source_line": 521,
+      "source_end_line": 531,
+      "accept": "one oper command and the same Prometheus text expose those four\nfacts per peer. Ripple suspicion and value-sync stay different fields. A\n\"still here\" liveness update is never gated on a newer HLC.",
+      "specification": "**Size M.** `link_health.zig` exists. The gauges an operator actually has are\n`onyx_s2s_tcp_active` and `onyx_s2s_links_active`. They already distinguish\n\"TCP open\" from \"Mooring up.\" They do not show RTT, send backlog, last\nanti-entropy round, or \"we are partitioned\" versus \"the peer is down.\"\n\n**Accept:** one oper command and the same Prometheus text expose those four\nfacts per peer. Ripple suspicion and value-sync stay different fields. A\n\"still here\" liveness update is never gated on a newer HLC.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O3",
+      "title": "Flight recorder is 256 events behind `DEBUG`",
+      "source_line": 532,
+      "source_end_line": 543,
+      "accept": "a fault (panic path, reactor give-up, Mooring death) writes the\nrecorder to a bounded file the operator named. Export format is one of qlog or\nthe existing tracelog. A second exporter waits until the first one has a\nreader.",
+      "specification": "**Size S.** `server.zig` holds `trace_recorder: tracelog.FlightRecorder(256)`,\ndumped by oper `DEBUG`. `substrate/tracing.zig` (OTel-style NDJSON) has no\ndaemon caller. `qlog.zig` is used by `substrate/transport_stack.zig`, which the\ndaemon does not import. `transport.qlog_capacity` is not applied.\n\n**Accept:** a fault (panic path, reactor give-up, Mooring death) writes the\nrecorder to a bounded file the operator named. Export format is one of qlog or\nthe existing tracelog. A second exporter waits until the first one has a\nreader.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O4",
+      "title": "`onyx-server doctor`",
+      "source_line": 544,
+      "source_end_line": 555,
+      "accept": "one command, read-only, prints a fixed list of checks against the\nloaded config and, when a metrics URL is given, the live gauges. Each check is\npass, fail, or skipped, with the file or gauge it used. No network action\nexcept the metrics GET the operator asked for.",
+      "specification": "**Size M.** `--check-config` answers \"does this parse.\" It does not answer\n\"why is `links_active` 0 while `tcp_active` is 1,\" \"is the OCSP worker pointed\nat a leaf with no URI,\" or \"is `defer_taskrun` combined with SQPOLL on a kernel\nthat returns `EINVAL`.\"\n\n**Accept:** one command, read-only, prints a fixed list of checks against the\nloaded config and, when a metrics URL is given, the live gauges. Each check is\npass, fail, or skipped, with the file or gauge it used. No network action\nexcept the metrics GET the operator asked for.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O5",
+      "title": "REHASH dry-run",
+      "source_line": 556,
+      "source_end_line": 563,
+      "accept": "`REHASH DRY` prints the changes and applies none. A listener add\nstill reports GAP-A7's cold-restart requirement.",
+      "specification": "**Size S.** REHASH applies. There is no diff of wards, classes, limits, and\nlistener set against the running image.\n\n**Accept:** `REHASH DRY` prints the changes and applies none. A listener add\nstill reports GAP-A7's cold-restart requirement.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O6",
+      "title": "Raid shield",
+      "source_line": 564,
+      "source_end_line": 574,
+      "accept": "reactor 0 correlates join shape across Mooring peers, raises one\nsigned Event Spine verdict, and can engage a channel or network slowmode\n(GAP-C2) that relaxes on its own. A single popular channel's normal growth\ndoes not trip it. The sketches stay bounded.",
+      "specification": "**Size L.** Per-IP and per-connection limits exist. A raid that arrives as one\nuser per address, mesh-wide, does not. `admission.zig`, `count_min_sketch.zig`,\n`topk.zig`, and `gcra.zig` have no daemon caller.\n\n**Accept:** reactor 0 correlates join shape across Mooring peers, raises one\nsigned Event Spine verdict, and can engage a channel or network slowmode\n(GAP-C2) that relaxes on its own. A single popular channel's normal growth\ndoes not trip it. The sketches stay bounded.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O7",
+      "title": "Mooring circuit breaker",
+      "source_line": 575,
+      "source_end_line": 584,
+      "accept": "repeated handshake or stall failures open a breaker, log one line,\nand retry with the existing backoff helper. An open breaker is a gauge. It\nnever accepts an unsigned frame to \"keep the link up.\"",
+      "specification": "**Size M.** `circuit_breaker.zig` has no daemon caller. A peer that accepts TCP\nand fails the handshake, or that stalls anti-entropy, can sit in\n`tcp_active` without a backoff that the operator can see.\n\n**Accept:** repeated handshake or stall failures open a breaker, log one line,\nand retry with the existing backoff helper. An open breaker is a gauge. It\nnever accepts an unsigned frame to \"keep the link up.\"",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O8",
+      "title": "Mesh ACL filters",
+      "source_line": 585,
+      "source_end_line": 593,
+      "accept": "a compact filter of network bans is what a peer exchanges first;\na hit is confirmed against the authoritative list before anyone is refused.\nFalse positives re-check. The filter is not the authority.",
+      "specification": "**Size M.** `bloom.zig`, `xor_filter.zig`, and `cuckoo_filter.zig` have no\ndaemon caller. Bans replicate as full lists.\n\n**Accept:** a compact filter of network bans is what a peer exchanges first;\na hit is confirmed against the authoritative list before anyone is refused.\nFalse positives re-check. The filter is not the authority.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O9",
+      "title": "Two-person rule",
+      "source_line": 594,
+      "source_end_line": 603,
+      "accept": "a config flag makes those commands wait for a second distinct oper\ninside a time window. The flag defaults off. Both approvals and the action land\non the audit trail. A single-oper network is unchanged.",
+      "specification": "**Size M.** One elevated session can `DIE`, `RESTART`, or mesh-scope a ban.\n`oper_session_provenance.zig` knows who is who. Nothing requires a second\noperator.\n\n**Accept:** a config flag makes those commands wait for a second distinct oper\ninside a time window. The flag defaults off. Both approvals and the action land\non the audit trail. A single-oper network is unchanged.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O10",
+      "title": "Policy rollback",
+      "source_line": 604,
+      "source_end_line": 612,
+      "accept": "ward, filter, class, and ban generations are numbered. An oper can\nroll the last generation back. The version in the proof matches the generation\nthat was live.",
+      "specification": "**Size M.** ProofMark records carry `policy_version`, and the live signer\nwrites the constant `1`. Wards and filters have no generation and no undo.\n\n**Accept:** ward, filter, class, and ban generations are numbered. An oper can\nroll the last generation back. The version in the proof matches the generation\nthat was live.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O11",
+      "title": "Outbound webhooks",
+      "source_line": 613,
+      "source_end_line": 624,
+      "accept": "an oper registers an outbound URL, a secret, and a category mask.\nDelivery retries with a cap, signs the body, and refuses link-local and\nloopback targets unless the config explicitly allows them. Inbound webhooks\nstay as they are.",
+      "specification": "**Size M.** Inbound `POST /api/webhooks/<id>/<token>` is live on loopback\n`:9140`. Nothing pushes Event Spine events out. `audit_trail.zig` is exported\nfrom `daemon/root.zig` and has no production caller; oper audit is a different\nring (`svc_operaudit.zig`).\n\n**Accept:** an oper registers an outbound URL, a secret, and a category mask.\nDelivery retries with a cap, signs the body, and refuses link-local and\nloopback targets unless the config explicitly allows them. Inbound webhooks\nstay as they are.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-O12",
+      "title": "Bot capabilities",
+      "source_line": 625,
+      "source_end_line": 636,
+      "accept": "a bot account holds scoped, expiring grants (speak in a channel,\npost a webhook, read history) that are listed and revoked. The grant is not an\noper bit. USR2 keeps it.\n\n---",
+      "specification": "**Size M.** `bot_registry.zig` records whether an account may announce, to\nwhich scope, and how often per hour. It is not a capability token. A bot is\neither ordinary or oper.\n\n**Accept:** a bot account holds scoped, expiring grants (speak in a channel,\npost a webhook, read history) that are listed and revoked. The grant is not an\noper bit. USR2 keeps it.\n\n---",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P0a",
+      "title": "005 and CHANMODES hide features the daemon already has",
+      "source_line": 648,
+      "source_end_line": 669,
+      "accept": "every mode and limit the daemon enforces is either in the\nadvertised token, derived from the same table the enforcer uses, or listed as\na divergence. `proto/isupport.zig`'s stale defaults are deleted or made to\ncompile-fail if they drift. One test renders `005` and checks `CHATHISTORY` and\n`x`.",
+      "specification": "**Size S.** Live `005` is `protocol_inventory.isupport_tokens` plus\n`buildIsupportTokens`. That list has no `CHATHISTORY`, `ELIST`, `SAFELIST`,\n`TARGMAX`, `EXCEPTS`, `INVEX`, `MAXPROP`, `MAXACCESS`, `MAXCODEPAGE`, or\n`MAXLANGUAGE`. `proto/isupport.zig` defines a richer default and nothing in the\ndaemon calls `emitDefault` / `emitFromLimits`. Its `PREFIX` and `CHANMODES`\nalso disagree with the live tokens (`PREFIX=(YQqov)*!.@+`). Treat that file as\na dead builder.\n\n`CHANMODES` omits modes the mode table implements: `p` private, `h` hidden,\n`u` knock, `a` auth-only, `d` cloneable, `E` clone, `r` registered, `z`\nservice, `x` auditorium, `w` nowhisper. Clients that learn modes from `005`\nwill not offer auditorium, hidden, knock, or auth-only. Halloy-style clients\nthat key history off `CHATHISTORY=` will not see a history limit.\n\n**Accept:** every mode and limit the daemon enforces is either in the\nadvertised token, derived from the same table the enforcer uses, or listed as\na divergence. `proto/isupport.zig`'s stale defaults are deleted or made to\ncompile-fail if they drift. One test renders `005` and checks `CHATHISTORY` and\n`x`.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P0b",
+      "title": "SASL stops at the password when 2FA is on",
+      "source_line": 670,
+      "source_end_line": 689,
+      "accept": "a 2FA account completes SASL with a second challenge, or the\ncapability value advertises that 2FA accounts must use `IDENTIFY` and clients\nare told before they start `AUTHENTICATE`. OAuth either refuses unknown\naccounts or the config says \"auto-provision\" on purpose. `PASS` either gains a\nreal server-password check or the command reference keeps saying it is only a\nmarker, which it already does — then the gap is just the 2FA and OAuth rows.",
+      "specification": "**Size M.** A `PLAIN` or SCRAM success on a 2FA account is failed with\n\"log in with IDENTIFY … `<code>`\" (`dispatch.zig`). There is no SASL\ncontinuation for the second factor, so a 2FA account cannot finish\n`AUTHENTICATE`. WebAuthn is a post-registration `WEBAUTHN` ceremony, absent\nfrom the SASL mechanism list, and inert unless `[webauthn] rp_id` and\n`origins` are set. OAuth is local JWT verification against a configured HMAC\nor JWKS, with no discovery. An unknown account name with no forbid reservation\nis not blocked, so a valid token can bind a session that never `REGISTER`d.\n`OAUTHBEARER` and `ANONYMOUS` cannot elevate oper. `PASS` sets a seen-bit and\ndoes not check a server password.\n\n**Accept:** a 2FA account completes SASL with a second challenge, or the\ncapability value advertises that 2FA accounts must use `IDENTIFY` and clients\nare told before they start `AUTHENTICATE`. OAuth either refuses unknown\naccounts or the config says \"auto-provision\" on purpose. `PASS` either gains a\nreal server-password check or the command reference keeps saying it is only a\nmarker, which it already does — then the gap is just the 2FA and OAuth rows.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P0c",
+      "title": "WHOIS, WHOWAS, KNOCK, LISTX, and reactions are thinner than the command list",
+      "source_line": 690,
+      "source_end_line": 730,
+      "accept": "each bullet is a test that matches the user-visible behavior, and\nthe command page says the limit in one sentence. The ones worth implementing,\nin order: `CHATHISTORY` in `005` (GAP-P0a), remote LISTX topic, WHOWAS account\nand real host, KNOCK that does not claim delivery it did not do, and a\nreaction tally that survives a subscriber joining late.",
+      "specification": "**Size M.**\n\n- `WHOWAS` stores `host = \"localhost\"`, drops the account in the reply, caps\n  the ring at 256 and the reply at 16, and does not record a mesh quit. Its\n  Helix codec is not sealed (GAP-D2).\n- Remote `WHOIS` fills identity lines from the roster and leaves idle, away,\n  and TLS-secure unreplicated.\n- `KNOCK` notifies local ops and then always sends `711` to the knocker, even\n  when no op on this node was online. Remote ops get an optional `MEMBER`\n  event, not `710`.\n- `LIST` / `LISTX` use an empty topic and creation time `0` for a channel that\n  exists only on the other node. A short window can show a remote `+s`/`+h`\n  channel before the mode burst.\n- Reactions: `activity.zig` describes a stored CRDT. `pushReactionActivity`\n  emits `ACTIVITY` only to current subscribers and returns if there are none.\n  A `TAGMSG` may keep a history row. There is no queryable tally.\n  `draft/reply` is the same client-tag relay (GAP-P1).\n- `cap-notify` is advertised. The set is static, so `CAP NEW` / `CAP DEL`\n  never fire. `proto/cap_notify.zig` is not imported by the daemon.\n- Classic IRCX AUTH packages `Anon`, `GateKeeper`, and `GateKeeperPassport`\n  parse and then map to \"unknown package.\" Remote `SYS`/`ADM` DATA tags fail\n  closed even for an oper (`policy_is_oper = false`).\n- `draft/multiline` reassembles inbound batches and does not split the\n  server's own long replies.\n- `announce_board.zig` is imported by `server.zig` and never called.\n  `BOTGRANT` records the account in `bot_registry` so `isBot` matches the\n  grant; that registry does not build WHOIS 335 or answer `!` commands.\n  `+B` / WHOIS `335` are live. The in-channel bot surface is `!weather` /\n  `!news`.\n- `oper` message-tag is absent. `draft/whoami` is absent from the live\n  capability list. `file-upload` exists only on the stale `proto/cap.zig`\n  table, which is not the live registry.\n\n**Accept:** each bullet is a test that matches the user-visible behavior, and\nthe command page says the limit in one sentence. The ones worth implementing,\nin order: `CHATHISTORY` in `005` (GAP-P0a), remote LISTX topic, WHOWAS account\nand real host, KNOCK that does not claim delivery it did not do, and a\nreaction tally that survives a subscriber joining late.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P16",
+      "title": "Read markers are this process",
+      "source_line": 731,
+      "source_end_line": 749,
+      "accept": "the marker survives USR2 and is the same value on every attachment\nof that account. A bouncer rewind after upgrade does not dump the whole ring.\n\nThe items below are absent as products. Tags and commands that look similar\nare named so they are not rebuilt.",
+      "specification": "**Current continuation:** authenticated account mesh and upgrade positions now\nhave implementation and local acceptance evidence linked in the continuation note\nabove. The following paragraph describes the frozen baseline audit; it is not a\ncurrent-source defect claim. Guest process continuity and global account ownership\nare outside this bounded slice.\n\n**Size M.** `MARKREAD` keys a process-local map by account or nick. Nothing\nrelays it over S2S. The Helix codec is not on the seal path. `onyx/bouncer`\nrewind depends on the marker, so a USR2 or a resume on the other node replays\nhistory the user already read.\n\n**Accept:** the marker survives USR2 and is the same value on every attachment\nof that account. A bouncer rewind after upgrade does not dump the whole ring.\n\nThe items below are absent as products. Tags and commands that look similar\nare named so they are not rebuilt.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P1",
+      "title": "Threads",
+      "source_line": 750,
+      "source_end_line": 758,
+      "accept": "a thread has a stable id, a root msgid, a bounded reply list, and\nit survives USR2 and, once GAP-D1 exists, cold start. Clients that only\nunderstand the tag still see the reply tag.",
+      "specification": "**Size L.** `+draft/reply` is a tag on a message (`proto/msgedit.zig`). There is\nno thread id, no membership of a thread, and no history scope that is a thread.\n\n**Accept:** a thread has a stable id, a root msgid, a bounded reply list, and\nit survives USR2 and, once GAP-D1 exists, cold start. Clients that only\nunderstand the tag still see the reply tag.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P2",
+      "title": "Slowmode",
+      "source_line": 759,
+      "source_end_line": 767,
+      "accept": "a channel mode or PROP sets a minimum gap between a member's\nmessages. Oper and a configured voice exemption exist. The gap survives USR2.\nA raid shield (GAP-O6) can set it and clear it.",
+      "specification": "**Size S.** No `slowmode` command, mode, or module. Per-connection flood is a\ndifferent control.\n\n**Accept:** a channel mode or PROP sets a minimum gap between a member's\nmessages. Oper and a configured voice exemption exist. The gap survives USR2.\nA raid shield (GAP-O6) can set it and clear it.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P3",
+      "title": "Scheduled delivery",
+      "source_line": 768,
+      "source_end_line": 778,
+      "accept": "a user or oper can defer a channel message or an oper action until\na timestamp or a cron fire. Reactor 0 fires it once. A replay after USR2 does\nnot send it twice. The memo and history paths that store the body are the\ndurable ones from Wave 0.",
+      "specification": "**Size M.** `substrate/cron.zig` parses five-field expressions and computes the\nnext fire. No other Zig file imports it. `TEMPMODE` schedules mode reversions\nonly (`svc_tempmode.zig`).\n\n**Accept:** a user or oper can defer a channel message or an oper action until\na timestamp or a cron fire. Reactor 0 fires it once. A replay after USR2 does\nnot send it twice. The memo and history paths that store the body are the\ndurable ones from Wave 0.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P4",
+      "title": "Retention",
+      "source_line": 779,
+      "source_end_line": 788,
+      "accept": "a channel PROP sets a TTL. Expiry removes the Lotus row, the search\nids, and any memo that was only a copy of that message. E2EE rooms expire\nciphertext the same way. The daemon does not need the plaintext to forget it.",
+      "specification": "**Size M.** History is a fixed ring (512 targets × 256 in the server's\n`HistoryStore`). Nothing expresses \"forget this channel after N days,\" and\nnothing deletes search rows, push payloads, and history together.\n\n**Accept:** a channel PROP sets a TTL. Expiry removes the Lotus row, the search\nids, and any memo that was only a copy of that message. E2EE rooms expire\nciphertext the same way. The daemon does not need the plaintext to forget it.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P5",
+      "title": "Mesh search",
+      "source_line": 789,
+      "source_end_line": 799,
+      "accept": "a search on one node returns hits from targets the user can see on\nany node, each hit authorized on its own, with a hard cap. Ciphertext bodies\nare skipped. Transcript search is a later flag on the same command once\ntranscripts are durable.",
+      "specification": "**Size L.** Local `SEARCH` works. It does not ask another node. Semantic\nsearch does not exist. Call transcripts are a 128-entry RAM ring cleared when\nthe call ends (`transcript.zig`), so they are not in the index.\n\n**Accept:** a search on one node returns hits from targets the user can see on\nany node, each hit authorized on its own, with a hard cap. Ciphertext bodies\nare skipped. Transcript search is a later flag on the same command once\ntranscripts are durable.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P6",
+      "title": "Unfurl proxy",
+      "source_line": 800,
+      "source_end_line": 810,
+      "accept": "an opt-in daemon fetch returns a bounded title/description/image\nfor `https` URLs, with a deny list for private, link-local, and loopback\naddresses, a size cap, and no cookie jar. Default off. The user's client can\nrefuse the preview.",
+      "specification": "**Size M.** No `unfurl` symbol in the Zig tree. Clients that fetch URLs\nthemselves leak the user's address and open an SSRF if a bot does it from the\nserver later.\n\n**Accept:** an opt-in daemon fetch returns a bounded title/description/image\nfor `https` URLs, with a deny list for private, link-local, and loopback\naddresses, a size cap, and no cookie jar. Default off. The user's client can\nrefuse the preview.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P7",
+      "title": "Appeals",
+      "source_line": 811,
+      "source_end_line": 819,
+      "accept": "a banned user on a new connection can file one structured appeal\nper window without joining the network. An oper lists, answers, and the answer\nis audited. The appeal path cannot send channel traffic.",
+      "specification": "**Size M.** A ban closes the socket. There is no rate-limited appeal object, no\n`appeal.zig`, and no oper queue.\n\n**Accept:** a banned user on a new connection can file one structured appeal\nper window without joining the network. An oper lists, answers, and the answer\nis audited. The appeal path cannot send channel traffic.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P8",
+      "title": "Challenge ladder",
+      "source_line": 820,
+      "source_end_line": 830,
+      "accept": "a connection that trips reputation or the raid shield can be asked\nfor a daemon-issued challenge (proof of work or an oper-configured question)\nbefore `001`. Failure delays. Success is not an account. The ladder is\npluggable behind one function so a later method replaces the first without a\nwire break.",
+      "specification": "**Size M.** `VERIFY` is an email code for `REGISTER`. It is not a challenge for\na suspicious connection. No captcha vendor belongs in-tree.\n\n**Accept:** a connection that trips reputation or the raid shield can be asked\nfor a daemon-issued challenge (proof of work or an oper-configured question)\nbefore `001`. Failure delays. Success is not an account. The ladder is\npluggable behind one function so a later method replaces the first without a\nwire break.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P9",
+      "title": "First-message hold and quarantine",
+      "source_line": 831,
+      "source_end_line": 838,
+      "accept": "a channel PROP holds first messages for an oper to release or drop.\nQuarantine is an explicit oper action with a reason on the audit trail.",
+      "specification": "**Size S.** Koshi can block a line. Nothing holds a new account's first N\nmessages for review, and nothing moves a joiner into a quarantine channel.\n\n**Accept:** a channel PROP holds first messages for an oper to release or drop.\nQuarantine is an explicit oper action with a reason on the audit trail.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P10",
+      "title": "Rich lines, components, slash registry",
+      "source_line": 839,
+      "source_end_line": 848,
+      "accept": "a bot registers a command name, a short help line, and a bounded\nargument list through a daemon command. Invocation is an ordinary `PRIVMSG` or\na dedicated verb that the bot's grant (GAP-O12) allows. Interactive buttons\nwait until the command registry is dull.",
+      "specification": "**Size L.** Messages are text plus tags. Bots have no registered slash verb\nwith a typed argument schema. Buttons and structured actions do not exist.\n\n**Accept:** a bot registers a command name, a short help line, and a bounded\nargument list through a daemon command. Invocation is an ordinary `PRIVMSG` or\na dedicated verb that the bot's grant (GAP-O12) allows. Interactive buttons\nwait until the command registry is dull.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P11",
+      "title": "IRCX client contract",
+      "source_line": 849,
+      "source_end_line": 860,
+      "accept": "a matrix row is either \"handler at file:line, test name\" or\n\"divergence, reason.\" The client work stays in `/home/kain/onyx`.",
+      "specification": "**Size L, mostly the Onyx repo, server-first where the wire is thin.** The\ndaemon already emits LISTX, MODEX, WHISPER, PROP, ACCESS, and EVENT. The\nclient still meets several of those as inbound-only or advanced-settings\n(`docs/releases/0.7-MAJOR-ROADMAP.md` CX-1…CX-10). Server work inside this item\nis whatever GAP-P0's matrix marks as missing for those screens: mesh-wide\nLISTX, auditorium `+x` NAMES, hidden `+h`, and non-oper EVENT types.\n\n**Accept:** a matrix row is either \"handler at file:line, test name\" or\n\"divergence, reason.\" The client work stays in `/home/kain/onyx`.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-P12",
+      "title": "HTTP read API",
+      "source_line": 861,
+      "source_end_line": 871,
+      "accept": "a loopback or explicitly bound HTTPS route returns history the\naccount can already see via `CHATHISTORY`, with the same authz. It is not a\nsecond admin API.\n\n---",
+      "specification": "**Size M.** Metrics and webhooks are the only HTTP. There is no read-only\nchannel export for a logged-in account.\n\n**Accept:** a loopback or explicitly bound HTTPS route returns history the\naccount can already see via `CHATHISTORY`, with the same authz. It is not a\nsecond admin API.\n\n---",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-V1",
+      "title": "DTLS 1.3 is enabled and not browser-proven",
+      "source_line": 878,
+      "source_end_line": 894,
+      "accept": "one unmodified browser completes a DTLS 1.3 handshake against this\ndaemon and media flows, or the live flag goes back to off and the code comment\nstays. Same-library tests do not close this item.\n\nSource `[media].dtls13` defaults off, and `dtls13_server.zig` keeps the\ntranscript caveat (`browser_interop_caveat_held`). With that flag off, a\nDTLS 1.2 ClientHello still gets `HelloVerifyRequest`. Unmodified Chromium\n150.0.7871.128 launches and has no DTLS client mode, so no handshake is\nclaimed and no media flowed. The live fleet TOML was not changed. The\nheading stays unmarked.",
+      "specification": "**Size M.** `media_plane.zig` says the RFC 9147 transcript interop points are\nnot browser-validated. `dtls13_server` carries the same caveat. The live TOML\nsets `dtls13 = true`, with 1.2 as the fallback when a peer does not offer 1.3.\n\n**Accept:** one unmodified browser completes a DTLS 1.3 handshake against this\ndaemon and media flows, or the live flag goes back to off and the code comment\nstays. Same-library tests do not close this item.\n\nSource `[media].dtls13` defaults off, and `dtls13_server.zig` keeps the\ntranscript caveat (`browser_interop_caveat_held`). With that flag off, a\nDTLS 1.2 ClientHello still gets `HelloVerifyRequest`. Unmodified Chromium\n150.0.7871.128 launches and has no DTLS client mode, so no handshake is\nclaimed and no media flowed. The live fleet TOML was not changed. The\nheading stays unmarked.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-V2",
+      "title": "An unmodified browser can join",
+      "source_line": 895,
+      "source_end_line": 908,
+      "accept": "a stock browser joins a room using the documented signaling, audio\nis intelligible, and a failure shows up as a numeric rather than a silent UDP\nblack hole. Native Cadence stays the preferred path for Onyx. TURN is either\nwired with an allocation API and an auth secret, or explicitly cut.",
+      "specification": "**Size XL.** Signaling is IRC `MEDIA`, not SDP. The SFU terminates DTLS-SRTP.\nBrowser WebSocket Cadence is opaque and is not bridged into RTP\n(`docs/architecture/03-media.md`). `media_bridge.zig` rewraps native↔RTP headers\nand does not transcode. `substrate/ice_agent.zig` is not imported by the\ndaemon; the plane does ICE-lite STUN. `substrate/turn.zig` is framing without\nsockets.\n\n**Accept:** a stock browser joins a room using the documented signaling, audio\nis intelligible, and a failure shows up as a numeric rather than a silent UDP\nblack hole. Native Cadence stays the preferred path for Onyx. TURN is either\nwired with an allocation API and an auth secret, or explicitly cut.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-V3",
+      "title": "Per-receiver simulcast on the RTP leg",
+      "source_line": 909,
+      "source_end_line": 922,
+      "accept": "two receivers of one publisher can sit on different spatial layers\nwithout forcing each other up or down. Congestion input is a measured signal\n(`twcc.zig` / the existing ABR hint), not a constant. A deferred RTX SSRC is\neither implemented or the cache's limits are documented as the product.",
+      "specification": "**Size L.** Native spatial ABR exists: `mediaAbrSelection` calls\n`simulcast_select.selectStable` with three spatial rungs and temporal layer 0.\n`native_media_link.zig` still forwards on a spatial ceiling plus keyframe.\nTemporal SVC is not in the Cadence container. The RTP SFU has no RID selector.\nRTX as its own SSRC is marked deferred in `media_plane.zig`; a retransmit cache\ninside `MediaTransport` does exist.\n\n**Accept:** two receivers of one publisher can sit on different spatial layers\nwithout forcing each other up or down. Congestion input is a measured signal\n(`twcc.zig` / the existing ABR hint), not a constant. A deferred RTX SSRC is\neither implemented or the cache's limits are documented as the product.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-V4",
+      "title": "Recording with consent",
+      "source_line": 923,
+      "source_end_line": 932,
+      "accept": "a recording starts only when every current member has a visible\nconsent bit, stops when a member joins who has not consented, and the daemon\nstores ciphertext or an oper-visible artifact whose existence is announced in\nthe room. A hidden recorder cannot be configured.",
+      "specification": "**Size L.** No recording path. Captions are a client-pushed ring\n(`MEDIA TRANSCRIPT`), not an ASR, and they vanish when the call ends.\n\n**Accept:** a recording starts only when every current member has a visible\nconsent bit, stops when a member joins who has not consented, and the daemon\nstores ciphertext or an oper-visible artifact whose existence is announced in\nthe room. A hidden recorder cannot be configured.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-V5",
+      "title": "Call quality forensics",
+      "source_line": 933,
+      "source_end_line": 940,
+      "accept": "a participant or oper can read a bounded quality summary for the\ncurrent call. The summary does not include key material.",
+      "specification": "**Size M.** Depends on GAP-O1. Per-call loss, RTT, and layer are not a\nqueryable object. `media_stats_agg.zig` and `qlog` are substrate.\n\n**Accept:** a participant or oper can read a bounded quality summary for the\ncurrent call. The summary does not include key material.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-V6",
+      "title": "Speaking queue and spatial audio",
+      "source_line": 941,
+      "source_end_line": 949,
+      "accept": "a `MEDIA` subcommand or PROP lists a queue the room can see, and\nthe sender's client is what enforces \"you are not at the head.\" Spatial audio\nis a later PROP of positions the server forwards and does not interpret.",
+      "specification": "**Size M / L.** No raise-hand protocol. No spatial positions. Both are product\nlayers on the existing room.\n\n**Accept:** a `MEDIA` subcommand or PROP lists a queue the room can see, and\nthe sender's client is what enforces \"you are not at the head.\" Spatial audio\nis a later PROP of positions the server forwards and does not interpret.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-V7",
+      "title": "FEC and epoch keys stay unwired until a call needs them",
+      "source_line": 950,
+      "source_end_line": 961,
+      "accept": "do not import them until GAP-V3 has a congestion signal that is\nwrong without FEC. Then one FEC scheme, behind the native leg, with a test\nthat a lossy sim still plays audio.\n\n---",
+      "specification": "**Size M when pulled.** `raptorq.zig`, `reed_solomon.zig`, `red_fec.zig`, and\n`media_epoch_key.zig` have no daemon caller. `bbr.zig`, `cc_cubic.zig`, and\n`l4s.zig` are in the same state.\n\n**Accept:** do not import them until GAP-V3 has a congestion signal that is\nwrong without FEC. Then one FEC scheme, behind the native leg, with a test\nthat a lossy sim still plays audio.\n\n---",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K1",
+      "title": "Client group E2EE journey",
+      "source_line": 967,
+      "source_end_line": 977,
+      "accept": "an Onyx room can be set `encryption-policy=required`, a removed\nmember cannot decrypt the next message, and a node operator cannot. This item\ncloses in the client repo. Server bugs found while doing it are in-scope.",
+      "specification": "**Size L, client-half, server already admits controls.** The server accept is\nthe one in `docs/design/message-v2-exact-once.md` and the E2EE activation note:\nexact-once control frames, replay guard survives USR2, member removal changes\nthe epoch the clients will use, daemon never sees group plaintext.\n\n**Accept:** an Onyx room can be set `encryption-policy=required`, a removed\nmember cannot decrypt the next message, and a node operator cannot. This item\ncloses in the client repo. Server bugs found while doing it are in-scope.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K2",
+      "title": "Key transparency across the mesh",
+      "source_line": 978,
+      "source_end_line": 989,
+      "accept": "a client verifies a device key against a log both nodes serve\nidentically, or each node serves a signed head the other has stored. A\nrevocation on one node is visible on the other after anti-entropy. A missing\nlog fails closed for clients that require it and stays invisible for clients\nthat do not.",
+      "specification": "**Size L.** `KEYTRANS` appends to a node-local MMR and can prove inclusion on\nthat node. It is not a consistency proof between eshmaki and ircx.us, and it\ndoes not anchor residence keys.\n\n**Accept:** a client verifies a device key against a log both nodes serve\nidentically, or each node serves a signed head the other has stored. A\nrevocation on one node is visible on the other after anti-entropy. A missing\nlog fails closed for clients that require it and stays invisible for clients\nthat do not.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K3",
+      "title": "ProofMark federation",
+      "source_line": 990,
+      "source_end_line": 1000,
+      "accept": "a third party with the node public key verifies a ban or kick\nwithout asking the operator to screenshot a notice. Proofs survive restart.\nThe chain detects a removed entry.",
+      "specification": "**Size L.** `AUDIT PROOF` verifies a local detached signature. The ring is RAM,\ncap 512. `policy_version` is the constant 1. There is no Merkle chain of\nmoderation proofs and no mesh forward of the proof object beyond the oper\nevent text.\n\n**Accept:** a third party with the node public key verifies a ban or kick\nwithout asking the operator to screenshot a notice. Proofs survive restart.\nThe chain detects a removed entry.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K4",
+      "title": "Sealed rooms",
+      "source_line": 1001,
+      "source_end_line": 1020,
+      "accept": "a design that names what the server still must see (routing,\nabuse, Helix) and what it must not (the member list in the clear), plus a\nfail-closed prototype that does not weaken ordinary channels. Do not start\nthis before GAP-K1 is boring.\n\nThe prototype is the channel PROP `membership-visibility`. Absent and\n`ordinary` keep today's `NAMES`, `WHO`, and `WHOX` lists, including a bare\n`NAMES`. `sealed` answers `MEMBERSHIP_SEALED` and does not emit the member\nlist or an empty end-of-list. Any other value is rejected. A stored value the\nserver does not understand refuses the roster. Delivery still uses the channel\nname, a `KICK` still names its one target, and the world membership used to\nroute stays. Helix does not publish that membership as a clear roster. No new\n`CapsuleKind`. The GAP-K1 client journey stays open. The heading stays unmarked.",
+      "specification": "**Size XL.** A channel whose membership the server can enumerate is the current\nmodel, and NAMES depends on it. A room the server cannot enumerate is a\ndifferent product.\n\n**Accept:** a design that names what the server still must see (routing,\nabuse, Helix) and what it must not (the member list in the clear), plus a\nfail-closed prototype that does not weaken ordinary channels. Do not start\nthis before GAP-K1 is boring.\n\nThe prototype is the channel PROP `membership-visibility`. Absent and\n`ordinary` keep today's `NAMES`, `WHO`, and `WHOX` lists, including a bare\n`NAMES`. `sealed` answers `MEMBERSHIP_SEALED` and does not emit the member\nlist or an empty end-of-list. Any other value is rejected. A stored value the\nserver does not understand refuses the roster. Delivery still uses the channel\nname, a `KICK` still names its one target, and the world membership used to\nroute stays. Helix does not publish that membership as a clear roster. No new\n`CapsuleKind`. The GAP-K1 client journey stays open. The heading stays unmarked.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K5",
+      "title": "Post-quantum signatures",
+      "source_line": 1021,
+      "source_end_line": 1030,
+      "accept": "signing arrives with ACVP `sigGen` vectors, or the verify-only\nposture is written down as the permanent 1.x choice. No private hybrid profile.",
+      "specification": "**Size L when a profile exists.** `ml_dsa.zig` and `slh_dsa.zig` verify. They\ndo not sign. TLS `SignatureScheme` has no ML-DSA or SLH code point.\nCertificateVerify signs Ed25519, ECDSA P-256, or RSA-PSS-SHA256. Hybrid\ncertificate profiles are not ratified here.\n\n**Accept:** signing arrives with ACVP `sigGen` vectors, or the verify-only\nposture is written down as the permanent 1.x choice. No private hybrid profile.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K6",
+      "title": "TLS interop breadth",
+      "source_line": 1031,
+      "source_end_line": 1054,
+      "accept": "each row is either implemented with a test or moved to the cut list\nin section 12 with a reason. BoGo's accept is a pinned runner whose\n`DisabledTests` name a reason per entry. A 24/3 baseline stays honest.",
+      "specification": "**Size M each, do not block the product.**\n\n| Gap | Evidence |\n| --- | --- |\n| ECH combined with HelloRetryRequest | Server raises `EchHrrUnsupported`; client raises `HelloRetryRequestUnsupported`. `retry_configs` on reject exists. |\n| HPKE AEAD for ECH is ChaCha20-Poly1305 only | BoringSSL-style AES-GCM ECH configs cannot be opened. |\n| Key shares are X25519, P-256, X25519MLKEM768 | `x448`, `secp384r1`, `secp521r1` are not key shares. P-384 ECDSA *verify* for certificates does exist. |\n| AES-CCM suites are named and `isAllowed` is false | Intentional unless a caller appears. |\n| Cert compression is zlib only | brotli and zstd are ignored. |\n| `armor s_server` and `armor enc` exit 3 | `src/cli/stub_cmds.zig`. `enc` stays exit 3: there is no openssl-enc KDF and this tree will not invent one. |\n| `armor s_client` live `-connect` | `s_client_cmd.run` returns `NotImplemented` after building a client. `handshakeInMemory` works. |\n| In-daemon CRL CDP and CT-log fetch | Callers pass DER. Default policy is fail-open unless `require_crl` / `require_sct`. ACME forces those off. |\n| `enforce_cert_signature_algorithms` defaults off | Chain scheme checks run only when the flag is set. |\n| BoGo lane | `tools/bogo/expected-baseline.txt` is 24 pass / 3 skip. The exploratory full corpus is not that lane. Disabled tests include ECH, HRR, resumption, 0-RTT, mTLS, DC, P-384, P-521, DTLS. |\n| Multi-certificate TOML | `[[tls.sni]]` parses in `config_format.zig` and the listener selects `sni_certs`. `[[tls.ech_keys]]` remains the ECH list. |\n| Delegated-credential mint and rotation | Both roles verify a presented DC. Nothing in-tree mints or rotates one. |\n| CLI sandbox | The armor CLI calls none of Landlock, seccomp, pledge, or unveil. Daemon Linux landlock and seccomp live in `kernel_linux.zig` (GAP-X3). pledge and unveil are absent. |\n\n**Accept:** each row is either implemented with a test or moved to the cut list\nin section 12 with a reason. BoGo's accept is a pinned runner whose\n`DisabledTests` name a reason per entry. A 24/3 baseline stays honest.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K7",
+      "title": "Forward-secure history rekey and metadata-min mode",
+      "source_line": 1055,
+      "source_end_line": 1065,
+      "accept": "a written threat boundary first. Implementation follows only if\nGAP-K1 and GAP-P4 are done and the boundary still demands it.\n\n---",
+      "specification": "**Size XL.** Not started. A retained ciphertext from an old epoch is readable\nby anyone who held that epoch's key. Metadata-min mode (hiding nicks, sizes,\nand timing from the server) fights NAMES, search, and abuse.\n\n**Accept:** a written threat boundary first. Implementation follows only if\nGAP-K1 and GAP-P4 are done and the boundary still demands it.\n\n---",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-X1",
+      "title": "Portable reactor",
+      "source_line": 1068,
+      "source_end_line": 1102,
+      "accept": "an `IoBackend` with accept, recv, send, poll, cancel, and timeout.\nLinux keeps today's ring. Windows IOCP and one BSD kqueue implement the same\ntrait and fail closed on a missing op. Helix `USR2` stays Linux. Other kernels\nrefuse a USR2 capsule instead of adopting it wrong. A `zig build` of the daemon\nsucceeds for `x86_64-linux` and at least one non-Linux triple.\n\nFreeBSD 14.5-RELEASE-p1 executed the shipped kqueue submit\n(`GAP-X1 freebsd kqueue submitted=6 errno=0`). OpenBSD 7.9 executed the\nshipped kqueue accept and recv twice\n(`GAP-X1 openbsd kqueue submitted=1 accepted=6 bytes=8 errno=0`), then pledge\n(`GAP-X3 openbsd pledge result=ok errno=0`). Windows 11 22H2 WinPE, build\n22621.525, executed the shipped IOCP submit twice\n(`GAP-X1 windows iocp submitted=6`, `GUEST_EXIT:0`). The same boots dequeued\nRegistered I/O (`GAP-X3 windows rio dequeue=1 bytes=4 status=0`). On Linux,\n`PortableServer` answered `PING lane` with `PONG` through `processLine` on\nringlane (the GAP-X1 test, twice, 0 leaked). NetBSD and DragonFly are out of\nscope. The witnessed non-Linux `onyx-server` processes are FreeBSD 14.5\nkqueue (`0.7.0+ddf11915`, three PONGs, capability mode), OpenBSD 7.9 kqueue\n(`0.7.0+ddf11915`, three PONGs, after pledge), and Windows 11 22H2 WinPE IOCP\n(`0.7.0+d4ea0097`, three PONGs, job flags `0x2400`). The headings stay\nunmarked. Live `IDENTIFY` and live `relay_v2_authoring=active` stay unmet.",
+      "specification": "**Size XL.** `Server` is `LinuxServer` on Linux and `PortableServer` elsewhere.\n`PortableServer.init` opens the native `IoBackend`, listens, and `runOnce`\naccepts and answers through `processLine`. Clocks, entropy, and pid are\nalready portable (`substrate/platform.zig`). Helix `USR2` adoption stays on\n`LinuxServer`.\n\n`substrate/io/ring.zig` is an unfinished prototype: no connect, poll, or cancel,\nand it does not register provided buffers with the kernel. The production ring\nis the private Ringlane inside `server.zig`. Do not promote the prototype by\nrenaming it.\n\n**Accept:** an `IoBackend` with accept, recv, send, poll, cancel, and timeout.\nLinux keeps today's ring. Windows IOCP and one BSD kqueue implement the same\ntrait and fail closed on a missing op. Helix `USR2` stays Linux. Other kernels\nrefuse a USR2 capsule instead of adopting it wrong. A `zig build` of the daemon\nsucceeds for `x86_64-linux` and at least one non-Linux triple.\n\nFreeBSD 14.5-RELEASE-p1 executed the shipped kqueue submit\n(`GAP-X1 freebsd kqueue submitted=6 errno=0`). OpenBSD 7.9 executed the\nshipped kqueue accept and recv twice\n(`GAP-X1 openbsd kqueue submitted=1 accepted=6 bytes=8 errno=0`), then pledge\n(`GAP-X3 openbsd pledge result=ok errno=0`). Windows 11 22H2 WinPE, build\n22621.525, executed the shipped IOCP submit twice\n(`GAP-X1 windows iocp submitted=6`, `GUEST_EXIT:0`). The same boots dequeued\nRegistered I/O (`GAP-X3 windows rio dequeue=1 bytes=4 status=0`). On Linux,\n`PortableServer` answered `PING lane` with `PONG` through `processLine` on\nringlane (the GAP-X1 test, twice, 0 leaked). NetBSD and DragonFly are out of\nscope. The witnessed non-Linux `onyx-server` processes are FreeBSD 14.5\nkqueue (`0.7.0+ddf11915`, three PONGs, capability mode), OpenBSD 7.9 kqueue\n(`0.7.0+ddf11915`, three PONGs, after pledge), and Windows 11 22H2 WinPE IOCP\n(`0.7.0+d4ea0097`, three PONGs, job flags `0x2400`). The headings stay\nunmarked. Live `IDENTIFY` and live `relay_v2_authoring=active` stay unmet.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-X2",
+      "title": "`server.zig` strangler, only as a seam is touched",
+      "source_line": 1103,
+      "source_end_line": 1116,
+      "accept": "each extraction is behavior-identical under the focused test for\nthat family, and `server.zig` shrinks by the moved lines. `onyx-server-integrator`\nremains the only writer of whatever file still owns the reactor loop.",
+      "specification": "**Size XL, sliced.** 102,407 lines in one file. A mechanical split is how\nreviews die. Extractions that pay for themselves:\n\n1. Ringlane submission and completion (unblocks GAP-X1).\n2. The delivery / SendQ path.\n3. One command family at a time (media, search, oper), each behind the existing\n   module thunks in `src/daemon/modules/`.\n\n**Accept:** each extraction is behavior-identical under the focused test for\nthat family, and `server.zig` shrinks by the moved lines. `onyx-server-integrator`\nremains the only writer of whatever file still owns the reactor loop.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-X3",
+      "title": "Kernel features, after the backend they belong to",
+      "source_line": 1117,
+      "source_end_line": 1135,
+      "accept": null,
+      "specification": "None of these strings appear in `src/**/*.zig` except the kqueue comment on\n`PortableServer`. They are real gaps, and they are per-OS. Ship them on the\nkernel that has them. Do not fake them with a compile-time zero.\n\n| OS | Missing | Notes |\n| --- | --- | --- |\n| Linux | Landlock, seccomp, `TCP_FASTOPEN`, `TCP_USER_TIMEOUT`, `SO_INCOMING_CPU`, `IORING_OP_MSG_RING`, `openat2` `RESOLVE_*`, `pidfd`, `close_range`, `MADV_DONTDUMP` / `MADV_WIPEONFORK` on secrets | `eventfd` already wakes shards. kTLS TX is live. Multishot accept/recv, provided buffer rings, `send_zc`, and fixed files are `RingFeatures` defaulting false and are not projected from config. |\n| FreeBSD | `TCP_TXTLS_ENABLE` ran on FreeBSD 14.5-RELEASE-p1: `GAP-X3 freebsd ktls result=ok errno=0` after `kern.ipc.tls.enable=1`. With that sysctl at 0 the same setsockopt returned errno 45. `SO_REUSEPORT_LB` and Capsicum are in that module | AES-GCM is `CRYPTO_AES_NIST_GCM_16` (25). ChaCha20-Poly1305 is 41. Linux `SO_REUSEPORT` is not the FreeBSD load-balancing option. The heading stays unmarked. |\n| OpenBSD | `pledge` / `unveil` ran on OpenBSD 7.9 (`kern.osrelease=7.9`): `GAP-X3 openbsd pledge result=ok errno=0`, with `/etc`, `/usr`, `/var`, and `/tmp` present | The armor CLI applies none (section 12). The daemon unveils `/etc` r, `/usr` r, `/var` rwc, `/tmp` rwc, then pledges `stdio rpath wpath cpath inet dns`. Off OpenBSD this is `MissingOp` before either call. The heading stays unmarked. |\n| Windows | On Windows 11 22H2 WinPE build 22621.525, `dequeueRegistered` called the table `Iocp.open` had loaded. Twice: `GAP-X3 windows rio dequeue=1 bytes=4 status=0` with `GUEST_EXIT:0`, and the same runs submitted `GAP-X1 windows iocp submitted=6`. `ioctlsocket(FIONBIO)` on the registered socket returned 10045 (`WSAEOPNOTSUPP`); that socket connects on a second thread | GUID `8509e081-96dd-4005-b165-9e2ee8c79e3f`, SIO `0xC8000024`, flags `WSA_FLAG_OVERLAPPED` \\| `WSA_FLAG_REGISTERED_IO`. A short or null table is `MissingOp` and the completion port is closed. The dequeue is `RIOSend` plus `RIODequeueCompletion` of four bytes, then the accepted socket reads those bytes. IOCP recv and send stay `IOCTL_AFD_RECEIVE` (`0x12017`) and `IOCTL_AFD_SEND` (`0x1201F`). No kTLS claim. The heading stays unmarked. |\n\n**Explicitly out,** even if a benchmark post suggests them: XDP / AF_XDP, BPF\nas a firewall, `IP_TRANSPARENT` / `TPROXY`, `SCHED_FIFO`, `TCP_CORK`, and\n`IORING_REGISTER_BUFFERS` for IRC payloads. Multishot recv and provided buffer\nrings wait for a Helix ownership design of their own; they rewrite which thread\nmay touch a buffer the successor might inherit.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-X4",
+      "title": "Per-OS benchmarks",
+      "source_line": 1136,
+      "source_end_line": 1146,
+      "accept": "one table, Linux first, with and without SQPOLL, TLS on and off,\none shard and four, JOIN+PRIVMSG RTT and RSS. Non-Linux rows appear when\nGAP-X1 can run the same recipe. No number without the command that produced it.",
+      "specification": "**Size M.** `zig build bench` and `zig build bench-live` exist\n(`docs/audit/bench-baseline-0.7.0-rc.1.md`, `bench-live-0.7.0-rc.1.md`). They\nare Linux numbers. SQPOLL is on in production without a published before/after\nin the release record.\n\n**Accept:** one table, Linux first, with and without SQPOLL, TLS on and off,\none shard and four, JOIN+PRIVMSG RTT and RSS. Non-Linux rows appear when\nGAP-X1 can run the same recipe. No number without the command that produced it.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-X5",
+      "title": "Hot path cost, measured",
+      "source_line": 1147,
+      "source_end_line": 1158,
+      "accept": "a bench names the bytes per connection and the microseconds per\nfan-out recipient before and after any shrink. A shrink that changes the Helix\nclient capsule is a version bump, not a silent layout edit.\n\n---",
+      "specification": "**Size M.** `ConnState` size, channel fan-out, and cross-shard `DeliverBuf`\nare called out in the Q4 performance track and are still unpaid. `command_usage`\ncounts invocations and bytes (`STATS m`) and does not record time.\n\n**Accept:** a bench names the bytes per connection and the microseconds per\nfan-out recipient before and after any shrink. A shrink that changes the Helix\nclient capsule is a version bump, not a silent layout edit.\n\n---",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K8",
+      "title": "HelloRetryRequest PSK binder covers the wrong transcript",
+      "source_line": 1350,
+      "source_end_line": 1363,
+      "accept": "an HRR resumption with a correct binder resumes, and a binder that\nomits ClientHello1 or the HelloRetryRequest is rejected. A regression drives\nthe shipped server and client functions.",
+      "specification": "**Size M.** `tls_server.zig` `verifyPskBinderT` hashes only the truncated\nClientHello. After HelloRetryRequest the client binder\n(`tls_client.zig`, the PSK binder transcript) is\n`message_hash(ClientHello1) || HRR || truncated ClientHello2`. A valid binder\nfails, `tryAcceptPsk` returns null, and the server continues a certificate\nhandshake instead of aborting (RFC 8446 §4.2.11.2) or resuming. A binder that\nomits the retry transcript is the one the server accepts.\n\n**Accept:** an HRR resumption with a correct binder resumes, and a binder that\nomits ClientHello1 or the HelloRetryRequest is rejected. A regression drives\nthe shipped server and client functions.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K9",
+      "title": "EndOfEarlyData is not in the handshake transcript",
+      "source_line": 1364,
+      "source_end_line": 1375,
+      "accept": "accepted 0-RTT puts `EndOfEarlyData` on both transcripts. The\nclient Finished and the resumption PSK cover it. A transcript that differs\nonly by that message fails Finished verification.",
+      "specification": "**Size M.** `processAcceptedEarlyRecords` requires `EndOfEarlyData` and then\nsets `early_data_done` without appending it. The client emits the message in\n`start` and also never appends it before `writeClientFinishedRecord` or the\nresumption master secret. RFC 8446 §4.4.1 places that message after the server\nFinished and before the client Finished.\n\n**Accept:** accepted 0-RTT puts `EndOfEarlyData` on both transcripts. The\nclient Finished and the resumption PSK cover it. A transcript that differs\nonly by that message fails Finished verification.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K10",
+      "title": "0-RTT is accepted again when nothing records the binder",
+      "source_line": 1376,
+      "source_end_line": 1388,
+      "accept": "with early data enabled, a second copy of the same 0-RTT flight is\nrejected when no `ReplayGuard` is installed, when the ticket has no age add or\nno issue time, and when no clock is set. 1-RTT resumption of an unexpired\nticket still completes.",
+      "specification": "**Size M.** When `replay_guard` is null, the 0-RTT check sets `replay_ok` to\ntrue (`tls_server.zig`, the early-data branch in ClientHello). `ticketAgeWithinWindow`\nreturns fresh when `ticket_age_add` is missing or `issued_unix_ms` is 0, and\nthe age check does not run when `now_unix_seconds` is null. `max_early_data_size`\ndefaults to 0; once a ticket advertises early data, this branch still accepts.\n\n**Accept:** with early data enabled, a second copy of the same 0-RTT flight is\nrejected when no `ReplayGuard` is installed, when the ticket has no age add or\nno issue time, and when no clock is set. 1-RTT resumption of an unexpired\nticket still completes.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K11",
+      "title": "Trust-anchor constraints never bind the path",
+      "source_line": 1389,
+      "source_end_line": 1405,
+      "accept": "a name-constrained or pathLen-0 anchor rejects a leaf outside the\nconstraint and a non-self-issued intermediate the path length forbids, even\nwhen the anchor is not resent in the chain. An intermediate whose own dNSName\nfalls outside its issuer's permitted subtree, or inside an excluded subtree,\nis rejected. The same chain still verifies when every certificate is inside\nthe constraints.",
+      "specification": "**Size M.** `verifyChainToTrustAnchors` (`tls_client.zig`) enforces CA,\n`keyCertSign`, name constraints, and path length only for certificates inside\nthe presented chain. On a DN and signature match it returns without reading\nthe anchor's name constraints or `pathLenConstraint`. RFC 5280 initializes\nboth from the trust anchor, which a normal TLS chain omits. In-chain\n`enforceNameConstraints` is called with the leaf only, so an intermediate's\nown dNSName is not checked against the CA that constrained it.\n\n**Accept:** a name-constrained or pathLen-0 anchor rejects a leaf outside the\nconstraint and a non-self-issued intermediate the path length forbids, even\nwhen the anchor is not resent in the chain. An intermediate whose own dNSName\nfalls outside its issuer's permitted subtree, or inside an excluded subtree,\nis rejected. The same chain still verifies when every certificate is inside\nthe constraints.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K12",
+      "title": "A leaf that forbids digitalSignature still verifies",
+      "source_line": 1406,
+      "source_end_line": 1416,
+      "accept": "a leaf whose `keyUsage` omits `digitalSignature` fails before\nCertificateVerify. A leaf with no `keyUsage` extension, and a leaf that sets\nthe bit, still verifies.",
+      "specification": "**Size S.** The leaf check in `verifyChainToTrustAnchors` stops at EKU\n`serverAuth`. When `keyUsage` is present and `digitalSignature` is clear,\nverification continues. An issuer in the chain is already rejected when\n`keyCertSign` is clear.\n\n**Accept:** a leaf whose `keyUsage` omits `digitalSignature` fails before\nCertificateVerify. A leaf with no `keyUsage` extension, and a leaf that sets\nthe bit, still verifies.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K13",
+      "title": "Application traffic sequence numbers wrap",
+      "source_line": 1417,
+      "source_end_line": 1427,
+      "accept": "the record after `2^64 - 1` under one application traffic key\nfails closed on both the client and the server. Nonce 0 is not reused. A\nregression calls the shipped seal or open path, not a copied counter.",
+      "specification": "**Size M.** Server `app_write_seq` / `app_read_seq` and the client counterparts\nare bare `u64` increments. `Seq64.next` in `tls.zig` refuses to emit the\nmaximum so a nonce cannot wrap, and these seal/open paths do not call it. The\nshipping daemon is built ReleaseFast, which does not trap the overflow.\n\n**Accept:** the record after `2^64 - 1` under one application traffic key\nfails closed on both the client and the server. Nonce 0 is not reused. A\nregression calls the shipped seal or open path, not a copied counter.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K14",
+      "title": "Critical CRL and SCT extensions are treated as understood",
+      "source_line": 1428,
+      "source_end_line": 1440,
+      "accept": "a critical CRL distribution point or a critical embedded SCT list\nfails closed. A non-critical copy of either extension may still be ignored.\nThis does not turn on live CRL or CT fetch (GAP-K6).",
+      "specification": "**Size S.** `extensionOidIsSupported` in `x509.zig` returns true for\n`cRLDistributionPoints` (2.5.29.31) and the CT SCT list\n(1.3.6.1.4.1.11129.2.4.2). `parseExtensions` does not interpret either OID and\ndoes not mark it handled, so `rejectUnsupportedCriticalExtension` does not\nfire. RFC 5280 §4.2 requires a verifier that does not process a critical\nextension to reject the certificate.\n\n**Accept:** a critical CRL distribution point or a critical embedded SCT list\nfails closed. A non-critical copy of either extension may still be ignored.\nThis does not turn on live CRL or CT fetch (GAP-K6).",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K15",
+      "title": "An IP literal matches a DNS name",
+      "source_line": 1441,
+      "source_end_line": 1451,
+      "accept": "`1.2.3.4` does not match a dNSName of that text or `*.2.3.4`. It\nmatches an `iPAddress` SAN of that address. A DNS name still matches `san_dns`,\nincluding a single-label wildcard, and still does not match an `iPAddress`.",
+      "specification": "**Size M.** `dnsNameMatchesCert` compares `server_name` only to `san_dns`.\n`dnsPatternMatches` treats a left-most `*.` label as one DNS label and does\nnot reject an address. `san_ips` is parsed in `x509.zig` and then ignored.\nRFC 9525: an IP verify name matches an `iPAddress` SAN only.\n\n**Accept:** `1.2.3.4` does not match a dNSName of that text or `*.2.3.4`. It\nmatches an `iPAddress` SAN of that address. A DNS name still matches `san_dns`,\nincluding a single-label wildcard, and still does not match an `iPAddress`.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K16",
+      "title": "The client offers a ticket past its lifetime",
+      "source_line": 1452,
+      "source_end_line": 1462,
+      "accept": "a ticket older than its advertised lifetime, or older than seven\ndays, is not offered and is not used for early data. A ticket inside both\nbounds is still offered.",
+      "specification": "**Size S.** A stored ticket is offered, and may carry 0-RTT, with no check\nthat `ticket_age_ms` is within `ticket_lifetime` (seconds) or the 7-day cap.\n`ResumeOffer.ticket_lifetime` is stored and not read on the offer path\n(`tls_client.zig`).\n\n**Accept:** a ticket older than its advertised lifetime, or older than seven\ndays, is not offered and is not used for early data. A ticket inside both\nbounds is still offered.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K17",
+      "title": "Ticket lifetime is the current config, and missing issue times never expire",
+      "source_line": 1463,
+      "source_end_line": 1476,
+      "accept": "a ticket minted with no issue time is rejected once a clock is\nconfigured. Lengthening `ticket_lifetime_seconds`, or opening the ticket on a\npeer with a longer config and the same ticket key, does not keep the PSK\nalive past the lifetime that was advertised at mint. A ticket inside that\nsealed lifetime still resumes.",
+      "specification": "**Size S.** `tryAcceptPsk` enforces lifetime only when a clock is set and\n`issued_unix_ms` truncates to a non-zero second count. The window is\n`effectiveTicketLifetimeSeconds` of the accepting node's current\n`ticket_lifetime_seconds`. The lifetime advertised when the ticket was minted\nis not sealed in the ticket.\n\n**Accept:** a ticket minted with no issue time is rejected once a clock is\nconfigured. Lengthening `ticket_lifetime_seconds`, or opening the ticket on a\npeer with a longer config and the same ticket key, does not keep the PSK\nalive past the lifetime that was advertised at mint. A ticket inside that\nsealed lifetime still resumes.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-K18",
+      "title": "Turning 0-RTT off does not bind tickets already sealed with a limit",
+      "source_line": 1477,
+      "source_end_line": 1488,
+      "accept": "`max_early_data_size = 0` refuses early data for every ticket,\nincluding one sealed earlier with a positive limit and one sealed by another\nnode that shares the ticket key. A non-zero config still accepts early data\nonly up to the smaller of the config and the sealed limit.",
+      "specification": "**Size S.** The 0-RTT gate reads the sealed ticket's `max_early_data_size`\n(`accepted_early_data_limit`), not `config.max_early_data_size`. The config\ncomment says zero disables acceptance. The accept path does not read that\nfield. New tickets are sealed from the config; old tickets are not.\n\n**Accept:** `max_early_data_size = 0` refuses early data for every ticket,\nincluding one sealed earlier with a positive limit and one sealed by another\nnode that shares the ticket key. A non-zero config still accepts early data\nonly up to the smaller of the config and the sealed limit.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-M1",
+      "title": "A version vector refuses the 65th replica",
+      "source_line": 1489,
+      "source_end_line": 1503,
+      "accept": "65 replicas merge and round-trip through `member_compact` without\n`CapacityExceeded` or `Oversize`. Callers that copy a vector or size a buffer\nfrom the entry count still build. A gossip sample size of 64 that still stores\nevery member is not this item.",
+      "specification": "**Size M.** `VersionVector.max_entries` is 64. `increment` returns\n`error.CapacityExceeded` at the 65th replica (`clock.zig`). `member_compact.max_context`\nis the same 64 and rejects a larger context as `Oversize`. The vector is a\nvalue type: callers copy it and read `entries` directly, and several size\nwire buffers from `max_entries`. Growing the two files alone leaves those\ncallers wrong. The mesh scale audit did not own this pair; the Codex lane\nconfirmed the ceiling and made no edit.\n\n**Accept:** 65 replicas merge and round-trip through `member_compact` without\n`CapacityExceeded` or `Oversize`. Callers that copy a vector or size a buffer\nfrom the entry count still build. A gossip sample size of 64 that still stores\nevery member is not this item.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-M2",
+      "title": "Mesh ceilings the scale audit did not confirm",
+      "source_line": 1504,
+      "source_end_line": 1522,
+      "accept": "leave these three alone unless a test shows a path that still\nrefuses or overwrites at 64 after the operator ceiling is raised above 64.\nDo not replace the partition detector's adjacency matrix under this id. The\ndrop-on-full behavior of a full passive view, at whatever capacity is\nconfigured, stays the view's eviction rule.",
+      "specification": "**Size S.** Three candidates were reported and the confirm pass rejected all\nthree as a hard lock at 64.\n\n| Candidate | What the code does | Why confirm rejected it |\n| --- | --- | --- |\n| `route_table.zig` `addMember` | The 65th distinct node returns `error.ChannelFanoutFull` when `len == nodes.len`. `nodes.len` is `Config.max_nodes_per_channel` (default 64). | TOML admits `4..4096`. A config above 64 inserts the 65th node. |\n| `membership_view.zig` `add passiveEntry` | At `passive_capacity` the next distinct node overwrites `passive[rng.index]` and the previous node leaves the view. Default capacity 64. | `mesh.gossip.view_passive_capacity` admits `active+1..4096`. |\n| `gossip_views.zig` `add passive` | Same overwrite at `passive_max` (default 64). | `passive_view_max=128` is accepted. |\n\nGossip rounds, the server registry, mesh topology, and the partition detector\nproduced no finding in that pass. `server_registry` already defaults to 512.\n\n**Accept:** leave these three alone unless a test shows a path that still\nrefuses or overwrites at 64 after the operator ceiling is raised above 64.\nDo not replace the partition detector's adjacency matrix under this id. The\ndrop-on-full behavior of a full passive view, at whatever capacity is\nconfigured, stays the view's eviction rule.",
+      "verification_status": "requires_current_requirement_by_requirement_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N1",
+      "title": "Collaborative canvas / CRDT document inside a channel",
+      "source_line": 1195,
+      "source_end_line": 1195,
+      "accept": null,
+      "specification": "`crdt_text` / `egwalker` are idle. Needs retention, authz, and a client.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N2",
+      "title": "Time-travel / deterministic replay of a room",
+      "source_line": 1196,
+      "source_end_line": 1196,
+      "accept": null,
+      "specification": "Needs durable history (GAP-D1) and a recorded seed. `fault_loom.zig` is the tool, not the product.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N3",
+      "title": "Protocol bridges (other chat systems)",
+      "source_line": 1197,
+      "source_end_line": 1197,
+      "accept": null,
+      "specification": "`media_bridge.zig` is an RTP header rewrap. A bridge is a new trust boundary.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N4",
+      "title": "Translation",
+      "source_line": 1198,
+      "source_end_line": 1198,
+      "accept": null,
+      "specification": "No translator in tree. Captions are not a translation pipeline. Client-side, provenance-labeled, if it happens at all.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N5",
+      "title": "Autonomous mesh: discover peers, reweight links, heal with no oper",
+      "source_line": 1199,
+      "source_end_line": 1199,
+      "accept": null,
+      "specification": "Peer lists are configured. GAP-O7 is the manual version. Autonomy that accepts a frame it should reject is a failure.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N6",
+      "title": "Geographic homing and adaptive shard move",
+      "source_line": 1200,
+      "source_end_line": 1200,
+      "accept": null,
+      "specification": "`rendezvous_hash.zig` is idle. Moving a session across shards has to preserve the Helix and reactor-0 rules.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N7",
+      "title": "Read-replica history nodes and tiered storage",
+      "source_line": 1201,
+      "source_end_line": 1201,
+      "accept": null,
+      "specification": "After GAP-D1 and GAP-P4. A replica that can answer `CHATHISTORY` without being a full mesh member.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N8",
+      "title": "Formal proof of CRDT merge laws",
+      "source_line": 1202,
+      "source_end_line": 1202,
+      "accept": null,
+      "specification": "Property tests exist (`concord_props.zig`, `merkle_props.zig`, `ripple_props.zig`). A machine-checked proof is research.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N9",
+      "title": "Programmable rooms on OroWasm",
+      "source_line": 1203,
+      "source_end_line": 1203,
+      "accept": null,
+      "specification": "The host, fuel, and one `message_pre_deliver` hook exist. Room-scoped apps with a permission prompt do not.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N10",
+      "title": "Edge nodes, connection hibernation, metadata-min transport",
+      "source_line": 1204,
+      "source_end_line": 1204,
+      "accept": null,
+      "specification": "Capacity work after the two-node fleet is dull to operate.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N11",
+      "title": "Forum mode, RSVP events, bookmarks, digests",
+      "source_line": 1205,
+      "source_end_line": 1205,
+      "accept": null,
+      "specification": "Product skins on GAP-P1 and GAP-D1.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N12",
+      "title": "Coverage-guided fuzzing as a CI job",
+      "source_line": 1206,
+      "source_end_line": 1206,
+      "accept": null,
+      "specification": "Deterministic fuzz harnesses exist (`tls_fuzz.zig`). A corpus-growing fuzzer is not wired as a required gate. `zig build test-dst` exists and filters DST names; a campaign runner with an operator-supplied seed range is the remaining piece of the old \"no dst step\" item, which is stale.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    },
+    {
+      "id": "GAP-N13",
+      "title": "Public `v0.7.0` tag and a reproducible artifact note",
+      "source_line": 1207,
+      "source_end_line": 1207,
+      "accept": null,
+      "specification": "The fleet runs `ae78d490`. No GitHub tag is recorded. Tagging is a release act, not a feature, and it waits on a human.",
+      "verification_status": "requires_concrete_acceptance_and_current_audit",
+      "evidence": []
+    }
+  ],
+  "current_execution_frontier": "Ordinary unbound multi-hop presence and direct delivery; strict retained/lease groundwork accepted, World preparation active; production causal tests still RED.",
+  "prior_sampled_evidence": "docs/audit/gap-frontier-2026-10-01.md",
+  "active_evidence": "docs/audit/mesh-presence-2026-10-01.md",
+  "global_context": [
+    {
+      "section": "## 2. How to read an item",
+      "source_line": 172,
+      "source_end_line": 183,
+      "text": "## 2. How to read an item\n\n- **Id** — stable for this document. One id, one outcome.\n- **Accept** — the observable that closes it. A helper test is not the accept.\n- **Size** — `S` one focused change, `M` a subsystem, `L` cross-subsystem, `XL` its own release.\n- **Owner** — from `.agents/ROSTER.md`. `onyx-server-integrator` is the only writer of `src/daemon/server.zig`.\n- Client work lives in `/home/kain/onyx`. Items marked **server-first** change a capability, token, or authority rule. Items marked **client-half** are blocked on the Onyx repo.\n\nInvariant bar on every item: reactor 0 owns shared timers; mesh identity is the node `shortId`; cross-host order is a wall-clock HLC; Helix layout changes bump the capsule and keep a legacy decode; untrusted input fails closed; secrets compare in constant time.\n\n---"
+    },
+    {
+      "section": "## 12. Cuts (do not build)",
+      "source_line": 1211,
+      "source_end_line": 1242,
+      "text": "## 12. Cuts (do not build)\n\n| Cut | Reason |\n| --- | --- |\n| `armor enc` openssl-compatible format | AEAD substrate only. Exit 3 stays. |\n| TURN relay allocation | No sockets and no auth secret. `MEDIA TURN` fails `TURN_CUT`. `substrate/turn.zig` stays framing-only. |\n| ECH with HelloRetryRequest | An accepted ECH inner that needs a retry fails `EchHrrUnsupported`. An ECH client fails `HelloRetryRequestUnsupported`. No ClientHello2 re-seal. |\n| AES-GCM HPKE for ECH | `hpke.aead_id` stays ChaCha20-Poly1305 `0x0003`. Any other AEAD fails `UnsupportedEchSuite`. |\n| x448, P-384, and P-521 key shares | The ClientHello offers X25519, P-256, and X25519MLKEM768 only. P-384 ECDSA certificate verify stays. |\n| AES-CCM cipher suites | Named, and `isAllowed` is false. No caller. |\n| brotli and zstd certificate compression | `pickSupported` returns zlib only. |\n| `armor s_server` | Exit 3. No standalone listener socket. |\n| `armor s_client -connect` | `run` returns `NotImplemented` after the client is built. `handshakeInMemory` stays. |\n| In-daemon CRL and CT fetch | Callers pass DER. `require_crl` defaults false and `require_sct` defaults 0. No CDP or CT URL fetch. |\n| `enforce_cert_signature_algorithms` on by default | The default stays off. The chain check runs only when the flag is set. |\n| BoGo beyond the pinned 24/3 lane | `DisabledTests` names a reason per entry. A missing BoringSSL checkout is not a pass. |\n| Delegated-credential mint and rotation | A presented credential is verified. Nothing mints or rotates one. |\n| CLI Landlock, seccomp, pledge, and unveil | The armor CLI applies none. Daemon Linux landlock and seccomp stay on the GAP-X3 path. pledge and unveil are absent. |\n| Full DTLS listener for IRC | Media-plane DTLS-SRTP is the DTLS this daemon has. |\n| PQ hybrid certificates of our own design | 1.x stays verify-only. No private hybrid profile (GAP-K5). |\n| Adopting `substrate/io/ring.zig` as the server | Unfinished, and it is not the live ring. |\n| Multishot recv, buf rings, `send_zc` inside 0.8 | Helix buffer ownership. Separate project after GAP-X1. |\n| XDP, BPF firewall, TPROXY, `SCHED_FIFO` | Not the IRC problem. |\n| WEBIRC, identd, STARTTLS | Clean-room exclusions in the Codex contract. |\n| Services as fake pseudoclient users | Services are real commands. |\n| In-daemon CT-log gossip behaving as a CA | Operator-supplied pins, or GAP-K6's fetch, nothing smarter. |\n| A second flood guard | `flood_guard.zig` replaced the earlier three. Extend it with GAP-D4's account axis. |\n| A second WAL beside OroStore | GAP-D* writes the families. |\n| Competitive clones of another network's bridge protocol | GAP-N3 if ever, from our wire, not from theirs. |\n\n---"
+    },
+    {
+      "section": "## 13. Order",
+      "source_line": 1243,
+      "source_end_line": 1298,
+      "text": "## 13. Order\n\nThe waves are the order. Inside a wave, the first slice is the one whose accept\nfits in one focused `zig build test-*` plus a named new test.\n\n| When | Ids | Why this order |\n| --- | --- | --- |\n| Now | GAP-V1, GAP-A5, GAP-A6, GAP-A8 | Live flags and live kernel behavior. Validation or an honest off-switch. |\n| Next | GAP-D1, GAP-D2, GAP-D3, GAP-D5 | Users already use history, memos, gags, vhosts, and account recovery. |\n| Then | GAP-A9, GAP-A10, GAP-A11 | One account directory, no false quit on a 90s lease, and an honest failure detector. A9 is the long one. |\n| Then | GAP-A2 | Flip authoring only after a DST, then on the fleet with a human. State whether power loss may drop the tail. |\n| Then | GAP-O1, GAP-O2, GAP-O4 | So the fleet flip is visible. |\n| Then | GAP-A1 | OCG2 project is the long authority arc. Observe stays until the accept exists. |\n| With the first slices | GAP-P0a, GAP-P16 | `005` already lies about history and IRCX modes. Read markers are the bouncer's memory. |\n| Then | GAP-P0b, GAP-P0c, GAP-P2, GAP-P4, GAP-O6 | SASL 2FA, WHOIS/LISTX honesty, slowmode, retention, raid shield. |\n| Parallel, one owner | GAP-X2 step 1, then GAP-X1 | Portability starts at the ring seam, not at a Windows `#ifdef` in the monolith. |\n| Later | Wave 4 rest, Wave 5, Wave 8 | Calls beyond the browser proof, fortress, moonshots. |\n\nHuman-only, whenever a slice is actually deployed: Helix `USR2` when the image\ntoken allows, cold restart one node at a time otherwise, GitHub push last.\nThis roadmap does not authorize a deploy.\n\nFreeBSD 14.5-RELEASE-p1 executed the shipped kqueue submit\n(`GAP-X1 freebsd kqueue submitted=6 errno=0`) and kernel TLS\n(`GAP-X3 freebsd ktls result=ok errno=0` with `kern.ipc.tls.enable=1`).\nOpenBSD 7.9 executed the shipped kqueue accept and recv twice\n(`GAP-X1 openbsd kqueue submitted=1 accepted=6 bytes=8 errno=0`) and the\nshipped pledge (`GAP-X3 openbsd pledge result=ok errno=0`). Windows 11 22H2\nWinPE, build 22621.525, executed the shipped IOCP submit twice\n(`GAP-X1 windows iocp submitted=6`, `GUEST_EXIT:0`) and dequeued Registered I/O\ntwice (`GAP-X3 windows rio dequeue=1 bytes=4 status=0`) through the table\n`Iocp.open` loaded. Those same kernels later answered process `PING`/`PONG`: FreeBSD\nkqueue `0.7.0+ddf11915`, OpenBSD kqueue `0.7.0+ddf11915`, and Windows IOCP\n`0.7.0+d4ea0097`. NetBSD and DragonFly are out of scope. The live `IDENTIFY`\nsentence (eshmaki.me / ircx.us) and the live `relay_v2_authoring=active` flip\nstay unmet. Wine is not a Windows kernel, and commit `838ee337` does not close\nGAP-X3. Headings stay unmarked, and the roadmap stays open.\n\n### First three slices a worker can pick up\n\n1. **GAP-V1 decision record and, if the browser test fails, the config hold.**\n   Smallest live risk. Files: media docs, and `dtls13` only if the hold becomes\n   a code default. Do not weaken the 1.2 path.\n2. **GAP-A5.** Make `--check-config` reject `sqpoll` plus `defer_taskrun` on\n   the combination the live kernel rejects, with a test. Files:\n   `config_format.zig` / `config_boot.zig` and the ring probe. One owner.\n3. **GAP-P0a.** Advertise `CHATHISTORY` and the IRCX modes the daemon already\n   enforces, from the same tables the handlers use. One `005` test. Highest\n   user-visible fix that does not need a new store.\n4. **GAP-D2.** Persist `MemoBox` through OroStore `.props` or a real capsule\n   kind, with a USR2 test and a cold-restart test. Leaves `server.zig` to the\n   integrator for the boot hook only. Read markers (GAP-P16) are the same\n   shape and can follow in the same capsule pass.\n\n---"
+    },
+    {
+      "section": "## 15. Cross-repo contracts that block a user-visible close",
+      "source_line": 1321,
+      "source_end_line": 1342,
+      "text": "## 15. Cross-repo contracts that block a user-visible close\n\nServer ships first for each of these. The client repo is `/home/kain/onyx`.\n\n| Server gap | Client work it unblocks |\n| --- | --- |\n| GAP-A3 / GAP-A9 | One nick for two devices, and `IDENTIFY` of the same account on either node |\n| GAP-P0a / GAP-P0b | Clients that trust `005`, and 2FA that can finish inside SASL |\n| GAP-P16 | Bouncer unread state that survives upgrade and node move |\n| GAP-K1 | Group E2EE room setup, member list, rekey on remove |\n| GAP-K2 | Trust center that verifies a device against the log |\n| GAP-P0c / GAP-P11 | LISTX browser, MODEX names, WHISPER compose, auditorium roster |\n| GAP-P5 | Search that is more than the local vault |\n| GAP-O1 / GAP-O2 | Oper desk mesh page |\n| GAP-V2 | A browser call button that does not require the native codec |\n| GAP-D1 / GAP-P4 | Vault retention that matches the server instead of fighting it |\n\nCapability and token additions stay server-first. A client-only reinterpretation\nof an existing tag can ship client-first.\n\n---"
+    },
+    {
+      "section": "## 0. Verdict",
+      "scope": "full_section",
+      "source_line": 111,
+      "source_end_line": 143,
+      "text": "## 0. Verdict\n\nOnyx Server is already a large IRC/IRCX mesh daemon: Armor TLS, Mooring,\nUndertow, Helix, reusable sessions, local search, group-control admission,\na media plane, and a two-node production mesh. The work that is *missing* is\nnot another subsystem. It is four things the current tree claims, stages, or\nleaves on the floor:\n\n1. **Durability.** A lot of user-visible state is a RAM table with a comment\n   that says \"persistent\" or \"survives reconnect.\" Reconnect of a socket is not\n   a process restart, and a Helix `USR2` is not a cold boot. History rides\n   Helix. Memos, gags, vhosts, flood/reputation, shuns, and password-reset\n   tokens do not.\n2. **Staged authority that cannot be turned on.** OCG2 `project` and `mint`\n   fail boot. MESSAGE_V2 defaults to `compat` (receive and forward, author the\n   legacy form), and its \"durable\" outbox survives Helix only, not a power\n   loss. Account databases are per node. Nick trust is a session-replica proof\n   for one live attachment, not a mesh-wide account directory. Ripple's\n   witnessed-death machine is a library the daemon timer does not call.\n3. **Libraries with no daemon caller.** Histograms, cron, circuit breakers,\n   GCRA, ICE-as-an-agent, TURN, RaptorQ, XOR/cuckoo filters, and the generic\n   audit ring are real Zig modules that nothing in `src/daemon/` calls.\n4. **Product surfaces a modern network is expected to have,** and this one does\n   not: slowmode, threads, scheduled messages, retention, appeals, outbound\n   webhooks, raid correlation, unfurls, standards-browser WebRTC, call\n   recording, and a reactor that runs on anything but Linux.\n\nDo not open a new crypto stack, a new mesh, or a new history codec to get\nthere. Wire, persist, and activate what is already written. Split\n`server.zig` only along a seam that one of those slices forces.\n\n---"
+    },
+    {
+      "section": "## 6. Wave 3 — the conversation product",
+      "scope": "section_preface",
+      "source_line": 637,
+      "source_end_line": 647,
+      "text": "## 6. Wave 3 — the conversation product\n\nIRCX verbs are registered. The 0.7 IX track (conformance matrix, MODEX names,\nLISTX filters, WHISPER/DATA hardening, ACCESS completeness, auditorium and\nhidden and knock on the mesh, PROP policy, non-oper EVENT types, AUTH-versus-SASL\ntable, HELP/ISUPPORT honesty) was never closed. Zig has not changed since that\ntable was written as open work. **GAP-P0** is that table, done as one matrix\nplus tests, not as ten speculative rewrites. Explicit divergences (`TACCESS`,\n`BTPROP`, Comic Chat avatar `DATA`, `OPFORCE`) stay divergences and get a row\nthat says so."
+    },
+    {
+      "section": "## 8. Wave 5 — fortress",
+      "scope": "section_preface",
+      "source_line": 962,
+      "source_end_line": 966,
+      "text": "## 8. Wave 5 — fortress\n\nGroup *control* frames are live. Group *content* secrecy is a client property.\nThe daemon must stay unable to read it."
+    },
+    {
+      "section": "## 10. Wave 7 — substrate that is waiting for a caller",
+      "scope": "full_section",
+      "source_line": 1159,
+      "source_end_line": 1187,
+      "text": "## 10. Wave 7 — substrate that is waiting for a caller\n\nImport these when a wave above needs them. Reimplementing them is the failure\nmode.\n\n| Module | Waiting for |\n| --- | --- |\n| `cron.zig` | GAP-P3 |\n| `ddsketch.zig`, `hdr_histogram.zig`, `tdigest.zig` | GAP-O1 |\n| `circuit_breaker.zig` | GAP-O7 |\n| `gcra.zig`, `count_min_sketch.zig`, `topk.zig`, `admission.zig` | GAP-O6, GAP-P2 |\n| `xor_filter.zig`, `cuckoo_filter.zig`, `bloom.zig` | GAP-O8 |\n| `tracing.zig`, `qlog.zig` | GAP-O3 |\n| `ice_agent.zig`, `pmtud.zig`, `turn.zig` | GAP-V2 |\n| `raptorq.zig`, `reed_solomon.zig`, `media_epoch_key.zig` | GAP-V7 |\n| `twcc.zig`, `bbr.zig`, `cc_cubic.zig` | GAP-V3, if the native ABR hint is not enough |\n| `egwalker.zig`, `crdt_text.zig` | GAP-N1 (canvas), not before |\n| `roaring.zig` | an unread-set or ACL set that is actually large |\n| `sparse_merkle.zig` | only if anti-entropy outgrows the Merkle already in Undertow |\n| `rendezvous_hash.zig` | GAP-N6 homing |\n| `audit_trail.zig`, `oper_override.zig` | GAP-O10 / GAP-O9, or delete them if the live audit ring is the one that stays |\n| Helix codecs with no kind: `memo_capsule`, `away_capsule`, `whowas_capsule`, and `ratelimit_capsule` are not maintained. `ban_capsule` stays for DST while live bans ride the world checkpoint. `CapsuleKind` is still 1 through 17 | GAP-D2, GAP-D3, GAP-D4. The second codec was removed. No new `CapsuleKind` was added |\n\n`wal.zig` is not the missing store. OroStore already is a checksummed WAL plus\nsnapshot (default 16 MiB/record, 256 MiB WAL). The gap is which families are\nactually written (GAP-D1…D6), not a second WAL.\n\n---"
+    },
+    {
+      "section": "## 11. Wave 8 — moonshots",
+      "scope": "section_preface",
+      "source_line": 1188,
+      "source_end_line": 1192,
+      "text": "## 11. Wave 8 — moonshots\n\nWorth remembering. Not scheduled. Each one needs a design note before code,\nbecause each one fights an invariant above."
+    }
+  ],
+  "current_execution_frontier_scope": "Historical extraction-era observation; consult current_record_review for the current full-goal frontier. All acceptance text and deliberate exclusions/constraints below remain authoritative.",
+  "current_record_review": "docs/audit/full-record-review-2026-10-02.md#record21-entire-record-reconciliation-and-new-source-blockers"
+}

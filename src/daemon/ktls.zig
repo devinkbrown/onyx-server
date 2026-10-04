@@ -352,6 +352,7 @@ pub const RecvError = error{
     NeedsRekey,
     /// `recvmsg` failed for any other reason (a real socket error).
     RecvFailed,
+    MalformedControl,
 };
 
 /// One record read off a kTLS-RX socket: the kernel-decrypted `plaintext` (a
@@ -360,37 +361,35 @@ pub const RecvError = error{
 pub const RecordRead = struct {
     record_type: u8,
     plaintext: []u8,
+    metadata_present: bool,
+    end_of_record: bool,
 };
 
-/// Extract the first `SOL_TLS` / `TLS_GET_RECORD_TYPE` cmsg's 1-byte content type
-/// from a completed `recvmsg`'s control buffer. Returns null when no such cmsg is
-/// present (⇒ the caller treats the read as application_data, matching a plain
-/// recv) or the control data was truncated (`MSG_CTRUNC`, fail-safe). Walks the
-/// ancillary buffer with the standard `CMSG_*` geometry rather than trusting a
-/// fixed offset, so an unexpected extra cmsg cannot desync the parse.
-fn parseRecordTypeCmsg(msg: *const linux.msghdr) ?u8 {
-    if (msg.flags & linux.MSG.CTRUNC != 0) return null;
-    const control = msg.control orelse return null;
-    const control_len = msg.controllen;
+/// Strict ancillary admission. Absence is distinct from corrupted metadata;
+/// CTRUNC, duplicate TLS metadata and noncanonical payload length are errors.
+fn parseRecordTypeCmsg(msg: *const linux.msghdr) error{MalformedControl}!?u8 {
+    if (msg.flags & (linux.MSG.CTRUNC | linux.MSG.TRUNC) != 0) return error.MalformedControl;
+    if (msg.controllen == 0) return null;
+    const control = msg.control orelse return error.MalformedControl;
     const base: [*]const u8 = @ptrCast(control);
     var off: usize = 0;
-    while (off + cmsg_hdr_len <= control_len) {
+    var found: ?u8 = null;
+    while (off < msg.controllen) {
+        if (msg.controllen - off < cmsg_hdr_len) return error.MalformedControl;
         const hdr: *align(cmsg_align_to) const linux.cmsghdr = @ptrCast(@alignCast(base + off));
         const clen = hdr.len;
-        if (clen < cmsg_hdr_len or off + clen > control_len) break;
+        if (clen < cmsg_hdr_len or clen > msg.controllen - off) return error.MalformedControl;
         if (hdr.level == @as(i32, @intCast(SOL_TLS)) and hdr.type == @as(i32, @intCast(TLS_GET_RECORD_TYPE))) {
-            // The content byte lives at base+CMSG_ALIGN(hdr) and must belong to
-            // THIS cmsg: require CMSG_LEN(1) worth of length (clen >=
-            // CMSG_ALIGN(hdr)+1). A header-only match (clen == cmsg_hdr_len)
-            // would otherwise read the first byte of the next cmsg's header.
-            const data_off = off + cmsgAlign(cmsg_hdr_len);
-            if (clen >= cmsgAlign(cmsg_hdr_len) + 1 and data_off < control_len) return base[data_off];
+            if (found != null or clen != cmsgAlign(cmsg_hdr_len) + 1) return error.MalformedControl;
+            found = base[off + cmsgAlign(cmsg_hdr_len)];
         }
+        // The final cmsg may omit alignment padding from controllen.
+        if (clen == msg.controllen - off) break;
         const step = cmsgAlign(clen);
-        if (step == 0) break;
+        if (step > msg.controllen - off) return error.MalformedControl;
         off += step;
     }
-    return null;
+    return found;
 }
 
 /// Do one `recvmsg(fd)` that also reads the out-of-band TLS record content type
@@ -423,9 +422,9 @@ pub fn recvmsgRecordType(fd: linux.fd_t, buf: []u8, flags: u32) RecvError!Record
             switch (posix.errno(rc)) {
                 .SUCCESS => {
                     const n: usize = @intCast(rc);
-                    if (n == 0) return error.Eof;
-                    const rt = parseRecordTypeCmsg(&msg) orelse @intFromEnum(RecordType.application_data);
-                    return .{ .record_type = rt, .plaintext = buf[0..n] };
+                    const metadata = try parseRecordTypeCmsg(&msg);
+                    if (n == 0 and metadata == null) return error.Eof;
+                    return .{ .record_type = metadata orelse @intFromEnum(RecordType.application_data), .plaintext = buf[0..n], .metadata_present = metadata != null, .end_of_record = msg.flags & linux.MSG.EOR != 0 };
                 },
                 .INTR => continue,
                 .AGAIN => return error.WouldBlock,
@@ -434,6 +433,67 @@ pub fn recvmsgRecordType(fd: linux.fd_t, buf: []u8, flags: u32) RecvError!Record
             }
         }
     } else return error.RecvFailed;
+}
+
+/// Owned full tuple returned by TLS_RX/TLS_TX. Key bytes never escape logs or
+/// survive the caller turn without explicit snapshot custody.
+pub const KernelTuple = struct {
+    bytes: [max_crypto_info_len]u8 = @splat(0),
+    len: usize,
+
+    pub fn wipe(self: *KernelTuple) void {
+        std.crypto.secureZero(u8, &self.bytes);
+    }
+    pub fn encoded(self: *const KernelTuple) []const u8 {
+        return self.bytes[0..self.len];
+    }
+    pub fn sequence(self: *const KernelTuple) u64 {
+        return std.mem.readInt(u64, self.bytes[self.len - 8 ..][0..8], .big);
+    }
+    pub fn validateEpoch(self: *const KernelTuple, expected: []const u8) ControlError!void {
+        if (expected.len != self.len or self.len < 8 or
+            std.crypto.timing_safe.compare(u8, self.bytes[0 .. self.len - 8], expected[0 .. expected.len - 8], .big) != .eq) return error.TupleMismatch;
+    }
+};
+
+pub const Direction = enum { tx, rx };
+pub const ControlError = error{ Unsupported, GetFailed, TupleMismatch, BadLength, WouldBlock, SendFailed };
+
+pub fn getTuple(fd: linux.fd_t, direction: Direction, cipher: Cipher) ControlError!KernelTuple {
+    if (comptime builtin.os.tag != .linux) return error.Unsupported;
+    var tuple: KernelTuple = .{ .len = cipher.cryptoInfoLen() };
+    errdefer tuple.wipe();
+    var len: linux.socklen_t = @intCast(tuple.len);
+    const rc = linux.getsockopt(fd, @intCast(SOL_TLS), if (direction == .tx) TLS_TX else TLS_RX, &tuple.bytes, &len);
+    if (posix.errno(rc) != .SUCCESS) return error.GetFailed;
+    if (len != tuple.len or std.mem.readInt(u16, tuple.bytes[0..2], native_endian) != TLS_1_3_VERSION or
+        std.mem.readInt(u16, tuple.bytes[2..4], native_endian) != cipher.cipherType().toInt()) return error.TupleMismatch;
+    return tuple;
+}
+
+/// Emit one old-epoch typed control fragment. Each accepted fragment is one
+/// handshake/alert record; the physical owner tracks the accepted prefix.
+pub fn sendControl(fd: linux.fd_t, record_type: RecordType, bytes: []const u8) ControlError!usize {
+    if (comptime builtin.os.tag != .linux) return error.Unsupported;
+    if (bytes.len == 0 or (record_type != .handshake and record_type != .alert)) return error.BadLength;
+    var cbuf: [cmsg_space_record_type]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+    const hdr: *linux.cmsghdr = @ptrCast(&cbuf);
+    hdr.* = .{ .len = cmsgAlign(cmsg_hdr_len) + 1, .level = @intCast(SOL_TLS), .type = @intCast(TLS_SET_RECORD_TYPE) };
+    cbuf[cmsgAlign(cmsg_hdr_len)] = @intFromEnum(record_type);
+    var iov = [_]posix.iovec_const{.{ .base = bytes.ptr, .len = bytes.len }};
+    const msg: linux.msghdr_const = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &cbuf, .controllen = cbuf.len, .flags = 0 };
+    while (true) {
+        const rc = linux.sendmsg(fd, &msg, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0 or rc > bytes.len) return error.SendFailed;
+                return rc;
+            },
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => return error.SendFailed,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -582,22 +642,22 @@ test "parseRecordTypeCmsg reads the TLS_GET_RECORD_TYPE content byte" {
         .flags = 0,
     };
     // The handshake(22) content type is parsed out of the ancillary data.
-    try testing.expectEqual(@as(?u8, @intFromEnum(RecordType.handshake)), parseRecordTypeCmsg(&msg));
+    try testing.expectEqual(@as(?u8, @intFromEnum(RecordType.handshake)), try parseRecordTypeCmsg(&msg));
 
     // No control data ⇒ null (the caller then treats the read as application_data,
     // matching a plain recv of app plaintext).
     msg.controllen = 0;
-    try testing.expectEqual(@as(?u8, null), parseRecordTypeCmsg(&msg));
+    try testing.expectEqual(@as(?u8, null), try parseRecordTypeCmsg(&msg));
 
-    // A truncated cmsg (MSG_CTRUNC) ⇒ null, fail-safe (never trust a partial type).
+    // A truncated cmsg is a fatal metadata error, never application data.
     msg.controllen = cmsg_len;
     msg.flags = linux.MSG.CTRUNC;
-    try testing.expectEqual(@as(?u8, null), parseRecordTypeCmsg(&msg));
+    try testing.expectError(error.MalformedControl, parseRecordTypeCmsg(&msg));
 
     // A cmsg for a different (level,type) is ignored ⇒ null.
     msg.flags = 0;
     hdr.type = @intCast(TLS_SET_RECORD_TYPE);
-    try testing.expectEqual(@as(?u8, null), parseRecordTypeCmsg(&msg));
+    try testing.expectEqual(@as(?u8, null), try parseRecordTypeCmsg(&msg));
 }
 
 test "parseRecordTypeCmsg rejects a data-less matching cmsg instead of reading the next header" {
@@ -635,8 +695,8 @@ test "parseRecordTypeCmsg rejects a data-less matching cmsg instead of reading t
         .controllen = next_off + cmsg_hdr_len, // both headers fully in-bounds
         .flags = 0,
     };
-    // Fail-closed: a data-less match yields null, never the adjacent header byte.
-    try testing.expectEqual(@as(?u8, null), parseRecordTypeCmsg(&msg));
+    // Fail closed instead of reading the following header as a type.
+    try testing.expectError(error.MalformedControl, parseRecordTypeCmsg(&msg));
 }
 
 test "cmsg geometry matches the LP64 CMSG_* macros" {

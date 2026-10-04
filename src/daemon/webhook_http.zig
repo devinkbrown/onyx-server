@@ -28,6 +28,9 @@ const posix = std.posix;
 
 const webhook = @import("webhook.zig");
 const webhook_render = @import("webhook_render.zig");
+const runtime_pause = @import("runtime_pause.zig");
+pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
+const metrics_http = @import("metrics_http.zig");
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("webhook_http requires a 64-bit target");
@@ -58,6 +61,7 @@ pub const ListenerError = error{
     ListenFailed,
     AddrLookupFailed,
     TimeoutSetupFailed,
+    InvalidListener,
 };
 
 /// Handler tunables (validation limits + rate policy).
@@ -214,6 +218,8 @@ pub const WebhookServer = struct {
     /// therefore linearize without two of them spawning or joining one handle.
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
     thread: ?std.Thread = null,
+    runtime: runtime_pause.WorkerState = .{},
+    config: Config = .{},
     stop_flag: std.atomic.Value(bool) = .{ .raw = false },
     conn_read_timeout_sec: u32 = default_conn_read_timeout_sec,
 
@@ -239,21 +245,20 @@ pub const WebhookServer = struct {
             return error.BindFailed;
         if (posix.errno(sys.listen(fd, config.listen_backlog)) != .SUCCESS)
             return error.ListenFailed;
-        if (comptime builtin.os.tag != .linux) {
-            @import("os_runtime.zig").setNonblocking(fd) catch return error.ListenFailed;
-        }
+        @import("os_runtime.zig").setNonblocking(fd) catch return error.ListenFailed;
 
         // A finite accept timeout is also the pause barrier's wake-up clock.
         // Clamp a configured zero to one millisecond: on Linux a zero timeval
         // disables SO_RCVTIMEO and could otherwise make pause() wait forever on
         // an idle listener.
-        const accept_poll_ms = @max(config.accept_poll_ms, 1);
+        const accept_poll_ms = normalizedConfig(config).accept_poll_ms;
         if (!installReceiveTimeoutMs(fd, accept_poll_ms)) return error.TimeoutSetupFailed;
 
         return .{
             .store = store,
             .sink = sink,
             .handler = config.handler,
+            .config = normalizedConfig(config),
             .listen_fd = fd,
             .port = try boundPort(fd),
             // A zero timeval disables SO_RCVTIMEO. The listener lifecycle needs
@@ -263,7 +268,7 @@ pub const WebhookServer = struct {
         };
     }
 
-    pub const ResumeError = std.Thread.SpawnError || error{ListenerClosed};
+    pub const ResumeError = std.Thread.SpawnError || error{ ListenerClosed, SharedGateOwned };
 
     /// Start the listener thread for the first time. Kept as the boot-facing
     /// name; lifecycle restarts use resumeServing() to make the retained-FD contract
@@ -278,9 +283,11 @@ pub const WebhookServer = struct {
     /// TCP handshakes may remain queued in the kernel backlog while paused; no
     /// request from them is parsed or acknowledged until the thread resumes.
     pub fn pause(self: *WebhookServer) void {
+        self.runtime.requireDetached() catch @panic("managed stop requires Runtime Control join and source detach");
         lockLifecycle(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
         self.stop_flag.store(true, .release);
+        self.runtime.wakeForStop();
         if (self.thread) |t| {
             t.join();
             self.thread = null;
@@ -292,6 +299,7 @@ pub const WebhookServer = struct {
     pub fn resumeServing(self: *WebhookServer) ResumeError!void {
         lockLifecycle(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        if (self.runtime.view != null) return error.SharedGateOwned;
         if (self.thread != null) return;
         if (self.listen_fd < 0) return error.ListenerClosed;
         self.stop_flag.store(false, .release);
@@ -303,28 +311,93 @@ pub const WebhookServer = struct {
         };
     }
 
-    /// Final, idempotent teardown. Unlike pause(), this releases the port and
-    /// permanently prevents resumeServing(). Closing first wakes a blocking accept;
-    /// listen_fd is invalidated only after the worker has joined, avoiding a
-    /// non-atomic field race with acceptLoop.
+    /// Final teardown retains the listener until the one producer has joined.
+    /// Main must cancel/join a pending shared Gate before freeing any context.
     pub fn shutdown(self: *WebhookServer) void {
+        self.runtime.requireDetached() catch @panic("managed stop requires Runtime Control join and source detach");
         lockLifecycle(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
         self.stop_flag.store(true, .release);
-        if (comptime builtin.os.tag == .linux) {
-            if (self.listen_fd >= 0) closeFd(self.listen_fd);
-        }
+        self.runtime.wakeForStop();
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
-        if (comptime builtin.os.tag != .linux) closeFd(self.listen_fd);
+        if (self.listen_fd >= 0) closeFd(self.listen_fd);
         self.listen_fd = -1;
     }
 
+    pub fn prepareColdResources(self: *WebhookServer, io: std.Io) !void {
+        if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        try validateEndpoint(try metrics_http.observeListener(self.listen_fd), self.port, self.config);
+        try self.runtime.pause.bindIo(io);
+    }
+    pub fn validateDormantRegistration(self: *WebhookServer, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime.validateRegistration(control, view, slot, .webhook, 0, self, dormant_spawn_options);
+    }
+    pub fn prepareDormantWorker(self: *WebhookServer, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime.validatePreparation(control, view, slot, .webhook, 0, self, dormant_spawn_options);
+        if (self.thread != null) return error.AlreadyStarted;
+        try validateEndpoint(try metrics_http.observeListener(self.listen_fd), self.port, self.config);
+        self.stop_flag.store(false, .release);
+        try self.runtime.prepare(control, view, slot, .webhook, 0, WebhookServer, self, acceptLoop, dormant_spawn_options);
+    }
+    /// Signals this owner only. Runtime Control owns all actual joins.
+    pub fn requestStopAndWake(self: *WebhookServer) void {
+        self.stop_flag.store(true, .release);
+        self.runtime.wakeForStop();
+    }
+    pub fn detachAfterJoined(self: *WebhookServer) !void {
+        try self.runtime.detachAfterJoined();
+    }
+    pub fn requireParked(self: *WebhookServer) !void {
+        try self.runtime.requireParked();
+    }
+    pub fn requireActivated(self: *WebhookServer) !void {
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+        try self.runtime.requireActivated();
+    }
+    pub fn requestPause(self: *WebhookServer, epoch: u64) !runtime_pause.Token {
+        return self.runtime.pause.request(epoch);
+    }
+    pub fn awaitPaused(self: *WebhookServer, token: runtime_pause.Token, deadline: std.Io.Clock.Timestamp) !void {
+        try self.runtime.pause.awaitPaused(token, deadline);
+    }
+    pub fn resumePaused(self: *WebhookServer, token: runtime_pause.Token) !void {
+        try self.runtime.pause.resumePaused(token);
+    }
+    pub fn capturePaused(self: *WebhookServer, token: runtime_pause.Token) !Snapshot {
+        if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+        try self.runtime.pause.requirePaused(token);
+        return self.captureCut(.paused);
+    }
+    pub fn captureUnstarted(self: *WebhookServer) !Snapshot {
+        if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
+        return self.captureCut(.unstarted);
+    }
+    fn captureCut(self: *WebhookServer, execution: Execution) !Snapshot {
+        const observed = try metrics_http.observeListener(self.listen_fd);
+        try validateEndpoint(observed, self.port, self.config);
+        return .{ .listener = observed, .config = self.config, .execution = execution };
+    }
+    /// Consumes the received duplicate on entry. The caller separately owns the
+    /// exact WebhookStore (bindings/rate state) and accepted reactor post queue.
+    /// Neither borrowed callback nor store pointers are serialized in this row.
+    pub fn initInherited(store: *webhook.WebhookStore, sink: webhook.PostSink, fd: sys.fd_t, carry: *const Snapshot, config: Config) !WebhookServer {
+        errdefer closeFd(fd);
+        try carry.validate(config);
+        const observed = try metrics_http.observeListener(fd);
+        if (!std.meta.eql(observed, carry.listener)) return error.ListenerMismatch;
+        return .{ .store = store, .sink = sink, .listen_fd = fd, .port = observed.port, .handler = carry.config.handler, .config = carry.config, .conn_read_timeout_sec = carry.config.conn_read_timeout_sec };
+    }
+
     fn acceptLoop(self: *WebhookServer) void {
+        self.runtime.markEntered();
+        defer self.runtime.markExited();
         var retry_ms: u32 = accept_retry_initial_ms;
         while (!self.stop_flag.load(.acquire)) {
+            self.runtime.pause.boundary();
+            if (self.stop_flag.load(.acquire)) break;
             const rc = acceptSocket(self.listen_fd);
             const err = posix.errno(rc);
             switch (err) {
@@ -355,6 +428,7 @@ pub const WebhookServer = struct {
 
     fn serveConn(self: *WebhookServer, fd: sys.fd_t) void {
         defer closeFd(fd);
+        const deadline = @import("../substrate/platform.zig").monotonicMillis() + @as(i64, self.conn_read_timeout_sec) * 1000;
         // Never enter the blocking request reader without a verified finite
         // timeout: pause() joins this thread and must not be hostage to a peer
         // holding a partial request open.
@@ -363,7 +437,7 @@ pub const WebhookServer = struct {
         // Read request headers + body (bounded). The read loop stops once the
         // full declared body is present, the buffer fills, or the socket idles.
         var req_buf: [max_header + max_body_hard]u8 = undefined;
-        const n = readRequest(fd, &req_buf, self.handler.max_body, &self.stop_flag, self.conn_read_timeout_sec) orelse return;
+        const n = readRequestUntil(fd, &req_buf, self.handler.max_body, &self.stop_flag, deadline) orelse return;
         if (n == 0) return;
 
         var scratch: [json_scratch]u8 = undefined;
@@ -380,7 +454,7 @@ pub const WebhookServer = struct {
             now_ms,
             &resp_buf,
         ) catch return;
-        if (!self.stop_flag.load(.acquire)) writeAll(fd, resp);
+        _ = metrics_http.writeUntil(fd, resp, &self.stop_flag, deadline);
     }
 };
 
@@ -392,8 +466,10 @@ pub const WebhookServer = struct {
 /// body, if any, is never awaited — `handleRequest` answers such a POST 411),
 /// which is what keeps a length-less slow body from pinning the accept loop.
 fn readRequest(fd: sys.fd_t, buf: []u8, max_body: usize, stop: *const std.atomic.Value(bool), timeout_sec: u32) ?usize {
+    return readRequestUntil(fd, buf, max_body, stop, @import("../substrate/platform.zig").monotonicMillis() + @as(i64, @intCast(@max(timeout_sec, 1))) * 1000);
+}
+fn readRequestUntil(fd: sys.fd_t, buf: []u8, max_body: usize, stop: *const std.atomic.Value(bool), deadline: i64) ?usize {
     const clock = @import("../substrate/platform.zig");
-    const deadline = clock.monotonicMillis() + @as(i64, @intCast(@max(timeout_sec, 1))) * 1000;
     var total: usize = 0;
     var header_end: ?usize = null;
     var need: ?usize = null; // total bytes required once headers are parsed
@@ -483,32 +559,30 @@ fn nextAcceptRetryMs(current_ms: u32) u32 {
 // BSD accept timeout is explicit: listener SO_RCVTIMEO is configuration,
 // poll bounds the wait, and nonblocking accept cannot hang after stale readiness.
 fn acceptSocket(fd: posix.fd_t) if (builtin.os.tag == .linux) usize else c_int {
-    if (comptime builtin.os.tag == .linux) return sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
     var tv: sys.timeval = undefined;
     var len: posix.socklen_t = @sizeOf(@TypeOf(tv));
-    if (sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), &len) != 0) return -1;
+    if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), &len)) != .SUCCESS) return acceptFailure(.INVAL);
     const millis = @max(@as(i64, 1), tv.sec * 1000 + @divTrunc(tv.usec, 1000));
     var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
     const rc = sys.poll(&pollfds, 1, @intCast(@min(millis, std.math.maxInt(c_int))));
-    if (rc < 0) return -1;
-    if (rc == 0) {
-        sys._errno().* = @intFromEnum(posix.E.AGAIN);
-        return -1;
-    }
+    if (posix.errno(rc) != .SUCCESS) return acceptFailure(posix.errno(rc));
+    if (rc == 0) return acceptFailure(.AGAIN);
     const accepted = sys.accept4(fd, null, null, posix.SOCK.CLOEXEC);
-    if (accepted < 0) return -1;
-    // BSD may inherit listener nonblocking state. Request readers use a
-    // verified SO_RCVTIMEO on a blocking accepted socket.
-    const old = sys.fcntl(accepted, posix.F.GETFL, @as(c_int, 0));
-    if (old >= 0) {
-        var flags: posix.O = @bitCast(@as(u32, @intCast(old)));
-        flags.NONBLOCK = false;
-        if (sys.fcntl(accepted, posix.F.SETFL, @as(usize, @as(u32, @bitCast(flags)))) == 0) return accepted;
-    }
-    const saved = sys._errno().*;
-    _ = sys.close(accepted);
-    sys._errno().* = saved;
-    return -1;
+    if (posix.errno(accepted) != .SUCCESS) return acceptFailure(posix.errno(accepted));
+    if (comptime builtin.os.tag == .linux) return accepted;
+    if (comptime builtin.os.tag != .linux) {
+        // Only the newly accepted socket changes mode; never an inherited listener.
+        const old = sys.fcntl(accepted, posix.F.GETFL, @as(c_int, 0));
+        if (old >= 0) {
+            var flags: posix.O = @bitCast(@as(u32, @intCast(old)));
+            flags.NONBLOCK = false;
+            if (sys.fcntl(accepted, posix.F.SETFL, @as(if (@import("builtin").os.tag == .linux) usize else c_int, @intCast(@as(u32, @bitCast(flags))))) == 0) return accepted;
+        }
+        const saved = sys._errno().*;
+        _ = sys.close(accepted);
+        sys._errno().* = saved;
+        return -1;
+    } else unreachable;
 }
 
 fn socketTcp() ListenerError!sys.fd_t {
@@ -1120,4 +1194,104 @@ test "WebhookServer pause and whole request deadline stop an active dribble befo
         try testing.expectEqual(@as(u32, 0), counted.count.load(.acquire));
         try testing.expect(server.listen_fd >= 0);
     }
+}
+
+fn acceptFailure(err: posix.E) if (builtin.os.tag == .linux) usize else c_int {
+    if (comptime builtin.os.tag == .linux) return @bitCast(-@as(isize, @intFromEnum(err))) else {
+        sys._errno().* = @intFromEnum(err);
+        return -1;
+    }
+}
+
+pub const Execution = enum(u8) { unstarted = 0, paused = 1 };
+pub const Snapshot = struct {
+    listener: metrics_http.ListenerObservation,
+    config: Config,
+    execution: Execution,
+    pub fn validate(self: *const Snapshot, config: Config) !void {
+        if (!std.meta.eql(self.config, normalizedConfig(config))) return error.ConfigMismatch;
+        if (self.config.handler.max_body > max_body_hard) return error.InvalidSnapshot;
+        try validateEndpoint(self.listener, self.listener.port, self.config);
+    }
+};
+fn normalizedConfig(config: Config) Config {
+    var result = config;
+    result.accept_poll_ms = @min(@max(result.accept_poll_ms, 1), std.math.maxInt(c_int));
+    result.conn_read_timeout_sec = @max(result.conn_read_timeout_sec, 1);
+    return result;
+}
+fn validateEndpoint(observed: metrics_http.ListenerObservation, port: u16, config: Config) !void {
+    var address: [16]u8 = @splat(0);
+    std.mem.writeInt(u32, address[0..4], config.bind_addr, .big);
+    if (observed.family != posix.AF.INET or port == 0 or observed.port != port or
+        observed.scope_id != 0 or observed.flow_info != 0 or !std.mem.eql(u8, &observed.address, &address)) return error.ListenerMismatch;
+    // Linux rounds sub-tick SO_RCVTIMEO upward; matching the held observation is
+    // authoritative, with this finite configured lower bound and one tick slack.
+    const wanted = @as(u64, normalizedConfig(config).accept_poll_ms) * 1000;
+    if (observed.recv_timeout_us < wanted or observed.recv_timeout_us - wanted > 10_000) return error.ListenerMismatch;
+}
+
+fn duplicateListenerForTest(fd: posix.fd_t) !posix.fd_t {
+    const rc = sys.fcntl(fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
+    if (posix.errno(rc) != .SUCCESS) return error.TestUnexpectedResult;
+    return @intCast(rc);
+}
+
+test "companion runtime webhook gated retained worker preserves backlog and exact listener" {
+    // getsockopt/setsockopt have no libc-free Windows mapping yet.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var store = webhook.WebhookStore.init();
+    const creds = seed(&store);
+    var counted = CountingSink{};
+    const config: Config = .{ .accept_poll_ms = 10, .conn_read_timeout_sec = 1 };
+    var server = try WebhookServer.init(&store, counted.sink(), 0, config);
+    try server.prepareColdResources(std.testing.io);
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .webhook, .instance = 0, .owner_identity = &server }};
+    const gate = runtime_pause.start_gate.create(std.testing.allocator, std.testing.io, &specs) catch |err| {
+        server.shutdown();
+        return err;
+    };
+    defer {
+        server.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        server.detachAfterJoined() catch unreachable;
+        server.shutdown();
+        gate.control.destroyJoined();
+    }
+    const first_pause = try server.requestPause(1);
+    try server.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.webhook, 0, &server));
+    try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try std.testing.expect(server.thread == null);
+    gate.control.releaseAll();
+    try server.awaitPaused(first_pause, std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try server.requireActivated();
+    const observed = try metrics_http.observeListener(server.listen_fd);
+    var carry = try server.capturePaused(first_pause);
+    const queued_fd = try connectLoopback(server.port);
+    defer closeFd(queued_fd);
+    var request: [512]u8 = undefined;
+    writeAll(queued_fd, buildRequest(&request, &creds.id, &creds.token, "{\"content\":\"retained\"}"));
+    try std.testing.expectEqual(@as(u32, 0), counted.count.load(.acquire));
+    var adopted = try WebhookServer.initInherited(&store, counted.sink(), try duplicateListenerForTest(server.listen_fd), &carry, config);
+    adopted.shutdown();
+    try std.testing.expectEqualDeep(observed, try metrics_http.observeListener(server.listen_fd));
+    const rejected = try duplicateListenerForTest(server.listen_fd);
+    carry.listener.inode ^= 1;
+    try std.testing.expectError(error.ListenerMismatch, WebhookServer.initInherited(&store, counted.sink(), rejected, &carry, config));
+    carry.listener.inode ^= 1;
+    try std.testing.expect(posix.errno(sys.fcntl(rejected, posix.F.GETFD, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0))) != .SUCCESS);
+    var wrong_config = config;
+    wrong_config.handler.rate.burst += 1;
+    try std.testing.expectError(error.ConfigMismatch, carry.validate(wrong_config));
+    try server.resumePaused(first_pause);
+    try expectNoContent(queued_fd);
+    try std.testing.expectEqual(@as(u32, 1), counted.count.load(.acquire));
+    const second_pause = try server.requestPause(2);
+    try server.awaitPaused(second_pause, std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try std.testing.expectError(error.InvalidToken, server.resumePaused(first_pause));
+    try std.testing.expectEqualDeep(observed, (try server.capturePaused(second_pause)).listener);
+    // Gate still owns exactly the original worker; neither rollback nor a new
+    // pause epoch respawns it. The borrowed sink has published the one post.
+    try std.testing.expectEqual(@as(usize, 1), gate.view.inspect().spawned);
+    try std.testing.expectEqual(@as(u32, 1), counted.count.load(.acquire));
 }

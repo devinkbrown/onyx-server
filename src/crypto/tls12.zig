@@ -33,6 +33,7 @@ pub const Error = error{
     CiphertextTooLong,
     InputTooLarge,
     PlaintextTooLong,
+    RecordOverflow,
     SequenceExhausted,
     UnsupportedCipherSuite,
 } || std.mem.Allocator.Error;
@@ -460,9 +461,9 @@ pub fn openRecordAlloc(
     if (parsed.wire_len != record.len) return error.BadRecord;
     const tag_len = suite.tagLen();
     const explicit_len = suite.explicitNonceLen();
-    if (parsed.fragment.len < explicit_len + tag_len) return error.BadRecord;
+    if (parsed.fragment.len < explicit_len + tag_len) return error.AeadAuthFailed;
     const cipher_len = parsed.fragment.len - explicit_len - tag_len;
-    if (cipher_len > max_plaintext_len) return error.PlaintextTooLong;
+    if (cipher_len > max_plaintext_len) return error.RecordOverflow;
     const ciphertext = parsed.fragment[explicit_len .. explicit_len + cipher_len];
     const tag = parsed.fragment[explicit_len + cipher_len ..];
     // AES-GCM (RFC 5288): the 8-byte explicit nonce is chosen by the SENDER and

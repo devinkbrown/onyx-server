@@ -110,6 +110,91 @@ pub const RetransmitBuffer = struct {
     packets: std.ArrayList(StoredPacket) = .empty,
     newest_ext_seq: ?i64 = null,
 
+    /// An owned, pointer-free description of this source's retained packet
+    /// history. The allocator is cleanup custody, never a wire field. Capture
+    /// requires the media owner to have stopped concurrent packet admission.
+    pub const Snapshot = struct {
+        allocator: Allocator,
+        capacity: usize,
+        packets: []Packet,
+        newest_ext_seq: ?i64,
+
+        pub const Packet = struct {
+            seq: u16,
+            ext_seq: i64,
+            bytes: []u8,
+        };
+
+        pub fn deinit(self: *Snapshot) void {
+            for (self.packets) |packet| {
+                std.crypto.secureZero(u8, packet.bytes);
+                self.allocator.free(packet.bytes);
+            }
+            self.allocator.free(self.packets);
+            self.* = undefined;
+        }
+
+        pub fn validate(self: *const Snapshot, expected_capacity: usize, max_bytes: usize) !void {
+            if (self.capacity != expected_capacity or self.packets.len > self.capacity) return error.InvalidSnapshot;
+            if (self.packets.len != 0 and self.newest_ext_seq == null) return error.InvalidSnapshot;
+            var bytes: usize = 0;
+            var previous: ?i64 = null;
+            for (self.packets) |packet| {
+                if (previous) |p| if (packet.ext_seq <= p) return error.InvalidSnapshot;
+                const seq: u16 = @truncate(@as(u64, @bitCast(packet.ext_seq)));
+                if (packet.seq != seq or packet.ext_seq > self.newest_ext_seq.?) return error.InvalidSnapshot;
+                bytes = std.math.add(usize, bytes, packet.bytes.len) catch return error.Capacity;
+                if (bytes > max_bytes) return error.Capacity;
+                previous = packet.ext_seq;
+            }
+        }
+    };
+
+    pub fn capture(self: *const RetransmitBuffer, allocator: Allocator, max_bytes: usize) !Snapshot {
+        // Validate the actual source before allocating any snapshot backing.
+        if (self.packets.items.len > self.capacity) return error.InvalidSnapshot;
+        var bytes: usize = 0;
+        var previous: ?i64 = null;
+        for (self.packets.items) |packet| {
+            if (previous) |p| if (packet.ext_seq <= p) return error.InvalidSnapshot;
+            if (self.newest_ext_seq == null or packet.ext_seq > self.newest_ext_seq.? or
+                packet.seq != @as(u16, @truncate(@as(u64, @bitCast(packet.ext_seq))))) return error.InvalidSnapshot;
+            bytes = std.math.add(usize, bytes, packet.bytes.len) catch return error.Capacity;
+            if (bytes > max_bytes) return error.Capacity;
+            previous = packet.ext_seq;
+        }
+        const packets = try allocator.alloc(Snapshot.Packet, self.packets.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (packets[0..initialized]) |packet| {
+                std.crypto.secureZero(u8, packet.bytes);
+                allocator.free(packet.bytes);
+            }
+            allocator.free(packets);
+        }
+        for (self.packets.items, 0..) |packet, i| {
+            packets[i] = .{ .seq = packet.seq, .ext_seq = packet.ext_seq, .bytes = try allocator.dupe(u8, packet.bytes) };
+            initialized += 1;
+        }
+        return .{ .allocator = allocator, .capacity = self.capacity, .packets = packets, .newest_ext_seq = self.newest_ext_seq };
+    }
+
+    /// Returns a detached owned candidate. No live source changes, packet
+    /// replay, sequence extension or NEW index assignment occurs here. The
+    /// aggregate must authenticate its capsule/configuration before using it.
+    pub fn prepareRestore(allocator: Allocator, snapshot: *const Snapshot, expected_capacity: usize, max_bytes: usize) !RetransmitBuffer {
+        try snapshot.validate(expected_capacity, max_bytes);
+        var candidate = init(allocator, expected_capacity);
+        errdefer candidate.deinit();
+        try candidate.packets.ensureTotalCapacity(allocator, snapshot.packets.len);
+        for (snapshot.packets) |packet| {
+            const bytes = try allocator.dupe(u8, packet.bytes);
+            candidate.packets.appendAssumeCapacity(.{ .seq = packet.seq, .ext_seq = packet.ext_seq, .bytes = bytes });
+        }
+        candidate.newest_ext_seq = snapshot.newest_ext_seq;
+        return candidate;
+    }
+
     pub fn init(allocator: Allocator, capacity: usize) RetransmitBuffer {
         return .{
             .allocator = allocator,
@@ -119,6 +204,7 @@ pub const RetransmitBuffer = struct {
 
     pub fn deinit(self: *RetransmitBuffer) void {
         for (self.packets.items) |packet| {
+            std.crypto.secureZero(u8, packet.bytes);
             self.allocator.free(packet.bytes);
         }
         self.packets.deinit(self.allocator);
@@ -154,6 +240,43 @@ pub const RetransmitBuffer = struct {
         }
     }
 
+    /// Detached storage for source owners that publish under exclusion. All
+    /// backend calls happen here or in deinit after the cut; commit is pure.
+    /// Existing ordinary onSent semantics remain separately available.
+    pub fn prepareSent(self: *RetransmitBuffer, seq: u16, bytes: []const u8) Allocator.Error!*PreparedSent {
+        const p = try self.allocator.create(SentPlan);
+        p.* = .{ .owner = self, .allocator = self.allocator, .old_ptr = @intFromPtr(self.packets.items.ptr), .old_len = self.packets.items.len, .old_capacity = self.packets.capacity, .old_newest = self.newest_ext_seq, .limit = self.capacity, .old_digest = sentDigest(self), .next_newest = self.newest_ext_seq };
+        errdefer self.allocator.destroy(p);
+        errdefer {
+            if (p.copied) |owned| self.allocator.free(owned);
+            p.rows.deinit(self.allocator);
+        }
+        if (self.capacity == 0) return @ptrCast(p);
+        const extended = if (self.newest_ext_seq) |old| extendSeq(seq, old) else @as(i64, seq);
+        p.next_newest = maxOptionalI64(self.newest_ext_seq, extended);
+        const copied = try self.allocator.dupe(u8, bytes);
+        p.copied = copied;
+        try p.rows.ensureTotalCapacity(self.allocator, self.packets.items.len + 1);
+        var inserted = false;
+        for (self.packets.items) |row| {
+            if (!inserted and row.ext_seq >= extended) {
+                p.rows.appendAssumeCapacity(.{ .seq = seq, .ext_seq = extended, .bytes = copied });
+                inserted = true;
+            }
+            if (row.ext_seq == extended) {
+                p.retired = row.bytes;
+                continue;
+            }
+            p.rows.appendAssumeCapacity(row);
+        }
+        if (!inserted) p.rows.appendAssumeCapacity(.{ .seq = seq, .ext_seq = extended, .bytes = copied });
+        if (p.rows.items.len > self.capacity) {
+            std.debug.assert(p.retired == null);
+            p.retired = p.rows.orderedRemove(0).bytes;
+        }
+        return @ptrCast(p);
+    }
+
     pub fn lookup(self: RetransmitBuffer, seq: u16) ?[]const u8 {
         var index = self.packets.items.len;
         while (index > 0) {
@@ -180,6 +303,69 @@ const StoredPacket = struct {
     seq: u16,
     ext_seq: i64,
     bytes: []u8,
+};
+
+const SentPlan = struct {
+    owner: *RetransmitBuffer,
+    allocator: Allocator,
+    old_ptr: usize,
+    old_len: usize,
+    old_capacity: usize,
+    old_newest: ?i64,
+    limit: usize,
+    old_digest: [32]u8,
+    next_newest: ?i64,
+    rows: std.ArrayList(StoredPacket) = .empty,
+    copied: ?[]u8 = null,
+    retired: ?[]u8 = null,
+    validated: bool = false,
+    committed: bool = false,
+};
+fn sentDigest(owner: *const RetransmitBuffer) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (owner.packets.items) |row| {
+        std.hash.autoHash(&hash, row.seq);
+        std.hash.autoHash(&hash, row.ext_seq);
+        std.hash.autoHash(&hash, @intFromPtr(row.bytes.ptr));
+        std.hash.autoHash(&hash, row.bytes.len);
+        hash.update(row.bytes);
+    }
+    return hash.finalResult();
+}
+fn sentPlan(plan: *PreparedSent) *SentPlan {
+    return @ptrCast(@alignCast(plan));
+}
+pub const PreparedSent = opaque {
+    pub fn validate(self: *PreparedSent) error{StaleCandidate}!void {
+        const p = sentPlan(self);
+        const owner = p.owner;
+        if (p.allocator.ptr != owner.allocator.ptr or p.allocator.vtable != owner.allocator.vtable or p.committed or p.old_ptr != @intFromPtr(owner.packets.items.ptr) or p.old_len != owner.packets.items.len or p.old_capacity != owner.packets.capacity or !std.meta.eql(p.old_newest, owner.newest_ext_seq) or p.limit != owner.capacity or !std.mem.eql(u8, &p.old_digest, &sentDigest(owner))) return error.StaleCandidate;
+        p.validated = true;
+    }
+    pub fn commitRetainingMetadata(self: *PreparedSent) void {
+        const p = sentPlan(self);
+        std.debug.assert(p.validated and !p.committed);
+        if (p.limit != 0) {
+            std.mem.swap(std.ArrayList(StoredPacket), &p.owner.packets, &p.rows);
+            p.owner.newest_ext_seq = p.next_newest;
+        }
+        p.committed = true;
+    }
+    pub fn deinit(self: *PreparedSent) void {
+        const p = sentPlan(self);
+        if (p.committed) {
+            if (p.retired) |bytes| {
+                std.crypto.secureZero(u8, bytes);
+                p.allocator.free(bytes);
+            }
+        } else if (p.copied) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            p.allocator.free(bytes);
+        }
+        // Array backing is owned; its retained packet payloads are borrowed.
+        p.rows.deinit(p.allocator);
+        p.allocator.destroy(p);
+    }
 };
 
 pub fn buildNackBlocks(allocator: Allocator, missing_seqs: []const u16) Allocator.Error![]NackBlock {
@@ -432,4 +618,415 @@ test "sequence wrap gaps and retransmit lookup are deterministic" {
     try std.testing.expectEqual(@as(?[]const u8, null), buffer.lookup(65535));
     try std.testing.expectEqualSlices(u8, "zero", buffer.lookup(0).?);
     try std.testing.expectEqualSlices(u8, "one", buffer.lookup(1).?);
+}
+
+fn restoreRetransmitAllocation(allocator: Allocator, source: *const RetransmitBuffer) !void {
+    const old_ptr = source.packets.items.ptr;
+    const old_newest = source.newest_ext_seq;
+    const old_first_ptr = source.packets.items[0].bytes.ptr;
+    defer {
+        std.testing.expectEqual(old_ptr, source.packets.items.ptr) catch @panic("OLD packet backing changed");
+        std.testing.expectEqual(old_newest, source.newest_ext_seq) catch @panic("OLD sequence changed");
+        std.testing.expectEqual(old_first_ptr, source.packets.items[0].bytes.ptr) catch @panic("OLD payload moved");
+        std.testing.expectEqualStrings("last", source.lookup(65535).?) catch @panic("OLD packet changed");
+    }
+    var snapshot = try source.capture(allocator, 32);
+    defer snapshot.deinit();
+    var candidate = try RetransmitBuffer.prepareRestore(allocator, &snapshot, 4, 32);
+    defer candidate.deinit();
+    try std.testing.expectEqual(source.newest_ext_seq, candidate.newest_ext_seq);
+    try std.testing.expectEqualStrings("last", candidate.lookup(65535).?);
+    try std.testing.expectEqualStrings("zero", candidate.lookup(0).?);
+    try std.testing.expectEqualStrings("one", candidate.lookup(1).?);
+}
+
+test "active media DTO retransmit preserves actual wrap reorder duplicate bytes and complete OOM rollback" {
+    var source = RetransmitBuffer.init(std.testing.allocator, 4);
+    defer source.deinit();
+    try source.onSent(65535, "last");
+    try source.onSent(1, "old-one");
+    try source.onSent(0, "zero");
+    try source.onSent(1, "one");
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, restoreRetransmitAllocation, .{&source});
+    var snapshot = try source.capture(std.testing.allocator, 32);
+    defer snapshot.deinit();
+    var candidate = try RetransmitBuffer.prepareRestore(std.testing.allocator, &snapshot, 4, 32);
+    defer candidate.deinit();
+    // Caller may dispose of its snapshot and OLD packet history independently.
+    snapshot.packets[0].bytes[0] ^= 1;
+    try std.testing.expectEqualStrings("last", candidate.lookup(65535).?);
+    try candidate.onSent(2, "two");
+    try candidate.onSent(3, "three");
+    try std.testing.expect(candidate.lookup(65535) == null);
+    try std.testing.expectEqualStrings("last", source.lookup(65535).?);
+    try std.testing.expectEqualStrings("zero", candidate.lookup(0).?);
+}
+
+test "active media DTO retransmit strict sequence order capacity and preallocation byte admission" {
+    var source = RetransmitBuffer.init(std.testing.allocator, 4);
+    defer source.deinit();
+    try source.onSent(65535, "last");
+    try source.onSent(0, "zero");
+    var snapshot = try source.capture(std.testing.allocator, 8);
+    defer snapshot.deinit();
+    var failure = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.Capacity, RetransmitBuffer.prepareRestore(failure.allocator(), &snapshot, 4, 7));
+    try std.testing.expectEqual(@as(usize, 0), failure.alloc_index);
+    try std.testing.expectError(error.InvalidSnapshot, RetransmitBuffer.prepareRestore(failure.allocator(), &snapshot, 3, 8));
+    snapshot.packets[1].seq = 1;
+    try std.testing.expectError(error.InvalidSnapshot, RetransmitBuffer.prepareRestore(failure.allocator(), &snapshot, 4, 8));
+    snapshot.packets[1].seq = 0;
+    const ext = snapshot.packets[1].ext_seq;
+    snapshot.packets[1].ext_seq = snapshot.packets[0].ext_seq;
+    try std.testing.expectError(error.InvalidSnapshot, snapshot.validate(4, 8));
+    snapshot.packets[1].ext_seq = ext;
+    snapshot.newest_ext_seq = null;
+    try std.testing.expectError(error.InvalidSnapshot, snapshot.validate(4, 8));
+    snapshot.newest_ext_seq = source.newest_ext_seq;
+    var candidate = try RetransmitBuffer.prepareRestore(std.testing.allocator, &snapshot, 4, 8);
+    defer candidate.deinit();
+    try std.testing.expectEqualStrings("zero", candidate.lookup(0).?);
+}
+
+fn preparedSentAllocationSweep(seq: u16, expected_old: ?[]const u8) !void {
+    var refused: usize = 0;
+    var observed_success = false;
+    for (0..8) |fault| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var source = RetransmitBuffer.init(failing.allocator(), 3);
+        defer source.deinit();
+        try source.onSent(65535, "last");
+        try source.onSent(0, "zero");
+        try source.onSent(1, "one");
+        const original_ptr = @intFromPtr(source.packets.items.ptr);
+        const original_capacity = source.packets.capacity;
+        const original_newest = source.newest_ext_seq;
+        const original_digest = sentDigest(&source);
+        failing.fail_index = failing.alloc_index + fault;
+        const prepared = source.prepareSent(seq, "candidate") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            refused += 1;
+            try std.testing.expectEqual(original_ptr, @intFromPtr(source.packets.items.ptr));
+            try std.testing.expectEqual(original_capacity, source.packets.capacity);
+            try std.testing.expectEqual(original_newest, source.newest_ext_seq);
+            try std.testing.expectEqualSlices(u8, &original_digest, &sentDigest(&source));
+            if (expected_old) |old| try std.testing.expectEqualStrings(old, source.lookup(seq).?);
+            failing.fail_index = std.math.maxInt(usize);
+            const retry = try source.prepareSent(seq, "candidate");
+            defer retry.deinit();
+            try retry.validate();
+            retry.commitRetainingMetadata();
+            try std.testing.expectEqualStrings("candidate", source.lookup(seq).?);
+            continue;
+        };
+        defer prepared.deinit();
+        try std.testing.expectEqualSlices(u8, &original_digest, &sentDigest(&source));
+        try prepared.validate();
+        // Every allocation is already owned. Actual publication makes no new
+        // backend call even when the original allocator is armed at its next.
+        failing.fail_index = failing.alloc_index;
+        const calls_before = failing.alloc_index;
+        prepared.commitRetainingMetadata();
+        try std.testing.expectEqual(calls_before, failing.alloc_index);
+        try std.testing.expectEqualStrings("candidate", source.lookup(seq).?);
+        try std.testing.expectEqualStrings("zero", source.lookup(0).?);
+        try std.testing.expectEqual(@as(usize, 3), source.len());
+        observed_success = true;
+        break;
+    }
+    try std.testing.expectEqual(@as(usize, 3), refused);
+    try std.testing.expect(observed_success);
+}
+
+test "physical media retransmit prepared allocation sweep retains exact OLD backing payloads and retries" {
+    try preparedSentAllocationSweep(1, "one");
+    try preparedSentAllocationSweep(2, null);
+}
+
+test "physical media retransmit prepared abort stale refusal and too-old insert preserve live history" {
+    var source = RetransmitBuffer.init(std.testing.allocator, 2);
+    defer source.deinit();
+    try source.onSent(100, "hundred");
+    try source.onSent(101, "one-oh-one");
+    const before = sentDigest(&source);
+    {
+        const aborted = try source.prepareSent(102, "abort-owned");
+        defer aborted.deinit();
+        try aborted.validate();
+    }
+    try std.testing.expectEqualSlices(u8, &before, &sentDigest(&source));
+    const stale = try source.prepareSent(102, "stale-owned");
+    defer stale.deinit();
+    try source.onSent(101, "new-101");
+    try std.testing.expectError(error.StaleCandidate, stale.validate());
+    try std.testing.expectEqualStrings("new-101", source.lookup(101).?);
+    {
+        const too_old = try source.prepareSent(99, "discard-owned");
+        defer too_old.deinit();
+        try too_old.validate();
+        too_old.commitRetainingMetadata();
+        try std.testing.expect(source.lookup(99) == null);
+        try std.testing.expectEqualStrings("hundred", source.lookup(100).?);
+        try std.testing.expectEqualStrings("new-101", source.lookup(101).?);
+        try std.testing.expectEqual(@as(?i64, 101), source.newest_ext_seq);
+    }
+    var disabled = RetransmitBuffer.init(std.testing.allocator, 0);
+    defer disabled.deinit();
+    const empty = try disabled.prepareSent(10, "no-cache");
+    defer empty.deinit();
+    try empty.validate();
+    empty.commitRetainingMetadata();
+    try std.testing.expectEqual(@as(usize, 0), disabled.len());
+    try std.testing.expect(disabled.newest_ext_seq == null);
+}
+
+/// Physical ingress histories are scoped to sender SSRC. Each stable cell owns
+/// its independent extended-sequence cache; no live stream is recycled to admit
+/// another. All allocation and retirement happens outside routing exclusion.
+pub const PerSsrcRetransmitBuffer = struct {
+    allocator: Allocator,
+    packet_capacity: usize,
+    stream_capacity: usize,
+    streams: StreamMap = .empty,
+    revision: u64 = 1,
+    const Cell = struct { cache: RetransmitBuffer };
+    const StreamMap = std.AutoHashMapUnmanaged(u32, *Cell);
+    pub fn init(allocator: Allocator, packet_capacity: usize, stream_capacity: usize) @This() {
+        return .{ .allocator = allocator, .packet_capacity = packet_capacity, .stream_capacity = stream_capacity };
+    }
+    pub fn deinit(self: *@This()) void {
+        var it = self.streams.valueIterator();
+        while (it.next()) |cell| {
+            cell.*.cache.deinit();
+            self.allocator.destroy(cell.*);
+        }
+        self.streams.deinit(self.allocator);
+        self.* = undefined;
+    }
+    pub fn lookup(self: *const @This(), ssrc: u32, seq: u16) ?[]const u8 {
+        const cell = self.streams.get(ssrc) orelse return null;
+        const bytes = cell.cache.lookup(seq) orelse return null;
+        if (!matchesPacket(bytes, ssrc, seq)) return null;
+        return bytes;
+    }
+    pub fn len(self: *const @This(), ssrc: u32) usize {
+        const cell = self.streams.get(ssrc) orelse return 0;
+        return cell.cache.len();
+    }
+    fn matchesPacket(bytes: []const u8, ssrc: u32, seq: u16) bool {
+        return bytes.len >= 12 and bytes[0] >> 6 == 2 and std.mem.readInt(u16, bytes[2..4], .big) == seq and std.mem.readInt(u32, bytes[8..12], .big) == ssrc;
+    }
+    pub fn prepareSent(self: *@This(), ssrc: u32, seq: u16, bytes: []const u8) !*PreparedPerSsrcSent {
+        if (!matchesPacket(bytes, ssrc, seq)) return error.InvalidPacket;
+        if (self.revision == 0 or self.revision == std.math.maxInt(u64)) return error.SequenceExhausted;
+        const old = self.streams.get(ssrc);
+        if (old == null and self.streams.count() >= self.stream_capacity) return error.StreamCapacity;
+        const plan = try self.allocator.create(PerSsrcPlan);
+        plan.* = .{ .owner = self, .allocator = self.allocator, .ssrc = ssrc, .seq = seq, .old = old, .revision = self.revision, .count = self.streams.count(), .capacity = self.streams.capacity(), .metadata = if (self.streams.metadata) |ptr| @intFromPtr(ptr) else 0 };
+        errdefer self.allocator.destroy(plan);
+        // One function-wide owner covers every later allocation boundary.
+        errdefer {
+            if (plan.inner) |inner| inner.deinit();
+            if (plan.growth) |*map| map.deinit(self.allocator);
+            if (plan.created) |cell| {
+                cell.cache.deinit();
+                self.allocator.destroy(cell);
+            }
+        }
+        const cell = old orelse create: {
+            const new = try self.allocator.create(Cell);
+            new.* = .{ .cache = RetransmitBuffer.init(self.allocator, self.packet_capacity) };
+            plan.created = new;
+            if (self.streams.available == 0) {
+                plan.growth = .empty;
+                try plan.growth.?.ensureTotalCapacity(self.allocator, self.streams.count() + 1);
+            }
+            break :create new;
+        };
+        plan.inner = try cell.cache.prepareSent(seq, bytes);
+        return @ptrCast(plan);
+    }
+    /// Allocation-free identity observation; it is never an ownership grant.
+    pub fn observationDigest(self: *const @This()) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        std.hash.autoHash(&hash, self.revision);
+        std.hash.autoHash(&hash, self.packet_capacity);
+        std.hash.autoHash(&hash, self.stream_capacity);
+        std.hash.autoHash(&hash, self.streams.count());
+        std.hash.autoHash(&hash, self.streams.capacity());
+        std.hash.autoHash(&hash, if (self.streams.metadata) |ptr| @intFromPtr(ptr) else @as(usize, 0));
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            std.hash.autoHash(&hash, entry.key_ptr.*);
+            std.hash.autoHash(&hash, @intFromPtr(entry.value_ptr.*));
+            hash.update(&sentDigest(&entry.value_ptr.*.cache));
+        }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+};
+const PerSsrcPlan = struct {
+    owner: *PerSsrcRetransmitBuffer,
+    allocator: Allocator,
+    ssrc: u32,
+    seq: u16,
+    old: ?*PerSsrcRetransmitBuffer.Cell,
+    created: ?*PerSsrcRetransmitBuffer.Cell = null,
+    growth: ?PerSsrcRetransmitBuffer.StreamMap = null,
+    inner: ?*PreparedSent = null,
+    revision: u64,
+    count: u32,
+    capacity: u32,
+    metadata: usize,
+    validated: bool = false,
+    committed: bool = false,
+};
+fn perSsrcPlan(candidate: *PreparedPerSsrcSent) *PerSsrcPlan {
+    return @ptrCast(@alignCast(candidate));
+}
+pub const PreparedPerSsrcSent = opaque {
+    pub fn validate(self: *@This()) !void {
+        const plan = perSsrcPlan(self);
+        const owner = plan.owner;
+        if (plan.committed or owner.revision != plan.revision or owner.streams.get(plan.ssrc) != plan.old or owner.streams.count() != plan.count or owner.streams.capacity() != plan.capacity or (if (owner.streams.metadata) |ptr| @intFromPtr(ptr) else @as(usize, 0)) != plan.metadata or owner.allocator.ptr != plan.allocator.ptr or owner.allocator.vtable != plan.allocator.vtable) return error.StaleCandidate;
+        try plan.inner.?.validate();
+        plan.validated = true;
+    }
+    pub fn commitRetainingMetadata(self: *@This()) void {
+        const plan = perSsrcPlan(self);
+        const owner = plan.owner;
+        std.debug.assert(plan.validated and !plan.committed and owner.revision == plan.revision);
+        if (plan.growth) |*growth| {
+            var it = owner.streams.iterator();
+            while (it.next()) |entry| growth.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+            std.mem.swap(PerSsrcRetransmitBuffer.StreamMap, &owner.streams, growth);
+        }
+        plan.inner.?.commitRetainingMetadata();
+        if (plan.created) |cell| owner.streams.putAssumeCapacity(plan.ssrc, cell);
+        owner.revision += 1;
+        plan.committed = true;
+    }
+    pub fn deinit(self: *@This()) void {
+        const plan = perSsrcPlan(self);
+        const allocator = plan.allocator;
+        if (plan.inner) |inner| inner.deinit();
+        if (plan.growth) |*map| map.deinit(allocator);
+        if (!plan.committed) if (plan.created) |cell| {
+            cell.cache.deinit();
+            allocator.destroy(cell);
+        };
+        allocator.destroy(plan);
+    }
+};
+
+fn perSsrcPacketTest(ssrc: u32, seq: u16, label: u8) [13]u8 {
+    var packet: [13]u8 = .{ 0x80, 111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, label };
+    std.mem.writeInt(u16, packet[2..4], seq, .big);
+    std.mem.writeInt(u32, packet[8..12], ssrc, .big);
+    return packet;
+}
+test "physical media per-SSRC cache retains independent equal sequence rollover and bounded stream custody" {
+    var source = PerSsrcRetransmitBuffer.init(std.testing.allocator, 3, 2);
+    defer source.deinit();
+    for ([_]struct { ssrc: u32, seq: u16, label: u8 }{ .{ .ssrc = 1, .seq = 65535, .label = 'a' }, .{ .ssrc = 2, .seq = 65535, .label = 'b' }, .{ .ssrc = 1, .seq = 0, .label = 'c' }, .{ .ssrc = 2, .seq = 65534, .label = 'd' } }) |entry| {
+        const packet = perSsrcPacketTest(entry.ssrc, entry.seq, entry.label);
+        const candidate = try source.prepareSent(entry.ssrc, entry.seq, &packet);
+        defer candidate.deinit();
+        try candidate.validate();
+        candidate.commitRetainingMetadata();
+    }
+    try std.testing.expectEqual(@as(u8, 'a'), source.lookup(1, 65535).?[12]);
+    try std.testing.expectEqual(@as(u8, 'b'), source.lookup(2, 65535).?[12]);
+    try std.testing.expectEqual(@as(u8, 'c'), source.lookup(1, 0).?[12]);
+    try std.testing.expectEqual(@as(u8, 'd'), source.lookup(2, 65534).?[12]);
+    const old = source.observationDigest();
+    const packet = perSsrcPacketTest(3, 1, 'x');
+    try std.testing.expectError(error.StreamCapacity, source.prepareSent(3, 1, &packet));
+    try std.testing.expectEqualSlices(u8, &old, &source.observationDigest());
+    try std.testing.expectError(error.InvalidPacket, source.prepareSent(2, 1, &packet));
+}
+fn perSsrcCacheAllocationSweep(allocator: Allocator) !void {
+    var source = PerSsrcRetransmitBuffer.init(allocator, 2, 8);
+    defer source.deinit();
+    for ([_]u32{ 1, 2, 3, 4, 5, 6 }) |ssrc| {
+        const packet = perSsrcPacketTest(ssrc, 7, @intCast(ssrc));
+        const old = source.observationDigest();
+        const candidate = source.prepareSent(ssrc, 7, &packet) catch |err| {
+            try std.testing.expectEqualSlices(u8, &old, &source.observationDigest());
+            return err;
+        };
+        defer candidate.deinit();
+        try candidate.validate();
+        candidate.commitRetainingMetadata();
+    }
+    const replacement = perSsrcPacketTest(1, 8, 9);
+    const old = source.observationDigest();
+    const candidate = source.prepareSent(1, 8, &replacement) catch |err| {
+        try std.testing.expectEqualSlices(u8, &old, &source.observationDigest());
+        return err;
+    };
+    defer candidate.deinit();
+    try candidate.validate();
+    candidate.commitRetainingMetadata();
+    for ([_]u32{ 1, 2, 3, 4, 5, 6 }) |ssrc| try std.testing.expectEqual(@as(u8, @intCast(ssrc)), source.lookup(ssrc, 7).?[12]);
+}
+test "physical media per-SSRC cache allocation sweep covers created cells growth existing histories and exact unwind" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, perSsrcCacheAllocationSweep, .{});
+}
+
+fn perSsrcRetryBoundaryTest(existing: bool, growth: bool) !void {
+    var refused: usize = 0;
+    var completed = false;
+    for (0..16) |index| {
+        var fail = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var source = PerSsrcRetransmitBuffer.init(fail.allocator(), 2, 32);
+        defer source.deinit();
+        if (existing or growth) {
+            var ssrc: u32 = 1;
+            while (true) : (ssrc += 1) {
+                const packet = perSsrcPacketTest(ssrc, 65535, @intCast(ssrc));
+                const seed = try source.prepareSent(ssrc, 65535, &packet);
+                {
+                    defer seed.deinit();
+                    try seed.validate();
+                    seed.commitRetainingMetadata();
+                }
+                if (!growth or source.streams.available == 0) break;
+                try std.testing.expect(ssrc < 32);
+            }
+        }
+        const ssrc: u32 = if (existing) 1 else 31;
+        const packet = perSsrcPacketTest(ssrc, 0, 'z');
+        const before = source.observationDigest();
+        fail.fail_index = fail.alloc_index + index;
+        const candidate = source.prepareSent(ssrc, 0, &packet) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqualSlices(u8, &before, &source.observationDigest());
+            refused += 1;
+            fail.fail_index = std.math.maxInt(usize);
+            const retry = try source.prepareSent(ssrc, 0, &packet);
+            defer retry.deinit();
+            try retry.validate();
+            retry.commitRetainingMetadata();
+            try std.testing.expectEqualSlices(u8, &packet, source.lookup(ssrc, 0).?);
+            if (existing) try std.testing.expectEqual(@as(u8, 1), source.lookup(1, 65535).?[12]);
+            continue;
+        };
+        defer candidate.deinit();
+        try candidate.validate();
+        fail.fail_index = fail.alloc_index;
+        const before_calls = fail.alloc_index;
+        candidate.commitRetainingMetadata();
+        try std.testing.expectEqual(before_calls, fail.alloc_index);
+        try std.testing.expectEqualSlices(u8, &packet, source.lookup(ssrc, 0).?);
+        completed = true;
+        break;
+    }
+    try std.testing.expect(refused > 0 and completed);
+}
+test "physical media per-SSRC cache every new existing growth allocation refusal retains exact source and same-owner retry" {
+    try perSsrcRetryBoundaryTest(false, false);
+    try perSsrcRetryBoundaryTest(true, false);
+    try perSsrcRetryBoundaryTest(false, true);
 }

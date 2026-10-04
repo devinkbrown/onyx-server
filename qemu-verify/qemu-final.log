@@ -1,0 +1,18 @@
+WARNING: Image format was not specified for 'json:{"fat-type": 0, "dir": "/home/kain/onyx-server/qemu-verify/share-final", "driver": "vvfat", "floppy": false, "rw": true, "write-target": {"driver": "qcow", "file": {"driver": "file", "filename": "/home/kain/onyx-server/qemu-verify/tmp/vl.1UJ5W3"}}}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+qemu: error reading initrd prior/files.cpio: Failed to open file “prior/files.cpio”: open() failed: No such file or directory
+WARNING: Image format was not specified for 'json:{"fat-type": 0, "dir": "/home/kain/onyx-server/qemu-verify/share-final", "driver": "vvfat", "floppy": false, "rw": true, "write-target": {"driver": "qcow", "file": {"driver": "file", "filename": "/home/kain/onyx-server/qemu-verify/tmp/vl.5HASW3"}}}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+WARNING: Image format was not specified for 'json:{"fat-type": 0, "dir": "/home/kain/onyx-server/qemu-verify/share-final", "driver": "vvfat", "floppy": false, "rw": true, "write-target": {"driver": "qcow", "file": {"driver": "file", "filename": "/home/kain/onyx-server/qemu-verify/tmp/vl.HU5QW3"}}}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+WARNING: Image format was not specified for 'json:{"fat-type": 0, "dir": "/home/kain/onyx-server/qemu-verify/share-final", "driver": "vvfat", "floppy": false, "rw": true, "write-target": {"driver": "qcow", "file": {"driver": "file", "filename": "/home/kain/onyx-server/qemu-verify/tmp/vl.DXS4W3"}}}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+qemu-system-x86_64: terminating on signal 15 from pid 1699710 ()
+WARNING: Image format was not specified for 'json:{"fat-type": 0, "dir": "/home/kain/onyx-server/qemu-verify/share-final", "driver": "vvfat", "floppy": false, "rw": true, "write-target": {"driver": "qcow", "file": {"driver": "file", "filename": "/home/kain/onyx-server/qemu-verify/tmp/vl.H1LUW3"}}}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+qemu-system-x86_64: terminating on signal 15 from pid 1719356 (/bin/sh)

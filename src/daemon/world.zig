@@ -123,6 +123,8 @@ fn clientIdInSet(client: ClientId, clients: []const ClientId) bool {
 pub const WorldError = std.mem.Allocator.Error || error{
     NickInUse,
     InvalidOwnerSet,
+    InvalidUnion,
+    InvalidGraph,
     NoSuchChannel,
     NotOnChannel,
     NoSuchNick,
@@ -405,6 +407,8 @@ pub const World = struct {
     /// loop) bracket world access with lockRead/lockWrite — see
     /// docs/planning/24-multithreading.md (Phase B).
     lock: rwlock.RwLock = .{},
+    // Only opaque handles cross the World boundary; payload custody stays here.
+    registered_stages: ?*RegisteredChannelRegistry = null,
 
     pub fn lockRead(self: *World) void {
         self.lock.lockShared();
@@ -808,6 +812,20 @@ pub const World = struct {
     }
 
     pub fn deinit(self: *World) void {
+        // Caller has stopped admission and joined every World borrower.
+        if (self.registered_stages) |registry| {
+            const r = registeredRegistryBacking(registry);
+            std.debug.assert(r.world == self and r.active == null);
+            var token = r.tokens;
+            while (token) |b| {
+                token = b.next_token;
+                std.debug.assert(!b.active);
+                self.allocator.free(b.target_name);
+                self.allocator.destroy(b);
+            }
+            self.allocator.destroy(r);
+            self.registered_stages = null;
+        }
         var channel_it = self.channels.iterator();
         while (channel_it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -1004,6 +1022,552 @@ pub const World = struct {
         }
     }
 
+    /// Rollback-owned nick projection. Caller retains World's write lock until
+    /// commit/abort; the ticket owns the RCU writer lock and detached activation.
+    /// Memberships and physical attachment identity are never inferred from nick.
+    pub const PreparedIdentity = struct {
+        world: *World,
+        exact: []ClientId,
+        target: ?[]u8 = null,
+        disposition: ?SessionNickDisposition = null,
+        rcu: ?*RcuNickState = null,
+        owns_rcu: bool = false,
+        stage: ?PreparedSessionRestore.NickStage = null,
+        remove_stage: ?world_rcu.NickRegistry.StagedEditBatch = null,
+        reservation: ?*ebr.Participant.RetireReservation = null,
+        changed: bool = true,
+        active: bool = true,
+
+        pub fn abort(self: *PreparedIdentity) void {
+            if (!self.active) return;
+            if (self.stage) |*stage| stage.abort();
+            if (self.remove_stage) |*stage| stage.abort();
+            self.finishReservation();
+            if (self.owns_rcu) self.world.destroyDetachedRcuNickState(self.rcu.?);
+            if (self.target) |target| self.world.allocator.free(target);
+            self.world.allocator.free(self.exact);
+            self.active = false;
+        }
+
+        fn finishReservation(self: *PreparedIdentity) void {
+            if (self.reservation) |reservation| {
+                reservation.finish();
+                self.world.allocator.destroy(reservation);
+                self.reservation = null;
+            }
+        }
+
+        /// All capacity, persistent snapshots and retirement storage are owned.
+        /// Publication has no allocation/error path. Abort after commit is safe.
+        pub fn commit(self: *PreparedIdentity) void {
+            std.debug.assert(self.active);
+            const world = self.world;
+            if (self.changed) {
+                for (self.exact) |client| {
+                    if (world.client_nicks.fetchRemove(client)) |removed| {
+                        _ = world.nicks.remove(removed.value);
+                        world.allocator.free(removed.value);
+                    }
+                }
+                if (self.disposition) |disposition| switch (disposition) {
+                    .claim_exact => |owner| {
+                        world.nicks.putAssumeCapacity(self.target.?, owner);
+                        world.client_nicks.putAssumeCapacity(owner, self.target.?);
+                    },
+                    .preserve_foreign => world.allocator.free(self.target.?),
+                };
+                if (self.stage) |*stage| stage.commit();
+                if (self.remove_stage) |*stage| stage.commit();
+                self.finishReservation();
+                if (self.owns_rcu) world.rcu_nicks = self.rcu.?;
+                if (self.rcu) |r| world.noteRcuNickWrite(r);
+            }
+            world.allocator.free(self.exact);
+            self.active = false;
+        }
+    };
+
+    fn detachedNickMirror(self: *World) WorldError!*RcuNickState {
+        const r = try self.createRcuNickState();
+        errdefer self.destroyDetachedRcuNickState(r);
+        var it = self.nicks.iterator();
+        while (it.next()) |entry| try r.nicks.set(r.writer_participant, entry.key_ptr.*, @bitCast(entry.value_ptr.*));
+        return r;
+    }
+
+    /// Exact logical-owner policy remains an explicit caller decision. This
+    /// changes only nick indexes, preserving every attachment's memberships.
+    pub fn prepareExactSessionNickOwner(self: *World, target: []const u8, exact_clients: []const ClientId, disposition: SessionNickDisposition) WorldError!PreparedIdentity {
+        for (exact_clients, 0..) |client, i| {
+            if (clientIdInSet(client, exact_clients[0..i])) return error.InvalidOwnerSet;
+        }
+        switch (disposition) {
+            .claim_exact => |owner| if (!clientIdInSet(owner, exact_clients)) return error.InvalidOwnerSet,
+            .preserve_foreign => |owner| if (clientIdInSet(owner, exact_clients)) return error.InvalidOwnerSet,
+        }
+        for (exact_clients) |client| try self.validateFallbackNickOwner(client);
+        var prepared = PreparedIdentity{ .world = self, .exact = &.{}, .disposition = disposition };
+        errdefer prepared.abort();
+        var aliases: usize = 0;
+        var already_exact = false;
+        for (exact_clients) |client| {
+            const current = self.client_nicks.get(client) orelse continue;
+            aliases += 1;
+            if (disposition == .claim_exact and client.eql(disposition.claim_exact) and std.mem.eql(u8, current, target)) already_exact = true;
+        }
+        const Counter = struct {
+            exact: []const ClientId,
+            count: usize = 0,
+            fn append(ctx: *@This(), _: []const u8, bits: world_rcu.ClientId) void {
+                if (clientIdInSet(@bitCast(bits), ctx.exact)) ctx.count += 1;
+            }
+        };
+        var counter = Counter{ .exact = exact_clients };
+        if (self.rcu_nicks) |r| r.nicks.iterate(r.writer_participant, &counter, Counter.append);
+        if (disposition == .preserve_foreign and aliases == 0 and counter.count == 0) {
+            const owner = self.findNickFallback(target) orelse return error.NickInUse;
+            if (!owner.eql(disposition.preserve_foreign)) return error.NickInUse;
+            if (self.rcu_nicks) |r| {
+                const bits = r.nicks.lookup(r.writer_participant, target) orelse return error.NickInUse;
+                if (!(@as(ClientId, @bitCast(bits))).eql(owner)) return error.NickInUse;
+            }
+            prepared.changed = false;
+            return prepared;
+        }
+        if (aliases == 1 and already_exact and counter.count == 1) {
+            if (self.rcu_nicks) |r| {
+                if (r.nicks.lookup(r.writer_participant, target)) |bits| {
+                    if ((@as(ClientId, @bitCast(bits))).eql(disposition.claim_exact)) {
+                        prepared.changed = false;
+                        return prepared;
+                    }
+                }
+            }
+        }
+        switch (disposition) {
+            .claim_exact => if (self.findNickFallback(target)) |owner| {
+                if (!clientIdInSet(owner, exact_clients)) return error.NickInUse;
+            },
+            .preserve_foreign => |foreign| {
+                const owner = self.findNickFallback(target) orelse return error.NickInUse;
+                if (!owner.eql(foreign)) return error.NickInUse;
+            },
+        }
+        prepared.exact = try self.allocator.dupe(ClientId, exact_clients);
+        prepared.target = try self.allocator.dupe(u8, target);
+        prepared.rcu = if (self.rcu_nicks) |r| r else try self.detachedNickMirror();
+        prepared.owns_rcu = self.rcu_nicks == null;
+        const r = prepared.rcu.?;
+        const ids = try self.allocator.alloc(world_rcu.ClientId, exact_clients.len);
+        defer self.allocator.free(ids);
+        for (exact_clients, ids) |client, *id| id.* = @bitCast(client);
+        try self.nicks.ensureUnusedCapacity(1);
+        try self.client_nicks.ensureUnusedCapacity(1);
+        const stage: PreparedSessionRestore.NickStage = switch (disposition) {
+            .claim_exact => |owner| .{ .claim = (try r.nicks.stageReplaceRemovingValues(r.writer_participant, target, @bitCast(owner), ids)) orelse return error.NickInUse },
+            .preserve_foreign => |foreign| .{ .preserve = (try r.nicks.stageRemoveValuesPreservingKey(r.writer_participant, target, @bitCast(foreign), ids)) orelse return error.NickInUse },
+        };
+        prepared.stage = stage;
+        return prepared;
+    }
+
+    pub fn preparePhysicalIdentityRegister(self: *World, client: ClientId, nick: []const u8) WorldError!PreparedIdentity {
+        return self.prepareExactSessionNickOwner(nick, &.{client}, .{ .claim_exact = client });
+    }
+
+    pub fn preparePhysicalIdentityRename(self: *World, client: ClientId, nick: []const u8) WorldError!PreparedIdentity {
+        return self.preparePhysicalIdentityRegister(client, nick);
+    }
+
+    fn validateFallbackNickOwner(self: *World, client: ClientId) WorldError!void {
+        if (self.client_nicks.get(client)) |reverse| {
+            const forward = self.nicks.getEntry(reverse) orelse return error.InvalidOwnerSet;
+            if (!forward.value_ptr.eql(client) or forward.key_ptr.ptr != reverse.ptr) return error.InvalidOwnerSet;
+        }
+        // An orphan fallback key has no proven string owner. Reject before
+        // publication rather than silently leaking/freeing arbitrary storage.
+        var fallback = self.nicks.iterator();
+        while (fallback.next()) |entry| {
+            if (!entry.value_ptr.eql(client)) continue;
+            const reverse = self.client_nicks.get(client) orelse return error.InvalidOwnerSet;
+            if (!std.mem.eql(u8, reverse, entry.key_ptr.*)) return error.InvalidOwnerSet;
+        }
+    }
+
+    fn preparePhysicalNickRemove(self: *World, client: ClientId) WorldError!PreparedIdentity {
+        try self.validateFallbackNickOwner(client);
+        var prepared = PreparedIdentity{ .world = self, .exact = try self.allocator.dupe(ClientId, &.{client}), .rcu = self.rcu_nicks };
+        errdefer prepared.abort();
+        if (self.rcu_nicks) |r| {
+            const keys = try self.allocator.alloc([]const u8, r.nicks.count(r.writer_participant));
+            defer self.allocator.free(keys);
+            const Collector = struct {
+                client: world_rcu.ClientId,
+                keys: [][]const u8,
+                count: usize = 0,
+                fn append(ctx: *@This(), key: []const u8, value: world_rcu.ClientId) void {
+                    if (value != ctx.client) return;
+                    ctx.keys[ctx.count] = key;
+                    ctx.count += 1;
+                }
+            };
+            var collector = Collector{ .client = @bitCast(client), .keys = keys };
+            // Borrowed keys stay alive: World's graph lock excludes writers,
+            // and the subsequent stage retains the source snapshot's keys.
+            r.nicks.iterate(r.writer_participant, &collector, Collector.append);
+            if (collector.count != 0) {
+                const reservation = try self.allocator.create(ebr.Participant.RetireReservation);
+                reservation.* = r.writer_participant.reserveRetireCapacity(1) catch |err| {
+                    self.allocator.destroy(reservation);
+                    return err;
+                };
+                prepared.reservation = reservation;
+                const stage = (try r.nicks.stageEditBatchReserved(reservation, keys[0..collector.count], &.{})) orelse return error.InvalidOwnerSet;
+                prepared.remove_stage = stage;
+            }
+        }
+        return prepared;
+    }
+
+    pub const DepartureNick = struct {
+        target: []const u8,
+        disposition: SessionNickDisposition,
+    };
+
+    /// Explicit physical contributors, supplied by the session authority owner.
+    /// expected_union proves no new authority: it asserts the complete graph
+    /// union derived here, including keeper-only channels and exact known flags.
+    pub const PhysicalDepartureSpec = struct {
+        source: ClientId,
+        keeper: ?ClientId,
+        exact_clients: []const ClientId,
+        nick: ?DepartureNick = null,
+        expected_union: ?[]const MemberRestore = null,
+    };
+
+    const DepartureChannel = struct {
+        name: []const u8,
+        channel: ?*Channel,
+        set: ?*world_rcu.MembershipSet,
+        source_rcu: bool,
+        add_keeper_rcu: bool,
+        union_member: bool,
+        union_modes: MemberModes,
+        cleanup: bool,
+        remove_name: bool,
+        insert_name: bool,
+        rebuilt: ?struct { key: []u8, set: *world_rcu.MembershipSet } = null,
+
+        fn lessThan(_: void, a: *DepartureChannel, b: *DepartureChannel) bool {
+            return @intFromPtr(a.set.?) < @intFromPtr(b.set.?);
+        }
+    };
+
+    /// One graph-lock-owned departure. Nick -> sorted unique membership sets ->
+    /// channel names are held through commit/abort. Every root and retirement
+    /// allocation precedes publication. The caller must not unlock World while
+    /// this ticket is active. Unlocked RCU reads do not provide a global cut.
+    pub const PreparedPhysicalDeparture = struct {
+        world: *World,
+        source: ClientId,
+        keeper: ?ClientId,
+        nick: PreparedIdentity,
+        channel_rcu: ?*RcuChannelState,
+        channels: []DepartureChannel,
+        channel_count: usize = 0,
+        stages: []world_rcu.MembershipSet.StagedEdit,
+        stage_count: usize = 0,
+        names: ?world_rcu.ChannelRegistry(u32).StagedEditBatch = null,
+        reservation: ?*ebr.Participant.RetireReservation = null,
+        active: bool = true,
+
+        fn finishReservation(self: *PreparedPhysicalDeparture) void {
+            if (self.reservation) |reservation| {
+                reservation.finish();
+                self.world.allocator.destroy(reservation);
+                self.reservation = null;
+            }
+        }
+
+        pub fn abort(self: *PreparedPhysicalDeparture) void {
+            if (!self.active) return;
+            if (self.names) |*names| names.abort();
+            while (self.stage_count != 0) {
+                self.stage_count -= 1;
+                self.stages[self.stage_count].abort();
+            }
+            self.finishReservation();
+            for (self.channels[0..self.channel_count]) |entry| if (entry.rebuilt) |rebuilt| {
+                rebuilt.set.deinit();
+                self.world.allocator.destroy(rebuilt.set);
+                self.world.allocator.free(rebuilt.key);
+            };
+            self.nick.abort();
+            self.world.allocator.free(self.stages);
+            self.world.allocator.free(self.channels);
+            self.active = false;
+        }
+
+        pub fn commit(self: *PreparedPhysicalDeparture) void {
+            std.debug.assert(self.active);
+            const world = self.world;
+            var it = world.channels.valueIterator();
+            while (it.next()) |channel| _ = channel.invites.remove(self.source);
+            for (self.channels[0..self.channel_count]) |entry| {
+                if (entry.channel) |channel| {
+                    _ = channel.members.remove(self.source);
+                    if (self.keeper) |keeper| if (entry.union_member) {
+                        channel.members.putAssumeCapacity(keeper, entry.union_modes);
+                    };
+                }
+                if (entry.rebuilt) |rebuilt| {
+                    self.channel_rcu.?.members.putAssumeCapacity(rebuilt.key, rebuilt.set);
+                }
+            }
+            for (self.stages[0..self.stage_count]) |*stage| stage.commit();
+            if (self.names) |*names| names.commit();
+            self.finishReservation();
+            self.nick.commit();
+            for (self.channels[0..self.channel_count]) |entry| {
+                if (!entry.cleanup) continue;
+                if (self.channel_rcu) |c| world.rcuDropMembership(c, entry.name);
+                world.removeFallbackChannel(entry.name);
+            }
+            // Retire reservations must be consumed before epoch maintenance.
+            if (self.channel_rcu) |c| {
+                for (0..self.stage_count) |_| world.noteRcuChannelWrite(c);
+                if (self.names != null) world.noteRcuChannelWrite(c);
+            }
+            world.allocator.free(self.stages);
+            world.allocator.free(self.channels);
+            self.active = false;
+        }
+    };
+
+    pub const PreparedIdentityRemove = PreparedPhysicalDeparture;
+
+    pub fn preparePhysicalIdentityRemove(self: *World, client: ClientId) WorldError!PreparedIdentityRemove {
+        return self.preparePhysicalDeparture(.{ .source = client, .keeper = null, .exact_clients = &.{client} });
+    }
+
+    fn deriveDepartureChannel(self: *World, spec: PhysicalDepartureSpec, name: []const u8, channel: ?*Channel, set: ?*world_rcu.MembershipSet) WorldError!DepartureChannel {
+        if (name.len > foldBufLen) return error.InvalidGraph;
+        const c = self.rcu_channels;
+        var union_member = false;
+        var modes = MemberModes.empty();
+        for (spec.exact_clients) |id| {
+            const fallback = if (channel) |ch| ch.members.get(id) else null;
+            const in_rcu = if (set) |s| s.contains(c.?.writer_participant, @bitCast(id)) else false;
+            union_member = union_member or fallback != null or in_rcu;
+            if (fallback) |flags| modes.bits |= flags.bits;
+        }
+        const source_fallback = if (channel) |ch| ch.members.contains(spec.source) else false;
+        const source_rcu = if (set) |s| s.contains(c.?.writer_participant, @bitCast(spec.source)) else false;
+        const add_keeper = if (spec.keeper) |keeper| union_member and (if (set) |s| !s.contains(c.?.writer_participant, @bitCast(keeper)) else false) else false;
+        const fallback_final = if (channel) |ch| ch.members.count() - @intFromBool(source_fallback) + @intFromBool(spec.keeper != null and union_member and !ch.members.contains(spec.keeper.?)) else 0;
+        const rcu_final = if (set) |s| s.count(c.?.writer_participant) - @intFromBool(source_rcu) + @intFromBool(add_keeper) else fallback_final;
+        const cleanup = if (channel) |ch| !ch.ext_modes.has(.registered) and fallback_final == 0 and rcu_final == 0 else false;
+        const affected = union_member or source_fallback or source_rcu or cleanup;
+        const oid = if (c) |state| state.names.lookup(state.writer_participant, name) else null;
+        if (affected and channel != null and oid != null and oid.? != channel.?.oid) return error.InvalidGraph;
+        if (affected and !cleanup and channel != null and c != null and oid == null) {
+            if (channel.?.oid == 0) return error.InvalidGraph;
+            // Off-map candidates and foreign fallback records may both lack a
+            // names witness. The full predecessor owns each OID, not just the
+            // currently published names root or this ticket's selected rows.
+            var fallback_owners = self.channels.valueIterator();
+            while (fallback_owners.next()) |other| {
+                if (other != channel.? and other.oid == channel.?.oid) return error.InvalidGraph;
+            }
+            const Witness = struct {
+                oid: u32,
+                found: bool = false,
+                fn inspect(ctx: *@This(), _: []const u8, existing: u32) void {
+                    if (existing == ctx.oid) ctx.found = true;
+                }
+            };
+            var witness = Witness{ .oid = channel.?.oid };
+            c.?.names.iterate(c.?.writer_participant, &witness, Witness.inspect);
+            if (witness.found) return error.InvalidGraph;
+        }
+        return .{ .name = name, .channel = channel, .set = set, .source_rcu = source_rcu, .add_keeper_rcu = add_keeper, .union_member = union_member, .union_modes = modes, .cleanup = cleanup, .remove_name = cleanup and oid != null, .insert_name = affected and !cleanup and channel != null and c != null and oid == null };
+    }
+
+    pub fn preparePhysicalDeparture(self: *World, spec: PhysicalDepartureSpec) WorldError!PreparedPhysicalDeparture {
+        var source_found = false;
+        var keeper_found = false;
+        for (spec.exact_clients, 0..) |id, i| {
+            for (spec.exact_clients[0..i]) |prior| if (id.eql(prior)) return error.InvalidOwnerSet;
+            source_found = source_found or id.eql(spec.source);
+            keeper_found = keeper_found or (spec.keeper != null and id.eql(spec.keeper.?));
+            try self.validateFallbackNickOwner(id);
+        }
+        if (!source_found) return error.InvalidOwnerSet;
+        if (spec.keeper) |keeper| {
+            if (keeper.eql(spec.source) or !keeper_found) return error.InvalidOwnerSet;
+        } else if (spec.exact_clients.len != 1 or spec.nick != null or (spec.expected_union != null and spec.expected_union.?.len != 0)) return error.InvalidOwnerSet;
+        if (spec.nick) |nick| switch (nick.disposition) {
+            .claim_exact => |chosen| if (!chosen.eql(spec.keeper.?)) return error.InvalidOwnerSet,
+            .preserve_foreign => |foreign| for (spec.exact_clients) |id| if (id.eql(foreign)) return error.InvalidOwnerSet,
+        };
+        // Reject shared set ownership globally before taking any set lock, even
+        // when just one of the corrupt aliases would otherwise be affected.
+        const c = self.rcu_channels;
+        if (c) |state| {
+            const owners = try self.allocator.alloc(*world_rcu.MembershipSet, state.members.count());
+            defer self.allocator.free(owners);
+            var members = state.members.iterator();
+            for (owners) |*owner| {
+                const entry = members.next().?;
+                if (entry.key_ptr.len > foldBufLen) return error.InvalidGraph;
+                var buf: [foldBufLen]u8 = undefined;
+                if (!std.mem.eql(u8, entry.key_ptr.*, foldName(entry.key_ptr.*, &buf))) return error.InvalidGraph;
+                owner.* = entry.value_ptr.*;
+            }
+            const Order = struct {
+                fn less(_: void, a: *world_rcu.MembershipSet, b: *world_rcu.MembershipSet) bool {
+                    return @intFromPtr(a) < @intFromPtr(b);
+                }
+            };
+            std.mem.sort(*world_rcu.MembershipSet, owners, {}, Order.less);
+            for (owners, 0..) |owner, i| if (i != 0 and owner == owners[i - 1]) return error.InvalidGraph;
+        }
+        var nick = if (spec.nick) |selected| try self.prepareExactSessionNickOwner(selected.target, spec.exact_clients, selected.disposition) else try self.preparePhysicalNickRemove(spec.source);
+        var owns_nick = true;
+        errdefer if (owns_nick) nick.abort();
+        const capacity = std.math.add(usize, self.channels.count(), if (c) |state| state.members.count() else 0) catch return error.OutOfMemory;
+        const channels = try self.allocator.alloc(DepartureChannel, capacity);
+        var owns_channels = true;
+        errdefer if (owns_channels) self.allocator.free(channels);
+        const stages = try self.allocator.alloc(world_rcu.MembershipSet.StagedEdit, capacity);
+        var prepared = PreparedPhysicalDeparture{ .world = self, .source = spec.source, .keeper = spec.keeper, .nick = nick, .channel_rcu = c, .channels = channels, .stages = stages };
+        owns_nick = false;
+        owns_channels = false;
+        errdefer prepared.abort();
+        var fallback = self.channels.iterator();
+        while (fallback.next()) |entry| {
+            if (entry.key_ptr.len > foldBufLen) return error.InvalidGraph;
+            const set = if (c) |state| rcuMembershipGet(state, entry.key_ptr.*) else null;
+            const delta = try self.deriveDepartureChannel(spec, entry.key_ptr.*, entry.value_ptr, set);
+            if (!delta.union_member and !delta.cleanup) continue;
+            channels[prepared.channel_count] = delta;
+            prepared.channel_count += 1;
+        }
+        if (c) |state| {
+            var members = state.members.iterator();
+            while (members.next()) |entry| {
+                if (self.channels.contains(entry.key_ptr.*)) continue;
+                const delta = try self.deriveDepartureChannel(spec, entry.key_ptr.*, null, entry.value_ptr.*);
+                if (!delta.union_member) continue;
+                channels[prepared.channel_count] = delta;
+                prepared.channel_count += 1;
+            }
+        }
+        if (if (spec.keeper != null) spec.expected_union else null) |expected| {
+            var count: usize = 0;
+            for (channels[0..prepared.channel_count]) |entry| if (entry.union_member) {
+                count += 1;
+            };
+            if (expected.len != count) return error.InvalidUnion;
+            for (expected, 0..) |row, i| {
+                if (row.channel.len > foldBufLen) return error.InvalidUnion;
+                for (expected[0..i]) |prior| if (std.ascii.eqlIgnoreCase(prior.channel, row.channel)) return error.InvalidUnion;
+                var found = false;
+                for (channels[0..prepared.channel_count]) |entry| {
+                    if (!entry.union_member or !std.ascii.eqlIgnoreCase(entry.name, row.channel)) continue;
+                    if (entry.union_modes.bits != row.modes.bits) return error.InvalidUnion;
+                    found = true;
+                    break;
+                }
+                if (!found) return error.InvalidUnion;
+            }
+        }
+        const locks = try self.allocator.alloc(*DepartureChannel, prepared.channel_count);
+        defer self.allocator.free(locks);
+        var lock_count: usize = 0;
+        var remove_count: usize = 0;
+        var insert_count: usize = 0;
+        var rebuild_count: usize = 0;
+        for (channels[0..prepared.channel_count]) |*entry| {
+            if (entry.channel) |channel| if (spec.keeper) |keeper| if (entry.union_member and !channel.members.contains(keeper)) {
+                const final_count = channel.members.count() + 1 - @intFromBool(channel.members.contains(spec.source));
+                try channel.members.ensureTotalCapacity(@intCast(final_count));
+            };
+            if (entry.set != null and (entry.source_rcu or entry.add_keeper_rcu)) {
+                locks[lock_count] = entry;
+                lock_count += 1;
+            }
+            if (entry.remove_name) remove_count += 1;
+            if (entry.insert_name) insert_count += 1;
+            if (c != null and entry.channel != null and entry.set == null and !entry.cleanup) rebuild_count += 1;
+        }
+        if (rebuild_count != 0) try c.?.members.ensureUnusedCapacity(self.allocator, @intCast(rebuild_count));
+        for (channels[0..prepared.channel_count]) |*entry| {
+            if (c == null or entry.channel == null or entry.set != null or entry.cleanup) continue;
+            const channel = entry.channel.?;
+            var buf: [foldBufLen]u8 = undefined;
+            const key = try self.allocator.dupe(u8, foldName(entry.name, &buf));
+            errdefer self.allocator.free(key);
+            const ids = try self.allocator.alloc(world_rcu.ClientId, channel.members.count() + 1);
+            defer self.allocator.free(ids);
+            var count: usize = 0;
+            var member_it = channel.members.keyIterator();
+            while (member_it.next()) |id| {
+                if (id.eql(spec.source)) continue;
+                ids[count] = @bitCast(id.*);
+                count += 1;
+            }
+            if (spec.keeper) |keeper| if (entry.union_member and !channel.members.contains(keeper)) {
+                ids[count] = @bitCast(keeper);
+                count += 1;
+            };
+            const set = try self.allocator.create(world_rcu.MembershipSet);
+            errdefer self.allocator.destroy(set);
+            set.* = try world_rcu.MembershipSet.initFromSlice(self.allocator, &c.?.domain, ids[0..count]);
+            entry.rebuilt = .{ .key = key, .set = set };
+        }
+        std.mem.sort(*DepartureChannel, locks[0..lock_count], {}, DepartureChannel.lessThan);
+        if (lock_count != 0 or remove_count != 0 or insert_count != 0) {
+            const reservation = try self.allocator.create(ebr.Participant.RetireReservation);
+            reservation.* = c.?.writer_participant.reserveRetireCapacity(lock_count + @intFromBool(remove_count != 0 or insert_count != 0)) catch |err| {
+                self.allocator.destroy(reservation);
+                return err;
+            };
+            prepared.reservation = reservation;
+        }
+        for (locks[0..lock_count]) |entry| {
+            const removals: []const world_rcu.ClientId = if (entry.source_rcu) &.{@bitCast(spec.source)} else &.{};
+            const additions: []const world_rcu.ClientId = if (entry.add_keeper_rcu) &.{@bitCast(spec.keeper.?)} else &.{};
+            const stage = (entry.set.?.stageEditReserved(prepared.reservation.?, removals, additions) catch |err| switch (err) {
+                error.InvalidEdit => return error.InvalidGraph,
+                error.OutOfMemory => return error.OutOfMemory,
+            }) orelse return error.InvalidGraph;
+            stages[prepared.stage_count] = stage;
+            prepared.stage_count += 1;
+        }
+        if (remove_count != 0 or insert_count != 0) {
+            const removals = try self.allocator.alloc([]const u8, remove_count);
+            defer self.allocator.free(removals);
+            const additions = try self.allocator.alloc(world_rcu.ChannelRegistry(u32).Insert, insert_count);
+            defer self.allocator.free(additions);
+            var ri: usize = 0;
+            var ai: usize = 0;
+            for (channels[0..prepared.channel_count]) |entry| {
+                if (entry.remove_name) {
+                    removals[ri] = entry.name;
+                    ri += 1;
+                }
+                if (entry.insert_name) {
+                    additions[ai] = .{ .key = entry.name, .value = entry.channel.?.oid };
+                    ai += 1;
+                }
+            }
+            const stage = (try c.?.names.stageEditBatchReserved(prepared.reservation.?, removals, additions)) orelse return error.InvalidGraph;
+            prepared.names = stage;
+        }
+        return prepared;
+    }
+
     /// Register `nick` for `client`, rejecting collisions. Collision detection
     /// is CASE-INSENSITIVE (RFC1459-ish ASCII casemapping): registering "Alice"
     /// then "alice" is a collision, not two entries. The RCU registry is the
@@ -1011,41 +1575,9 @@ pub const World = struct {
     /// authoritative id->nick reverse index and `nicks` is kept as a consistent
     /// case-sensitive fallback mirror.
     pub fn registerNick(self: *World, nick: []const u8, client: ClientId) WorldError!void {
-        // Activate the RCU mirror up front so reads are always served from it.
-        const r = try self.ensureRcuNicks();
-
-        // Case-insensitive collision check against the authoritative RCU map.
-        if (r.nicks.lookup(r.writer_participant, nick)) |existing| {
-            if ((@as(ClientId, @bitCast(existing))).eql(client)) {
-                // Same owner: a pure case change ("Alice" -> "ALICE") still
-                // updates the stored display form below; otherwise no-op.
-                if (self.nickOf(client)) |cur| {
-                    if (std.mem.eql(u8, cur, nick)) return;
-                }
-            } else {
-                return error.NickInUse;
-            }
-        }
-
-        if (self.client_nicks.contains(client)) {
-            self.unregisterNick(client);
-        }
-
-        const owned = try self.allocator.dupe(u8, nick);
-        errdefer self.allocator.free(owned);
-
-        // Authoritative nick->id lives in the RCU registry (case-insensitive).
-        try r.nicks.set(r.writer_participant, nick, @bitCast(client));
-        self.noteRcuNickWrite(r);
-        errdefer {
-            r.nicks.remove(r.writer_participant, nick) catch {};
-            self.noteRcuNickWrite(r);
-        }
-
-        try self.nicks.put(owned, client);
-        errdefer _ = self.nicks.remove(owned);
-
-        try self.client_nicks.put(client, owned);
+        var prepared = try self.preparePhysicalIdentityRegister(client, nick);
+        defer prepared.abort();
+        prepared.commit();
     }
 
     /// Remove any nick owned by `client`.
@@ -1075,56 +1607,11 @@ pub const World = struct {
         chosen: ClientId,
         exact_clients: []const ClientId,
     ) WorldError!bool {
-        if (!clientIdInSet(chosen, exact_clients)) return error.InvalidOwnerSet;
-
-        var owned_aliases: usize = 0;
-        var already_exact = false;
-        for (exact_clients) |client| {
-            const current = self.client_nicks.get(client) orelse continue;
-            owned_aliases += 1;
-            if (client.eql(chosen) and std.mem.eql(u8, current, target)) already_exact = true;
-        }
-        if (owned_aliases == 1 and already_exact) {
-            if (self.rcu_nicks) |r| {
-                if (r.nicks.lookup(r.writer_participant, target)) |bits| {
-                    if ((@as(ClientId, @bitCast(bits))).eql(chosen)) return false;
-                }
-            }
-        }
-
-        const r = try self.ensureRcuNicks();
-        if (r.nicks.lookup(r.writer_participant, target)) |bits| {
-            const owner: ClientId = @bitCast(bits);
-            if (!clientIdInSet(owner, exact_clients)) return error.NickInUse;
-        }
-        if (self.findNickFallback(target)) |owner| {
-            if (!clientIdInSet(owner, exact_clients)) return error.NickInUse;
-        }
-
-        const owned_target = try self.allocator.dupe(u8, target);
-        errdefer self.allocator.free(owned_target);
-        const rcu_clients = try self.allocator.alloc(world_rcu.ClientId, exact_clients.len);
-        defer self.allocator.free(rcu_clients);
-        for (exact_clients, rcu_clients) |client, *rcu_client| rcu_client.* = @bitCast(client);
-        try self.nicks.ensureUnusedCapacity(1);
-        try self.client_nicks.ensureUnusedCapacity(1);
-
-        if (!try r.nicks.replaceRemovingValues(r.writer_participant, target, @bitCast(chosen), rcu_clients))
-            return error.NickInUse;
-
-        // Everything below is allocation-free. The RCU publication above is the
-        // linearization point seen by lock-free readers; World mutations run
-        // under the caller's exclusive lock and cannot fail after that point.
-        for (exact_clients) |client| {
-            if (self.client_nicks.fetchRemove(client)) |removed| {
-                _ = self.nicks.remove(removed.value);
-                self.allocator.free(removed.value);
-            }
-        }
-        self.nicks.putAssumeCapacity(owned_target, chosen);
-        self.client_nicks.putAssumeCapacity(chosen, owned_target);
-        self.noteRcuNickWrite(r);
-        return true;
+        var prepared = try self.prepareExactSessionNickOwner(target, exact_clients, .{ .claim_exact = chosen });
+        defer prepared.abort();
+        const changed = prepared.changed;
+        prepared.commit();
+        return changed;
     }
 
     /// Atomically retire every World alias owned by one exact logical session
@@ -1138,34 +1625,11 @@ pub const World = struct {
         foreign_owner: ClientId,
         exact_clients: []const ClientId,
     ) WorldError!bool {
-        if (clientIdInSet(foreign_owner, exact_clients)) return error.InvalidOwnerSet;
-        var aliases: usize = 0;
-        for (exact_clients) |client| {
-            if (self.client_nicks.contains(client)) aliases += 1;
-        }
-        if (aliases == 0) return false;
-
-        const r = try self.ensureRcuNicks();
-        const current_bits = r.nicks.lookup(r.writer_participant, target) orelse return error.NickInUse;
-        const current: ClientId = @bitCast(current_bits);
-        if (!current.eql(foreign_owner)) return error.NickInUse;
-        const fallback = self.findNickFallback(target) orelse return error.NickInUse;
-        if (!fallback.eql(foreign_owner)) return error.NickInUse;
-
-        const rcu_clients = try self.allocator.alloc(world_rcu.ClientId, exact_clients.len);
-        defer self.allocator.free(rcu_clients);
-        for (exact_clients, rcu_clients) |client, *rcu_client| rcu_client.* = @bitCast(client);
-        if (!try r.nicks.removeValuesPreservingKey(r.writer_participant, target, @bitCast(foreign_owner), rcu_clients))
-            return error.NickInUse;
-
-        for (exact_clients) |client| {
-            if (self.client_nicks.fetchRemove(client)) |removed| {
-                _ = self.nicks.remove(removed.value);
-                self.allocator.free(removed.value);
-            }
-        }
-        self.noteRcuNickWrite(r);
-        return true;
+        var prepared = try self.prepareExactSessionNickOwner(target, exact_clients, .{ .preserve_foreign = foreign_owner });
+        defer prepared.abort();
+        const changed = prepared.changed;
+        prepared.commit();
+        return changed;
     }
 
     /// Atomically hand an existing nick's primary lookup ownership from one live
@@ -2472,6 +2936,382 @@ pub const World = struct {
         return before != on;
     }
 
+    /// Retained, one-shot source handle. Aliases consume the SAME private payload;
+    /// no fields, stage IDs or payload getters cross this boundary. The creator
+    /// keeps the original write acquisition through terminal publication. Core
+    /// validates readiness before WAL and excludes intervening World mutations.
+    /// Tokens have a finite owner budget and remain distinct until real quiescent
+    /// World destruction; callers must never use a handle after that destruction.
+    pub const PreparedRegisteredChannel = opaque {
+        pub fn requireOriginalWorld(self: *const PreparedRegisteredChannel, world: *World, creator: std.Thread.Id, acquisition: u64) !void {
+            const b = registeredChannelBacking(self);
+            if (b.creator != std.Thread.getCurrentId()) return error.ChannelStageWrongCaller;
+            if (b.world != world or b.creator != creator or b.acquisition != acquisition) return error.ChannelStageSourceMismatch;
+            // Identity validation intentionally also works for a genuine cold
+            // interrupted/MAX lane; the original Core supplies that proof.
+            try world.lock.requireExclusiveHeldByCurrentThread();
+            try b.requireActive();
+        }
+
+        pub fn requireReady(self: *const PreparedRegisteredChannel) !void {
+            const b = registeredChannelBacking(self);
+            try b.requireCaller();
+            try b.requirePlacement();
+        }
+
+        pub fn bindOriginalCoreScope(self: *PreparedRegisteredChannel, scope: *@import("server.zig").ManagedLeasedWorldScope) !void {
+            try self.requireReady();
+            const b = registeredChannelBacking(self);
+            if (b.core_scope != null) return error.ChannelStageAlreadyBound;
+            try scope.bindOriginalRegisteredChannelStage(self);
+            b.core_scope = scope;
+        }
+
+        pub fn requireColdCancellation(self: *PreparedRegisteredChannel, scope: *@import("server.zig").ManagedLeasedWorldScope) !void {
+            const b = registeredChannelBacking(self);
+            if (b.creator != std.Thread.getCurrentId()) return error.ChannelStageWrongCaller;
+            try b.world.lock.requireExclusiveHeldByCurrentThread();
+            try b.requireActive();
+            if (b.core_scope != scope) return error.ChannelStageScopeMismatch;
+            try scope.requireOriginalRegisteredChannelColdCancellation(self);
+        }
+
+        pub fn abortForColdCore(self: *PreparedRegisteredChannel, scope: *@import("server.zig").ManagedLeasedWorldScope) !void {
+            try self.requireColdCancellation(scope);
+            const b = registeredChannelBacking(self);
+            b.discardUnpublished();
+            b.retire();
+        }
+
+        /// No allocation/I/O/callback follows this source-prevalidated lexical
+        /// cut. A private coordinator must not mutate World after requireReady
+        /// and before its synced batch plus this terminal publication.
+        pub fn commit(self: *PreparedRegisteredChannel) void {
+            self.requireReady() catch @panic("original channel World stage not ready");
+            const b = registeredChannelBacking(self);
+            const world = b.world;
+            if (b.existing != null) {
+                // requirePlacement resolves and validates the CURRENT entry
+                // before any old pointer is dereferenced.
+                const channel = world.channels.getPtr(b.target_name).?;
+                if (b.on) channel.ext_modes.set(.registered) else channel.ext_modes.clear(.registered);
+            } else if (b.new_channel) |channel| {
+                const c = b.channel_rcu.?;
+                c.members.putAssumeCapacityNoClobber(b.member_key.?, b.member_set.?);
+                world.channels.putAssumeCapacityNoClobber(b.owned_name.?, channel);
+                b.member_key = null;
+                b.member_set = null;
+                b.owned_name = null;
+                b.new_channel = null;
+                world.next_oid = b.next_oid_after;
+                b.names.?.commit();
+                b.names = null;
+                if (b.owns_rcu) world.rcu_channels = c;
+                b.owns_rcu = false;
+                world.noteRcuChannelWrite(c);
+            }
+            b.finishReservation();
+            b.retire();
+        }
+
+        /// Logical conflict does not prevent freeing original UNPUBLISHED
+        /// resources. Ordinary abort still requires the exact creator/lane.
+        pub fn abort(self: *PreparedRegisteredChannel) void {
+            const b = registeredChannelBacking(self);
+            if (b.creator != std.Thread.getCurrentId()) @panic("original channel stage creator lost before abort");
+            if (!b.active) return;
+            b.requireCaller() catch @panic("original channel World acquisition lost before abort");
+            b.discardUnpublished();
+            b.retire();
+        }
+    };
+
+    const RegisteredChannelRegistry = opaque {};
+    const RegisteredChannelRegistryBacking = struct {
+        world: *World,
+        active: ?*RegisteredChannelBacking = null,
+        tokens: ?*RegisteredChannelBacking = null,
+        issued: usize = 0,
+    };
+    const max_registered_channel_tokens = 4096;
+
+    fn registeredRegistryBacking(handle: *RegisteredChannelRegistry) *RegisteredChannelRegistryBacking {
+        return @ptrCast(@alignCast(handle));
+    }
+    fn registeredChannelBacking(handle: *const PreparedRegisteredChannel) *RegisteredChannelBacking {
+        return @ptrCast(@alignCast(@constCast(handle)));
+    }
+    pub fn requireNoActiveRegisteredChannelStage(self: *World) !void {
+        try self.lock.requireExclusiveHeldByCurrentThread();
+        if (self.registered_stages) |handle| {
+            const r = registeredRegistryBacking(handle);
+            if (r.world != self) return error.ChannelStageSourceMismatch;
+            if (r.active != null) return error.ChannelStageActive;
+        }
+    }
+
+    const RegisteredChannelBacking = struct {
+        world: *World,
+        creator: std.Thread.Id,
+        acquisition: u64,
+        on: bool,
+        next_token: ?*RegisteredChannelBacking = null,
+        target_name: []u8,
+        target_oid: ?u32,
+        original_capacity: u32 = 0,
+        original_count: u32 = 0,
+        original_next_oid: u32,
+        original_rcu: ?*RcuChannelState,
+        original_names_root: ?usize,
+        original_member_set: ?*world_rcu.MembershipSet,
+        original_member_root: ?usize,
+        original_registered: bool,
+        existing: ?*Channel = null,
+        new_channel: ?Channel = null,
+        owned_name: ?[]u8 = null,
+        member_key: ?[]u8 = null,
+        member_set: ?*world_rcu.MembershipSet = null,
+        channel_rcu: ?*RcuChannelState = null,
+        owns_rcu: bool = false,
+        names: ?world_rcu.ChannelRegistry(u32).StagedInsertAbsentBatch = null,
+        reservation: ?*ebr.Participant.RetireReservation = null,
+        next_oid_after: u32,
+        active: bool = false,
+        core_scope: ?*@import("server.zig").ManagedLeasedWorldScope = null,
+
+        fn requireActive(self: *const RegisteredChannelBacking) !void {
+            const r = registeredRegistryBacking(self.world.registered_stages orelse return error.ConsumedChannelStage);
+            if (r.world != self.world or !self.active or r.active != self) return error.ConsumedChannelStage;
+        }
+        fn requireCaller(self: *const RegisteredChannelBacking) !void {
+            if (self.creator != std.Thread.getCurrentId()) return error.ChannelStageWrongCaller;
+            // Only the exact creator retires this token; stale creator aliases
+            // fail without touching a successor's mutable registry or lane.
+            if (!self.active) return error.ConsumedChannelStage;
+            try self.world.lock.requireExclusiveAcquisitionByCurrentThread(self.acquisition);
+            try self.requireActive();
+        }
+        fn requirePlacement(self: *const RegisteredChannelBacking) !void {
+            const w = self.world;
+            if (w.channels.capacity() != self.original_capacity or w.channels.count() != self.original_count or
+                w.next_oid != self.original_next_oid or w.rcu_channels != self.original_rcu) return error.ChannelStageConflict;
+            const entry = w.channels.getEntry(self.target_name);
+            if (self.existing) |original| {
+                const current = entry orelse return error.ChannelStageConflict;
+                if (current.value_ptr != original or !std.mem.eql(u8, current.key_ptr.*, self.target_name) or
+                    current.value_ptr.oid != self.target_oid.? or current.value_ptr.ext_modes.has(.registered) != self.original_registered)
+                    return error.ChannelStageConflict;
+                var others = w.channels.iterator();
+                while (others.next()) |other| {
+                    if (other.value_ptr != current.value_ptr and other.value_ptr.oid == self.target_oid.?) return error.ChannelStageConflict;
+                }
+            } else if (entry != null) return error.ChannelStageConflict;
+            if (w.rcu_channels) |c| {
+                if (@intFromPtr(c.names.published.load(.acquire)) != self.original_names_root.?) return error.ChannelStageConflict;
+                const set = rcuMembershipGet(c, self.target_name);
+                if (set != self.original_member_set) return error.ChannelStageConflict;
+                if (set) |members| {
+                    if (@intFromPtr(members.published.load(.acquire)) != self.original_member_root.?) return error.ChannelStageConflict;
+                }
+            }
+        }
+        fn retire(self: *RegisteredChannelBacking) void {
+            const r = registeredRegistryBacking(self.world.registered_stages.?);
+            std.debug.assert(r.active == self and self.active);
+            r.active = null;
+            self.active = false;
+        }
+        fn finishReservation(self: *RegisteredChannelBacking) void {
+            if (self.reservation) |reservation| {
+                reservation.finish();
+                self.world.allocator.destroy(reservation);
+                self.reservation = null;
+            }
+        }
+
+        fn discardUnpublished(self: *RegisteredChannelBacking) void {
+            if (self.names) |*names| names.abort();
+            self.names = null;
+            self.finishReservation();
+            if (self.new_channel) |*channel| channel.deinit();
+            self.new_channel = null;
+            if (self.owned_name) |name| self.world.allocator.free(name);
+            self.owned_name = null;
+            if (self.member_set) |set| {
+                set.deinit();
+                self.world.allocator.destroy(set);
+            }
+            self.member_set = null;
+            if (self.member_key) |key| self.world.allocator.free(key);
+            self.member_key = null;
+            if (self.owns_rcu) self.world.destroyUnpublishedRegisteredRcu(self.channel_rcu.?);
+            self.owns_rcu = false;
+        }
+    };
+
+    /// Prepare +r without changing logical maps, mirrors, memberships, flags
+    /// or OIDs. Capacity growth is allowed; no name/root is published. Drop of
+    /// an absent channel only funds custody metadata; it never materializes a channel.
+    /// Divergent fallback/RCU state and nonrepresentable successor OIDs refuse.
+    pub fn prepareRegisteredChannel(self: *World, name: []const u8, on: bool) !*PreparedRegisteredChannel {
+        const acquisition = try self.lock.captureExclusiveAcquisitionForCurrentThread();
+        try self.requireNoActiveRegisteredChannelStage();
+        if (!isChannelName(name) or name.len > foldBufLen) return error.InvalidChannel;
+        for (name) |byte| if (byte <= ' ' or byte == ',' or byte == 127) return error.InvalidChannel;
+        const registry = if (self.registered_stages) |handle| registeredRegistryBacking(handle) else blk: {
+            const r = try self.allocator.create(RegisteredChannelRegistryBacking);
+            r.* = .{ .world = self };
+            self.registered_stages = @ptrCast(r);
+            break :blk r;
+        };
+        if (registry.issued == max_registered_channel_tokens) return error.ChannelStageCapacity;
+        const prepared = try self.allocator.create(RegisteredChannelBacking);
+        errdefer self.allocator.destroy(prepared);
+        const target = try self.allocator.dupe(u8, if (self.channels.getEntry(name)) |entry| entry.key_ptr.* else name);
+        errdefer self.allocator.free(target);
+        const existing = self.channels.getPtr(name);
+        const original_set = if (self.rcu_channels) |c| rcuMembershipGet(c, name) else null;
+        prepared.* = .{
+            .world = self,
+            .creator = std.Thread.getCurrentId(),
+            .acquisition = acquisition,
+            .on = on,
+            .existing = existing,
+            .target_name = target,
+            .target_oid = if (existing) |channel| channel.oid else null,
+            .original_next_oid = self.next_oid,
+            .original_rcu = self.rcu_channels,
+            .original_names_root = if (self.rcu_channels) |c| @intFromPtr(c.names.published.load(.acquire)) else null,
+            .original_member_set = original_set,
+            .original_member_root = if (original_set) |set| @intFromPtr(set.published.load(.acquire)) else null,
+            .original_registered = if (existing) |channel| channel.ext_modes.has(.registered) else false,
+            .next_oid_after = self.next_oid,
+        };
+        errdefer prepared.discardUnpublished();
+        if (existing) |channel| {
+            if (channel.oid == 0) return error.InvalidGraph;
+            var others = self.channels.valueIterator();
+            while (others.next()) |other| {
+                if (other != channel and other.oid == channel.oid) return error.InvalidGraph;
+            }
+        }
+
+        if (self.rcu_channels) |c| {
+            const mirror_oid = c.names.lookup(c.writer_participant, name);
+            const mirror_members = rcuMembershipGet(c, name);
+            if (prepared.existing) |channel| {
+                if (channel.oid == 0 or mirror_oid == null or mirror_oid.? != channel.oid or mirror_members == null or
+                    mirror_members.?.count(c.writer_participant) != channel.members.count()) return error.InvalidGraph;
+                var members = channel.members.keyIterator();
+                while (members.next()) |id| {
+                    if (!mirror_members.?.contains(c.writer_participant, @bitCast(id.*))) return error.InvalidGraph;
+                }
+            } else if (mirror_oid != null or mirror_members != null) return error.InvalidGraph;
+        }
+
+        if (prepared.existing == null and on) {
+            if (self.next_oid == 0) return error.ObjectIdExhausted;
+            var greatest: u32 = 0;
+            var channels = self.channels.valueIterator();
+            while (channels.next()) |channel| {
+                if (channel.oid == 0) return error.InvalidGraph;
+                greatest = @max(greatest, channel.oid);
+            }
+            if (self.rcu_channels) |c| {
+                const Oids = struct {
+                    fn append(maximum: *u32, _: []const u8, oid: u32) void {
+                        maximum.* = @max(maximum.*, oid);
+                    }
+                };
+                c.names.iterate(c.writer_participant, &greatest, Oids.append);
+            }
+            const after_known = std.math.add(u32, greatest, 1) catch return error.ObjectIdExhausted;
+            const oid = @max(self.next_oid, after_known);
+            prepared.next_oid_after = std.math.add(u32, oid, 1) catch return error.ObjectIdExhausted;
+            try self.channels.ensureUnusedCapacity(1);
+            const c = self.rcu_channels orelse try self.prepareRegisteredRcuImage();
+            prepared.channel_rcu = c;
+            prepared.owns_rcu = self.rcu_channels == null;
+            try c.members.ensureUnusedCapacity(self.allocator, 1);
+            prepared.owned_name = try self.allocator.dupe(u8, name);
+            var folded_buf: [foldBufLen]u8 = undefined;
+            prepared.member_key = try self.allocator.dupe(u8, foldName(name, &folded_buf));
+            if (c.members.contains(prepared.member_key.?)) return error.InvalidGraph;
+            const set = try self.allocator.create(world_rcu.MembershipSet);
+            set.* = world_rcu.MembershipSet.init(self.allocator, &c.domain) catch |err| {
+                self.allocator.destroy(set);
+                return err;
+            };
+            prepared.member_set = set;
+            var channel = Channel.init(self.allocator);
+            channel.oid = oid;
+            channel.created_unix = self.clock_unix;
+            channel.ext_modes.set(.registered);
+            prepared.new_channel = channel;
+            const reservation = try self.allocator.create(ebr.Participant.RetireReservation);
+            reservation.* = c.writer_participant.reserveRetireCapacity(1) catch |err| {
+                self.allocator.destroy(reservation);
+                return err;
+            };
+            prepared.reservation = reservation;
+            const inserts = [_]world_rcu.ChannelRegistry(u32).Insert{.{ .key = prepared.owned_name.?, .value = oid }};
+            prepared.names = (try c.names.stageInsertAbsentBatchReserved(reservation, &inserts)) orelse return error.InvalidGraph;
+        }
+        prepared.original_capacity = self.channels.capacity();
+        prepared.original_count = self.channels.count();
+        prepared.next_token = registry.tokens;
+        registry.tokens = prepared;
+        registry.issued += 1;
+        registry.active = prepared;
+        prepared.active = true;
+        return @ptrCast(prepared);
+    }
+
+    /// Build a complete private mirror when legacy fallback records exist but
+    /// the lazy RCU image is inactive. Publishing a target-only image would hide
+    /// unrelated channels and their memberships from lock-free readers.
+    fn prepareRegisteredRcuImage(self: *World) !*RcuChannelState {
+        const c = try self.createRcuChannelState();
+        errdefer self.destroyUnpublishedRegisteredRcu(c);
+        var channels = self.channels.iterator();
+        while (channels.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (name.len > foldBufLen) return error.InvalidGraph;
+            const set = try self.allocator.create(world_rcu.MembershipSet);
+            set.* = world_rcu.MembershipSet.init(self.allocator, &c.domain) catch |err| {
+                self.allocator.destroy(set);
+                return err;
+            };
+            var owned_set = true;
+            errdefer if (owned_set) {
+                set.deinit();
+                self.allocator.destroy(set);
+            };
+            var members = entry.value_ptr.members.keyIterator();
+            while (members.next()) |id| try set.add(c.writer_participant, @bitCast(id.*));
+            var folded_buf: [foldBufLen]u8 = undefined;
+            const key = try self.allocator.dupe(u8, foldName(name, &folded_buf));
+            var owned_key = true;
+            errdefer if (owned_key) self.allocator.free(key);
+            try c.members.put(self.allocator, key, set);
+            owned_set = false;
+            owned_key = false;
+            try c.names.set(c.writer_participant, name, entry.value_ptr.oid);
+        }
+        return c;
+    }
+
+    fn destroyUnpublishedRegisteredRcu(self: *World, c: *RcuChannelState) void {
+        var members = c.members.iterator();
+        while (members.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        c.members.clearRetainingCapacity();
+        self.destroyDetachedRcuChannelState(c);
+    }
+
     /// Set or clear an IRCX extended channel flag. Returns true if it changed.
     pub fn setChannelExtFlag(self: *World, name: []const u8, flag: chanmode_ext.ExtChannelFlag, on: bool) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
@@ -3632,6 +4472,361 @@ pub const World = struct {
 const foldBufLen = 256;
 const rcuAdvanceWriteInterval: usize = 64;
 const rcuAdvancePasses: usize = 3;
+
+test "World prepared registration preserves old owner when first allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var world = World.init(failing.allocator());
+    defer world.deinit();
+    const client = testClient(200);
+    try world.registerNick("Before", client);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, world.registerNick("After", client));
+    try std.testing.expectEqualStrings("Before", world.nickOf(client).?);
+    try std.testing.expectEqual(@as(?ClientId, client), world.findNick("before"));
+    try std.testing.expect(world.findNick("after") == null);
+}
+
+test "World prepared identity rename and exact logical nick ownership preserve memberships and foreign policy" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = testClient(201);
+    const b = testClient(202);
+    const foreign = testClient(203);
+    try world.registerNick("Old", a);
+    try world.registerNick("Alias", b);
+    try world.registerNick("Foreign", foreign);
+    try world.restoreMember("#Room", a, MemberModes.fromModes(&.{.op}));
+    try world.restoreMember("#Room", b, MemberModes.fromModes(&.{.voice}));
+    var aborted = try world.preparePhysicalIdentityRename(a, "New");
+    try std.testing.expectEqualStrings("Old", world.nickOf(a).?);
+    try std.testing.expect(world.findNick("new") == null);
+    aborted.abort();
+    aborted.abort();
+    var renamed = try world.preparePhysicalIdentityRename(a, "OLD");
+    defer renamed.abort();
+    renamed.commit();
+    try std.testing.expectEqualStrings("OLD", world.nickOf(a).?);
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#room", a).?.bits);
+    try std.testing.expect(world.isMember("#ROOM", a));
+    try std.testing.expectError(error.NickInUse, world.preparePhysicalIdentityRegister(b, "old"));
+    var shared = try world.prepareExactSessionNickOwner("OLD", &.{ a, b }, .{ .claim_exact = b });
+    defer shared.abort();
+    try std.testing.expectEqual(@as(?ClientId, a), world.findNick("old"));
+    shared.commit();
+    try std.testing.expect(world.nickOf(a) == null);
+    try std.testing.expectEqual(@as(?ClientId, b), world.findNick("old"));
+    try std.testing.expect(world.findNick("alias") == null);
+    try std.testing.expect(world.isMember("#room", a));
+    try std.testing.expect(world.isMember("#room", b));
+    var preserved = try world.prepareExactSessionNickOwner("Foreign", &.{ a, b }, .{ .preserve_foreign = foreign });
+    defer preserved.abort();
+    preserved.commit();
+    try std.testing.expect(world.nickOf(b) == null);
+    try std.testing.expectEqual(@as(?ClientId, foreign), world.findNick("foreign"));
+    try std.testing.expect(world.isMember("#room", a));
+    try std.testing.expect(world.isMember("#room", b));
+    try std.testing.expectError(error.InvalidOwnerSet, world.prepareExactSessionNickOwner("Foreign", &.{ a, a }, .{ .claim_exact = a }));
+    try std.testing.expectError(error.InvalidOwnerSet, world.prepareExactSessionNickOwner("Foreign", &.{ a, foreign }, .{ .preserve_foreign = foreign }));
+}
+
+test "World prepared exact nick noops remove RCU only aliases and registration exact spelling allocates nothing" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var world = World.init(failing.allocator());
+    defer world.deinit();
+    const a = testClient(204);
+    const b = testClient(205);
+    const foreign = testClient(206);
+    try world.registerNick("Chosen", a);
+    try world.registerNick("Foreign", foreign);
+    const r = world.rcu_nicks.?;
+    try r.nicks.set(r.writer_participant, "Ghost", @bitCast(b));
+    var claimed = try world.prepareExactSessionNickOwner("Chosen", &.{ a, b }, .{ .claim_exact = a });
+    defer claimed.abort();
+    try std.testing.expect(claimed.changed);
+    try std.testing.expectEqual(@as(?ClientId, b), world.findNick("ghost"));
+    claimed.commit();
+    try std.testing.expect(world.findNick("ghost") == null);
+    try r.nicks.set(r.writer_participant, "Ghost", @bitCast(b));
+    var preserved = try world.prepareExactSessionNickOwner("Foreign", &.{b}, .{ .preserve_foreign = foreign });
+    defer preserved.abort();
+    try std.testing.expect(preserved.changed);
+    preserved.commit();
+    try std.testing.expect(world.findNick("ghost") == null);
+    try std.testing.expectEqual(@as(?ClientId, foreign), world.findNick("foreign"));
+    const count = failing.allocations;
+    failing.fail_index = failing.alloc_index;
+    try world.registerNick("Chosen", a);
+    try std.testing.expectEqual(count, failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+fn worldPreparedRemoveFixture(world: *World, client: ClientId, keeper: ClientId) !void {
+    try world.registerNick("Departing", client);
+    try world.registerNick("Keeper", keeper);
+    try world.restoreMember("#Ephemeral", client, MemberModes.fromModes(&.{.op}));
+    try world.restoreMember("#Registered", client, MemberModes.fromModes(&.{.voice}));
+    _ = try world.markRegistered("#Registered", true);
+    _ = try world.markRegistered("#EmptyRegistered", true);
+    try world.restoreMember("#Shared", client, MemberModes.fromModes(&.{.voice}));
+    try world.restoreMember("#Shared", keeper, MemberModes.fromModes(&.{.op}));
+    try world.restoreMember("#RcuOnly", client, MemberModes.empty());
+    world.removeFallbackChannel("#RcuOnly");
+    try world.channels.getPtr("#Shared").?.invites.put(world.allocator, client, {});
+    try world.channels.getPtr("#Shared").?.invites.put(world.allocator, keeper, {});
+    try world.channels.getPtr("#EmptyRegistered").?.invites.put(world.allocator, client, {});
+    // Interrupted historical unregister can leave a nick alias with no reverse.
+    try world.rcu_nicks.?.nicks.set(world.rcu_nicks.?.writer_participant, "Ghost", @bitCast(client));
+}
+
+fn worldPreparedRemoveBefore(world: *World, client: ClientId, keeper: ClientId) !void {
+    try std.testing.expectEqualStrings("Departing", world.nickOf(client).?);
+    try std.testing.expectEqual(@as(?ClientId, client), world.findNick("departing"));
+    try std.testing.expectEqual(@as(?ClientId, client), world.findNick("ghost"));
+    for ([_][]const u8{ "#ephemeral", "#registered", "#shared", "#rcuonly" }) |name| try std.testing.expect(world.isMember(name, client));
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#EPHEMERAL", client).?.bits);
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#shared", client).?.bits);
+    try std.testing.expect(world.isMember("#shared", keeper));
+    try std.testing.expect(world.channels.getPtr("#Shared").?.invites.contains(client));
+    try std.testing.expect(world.channels.getPtr("#EmptyRegistered").?.invites.contains(client));
+}
+
+fn worldPreparedRemoveAfter(world: *World, client: ClientId, keeper: ClientId) !void {
+    try std.testing.expect(world.nickOf(client) == null);
+    try std.testing.expect(world.findNick("departing") == null);
+    try std.testing.expect(world.findNick("ghost") == null);
+    try std.testing.expectEqual(@as(?ClientId, keeper), world.findNick("keeper"));
+    try std.testing.expect(!world.channels.contains("#ephemeral"));
+    try std.testing.expect(!world.channelExists("#EPHEMERAL"));
+    for ([_][]const u8{ "#registered", "#shared", "#rcuonly" }) |name| {
+        try std.testing.expect(world.channelExists(name));
+        try std.testing.expect(!world.isMember(name, client));
+    }
+    try std.testing.expectEqual(@as(usize, 0), world.channels.getPtr("#registered").?.members.count());
+    try std.testing.expect(world.channelExists("#emptyregistered"));
+    try std.testing.expect(!world.channels.getPtr("#EmptyRegistered").?.invites.contains(client));
+    const shared = world.channels.getPtr("#shared").?;
+    try std.testing.expect(!shared.members.contains(client));
+    try std.testing.expect(!shared.invites.contains(client));
+    try std.testing.expect(shared.invites.contains(keeper));
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, shared.members.get(keeper).?.bits);
+    try std.testing.expect(world.isMember("#shared", keeper));
+}
+
+test "World prepared physical removal abort is inert and commit cleans members invites ephemeral and RCU only aliases" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const client = testClient(207);
+    const keeper = testClient(208);
+    try worldPreparedRemoveFixture(&world, client, keeper);
+    var aborted = try world.preparePhysicalIdentityRemove(client);
+    try worldPreparedRemoveBefore(&world, client, keeper);
+    aborted.abort();
+    aborted.abort();
+    try worldPreparedRemoveBefore(&world, client, keeper);
+    var prepared = try world.preparePhysicalIdentityRemove(client);
+    defer prepared.abort();
+    prepared.commit();
+    try worldPreparedRemoveAfter(&world, client, keeper);
+    var repeated = try world.preparePhysicalIdentityRemove(client);
+    defer repeated.abort();
+    repeated.commit();
+    try worldPreparedRemoveAfter(&world, client, keeper);
+}
+
+test "World prepared physical removal exhaustive allocation failure rollback retry and allocation free commit" {
+    const client = testClient(209);
+    const keeper = testClient(210);
+    var index: usize = 0;
+    while (index < 10000) : (index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var world = World.init(failing.allocator());
+        defer world.deinit();
+        try worldPreparedRemoveFixture(&world, client, keeper);
+        const nick_root = world.rcu_nicks.?.nicks.published.load(.acquire);
+        const channel_root = world.rcu_channels.?.names.published.load(.acquire);
+        failing.fail_index = failing.alloc_index + index;
+        var prepared = world.preparePhysicalIdentityRemove(client) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(nick_root, world.rcu_nicks.?.nicks.published.load(.acquire));
+            try std.testing.expectEqual(channel_root, world.rcu_channels.?.names.published.load(.acquire));
+            try worldPreparedRemoveBefore(&world, client, keeper);
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try world.preparePhysicalIdentityRemove(client);
+            defer retry.abort();
+            const allocations = failing.allocations;
+            failing.fail_index = failing.alloc_index;
+            retry.commit();
+            try std.testing.expectEqual(allocations, failing.allocations);
+            try worldPreparedRemoveAfter(&world, client, keeper);
+            continue;
+        };
+        defer prepared.abort();
+        try std.testing.expect(!failing.has_induced_failure);
+        const allocations = failing.allocations;
+        failing.fail_index = failing.alloc_index;
+        prepared.commit();
+        try std.testing.expectEqual(allocations, failing.allocations);
+        try std.testing.expect(!failing.has_induced_failure);
+        try worldPreparedRemoveAfter(&world, client, keeper);
+        try std.testing.expect(index > 0);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "World prepared physical nick exhaustive allocation rollback detached activation retry and no fail commit" {
+    for ([_]bool{ false, true }) |rename| {
+        var index: usize = 0;
+        while (index < 10000) : (index += 1) {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var world = World.init(failing.allocator());
+            defer world.deinit();
+            const client = testClient(211);
+            if (rename) {
+                try world.registerNick("Before", client);
+                try world.restoreMember("#Room", client, MemberModes.fromModes(&.{.op}));
+            }
+            const old_rcu = world.rcu_nicks;
+            const old_root = if (old_rcu) |r| r.nicks.published.load(.acquire) else null;
+            failing.fail_index = failing.alloc_index + index;
+            var prepared = world.preparePhysicalIdentityRegister(client, "After") catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expectEqual(old_rcu, world.rcu_nicks);
+                if (old_rcu) |r| try std.testing.expectEqual(old_root, r.nicks.published.load(.acquire));
+                if (rename) {
+                    try std.testing.expectEqualStrings("Before", world.nickOf(client).?);
+                    try std.testing.expectEqual(@as(?ClientId, client), world.findNick("before"));
+                    try std.testing.expect(world.isMember("#room", client));
+                } else {
+                    try std.testing.expect(world.nickOf(client) == null);
+                    try std.testing.expectEqual(@as(usize, 0), world.nicks.count());
+                }
+                failing.fail_index = std.math.maxInt(usize);
+                var retry = try world.preparePhysicalIdentityRegister(client, "After");
+                defer retry.abort();
+                const allocations = failing.allocations;
+                failing.fail_index = failing.alloc_index;
+                retry.commit();
+                try std.testing.expectEqual(allocations, failing.allocations);
+                try std.testing.expectEqual(@as(?ClientId, client), world.findNick("after"));
+                if (rename) try std.testing.expect(world.isMember("#room", client));
+                continue;
+            };
+            defer prepared.abort();
+            try std.testing.expectEqual(old_rcu, world.rcu_nicks);
+            const allocations = failing.allocations;
+            failing.fail_index = failing.alloc_index;
+            prepared.commit();
+            try std.testing.expectEqual(allocations, failing.allocations);
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(@as(?ClientId, client), world.findNick("after"));
+            try std.testing.expect(world.findNick("before") == null);
+            if (rename) try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#Room", client).?.bits);
+            break;
+        }
+        try std.testing.expect(index > 0 and index < 10000);
+    }
+}
+
+test "World prepared removal handles channel less nick owner and membership only attachment independently" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const nick_owner = testClient(212);
+    const member_only = testClient(213);
+    const sibling = testClient(214);
+    try world.registerNick("SharedDisplay", nick_owner);
+    try world.restoreMember("#Physical", member_only, MemberModes.fromModes(&.{.voice}));
+    try world.restoreMember("#Physical", sibling, MemberModes.fromModes(&.{.op}));
+    var owner_remove = try world.preparePhysicalIdentityRemove(nick_owner);
+    defer owner_remove.abort();
+    owner_remove.commit();
+    try std.testing.expect(world.findNick("shareddisplay") == null);
+    try std.testing.expect(world.isMember("#physical", member_only));
+    try std.testing.expect(world.isMember("#physical", sibling));
+    var member_remove = try world.preparePhysicalIdentityRemove(member_only);
+    defer member_remove.abort();
+    member_remove.commit();
+    try std.testing.expect(!world.isMember("#physical", member_only));
+    try std.testing.expect(world.isMember("#physical", sibling));
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#physical", sibling).?.bits);
+}
+
+test "World prepared nick transactions reject orphan fallback and mismatched reverse before publication" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const client = testClient(215);
+    const sibling = testClient(216);
+    try world.registerNick("Owned", client);
+    try world.registerNick("Sibling", sibling);
+    const reverse = world.client_nicks.fetchRemove(client).?;
+    defer world.client_nicks.putAssumeCapacity(client, reverse.value);
+    const root = world.rcu_nicks.?.nicks.published.load(.acquire);
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalIdentityRegister(client, "New"));
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalIdentityRemove(client));
+    try std.testing.expectEqual(root, world.rcu_nicks.?.nicks.published.load(.acquire));
+    try std.testing.expectEqual(@as(?ClientId, client), world.findNick("owned"));
+    world.client_nicks.putAssumeCapacity(client, world.client_nicks.get(sibling).?);
+    defer _ = world.client_nicks.remove(client);
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalIdentityRename(client, "New"));
+    try std.testing.expectEqual(@as(?ClientId, sibling), world.findNick("sibling"));
+}
+
+test "World prepared exact logical claim and foreign preservation sweep all allocation failures" {
+    for ([_]bool{ false, true }) |preserve| {
+        var index: usize = 0;
+        while (index < 10000) : (index += 1) {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var world = World.init(failing.allocator());
+            defer world.deinit();
+            const a = testClient(217);
+            const b = testClient(218);
+            const foreign = testClient(219);
+            try world.registerNick("First", a);
+            try world.registerNick("Second", b);
+            try world.registerNick("Foreign", foreign);
+            try world.restoreMember("#Room", a, MemberModes.fromModes(&.{.op}));
+            try world.restoreMember("#Room", b, MemberModes.fromModes(&.{.voice}));
+            const target = if (preserve) "Foreign" else "Unified";
+            const disposition: World.SessionNickDisposition = if (preserve) .{ .preserve_foreign = foreign } else .{ .claim_exact = b };
+            const root = world.rcu_nicks.?.nicks.published.load(.acquire);
+            failing.fail_index = failing.alloc_index + index;
+            var prepared = world.prepareExactSessionNickOwner(target, &.{ a, b }, disposition) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expectEqual(root, world.rcu_nicks.?.nicks.published.load(.acquire));
+                try std.testing.expectEqualStrings("First", world.nickOf(a).?);
+                try std.testing.expectEqualStrings("Second", world.nickOf(b).?);
+                try std.testing.expectEqual(@as(?ClientId, a), world.findNick("first"));
+                try std.testing.expectEqual(@as(?ClientId, b), world.findNick("second"));
+                try std.testing.expect(world.isMember("#room", a));
+                try std.testing.expect(world.isMember("#room", b));
+                failing.fail_index = std.math.maxInt(usize);
+                var retry = try world.prepareExactSessionNickOwner(target, &.{ a, b }, disposition);
+                defer retry.abort();
+                const allocations = failing.allocations;
+                failing.fail_index = failing.alloc_index;
+                retry.commit();
+                try std.testing.expectEqual(allocations, failing.allocations);
+                try std.testing.expectEqual(@as(?ClientId, if (preserve) foreign else b), world.findNick(target));
+                try std.testing.expect(world.findNick("first") == null and world.findNick("second") == null);
+                try std.testing.expect(world.isMember("#room", a) and world.isMember("#room", b));
+                continue;
+            };
+            defer prepared.abort();
+            const allocations = failing.allocations;
+            failing.fail_index = failing.alloc_index;
+            prepared.commit();
+            try std.testing.expectEqual(allocations, failing.allocations);
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(@as(?ClientId, if (preserve) foreign else b), world.findNick(target));
+            try std.testing.expect(world.findNick("first") == null and world.findNick("second") == null);
+            try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#Room", a).?.bits);
+            try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#Room", b).?.bits);
+            break;
+        }
+        try std.testing.expect(index > 0 and index < 10000);
+    }
+}
 
 fn advanceRcuDomainIfIdle(domain: *ebr.Domain) bool {
     if (!rcuDomainIdle(domain)) return false;
@@ -6130,4 +7325,991 @@ test "renameChannel keeps RCU existence and membership mirrors in step" {
     try std.testing.expect(world.channelExists("#NEW"));
     try std.testing.expect(world.isMember("#new", a));
     try std.testing.expect(!world.isMember("#old", a));
+}
+
+test "World compound causal handoff followed by late removal OOM must leave predecessor intact" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var world = World.init(failing.allocator());
+    defer world.deinit();
+    const source = testClient(900);
+    const keeper = testClient(901);
+    try world.registerNick("Shared", source);
+    try world.restoreMember("#Only", source, MemberModes.fromModes(&.{.op}));
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, world.preparePhysicalDeparture(.{ .source = source, .keeper = keeper, .exact_clients = &.{ source, keeper }, .nick = .{ .target = "Shared", .disposition = .{ .claim_exact = keeper } } }));
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(?ClientId, source), world.findNick("Shared"));
+    try std.testing.expect(!world.isMember("#Only", keeper));
+}
+
+const compound_source = testClient(910);
+const compound_keeper = testClient(911);
+const compound_third = testClient(912);
+const compound_foreign = testClient(913);
+
+fn compoundFixture(world: *World, divergent: bool) !void {
+    try world.registerNick("Shared", compound_source);
+    try world.registerNick("Third", compound_third);
+    try world.registerNick("Foreign", compound_foreign);
+    try world.restoreMember("#Shared", compound_source, MemberModes.fromModes(&.{.op}));
+    try world.restoreMember("#Shared", compound_keeper, MemberModes.fromModes(&.{.voice}));
+    try world.restoreMember("#Shared", compound_foreign, MemberModes.fromModes(&.{.owner}));
+    try world.restoreMember("#SourceOnly", compound_source, MemberModes.fromModes(&.{.voice}));
+    try world.restoreMember("#KeeperOnly", compound_keeper, MemberModes.fromModes(&.{.op}));
+    try world.restoreMember("#ThirdOnly", compound_third, MemberModes.fromModes(&.{.voice}));
+    try world.restoreMember("#ForeignOnly", compound_foreign, MemberModes.fromModes(&.{.owner}));
+    _ = try world.markRegistered("#RegisteredEmpty", true);
+    _ = try world.markRegistered("#Empty", true);
+    _ = try world.markRegistered("#Empty", false);
+    try world.channels.getPtr("#RegisteredEmpty").?.invites.put(world.allocator, compound_source, {});
+    try world.channels.getPtr("#ForeignOnly").?.invites.put(world.allocator, compound_source, {});
+    try world.channels.getPtr("#ForeignOnly").?.invites.put(world.allocator, compound_keeper, {});
+    const metadata = world.channels.getPtr("#SourceOnly").?;
+    try metadata.setTopic("persistent subject-only channel", "operator", 91234);
+    metadata.key = try world.allocator.dupe(u8, "channel-key");
+    metadata.forward = try world.allocator.dupe(u8, "#ForeignOnly");
+    metadata.limit = 7;
+    metadata.private = true;
+    metadata.hidden = true;
+    metadata.throttle_joins = 3;
+    metadata.throttle_secs = 9;
+    metadata.throttle_alert_ms = 999;
+    try metadata.throttle_times.append(world.allocator, 81234);
+    const ban = try ListEntry.init(world.allocator, "*!*@blocked", "operator", 41234);
+    metadata.bans.append(world.allocator, ban) catch |err| {
+        var owned = ban;
+        owned.deinit(world.allocator);
+        return err;
+    };
+    if (divergent) {
+        const c = world.rcu_channels.?;
+        world.rcuDropMembership(c, "#SourceOnly");
+        try c.names.remove(c.writer_participant, "#SourceOnly");
+        try world.restoreMember("#RcuOnly", compound_source, MemberModes.fromModes(&.{.op}));
+        world.removeFallbackChannel("#RcuOnly");
+        try world.restoreMember("#RcuGap", compound_source, MemberModes.fromModes(&.{.op}));
+        _ = world.channels.getPtr("#RcuGap").?.members.remove(compound_source);
+        try world.restoreMember("#FallbackGap", compound_source, MemberModes.fromModes(&.{.op}));
+        try World.rcuMembershipGet(c, "#FallbackGap").?.remove(c.writer_participant, @bitCast(compound_source));
+        const n = world.rcu_nicks.?;
+        try n.nicks.set(n.writer_participant, "Ghost", @bitCast(compound_source));
+    }
+}
+
+fn compoundSpec(policy: u2) World.PhysicalDepartureSpec {
+    return .{ .source = compound_source, .keeper = compound_keeper, .exact_clients = &.{ compound_source, compound_keeper, compound_third }, .nick = switch (policy) {
+        0 => .{ .target = "Shared", .disposition = .{ .claim_exact = compound_keeper } },
+        1 => .{ .target = "Foreign", .disposition = .{ .preserve_foreign = compound_foreign } },
+        else => null,
+    } };
+}
+
+fn compoundBefore(world: *World, divergent: bool) !void {
+    try std.testing.expectEqual(@as(?ClientId, compound_source), world.findNick("Shared"));
+    try std.testing.expectEqual(@as(?ClientId, compound_third), world.findNick("Third"));
+    try std.testing.expect(world.channels.getPtr("#Shared").?.members.contains(compound_source));
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#Shared", compound_keeper).?.bits);
+    try std.testing.expect(!world.channels.getPtr("#SourceOnly").?.members.contains(compound_keeper));
+    try std.testing.expect(!world.isMember("#ThirdOnly", compound_keeper));
+    try std.testing.expect(world.channels.getPtr("#ForeignOnly").?.invites.contains(compound_source));
+    try std.testing.expect(world.channelExists("#Empty"));
+    if (divergent) {
+        try std.testing.expect(World.rcuMembershipGet(world.rcu_channels.?, "#SourceOnly") == null);
+        try std.testing.expect(!world.channelExists("#SourceOnly"));
+        try std.testing.expectEqual(@as(?ClientId, compound_source), world.findNick("Ghost"));
+        try std.testing.expect(!world.channels.contains("#RcuOnly"));
+        try std.testing.expect(world.isMember("#RcuOnly", compound_source));
+        try std.testing.expect(!world.channels.getPtr("#RcuGap").?.members.contains(compound_source));
+    }
+}
+
+fn compoundAfter(world: *World, divergent: bool, policy: u2) !void {
+    try std.testing.expect(world.nickOf(compound_source) == null);
+    try std.testing.expect(world.findNick("Ghost") == null);
+    try std.testing.expectEqual(@as(?ClientId, compound_foreign), world.findNick("Foreign"));
+    if (policy == 0) {
+        try std.testing.expectEqual(@as(?ClientId, compound_keeper), world.findNick("Shared"));
+        try std.testing.expect(world.findNick("Third") == null);
+    } else {
+        try std.testing.expect(world.findNick("Shared") == null);
+        try std.testing.expectEqual(if (policy == 1) @as(?ClientId, null) else @as(?ClientId, compound_third), world.findNick("Third"));
+    }
+    try std.testing.expectEqual(MemberModes.fromModes(&.{ .op, .voice }).bits, world.memberModes("#Shared", compound_keeper).?.bits);
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.owner}).bits, world.memberModes("#Shared", compound_foreign).?.bits);
+    for ([_][]const u8{ "#Shared", "#SourceOnly", "#KeeperOnly", "#ThirdOnly" }) |name| {
+        try std.testing.expect(world.isMember(name, compound_keeper));
+        try std.testing.expect(!world.isMember(name, compound_source));
+    }
+    try std.testing.expect(world.isMember("#ThirdOnly", compound_third));
+    try std.testing.expect(!world.isMember("#ForeignOnly", compound_keeper));
+    try std.testing.expect(!world.channels.getPtr("#ForeignOnly").?.invites.contains(compound_source));
+    try std.testing.expect(world.channels.getPtr("#ForeignOnly").?.invites.contains(compound_keeper));
+    try std.testing.expect(world.channelExists("#RegisteredEmpty"));
+    try std.testing.expect(!world.channels.getPtr("#RegisteredEmpty").?.invites.contains(compound_source));
+    try std.testing.expect(!world.channelExists("#Empty"));
+    if (divergent) {
+        try std.testing.expect(!world.channels.contains("#RcuOnly"));
+        try std.testing.expect(world.isMember("#RcuOnly", compound_keeper));
+        try std.testing.expect(!world.isMember("#RcuOnly", compound_source));
+        try std.testing.expectEqual(@as(u8, 0), world.memberModes("#RcuGap", compound_keeper).?.bits);
+        try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#FallbackGap", compound_keeper).?.bits);
+    }
+}
+
+test "World compound departure derives complete OR union preserves metadata and aborts atomically" {
+    for ([_]bool{ false, true }) |divergent| for ([_]u2{ 0, 1, 2 }) |policy| {
+        var world = World.init(std.testing.allocator);
+        defer world.deinit();
+        try compoundFixture(&world, divergent);
+        const metadata = compoundMetadataDigest(world.channels.getPtr("#SourceOnly").?);
+        const oid = world.channels.getPtr("#SourceOnly").?.oid;
+        const created = world.channels.getPtr("#SourceOnly").?.created_unix;
+        var aborted = try world.preparePhysicalDeparture(compoundSpec(policy));
+        try compoundBefore(&world, divergent);
+        aborted.abort();
+        aborted.abort();
+        try compoundBefore(&world, divergent);
+        var prepared = try world.preparePhysicalDeparture(compoundSpec(policy));
+        defer prepared.abort();
+        prepared.commit();
+        try compoundAfter(&world, divergent, policy);
+        try std.testing.expectEqual(oid, world.channels.getPtr("#SourceOnly").?.oid);
+        try std.testing.expectEqual(created, world.channels.getPtr("#SourceOnly").?.created_unix);
+        try std.testing.expectEqual(metadata, compoundMetadataDigest(world.channels.getPtr("#SourceOnly").?));
+        var again = try world.preparePhysicalDeparture(compoundSpec(policy));
+        defer again.abort();
+        again.commit();
+        try compoundAfter(&world, divergent, policy);
+    };
+}
+
+test "World compound departure union assertions and exact owner sets reject invented authority" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    try compoundFixture(&world, false);
+    const root = world.rcu_nicks.?.nicks.published.load(.acquire);
+    var spec = compoundSpec(0);
+    spec.expected_union = &.{.{ .channel = "#Shared", .modes = MemberModes.fromModes(&.{ .op, .voice }) }};
+    try std.testing.expectError(error.InvalidUnion, world.preparePhysicalDeparture(spec));
+    const good = [_]MemberRestore{
+        .{ .channel = "#shared", .modes = MemberModes.fromModes(&.{ .op, .voice }) },
+        .{ .channel = "#SourceOnly", .modes = MemberModes.fromModes(&.{.voice}) },
+        .{ .channel = "#KeeperOnly", .modes = MemberModes.fromModes(&.{.op}) },
+        .{ .channel = "#ThirdOnly", .modes = MemberModes.fromModes(&.{.voice}) },
+    };
+    var wrong = good;
+    wrong[3].channel = "#SHARED";
+    spec.expected_union = &wrong;
+    try std.testing.expectError(error.InvalidUnion, world.preparePhysicalDeparture(spec));
+    wrong = good;
+    wrong[0].modes = MemberModes.fromModes(&.{.owner});
+    try std.testing.expectError(error.InvalidUnion, world.preparePhysicalDeparture(spec));
+    wrong = good;
+    wrong[3].channel = "#Extra";
+    try std.testing.expectError(error.InvalidUnion, world.preparePhysicalDeparture(spec));
+    spec = compoundSpec(0);
+    spec.exact_clients = &.{ compound_source, compound_keeper, compound_keeper };
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalDeparture(spec));
+    spec = compoundSpec(0);
+    spec.keeper = compound_source;
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalDeparture(spec));
+    spec = compoundSpec(0);
+    spec.nick.?.disposition = .{ .claim_exact = compound_third };
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalDeparture(spec));
+    spec = compoundSpec(0);
+    spec.nick.?.disposition = .{ .preserve_foreign = compound_foreign };
+    try std.testing.expectError(error.NickInUse, world.preparePhysicalDeparture(spec));
+    try std.testing.expectEqual(root, world.rcu_nicks.?.nicks.published.load(.acquire));
+    try compoundBefore(&world, false);
+    spec = compoundSpec(0);
+    spec.expected_union = &good;
+    var accepted = try world.preparePhysicalDeparture(spec);
+    defer accepted.abort();
+    accepted.commit();
+    try compoundAfter(&world, false, 0);
+}
+
+test "World compound departure exhaustive OOM rollback every root retry and allocation armed commit" {
+    for ([_]bool{ false, true }) |divergent| for ([_]u2{ 0, 1, 2 }) |policy| {
+        var index: usize = 0;
+        while (index < 10000) : (index += 1) {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var world = World.init(failing.allocator());
+            defer {
+                failing.fail_index = std.math.maxInt(usize);
+                world.deinit();
+            }
+            try compoundFixture(&world, divergent);
+            const c = world.rcu_channels.?;
+            const nick_root = world.rcu_nicks.?.nicks.published.load(.acquire);
+            const names_root = c.names.published.load(.acquire);
+            const Capture = struct { set: *world_rcu.MembershipSet, root: usize };
+            const roots = try std.testing.allocator.alloc(Capture, c.members.count());
+            defer std.testing.allocator.free(roots);
+            var it = c.members.valueIterator();
+            for (roots) |*capture| {
+                const set = it.next().?.*;
+                capture.* = .{ .set = set, .root = @intFromPtr(set.published.load(.acquire)) };
+            }
+            const fallback_digest = compoundFallbackDigest(&world);
+            failing.fail_index = failing.alloc_index + index;
+            var prepared = world.preparePhysicalDeparture(compoundSpec(policy)) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(nick_root, world.rcu_nicks.?.nicks.published.load(.acquire));
+                try std.testing.expectEqual(names_root, c.names.published.load(.acquire));
+                for (roots) |capture| try std.testing.expectEqual(capture.root, @intFromPtr(capture.set.published.load(.acquire)));
+                try compoundBefore(&world, divergent);
+                try std.testing.expectEqual(fallback_digest, compoundFallbackDigest(&world));
+                failing.fail_index = std.math.maxInt(usize);
+                var retry = try world.preparePhysicalDeparture(compoundSpec(policy));
+                defer retry.abort();
+                const allocations = failing.allocations;
+                failing.fail_index = failing.alloc_index;
+                retry.commit();
+                try std.testing.expectEqual(allocations, failing.allocations);
+                try compoundAfter(&world, divergent, policy);
+                continue;
+            };
+            const allocations = failing.allocations;
+            failing.fail_index = failing.alloc_index;
+            prepared.abort();
+            prepared.abort();
+            try std.testing.expectEqual(fallback_digest, compoundFallbackDigest(&world));
+            try std.testing.expectEqual(allocations, failing.allocations);
+            try std.testing.expect(!failing.has_induced_failure);
+            try compoundBefore(&world, divergent);
+            failing.fail_index = std.math.maxInt(usize);
+            var success = try world.preparePhysicalDeparture(compoundSpec(policy));
+            defer success.abort();
+            failing.fail_index = failing.alloc_index;
+            const before_commit = failing.allocations;
+            success.commit();
+            try std.testing.expectEqual(before_commit, failing.allocations);
+            try compoundAfter(&world, divergent, policy);
+            try std.testing.expect(index > 0);
+            break;
+        }
+        try std.testing.expect(index < 10000);
+    };
+}
+
+test "World compound departure pair contributes only pair and leaves unrelated exact attachment untouched" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    try compoundFixture(&world, false);
+    var spec = compoundSpec(2);
+    spec.exact_clients = &.{ compound_source, compound_keeper };
+    var prepared = try world.preparePhysicalDeparture(spec);
+    defer prepared.abort();
+    prepared.commit();
+    try std.testing.expect(world.isMember("#ThirdOnly", compound_third));
+    try std.testing.expect(!world.isMember("#ThirdOnly", compound_keeper));
+    try std.testing.expectEqual(@as(?ClientId, compound_third), world.findNick("Third"));
+    try std.testing.expect(world.isMember("#SourceOnly", compound_keeper));
+}
+
+test "World compound departure rejects graph alias long names and contradictory name OID before publication" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    try compoundFixture(&world, false);
+    const c = world.rcu_channels.?;
+    const nick_root = world.rcu_nicks.?.nicks.published.load(.acquire);
+    const oid = world.channels.getPtr("#SourceOnly").?.oid;
+    try c.names.set(c.writer_participant, "#SourceOnly", oid + 1);
+    try std.testing.expectError(error.InvalidGraph, world.preparePhysicalDeparture(compoundSpec(0)));
+    try c.names.set(c.writer_participant, "#SourceOnly", oid);
+    const alias = try world.allocator.dupe(u8, "#alias");
+    try c.members.put(world.allocator, alias, World.rcuMembershipGet(c, "#Shared").?);
+    try std.testing.expectError(error.InvalidGraph, world.preparePhysicalDeparture(compoundSpec(0)));
+    _ = c.members.remove(alias);
+    world.allocator.free(alias);
+    var too_long: [foldBufLen + 1]u8 = @splat('x');
+    too_long[0] = '#';
+    const long_key = try world.allocator.dupe(u8, &too_long);
+    try c.members.put(world.allocator, long_key, World.rcuMembershipGet(c, "#Shared").?);
+    try std.testing.expectError(error.InvalidGraph, world.preparePhysicalDeparture(compoundSpec(0)));
+    _ = c.members.remove(long_key);
+    world.allocator.free(long_key);
+    // A missing name cannot claim the identity of an unrelated names-only entity.
+    try c.names.remove(c.writer_participant, "#SourceOnly");
+    try c.names.set(c.writer_participant, "#NamesOnly", oid);
+    try std.testing.expectError(error.InvalidGraph, world.preparePhysicalDeparture(compoundSpec(0)));
+    try c.names.remove(c.writer_participant, "#NamesOnly");
+    try c.names.set(c.writer_participant, "#SourceOnly", oid);
+    try std.testing.expectEqual(nick_root, world.rcu_nicks.?.nicks.published.load(.acquire));
+    try compoundBefore(&world, false);
+}
+
+test "World compound departure RCU only entity stays empty names only survives and foreign RCU prevents deletion" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const source = compound_source;
+    try world.restoreMember("#RcuOnly", source, MemberModes.empty());
+    const c = world.rcu_channels.?;
+    world.removeFallbackChannel("#RcuOnly");
+    try c.names.set(c.writer_participant, "#NamesOnly", 99000);
+    try world.restoreMember("#ForeignGap", source, MemberModes.fromModes(&.{.op}));
+    try world.restoreMember("#ForeignGap", compound_foreign, MemberModes.fromModes(&.{.voice}));
+    _ = world.channels.getPtr("#ForeignGap").?.members.remove(compound_foreign);
+    var prepared = try world.preparePhysicalDeparture(.{ .source = source, .keeper = null, .exact_clients = &.{source}, .expected_union = &.{} });
+    defer prepared.abort();
+    prepared.commit();
+    try std.testing.expect(!world.channels.contains("#RcuOnly"));
+    try std.testing.expect(World.rcuMembershipGet(c, "#RcuOnly") != null);
+    try std.testing.expectEqual(@as(usize, 0), World.rcuMembershipGet(c, "#RcuOnly").?.count(c.writer_participant));
+    try std.testing.expect(world.channelExists("#NamesOnly"));
+    try std.testing.expect(World.rcuMembershipGet(c, "#NamesOnly") == null);
+    try std.testing.expect(world.channels.contains("#ForeignGap"));
+    try std.testing.expect(world.isMember("#ForeignGap", compound_foreign));
+    try std.testing.expectEqual(@as(usize, 0), world.channels.getPtr("#ForeignGap").?.members.count());
+}
+
+fn compoundFallbackOnlyFixture(world: *World) !void {
+    // Construct the supported globally inactive mirror case directly; every
+    // fallback row still owns its canonical Channel metadata and key storage.
+    const key = try world.allocator.dupe(u8, "#Dormant");
+    errdefer world.allocator.free(key);
+    var channel = Channel.init(world.allocator);
+    errdefer channel.deinit();
+    channel.oid = 810;
+    channel.created_unix = 12345;
+    try channel.members.put(compound_source, MemberModes.fromModes(&.{.op}));
+    try channel.members.put(compound_foreign, MemberModes.fromModes(&.{.voice}));
+    try channel.invites.put(world.allocator, compound_source, {});
+    try world.channels.put(key, channel);
+}
+
+test "World compound departure inactive RCU exhaustive OOM abort and keeper commit do not activate partial mirror" {
+    var index: usize = 0;
+    while (index < 10000) : (index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var world = World.init(failing.allocator());
+        defer {
+            failing.fail_index = std.math.maxInt(usize);
+            world.deinit();
+        }
+        try compoundFallbackOnlyFixture(&world);
+        const spec = World.PhysicalDepartureSpec{ .source = compound_source, .keeper = compound_keeper, .exact_clients = &.{ compound_source, compound_keeper } };
+        failing.fail_index = failing.alloc_index + index;
+        var prepared = world.preparePhysicalDeparture(spec) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(world.rcu_channels == null and world.rcu_nicks == null);
+            const channel = world.channels.getPtr("#Dormant").?;
+            try std.testing.expect(channel.members.contains(compound_source));
+            try std.testing.expect(!channel.members.contains(compound_keeper));
+            try std.testing.expect(channel.invites.contains(compound_source));
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try world.preparePhysicalDeparture(spec);
+            defer retry.abort();
+            const allocations = failing.allocations;
+            failing.fail_index = failing.alloc_index;
+            retry.commit();
+            try std.testing.expectEqual(allocations, failing.allocations);
+            try std.testing.expect(world.rcu_channels == null and world.rcu_nicks == null);
+            try std.testing.expect(!channel.members.contains(compound_source));
+            try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, channel.members.get(compound_keeper).?.bits);
+            try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, channel.members.get(compound_foreign).?.bits);
+            continue;
+        };
+        prepared.abort();
+        prepared.abort();
+        try std.testing.expect(world.rcu_channels == null and world.rcu_nicks == null);
+        try std.testing.expect(world.channels.getPtr("#Dormant").?.members.contains(compound_source));
+        try std.testing.expect(index > 0);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "World compound departure missing set final rebuild preserves foreign and names OID" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    try world.restoreMember("#Mixed", compound_source, MemberModes.fromModes(&.{.op}));
+    try world.restoreMember("#Mixed", compound_foreign, MemberModes.fromModes(&.{.voice}));
+    const c = world.rcu_channels.?;
+    const oid = world.channels.getPtr("#Mixed").?.oid;
+    world.rcuDropMembership(c, "#Mixed");
+    try c.names.remove(c.writer_participant, "#Mixed");
+    var prepared = try world.preparePhysicalDeparture(.{ .source = compound_source, .keeper = compound_keeper, .exact_clients = &.{ compound_source, compound_keeper } });
+    defer prepared.abort();
+    try std.testing.expect(World.rcuMembershipGet(c, "#Mixed") == null);
+    prepared.commit();
+    try std.testing.expect(!world.isMember("#Mixed", compound_source));
+    try std.testing.expect(world.isMember("#Mixed", compound_keeper));
+    try std.testing.expect(world.isMember("#Mixed", compound_foreign));
+    try std.testing.expectEqual(oid, c.names.lookup(c.writer_participant, "#Mixed").?);
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#Mixed", compound_foreign).?.bits);
+}
+
+// Capacity and hash table layout may change on failed reservation; logical
+// ownership, memberships/modes, metadata and invitation capabilities may not.
+fn compoundMetadataDigest(channel: *const Channel) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    inline for (.{ "topic", "topic_setter", "key", "forward" }) |field| {
+        const bytes = @field(channel, field);
+        hash.update(&.{@intFromBool(bytes != null)});
+        if (bytes) |value| {
+            const len = value.len;
+            hash.update(std.mem.asBytes(&len));
+            hash.update(value);
+        }
+    }
+    inline for (.{ "topic_time", "throttle_joins", "throttle_secs", "throttle_alert_ms", "private", "hidden", "oid", "created_unix" }) |field| {
+        const value = @field(channel, field);
+        hash.update(std.mem.asBytes(&value));
+    }
+    const limit = channel.limit orelse 0;
+    hash.update(&.{@intFromBool(channel.limit != null)});
+    hash.update(std.mem.asBytes(&limit));
+    const base = checkpointBaseModeBits(channel.modes);
+    hash.update(std.mem.asBytes(&base));
+    const extended: u32 = @bitCast(channel.ext_modes);
+    hash.update(std.mem.asBytes(&extended));
+    inline for (.{ "bans", "exempts", "invex", "mutes" }) |field| {
+        const list = @field(channel, field).items;
+        const len = list.len;
+        hash.update(std.mem.asBytes(&len));
+        for (list) |row| {
+            hash.update(row.mask);
+            hash.update(row.setter);
+            hash.update(std.mem.asBytes(&row.set_at));
+        }
+    }
+    hash.update(std.mem.sliceAsBytes(channel.throttle_times.items));
+    return hash.final();
+}
+
+fn compoundFallbackDigest(world: *World) u64 {
+    var sum: u64 = 0;
+    var it = world.channels.iterator();
+    while (it.next()) |entry| {
+        var hash = std.hash.Wyhash.init(compoundMetadataDigest(entry.value_ptr));
+        hash.update(entry.key_ptr.*);
+        var members = entry.value_ptr.members.iterator();
+        var member_sum: u64 = 0;
+        while (members.next()) |row| {
+            const id: u64 = @bitCast(row.key_ptr.*);
+            var member = std.hash.Wyhash.init(id);
+            member.update(&.{row.value_ptr.bits});
+            member_sum +%= member.final();
+        }
+        hash.update(std.mem.asBytes(&member_sum));
+        var invites = entry.value_ptr.invites.keyIterator();
+        var invite_sum: u64 = 0;
+        while (invites.next()) |id| {
+            const bits: u64 = @bitCast(id.*);
+            invite_sum +%= std.hash.Wyhash.hash(0, std.mem.asBytes(&bits));
+        }
+        hash.update(std.mem.asBytes(&invite_sum));
+        const member_count = entry.value_ptr.members.count();
+        const invite_count = entry.value_ptr.invites.count();
+        hash.update(std.mem.asBytes(&member_count));
+        hash.update(std.mem.asBytes(&invite_count));
+        sum +%= hash.final();
+    }
+    return sum;
+}
+
+const RegisteredStageTestCut = struct {
+    const Root = struct { set: *world_rcu.MembershipSet, root: usize };
+    fallback: u64,
+    channel_count: usize,
+    next_oid: u32,
+    rcu: ?*RcuChannelState,
+    names_root: ?usize,
+    member_count: usize,
+    writes: usize,
+    roots: []Root,
+
+    fn capture(world: *World) !RegisteredStageTestCut {
+        const c = world.rcu_channels;
+        const roots = try std.testing.allocator.alloc(Root, if (c) |mirror| mirror.members.count() else 0);
+        if (c) |mirror| {
+            var it = mirror.members.valueIterator();
+            for (roots) |*root| {
+                const set = it.next().?.*;
+                root.* = .{ .set = set, .root = @intFromPtr(set.published.load(.acquire)) };
+            }
+        }
+        return .{
+            .fallback = compoundFallbackDigest(world),
+            .channel_count = world.channels.count(),
+            .next_oid = world.next_oid,
+            .rcu = c,
+            .names_root = if (c) |mirror| @intFromPtr(mirror.names.published.load(.acquire)) else null,
+            .member_count = if (c) |mirror| mirror.members.count() else 0,
+            .writes = world.rcu_channel_writes_since_advance,
+            .roots = roots,
+        };
+    }
+    fn deinit(self: RegisteredStageTestCut) void {
+        std.testing.allocator.free(self.roots);
+    }
+    fn expectUnchanged(self: RegisteredStageTestCut, world: *World) !void {
+        try std.testing.expectEqual(self.fallback, compoundFallbackDigest(world));
+        try std.testing.expectEqual(self.channel_count, world.channels.count());
+        try std.testing.expectEqual(self.next_oid, world.next_oid);
+        try std.testing.expect(self.rcu == world.rcu_channels);
+        try std.testing.expectEqual(self.writes, world.rcu_channel_writes_since_advance);
+        if (self.rcu) |mirror| {
+            try std.testing.expectEqual(self.names_root.?, @intFromPtr(mirror.names.published.load(.acquire)));
+            try std.testing.expectEqual(self.member_count, mirror.members.count());
+        }
+        for (self.roots) |root| try std.testing.expectEqual(root.root, @intFromPtr(root.set.published.load(.acquire)));
+    }
+};
+
+const RegisteredStageCase = enum { empty, active, dormant, existing, drop, absent_drop };
+
+fn registeredStageFixture(world: *World, case: RegisteredStageCase) !void {
+    world.clock_unix = 123456;
+    switch (case) {
+        .empty, .absent_drop => {},
+        .dormant => try compoundFallbackOnlyFixture(world),
+        .active, .existing, .drop => {
+            try world.restoreMember("#Keeper", compound_source, MemberModes.fromModes(&.{.op}));
+            try world.restoreMember("#Keeper", compound_foreign, MemberModes.fromModes(&.{.voice}));
+            const channel = world.channels.getPtr("#Keeper").?;
+            try channel.setTopic("original topic", "original setter", 12345);
+            channel.key = try world.allocator.dupe(u8, "original key");
+            channel.private = true;
+            try channel.invites.put(world.allocator, compound_keeper, {});
+            if (case == .drop) channel.ext_modes.set(.registered);
+        },
+    }
+}
+
+fn registeredStageOutcome(world: *World, case: RegisteredStageCase) !void {
+    const target = if (case == .existing or case == .drop) "#Keeper" else "#New";
+    if (case == .absent_drop) {
+        try std.testing.expect(world.channels.count() == 0 and world.rcu_channels == null and world.next_oid == 1);
+        return;
+    }
+    try std.testing.expect(world.channelExists(target));
+    try std.testing.expectEqual(case != .drop, world.channelHasExtFlag(target, .registered));
+    if (case == .active or case == .existing or case == .drop) {
+        try std.testing.expect(world.isMember("#keeper", compound_source) and world.isMember("#KEEPER", compound_foreign));
+        const keeper = world.channels.getPtr("#Keeper").?;
+        try std.testing.expectEqualStrings("original topic", keeper.topic.?);
+        try std.testing.expectEqualStrings("original setter", keeper.topic_setter.?);
+        try std.testing.expectEqualStrings("original key", keeper.key.?);
+        try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, keeper.members.get(compound_source).?.bits);
+        try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, keeper.members.get(compound_foreign).?.bits);
+        try std.testing.expect(keeper.private and keeper.invites.contains(compound_keeper));
+    } else if (case == .dormant) {
+        try std.testing.expect(world.channelExists("#DORMANT"));
+        try std.testing.expect(world.isMember("#dormant", compound_source) and world.isMember("#Dormant", compound_foreign));
+        try std.testing.expectEqual(@as(?u32, 810), world.channelOid("#Dormant"));
+        try std.testing.expectEqual(@as(?u32, 811), world.channelOid("#New"));
+        try std.testing.expect(world.channels.getPtr("#Dormant").?.invites.contains(compound_source));
+    }
+    if (case == .empty or case == .active or case == .dormant) {
+        try std.testing.expectEqual(@as(usize, 0), world.channels.getPtr("#new").?.members.count());
+        try std.testing.expectEqual(@as(?i64, 123456), world.channelCreatedUnix("#new"));
+    }
+}
+
+test "World registered channel staged exhaustive OOM exact logical rollback retry and zero allocation terminal commit" {
+    for (std.enums.values(RegisteredStageCase)) |case| {
+        var index: usize = 0;
+        var finished = false;
+        while (index < 1000) : (index += 1) {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var world = World.init(failing.allocator());
+            defer {
+                failing.fail_index = std.math.maxInt(usize);
+                world.deinit();
+            }
+            world.lockWrite();
+            defer world.unlockWrite();
+            try registeredStageFixture(&world, case);
+            const before = try RegisteredStageTestCut.capture(&world);
+            defer before.deinit();
+            const target = if (case == .existing or case == .drop) "#kEEPER" else "#New";
+            const on = case != .drop and case != .absent_drop;
+            failing.fail_index = failing.alloc_index + index;
+            const prepared = world.prepareRegisteredChannel(target, on) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expect(failing.has_induced_failure);
+                try world.requireNoActiveRegisteredChannelStage();
+                try before.expectUnchanged(&world);
+                failing.fail_index = std.math.maxInt(usize);
+                const retry = try world.prepareRegisteredChannel(target, on);
+                defer retry.abort();
+                try retry.requireReady();
+                try before.expectUnchanged(&world);
+                const allocations = failing.allocations;
+                failing.fail_index = failing.alloc_index;
+                retry.commit();
+                try std.testing.expectEqual(allocations, failing.allocations);
+                failing.fail_index = std.math.maxInt(usize);
+                try registeredStageOutcome(&world, case);
+                continue;
+            };
+            defer prepared.abort();
+            try before.expectUnchanged(&world);
+            try std.testing.expectError(error.ChannelStageActive, world.prepareRegisteredChannel("#Nested", true));
+            const allocations = failing.allocations;
+            failing.fail_index = failing.alloc_index;
+            prepared.abort();
+            prepared.abort();
+            try std.testing.expectEqual(allocations, failing.allocations);
+            try before.expectUnchanged(&world);
+            failing.fail_index = std.math.maxInt(usize);
+            const retry = try world.prepareRegisteredChannel(target, on);
+            defer retry.abort();
+            const before_commit = failing.allocations;
+            failing.fail_index = failing.alloc_index;
+            retry.commit();
+            try std.testing.expectEqual(before_commit, failing.allocations);
+            failing.fail_index = std.math.maxInt(usize);
+            try registeredStageOutcome(&world, case);
+            if (case == .empty or case == .active or case == .dormant) try std.testing.expect(index > 0);
+            finished = true;
+            break;
+        }
+        try std.testing.expect(finished);
+        std.debug.print("registered channel source case={s} actual prepare OOM boundaries={}\n", .{ @tagName(case), index });
+    }
+}
+
+test "World registered channel stage rejects invalid name divergent projection and nonwrap OID without publication" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    try std.testing.expectError(error.ExclusiveLockNotHeldByCaller, world.prepareRegisteredChannel("#New", true));
+    world.lockWrite();
+    defer world.unlockWrite();
+    try registeredStageFixture(&world, .active);
+    try std.testing.expectError(error.InvalidChannel, world.prepareRegisteredChannel("#Bad Name", true));
+    world.next_oid = std.math.maxInt(u32);
+    const before = try RegisteredStageTestCut.capture(&world);
+    defer before.deinit();
+    try std.testing.expectError(error.ObjectIdExhausted, world.prepareRegisteredChannel("#New", true));
+    try before.expectUnchanged(&world);
+    world.next_oid = 0;
+    try std.testing.expectError(error.ObjectIdExhausted, world.prepareRegisteredChannel("#New", true));
+    world.next_oid = 2;
+    const c = world.rcu_channels.?;
+    try c.names.set(c.writer_participant, "#Keeper", 999);
+    const divergent = try RegisteredStageTestCut.capture(&world);
+    defer divergent.deinit();
+    try std.testing.expectError(error.InvalidGraph, world.prepareRegisteredChannel("#KEEPER", true));
+    try divergent.expectUnchanged(&world);
+    try c.names.set(c.writer_participant, "#Keeper", world.channels.getPtr("#Keeper").?.oid);
+    world.next_oid = std.math.maxInt(u32) - 1;
+    const last = try world.prepareRegisteredChannel("#Last", true);
+    defer last.abort();
+    last.commit();
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32) - 1), world.channelOid("#Last"));
+    try std.testing.expectEqual(std.math.maxInt(u32), world.next_oid);
+    try std.testing.expectError(error.ObjectIdExhausted, world.prepareRegisteredChannel("#NeverWrap", true));
+    const existing = try world.prepareRegisteredChannel("#Keeper", true);
+    defer existing.abort();
+    existing.commit();
+    try std.testing.expect(world.channelHasExtFlag("#Keeper", .registered));
+}
+
+test "World registered channel stage owns caller name and stale opaque alias cannot bind a successor" {
+    comptime {
+        if (@typeInfo(World.PreparedRegisteredChannel) != .@"opaque") @compileError("channel payload must be opaque");
+        const Registry = @typeInfo(@TypeOf(@as(World, undefined).registered_stages)).optional.child;
+        if (@typeInfo(@typeInfo(Registry).pointer.child) != .@"opaque") @compileError("registry payload must be opaque");
+        if (@hasDecl(World.PreparedRegisteredChannel, "backing") or @hasDecl(World.PreparedRegisteredChannel, "identity"))
+            @compileError("no public source payload or numeric authority getter");
+    }
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    world.lockWrite();
+    defer world.unlockWrite();
+    var input = [_]u8{ '#', 'N', 'e', 'w' };
+    const prepared = try world.prepareRegisteredChannel(&input, true);
+    defer prepared.abort();
+    const stale = prepared;
+    input[1] = 'X';
+    prepared.commit();
+    try std.testing.expect(world.channelExists("#New") and !world.channelExists("#Xew"));
+    const successor = try world.prepareRegisteredChannel("#Next", true);
+    defer successor.abort();
+    try std.testing.expectError(error.ConsumedChannelStage, stale.requireReady());
+    successor.commit();
+    try std.testing.expect(world.channelExists("#Next"));
+}
+
+test "World registered channel stage real child cannot validate creator custody and caller joins before abort" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    world.lockWrite();
+    defer world.unlockWrite();
+    const prepared = try world.prepareRegisteredChannel("#Private", true);
+    defer prepared.abort();
+    const before = try RegisteredStageTestCut.capture(&world);
+    defer before.deinit();
+    const Child = struct {
+        fn run(plan: *const World.PreparedRegisteredChannel, result: *std.atomic.Value(u8), returned: *std.Io.Event) void {
+            defer returned.set(std.testing.io);
+            plan.requireReady() catch |err| {
+                result.store(if (err == error.ChannelStageWrongCaller) 1 else 2, .release);
+                return;
+            };
+            result.store(3, .release);
+        }
+    };
+    var result = std.atomic.Value(u8).init(0);
+    var returned: std.Io.Event = .unset;
+    const child = try std.Thread.spawn(.{}, Child.run, .{ prepared, &result, &returned });
+    const returned_deadline: std.Io.Clock.Timestamp = .{
+        .clock = .awake,
+        .raw = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromMilliseconds(5000)),
+    };
+    // Never unwind borrowed World/plan/context or blindly join a child whose
+    // callback has not proven return. Timeout terminates this failing process.
+    returned.waitTimeout(std.testing.io, .{ .deadline = returned_deadline }) catch
+        @panic("registered channel child did not return before deadline; borrowed source retained");
+    // The event proves callback completion; the actual join releases caller
+    // stack/thread custody before any borrowed source can be freed.
+    child.join();
+    try std.testing.expectEqual(@as(u8, 1), result.load(.acquire));
+    try before.expectUnchanged(&world);
+    try prepared.requireReady();
+    prepared.abort();
+    try before.expectUnchanged(&world);
+}
+
+test "World registered channel opaque stage same acquisition rename delete and map growth conflict abort preserves surviving graph" {
+    const Mutation = enum { rename, delete, growth };
+    for (std.enums.values(Mutation)) |mutation| {
+        var world = World.init(std.testing.allocator);
+        defer world.deinit();
+        world.lockWrite();
+        defer world.unlockWrite();
+        try registeredStageFixture(&world, .active);
+        const plan = try world.prepareRegisteredChannel("#kEEPER", true);
+        defer plan.abort();
+        try plan.requireReady();
+        switch (mutation) {
+            .rename => try std.testing.expect(try world.renameChannel("#Keeper", "#Moved")),
+            .delete => world.removeChannel("#Keeper"),
+            .growth => {
+                // The same original lock acquisition does not keep a map entry
+                // address stable. Exercise real map relocation without a mock.
+                const capacity = world.channels.capacity();
+                try world.channels.ensureTotalCapacity(capacity + 100);
+                try std.testing.expect(world.channels.capacity() != capacity);
+            },
+        }
+        const after_mutation = try RegisteredStageTestCut.capture(&world);
+        defer after_mutation.deinit();
+        try std.testing.expectError(error.ChannelStageConflict, plan.requireReady());
+        plan.abort();
+        try after_mutation.expectUnchanged(&world);
+        try world.requireNoActiveRegisteredChannelStage();
+        try std.testing.expectError(error.ConsumedChannelStage, plan.requireReady());
+        const target = if (mutation == .rename) "#Moved" else "#Keeper";
+        const retry = try world.prepareRegisteredChannel(target, true);
+        defer retry.abort();
+        try retry.requireReady();
+        retry.commit();
+        try std.testing.expect(world.channelHasExtFlag(target, .registered));
+        if (mutation != .delete) {
+            try std.testing.expect(world.isMember(target, compound_source) and world.isMember(target, compound_foreign));
+            try std.testing.expectEqualStrings("original topic", world.channels.getPtr(target).?.topic.?);
+        }
+    }
+}
+
+test "World registered channel opaque aliases retire only original unpublished resources and finite budget refuses before allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var world = World.init(failing.allocator());
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        world.deinit();
+    }
+    world.lockWrite();
+    defer world.unlockWrite();
+    const before = try RegisteredStageTestCut.capture(&world);
+    defer before.deinit();
+    const original = try world.prepareRegisteredChannel("#Private", true);
+    const alias = original;
+    try std.testing.expect(original == alias);
+    const allocations = failing.allocations;
+    failing.fail_index = failing.alloc_index;
+    alias.abort();
+    original.abort();
+    try std.testing.expectEqual(allocations, failing.allocations);
+    try before.expectUnchanged(&world);
+    failing.fail_index = std.math.maxInt(usize);
+    var remaining: usize = World.max_registered_channel_tokens - 1;
+    while (remaining != 0) : (remaining -= 1) {
+        const next = try world.prepareRegisteredChannel("#Absent", false);
+        try std.testing.expect(next != original);
+        try std.testing.expectError(error.ConsumedChannelStage, alias.requireReady());
+        next.abort();
+    }
+    try before.expectUnchanged(&world);
+    const before_budget = failing.allocations;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.ChannelStageCapacity, world.prepareRegisteredChannel("#Beyond", true));
+    try std.testing.expectEqual(before_budget, failing.allocations);
+    try before.expectUnchanged(&world);
+    try world.requireNoActiveRegisteredChannelStage();
+    try std.testing.expectError(error.ConsumedChannelStage, original.requireReady());
+    // A separate real World has a separate fresh budget. No old token may be
+    // used after its original World's actual quiescent destruction.
+    var fresh = World.init(std.testing.allocator);
+    defer fresh.deinit();
+    fresh.lockWrite();
+    defer fresh.unlockWrite();
+    const first = try fresh.prepareRegisteredChannel("#Fresh", false);
+    first.abort();
+}
+
+fn compoundNoKeeperAfter(world: *World) !void {
+    try std.testing.expect(world.nickOf(compound_source) == null);
+    try std.testing.expect(world.findNick("Ghost") == null);
+    try std.testing.expectEqual(@as(?ClientId, compound_third), world.findNick("Third"));
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#Shared", compound_keeper).?.bits);
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.owner}).bits, world.memberModes("#Shared", compound_foreign).?.bits);
+    for ([_][]const u8{ "#SourceOnly", "#RcuGap", "#FallbackGap", "#Empty" }) |name| try std.testing.expect(!world.channelExists(name));
+    try std.testing.expect(world.isMember("#ThirdOnly", compound_third));
+    try std.testing.expect(!world.isMember("#ThirdOnly", compound_keeper));
+    try std.testing.expect(!world.channels.getPtr("#ForeignOnly").?.invites.contains(compound_source));
+    try std.testing.expect(world.channels.getPtr("#ForeignOnly").?.invites.contains(compound_keeper));
+    try std.testing.expect(world.channelExists("#RegisteredEmpty"));
+    try std.testing.expect(!world.channels.getPtr("#RegisteredEmpty").?.invites.contains(compound_source));
+    try std.testing.expect(world.channelExists("#RcuOnly"));
+    try std.testing.expect(!world.channels.contains("#RcuOnly"));
+    try std.testing.expect(!world.isMember("#RcuOnly", compound_source));
+}
+
+test "World compound departure no keeper divergent graph exhaustive OOM restores exact logical image" {
+    var index: usize = 0;
+    while (index < 10000) : (index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var world = World.init(failing.allocator());
+        defer {
+            failing.fail_index = std.math.maxInt(usize);
+            world.deinit();
+        }
+        try compoundFixture(&world, true);
+        const old_digest = compoundFallbackDigest(&world);
+        const old_nicks = world.rcu_nicks.?.nicks.published.load(.acquire);
+        const old_names = world.rcu_channels.?.names.published.load(.acquire);
+        const spec = World.PhysicalDepartureSpec{ .source = compound_source, .keeper = null, .exact_clients = &.{compound_source} };
+        failing.fail_index = failing.alloc_index + index;
+        var prepared = world.preparePhysicalDeparture(spec) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(old_digest, compoundFallbackDigest(&world));
+            try std.testing.expectEqual(old_nicks, world.rcu_nicks.?.nicks.published.load(.acquire));
+            try std.testing.expectEqual(old_names, world.rcu_channels.?.names.published.load(.acquire));
+            try compoundBefore(&world, true);
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try world.preparePhysicalDeparture(spec);
+            defer retry.abort();
+            const allocations = failing.allocations;
+            failing.fail_index = failing.alloc_index;
+            retry.commit();
+            try std.testing.expectEqual(allocations, failing.allocations);
+            try compoundNoKeeperAfter(&world);
+            continue;
+        };
+        failing.fail_index = failing.alloc_index;
+        prepared.abort();
+        prepared.abort();
+        try std.testing.expectEqual(old_digest, compoundFallbackDigest(&world));
+        try std.testing.expect(!failing.has_induced_failure);
+        failing.fail_index = std.math.maxInt(usize);
+        var success = try world.preparePhysicalDeparture(spec);
+        defer success.abort();
+        failing.fail_index = failing.alloc_index;
+        const allocations = failing.allocations;
+        success.commit();
+        try std.testing.expectEqual(allocations, failing.allocations);
+        try compoundNoKeeperAfter(&world);
+        try std.testing.expect(index > 0);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "World compound departure rejects missing contributor keeper and invalid no keeper shapes" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    try compoundFixture(&world, false);
+    const digest = compoundFallbackDigest(&world);
+    var spec = compoundSpec(0);
+    spec.exact_clients = &.{ compound_keeper, compound_third };
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalDeparture(spec));
+    spec = compoundSpec(0);
+    spec.exact_clients = &.{ compound_source, compound_third };
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalDeparture(spec));
+    spec = compoundSpec(0);
+    spec.keeper = null;
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalDeparture(spec));
+    spec.exact_clients = &.{compound_source};
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalDeparture(spec));
+    spec.nick = null;
+    spec.expected_union = &.{.{ .channel = "#Shared", .modes = MemberModes.empty() }};
+    try std.testing.expectError(error.InvalidOwnerSet, world.preparePhysicalDeparture(spec));
+    try std.testing.expectEqual(digest, compoundFallbackDigest(&world));
+    try compoundBefore(&world, false);
+}
+
+test "World compound departure RCU only contributor cannot claim unknown privilege in expected union" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    try world.restoreMember("#KnownMetadata", compound_source, MemberModes.fromModes(&.{.op}));
+    _ = world.channels.getPtr("#KnownMetadata").?.members.remove(compound_source);
+    const before = compoundFallbackDigest(&world);
+    var spec = World.PhysicalDepartureSpec{ .source = compound_source, .keeper = compound_keeper, .exact_clients = &.{ compound_source, compound_keeper }, .expected_union = &.{.{ .channel = "#KnownMetadata", .modes = MemberModes.fromModes(&.{.op}) }} };
+    try std.testing.expectError(error.InvalidUnion, world.preparePhysicalDeparture(spec));
+    try std.testing.expectEqual(before, compoundFallbackDigest(&world));
+    spec.expected_union = &.{.{ .channel = "#KNOWNMETADATA", .modes = MemberModes.empty() }};
+    var prepared = try world.preparePhysicalDeparture(spec);
+    defer prepared.abort();
+    prepared.commit();
+    try std.testing.expectEqual(@as(u8, 0), world.memberModes("#KnownMetadata", compound_keeper).?.bits);
+    try std.testing.expect(!world.isMember("#KnownMetadata", compound_source));
+}
+
+test "World compound departure secondary attachment removes its RCU aliases and leaves sole keeper nickname reachable" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    try world.registerNick("Shared", compound_keeper);
+    const n = world.rcu_nicks.?;
+    try n.nicks.set(n.writer_participant, "Ghost", @bitCast(compound_source));
+    try world.restoreMember("#Secondary", compound_source, MemberModes.fromModes(&.{.voice}));
+    var prepared = try world.preparePhysicalDeparture(.{ .source = compound_source, .keeper = compound_keeper, .exact_clients = &.{ compound_source, compound_keeper }, .nick = .{ .target = "Shared", .disposition = .{ .claim_exact = compound_keeper } } });
+    defer prepared.abort();
+    try std.testing.expectEqual(@as(?ClientId, compound_keeper), world.findNick("Shared"));
+    try std.testing.expectEqual(@as(?ClientId, compound_source), world.findNick("Ghost"));
+    prepared.commit();
+    try std.testing.expectEqual(@as(?ClientId, compound_keeper), world.findNick("Shared"));
+    try std.testing.expect(world.findNick("Ghost") == null);
+    try std.testing.expect(world.isMember("#Secondary", compound_keeper));
+    try std.testing.expect(!world.isMember("#Secondary", compound_source));
+}
+
+test "World compound missing name candidates reject duplicate fallback OID including unaffected foreign owner" {
+    for ([_]bool{ false, true }) |foreign| {
+        var world = World.init(std.testing.allocator);
+        defer world.deinit();
+        try world.restoreMember("#First", compound_source, MemberModes.fromModes(&.{.op}));
+        try world.restoreMember("#Second", if (foreign) compound_foreign else compound_source, MemberModes.fromModes(&.{.voice}));
+        const c = world.rcu_channels.?;
+        world.channels.getPtr("#Second").?.oid = world.channels.getPtr("#First").?.oid;
+        try c.names.remove(c.writer_participant, "#First");
+        try c.names.remove(c.writer_participant, "#Second");
+        const digest = compoundFallbackDigest(&world);
+        const names = c.names.published.load(.acquire);
+        const Attempt = struct {
+            fn prepare(target: *World) !void {
+                var ticket = try target.preparePhysicalDeparture(.{ .source = compound_source, .keeper = compound_keeper, .exact_clients = &.{ compound_source, compound_keeper } });
+                defer ticket.abort();
+            }
+        };
+        try std.testing.expectError(error.InvalidGraph, Attempt.prepare(&world));
+        try std.testing.expectEqual(digest, compoundFallbackDigest(&world));
+        try std.testing.expectEqual(names, c.names.published.load(.acquire));
+    }
 }

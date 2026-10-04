@@ -13,6 +13,8 @@
 //! serving everything else. This listener never binds a public interface.
 
 const std = @import("std");
+const metrics_http = @import("metrics_http.zig");
+const platform = @import("../substrate/platform.zig");
 const builtin = @import("builtin");
 
 const http01 = @import("acme_http01_server.zig");
@@ -82,6 +84,7 @@ pub const ChallengeServer = struct {
     port: u16,
     thread: ?std.Thread = null,
     stop_flag: std.atomic.Value(bool) = .{ .raw = false },
+    operation_active: std.atomic.Value(bool) = .{ .raw = false },
     /// Per-connection read timeout (seconds); read by the accept loop.
     conn_read_timeout_sec: u32 = default_conn_read_timeout_sec,
 
@@ -176,23 +179,39 @@ pub const ChallengeServer = struct {
     }
 
     fn serveConn(self: *ChallengeServer, fd: sys.fd_t) void {
+        self.operation_active.store(true, .release);
+        defer self.operation_active.store(false, .release);
         defer closeFd(fd);
         // Accepted sockets do not inherit the listener's timeout; cap the read so a
         // silent/slow client cannot stall the single-threaded accept loop.
+        const deadline = platform.monotonicMillis() +| (@as(i64, self.conn_read_timeout_sec) * 1000);
         const tv = sys.timeval{ .sec = @intCast(self.conn_read_timeout_sec), .usec = 0 };
         const timeout_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
-        if (comptime builtin.os.tag != .linux) {
-            if (posix.errno(timeout_rc) != .SUCCESS or posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval))) != .SUCCESS) return;
-        }
+        if (posix.errno(timeout_rc) != .SUCCESS) return;
         var req_buf: [max_request]u8 = undefined;
-        const rc = sys.read(fd, &req_buf, req_buf.len);
-        if (posix.errno(rc) != .SUCCESS) return;
-        const n: usize = @intCast(rc);
-        if (n == 0) return;
+        const n = while (!self.stop_flag.load(.acquire)) {
+            if (platform.monotonicMillis() >= deadline) return;
+            var ready = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+            const polled = sys.poll(&ready, 1, 50);
+            if (posix.errno(polled) != .SUCCESS) {
+                if (posix.errno(polled) == .INTR) continue;
+                return;
+            }
+            if (polled == 0) continue;
+            const rc = sys.recvfrom(fd, &req_buf, req_buf.len, posix.MSG.DONTWAIT, null, null);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return;
+                    break @as(usize, @intCast(rc));
+                },
+                .AGAIN, .INTR => continue,
+                else => return,
+            }
+        } else return;
 
         var resp_buf: [max_response]u8 = undefined;
         const resp = http01.handleRequest(self.store, req_buf[0..n], &resp_buf) catch return;
-        writeAll(fd, resp);
+        _ = metrics_http.writeUntil(fd, resp, &self.stop_flag, deadline);
     }
 };
 
@@ -403,4 +422,36 @@ test "initWithConfig honors a custom backlog and read timeout" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "companion runtime ACME child stop joins active silent connection before listener close" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var store = http01.TokenStore.init(std.testing.allocator);
+    defer store.deinit();
+    var child = try ChallengeServer.initWithConfig(&store, 0, .{ .accept_poll_ms = 0, .conn_read_timeout_sec = 0 });
+    defer child.shutdown();
+    const flags_arg: if (builtin.os.tag == .linux) usize else c_int = 0;
+    const flags = sys.fcntl(child.listen_fd, posix.F.GETFL, flags_arg);
+    try std.testing.expect(posix.errno(flags) == .SUCCESS);
+    try std.testing.expect(@as(posix.O, @bitCast(@as(u32, @intCast(flags)))).NONBLOCK);
+    try child.spawn();
+    const client = try socketTcp();
+    defer closeFd(client);
+    const address = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, child.port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    try std.testing.expect(posix.errno(sys.connect(client, @ptrCast(&address), @sizeOf(@TypeOf(address)))) == .SUCCESS);
+    const entered_deadline = platform.monotonicMillis() + 2000;
+    while (!child.operation_active.load(.acquire)) {
+        if (platform.monotonicMillis() >= entered_deadline) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    const held_listener = child.listen_fd;
+    child.shutdown();
+    try std.testing.expect(!child.operation_active.load(.acquire));
+    try std.testing.expect(child.thread == null and child.listen_fd == -1);
+    try std.testing.expect(posix.errno(sys.fcntl(held_listener, posix.F.GETFD, flags_arg)) != .SUCCESS);
+    var ready = [_]posix.pollfd{.{ .fd = client, .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect(sys.poll(&ready, 1, 1000) > 0);
+    var buf: [8]u8 = undefined;
+    const read = sys.recvfrom(client, &buf, buf.len, posix.MSG.DONTWAIT, null, null);
+    try std.testing.expect(posix.errno(read) == .SUCCESS and read == 0);
 }

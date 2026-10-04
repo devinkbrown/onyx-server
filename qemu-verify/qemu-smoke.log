@@ -1,0 +1,9 @@
+WARNING: Image format was not specified for 'json:{"fat-type": 0, "dir": "/home/kain/onyx-server/qemu-verify/share", "driver": "vvfat", "floppy": false, "rw": true, "write-target": {"driver": "qcow", "file": {"driver": "file", "filename": "/home/kain/onyx-server/qemu-verify/tmp/vl.B5N0W3"}}}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+WARNING: Image format was not specified for 'json:{"fat-type": 0, "dir": "/home/kain/onyx-server/qemu-verify/share", "driver": "vvfat", "floppy": false, "rw": true, "write-target": {"driver": "qcow", "file": {"driver": "file", "filename": "/home/kain/onyx-server/qemu-verify/tmp/vl.U01UW3"}}}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+WARNING: Image format was not specified for 'json:{"fat-type": 0, "dir": "/home/kain/onyx-server/qemu-verify/share", "driver": "vvfat", "floppy": false, "rw": true, "write-target": {"driver": "qcow", "file": {"driver": "file", "filename": "/home/kain/onyx-server/qemu-verify/tmp/vl.QJ6MW3"}}}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.

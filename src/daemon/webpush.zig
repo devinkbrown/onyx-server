@@ -18,6 +18,7 @@
 //!     Endpoints answering 404/410 land on a dead-list the server drains to
 //!     prune stale subscriptions.
 const std = @import("std");
+const builtin = @import("builtin");
 const dlog = @import("dlog.zig");
 const wp_crypto = @import("../crypto/webpush.zig");
 const ecdsa = @import("../crypto/ecdsa_p256.zig");
@@ -25,10 +26,15 @@ const acme_runner = @import("acme_runner.zig");
 const http1 = @import("../proto/http1_client.zig");
 const platform = @import("../substrate/platform.zig");
 const services_mod = @import("services.zig");
+pub const runtime_pause = @import("runtime_pause.zig");
 
 const Allocator = std.mem.Allocator;
 const net = std.Io.net;
 const b64url = std.base64.url_safe_no_pad;
+
+/// Real HTTPS and hybrid key exchange frames require this source-owned stack
+/// policy. Inventory registration and both spawn paths use this exact value.
+pub const dormant_spawn_options: std.Thread.SpawnConfig = .{ .stack_size = 2 * 1024 * 1024 };
 
 pub const max_subscriptions_per_account: usize = 3;
 /// Length of the base64url-unpadded VAPID public key (65 SEC1 bytes).
@@ -283,8 +289,9 @@ pub const Job = struct {
     payload: []u8,
 
     fn deinit(self: *Job, allocator: Allocator) void {
-        allocator.free(self.endpoint);
-        allocator.free(self.payload);
+        freeEndpoint(allocator, self.endpoint);
+        freeEndpoint(allocator, self.payload);
+        std.crypto.secureZero(u8, &self.auth);
     }
 };
 
@@ -300,8 +307,15 @@ pub const Worker = struct {
     /// Endpoints the push service reported gone (404/410); the server drains
     /// this (under the world lock) and prunes the stored subscriptions.
     dead: std.ArrayListUnmanaged([]u8) = .empty,
+    /// One worker reserves dead-list metadata before taking a job. The reactor
+    /// cannot transfer that backing until the complete delivery has settled.
+    delivery_inflight: bool = false,
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
+    runtime: runtime_pause.WorkerState = .{},
+    producers: runtime_pause.ProducerState = .{},
+    system_resolver: ?*acme_runner.SystemResolver = null,
+    delivery_fixture: if (builtin.is_test) ?*DeliveryFixture else void = if (builtin.is_test) null else {},
 
     /// Delivery stats (worker-thread writes, oper-command reads are racy-read
     /// tolerable: monotonically increasing counters).
@@ -313,20 +327,207 @@ pub const Worker = struct {
     /// Unpublished overflow oper events. Drained by `takeOverflowOperEvent`.
     overflow_events: usize = 0,
 
+    /// Bind the actual supported SystemResolver callback/context before any
+    /// thread escapes. An arbitrary callback is not silently treated as the
+    /// default resolver, and no address/function pointer is serialized.
+    pub fn prepareColdResources(self: *Worker, io: std.Io, resolver: *acme_runner.SystemResolver) !void {
+        if (self.thread != null or self.runtime.view != null or self.system_resolver != null) return error.AlreadyStarted;
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+        const actual = resolver.resolver();
+        if (actual.ctx != self.resolver.ctx or actual.resolveFn != self.resolver.resolveFn) return error.ConfigMismatch;
+        self.system_resolver = resolver;
+        errdefer self.system_resolver = null;
+        _ = try self.configDigest();
+        try self.runtime.pause.bindIo(io);
+    }
+    pub fn validateDormantRegistration(self: *Worker, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime.validateRegistration(control, view, slot, .webpush, 0, self, dormant_spawn_options);
+        if (self.thread != null) return error.AlreadyStarted;
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+    }
+    pub fn prepareDormantWorker(self: *Worker, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.validateDormantRegistration(control, view, slot);
+        try self.runtime.validatePreparation(control, view, slot, .webpush, 0, self, dormant_spawn_options);
+        _ = try self.configDigest();
+        try self.runtime.prepare(control, view, slot, .webpush, 0, Worker, self, run, dormant_spawn_options);
+    }
+    /// Request this source's normal FIFO drain and wake a retained pause. Only
+    /// the runtime's Control owner joins the shared thread handles.
+    pub fn requestStopAndWake(self: *Worker) void {
+        self.stop_flag.store(true, .release);
+        self.runtime.wakeForStop();
+    }
+    pub fn detachAfterJoined(self: *Worker) !void {
+        try self.runtime.detachAfterJoined();
+    }
+    pub fn requireParked(self: *Worker) !void {
+        try self.runtime.requireParked();
+    }
+    pub fn requireActivated(self: *Worker) !void {
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+        try self.runtime.requireActivated();
+    }
+    pub fn fenceProducers(self: *Worker) !runtime_pause.ProducerFence {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.producers.freezeLocked();
+    }
+    pub fn requireProducersFrozen(self: *Worker, fence: runtime_pause.ProducerFence) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        try self.producers.requireLocked(fence);
+    }
+    pub fn resumeProducers(self: *Worker, fence: runtime_pause.ProducerFence) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        try self.producers.resumeLocked(fence);
+    }
+    /// Joined source fact, never a service stop receipt. Pending queue entries,
+    /// dead subscription results and overflow notices keep their original
+    /// custody until the owning runtime actually reconciles them.
+    pub fn requireTerminalSettled(self: *Worker, fence: runtime_pause.ProducerFence) !void {
+        const view = self.runtime.view orelse return error.NotPrepared;
+        try view.requireSlotJoined(self.runtime.slot orelse return error.InvalidSlot);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        try self.producers.requireLocked(fence);
+        if (!self.stop_flag.load(.acquire) or !self.runtime.exited.load(.acquire)) return error.NotQuiescent;
+        if (self.delivery_inflight or self.queue.items.len != 0 or self.dead.items.len != 0 or self.overflow_events != 0)
+            return error.PendingOutput;
+    }
+    pub fn requestPause(self: *Worker, epoch: u64) !runtime_pause.Token {
+        return self.runtime.pause.request(epoch);
+    }
+    pub fn awaitPaused(self: *Worker, token: runtime_pause.Token, deadline: std.Io.Clock.Timestamp) !void {
+        try self.runtime.pause.awaitPaused(token, deadline);
+    }
+    pub fn resumePaused(self: *Worker, token: runtime_pause.Token) !void {
+        try self.runtime.pause.resumePaused(token);
+    }
+    fn requireCaptureCut(self: *Worker, token: ?runtime_pause.Token) !Execution {
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+        if (token) |actual| {
+            if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+            try self.runtime.pause.requirePaused(actual);
+            return .paused;
+        }
+        if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
+        return .unstarted;
+    }
+    pub fn capturePaused(self: *Worker, allocator: Allocator, token: runtime_pause.Token, bounds: SnapshotBounds) !Snapshot {
+        return self.captureCut(allocator, token, null, bounds);
+    }
+    pub fn captureUnstarted(self: *Worker, allocator: Allocator, bounds: SnapshotBounds) !Snapshot {
+        return self.captureCut(allocator, null, null, bounds);
+    }
+    pub fn captureFrozen(self: *Worker, allocator: Allocator, fence: runtime_pause.ProducerFence, token: ?runtime_pause.Token, bounds: SnapshotBounds) !Snapshot {
+        try self.requireProducersFrozen(fence);
+        return self.captureCut(allocator, token, fence, bounds);
+    }
+    fn captureCut(self: *Worker, allocator: Allocator, token: ?runtime_pause.Token, fence: ?runtime_pause.ProducerFence, bounds: SnapshotBounds) !Snapshot {
+        const execution = try self.requireCaptureCut(token);
+        const digest = try self.configDigest();
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (fence) |proof| try self.producers.requireLocked(proof);
+        _ = try self.requireCaptureCut(token);
+        if (self.delivery_inflight) return error.NotQuiescent;
+        try checkSnapshotBounds(self.queue.items, self.dead.items, bounds);
+        const jobs = try allocator.alloc(Job, self.queue.items.len);
+        errdefer allocator.free(jobs);
+        var copied: usize = 0;
+        errdefer for (jobs[0..copied]) |*job| job.deinit(allocator);
+        for (self.queue.items, jobs) |job, *out| {
+            out.* = try clonePushJob(allocator, job);
+            copied += 1;
+        }
+        const dead = try allocator.alloc([]u8, self.dead.items.len);
+        errdefer allocator.free(dead);
+        var dead_copied: usize = 0;
+        errdefer for (dead[0..dead_copied]) |endpoint| freeEndpoint(allocator, endpoint);
+        for (self.dead.items, dead) |endpoint, *out| {
+            out.* = try allocator.dupe(u8, endpoint);
+            dead_copied += 1;
+        }
+        return .{ .allocator = allocator, .jobs = jobs, .dead = dead, .sent = self.sent, .failed = self.failed, .dropped = self.dropped.load(.acquire), .overflow_events = self.overflow_events, .config_digest = digest, .execution = execution };
+    }
+    pub fn restoreSnapshot(self: *Worker, snapshot: *const Snapshot, bounds: SnapshotBounds) !void {
+        // Construction/restore and source teardown require external exclusion
+        // from all producer calls. The mutex also protects the whole clone/swap.
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.thread != null or self.runtime.view != null or self.runtime.pause.request_epoch != 0) return error.AlreadyStarted;
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+        if (self.delivery_inflight) return error.NotQuiescent;
+        try snapshot.validate(self, bounds);
+        var jobs: std.ArrayListUnmanaged(Job) = .empty;
+        errdefer {
+            for (jobs.items) |*job| job.deinit(self.allocator);
+            jobs.deinit(self.allocator);
+        }
+        try jobs.ensureTotalCapacityPrecise(self.allocator, snapshot.jobs.len);
+        for (snapshot.jobs) |job| jobs.appendAssumeCapacity(try clonePushJob(self.allocator, job));
+        var dead: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (dead.items) |endpoint| freeEndpoint(self.allocator, endpoint);
+            dead.deinit(self.allocator);
+        }
+        try dead.ensureTotalCapacityPrecise(self.allocator, snapshot.dead.len);
+        for (snapshot.dead) |endpoint| dead.appendAssumeCapacity(try self.allocator.dupe(u8, endpoint));
+        for (self.queue.items) |*job| job.deinit(self.allocator);
+        self.queue.deinit(self.allocator);
+        for (self.dead.items) |endpoint| freeEndpoint(self.allocator, endpoint);
+        self.dead.deinit(self.allocator);
+        self.queue = jobs;
+        self.dead = dead;
+        self.sent = snapshot.sent;
+        self.failed = snapshot.failed;
+        self.dropped.store(snapshot.dropped, .release);
+        self.overflow_events = snapshot.overflow_events;
+    }
+    pub fn configDigest(self: *const Worker) ![32]u8 {
+        const resolver = self.system_resolver orelse return error.NotPrepared;
+        const actual = resolver.resolver();
+        if (actual.ctx != self.resolver.ctx or actual.resolveFn != self.resolver.resolveFn) return error.ConfigMismatch;
+        const derived = try ecdsa.KeyPair.fromSecretKey(self.vapid.secret_key);
+        const public_key = self.vapid.public_key.toUncompressedSec1();
+        const expected_key = derived.public_key.toUncompressedSec1();
+        if (!std.mem.eql(u8, &public_key, &expected_key)) return error.ConfigMismatch;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("onyx/companion/webpush-config/v1");
+        hash.update(&public_key);
+        try runtime_pause.hashBytes(&hash, self.subject);
+        const count = std.math.cast(u32, self.trust_anchors.len) orelse return error.Capacity;
+        var numbers: [14]u8 = undefined;
+        std.mem.writeInt(u32, numbers[0..4], count, .big);
+        std.mem.writeInt(u64, numbers[4..12], std.math.cast(u64, resolver.resolv_conf_max_bytes) orelse return error.Capacity, .big);
+        std.mem.writeInt(u16, numbers[12..14], resolver.dns_port, .big);
+        hash.update(&numbers);
+        for (self.trust_anchors) |anchor| try runtime_pause.hashBytes(&hash, anchor);
+        return hash.finalResult();
+    }
+
     pub fn spawn(self: *Worker) !void {
+        if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
         // The HTTPS client and hybrid key exchange have nested Debug frames
         // larger than 512 KiB. Reserve enough stack for real push delivery.
-        self.thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, run, .{self});
+        self.thread = try std.Thread.spawn(dormant_spawn_options, run, .{self});
     }
 
     pub fn shutdown(self: *Worker) void {
-        self.stop_flag.store(true, .release);
+        self.runtime.requireDetached() catch @panic("managed webpush worker must join and detach before shutdown");
+        self.requestStopAndWake();
         if (self.thread) |t| t.join();
         self.thread = null;
+        std.debug.assert(!self.delivery_inflight);
         for (self.queue.items) |*j| j.deinit(self.allocator);
         self.queue.deinit(self.allocator);
-        for (self.dead.items) |e| self.allocator.free(e);
+        self.queue = .empty;
+        for (self.dead.items) |e| freeEndpoint(self.allocator, e);
         self.dead.deinit(self.allocator);
+        self.dead = .empty;
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.vapid));
     }
 
     pub const EnqueueResult = enum { queued, dropped, stopped, nomem };
@@ -344,15 +545,15 @@ pub const Worker = struct {
     ) EnqueueResult {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        if (self.stop_flag.load(.acquire)) return .stopped;
+        if (self.producers.frozen or self.stop_flag.load(.acquire)) return .stopped;
         if (self.queue.items.len >= max_queued_jobs) {
-            _ = self.dropped.fetchAdd(1, .monotonic);
+            self.dropped.store(self.dropped.load(.monotonic) +| 1, .monotonic);
             self.overflow_events +|= 1;
             return .dropped;
         }
         const ep = self.allocator.dupe(u8, endpoint) catch return .nomem;
         const pl = self.allocator.dupe(u8, payload) catch {
-            self.allocator.free(ep);
+            freeEndpoint(self.allocator, ep);
             return .nomem;
         };
         self.queue.append(self.allocator, .{
@@ -361,8 +562,8 @@ pub const Worker = struct {
             .auth = auth,
             .payload = pl,
         }) catch {
-            self.allocator.free(ep);
-            self.allocator.free(pl);
+            freeEndpoint(self.allocator, ep);
+            freeEndpoint(self.allocator, pl);
             return .nomem;
         };
         return .queued;
@@ -383,25 +584,78 @@ pub const Worker = struct {
     pub fn drainDead(self: *Worker) []const []u8 {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        if (self.delivery_inflight) return &.{};
         return self.dead.toOwnedSlice(self.allocator) catch &.{};
     }
 
+    /// Retain the original endpoint outcomes until the source consumer has
+    /// reconciled every account. The callback must not reenter this Worker.
+    /// A failed Store write leaves the exact list owned here for idempotent
+    /// retry, including writes whose durable boundary became uncertain.
+    pub fn reconcileDead(self: *Worker, context: anytype, comptime reconcile: fn (@TypeOf(context), []const []const u8) anyerror!void) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.dead.items.len == 0) return;
+        try reconcile(context, self.dead.items);
+        for (self.dead.items) |endpoint| freeEndpoint(self.allocator, endpoint);
+        self.dead.clearRetainingCapacity();
+    }
+
+    /// Consume a notice only after accepted oper-event publication. On
+    /// allocation or admission failure the original count remains retryable.
+    /// The callback must not reenter this Worker.
+    pub fn reconcileOverflow(self: *Worker, context: anytype, comptime publish: fn (@TypeOf(context), []const u8) anyerror!void) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        while (self.overflow_events != 0) {
+            try publish(context, overflow_oper_message);
+            self.overflow_events -= 1;
+        }
+    }
+
+    fn beginDelivery(self: *Worker) Allocator.Error!?Job {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        std.debug.assert(!self.delivery_inflight);
+        if (self.queue.items.len == 0) return null;
+        // Before dequeue or HTTP: failed admission leaves the exact job queued.
+        try self.dead.ensureUnusedCapacity(self.allocator, 1);
+        self.delivery_inflight = true;
+        const job = self.queue.orderedRemove(0);
+        // orderedRemove shifts the remaining jobs; erase the vacated auth copy.
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.queue.allocatedSlice()[self.queue.items.len]));
+        return job;
+    }
+    fn finishDelivery(self: *Worker) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        std.debug.assert(self.delivery_inflight);
+        self.delivery_inflight = false;
+    }
+
     fn run(self: *Worker) void {
+        self.runtime.markEntered();
+        defer self.runtime.markExited();
         while (true) {
-            const maybe_job: ?Job = blk: {
-                lockSpin(&self.mutex);
-                defer self.mutex.unlock();
-                if (self.queue.items.len == 0) break :blk null;
-                break :blk self.queue.orderedRemove(0);
+            self.runtime.pause.boundary();
+            const maybe_job = self.beginDelivery() catch {
+                // No operation was admitted, so a pending pause can settle.
+                // During final stop, remaining jobs retain the existing explicit
+                // shutdown disposal policy instead of spinning forever on OOM.
+                if (self.stop_flag.load(.acquire)) return;
+                sleepMs(200);
+                continue;
             };
             var job = maybe_job orelse {
                 if (self.stop_flag.load(.acquire)) return;
                 sleepMs(200);
                 continue;
             };
+            defer self.finishDelivery();
             defer job.deinit(self.allocator);
+            if (builtin.is_test) if (self.delivery_fixture) |fixture| fixture.beforeDelivery();
             self.deliver(&job) catch |err| {
-                self.failed += 1;
+                self.failed +|= 1;
                 dlog.log("webpush: delivery to {s} failed: {s}\n", .{ job.endpoint, @errorName(err) });
             };
         }
@@ -458,21 +712,27 @@ pub const Worker = struct {
 
         var header_scratch: [64]http1.Header = undefined;
         const resp = try http1.parseResponse(raw, &header_scratch);
-        if (resp.status >= 200 and resp.status < 300) {
-            self.sent += 1;
+        self.recordResponseStatus(job, resp.status);
+    }
+
+    fn recordResponseStatus(self: *Worker, job: *Job, status: u16) void {
+        if (status >= 200 and status < 300) {
+            self.sent +|= 1;
             return;
         }
-        if (resp.status == 404 or resp.status == 410) {
-            // Subscription is gone — surface it for pruning.
+        if (status == 404 or status == 410) {
+            // Transfer the existing endpoint into pre-admitted metadata. An
+            // accepted removal outcome must not require another allocation.
             lockSpin(&self.mutex);
             defer self.mutex.unlock();
-            const ep = self.allocator.dupe(u8, job.endpoint) catch return;
-            self.dead.append(self.allocator, ep) catch self.allocator.free(ep);
-            self.failed += 1;
+            std.debug.assert(self.delivery_inflight and self.dead.items.len < self.dead.capacity);
+            self.dead.appendAssumeCapacity(job.endpoint);
+            job.endpoint = &.{};
+            self.failed +|= 1;
             return;
         }
-        self.failed += 1;
-        dlog.log("webpush: {s} answered {d}\n", .{ job.endpoint, resp.status });
+        self.failed +|= 1;
+        dlog.log("webpush: {s} answered {d}\n", .{ job.endpoint, status });
     }
 };
 
@@ -721,4 +981,685 @@ test "DST GAP-D8 webpush queue overflow increments a metric and emits an oper ev
     try testing.expectEqualStrings(portable_disable_reason, "web push is Linux-only; disabled");
 
     std.debug.print("GAP-D8 branch=full webpush queue increments onyx_webpush_dropped and emits an oper event; subscription rows in props stay; live mail stays off; non-Linux keeps the explicit disable\n", .{});
+}
+
+pub const Execution = enum(u8) { unstarted, paused };
+pub const SnapshotBounds = struct { max_bytes: usize, max_dead_entries: usize };
+pub const Snapshot = struct {
+    allocator: Allocator,
+    jobs: []Job,
+    dead: [][]u8,
+    sent: usize,
+    failed: usize,
+    dropped: usize,
+    overflow_events: usize,
+    config_digest: [32]u8,
+    execution: Execution,
+    pub fn deinit(self: *Snapshot) void {
+        for (self.jobs) |*job| job.deinit(self.allocator);
+        // Preserve the explicit secret wipe through the allocator handoff.
+        if (self.jobs.len != 0) self.allocator.rawFree(std.mem.sliceAsBytes(self.jobs), .fromByteUnits(@alignOf(Job)), @returnAddress());
+        for (self.dead) |endpoint| freeEndpoint(self.allocator, endpoint);
+        self.allocator.free(self.dead);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const Snapshot, worker: *const Worker, bounds: SnapshotBounds) !void {
+        if (!std.mem.eql(u8, &self.config_digest, &try worker.configDigest())) return error.ConfigMismatch;
+        try checkSnapshotBounds(self.jobs, self.dead, bounds);
+    }
+};
+fn checkSnapshotBounds(jobs: []const Job, dead: []const []const u8, bounds: SnapshotBounds) !void {
+    if (jobs.len > max_queued_jobs or dead.len > bounds.max_dead_entries) return error.Capacity;
+    var bytes: usize = @sizeOf(Snapshot);
+    bytes = std.math.add(usize, bytes, std.math.mul(usize, jobs.len, @sizeOf(Job)) catch return error.Capacity) catch return error.Capacity;
+    bytes = std.math.add(usize, bytes, std.math.mul(usize, dead.len, @sizeOf([]u8)) catch return error.Capacity) catch return error.Capacity;
+    for (jobs) |job| {
+        bytes = std.math.add(usize, bytes, job.endpoint.len) catch return error.Capacity;
+        bytes = std.math.add(usize, bytes, job.payload.len) catch return error.Capacity;
+    }
+    for (dead) |endpoint| bytes = std.math.add(usize, bytes, endpoint.len) catch return error.Capacity;
+    if (bytes > bounds.max_bytes) return error.Capacity;
+}
+fn clonePushJob(allocator: Allocator, job: Job) !Job {
+    const endpoint = try allocator.dupe(u8, job.endpoint);
+    errdefer freeEndpoint(allocator, endpoint);
+    const payload = try allocator.dupe(u8, job.payload);
+    return .{ .endpoint = endpoint, .payload = payload, .ua_public = job.ua_public, .auth = job.auth };
+}
+
+fn freeEndpoint(allocator: Allocator, endpoint: []u8) void {
+    std.crypto.secureZero(u8, endpoint);
+    if (endpoint.len != 0) allocator.rawFree(endpoint, .fromByteUnits(1), @returnAddress());
+}
+
+const DeliveryFixture = if (builtin.is_test) struct {
+    entered: std.Io.Event = .unset,
+    proceed: std.Io.Event = .unset,
+    calls: std.atomic.Value(usize) = .init(0),
+    fn beforeDelivery(self: *@This()) void {
+        if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
+        self.entered.set(testing.io);
+        self.proceed.waitUncancelable(testing.io);
+    }
+} else void;
+
+fn retainedTestWorker(allocator: Allocator, resolver: *acme_runner.SystemResolver) !Worker {
+    const secret = try ecdsa.SecretKey.fromBytes(@splat(1));
+    return .{ .allocator = allocator, .vapid = try ecdsa.KeyPair.fromSecretKey(secret), .subject = "mailto:retained@example.invalid", .resolver = resolver.resolver(), .trust_anchors = &.{} };
+}
+fn retainedTestSeed(worker: *Worker) !void {
+    const key = worker.vapid.public_key.toUncompressedSec1();
+    if (worker.enqueue("https://127.0.0.1/first", key, @splat(1), "first-payload") != .queued) return error.OutOfMemory;
+    if (worker.enqueue("https://127.0.0.1/second", key, @splat(2), "second-payload") != .queued) return error.OutOfMemory;
+    for ([_][]const u8{ "https://dead.invalid/one", "https://dead.invalid/two", "https://dead.invalid/three" }) |value| {
+        const owned = try worker.allocator.dupe(u8, value);
+        errdefer freeEndpoint(worker.allocator, owned);
+        try worker.dead.append(worker.allocator, owned);
+    }
+    worker.sent = 31;
+    worker.failed = 17;
+    worker.dropped.store(9, .monotonic);
+    worker.overflow_events = 4;
+}
+const retained_test_bounds: SnapshotBounds = .{ .max_bytes = 65536, .max_dead_entries = 32 };
+
+test "webpush lifecycle: failed output reconciliation retains exact endpoints and unaccepted notices for retry" {
+    const Consumer = struct {
+        refuse: bool = true,
+        dead_calls: usize = 0,
+        notices: usize = 0,
+        fn dead(self: *@This(), endpoints: []const []const u8) anyerror!void {
+            self.dead_calls += 1;
+            try testing.expectEqual(@as(usize, 3), endpoints.len);
+            try testing.expectEqualStrings("https://dead.invalid/three", endpoints[2]);
+            if (self.refuse) return error.DurableBoundaryUncertain;
+        }
+        fn notice(self: *@This(), message: []const u8) anyerror!void {
+            try testing.expectEqualStrings(overflow_oper_message, message);
+            if (self.refuse and self.notices == 1) return error.OutOfMemory;
+            self.notices += 1;
+        }
+    };
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var worker = try retainedTestWorker(testing.allocator, &resolver);
+    defer worker.shutdown();
+    try retainedTestSeed(&worker);
+    const original = worker.dead.items[2].ptr;
+    var consumer: Consumer = .{};
+    try testing.expectError(error.DurableBoundaryUncertain, worker.reconcileDead(&consumer, Consumer.dead));
+    try testing.expectEqual(@as(usize, 3), worker.dead.items.len);
+    try testing.expect(worker.dead.items[2].ptr == original);
+    try testing.expectError(error.OutOfMemory, worker.reconcileOverflow(&consumer, Consumer.notice));
+    try testing.expectEqual(@as(usize, 3), worker.overflow_events);
+    consumer.refuse = false;
+    try worker.reconcileDead(&consumer, Consumer.dead);
+    try worker.reconcileOverflow(&consumer, Consumer.notice);
+    try testing.expectEqual(@as(usize, 2), consumer.dead_calls);
+    try testing.expectEqual(@as(usize, 4), consumer.notices);
+    try testing.expectEqual(@as(usize, 0), worker.dead.items.len);
+    try testing.expectEqual(@as(usize, 0), worker.overflow_events);
+    try testing.expectEqual(@as(usize, 2), worker.queue.items.len);
+    try worker.reconcileDead(&consumer, Consumer.dead);
+    try worker.reconcileOverflow(&consumer, Consumer.notice);
+    try testing.expectEqual(@as(usize, 2), consumer.dead_calls);
+    try testing.expectEqual(@as(usize, 4), consumer.notices);
+}
+
+test "webpush lifecycle: original producer fence rejects enqueue and foreign or resumed snapshot authority" {
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var worker = try retainedTestWorker(testing.allocator, &resolver);
+    defer worker.shutdown();
+    try worker.prepareColdResources(testing.io, &resolver);
+    try retainedTestSeed(&worker);
+    var other = try retainedTestWorker(testing.allocator, &resolver);
+    defer other.shutdown();
+    const foreign = try other.fenceProducers();
+    const fence = try worker.fenceProducers();
+    const key = worker.vapid.public_key.toUncompressedSec1();
+    try testing.expectEqual(Worker.EnqueueResult.stopped, worker.enqueue("https://127.0.0.1/refused", key, @splat(3), "refused"));
+    try testing.expectError(error.InvalidProducerFence, worker.captureFrozen(testing.allocator, foreign, null, retained_test_bounds));
+    var snapshot = try worker.captureFrozen(testing.allocator, fence, null, retained_test_bounds);
+    defer snapshot.deinit();
+    try testing.expectEqual(@as(usize, 2), snapshot.jobs.len);
+    try testing.expectEqual(@as(usize, 3), snapshot.dead.len);
+    try testing.expectEqual(@as(usize, 4), snapshot.overflow_events);
+    try expectRetainedSeed(&worker);
+    try worker.resumeProducers(fence);
+    try testing.expectError(error.ProducersNotFrozen, worker.captureFrozen(testing.allocator, fence, null, retained_test_bounds));
+    const next = try worker.fenceProducers();
+    try testing.expectError(error.InvalidProducerFence, worker.requireProducersFrozen(fence));
+    try worker.requireProducersFrozen(next);
+}
+
+test "webpush lifecycle: joined OOM worker retains queued output and refuses terminal settlement" {
+    var allocator = testing.FailingAllocator.init(testing.allocator, .{});
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var worker = try retainedTestWorker(allocator.allocator(), &resolver);
+    var cleanup_transferred = false;
+    defer if (!cleanup_transferred) worker.shutdown();
+    try worker.prepareColdResources(testing.io, &resolver);
+    const key = worker.vapid.public_key.toUncompressedSec1();
+    try testing.expectEqual(Worker.EnqueueResult.queued, worker.enqueue("https://127.0.0.1/retained", key, @splat(1), "original-payload"));
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .webpush, .instance = 0, .owner_identity = &worker, .options = dormant_spawn_options }};
+    const gate = try runtime_pause.start_gate.create(testing.allocator, testing.io, &specs);
+    cleanup_transferred = true;
+    defer {
+        worker.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        worker.detachAfterJoined() catch unreachable;
+        worker.shutdown();
+        gate.control.destroyJoined();
+    }
+    const slot = try gate.view.slot(.webpush, 0, &worker);
+    try worker.prepareDormantWorker(gate.control, gate.view, slot);
+    try gate.control.awaitAllParked(retainedTestDeadline(5000));
+    const fence = try worker.fenceProducers();
+    try testing.expectError(error.NotJoined, worker.requireTerminalSettled(fence));
+    // beginDelivery must reserve dead-output metadata before consuming a job.
+    // Fail that exact next allocation; stopping must retain the original job.
+    allocator.fail_index = allocator.alloc_index;
+    allocator.resize_fail_index = allocator.resize_index;
+    worker.requestStopAndWake();
+    gate.control.releaseAll();
+    try gate.control.joinParticipant(slot);
+    try testing.expect(allocator.has_induced_failure);
+    try testing.expectError(error.PendingOutput, worker.requireTerminalSettled(fence));
+    try testing.expectEqual(@as(usize, 1), worker.queue.items.len);
+    try testing.expectEqualStrings("original-payload", worker.queue.items[0].payload);
+    try testing.expect(!worker.delivery_inflight);
+    try testing.expectEqual(@as(usize, 0), worker.sent);
+    try testing.expectEqual(@as(usize, 0), worker.failed);
+}
+
+fn expectRetainedSeed(worker: *Worker) !void {
+    try testing.expectEqual(@as(usize, 2), worker.queue.items.len);
+    try testing.expectEqualStrings("https://127.0.0.1/first", worker.queue.items[0].endpoint);
+    try testing.expectEqualStrings("first-payload", worker.queue.items[0].payload);
+    try testing.expectEqualStrings("second-payload", worker.queue.items[1].payload);
+    try testing.expectEqualSlices(u8, &@as([16]u8, @splat(2)), &worker.queue.items[1].auth);
+    try testing.expectEqual(@as(usize, 3), worker.dead.items.len);
+    try testing.expectEqualStrings("https://dead.invalid/three", worker.dead.items[2]);
+    try testing.expectEqual(@as(usize, 31), worker.sent);
+    try testing.expectEqual(@as(usize, 17), worker.failed);
+    try testing.expectEqual(@as(usize, 9), worker.dropped.load(.acquire));
+    try testing.expectEqual(@as(usize, 4), worker.overflow_events);
+}
+fn captureRetainedOom(allocator: Allocator) !void {
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var source = try retainedTestWorker(testing.allocator, &resolver);
+    defer source.shutdown();
+    try source.prepareColdResources(testing.io, &resolver);
+    try retainedTestSeed(&source);
+    const original = source.queue.items[0].endpoint.ptr;
+    var snapshot = source.captureUnstarted(allocator, retained_test_bounds) catch |err| {
+        try expectRetainedSeed(&source);
+        try testing.expect(source.queue.items[0].endpoint.ptr == original);
+        var retry = try source.captureUnstarted(testing.allocator, retained_test_bounds);
+        retry.deinit();
+        return err;
+    };
+    defer snapshot.deinit();
+    try testing.expectEqual(Execution.unstarted, snapshot.execution);
+    try testing.expect(snapshot.jobs[0].endpoint.ptr != original);
+    try expectRetainedSeed(&source);
+    var target = try retainedTestWorker(testing.allocator, &resolver);
+    defer target.shutdown();
+    try target.prepareColdResources(testing.io, &resolver);
+    try target.restoreSnapshot(&snapshot, retained_test_bounds);
+    try expectRetainedSeed(&target);
+    try testing.expect(target.queue.items[0].endpoint.ptr != snapshot.jobs[0].endpoint.ptr);
+    try testing.expect(target.dead.items[2].ptr != snapshot.dead[2].ptr);
+}
+
+test "webpush retained capture owns full FIFO dead events secrets counters and every OOM retry" {
+    try testing.checkAllAllocationFailures(testing.allocator, captureRetainedOom, .{});
+    try captureRetainedOom(testing.allocator);
+}
+
+test "webpush restore every allocation failure preserves target and same-owner retry" {
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var source = try retainedTestWorker(testing.allocator, &resolver);
+    defer source.shutdown();
+    try source.prepareColdResources(testing.io, &resolver);
+    try retainedTestSeed(&source);
+    var snapshot = try source.captureUnstarted(testing.allocator, retained_test_bounds);
+    defer snapshot.deinit();
+    var index: usize = 0;
+    while (index < 100) : (index += 1) {
+        var fail = testing.FailingAllocator.init(testing.allocator, .{});
+        var target = try retainedTestWorker(fail.allocator(), &resolver);
+        defer target.shutdown();
+        try target.prepareColdResources(testing.io, &resolver);
+        const key = target.vapid.public_key.toUncompressedSec1();
+        try testing.expectEqual(Worker.EnqueueResult.queued, target.enqueue("https://old.invalid/kept", key, @splat(7), "OLD-target"));
+        const old_queue = target.queue.items.ptr;
+        const old_endpoint = target.queue.items[0].endpoint.ptr;
+        target.sent = 91;
+        fail.fail_index = fail.alloc_index + index;
+        fail.resize_fail_index = fail.resize_index; // never hide an allocation behind resize
+        if (target.restoreSnapshot(&snapshot, retained_test_bounds)) |_| {
+            try expectRetainedSeed(&target);
+            try testing.expect(index > 0);
+            return;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(@as(usize, 1), target.queue.items.len);
+            try testing.expectEqualStrings("OLD-target", target.queue.items[0].payload);
+            try testing.expect(target.queue.items.ptr == old_queue and target.queue.items[0].endpoint.ptr == old_endpoint);
+            try testing.expectEqual(@as(usize, 91), target.sent);
+            try testing.expectEqual(@as(usize, 0), target.dead.items.len);
+            fail.fail_index = std.math.maxInt(usize);
+            fail.resize_fail_index = std.math.maxInt(usize);
+            try target.restoreSnapshot(&snapshot, retained_test_bounds);
+            try expectRetainedSeed(&target);
+        }
+    }
+    return error.MissingSuccessfulAllocationFrontier;
+}
+
+test "webpush snapshot bounds and configuration mismatches refuse before clone" {
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var source = try retainedTestWorker(testing.allocator, &resolver);
+    defer source.shutdown();
+    try source.prepareColdResources(testing.io, &resolver);
+    try retainedTestSeed(&source);
+    var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.Capacity, source.captureUnstarted(fail.allocator(), .{ .max_bytes = 65536, .max_dead_entries = 2 }));
+    try testing.expectError(error.Capacity, source.captureUnstarted(fail.allocator(), .{ .max_bytes = 1, .max_dead_entries = 32 }));
+    try testing.expectEqual(@as(usize, 0), fail.alloc_index);
+    var snapshot = try source.captureUnstarted(testing.allocator, retained_test_bounds);
+    defer snapshot.deinit();
+    var target = try retainedTestWorker(fail.allocator(), &resolver);
+    defer target.shutdown();
+    try target.prepareColdResources(testing.io, &resolver);
+    target.subject = "mailto:different@example.invalid";
+    try testing.expectError(error.ConfigMismatch, target.restoreSnapshot(&snapshot, retained_test_bounds));
+    target.subject = source.subject;
+    target.trust_anchors = &.{"different DER anchor"};
+    try testing.expectError(error.ConfigMismatch, target.restoreSnapshot(&snapshot, retained_test_bounds));
+    target.trust_anchors = &.{};
+    resolver.dns_port += 1;
+    try testing.expectError(error.ConfigMismatch, target.restoreSnapshot(&snapshot, retained_test_bounds));
+    resolver.dns_port -= 1;
+    resolver.resolv_conf_max_bytes += 1;
+    try testing.expectError(error.ConfigMismatch, target.restoreSnapshot(&snapshot, retained_test_bounds));
+    resolver.resolv_conf_max_bytes -= 1;
+    target.vapid = try ecdsa.KeyPair.fromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(2)));
+    try testing.expectError(error.ConfigMismatch, target.restoreSnapshot(&snapshot, retained_test_bounds));
+    target.vapid.secret_key = source.vapid.secret_key; // inconsistent key pair must also refuse
+    try testing.expectError(error.ConfigMismatch, target.restoreSnapshot(&snapshot, retained_test_bounds));
+    try testing.expectEqual(@as(usize, 0), fail.alloc_index);
+    try expectRetainedSeed(&source);
+}
+
+test "webpush dead response transfers admitted endpoint with no allocation or lost drain" {
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    for ([_]u16{ 404, 410 }) |status| {
+        var fail = testing.FailingAllocator.init(testing.allocator, .{});
+        var worker = try retainedTestWorker(fail.allocator(), &resolver);
+        defer worker.shutdown();
+        const key = worker.vapid.public_key.toUncompressedSec1();
+        try testing.expectEqual(Worker.EnqueueResult.queued, worker.enqueue("https://dead.invalid/exact", key, @splat(3), "secret"));
+        const original = worker.queue.items[0].endpoint.ptr;
+        fail.fail_index = fail.alloc_index;
+        fail.resize_fail_index = fail.resize_index;
+        try testing.expectError(error.OutOfMemory, worker.beginDelivery());
+        try testing.expectEqual(@as(usize, 1), worker.queue.items.len);
+        try testing.expect(worker.queue.items[0].endpoint.ptr == original);
+        try testing.expect(!worker.delivery_inflight);
+        fail.fail_index = std.math.maxInt(usize);
+        fail.resize_fail_index = std.math.maxInt(usize);
+        var job = (try worker.beginDelivery()).?;
+        defer {
+            job.deinit(worker.allocator);
+            worker.finishDelivery();
+        }
+        const before_allocations = fail.alloc_index;
+        const before_resizes = fail.resize_index;
+        fail.fail_index = before_allocations;
+        fail.resize_fail_index = before_resizes;
+        try testing.expectEqual(@as(usize, 0), worker.drainDead().len);
+        worker.recordResponseStatus(&job, status);
+        try testing.expectEqual(@as(usize, 0), job.endpoint.len);
+        try testing.expectEqual(@as(usize, 1), worker.dead.items.len);
+        try testing.expect(worker.dead.items[0].ptr == original);
+        try testing.expectEqualStrings("https://dead.invalid/exact", worker.dead.items[0]);
+        try testing.expectEqual(@as(usize, 1), worker.failed);
+        try testing.expectEqual(before_allocations, fail.alloc_index);
+        try testing.expectEqual(before_resizes, fail.resize_index);
+    }
+}
+
+fn retainedTestDeadline(ms: i64) std.Io.Clock.Timestamp {
+    return std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(ms) });
+}
+
+test "webpush actual Gate worker pauses after one settled delivery and retains exact remaining FIFO" {
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var worker = try retainedTestWorker(testing.allocator, &resolver);
+    var cleanup_transferred = false;
+    defer if (!cleanup_transferred) worker.shutdown();
+    try worker.prepareColdResources(testing.io, &resolver);
+    var fixture: DeliveryFixture = .{};
+    worker.delivery_fixture = &fixture;
+    const key = worker.vapid.public_key.toUncompressedSec1();
+    try testing.expectEqual(Worker.EnqueueResult.queued, worker.enqueue("https://127.0.0.1/first", key, @splat(1), "first"));
+    try testing.expectEqual(Worker.EnqueueResult.queued, worker.enqueue("https://127.0.0.1/second", key, @splat(2), "second"));
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .webpush, .instance = 0, .owner_identity = &worker, .options = dormant_spawn_options }};
+    const gate = try runtime_pause.start_gate.create(testing.allocator, testing.io, &specs);
+    cleanup_transferred = true;
+    defer {
+        fixture.proceed.set(testing.io);
+        worker.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        worker.detachAfterJoined() catch unreachable;
+        worker.shutdown();
+        gate.control.destroyJoined();
+    }
+    const slot = try gate.view.slot(.webpush, 0, &worker);
+    try worker.prepareDormantWorker(gate.control, gate.view, slot);
+    try gate.control.awaitAllParked(retainedTestDeadline(5000));
+    try worker.requireParked();
+    try testing.expectEqual(@as(usize, 0), fixture.calls.load(.acquire));
+    try testing.expectError(error.NotPrepared, worker.requireActivated());
+    try testing.expectError(error.NotQuiescent, worker.captureUnstarted(testing.allocator, retained_test_bounds));
+    gate.control.releaseAll();
+    try fixture.entered.waitTimeout(testing.io, .{ .deadline = retainedTestDeadline(5000) });
+    try worker.requireActivated();
+    const token = try worker.requestPause(1);
+    try testing.expectError(error.Timeout, worker.awaitPaused(token, retainedTestDeadline(0)));
+    try testing.expectError(error.NotPaused, worker.capturePaused(testing.allocator, token, retained_test_bounds));
+    fixture.proceed.set(testing.io);
+    try worker.awaitPaused(token, retainedTestDeadline(5000));
+    var snapshot = try worker.capturePaused(testing.allocator, token, retained_test_bounds);
+    defer snapshot.deinit();
+    try testing.expectEqual(Execution.paused, snapshot.execution);
+    try testing.expectEqual(@as(usize, 1), snapshot.failed); // actual crypto + guarded resolver refusal, no socket connect
+    try testing.expectEqual(@as(usize, 1), snapshot.jobs.len);
+    try testing.expectEqualStrings("https://127.0.0.1/second", snapshot.jobs[0].endpoint);
+    try testing.expectEqualStrings("second", snapshot.jobs[0].payload);
+    try testing.expectEqual(@as(usize, 1), gate.view.inspect().spawned);
+    try worker.resumePaused(token);
+    worker.requestStopAndWake(); // same worker drains the second accepted job
+    gate.control.joinAll();
+    try worker.detachAfterJoined();
+    worker.shutdown();
+    try testing.expectEqual(@as(usize, 2), worker.failed);
+    try testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), gate.view.inspect().joined);
+    try testing.expectEqual(@as(usize, 1), snapshot.jobs.len); // independently owned after source shutdown
+    try testing.expectError(error.Stopped, worker.captureUnstarted(testing.allocator, retained_test_bounds));
+}
+
+test "webpush snapshot and stopped owner wipe secret copies in retained allocator storage" {
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var source = try retainedTestWorker(testing.allocator, &resolver);
+    defer source.shutdown();
+    try source.prepareColdResources(testing.io, &resolver);
+    try retainedTestSeed(&source);
+    var bytes: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&bytes);
+    var snapshot = try source.captureUnstarted(fba.allocator(), retained_test_bounds);
+    const endpoint = snapshot.jobs[0].endpoint;
+    const payload = snapshot.jobs[0].payload;
+    const auth = &snapshot.jobs[0].auth;
+    const dead = snapshot.dead[0];
+    snapshot.deinit();
+    for (endpoint) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (payload) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (auth) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (dead) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    source.shutdown();
+    for (std.mem.asBytes(&source.vapid)) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    try testing.expectError(error.Stopped, source.spawn());
+}
+
+test "webpush configured resolver rejects foreign identity before binding and retries exact owner" {
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var other: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var worker = try retainedTestWorker(testing.allocator, &resolver);
+    defer worker.shutdown();
+    const expected = resolver.resolver();
+    worker.resolver = other.resolver();
+    try testing.expectError(error.ConfigMismatch, worker.prepareColdResources(testing.io, &resolver));
+    try testing.expect(worker.system_resolver == null and worker.runtime.pause.io == null);
+    const Foreign = struct {
+        fn resolve(_: *anyopaque, _: []const u8, _: u16) anyerror!net.IpAddress {
+            return error.TestUnexpectedResolution;
+        }
+    };
+    worker.resolver = .{ .ctx = expected.ctx, .resolveFn = Foreign.resolve };
+    try testing.expectError(error.ConfigMismatch, worker.prepareColdResources(testing.io, &resolver));
+    try testing.expect(worker.system_resolver == null and worker.runtime.pause.io == null);
+    worker.resolver = expected;
+    try worker.prepareColdResources(testing.io, &resolver);
+    try testing.expect(worker.system_resolver.? == &resolver);
+    try testing.expectError(error.AlreadyStarted, worker.prepareColdResources(testing.io, &resolver));
+}
+
+test "webpush dormant cancellation joins without entering delivery or consuming accepted state" {
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var worker = try retainedTestWorker(testing.allocator, &resolver);
+    var cleanup_transferred = false;
+    defer if (!cleanup_transferred) worker.shutdown();
+    try worker.prepareColdResources(testing.io, &resolver);
+    try retainedTestSeed(&worker);
+    var fixture: DeliveryFixture = .{};
+    worker.delivery_fixture = &fixture;
+    const old_endpoint = worker.queue.items[0].endpoint.ptr;
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .webpush, .instance = 0, .owner_identity = &worker, .options = dormant_spawn_options }};
+    const gate = try runtime_pause.start_gate.create(testing.allocator, testing.io, &specs);
+    cleanup_transferred = true;
+    defer {
+        fixture.proceed.set(testing.io);
+        worker.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        worker.detachAfterJoined() catch unreachable;
+        worker.shutdown();
+        gate.control.destroyJoined();
+    }
+    try worker.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.webpush, 0, &worker));
+    try gate.control.awaitAllParked(retainedTestDeadline(5000));
+    try worker.requireParked();
+    gate.control.cancelAllAndJoin();
+    try testing.expectEqual(@as(usize, 0), fixture.calls.load(.acquire));
+    try testing.expect(!worker.runtime.entered.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), gate.view.inspect().joined);
+    try expectRetainedSeed(&worker);
+    try testing.expect(worker.queue.items[0].endpoint.ptr == old_endpoint);
+    try testing.expectError(error.NotPrepared, worker.requireActivated());
+    try testing.expectError(error.SharedGateOwned, worker.runtime.requireDetached());
+    try worker.detachAfterJoined();
+    worker.shutdown();
+    try testing.expectEqual(@as(usize, 1), gate.view.inspect().joined);
+}
+
+fn loadExistingRetainedOom(allocator: Allocator, dir: std.Io.Dir) !void {
+    var value = try Vapid.loadExisting(testing.io, allocator, dir, "retained.key");
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&value));
+    const expected = try ecdsa.KeyPair.fromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(1)));
+    try testing.expectEqualSlices(u8, &expected.public_key.toUncompressedSec1(), &value.key_pair.public_key.toUncompressedSec1());
+}
+
+test "webpush inherited VAPID identity is read only and every allocation failure permits exact retry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testing.expectError(error.FileNotFound, Vapid.loadExisting(testing.io, testing.allocator, tmp.dir, "retained.key"));
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, "retained.key", .{}));
+    const encoded = "0101010101010101010101010101010101010101010101010101010101010101\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "retained.key", .data = encoded });
+    try testing.checkAllAllocationFailures(testing.allocator, loadExistingRetainedOom, .{tmp.dir});
+    try loadExistingRetainedOom(testing.allocator, tmp.dir);
+    const after = try tmp.dir.readFileAlloc(testing.io, "retained.key", testing.allocator, .limited(256));
+    defer freeEndpoint(testing.allocator, after);
+    try testing.expectEqualStrings(encoded, after);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "retained.key", .data = "invalid" });
+    try testing.expectError(error.InvalidVapidKey, Vapid.loadExisting(testing.io, testing.allocator, tmp.dir, "retained.key"));
+    const invalid = try tmp.dir.readFileAlloc(testing.io, "retained.key", testing.allocator, .limited(256));
+    defer freeEndpoint(testing.allocator, invalid);
+    try testing.expectEqualStrings("invalid", invalid);
+}
+
+test "webpush dormant registration demands source stack and allocator before retaining any row" {
+    const start = runtime_pause.start_gate;
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var worker = try retainedTestWorker(testing.allocator, &resolver);
+    defer worker.shutdown();
+    try worker.prepareColdResources(testing.io, &resolver);
+    try retainedTestSeed(&worker);
+    const endpoint = worker.queue.items[0].endpoint.ptr;
+    var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const wrong_options = [_]std.Thread.SpawnConfig{
+        .{},
+        .{ .stack_size = 4 * 1024 * 1024 },
+        .{ .stack_size = dormant_spawn_options.stack_size, .allocator = fail.allocator() },
+    };
+    for (wrong_options) |options| {
+        const specs = [_]start.ParticipantSpec{.{ .kind = .webpush, .instance = 0, .owner_identity = &worker, .options = options }};
+        const gate = try start.create(testing.allocator, testing.io, &specs);
+        defer {
+            gate.control.cancelAllAndJoin();
+            worker.detachAfterJoined() catch unreachable;
+            gate.control.destroyJoined();
+        }
+        const slot = try gate.view.slot(.webpush, 0, &worker);
+        try testing.expectError(error.InvalidOptions, worker.validateDormantRegistration(gate.control, gate.view, slot));
+        try testing.expectError(error.InvalidOptions, worker.prepareDormantWorker(gate.control, gate.view, slot));
+        try testing.expectEqual(@as(usize, 0), gate.view.inspect().spawned);
+        try testing.expect(worker.runtime.view == null and worker.runtime.slot == null);
+        try testing.expect(!worker.stop_flag.load(.acquire));
+        try testing.expect(!worker.runtime.entered.load(.acquire));
+        try expectRetainedSeed(&worker);
+        try testing.expect(worker.queue.items[0].endpoint.ptr == endpoint);
+    }
+    try testing.expectEqual(@as(usize, 0), fail.alloc_index);
+}
+
+test "webpush registration rejects foreign control slot and owner without changing source custody" {
+    const start = runtime_pause.start_gate;
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var worker = try retainedTestWorker(testing.allocator, &resolver);
+    defer worker.shutdown();
+    var other = try retainedTestWorker(testing.allocator, &resolver);
+    defer other.shutdown();
+    const specs = [_]start.ParticipantSpec{.{ .kind = .webpush, .instance = 0, .owner_identity = &worker, .options = dormant_spawn_options }};
+    const foreign_specs = [_]start.ParticipantSpec{.{ .kind = .webpush, .instance = 0, .owner_identity = &other, .options = dormant_spawn_options }};
+    const gate = try start.create(testing.allocator, testing.io, &specs);
+    defer {
+        worker.requestStopAndWake();
+        gate.control.cancelAllAndJoin();
+        worker.detachAfterJoined() catch unreachable;
+        gate.control.destroyJoined();
+    }
+    const foreign = try start.create(testing.allocator, testing.io, &foreign_specs);
+    defer {
+        foreign.control.cancelAllAndJoin();
+        foreign.control.destroyJoined();
+    }
+    const slot = try gate.view.slot(.webpush, 0, &worker);
+    const other_slot = try foreign.view.slot(.webpush, 0, &other);
+    try worker.validateDormantRegistration(gate.control, gate.view, slot);
+    try testing.expectError(error.NotPrepared, worker.prepareDormantWorker(gate.control, gate.view, slot));
+    try worker.prepareColdResources(testing.io, &resolver);
+    try retainedTestSeed(&worker);
+    const endpoint = worker.queue.items[0].endpoint.ptr;
+    try testing.expectError(error.InvalidGate, worker.prepareDormantWorker(foreign.control, gate.view, slot));
+    try testing.expectError(error.InvalidSlot, worker.prepareDormantWorker(gate.control, gate.view, other_slot));
+    try testing.expectError(error.InvalidSlot, worker.prepareDormantWorker(foreign.control, foreign.view, other_slot));
+    try testing.expect(worker.runtime.view == null and worker.runtime.slot == null);
+    try testing.expect(!worker.stop_flag.load(.acquire));
+    try expectRetainedSeed(&worker);
+    try testing.expect(worker.queue.items[0].endpoint.ptr == endpoint);
+    try testing.expectEqual(@as(usize, 0), gate.view.inspect().spawned);
+    try testing.expectEqual(@as(usize, 0), foreign.view.inspect().spawned);
+    try worker.prepareDormantWorker(gate.control, gate.view, slot);
+    try gate.control.awaitAllParked(retainedTestDeadline(5000));
+    try testing.expect(worker.runtime.view.? == gate.view);
+    try testing.expectError(error.NotJoined, worker.detachAfterJoined());
+    try testing.expectError(error.SharedGateOwned, worker.runtime.requireDetached());
+    try testing.expectEqual(@as(usize, 0), gate.view.inspect().joined);
+    try testing.expectEqual(start.Phase.preparing, gate.view.inspect().phase);
+    gate.control.cancelAllAndJoin();
+    try worker.detachAfterJoined();
+    try worker.runtime.requireDetached();
+    try expectRetainedSeed(&worker);
+}
+
+test "webpush failed managed spawn retains its row until coordinator cancellation and detach" {
+    const start = runtime_pause.start_gate;
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var worker = try retainedTestWorker(testing.allocator, &resolver);
+    defer worker.shutdown();
+    try worker.prepareColdResources(testing.io, &resolver);
+    try retainedTestSeed(&worker);
+    const endpoint = worker.queue.items[0].endpoint.ptr;
+    const specs = [_]start.ParticipantSpec{.{ .kind = .webpush, .instance = 0, .owner_identity = &worker, .options = dormant_spawn_options }};
+    const gate = try start.create(testing.allocator, testing.io, &specs);
+    defer {
+        worker.requestStopAndWake();
+        gate.control.cancelAllAndJoin();
+        worker.detachAfterJoined() catch unreachable;
+        gate.control.destroyJoined();
+    }
+    start.Fixture.failSpawn(gate.control, 0);
+    const slot = try gate.view.slot(.webpush, 0, &worker);
+    try testing.expectError(error.SystemResources, worker.prepareDormantWorker(gate.control, gate.view, slot));
+    try testing.expect(worker.runtime.view.? == gate.view);
+    try testing.expectEqual(@as(usize, 0), gate.view.inspect().spawned);
+    try testing.expectError(error.NotJoined, worker.detachAfterJoined());
+    try testing.expectError(error.SharedGateOwned, worker.runtime.requireDetached());
+    try expectRetainedSeed(&worker);
+    try testing.expect(worker.queue.items[0].endpoint.ptr == endpoint);
+    gate.control.cancelAllAndJoin();
+    try testing.expectError(error.SharedGateOwned, worker.runtime.requireDetached());
+    try worker.detachAfterJoined();
+    try worker.runtime.requireDetached();
+    try testing.expect(!worker.runtime.entered.load(.acquire));
+    try expectRetainedSeed(&worker);
+}
+
+test "webpush retained paused worker drains accepted FIFO on source stop before external join" {
+    const start = runtime_pause.start_gate;
+    var resolver: acme_runner.SystemResolver = .{ .allocator = testing.allocator, .io = testing.io };
+    var worker = try retainedTestWorker(testing.allocator, &resolver);
+    defer worker.shutdown();
+    try worker.prepareColdResources(testing.io, &resolver);
+    const specs = [_]start.ParticipantSpec{.{ .kind = .webpush, .instance = 0, .owner_identity = &worker, .options = dormant_spawn_options }};
+    const gate = try start.create(testing.allocator, testing.io, &specs);
+    defer {
+        worker.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        worker.detachAfterJoined() catch unreachable;
+        gate.control.destroyJoined();
+    }
+    const token = try worker.requestPause(1);
+    try worker.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.webpush, 0, &worker));
+    try gate.control.awaitAllParked(retainedTestDeadline(5000));
+    gate.control.releaseAll();
+    try worker.awaitPaused(token, retainedTestDeadline(5000));
+    try worker.requireActivated();
+    const key = worker.vapid.public_key.toUncompressedSec1();
+    try testing.expectEqual(Worker.EnqueueResult.queued, worker.enqueue("invalid-first", key, @splat(1), "first"));
+    try testing.expectEqual(Worker.EnqueueResult.queued, worker.enqueue("invalid-second", key, @splat(2), "second"));
+    var snapshot = try worker.capturePaused(testing.allocator, token, retained_test_bounds);
+    defer snapshot.deinit();
+    try testing.expectEqual(@as(usize, 2), snapshot.jobs.len);
+    try testing.expectEqualStrings("invalid-first", snapshot.jobs[0].endpoint);
+    try testing.expectEqualStrings("invalid-second", snapshot.jobs[1].endpoint);
+    worker.requestStopAndWake();
+    try testing.expectError(error.Stopped, worker.requireActivated());
+    try testing.expectEqual(Worker.EnqueueResult.stopped, worker.enqueue("refused", key, @splat(3), "third"));
+    try testing.expectEqual(@as(usize, 0), gate.view.inspect().joined);
+    try testing.expectError(error.NotJoined, worker.detachAfterJoined());
+    gate.control.joinAll();
+    try testing.expectEqual(@as(usize, 2), worker.failed); // actual URL refusal; no network dependency
+    try testing.expectEqual(@as(usize, 0), worker.queue.items.len);
+    try testing.expect(!worker.delivery_inflight);
+    try testing.expect(worker.runtime.exited.load(.acquire));
+    try testing.expectError(error.SharedGateOwned, worker.runtime.requireDetached());
+    try worker.detachAfterJoined();
+    worker.shutdown();
+    try testing.expectEqual(@as(usize, 1), gate.view.inspect().spawned);
+    try testing.expectEqual(@as(usize, 1), gate.view.inspect().joined);
+    try testing.expectEqual(@as(usize, 2), snapshot.jobs.len);
 }

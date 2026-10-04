@@ -71,6 +71,23 @@ deliveries. Final full Linux Debug/ReleaseSafe each pass 8845/8869 with 24 skips
 named gates each pass 2354/2365 with 11 skips. Far-only unbound nickname routing
 remains a separate gap.
 No deployment or push was performed.
+The next [ordinary presence and direct-delivery slice](audit/mesh-presence-2026-10-01.md)
+has confirmed two one-hop boundaries with independent unbound guest fixtures.
+Its unused signed original/frontier codecs, strict authenticated retained image,
+leased atomic four-row authority, durable expiry floor and compound local lifecycle
+now include exact-head hot staging and typed inherited lease custody.
+Combined Linux Debug/ReleaseSafe pass 182/182 each; native OpenBSD7.9 ReleaseSafe
+passes 180/182 (two Linux-only skips). Native typed descriptor tests pass 86/86,
+including actual SCM_RIGHTS custody and pre-READY refusal. Fresh independent
+review covers this groundwork; actual Astra review covers the preceding compound cut.
+Every remote-negative and compound-QUIT append prefix, modeled snapshot faults,
+allocation failures and Linux serialized-WAL SIGKILL boundaries have bounded
+recovery evidence. These leaves are not live consumers. Mandatory capsule and
+lease sender/adoption integration, transactional World/physical mapping,
+authenticated paths/original repair,
+ordinary guest DM custody, capacity/performance and far three-node native acceptance
+remain open; the two original production causal regressions remain RED. The [sampled foundational frontier](audit/gap-frontier-2026-10-01.md)
+orders remaining cold custody, durable publication, directory and product gates.
 
 **Audience:** the person deciding what the daemon builds next.
 **Baseline source audit:** the tree at `99974787`, whose Zig sources are byte-identical

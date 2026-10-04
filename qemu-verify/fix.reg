@@ -1,0 +1,4 @@
+Windows Registry Editor Version 5.00
+
+[Microsoft\Windows NT\CurrentVersion]
+"SystemRoot"="X:\\windows"

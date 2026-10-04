@@ -147,6 +147,19 @@ pub fn recordContentLimit12(peer_record_size_limit: usize) usize {
 /// the largest is 2^14+1 (TLSInnerPlaintext including the content-type byte).
 pub const record_size_limit_min: u16 = 64;
 pub const record_size_limit_max: u16 = max_plaintext_len + 1;
+pub const record_size_limit_max12: u16 = max_plaintext_len;
+
+/// Whole protected TLS 1.3 batch sizing and nonce preflight. The caller seals
+/// with a local sequence and publishes it only after complete wire custody.
+pub fn protectedBatchLayout(content_len: usize, peer_limit: usize, tag_len: usize, first_seq: u64) Error!struct { wire_len: usize, records: usize, next_seq: u64 } {
+    const limit = recordContentLimit(peer_limit);
+    const records = @max(1, content_len / limit + @intFromBool(content_len % limit != 0));
+    const count = std.math.cast(u64, records) orelse return error.SequenceExhausted;
+    if (first_seq > std.math.maxInt(u64) - count) return error.SequenceExhausted;
+    const overhead = std.math.mul(usize, records, record_header_len + 1 + tag_len) catch return error.RecordOverflow;
+    const wire_len = std.math.add(usize, content_len, overhead) catch return error.RecordOverflow;
+    return .{ .wire_len = wire_len, .records = records, .next_seq = first_seq + count };
+}
 
 /// RFC 8446 §5 / Appendix D.4: in "middlebox compatibility mode" a TLS 1.3 peer
 /// may interleave *unencrypted* change_cipher_spec records into the handshake,
@@ -171,6 +184,7 @@ pub fn isLegalCompatCcs(fragment: []const u8) bool {
 
 pub const Error = aead.Error || error{
     BadRecordHeader,
+    InvalidRecordSizeLimit,
     InvalidContentType,
     InvalidInnerPlaintext,
     OutputTooSmall,
@@ -251,8 +265,9 @@ pub fn encodeInnerPlaintext(
 ) Error![]u8 {
     if (!isInnerContentType(content_type)) return error.InvalidContentType;
     if (plaintext.len > max_plaintext_len) return error.PlaintextTooLong;
-    const inner_len = plaintext.len + 1 + padding_len;
-    if (inner_len > max_ciphertext_len) return error.RecordOverflow;
+    const content_len = std.math.add(usize, plaintext.len, 1) catch return error.RecordOverflow;
+    const inner_len = std.math.add(usize, content_len, padding_len) catch return error.RecordOverflow;
+    if (inner_len > record_size_limit_max) return error.RecordOverflow;
     if (out.len < inner_len) return error.OutputTooSmall;
 
     @memcpy(out[0..plaintext.len], plaintext);
@@ -264,6 +279,7 @@ pub fn encodeInnerPlaintext(
 /// Strip TLS 1.3 zero padding with a full-length scan.
 pub fn decodeInnerPlaintext(inner: []u8) Error!OpenedPlaintext {
     if (inner.len == 0) return error.InvalidInnerPlaintext;
+    if (inner.len > record_size_limit_max) return error.RecordOverflow;
 
     var found: u8 = 0;
     var type_index: usize = 0;
@@ -381,7 +397,8 @@ test "seal/open round-trip" {
     const iv = hex("000102030405060708090a0b");
     const plaintext = "onyx tls record payload";
     const padding_len = 5;
-    const inner_len = plaintext.len + 1 + padding_len;
+    const content_len = std.math.add(usize, plaintext.len, 1) catch return error.RecordOverflow;
+    const inner_len = std.math.add(usize, content_len, padding_len) catch return error.RecordOverflow;
 
     const inner = try allocator.alloc(u8, inner_len);
     defer allocator.free(inner);
@@ -750,7 +767,7 @@ test "exploit: an inner plaintext whose content exceeds 2^14 is rejected after d
     defer allocator.free(inner);
     @memset(inner, 'B');
     inner[inner.len - 1] = @intFromEnum(ContentType.application_data);
-    try testing.expectError(error.PlaintextTooLong, decodeInnerPlaintext(inner));
+    try testing.expectError(error.RecordOverflow, decodeInnerPlaintext(inner));
 }
 
 test "exploit: peer-advertised record_size_limit can never widen our records" {
@@ -770,4 +787,29 @@ test "exploit: peer-advertised record_size_limit can never widen our records" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+/// Fatal software alert bytes; transport callers own generation and draining.
+pub fn fatalAlertBytes(failure: anyerror) ?[2]u8 {
+    const description: u8 = switch (failure) {
+        error.OutOfMemory, error.BadState, error.NeedMore, error.TlsAlert => return null,
+        error.RecordAuthenticationFailed, error.AeadAuthFailed => 20,
+        error.RecordOverflow, error.CiphertextTooLong => 22,
+        error.InvalidRecordSizeLimit => 47,
+        error.FinishedMismatch => 51,
+        error.ProtocolVersion => 70,
+        error.BadHandshake, error.BadRecord, error.BadRecordHeader => 50,
+        else => 40,
+    };
+    return .{ 2, description };
+}
+
+test "TLS record limit: full inner global maximum includes padding and overflow-safe sizing" {
+    var inner: [record_size_limit_max + 1]u8 = @splat(0);
+    inner[0] = @intFromEnum(ContentType.application_data);
+    const exact = try decodeInnerPlaintext(inner[0..record_size_limit_max]);
+    try std.testing.expectEqual(@as(usize, 0), exact.content.len);
+    try std.testing.expectEqual(@as(usize, record_size_limit_max - 1), exact.padding_len);
+    try std.testing.expectError(error.RecordOverflow, decodeInnerPlaintext(&inner));
+    try std.testing.expectError(error.RecordOverflow, encodeInnerPlaintext(.application_data, "x", std.math.maxInt(usize), &inner));
 }

@@ -145,7 +145,12 @@ retains 40 mixed IPv4/IPv6 plain/TLS 1.2/TLS 1.3/WSS sockets after a rejected
 candidate and two successful upgrades. See [the port record](../dev/openbsd-full-port.md)
 for artifacts, native unit coverage and remaining shared mesh limitations.
 
-## Next bounded gap
+## Historical next bounded gap
+
+The paragraph below records the frontier on2026-09-30. Later shared-session
+MARKREAD relay and Helix evidence supersedes its local-only statement;
+independent directory authority and current combined acceptance remain open.
+See the [full-record review](full-record-review-2026-10-02.md).
 
 GAP-P16 read markers remain local-store state. A second attachment reading the
 same store does not prove migration between distinct nodes. Authenticated

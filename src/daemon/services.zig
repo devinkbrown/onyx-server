@@ -31,6 +31,8 @@ const rwlock = @import("../substrate/rwlock.zig");
 const svc_enforce = @import("svc_enforce.zig");
 const svc_acclist = @import("svc_acclist.zig");
 const svc_chanbadwords = @import("svc_chanbadwords.zig");
+const webpush_mod = @import("webpush.zig");
+const delivery_authority = @import("delivery_authority.zig");
 
 /// Private post-copy test hook. Production callers pass null; tests use it to
 /// deterministically merge a successor between detached crypto and the exact
@@ -488,6 +490,10 @@ const AkickRecord = struct {
 
 pub const Services = struct {
     store: *OroStore,
+    /// Set only by the closed StateContext factory. That factory retains this
+    /// entire Services object privately; no bound Services/Store pointer leaves
+    /// its opaque named-dispatch loan. Core installation remains separate.
+    bound_state_context: ?*delivery_authority.StateContext = null,
     state: ?StateHook = null,
     cfg: Config = .{},
     /// Optional SCRAM-SHA-256 credential mirror. When set, account registration
@@ -525,6 +531,14 @@ pub const Services = struct {
 
     pub fn initWithConfig(store: *OroStore, state: ?StateHook, cfg: Config) Services {
         return .{ .store = store, .state = state, .cfg = cfg };
+    }
+
+    /// Compatibility for legacy source helpers only. Bound owners must use
+    /// named operations under their original lock; they cannot acquire the
+    /// leased Store through this accessor.
+    pub fn legacyStore(self: *Services) error{BoundStateRequiresTransaction}!*OroStore {
+        if (self.bound_state_context != null) return error.BoundStateRequiresTransaction;
+        return self.store;
     }
 
     /// An ambiguous durable write requires a cold reopen before any new
@@ -2627,6 +2641,7 @@ pub const Services = struct {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
+        if (self.bound_state_context != null and self.store.preparedWritesPoisoned()) return error.StorePoisoned;
         const key = try accountKey(name);
         if (self.accountForbiddenUnlocked(key.asSlice())) return error.Forbidden;
         if (self.store.family(.accounts).get(key.asSlice()) != null) return error.AlreadyExists;
@@ -2646,7 +2661,16 @@ pub const Services = struct {
             .email_verified = email_verified and email != null,
         };
         const encoded = try encodeAccount(record, scratch);
-        try self.store.family(.accounts).put(key.asSlice(), encoded);
+        if (self.bound_state_context != null) {
+            // The closed StateContext factory attaches no mutable credential
+            // mirror. Stage every Store allocation before durable admission;
+            // ambiguous IO keeps the original source poisoned for cold recovery.
+            var prepared = try self.store.prepareBatch(&.{
+                .{ .family = .accounts, .kind = .put, .key = key.asSlice(), .value = encoded },
+            });
+            defer prepared.abort();
+            try prepared.commit();
+        } else try self.store.family(.accounts).put(key.asSlice(), encoded);
 
         // Mirror the credential into the SCRAM store, if attached, so a
         // SCRAM-SHA-256 exchange can later verify this account. The canonical
@@ -3721,6 +3745,20 @@ pub const Services = struct {
         return allocator.dupe(u8, blob) catch null;
     }
 
+    /// Exact stored blob copy. Missing state alone returns null; source poison,
+    /// invalid names and allocator failure remain explicit. Decode remains the
+    /// typed consumer's obligation and malformed data is never called absent.
+    pub fn webpushGetAllocStrict(self: *Services, allocator: std.mem.Allocator, account: []const u8) (ServiceError || std.mem.Allocator.Error)!?[]u8 {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        if (self.store.preparedWritesPoisoned()) return error.StorePoisoned;
+        const canonical = try accountKey(account);
+        var kb: [webpush_key_max]u8 = undefined;
+        const k = webpushKey(&kb, canonical.asSlice()) orelse return error.InvalidName;
+        const blob = self.store.family(.props).get(k) orelse return null;
+        return try allocator.dupe(u8, blob);
+    }
+
     /// Replace the account's subscription blob; empty blob deletes the record.
     pub fn webpushPut(self: *Services, account: []const u8, blob: []const u8) ServiceError!void {
         if (blob.len > webpush_value_max) return;
@@ -3733,6 +3771,150 @@ pub const Services = struct {
         } else {
             try self.store.family(.props).put(k, blob);
         }
+    }
+
+    /// Closed shared-context dispatch cannot turn invalid/oversized input into
+    /// an accepted no-op. The actual source lock and fixed webpush namespace
+    /// protect the original Store; these keys cannot address authority rows.
+    /// All fallible staging precedes synced no-fail RAM publication. Ambiguous
+    /// IO retains prior live state and poisons this exact Store until cold open.
+    pub fn webpushPutStrict(self: *Services, account: []const u8, blob: []const u8) ServiceError!void {
+        if (blob.len > webpush_value_max) return error.InvalidValue;
+        const canonical = try accountKey(account);
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [webpush_key_max]u8 = undefined;
+        const k = webpushKey(&kb, canonical.asSlice()) orelse return error.InvalidName;
+        var prepared = try self.store.prepareBatch(&.{
+            .{ .family = .props, .kind = if (blob.len == 0) .delete else .put, .key = k, .value = if (blob.len == 0) null else blob },
+        });
+        defer prepared.abort();
+        try prepared.commit();
+    }
+
+    pub const WebpushPruneResult = struct {
+        rows_examined: usize = 0,
+        rows_changed: usize = 0,
+        subscriptions_removed: usize = 0,
+    };
+    const WebpushPruneRow = struct {
+        key: [webpush_key_max]u8,
+        key_len: usize,
+        blob: ?[]u8,
+
+        fn before(_: void, a: WebpushPruneRow, b: WebpushPruneRow) bool {
+            return std.mem.lessThan(u8, a.key[0..a.key_len], b.key[0..b.key_len]);
+        }
+    };
+
+    /// Prune an original worker-owned dead-endpoint cut from EVERY actual
+    /// private Webpush row in this Services' Store. The caller retains that
+    /// cut until this entire operation succeeds; no input ownership is taken.
+    /// All namespace rows strictly decode before the first mutation. Each
+    /// prepared group is synced before publication. A later failure can leave
+    /// a durable prefix of groups; retrying the complete cut is idempotent.
+    /// Ambiguous write/sync poisons the original Store and requires cold reopen.
+    /// The serialized Services lock also excludes concurrent subscription edits.
+    pub fn webpushPruneDead(self: *Services, allocator: std.mem.Allocator, endpoints: []const []const u8) !WebpushPruneResult {
+        return self.webpushPruneDeadImpl(allocator, endpoints, null);
+    }
+    /// Lifecycle consumer variant: use the original absolute source deadline.
+    /// Deadline checks precede each staged row and each prepared commit. A
+    /// completed sync can still leave a durable prefix before a later timeout;
+    /// fsync itself is not made cancelable by this admission check.
+    pub fn webpushPruneDeadUntil(self: *Services, allocator: std.mem.Allocator, endpoints: []const []const u8, deadline: std.Io.Clock.Timestamp) !WebpushPruneResult {
+        if (deadline.clock != .awake) return error.InvalidDeadline;
+        return self.webpushPruneDeadImpl(allocator, endpoints, deadline);
+    }
+    fn requireWebpushPruneDeadline(self: *Services, deadline: ?std.Io.Clock.Timestamp) !void {
+        if (deadline) |until| if (std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(self.store.io, .awake), .gte, until)) return error.Timeout;
+    }
+    fn webpushPruneDeadImpl(self: *Services, allocator: std.mem.Allocator, endpoints: []const []const u8, deadline: ?std.Io.Clock.Timestamp) !WebpushPruneResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        try self.requireWebpushPruneDeadline(deadline);
+        if (self.store.preparedWritesPoisoned()) return error.StorePoisoned;
+        for (endpoints) |endpoint| if (!webpush_mod.validEndpoint(endpoint)) return error.InvalidValue;
+        if (endpoints.len == 0) return .{};
+
+        var rows: std.ArrayListUnmanaged(WebpushPruneRow) = .empty;
+        defer {
+            for (rows.items) |row| if (row.blob) |blob| {
+                std.crypto.secureZero(u8, blob);
+                allocator.free(blob);
+            };
+            rows.deinit(allocator);
+        }
+        var result: WebpushPruneResult = .{};
+        var iterator = self.store.maps[@intFromEnum(store_mod.Family.props)].map.iterator();
+        while (iterator.next()) |entry| {
+            try self.requireWebpushPruneDeadline(deadline);
+            const key = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, webpush_prefix)) continue;
+            const account = key[webpush_prefix.len..];
+            const canonical = canonicalAccount(account) catch return error.InvalidRecord;
+            if (!std.mem.eql(u8, canonical.asSlice(), account)) return error.InvalidRecord;
+            const blob = entry.value_ptr.*;
+            if (blob.len == 0 or blob.len > webpush_value_max) return error.InvalidRecord;
+            const subs = try webpush_mod.decodeList(allocator, blob);
+            defer {
+                for (subs) |*sub| std.crypto.secureZero(u8, &sub.auth);
+                webpush_mod.freeList(allocator, subs);
+            }
+            if (subs.len == 0 or subs.len > webpush_mod.max_subscriptions_per_account) return error.InvalidRecord;
+            var kept: [webpush_mod.max_subscriptions_per_account]webpush_mod.Subscription = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&kept));
+            var count: usize = 0;
+            for (subs, 0..) |sub, index| {
+                if (!webpush_mod.validEndpoint(sub.endpoint)) return error.InvalidRecord;
+                for (subs[0..index]) |previous| if (std.mem.eql(u8, previous.endpoint, sub.endpoint)) return error.InvalidRecord;
+                var dead = false;
+                for (endpoints) |endpoint| if (std.mem.eql(u8, sub.endpoint, endpoint)) {
+                    dead = true;
+                    break;
+                };
+                if (!dead) {
+                    kept[count] = sub;
+                    count += 1;
+                }
+            }
+            result.rows_examined = try std.math.add(usize, result.rows_examined, 1);
+            if (count == subs.len) continue;
+            const next_rows_changed = try std.math.add(usize, result.rows_changed, 1);
+            const next_removed = try std.math.add(usize, result.subscriptions_removed, subs.len - count);
+            var row: WebpushPruneRow = .{ .key = undefined, .key_len = key.len, .blob = null };
+            @memcpy(row.key[0..key.len], key);
+            if (count != 0) row.blob = try webpush_mod.encodeList(allocator, kept[0..count]);
+            errdefer if (row.blob) |owned| {
+                std.crypto.secureZero(u8, owned);
+                allocator.free(owned);
+            };
+            try rows.append(allocator, row);
+            result.rows_changed = next_rows_changed;
+            result.subscriptions_removed = next_removed;
+        }
+        // Keys/blobs are independent of the Store iterator and of earlier
+        // committed rows. Prepared WAL preflight/compaction may replace tables.
+        std.mem.sort(WebpushPruneRow, rows.items, {}, WebpushPruneRow.before);
+        var offset: usize = 0;
+        while (offset < rows.items.len) {
+            try self.requireWebpushPruneDeadline(deadline);
+            // Current OroStore prepared groups support at most four mutations.
+            var mutations: [4]store_mod.BatchMutation = undefined;
+            const count = @min(mutations.len, rows.items.len - offset);
+            for (rows.items[offset..][0..count], mutations[0..count]) |*row, *mutation| mutation.* = .{
+                .family = .props,
+                .kind = if (row.blob != null) .put else .delete,
+                .key = row.key[0..row.key_len],
+                .value = row.blob,
+            };
+            var prepared = try self.store.prepareBatch(mutations[0..count]);
+            defer prepared.deinit();
+            try self.requireWebpushPruneDeadline(deadline);
+            try prepared.commit();
+            offset += count;
+        }
+        return result;
     }
 
     // ── Durable account-scoped TOTP secret (2FA enrollment survives restart) ────
@@ -5185,6 +5367,244 @@ fn sameBytes(comptime len: usize, a: *const [len]u8, b: *const [len]u8) bool {
 
 fn openTestStore(tmp: std.testing.TmpDir, name: []const u8) !OroStore {
     return OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, name);
+}
+
+const webpush_prune_accounts = [_][]const u8{ "alpha", "beta", "delta", "epsilon", "gamma", "zeta" };
+const webpush_prune_dead = [_][]const u8{ "https://push.example.test/dead-one", "https://push.example.test/dead-two", "https://push.example.test/dead-one" };
+const webpush_prune_live = "https://push.example.test/live";
+
+fn webpushPruneTestBlob(allocator: std.mem.Allocator, endpoints: []const []const u8) ![]u8 {
+    const ecdsa = @import("../crypto/ecdsa_p256.zig");
+    const pair = try ecdsa.KeyPair.fromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(1)));
+    var subs: [webpush_mod.max_subscriptions_per_account]webpush_mod.Subscription = undefined;
+    for (endpoints, subs[0..endpoints.len]) |endpoint, *sub| sub.* = .{
+        .endpoint = @constCast(endpoint),
+        .ua_public = pair.public_key.toUncompressedSec1(),
+        .auth = @splat(7),
+    };
+    return webpush_mod.encodeList(allocator, subs[0..endpoints.len]);
+}
+fn webpushPruneTestSeed(services: *Services) !void {
+    var scratch: [record_max]u8 = undefined;
+    for (webpush_prune_accounts, 0..) |account, index| {
+        _ = try services.registerAccount(account, "test-password", &scratch);
+        const endpoints: []const []const u8 = if (index == 0)
+            &.{ webpush_prune_dead[0], webpush_prune_dead[1] }
+        else
+            &.{ webpush_prune_dead[0], webpush_prune_live, webpush_prune_dead[1] };
+        const blob = try webpushPruneTestBlob(std.testing.allocator, endpoints);
+        defer std.testing.allocator.free(blob);
+        try services.webpushPut(account, blob);
+    }
+    _ = try services.registerAccount("untouched", "test-password", &scratch);
+    const live = try webpushPruneTestBlob(std.testing.allocator, &.{webpush_prune_live});
+    defer std.testing.allocator.free(live);
+    try services.webpushPut("untouched", live);
+    try services.store.family(.props).put("mda\x00alpha\x00ordinary", "keep unrelated property");
+}
+/// Every examined row must equal its exact predecessor or its exact pruned
+/// successor. An atomic group's publication is all four rows or none.
+fn webpushPruneTestProgress(services: *Services) !usize {
+    const live = try webpushPruneTestBlob(std.testing.allocator, &.{webpush_prune_live});
+    defer std.testing.allocator.free(live);
+    var changed: usize = 0;
+    for (webpush_prune_accounts, 0..) |account, index| {
+        var key_buf: [Services.webpush_key_max]u8 = undefined;
+        const key = Services.webpushKey(&key_buf, account).?;
+        const current = services.store.family(.props).get(key);
+        if (index == 0 and current == null) {
+            changed += 1;
+            continue;
+        }
+        const actual = current orelse return error.MissingWebpushSubscription;
+        if (index != 0 and std.mem.eql(u8, actual, live)) {
+            changed += 1;
+            continue;
+        }
+        const expected = try webpushPruneTestBlob(std.testing.allocator, if (index == 0)
+            &.{ webpush_prune_dead[0], webpush_prune_dead[1] }
+        else
+            &.{ webpush_prune_dead[0], webpush_prune_live, webpush_prune_dead[1] });
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+    try std.testing.expectEqualStrings(live, services.store.family(.props).get("wps\x00untouched") orelse return error.MissingWebpushSubscription);
+    try std.testing.expectEqualStrings("keep unrelated property", services.store.family(.props).get("mda\x00alpha\x00ordinary") orelse return error.MissingUnrelatedProperty);
+    return changed;
+}
+
+test "webpush reconciliation: real all-account private rows commit synced groups and cold reopen exact subscriptions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openTestStore(tmp, "webpush-prune.wal");
+        defer store.deinit();
+        var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        try webpushPruneTestSeed(&services);
+        const result = try services.webpushPruneDead(std.testing.allocator, &webpush_prune_dead);
+        try std.testing.expectEqual(@as(usize, 7), result.rows_examined);
+        try std.testing.expectEqual(@as(usize, 6), result.rows_changed);
+        try std.testing.expectEqual(@as(usize, 12), result.subscriptions_removed);
+        try std.testing.expectEqual(@as(usize, 6), try webpushPruneTestProgress(&services));
+        const sequence = store.next_seq;
+        const offset = store.wal_offset;
+        const repeated = try services.webpushPruneDead(std.testing.allocator, &webpush_prune_dead);
+        try std.testing.expectEqual(@as(usize, 0), repeated.rows_changed);
+        try std.testing.expectEqual(sequence, store.next_seq);
+        try std.testing.expectEqual(offset, store.wal_offset);
+    }
+    var reopened = try openTestStore(tmp, "webpush-prune.wal");
+    defer reopened.deinit();
+    var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
+    try std.testing.expectEqual(@as(usize, 6), try webpushPruneTestProgress(&cold));
+    _ = try cold.identifyAccount("alpha", "test-password");
+}
+
+test "webpush reconciliation: every allocator failure retains exact old or synced-prefix rows and complete cut retries same Store with cold replay" {
+    var failures: usize = 0;
+    var prefix_failures: usize = 0;
+    for (0..256) |index| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        var store = try OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "webpush-oom.wal");
+        defer store.deinit();
+        var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        try webpushPruneTestSeed(&services);
+        const sequence = store.next_seq;
+        const before = try tmp.dir.readFileAlloc(std.testing.io, "webpush-oom.wal", std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(before);
+        failing.fail_index = failing.alloc_index + index;
+        var induced = false;
+        _ = services.webpushPruneDead(failing.allocator(), &webpush_prune_dead) catch |err| blk: {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            failing.fail_index = std.math.maxInt(usize);
+            try std.testing.expect(!store.preparedWritesPoisoned());
+            const progress = try webpushPruneTestProgress(&services);
+            try std.testing.expect(progress == 0 or progress == 4);
+            try std.testing.expectEqual(sequence + progress, store.next_seq);
+            if (progress == 0) {
+                const after = try tmp.dir.readFileAlloc(std.testing.io, "webpush-oom.wal", std.testing.allocator, .unlimited);
+                defer std.testing.allocator.free(after);
+                try std.testing.expectEqualSlices(u8, before, after);
+            } else prefix_failures += 1;
+            // Original live row publication agrees with actual synced WAL.
+            {
+                var reopened = try OroStore.openReadOnlyWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "webpush-oom.wal", .{});
+                defer reopened.deinit();
+                var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
+                try std.testing.expectEqual(progress, try webpushPruneTestProgress(&cold));
+            }
+            // Retry the SAME live original Store. An independent read-only
+            // replay proves the synced result; no owner is substituted.
+            _ = try services.webpushPruneDead(failing.allocator(), &webpush_prune_dead);
+            try std.testing.expectEqual(@as(usize, 6), try webpushPruneTestProgress(&services));
+            {
+                var reopened = try OroStore.openReadOnlyWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "webpush-oom.wal", .{});
+                defer reopened.deinit();
+                var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
+                try std.testing.expectEqual(@as(usize, 6), try webpushPruneTestProgress(&cold));
+            }
+            failures += 1;
+            induced = true;
+            break :blk Services.WebpushPruneResult{};
+        };
+        if (!induced) {
+            try std.testing.expectEqual(@as(usize, 6), try webpushPruneTestProgress(&services));
+            try std.testing.expect(failures > 0 and prefix_failures > 0);
+            std.debug.print("webpush reconciliation: {d} allocator failures including {d} synced-prefix retries\n", .{ failures, prefix_failures });
+            return;
+        }
+    }
+    return error.FailureSweepDidNotComplete;
+}
+
+test "webpush reconciliation: failed short and uncertain sync preserve live predecessor and require actual poisoned Store cold reopen" {
+    const cases = [_]struct { fault: store_mod.PreparedIoFault, durable_rows: usize }{
+        .{ .fault = .{ .write = .failed }, .durable_rows = 0 },
+        .{ .fault = .{ .write = .short }, .durable_rows = 0 },
+        .{ .fault = .{ .sync = true }, .durable_rows = 4 },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var store = try openTestStore(tmp, "webpush-io.wal");
+            defer store.deinit();
+            var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+            try webpushPruneTestSeed(&services);
+            const sequence = store.next_seq;
+            const offset = store.wal_offset;
+            store.setPreparedIoFault(case.fault);
+            try std.testing.expectError(error.IoAmbiguous, services.webpushPruneDead(std.testing.allocator, &webpush_prune_dead));
+            try std.testing.expect(store.preparedWritesPoisoned());
+            try std.testing.expectEqual(@as(usize, 0), try webpushPruneTestProgress(&services));
+            try std.testing.expectEqual(sequence, store.next_seq);
+            try std.testing.expectEqual(offset, store.wal_offset);
+            try std.testing.expectError(error.StorePoisoned, services.webpushPruneDead(std.testing.allocator, &webpush_prune_dead));
+        }
+        var reopened = try openTestStore(tmp, "webpush-io.wal");
+        defer reopened.deinit();
+        var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
+        try std.testing.expectEqual(case.durable_rows, try webpushPruneTestProgress(&cold));
+        _ = try cold.webpushPruneDead(std.testing.allocator, &webpush_prune_dead);
+        try std.testing.expectEqual(@as(usize, 6), try webpushPruneTestProgress(&cold));
+    }
+}
+
+test "webpush reconciliation: malformed private rows fail before any pruning and unrelated namespaces stay outside the cut" {
+    const faults = [_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "wps\x00bad", .value = "not a subscription" },
+        .{ .key = "wps\x00BAD", .value = "" },
+        .{ .key = "wps\x00", .value = "" },
+    };
+    for (faults) |fault| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try openTestStore(tmp, "webpush-malformed.wal");
+        defer store.deinit();
+        var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        try webpushPruneTestSeed(&services);
+        try store.family(.props).put(fault.key, fault.value);
+        const sequence = store.next_seq;
+        const before = try tmp.dir.readFileAlloc(std.testing.io, "webpush-malformed.wal", std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(before);
+        if (services.webpushPruneDead(std.testing.allocator, &webpush_prune_dead)) |_| return error.ExpectedMalformedRecord else |err| try std.testing.expect(err == error.InvalidRecord or err == error.MalformedRecord);
+        try std.testing.expectEqual(@as(usize, 0), try webpushPruneTestProgress(&services));
+        try std.testing.expectEqual(sequence, store.next_seq);
+        const after = try tmp.dir.readFileAlloc(std.testing.io, "webpush-malformed.wal", std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+    }
+}
+
+test "webpush reconciliation: original absolute deadline rejects before allocation or durable mutation and a fresh deadline admits exact pruning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "webpush-deadline.wal");
+    defer store.deinit();
+    var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    try webpushPruneTestSeed(&services);
+    const sequence = store.next_seq;
+    const before = try tmp.dir.readFileAlloc(std.testing.io, "webpush-deadline.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const expired: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = .zero };
+    try std.testing.expectError(error.Timeout, services.webpushPruneDeadUntil(failing.allocator(), &webpush_prune_dead, expired));
+    const wrong: std.Io.Clock.Timestamp = .{ .clock = .real, .raw = .zero };
+    try std.testing.expectError(error.InvalidDeadline, services.webpushPruneDeadUntil(failing.allocator(), &webpush_prune_dead, wrong));
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(sequence, store.next_seq);
+    try std.testing.expectEqual(@as(usize, 0), try webpushPruneTestProgress(&services));
+    const after = try tmp.dir.readFileAlloc(std.testing.io, "webpush-deadline.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    const fresh: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromMilliseconds(5000)) };
+    const result = try services.webpushPruneDeadUntil(std.testing.allocator, &webpush_prune_dead, fresh);
+    try std.testing.expectEqual(@as(usize, 6), result.rows_changed);
+    try std.testing.expectEqual(@as(usize, 6), try webpushPruneTestProgress(&services));
 }
 
 fn durableServicesEvent(
@@ -10698,4 +11118,44 @@ test "S6C5 Services reflection keeps C4 private and production callers at zero" 
         search = at + call.len;
     }
     try std.testing.expectEqual(@as(usize, 0), production_calls);
+}
+
+test "services shared context strict webpush copy distinguishes source poison allocation failure malformed data and absence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "strict-copy.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    try std.testing.expect((try services.legacyStore()) == &store);
+    try std.testing.expect((try services.webpushGetAllocStrict(std.testing.allocator, "alice")) == null);
+    try services.webpushPutStrict("alice", "malformed original subscription image");
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, services.webpushGetAllocStrict(failing.allocator(), "alice"));
+    const exact = (try services.webpushGetAllocStrict(std.testing.allocator, "alice")).?;
+    defer std.testing.allocator.free(exact);
+    try std.testing.expectEqualStrings("malformed original subscription image", exact);
+    try std.testing.expectError(error.InvalidName, services.webpushGetAllocStrict(std.testing.allocator, "invalid name"));
+    var plan = try store.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "source", .value = "uncertain" }});
+    defer plan.abort();
+    store.setPreparedIoFault(.{ .sync = true });
+    try std.testing.expectError(error.IoAmbiguous, plan.commit());
+    try std.testing.expectError(error.StorePoisoned, services.webpushGetAllocStrict(std.testing.allocator, "alice"));
+}
+
+test "services shared context strict webpush mutation refuses invalid or oversized input and retains legacy unbound access" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "strict-put.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    try services.webpushPutStrict("alice", "original");
+    const before = store.next_seq;
+    try std.testing.expectError(error.InvalidName, services.webpushPutStrict("invalid name", "replacement"));
+    var oversized: [Services.webpush_value_max + 1]u8 = @splat('x');
+    try std.testing.expectError(error.InvalidValue, services.webpushPutStrict("alice", &oversized));
+    try std.testing.expectEqual(before, store.next_seq);
+    const value = (try services.webpushGetAllocStrict(std.testing.allocator, "alice")).?;
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("original", value);
+    try std.testing.expect((try services.legacyStore()) == &store);
 }

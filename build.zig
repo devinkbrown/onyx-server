@@ -990,7 +990,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = release_mod }},
         }),
     });
-    release_step.dependOn(&b.addInstallArtifact(release_exe, .{}).step);
+    const release_install = b.addInstallArtifact(release_exe, .{});
+    release_step.dependOn(&release_install.step);
 
     // `zig build package` — a deployment bundle: the optimized daemon binary plus
     // the operational assets an operator needs to stand a node up, all staged into
@@ -1001,11 +1002,90 @@ pub fn build(b: *std.Build) void {
     // Layout under <prefix>:
     //   bin/onyx-server                              (ReleaseFast, stripped)
     //   etc/onyx-server/onyx-server.reference.toml   (annotated reference config)
-    //   lib/systemd/system/onyx-server.service       (the unit; see its header)
-    const package_step = b.step("package", "Stage the daemon + deployment assets (binary, reference config, systemd unit) into the install prefix");
-    package_step.dependOn(&b.addInstallArtifact(release_exe, .{}).step);
-    package_step.dependOn(&b.addInstallFile(b.path("etc/onyx-server.reference.toml"), "etc/onyx-server/onyx-server.reference.toml").step);
-    package_step.dependOn(&b.addInstallFile(b.path("etc/systemd/onyx-server.service"), "lib/systemd/system/onyx-server.service").step);
+    //   lib/systemd/system/onyx-server.service       (Linux only)
+    //   libexec/onyx-server-helper                   (OpenBSD only)
+    //   libexec/onyx-server-policy                   (OpenBSD only)
+    //   etc/rc.d/onyx_server                        (OpenBSD only)
+    // The helper is a separate, non-setuid executable. Keep its privileged
+    // boundary in ReleaseSafe even when the daemon package uses ReleaseFast.
+    const helper_step = b.step("native-service-helper", "Build and stage the OpenBSD service helper (ReleaseSafe) in libexec");
+    const policy_step = b.step("native-service-policy", "Build and stage the strict OpenBSD NSCF policy compiler in libexec");
+    const openbsd_assets = b.step("openbsd-service-assets", "Stage the OpenBSD helper, rc.d script and reference config");
+    const reference_install = b.addInstallFile(b.path("etc/onyx-server.reference.toml"), "etc/onyx-server/onyx-server.reference.toml");
+    const openbsd_package_permissions = if (os_tag == .openbsd) blk: {
+        const helper_exe = b.addExecutable(.{
+            .name = "onyx-server-helper",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/native_service_helper_main.zig"),
+                .target = target,
+                .optimize = .ReleaseSafe,
+                .link_libc = true,
+                .strip = true,
+            }),
+        });
+        const install = b.addInstallArtifact(helper_exe, .{ .dest_dir = .{ .override = .{ .custom = "libexec" } } });
+        const policy_exe = b.addExecutable(.{
+            .name = "onyx-server-policy",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/native_service_policy_main.zig"),
+                .target = target,
+                .optimize = .ReleaseSafe,
+                .link_libc = true,
+                .strip = true,
+            }),
+        });
+        const policy_install = b.addInstallArtifact(policy_exe, .{ .dest_dir = .{ .override = .{ .custom = "libexec" } } });
+        const permission_tool = b.addExecutable(.{
+            .name = "stage-openbsd-service",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/stage_openbsd_service.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+                .link_libc = b.graph.host.result.os.tag != .linux and b.graph.host.result.os.tag != .windows,
+            }),
+        });
+        const helper_permissions = b.addRunArtifact(permission_tool);
+        helper_permissions.addArg("helper");
+        helper_permissions.addDirectoryArg2(.{ .relative = .{ .base = .install_prefix } }, .{});
+        helper_permissions.has_side_effects = true;
+        helper_permissions.step.dependOn(&install.step);
+        helper_step.dependOn(&helper_permissions.step);
+        const policy_permissions = b.addRunArtifact(permission_tool);
+        policy_permissions.addArg("policy");
+        policy_permissions.addDirectoryArg2(.{ .relative = .{ .base = .install_prefix } }, .{});
+        policy_permissions.has_side_effects = true;
+        policy_permissions.step.dependOn(&policy_install.step);
+        policy_step.dependOn(&policy_permissions.step);
+        const asset_permissions = b.addRunArtifact(permission_tool);
+        asset_permissions.addArg("assets");
+        asset_permissions.addDirectoryArg2(.{ .relative = .{ .base = .install_prefix } }, .{});
+        asset_permissions.has_side_effects = true;
+        asset_permissions.step.dependOn(&helper_permissions.step);
+        asset_permissions.step.dependOn(&policy_permissions.step);
+        asset_permissions.step.dependOn(&b.addInstallFile(b.path("etc/rc.d/onyx_server"), "etc/rc.d/onyx_server").step);
+        asset_permissions.step.dependOn(&reference_install.step);
+        openbsd_assets.dependOn(&asset_permissions.step);
+        const package_permissions = b.addRunArtifact(permission_tool);
+        package_permissions.addArg("package");
+        package_permissions.addDirectoryArg2(.{ .relative = .{ .base = .install_prefix } }, .{});
+        package_permissions.has_side_effects = true;
+        package_permissions.step.dependOn(&asset_permissions.step);
+        package_permissions.step.dependOn(&release_install.step);
+        break :blk package_permissions;
+    } else blk: {
+        helper_step.dependOn(&b.addFail("native-service-helper requires an OpenBSD target; use -Dtarget=x86_64-openbsd").step);
+        policy_step.dependOn(&b.addFail("native-service-policy requires an OpenBSD target; use -Dtarget=x86_64-openbsd").step);
+        openbsd_assets.dependOn(&b.addFail("openbsd-service-assets requires an OpenBSD target").step);
+        break :blk null;
+    };
+
+    const package_step = b.step("package", "Stage the daemon, reference config and target-specific deployment assets into the install prefix");
+    package_step.dependOn(&release_install.step);
+    package_step.dependOn(&reference_install.step);
+    if (os_tag == .linux) {
+        package_step.dependOn(&b.addInstallFile(b.path("etc/systemd/onyx-server.service"), "lib/systemd/system/onyx-server.service").step);
+    }
+    if (openbsd_package_permissions) |permissions| package_step.dependOn(&permissions.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

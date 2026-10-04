@@ -1,0 +1,1166 @@
+test-media
++- run test 430 pass, 17 skip, 40 fail (487 total)
+error: 'proto.dtls12_server.test.physical media five-blocker causal genuine mutual SRTP cache OOM preserves identical packet retry' failed:
+       GAP-V3 branch=rtp per-receiver spatial ceiling from the packet layer; rtx cache 512 is the product, no separate RTX SSRC
+       /home/kain/onyx-server/src/daemon/media_plane.zig:2367:49: 0x23212e1 in testOnlyPhysicalCacheOomIndex (root.zig)
+               _ = peer.recvFrom(&response_buf) orelse return error.TestUnexpectedResult;
+                                                       ^
+       /home/kain/onyx-server/src/daemon/media_plane.zig:2308:9: 0x23284d1 in testOnlyPhysicalCacheOom (root.zig)
+               return testOnlyPhysicalCacheOomIndex(term, peer, expected_fp, client_finished, material, 0);
+               ^
+       /home/kain/onyx-server/src/proto/dtls12_server.zig:2136:5: 0x2329189 in test.physical media five-blocker causal genuine mutual SRTP cache OOM preserves identical packet retry (root.zig)
+           try plane.MediaPlane.testOnlyPhysicalCacheOom(&setup.term, &peer, expected_fp, client.sent_flight5[0..client.sent_flight5_len], material);
+           ^
+error: 'proto.dtls12_server.test.physical media genuine mutual SRTP every NEW cache allocation refusal preserves identical authentic retry' failed:
+       /home/kain/onyx-server/src/daemon/media_plane.zig:2367:49: 0x23212e1 in testOnlyPhysicalCacheOomIndex (root.zig)
+               _ = peer.recvFrom(&response_buf) orelse return error.TestUnexpectedResult;
+                                                       ^
+       /home/kain/onyx-server/src/proto/dtls12_server.zig:2162:9: 0x2326763 in test.physical media genuine mutual SRTP every NEW cache allocation refusal preserves identical authentic retry (root.zig)
+               try plane.MediaPlane.testOnlyPhysicalCacheOomIndex(&setup.term, &peer, expected_fp, client.sent_flight5[0..client.sent_flight5_len], material, fault_index);
+               ^
+error: 'daemon.native_media_transport.test.physical media namespace collision spans distinct calls and real departure releases accepted RTC claim' failed:
+       GAP-V1 branch=hold-off dtls13=off caveat=kept dtls12=HelloVerifyRequest
+       complete fanout fixture NOFILE old=524288/524288 selected=524288/524288
+       complete fanout causal rtcp=false authenticated_receivers=130 actual_datagrams=130
+       complete fanout fixture NOFILE old=524288/524288 selected=524288/524288
+       complete fanout causal rtcp=true authenticated_receivers=130 actual_datagrams=130
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:614:14: 0x1886d89 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/kain/onyx-server/src/daemon/native_media_transport.zig:2821:5: 0x1e4d855 in test.physical media namespace collision spans distinct calls and real departure releases accepted RTC claim (root.zig)
+           try testing.expect(current_native.identity.stream_id != accepted_stream);
+           ^
+error: 'daemon.server.test.managed core: prepared media retains original callbacks Domain registrations and funded FIFO' failed:
+       GAP-V1 branch=hold-off dtls13=off caveat=kept
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x256595a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:56999:9: 0x2567dfc in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:58860:21: 0x4009d3c in initWithInputs (root.zig)
+               self.core = try ManagedCore.createCold(a, std.testing.io, inputs, .{ .rdns = resolver, .dnsbl = null, .mail = null, .webpush = null });
+                           ^
+       /home/kain/onyx-server/src/daemon/server.zig:58845:9: 0x400bc46 in initWithMedia (root.zig)
+               return self.initWithInputs(.{
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:59172:5: 0x400c3ce in test.managed core: prepared media retains original callbacks Domain registrations and funded FIFO (root.zig)
+           try fixture.initWithMedia(2, null, true);
+           ^
+error: 'daemon.server.test.protected MEDIA output: final labeled batch has actual TLS custody before sequence publication' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127105:23: 0x3f93512 in test.protected MEDIA output: final labeled batch has actual TLS custody before sequence publication (root.zig)
+               var fixture = try Tls3ServerFixture.create(suite);
+                             ^
+error: 'daemon.server.test.protected MEDIA output: queue refusal and abort preserve actual TLS sequence and owner' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127143:19: 0x3f8dd19 in test.protected MEDIA output: queue refusal and abort preserve actual TLS sequence and owner (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA caller: OFFER refuses another physical selector before profile publication' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127176:19: 0x3f8cb57 in test.protected MEDIA caller: OFFER refuses another physical selector before profile publication (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA physical JOIN: abort preserves attachment and browser binding; retry commits one kind' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127197:19: 0x3f8a99e in test.protected MEDIA physical JOIN: abort preserves attachment and browser binding; retry commits one kind (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA physical JOIN: changed original binding refuses before membership mutation' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127240:19: 0x3f8a0e7 in test.protected MEDIA physical JOIN: changed original binding refuses before membership mutation (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA browser JOIN: joined source plans publish only final labeled WS TLS custody' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127276:23: 0x3f84ca5 in test.protected MEDIA browser JOIN: joined source plans publish only final labeled WS TLS custody (root.zig)
+               var fixture = try Tls3ServerFixture.create(suite);
+                             ^
+error: 'daemon.server.test.protected MEDIA browser JOIN: protected queue refusal leaves all original authority retryable' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127324:19: 0x3f5a304 in test.protected MEDIA browser JOIN: protected queue refusal leaves all original authority retryable (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA browser JOIN: changed Room or foreign Domain refuses before output and physical publication' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127364:19: 0x3f5808c in test.protected MEDIA browser JOIN: changed Room or foreign Domain refuses before output and physical publication (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA negotiation: offered capability is separate from agreement and no authority publishes' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127390:19: 0x3f56407 in test.protected MEDIA negotiation: offered capability is separate from agreement and no authority publishes (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA negotiation: actual shared profile rejects changed used values and ignores unused codec tails' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127419:19: 0x3f54c29 in test.protected MEDIA negotiation: actual shared profile rejects changed used values and ignores unused codec tails (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA negotiation: exact caller membership config and malformed input refuse before output' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127457:19: 0x3f53170 in test.protected MEDIA negotiation: exact caller membership config and malformed input refuse before output (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA negotiation: every actual agreement OOM keeps source and retries on the same owner' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127490:19: 0x3f4c450 in test.protected MEDIA negotiation: every actual agreement OOM keeps source and retries on the same owner (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA advertisement: actual native-only resource host and labeled secret bytes stage without RTC or authority publication' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127535:19: 0x398fb2f in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:127569:19: 0x3f49217 in test.protected MEDIA advertisement: actual native-only resource host and labeled secret bytes stage without RTC or authority publication (root.zig)
+           var fixture = try MediaAdvertisementsTestFixture.create();
+                         ^
+error: 'daemon.server.test.protected MEDIA advertisement: missing actual TLS refuses before capture and original owner retries' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127535:19: 0x398fb2f in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:127614:19: 0x3993dcc in test.protected MEDIA advertisement: missing actual TLS refuses before capture and original owner retries (root.zig)
+           var fixture = try MediaAdvertisementsTestFixture.create();
+                         ^
+error: 'daemon.server.test.protected MEDIA advertisement: actual held port discovery and config changes refuse final relation then original plans retry' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127535:19: 0x398fb2f in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:127645:19: 0x3991e79 in test.protected MEDIA advertisement: actual held port discovery and config changes refuse final relation then original plans retry (root.zig)
+           var fixture = try MediaAdvertisementsTestFixture.create();
+                         ^
+error: 'daemon.server.test.protected MEDIA advertisement: independently valid foreign agreed FEC refuses before output or route publishes' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127535:19: 0x398fb2f in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:127688:19: 0x3990589 in test.protected MEDIA advertisement: independently valid foreign agreed FEC refuses before output or route publishes (root.zig)
+           var fixture = try MediaAdvertisementsTestFixture.create();
+                         ^
+error: 'daemon.server.test.protected MEDIA complete departure: all actual physical rows retire in one cut and same-nick sibling survives' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127779:19: 0x398b427 in test.protected MEDIA complete departure: all actual physical rows retire in one cut and same-nick sibling survives (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA complete departure: changed sibling row or original attachment refuses before any retirement' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127824:19: 0x3989227 in test.protected MEDIA complete departure: changed sibling row or original attachment refuses before any retirement (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA complete departure: mismatched genuine Domain census refuses Server row removal' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127856:19: 0x3987367 in test.protected MEDIA complete departure: mismatched genuine Domain census refuses Server row removal (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA complete departure: every metadata OOM keeps exact original row and same-owner retry' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127880:19: 0x3982f0b in test.protected MEDIA complete departure: every metadata OOM keeps exact original row and same-owner retry (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA dispatch: actual disabled module retains label and refuses before handler authority' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127936:19: 0x3980607 in test.protected MEDIA dispatch: actual disabled module retains label and refuses before handler authority (root.zig)
+           var fixture = try Tls3ServerFixture.create(0x1301);
+                         ^
+error: 'daemon.server.test.protected MEDIA dispatch: malformed real OFFER uses actual spine with one labeled or unlabeled TLS reply and restores turn' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127962:23: 0x397f456 in test.protected MEDIA dispatch: malformed real OFFER uses actual spine with one labeled or unlabeled TLS reply and restores turn (root.zig)
+               var fixture = try Tls3ServerFixture.create(0x1301);
+                             ^
+error: 'daemon.server.test.protected MEDIA caller: registered OFFER and reduced ANSWER publish exact encrypted native credentials without JOIN' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127991:19: 0x396bd9d in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:128059:19: 0x397b772 in test.protected MEDIA caller: registered OFFER and reduced ANSWER publish exact encrypted native credentials without JOIN (root.zig)
+           var fixture = try RegisteredMediaCallerFixture.create(true);
+                         ^
+error: 'daemon.server.test.protected MEDIA caller: actual plaintext OFFER refuses native publication despite TLS label then same owner succeeds' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127991:19: 0x396bd9d in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:128113:19: 0x397a335 in test.protected MEDIA caller: actual plaintext OFFER refuses native publication despite TLS label then same owner succeeds (root.zig)
+           var fixture = try RegisteredMediaCallerFixture.create(true);
+                         ^
+error: 'daemon.server.test.protected MEDIA caller: late real protected queue refusal leaves route profile TLS and label retryable' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127991:19: 0x396bd9d in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:128147:19: 0x3978b1c in test.protected MEDIA caller: late real protected queue refusal leaves route profile TLS and label retryable (root.zig)
+           var fixture = try RegisteredMediaCallerFixture.create(true);
+                         ^
+error: 'daemon.server.test.protected MEDIA caller: actual browser JOIN refuses plaintext before physical Room E2EE and MACKEY then retries securely' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127991:19: 0x396bd9d in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:128182:19: 0x3975875 in test.protected MEDIA caller: actual browser JOIN refuses plaintext before physical Room E2EE and MACKEY then retries securely (root.zig)
+           var fixture = try RegisteredMediaCallerFixture.create(false);
+                         ^
+error: 'daemon.server.test.protected MEDIA caller: public plaintext negotiation retains exact agreement without endpoint secrets or UDP authority' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127991:19: 0x396bd9d in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:128227:19: 0x3973225 in test.protected MEDIA caller: public plaintext negotiation retains exact agreement without endpoint secrets or UDP authority (root.zig)
+           var fixture = try RegisteredMediaCallerFixture.create(false);
+                         ^
+error: 'daemon.server.test.protected MEDIA caller: real logical JOIN binds exact physical membership without MACKEY or transport offer' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127991:19: 0x396bd9d in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:128260:19: 0x3971235 in test.protected MEDIA caller: real logical JOIN binds exact physical membership without MACKEY or transport offer (root.zig)
+           var fixture = try RegisteredMediaCallerFixture.create(false);
+                         ^
+error: 'daemon.server.test.protected MEDIA caller: actual command allocation refusal publishes nothing and retries on the original source' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x3941984 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x3968564 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:99007:24: 0x396a0ba in createTransport (root.zig)
+               const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+                              ^
+       /home/kain/onyx-server/src/daemon/server.zig:98998:9: 0x396bcfc in create (root.zig)
+               return createTransport(suite, false);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:127991:19: 0x396bd9d in create (root.zig)
+               var tls = try Tls3ServerFixture.create(0x1301);
+                         ^
+       /home/kain/onyx-server/src/daemon/server.zig:128284:19: 0x396e6bc in test.protected MEDIA caller: actual command allocation refusal publishes nothing and retries on the original source (root.zig)
+           var fixture = try RegisteredMediaCallerFixture.create(true);
+                         ^
+error: 'daemon.configured_runtime.test.configured runtime: synchronous media bind failure refunds earlier prepared resources and preserves the unrelated socket' failed:
+       expected error.BindFailed, found error.Unsupported
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x256595a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:56999:9: 0x2567dfc in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, null);
+               ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:482:14: 0x25901f0 in createColdImpl (root.zig)
+           b.core = try server_mod.ManagedCore.createCold(allocator, io, inputs.core, .{
+                    ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:121:9: 0x3923f4e in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, deadline, if (builtin.is_test) null else {});
+               ^
+       /usr/local/lib/zig-0.17/lib/zig/std/testing.zig:64:13: 0x394c6ae in expectError__anon_727083 (std.zig)
+                   return error.TestUnexpectedError;
+                   ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:1071:5: 0x394cacd in test.configured runtime: synchronous media bind failure refunds earlier prepared resources and preserves the unrelated socket (root.zig)
+           try std.testing.expectError(error.BindFailed, Runtime.createCold(std.testing.allocator, std.testing.io, inputs, testDeadline()));
+           ^
+error: 'daemon.configured_runtime.test.configured runtime: real WebTransport and Metrics resources retain independent full policy behind the private Gate' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x256595a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:56999:9: 0x2567dfc in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, null);
+               ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:482:14: 0x25901f0 in createColdImpl (root.zig)
+           b.core = try server_mod.ManagedCore.createCold(allocator, io, inputs.core, .{
+                    ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:121:9: 0x3923f4e in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, deadline, if (builtin.is_test) null else {});
+               ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:1283:21: 0x394a545 in test.configured runtime: real WebTransport and Metrics resources retain independent full policy behind the private Gate (root.zig)
+           const runtime = try Runtime.createCold(std.testing.allocator, std.testing.io, inputs, testDeadline());
+                           ^
+error: 'daemon.configured_runtime.test.configured runtime: prepared native and WebRTC media retain full policy and original UDP custody' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x256595a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:56999:9: 0x2567dfc in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, null);
+               ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:482:14: 0x25901f0 in createColdImpl (root.zig)
+           b.core = try server_mod.ManagedCore.createCold(allocator, io, inputs.core, .{
+                    ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:121:9: 0x3923f4e in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, deadline, if (builtin.is_test) null else {});
+               ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:1371:21: 0x3947c5d in test.configured runtime: prepared native and WebRTC media retain full policy and original UDP custody (root.zig)
+           const runtime = try Runtime.createCold(std.testing.allocator, std.testing.io, inputs, testDeadline());
+                           ^
+error: 'daemon.configured_runtime.test.configured runtime: configured Webpush and WebTransport publish their real sources and retain joined settlement custody' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x256595a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:56999:9: 0x2567dfc in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, null);
+               ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:482:14: 0x25901f0 in createColdImpl (root.zig)
+           b.core = try server_mod.ManagedCore.createCold(allocator, io, inputs.core, .{
+                    ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:121:9: 0x3923f4e in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, deadline, if (builtin.is_test) null else {});
+               ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:1625:21: 0x392538a in test.configured runtime: configured Webpush and WebTransport publish their real sources and retain joined settlement custody (root.zig)
+           const runtime = try Runtime.createCold(std.testing.allocator, std.testing.io, inputs, testDeadline());
+                           ^
+error: 'daemon.configured_runtime.test.configured runtime: immediate terminal stop joins the actual late inline caller and cancels source entry without a permanent failure' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x253b39e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x253c47b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x253c7b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x253e8f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x2546fe1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:57061:13: 0x256595a in createColdImpl (root.zig)
+                   try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+                   ^
+       /home/kain/onyx-server/src/daemon/server.zig:56999:9: 0x2567dfc in createCold (root.zig)
+               return createColdImpl(allocator, io, inputs, binding, null);
+               ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:482:14: 0x25901f0 in createColdImpl (root.zig)
+           b.core = try server_mod.ManagedCore.createCold(allocator, io, inputs.core, .{
+                    ^
+       /home/kain/onyx-server/src/daemon/configured_runtime.zig:1726:21: 0x25be50f in test.configured runtime: immediate terminal stop joins the actual late inline caller and cancels source entry without a permanent failure (root.zig)
+           const runtime = try createColdImpl(std.testing.allocator, std.testing.io, testInputs(1), testDeadline(), &fixture);
+                           ^
+error: 'daemon.webtransport_listener.test.interop: curl --http3 GET / gets 200 from the live QUIC/HTTP3 listener' failed:
+       /home/kain/onyx-server/src/daemon/webtransport_listener.zig:2263:17: 0x24755a0 in test.interop: curl --http3 GET / gets 200 from the live QUIC/HTTP3 listener (root.zig)
+                       return error.CurlFailed;
+                       ^
+error: 'daemon.webtransport_listener.test.interop: curl --http3 large transfer + multi-request + Retry round-trip (deep)' failed:
+       /home/kain/onyx-server/src/daemon/webtransport_listener.zig:2325:17: 0x246a542 in test.interop: curl --http3 large transfer + multi-request + Retry round-trip (deep) (root.zig)
+                       return error.CurlFailed;
+                       ^
+failed command: ./.zig-cache/o/bc42e75e789f095853fec1e233e578b8/test --cache-dir=./.zig-cache --seed=0x123414f1 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 430/487 tests passed (17 skipped, 40 failed)
+test-media transitive failure
++- run test 430 pass, 17 skip, 40 fail (487 total)
+

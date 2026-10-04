@@ -3,7 +3,7 @@
 
 //! IPv4/IPv6 UDP sockets for the WebTransport listener.
 //!
-//! Linux uses one blocking `AF_INET6` socket with `IPV6_V6ONLY=0`; IPv4
+//! Linux uses one nonblocking `AF_INET6` socket with `IPV6_V6ONLY=0`; IPv4
 //! peers arrive as mapped addresses. OpenBSD uses native IPv4 and IPv6 sockets
 //! sharing one port, with finite readiness polls and fair dispatch. This mirrors the
 //! shape of `MediaSocket` (`bind` / `deinit` / `localPort` / `setRecvTimeoutMs` /
@@ -72,7 +72,7 @@ pub const DualStackUdpSocket = struct {
     pub fn bind(bind_addr: BindAddr, port: u16) Error!DualStackUdpSocket {
         if (comptime builtin.os.tag == .windows) return error.SocketUnavailable;
         if (comptime builtin.os.tag != .linux) return bindNative(bind_addr, port);
-        const rc = sys.socket(posix.AF.INET6, sys.SOCK.DGRAM | sys.SOCK.CLOEXEC, sys.IPPROTO.UDP);
+        const rc = sys.socket(posix.AF.INET6, sys.SOCK.DGRAM | sys.SOCK.CLOEXEC | sys.SOCK.NONBLOCK, sys.IPPROTO.UDP);
         if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
         const fd: sys.fd_t = @intCast(rc);
         errdefer _ = sys.close(fd);
@@ -195,13 +195,40 @@ pub const DualStackUdpSocket = struct {
     /// Bound a blocking recv with a timeout so the pump loop can re-check a stop
     /// flag (and tests never hang).
     pub fn setRecvTimeoutMs(self: *DualStackUdpSocket, ms: u32) void {
-        if (comptime builtin.os.tag == .windows) return;
-        if (comptime builtin.os.tag != .linux) {
-            self.recv_timeout_ms = @max(ms, 1);
-            return;
+        self.recv_timeout_ms = @min(@max(ms, 1), std.math.maxInt(c_int));
+    }
+
+    pub fn capture(self: *const DualStackUdpSocket) !Snapshot {
+        var carry: Snapshot = .{ .primary = try observeDatagram(self.fd), .ipv4 = null, .primary_ipv4 = self.primary_ipv4, .recv_timeout_ms = self.recv_timeout_ms, .prefer_ipv4 = self.prefer_ipv4 };
+        if (self.ipv4_fd >= 0) {
+            if (self.ipv4_fd == self.fd) return error.InvalidSocket;
+            carry.ipv4 = try observeDatagram(self.ipv4_fd);
         }
-        const tv = sys.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
-        _ = sys.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+        try carry.validate();
+        return carry;
+    }
+    /// Takes both transferred references on entry, including refusal. It never
+    /// binds, sets flags/options, reads or shuts down a shared open description.
+    pub fn initInherited(fd: posix.fd_t, ipv4_fd: ?posix.fd_t, carry: *const Snapshot) !DualStackUdpSocket {
+        errdefer {
+            _ = sys.close(fd);
+            if (ipv4_fd) |other| if (other != fd) {
+                _ = sys.close(other);
+            };
+        }
+        try carry.validate();
+        if ((ipv4_fd != null) != (carry.ipv4 != null) or (ipv4_fd != null and ipv4_fd.? == fd)) return error.InvalidSocket;
+        const actual = try observeDatagram(fd);
+        if (!std.meta.eql(actual, carry.primary)) return error.SocketMismatch;
+        if (ipv4_fd) |other| {
+            if (!std.meta.eql(try observeDatagram(other), carry.ipv4.?)) return error.SocketMismatch;
+        }
+        // OpenBSD socket fstat reports no device/inode identity. A cold
+        // source-owned observation is useful, but cannot authenticate an
+        // inherited open description. Keep adoption closed until a genuine
+        // source-custody bridge supplies that proof.
+        if (actual.inode == 0 or (carry.ipv4 != null and carry.ipv4.?.inode == 0)) return error.UnverifiableSocketIdentity;
+        return .{ .fd = fd, .ipv4_fd = ipv4_fd orelse -1, .primary_ipv4 = carry.primary_ipv4, .recv_timeout_ms = carry.recv_timeout_ms, .prefer_ipv4 = carry.prefer_ipv4 };
     }
 
     /// Send `bytes` to `dest`. A v4 `TransportAddress` is re-wrapped as a
@@ -209,18 +236,15 @@ pub const DualStackUdpSocket = struct {
     /// with an unexpected `ip_len` (neither 4 nor 16) is dropped.
     pub fn sendTo(self: *DualStackUdpSocket, dest: TransportAddress, bytes: []const u8) void {
         if (comptime builtin.os.tag == .windows) return;
-        if (comptime builtin.os.tag != .linux) {
-            if (dest.ip_len == 4) {
-                const fd = if (self.primary_ipv4) self.fd else self.ipv4_fd;
-                if (fd < 0) return;
-                const sa4 = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, dest.port), .addr = @bitCast(dest.ip[0..4].*) };
-                _ = sys.sendto(fd, bytes.ptr, bytes.len, 0, @ptrCast(&sa4), @sizeOf(@TypeOf(sa4)));
-                return;
-            }
-            if (self.primary_ipv4 or dest.ip_len != 16) return;
+        if (dest.ip_len == 4 and (self.primary_ipv4 or self.ipv4_fd >= 0)) {
+            const fd = if (self.primary_ipv4) self.fd else self.ipv4_fd;
+            const sa4 = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, dest.port), .addr = @bitCast(dest.ip[0..4].*) };
+            _ = sys.sendto(fd, bytes.ptr, bytes.len, posix.MSG.DONTWAIT, @ptrCast(&sa4), @sizeOf(@TypeOf(sa4)));
+            return;
         }
+        if (self.primary_ipv4 or (comptime builtin.os.tag != .linux) and dest.ip_len != 16) return;
         const sa = toSockaddrIn6(dest) orelse return;
-        _ = sys.sendto(self.fd, bytes.ptr, bytes.len, 0, @ptrCast(&sa), @sizeOf(sys.sockaddr.in6));
+        _ = sys.sendto(self.fd, bytes.ptr, bytes.len, posix.MSG.DONTWAIT, @ptrCast(&sa), @sizeOf(sys.sockaddr.in6));
     }
 
     pub const Received = struct { data: []u8, from: TransportAddress };
@@ -230,14 +254,7 @@ pub const DualStackUdpSocket = struct {
     /// becomes a 4-byte ipv4 address, anything else a 16-byte ipv6 address.
     pub fn recvFrom(self: *DualStackUdpSocket, buf: []u8) ?Received {
         if (comptime builtin.os.tag == .windows) return null;
-        if (comptime builtin.os.tag != .linux) return self.recvNative(buf);
-        var sa: sys.sockaddr.in6 = undefined;
-        var slen: posix.socklen_t = @sizeOf(sys.sockaddr.in6);
-        const rc = sys.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&sa), &slen);
-        if (posix.errno(rc) != .SUCCESS) return null;
-        const n: usize = @intCast(rc);
-        const from = fromSockaddrIn6(&sa) catch return null;
-        return .{ .data = buf[0..n], .from = from };
+        return self.recvNative(buf);
     }
     fn recvNative(self: *DualStackUdpSocket, buf: []u8) ?Received {
         var fds = [_]posix.pollfd{
@@ -251,7 +268,7 @@ pub const DualStackUdpSocket = struct {
             if (fds[idx].fd < 0 or fds[idx].revents & posix.POLL.IN == 0) continue;
             var sa: posix.sockaddr.storage = undefined;
             var len: posix.socklen_t = @sizeOf(@TypeOf(sa));
-            const rc = sys.recvfrom(fds[idx].fd, buf.ptr, buf.len, 0, @ptrCast(&sa), &len);
+            const rc = sys.recvfrom(fds[idx].fd, buf.ptr, buf.len, posix.MSG.DONTWAIT, @ptrCast(&sa), &len);
             if (posix.errno(rc) != .SUCCESS) continue;
             const n: usize = @intCast(rc);
             if (n > buf.len) return null;
@@ -559,4 +576,166 @@ test "dualstack socket: native paired families share a port and preserve both qu
     try testing.expect(server.recvFrom(&buf) == null);
     const elapsed = @import("../substrate/platform.zig").monotonicMillis() - before;
     try testing.expect(elapsed >= 50 and elapsed < 1000);
+}
+
+/// Kernel observations only. Authenticated transfer and predecessor inventory
+/// establish same-OFD lineage; equal socket metadata alone cannot prove it.
+pub const DatagramObservation = struct {
+    device: u64,
+    inode: u64,
+    family: u16,
+    address: [16]u8,
+    port: u16,
+    scope_id: u32,
+    flowinfo: u32,
+    v6only: bool,
+    pub fn validate(self: *const DatagramObservation) !void {
+        if (self.port == 0 or (self.family != posix.AF.INET and self.family != posix.AF.INET6)) return error.InvalidSocket;
+        if (self.family == posix.AF.INET) {
+            for (self.address[4..]) |byte| if (byte != 0) return error.InvalidSocket;
+            if (self.scope_id != 0 or self.flowinfo != 0 or self.v6only) return error.InvalidSocket;
+        } else if (self.scope_id != 0 or self.flowinfo != 0) return error.InvalidSocket;
+    }
+};
+/// Endpoint and descriptor observations, not an inherited-custody receipt.
+/// A zero inode explicitly means that the platform supplies no socket identity.
+pub const Snapshot = struct {
+    primary: DatagramObservation,
+    ipv4: ?DatagramObservation,
+    primary_ipv4: bool,
+    recv_timeout_ms: u32,
+    prefer_ipv4: bool,
+    pub fn validate(self: *const Snapshot) !void {
+        try self.primary.validate();
+        if (self.recv_timeout_ms == 0 or self.recv_timeout_ms > std.math.maxInt(c_int) or self.primary_ipv4 != (self.primary.family == posix.AF.INET)) return error.InvalidSocket;
+        if (self.ipv4) |*other| {
+            try other.validate();
+            if (self.primary_ipv4 or !self.primary.v6only or other.family != posix.AF.INET or other.port != self.primary.port or (other.inode != 0 and other.device == self.primary.device and other.inode == self.primary.inode)) return error.InvalidSocket;
+            // Only .any creates a native two-family pair.
+            for (self.primary.address) |byte| if (byte != 0) return error.InvalidSocket;
+            for (other.address) |byte| if (byte != 0) return error.InvalidSocket;
+        }
+    }
+};
+fn identityBits(value: anytype) u64 {
+    return @intCast(@as(@Int(.unsigned, @bitSizeOf(@TypeOf(value))), @bitCast(value)));
+}
+fn observeDatagram(fd: posix.fd_t) !DatagramObservation {
+    var typ: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.TYPE, std.mem.asBytes(&typ), &len)) != .SUCCESS or len != @sizeOf(c_int) or typ != posix.SOCK.DGRAM) return error.InvalidSocket;
+    const arg: if (builtin.os.tag == .linux) usize else c_int = 0;
+    const flags = sys.fcntl(fd, posix.F.GETFL, arg);
+    if (posix.errno(flags) != .SUCCESS or !@as(posix.O, @bitCast(@as(u32, @intCast(flags)))).NONBLOCK) return error.InvalidSocket;
+    const fdflags = sys.fcntl(fd, posix.F.GETFD, arg);
+    if (posix.errno(fdflags) != .SUCCESS or (fdflags & posix.FD_CLOEXEC) == 0) return error.InvalidSocket;
+    var address: posix.sockaddr.storage = undefined;
+    len = @sizeOf(@TypeOf(address));
+    if (posix.errno(sys.getsockname(fd, @ptrCast(&address), &len)) != .SUCCESS) return error.InvalidSocket;
+    var result: DatagramObservation = .{ .device = 0, .inode = 0, .family = address.family, .address = @splat(0), .port = 0, .scope_id = 0, .flowinfo = 0, .v6only = false };
+    if (address.family == posix.AF.INET and len == @sizeOf(posix.sockaddr.in)) {
+        const sa: *const posix.sockaddr.in = @ptrCast(@alignCast(&address));
+        @memcpy(result.address[0..4], &@as([4]u8, @bitCast(sa.addr)));
+        result.port = std.mem.bigToNative(u16, sa.port);
+    } else if (address.family == posix.AF.INET6 and len == @sizeOf(posix.sockaddr.in6)) {
+        const sa: *const posix.sockaddr.in6 = @ptrCast(@alignCast(&address));
+        result.address = sa.addr;
+        result.port = std.mem.bigToNative(u16, sa.port);
+        result.scope_id = sa.scope_id;
+        result.flowinfo = sa.flowinfo;
+        var only: c_int = 0;
+        len = @sizeOf(c_int);
+        if (posix.errno(sys.getsockopt(fd, posix.IPPROTO.IPV6, ipv6V6Only(), std.mem.asBytes(&only), &len)) != .SUCCESS or len != @sizeOf(c_int) or (only != 0 and only != 1)) return error.InvalidSocket;
+        result.v6only = only == 1;
+    } else return error.InvalidSocket;
+    if (comptime builtin.os.tag == .linux) {
+        var stat: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
+        if (posix.errno(std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .TYPE = true, .INO = true }, &stat)) != .SUCCESS or !stat.mask.TYPE or !stat.mask.INO or (stat.mode & posix.S.IFMT) != posix.S.IFSOCK) return error.InvalidSocket;
+        result.device = (@as(u64, stat.dev_major) << 32) | stat.dev_minor;
+        result.inode = stat.ino;
+    } else {
+        var stat: posix.Stat = undefined;
+        if (posix.errno(sys.fstat(fd, &stat)) != .SUCCESS or (stat.mode & posix.S.IFMT) != posix.S.IFSOCK) return error.InvalidSocket;
+        result.device = identityBits(stat.dev);
+        result.inode = identityBits(stat.ino);
+    }
+    try result.validate();
+    return result;
+}
+
+test "companion runtime dualstack native pair exact inherited custody and live OLD traffic" {
+    // Direct `bindNative`/`capture` use; no Windows support (`SOCK_CLOEXEC`).
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    // Exercise the native pair algorithm on Linux too, rather than relying on
+    // the mapped one-FD implementation to stand in for native pair custody.
+    var owner = try DualStackUdpSocket.bindNative(.any, 0);
+    defer owner.deinit();
+    owner.setRecvTimeoutMs(200);
+    owner.prefer_ipv4 = true;
+    var carry = try owner.capture();
+    try std.testing.expect(carry.ipv4 != null);
+    const arg: if (builtin.os.tag == .linux) usize else c_int = 0;
+    const fd = sys.fcntl(owner.fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), arg);
+    try std.testing.expect(posix.errno(fd) == .SUCCESS);
+    const fd4 = sys.fcntl(owner.ipv4_fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), arg);
+    if (posix.errno(fd4) != .SUCCESS) {
+        _ = sys.close(@intCast(fd));
+        return error.TestUnexpectedResult;
+    }
+    if (carry.primary.inode == 0 or carry.ipv4.?.inode == 0) {
+        try std.testing.expectError(error.UnverifiableSocketIdentity, DualStackUdpSocket.initInherited(@intCast(fd), @intCast(fd4), &carry));
+        try std.testing.expect(posix.errno(sys.fcntl(@intCast(fd), posix.F.GETFD, arg)) != .SUCCESS);
+        try std.testing.expect(posix.errno(sys.fcntl(@intCast(fd4), posix.F.GETFD, arg)) != .SUCCESS);
+    } else {
+        var adopted = try DualStackUdpSocket.initInherited(@intCast(fd), @intCast(fd4), &carry);
+        try std.testing.expect(adopted.prefer_ipv4);
+        adopted.deinit();
+    }
+    try std.testing.expectEqualDeep(carry, try owner.capture());
+    const bad = sys.fcntl(owner.fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), arg);
+    try std.testing.expect(posix.errno(bad) == .SUCCESS);
+    const bad4 = sys.fcntl(owner.ipv4_fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), arg);
+    if (posix.errno(bad4) != .SUCCESS) {
+        _ = sys.close(@intCast(bad));
+        return error.TestUnexpectedResult;
+    }
+    carry.ipv4.?.inode ^= std.math.maxInt(u64);
+    try std.testing.expectError(error.SocketMismatch, DualStackUdpSocket.initInherited(@intCast(bad), @intCast(bad4), &carry));
+    try std.testing.expect(posix.errno(sys.fcntl(@intCast(bad), posix.F.GETFD, arg)) != .SUCCESS);
+    try std.testing.expect(posix.errno(sys.fcntl(@intCast(bad4), posix.F.GETFD, arg)) != .SUCCESS);
+    carry.ipv4.?.inode ^= std.math.maxInt(u64);
+    var sender = try DualStackUdpSocket.bindNative(.any, 0);
+    defer sender.deinit();
+    sender.sendTo(try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, carry.primary.port), "v4 alive");
+    var address: [16]u8 = @splat(0);
+    address[15] = 1;
+    var buf: [64]u8 = undefined;
+    const first = owner.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, "v4 alive", first.data);
+    try std.testing.expectEqual(@as(u8, 4), first.from.ip_len);
+    sender.sendTo(try TransportAddress.fromBytes(&address, carry.primary.port), "v6 alive");
+    const second = owner.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, "v6 alive", second.data);
+    try std.testing.expectEqual(@as(u8, 16), second.from.ip_len);
+}
+
+test "companion runtime native socket observation refuses a rebound endpoint as original custody" {
+    // Direct `bindNative` use; no Windows support (`SOCK_CLOEXEC`).
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const loopback = DualStackUdpSocket.BindAddr{ .v4_mapped = .{ 127, 0, 0, 1 } };
+    const carry = blk: {
+        var original = try DualStackUdpSocket.bindNative(loopback, 0);
+        defer original.deinit();
+        break :blk try original.capture();
+    };
+    // The original description is gone. A newly bound socket can repeat every
+    // endpoint observation, but must never acquire its predecessor's custody.
+    var replacement = try DualStackUdpSocket.bindNative(loopback, carry.primary.port);
+    defer replacement.deinit();
+    const arg: if (builtin.os.tag == .linux) usize else c_int = 0;
+    const fd = sys.fcntl(replacement.fd, (if (builtin.os.tag == .openbsd) @as(c_int, 10) else posix.F.DUPFD_CLOEXEC), arg);
+    try std.testing.expect(posix.errno(fd) == .SUCCESS);
+    try std.testing.expectError(if (carry.primary.inode == 0) error.UnverifiableSocketIdentity else error.SocketMismatch, DualStackUdpSocket.initInherited(@intCast(fd), null, &carry));
+    try std.testing.expect(posix.errno(sys.fcntl(@intCast(fd), posix.F.GETFD, arg)) != .SUCCESS);
+    try std.testing.expectEqual(carry.primary.port, try replacement.localPort());
 }

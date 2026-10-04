@@ -1,0 +1,1010 @@
+test-mesh
++- run test 607 pass, 51 skip, 36 fail (694 total)
+error: 'daemon.server.test.MARKREAD secured burst keeps signed frontier through SendQ pressure outer OOM and duplicate repair' failed:
+       GAP-A2 branch=check-config refuse unsecured mesh.connect; compat default
+       live compaction actual successor SIGKILL prefixes: 556 (0..555)
+       GAP-K7 branch=written threat boundary; history rekey is not a daemon mode because the daemon holds no epoch key; metadata-min is refused because NAMES search and abuse require server-visible membership; implementation does not follow
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:69088:5: 0x3ee71c3 in readMarkerServerForTest (root.zig)
+           return createTestServer(allocator, .{
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:69319:20: 0x3ee80a4 in test.MARKREAD secured burst keeps signed frontier through SendQ pressure outer OOM and duplicate repair (root.zig)
+           const author = try readMarkerServerForTest(alloc, &services1, &pair.ida);
+                          ^
+error: 'daemon.server.test.same-IP mesh dial plaintext responder loser delivers its final handshake before close' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114114:20: 0x3784b6f in test.same-IP mesh dial plaintext responder loser delivers its final handshake before close (root.zig)
+           const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .server_name = "aaa-local.test" });
+                          ^
+error: 'daemon.server.test.same-IP mesh dial secured responder loser retains armed ciphertext until send completion' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114173:20: 0x37735e8 in test.same-IP mesh dial secured responder loser retains armed ciphertext until send completion (root.zig)
+           const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .server_name = "aaa-local.test" });
+                          ^
+error: 'daemon.server.test.same-IP mesh dial blocked duplicate drain expires and Helix refuses its partial cut' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114246:20: 0x376f35c in test.same-IP mesh dial blocked duplicate drain expires and Helix refuses its partial cut (root.zig)
+           const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0 });
+                          ^
+error: 'daemon.server.test.same-IP mesh dial receive caller observes zero-output loser retirement by exact generation' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114322:24: 0x3766595 in test.same-IP mesh dial receive caller observes zero-output loser retirement by exact generation (root.zig)
+               const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .server_name = "zzz-local.test" });
+                              ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 replay' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114394:20: 0x3752965 in expectDrainingRouteUsesSurvivor (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114519:5: 0x3764769 in test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 replay (root.zig)
+           try expectDrainingRouteUsesSurvivor(.message_v2);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114394:20: 0x3752965 in expectDrainingRouteUsesSurvivor (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114522:5: 0x37646e9 in test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK (root.zig)
+           try expectDrainingRouteUsesSurvivor(.ack);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK_CONFIRM' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114394:20: 0x3752965 in expectDrainingRouteUsesSurvivor (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114525:5: 0x3764669 in test.same-IP mesh dial routing excludes draining loser for MESSAGE_V2 ACK_CONFIRM (root.zig)
+           try expectDrainingRouteUsesSurvivor(.ack_confirm);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114394:20: 0x3752965 in expectDrainingRouteUsesSurvivor (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114528:5: 0x37645e9 in test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK (root.zig)
+           try expectDrainingRouteUsesSurvivor(.e2ee_ack);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK_CONFIRM' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114394:20: 0x3752965 in expectDrainingRouteUsesSurvivor (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114531:5: 0x3764569 in test.same-IP mesh dial routing excludes draining loser for E2EEGROUP ACK_CONFIRM (root.zig)
+           try expectDrainingRouteUsesSurvivor(.e2ee_confirm);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser from Event Spine fanout' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114394:20: 0x3752965 in expectDrainingRouteUsesSurvivor (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114534:5: 0x37644e9 in test.same-IP mesh dial routing excludes draining loser from Event Spine fanout (root.zig)
+           try expectDrainingRouteUsesSurvivor(.oper_event);
+           ^
+error: 'daemon.server.test.same-IP mesh dial routing excludes draining loser from legacy message fanout' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114394:20: 0x3752965 in expectDrainingRouteUsesSurvivor (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114537:5: 0x3764469 in test.same-IP mesh dial routing excludes draining loser from legacy message fanout (root.zig)
+           try expectDrainingRouteUsesSurvivor(.legacy_message);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring peer cannot credit endpoint breaker' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114554:20: 0x3749de8 in expectRetiringSelectorUsesActivePeer (root.zig)
+           const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .server_name = "replay-a.test" });
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114605:5: 0x3751339 in test.same-IP mesh dial retiring peer cannot credit endpoint breaker (root.zig)
+           try expectRetiringSelectorUsesActivePeer(.dial_credit);
+           ^
+error: 'daemon.server.test.same-IP mesh dial SQUIT selects active survivor before retained loser' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114554:20: 0x3749de8 in expectRetiringSelectorUsesActivePeer (root.zig)
+           const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .server_name = "replay-a.test" });
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114609:5: 0x37512b9 in test.same-IP mesh dial SQUIT selects active survivor before retained loser (root.zig)
+           try expectRetiringSelectorUsesActivePeer(.squit);
+           ^
+error: 'daemon.server.test.same-IP mesh dial mid-turn retirement stops MODE publication' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114624:20: 0x3742d91 in expectRetirementStopsLaterFrameFamilies (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114724:5: 0x3749779 in test.same-IP mesh dial mid-turn retirement stops MODE publication (root.zig)
+           try expectRetirementStopsLaterFrameFamilies(.mode);
+           ^
+error: 'daemon.server.test.same-IP mesh dial mid-turn retirement stops SEARCH encoding' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114624:20: 0x3742d91 in expectRetirementStopsLaterFrameFamilies (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114728:5: 0x37496f9 in test.same-IP mesh dial mid-turn retirement stops SEARCH encoding (root.zig)
+           try expectRetirementStopsLaterFrameFamilies(.search);
+           ^
+error: 'daemon.server.test.same-IP mesh dial active frame-family control publishes MODE and SEARCH' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114624:20: 0x3742d91 in expectRetirementStopsLaterFrameFamilies (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114732:5: 0x3749149 in test.same-IP mesh dial active frame-family control publishes MODE and SEARCH (root.zig)
+           try expectRetirementStopsLaterFrameFamilies(.active_control);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot override the survivor nick home' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115000:5: 0x3741b09 in test.same-IP mesh dial retiring roster cannot override the survivor nick home (root.zig)
+           try expectRetiringRosterUsesSurvivor(.home);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot supply stale trusted account authority' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115003:5: 0x3741a89 in test.same-IP mesh dial retiring roster cannot supply stale trusted account authority (root.zig)
+           try expectRetiringRosterUsesSurvivor(.account);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot supply stale channel membership' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115006:5: 0x3741a09 in test.same-IP mesh dial retiring roster cannot supply stale channel membership (root.zig)
+           try expectRetiringRosterUsesSurvivor(.membership);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot grant stale channel status' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115009:5: 0x3741989 in test.same-IP mesh dial retiring roster cannot grant stale channel status (root.zig)
+           try expectRetiringRosterUsesSurvivor(.status);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster is absent from WHOIS identity and channels' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115012:5: 0x3741909 in test.same-IP mesh dial retiring roster is absent from WHOIS identity and channels (root.zig)
+           try expectRetiringRosterUsesSurvivor(.whois);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster is absent from LIST and NAMES projection' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115015:5: 0x3741889 in test.same-IP mesh dial retiring roster is absent from LIST and NAMES projection (root.zig)
+           try expectRetiringRosterUsesSurvivor(.projection);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot override current channel metadata' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115018:5: 0x3741809 in test.same-IP mesh dial retiring roster cannot override current channel metadata (root.zig)
+           try expectRetiringRosterUsesSurvivor(.channel_metadata);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster is absent from the active mesh user count' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115021:5: 0x3741789 in test.same-IP mesh dial retiring roster is absent from the active mesh user count (root.zig)
+           try expectRetiringRosterUsesSurvivor(.user_count);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster is absent from active INFO peers' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115024:5: 0x3741709 in test.same-IP mesh dial retiring roster is absent from active INFO peers (root.zig)
+           try expectRetiringRosterUsesSurvivor(.info);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot reject current signed MESSAGE_V2' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115027:5: 0x3741689 in test.same-IP mesh dial retiring roster cannot reject current signed MESSAGE_V2 (root.zig)
+           try expectRetiringRosterUsesSurvivor(.message_v2);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring roster cannot reject current signed E2EEGROUP' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:114756:20: 0x3716fb3 in expectRetiringRosterUsesSurvivorInOrder (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:114738:5: 0x373db15 in expectRetiringRosterUsesSurvivor (root.zig)
+           try expectRetiringRosterUsesSurvivorInOrder(operation, false);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115030:5: 0x373dc19 in test.same-IP mesh dial retiring roster cannot reject current signed E2EEGROUP (root.zig)
+           try expectRetiringRosterUsesSurvivor(.e2ee_group);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring plaintext roster expiration cannot publish or fold legacy PART' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115037:20: 0x370251c in expectRetiringPlainMaintenance (root.zig)
+           const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .node_id = 2 });
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:115155:5: 0x3714df9 in test.same-IP mesh dial retiring plaintext roster expiration cannot publish or fold legacy PART (root.zig)
+           try expectRetiringPlainMaintenance(false);
+           ^
+error: 'daemon.server.test.same-IP mesh dial retiring plaintext pending identity cannot publish NICK PART or fold legacy state' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115037:20: 0x370251c in expectRetiringPlainMaintenance (root.zig)
+           const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .node_id = 2 });
+                          ^
+       /home/kain/onyx-server/src/daemon/server.zig:115158:5: 0x3714739 in test.same-IP mesh dial retiring plaintext pending identity cannot publish NICK PART or fold legacy state (root.zig)
+           try expectRetiringPlainMaintenance(true);
+           ^
+error: 'daemon.server.test.same-IP mesh dial unknown inbound peer cannot claim another configured endpoint' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115170:20: 0x370131c in test.same-IP mesh dial unknown inbound peer cannot claim another configured endpoint (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+error: 'daemon.server.test.same-IP mesh dial binding requires the full secured key despite equal peer names' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115204:20: 0x36f7fc8 in test.same-IP mesh dial binding requires the full secured key despite equal peer names (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+error: 'daemon.server.test.same-IP mesh dial malformed carried endpoint is refused before slot or dial mutation' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:68782:5: 0x1fdc0f4 in createTestServer (root.zig)
+           try server.initInPlace(allocator, config);
+           ^
+       /home/kain/onyx-server/src/daemon/server.zig:115268:20: 0x36f3b37 in test.same-IP mesh dial malformed carried endpoint is refused before slot or dial mutation (root.zig)
+           const server = try createTestServer(alloc, .{
+                          ^
+error: 'daemon.server.test.threaded server: same-IP mesh dial partition heals after inbound binding and sequential Helix' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:117343:9: 0x357c37e in init (root.zig)
+               try server.initInPlace(allocator, config);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:118182:13: 0x368dabb in test.threaded server: same-IP mesh dial partition heals after inbound binding and sequential Helix (root.zig)
+           var a = try LiveUpgradeTestNode.init(alloc, config_a);
+                   ^
+error: 'daemon.server.test.threaded server: four-client reusable session and MARKREAD survive sequential Helix upgrades across secured mesh' failed:
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:64:18: 0x1fbcc9e in init_params (std.zig)
+               .PERM => return error.PermissionDenied,
+                        ^
+       /usr/local/lib/zig-0.17/lib/zig/std/os/linux/IoUring.zig:32:12: 0x1fbdd7b in init (std.zig)
+           return try IoUring.init_params(entries, &params);
+                  ^
+       /home/kain/onyx-server/src/daemon/ringlane.zig:169:28: 0x1fbe0b4 in init (root.zig)
+               return .{ .inner = try IoUring.init(entries, features.setupFlags()), .features = features };
+                                  ^
+       /home/kain/onyx-server/src/daemon/server.zig:4914:55: 0x1fc01f5 in initReactor (root.zig)
+                   if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
+                                                             ^
+       /home/kain/onyx-server/src/daemon/server.zig:5056:31: 0x1fc95b1 in initInPlaceWithAccountSource (root.zig)
+                   reactors[built] = try initReactor(allocator, shard_config, @intCast(built), reuse_port);
+                                     ^
+       /home/kain/onyx-server/src/daemon/server.zig:4963:9: 0x1fdbef4 in initInPlace (root.zig)
+               return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:117343:9: 0x357c37e in init (root.zig)
+               try server.initInPlace(allocator, config);
+               ^
+       /home/kain/onyx-server/src/daemon/server.zig:118362:17: 0x358603c in test.threaded server: four-client reusable session and MARKREAD survive sequential Helix upgrades across secured mesh (root.zig)
+           var node2 = try LiveUpgradeTestNode.init(alloc, node2_config);
+                       ^
+error: 'daemon.helix.live.test.mesh state pieces advertise ordinary overlap and exact property requirement' failed:
+       /home/kain/onyx-server/src/daemon/helix/handoff.zig:118:17: 0x3001cf7 in socketPair (root.zig)
+               else => return error.SocketPairFailed,
+                       ^
+       /home/kain/onyx-server/src/daemon/helix/supervisor.zig:184:24: 0x3001b19 in initControl (root.zig)
+               self.control = try handoff.socketPair();
+                              ^
+       /home/kain/onyx-server/src/daemon/helix/live.zig:194:5: 0x2fff537 in prepare (root.zig)
+           try runtime.initControl();
+           ^
+       /home/kain/onyx-server/src/daemon/helix/live.zig:1000:20: 0x2ffbf5c in test.mesh state pieces advertise ordinary overlap and exact property requirement (root.zig)
+           var prepared = try prepare(allocator, .{
+                          ^
+failed command: ./.zig-cache/o/1249bc85f290bde0ac06b1d9c8782efa/test --cache-dir=./.zig-cache --seed=0x61a27c0d --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 607/694 tests passed (51 skipped, 36 failed)
+test-mesh transitive failure
++- run test 607 pass, 51 skip, 36 fail (694 total)
+

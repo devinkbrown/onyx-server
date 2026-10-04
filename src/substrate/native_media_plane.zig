@@ -38,6 +38,39 @@ pub fn NativeMediaPlane(comptime max_participants: usize) type {
         sel_vals: [max_participants]Selection = undefined,
         sel_len: usize = 0,
 
+        pub const Snapshot = struct {
+            session: media.Session(max_participants).Snapshot = .{},
+            sel_ids: [max_participants]ParticipantId = @splat(.{}),
+            sel_vals: [max_participants]Selection = @splat(.{}),
+            sel_len: usize = 0,
+
+            pub fn validate(self: *const Snapshot) error{InvalidSnapshot}!void {
+                try self.session.validate();
+                if (self.sel_len > max_participants) return error.InvalidSnapshot;
+                for (self.sel_ids[0..self.sel_len], 0..) |id, i| {
+                    try media.validateParticipantId(id);
+                    for (self.sel_ids[0..i]) |prior| if (prior.eql(&id)) return error.InvalidSnapshot;
+                }
+                // Selection can outlive roster membership; preserve it exactly.
+                for (self.sel_ids[self.sel_len..]) |id| if (!std.meta.eql(id, ParticipantId{})) return error.InvalidSnapshot;
+                for (self.sel_vals[self.sel_len..]) |selection| if (!std.meta.eql(selection, Selection{})) return error.InvalidSnapshot;
+            }
+        };
+
+        pub fn capture(self: *const Self) error{InvalidSnapshot}!Snapshot {
+            if (self.sel_len > max_participants) return error.InvalidSnapshot;
+            var snapshot: Snapshot = .{ .session = try self.session.capture(), .sel_len = self.sel_len };
+            @memcpy(snapshot.sel_ids[0..self.sel_len], self.sel_ids[0..self.sel_len]);
+            @memcpy(snapshot.sel_vals[0..self.sel_len], self.sel_vals[0..self.sel_len]);
+            try snapshot.validate();
+            return snapshot;
+        }
+
+        pub fn prepareRestore(snapshot: *const Snapshot) error{InvalidSnapshot}!Self {
+            try snapshot.validate();
+            return .{ .session = try media.Session(max_participants).prepareRestore(&snapshot.session), .sel_ids = snapshot.sel_ids, .sel_vals = snapshot.sel_vals, .sel_len = snapshot.sel_len };
+        }
+
         pub fn init() Self {
             return .{ .session = media.Session(max_participants).init() };
         }
@@ -156,4 +189,30 @@ test "leave removes a participant from the forward set" {
     try testing.expectEqual(@as(usize, 1), plane.forward(pid("a"), .voice, 0, 0, false, &out));
     try plane.leave(pid("b"), .voice);
     try testing.expectEqual(@as(usize, 0), plane.forward(pid("a"), .voice, 0, 0, false, &out));
+}
+
+test "active media DTO native plane retains orphan layer selection and forwarding" {
+    const P = NativeMediaPlane(4);
+    var old = P.init();
+    try old.join(pid("source"), .video);
+    try old.join(pid("receiver"), .video);
+    old.setSelection(pid("receiver"), .{ .max_spatial = 1, .max_temporal = 2 });
+    old.setSelection(pid("orphan"), .{ .max_spatial = 0, .max_temporal = 0 });
+    const carry = try old.capture();
+    var candidate = try P.prepareRestore(&carry);
+    try testing.expectEqualDeep(carry, try candidate.capture());
+    var a: [4]ParticipantId = undefined;
+    var b: [4]ParticipantId = undefined;
+    const an = old.forward(pid("source"), .video, 2, 0, false, &a);
+    const bn = candidate.forward(pid("source"), .video, 2, 0, false, &b);
+    try testing.expectEqualSlices(ParticipantId, a[0..an], b[0..bn]);
+    try candidate.join(pid("orphan"), .video);
+    try testing.expectEqualDeep(Selection{ .max_spatial = 0, .max_temporal = 0 }, candidate.selectionOf(pid("orphan")));
+    var bad = carry;
+    bad.sel_len = 5;
+    try testing.expectError(error.InvalidSnapshot, P.prepareRestore(&bad));
+    bad = carry;
+    bad.sel_ids[1] = bad.sel_ids[0];
+    try testing.expectError(error.InvalidSnapshot, P.prepareRestore(&bad));
+    try testing.expectEqualDeep(carry, try old.capture());
 }

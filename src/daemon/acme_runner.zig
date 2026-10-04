@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const dlog = @import("dlog.zig");
 
 const tls_client = @import("../crypto/tls_client.zig");
+const tls_client_failure = @import("tls_client_failure.zig");
 const http1 = @import("../proto/http1_client.zig");
 const acme = @import("acme_client.zig");
 const http01 = @import("acme_http01_server.zig");
@@ -148,7 +149,10 @@ pub fn httpsRequest(
     var read_buf: [max_tls_record]u8 = undefined;
     while (!tc.handshakeDone()) {
         const n = try readSome(fd, &read_buf);
-        switch (try tc.feed(read_buf[0..n])) {
+        switch (tc.feed(read_buf[0..n]) catch |err| {
+            tls_client_failure.sendFatal(fd, &tc, err);
+            return err;
+        }) {
             .need_more => {},
             .bytes_to_send => |out| {
                 defer allocator.free(out);
@@ -182,7 +186,10 @@ pub fn httpsRequest(
                 // A trailing alert (close_notify, sent with Connection: close)
                 // ends the stream; the HTTP response we already have is final.
                 error.TlsAlert => break :read_loop,
-                else => return err,
+                else => {
+                    tls_client_failure.sendFatal(fd, &tc, err);
+                    return err;
+                },
             };
             switch (read) {
                 .application_data => |pt| {
@@ -1087,4 +1094,10 @@ test "queryOneServer6 round-trips an A record against a ::1 DNS responder" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "TLS client fatal transport: acme_runner socket writer preserves control custody" {
+    // Unix-socketpair proof; no `socketpair` on Windows.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try tls_client_failure.testFatalTransportProof(true, writeAll);
 }

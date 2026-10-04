@@ -65,6 +65,7 @@ pub fn handle(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void 
             return;
         }
         try self.mediaOffer(
+            id,
             conn,
             channel,
             if (parsed.param_count >= 3) parsed.paramSlice()[2] else "",
@@ -74,6 +75,7 @@ pub fn handle(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void 
     }
     if (std.ascii.eqlIgnoreCase(sub, "ANSWER")) {
         try self.mediaAnswer(
+            id,
             conn,
             channel,
             if (parsed.param_count >= 3) parsed.paramSlice()[2] else "",
@@ -486,35 +488,7 @@ pub fn handle(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void 
             try self.failReply(conn, "MEDIA", "TX_DENIED", "Media transmission is disabled for your session");
             return;
         }
-        const physical = self.addMediaPhysicalAttachment(id, channel, nick, kind) catch {
-            try self.failReply(conn, "MEDIA", "JOIN_FAILED", "Could not join the call");
-            return;
-        };
-        if (!physical.changed) return;
-        self.media_rooms.join(channel, nick, kind) catch {
-            self.rollbackMediaPhysicalKind(id, channel, nick, kind);
-            try self.failReply(conn, "MEDIA", "JOIN_FAILED", "Could not join the call");
-            return;
-        };
-        if (self.media_physical_attachments.items.len == 1 or physical.first_kind) conn.clearMediaE2eeAttachment();
-        if (physical.first_kind) try self.broadcastMediaEvent(channel, "JOIN", nick, kname);
-        if (physical.first_kind) {
-            if (self.media_rooms.recordingOf(channel)) |rec| {
-                if (rec.active and !self.media_rooms.hasConsent(channel, nick)) {
-                    _ = self.media_rooms.stopRecording(channel);
-                    try self.broadcastMediaEvent(channel, "RECORD", nick, "stopped");
-                    try self.sendMediaEventReply(conn, "RECORD", channel, "stopped");
-                }
-            }
-        }
-        // Era 3 C3: closed-tab call invite for co-channel members not yet in media.
-        if (physical.first_kind) self.webpushNotifyCallInvite(channel, nick);
-        // WS media plane: bind this connection to the call and hand it the
-        // per-stream MAC key so its browser can authenticate each datagram.
-        if (self.config.ws_media_relay and conn.ws != null) {
-            conn.setMediaCall(channel, nick);
-            if (conn.mediaCallChannel() != null) self.issueMediaMacKey(conn, channel, nick);
-        }
+        return self.mediaJoinJoined(id, conn, channel, kind);
     } else if (std.ascii.eqlIgnoreCase(sub, "MUTE")) {
         if (self.media_rooms.setMuted(channel, nick, kind, true))
             try self.broadcastMediaEvent(channel, "MUTE", nick, kname)

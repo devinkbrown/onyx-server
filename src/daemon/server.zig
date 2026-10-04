@@ -208,6 +208,7 @@ const channel_mode_state_event = @import("../proto/channel_mode_state_event.zig"
 const usermode = @import("../proto/usermode.zig");
 const content_filter_mod = @import("content_filter.zig");
 const media_room = @import("media_room.zig");
+const media_routing = @import("../substrate/media_routing.zig");
 const media_plane_mod = @import("media_plane.zig");
 const dtls_fingerprint_mod = @import("../proto/dtls_fingerprint.zig");
 const dtls_peer_verify_mod = @import("../proto/dtls_peer_verify.zig");
@@ -343,6 +344,45 @@ fn bridgeOnRtcpFeedback(ctx: *anyopaque, channel: []const u8, rtcp: []const u8) 
     var sctx = BridgeSendCtx{ .server = self, .channel = channel };
     return br.fanoutRtcpFeedbackToNative(rtcp, &sctx, bridgeSendFeedbackToNative);
 }
+
+/// Builtin-test-only adapter for the actual Server native-media callback. A
+/// supplied real transport is temporarily moved into a fully constructed NEW
+/// Server, then restored before either owner tears down its resources.
+pub const MediaBridgeFixture = if (builtin.is_test) struct {
+    pub fn nativeToWebrtc(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        plane: *media_plane_mod.MediaPlane,
+        channel: []const u8,
+        source_id: []const u8,
+        source: media_bridge_mod.Member,
+        recipient_id: []const u8,
+        recipient: media_bridge_mod.Member,
+        datagram: []const u8,
+    ) anyerror!void {
+        // A moved worker context would break its stable-address borrow. This
+        // fixture only owns a synchronous stopped transport with real crypto.
+        if (plane.thread != null or plane.runtime.slot != null or
+            plane.runtime.entered.load(.acquire) or plane.runtime.exited.load(.acquire))
+            return error.ActiveMediaFixture;
+        const server = try allocator.create(LinuxServer);
+        defer allocator.destroy(server);
+        try server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 2, .crypto_io = io });
+        defer server.deinit();
+        std.mem.swap(media_plane_mod.MediaPlane, &server.media_plane, plane);
+        defer std.mem.swap(media_plane_mod.MediaPlane, &server.media_plane, plane);
+        var bridge = Bridge.init();
+        try bridge.register(source_id, source);
+        try bridge.register(recipient_id, recipient);
+        const owned_channel = try allocator.dupe(u8, channel);
+        errdefer allocator.free(owned_channel);
+        try server.media_bridges.put(allocator, owned_channel, bridge);
+        // Exactly the callback installed on the real native transport; no test
+        // routing verdict, direct crypto mutation or synthetic send is supplied.
+        bridgeOnNativeFrame(server, channel, datagram);
+    }
+} else struct {};
+
 const memo_mod = @import("memo.zig");
 const raid_shield = @import("raid_shield.zig");
 const webpush_mod = @import("webpush.zig");
@@ -368,6 +408,8 @@ const node_identity = @import("node_identity.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
 const secured_s2s_link = @import("secured_s2s_link.zig");
 const tls_conn = @import("tls_conn.zig");
+const ktls = @import("ktls.zig");
+const tls_record = @import("../crypto/tls_record.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 const rsa_sign = @import("../crypto/rsa_sign.zig");
 const reactor_wake = @import("reactor_wake.zig");
@@ -382,6 +424,7 @@ const conn_class = @import("conn_class.zig");
 const flood_guard = @import("flood_guard.zig");
 const og_mod = @import("operator_groups.zig");
 const config_format = @import("config_format.zig");
+const delivery_authority = @import("delivery_authority.zig");
 const tls_certs = @import("tls_certs.zig");
 const x509_verify = @import("../crypto/x509_verify.zig");
 const services_mod = @import("services.zig");
@@ -893,6 +936,7 @@ const io_backend = @import("io_backend.zig");
 const reactor_backend = @import("reactor_backend.zig");
 const os_runtime = @import("os_runtime.zig");
 const sendq = @import("sendq.zig");
+const ws_output = @import("ws_output.zig");
 const search_cmd = @import("search_cmd.zig");
 const media_cmd = @import("media_cmd.zig");
 const oper_cmd = @import("oper_cmd.zig");
@@ -2392,6 +2436,9 @@ pub const ConnState = struct {
     /// RECV completion clears this latch.
     recv_armed: bool = false,
     send_armed: bool = false,
+    /// Exact successful submission length, released only by its matching CQE.
+    send_submitted_len: usize = 0,
+    send_submitted_offset: usize = 0,
     /// Declared in-memory fixture sink; no descriptor or kernel ownership.
     /// The field and arm bypass are absent from daemon builds.
     test_sendq_capture: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
@@ -2426,6 +2473,26 @@ pub const ConnState = struct {
     /// The kernel never reads this directly (only the fixed inline `send_buf`),
     /// so the zero-copy send is never reading a buffer that could move/free.
     send_overflow: std.ArrayListUnmanaged(u8) = .empty,
+    /// Exact already-framed application chunks held behind a software TLS KU.
+    /// They share the physical SendQ cap and are never submitted as wire bytes.
+    tls_deferred_plain: std.ArrayList(u8) = .empty,
+    tls_deferred_charge: usize = 0,
+    tls_control_charge: usize = 0,
+    /// Frozen old plaintext prefix; suffix appends never extend this cursor.
+    tls_kernel_prefix_remaining: u64 = 0,
+    /// Terminal kernel alert is typed control, never software ciphertext.
+    tls_alert_pending: bool = false,
+    tls_alert_bytes: [2]u8 = @splat(0),
+    tls_alert_sent: u2 = 0,
+    tls_discard_unsent: bool = false,
+    /// Explicit abort disposition; a healthy close-after delivery still drains
+    /// its admitted control and application FIFO before ordinary final teardown.
+    tls_terminal_failure: bool = false,
+    /// Turn-local guards: no nested protocol progress or hot capture while a
+    /// borrowed Outcome is being dispatched. They never survive a safe point.
+    tls_ingress_active: bool = false,
+    tls_progress_active: bool = false,
+
     /// Per-connection SendQ ceiling = (inline-queued + overflow) cap, from the
     /// matched connection class. Set at registration; a generous default covers
     /// the pre-registration window. (Hot-path duplicate of `class_policy.sendq`.)
@@ -2443,9 +2510,8 @@ pub const ConnState = struct {
     /// change token balances, so the oper explanation reads this alongside
     /// the snapshot. It dies with the connection.
     last_flood: flood_guard.Decision = .allow,
-    /// Allocator backing `send_overflow` (the owning reactor's). `undefined` on a
-    /// test-only `ConnState.init(-1)`; only touched once overflow is non-empty,
-    /// which such conns never reach.
+    /// Owning reactor allocator for overflow, WS staging and typed TLS output.
+    /// Every live constructor initializes it before application publication.
     overflow_allocator: std.mem.Allocator = undefined,
     closing: bool = false,
     /// A cross-shard handoff for this exact connection generation developed a
@@ -3183,6 +3249,9 @@ const Reactor = struct {
     wake: ?reactor_wake.ReactorWake = null,
     wake_armed: bool = false,
     wake_count: std.atomic.Value(u32) = .init(0),
+    /// Published only after this actual owner completes a successful backend
+    /// loop turn. A Gate arrival/release is not an activation acknowledgment.
+    runtime_activated: std.atomic.Value(bool) = .init(false),
 
     /// Fair, generation-safe cursor for bounded post-Helix socket activation.
     /// Only the slot index is retained across turns; every scan revalidates the
@@ -3263,6 +3332,54 @@ const Reactor = struct {
 /// `boundPort`), where `rx()` falls back to the single embedded reactor — which is
 /// the same pointer in the single-reactor configuration, so the fallback is exact.
 threadlocal var current_reactor: ?*Reactor = null;
+
+// Only the actual registered MEDIA dispatch owns this thread-local stack turn.
+// It is not retained in public Server/ConnState or returned to module callers.
+threadlocal var current_media_authority_turn: ?*MediaAuthorityTurn = null;
+
+const MediaAuthorityTurn = struct {
+    server: *LinuxServer,
+    id: client_model.ClientId,
+    conn: *ConnState,
+    action: Action,
+    channel: []const u8,
+    capture: *ReplyCapture,
+    label_storage: [labeled_response.MAX_LABEL_LEN]u8 = @splat(0),
+    label_len: usize = 0,
+    // Written only by the concrete joined handler after actual output and all
+    // authority candidates publish. This dispatch bookkeeping grants no receipt.
+    published: bool = false,
+
+    const Action = enum { offer, answer, join };
+
+    fn selected(parsed: *const irc_line.LineView) ?Action {
+        if (!std.ascii.eqlIgnoreCase(parsed.command, "MEDIA") or parsed.param_count < 2) return null;
+        const sub = parsed.paramSlice()[0];
+        if (std.ascii.eqlIgnoreCase(sub, "OFFER")) return .offer;
+        if (std.ascii.eqlIgnoreCase(sub, "ANSWER")) return .answer;
+        if (std.ascii.eqlIgnoreCase(sub, "JOIN")) return .join;
+        return null;
+    }
+
+    fn label(self: *const MediaAuthorityTurn) ?[]const u8 {
+        return if (self.label_len == 0) null else self.label_storage[0..self.label_len];
+    }
+
+    fn require(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState, action: Action, channel: []const u8) !*MediaAuthorityTurn {
+        const self = current_media_authority_turn orelse return error.BadState;
+        if (self.server != server or !self.id.eql(id) or self.conn != conn or
+            self.action != action or !std.ascii.eqlIgnoreCase(self.channel, channel) or
+            self.published or conn.reply_capture != self.capture) return error.BadState;
+        try server.requireMediaCaller(id, conn, channel);
+        return self;
+    }
+
+    fn requireEmptyIssuer(self: *const MediaAuthorityTurn) !void {
+        if (current_media_authority_turn != self or self.published or
+            self.conn.reply_capture != self.capture or self.capture.overflowed or
+            self.capture.len != 0) return error.BadState;
+    }
+};
 // Test-only final-edge allocator tripwire. Production never assigns these;
 // the guarded writes compile to no work outside a test artifact.
 threadlocal var test_dprop_commit_fail_index: ?*usize = null;
@@ -3368,12 +3485,12 @@ fn disabledFeaturePresent(features: []const []const u8, needle: []const u8) bool
     return false;
 }
 
-fn runtimeDisabledFeatures(allocator: std.mem.Allocator, config: Config) !RuntimeFeatureConfig {
+fn runtimeDisabledFeatures(allocator: std.mem.Allocator, config: Config, accounts_available: bool) !RuntimeFeatureConfig {
     // Conditionally hide feature-gated commands. Each appended tag makes every
     // `CommandSpec` with that `.feature` return `.disabled` (→ 421), so the
     // WEBHOOK command is invisible unless `[webhook] enabled` is set — keeping a
     // webhook-off daemon byte-identical to one built without the feature.
-    const need_accounts = config.account_services == null and
+    const need_accounts = !accounts_available and
         !disabledFeaturePresent(config.disabled_features, "accounts");
     const need_webhook = !config.webhook_enabled and
         !disabledFeaturePresent(config.disabled_features, "webhook");
@@ -3397,6 +3514,24 @@ fn runtimeDisabledFeatures(allocator: std.mem.Allocator, config: Config) !Runtim
     }
     out.disabled_features = merged;
     return .{ .config = out, .owned_disabled_features = merged };
+}
+
+/// One normalization path for ordinary Server construction and the private
+/// managed policy stage. Managed account availability is derived from validated
+/// constructor inputs before the actual Services object exists.
+fn normalizeServerPolicy(allocator: std.mem.Allocator, raw: Config, accounts_available: bool) !RuntimeFeatureConfig {
+    var staged = try runtimeDisabledFeatures(allocator, raw, accounts_available);
+    errdefer if (staged.owned_disabled_features) |owned| allocator.free(owned);
+    const config = &staged.config;
+    if ((config.ocg2_runtime == null) != (config.ocg2_runtime_monotonic_origin_ms == null) or
+        (config.ocg2_projection == null) != (config.ocg2_projection_origin_ms == null) or
+        (config.ocg2_projection != null and config.ocg2_audit == null)) return error.InvalidOcg2RuntimeClock;
+    // Every producer and secured route must use the configured identity's
+    // canonical routing handle. Managed staging additionally proves the full
+    // key and cached node ID before any Services or listener construction.
+    if (config.node_identity) |identity| config.node_id = identity.shortId();
+    if (config.server_name.len == 0) config.server_name = server_name;
+    return staged;
 }
 
 fn appendSaslInfoMech(out: []u8, len: *usize, name: []const u8) error{OutputTooSmall}!void {
@@ -3763,6 +3898,48 @@ const OutboundWebhook = struct {
     mask: event_spine.CategoryMask,
 };
 
+/// Exact output candidates owned before one Webpush overflow event accepts.
+/// Subscription edits cannot replace a retained destination or signing secret.
+const WebpushOverflowDelivery = struct {
+    origin: []u8,
+    origin_node: u64,
+    hlc: u64,
+    event_id: ?oper_event.EventId = null,
+    public_key: [oper_event.pubkey_len]u8 = undefined,
+    signature: [oper_event.sig_len]u8 = undefined,
+    body: [1024]u8 = undefined,
+    body_len: usize = 0,
+    destinations: [outbound_webhook_slots]?OutboundWebhook = @splat(null),
+    next_destination: usize = 0,
+    fanout_published: bool = false,
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.origin);
+        for (self.destinations) |destination| if (destination) |owned| {
+            allocator.free(owned.url);
+            std.crypto.secureZero(u8, owned.secret);
+            allocator.free(owned.secret);
+        };
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+    fn event(self: *const @This()) oper_event.SignedOperEventV2 {
+        return .{
+            .category = @intFromEnum(event_spine.EventCategory.service),
+            .severity = @intFromEnum(event_spine.EventSeverity.warn),
+            .origin_node = self.origin_node,
+            .hlc = self.hlc,
+            .origin_server = self.origin,
+            .subject = webpush_mod.overflow_oper_message,
+            .message = webpush_mod.overflow_oper_message,
+            .origin_pubkey = &self.public_key,
+            .origin_sig = &self.signature,
+        };
+    }
+};
+const webpush_overflow_delivery_slots: usize = 8;
+
+const RuntimePhase = enum(u8) { idle, resources, workers, published, joined };
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -3935,8 +4112,23 @@ pub const LinuxServer = struct {
     mooring_breaker_logs: u64 = 0,
     /// Cross-shard outbound delivery fabric (per-shard mailbox + wake + shared
     /// pool). Null in the single-reactor configuration (no cross-shard handoff is
-    /// ever needed); allocated by `runThreaded` when `reactors.len > 1`.
+    /// ever needed); prepared before any startup worker or native READY.
     fabric: ?reactor_fabric.ReactorFabric = null,
+    /// Source-owned startup phase. Gate validates actual OS-thread arrivals;
+    /// these scalars alone are never configured-owner/service-ready authority.
+    runtime_phase: std.atomic.Value(RuntimePhase) = .init(.idle),
+    /// Borrowed observation only. Runtime/standalone caller owns the distinct
+    /// Control, and must join its handles before this graph can detach/free.
+    runtime_gate: ?*const reactor_pool_mod.runtime_start_gate.View = null,
+    // Only the closed, unpublished Core factory installs these original
+    // opaque owners. Legacy account_services never aliases private Services.
+    leased_authority: ?*delivery_authority.Authority = null,
+    leased_services: ?*delivery_authority.ServicesLoan = null,
+    runtime_io: ?std.Io = null,
+    /// Captured at construction, before adopt consumes its input descriptors.
+    /// Cold disk replay must never overwrite an inherited semantic image.
+    runtime_inherited_image: bool = false,
+    configured_cold_resources_prepared: bool = false,
     /// Worker-thread pool that owns the per-shard reactor threads while
     /// `runThreaded` runs the multi-reactor topology. Idle in single-reactor mode.
     pool: reactor_pool_mod.ReactorPool(*LinuxServer),
@@ -4394,6 +4586,7 @@ pub const LinuxServer = struct {
     native_media: native_media_mod.NativeMediaTransport,
     /// Per-channel cross-leg bridge roster (native ↔ opt-in WebRTC). Consulted by
     /// the native pump's cross-leg sink; guarded by `media_bridges_mu`.
+    media_routing_owner: ?*OwnedMediaRouting = null,
     media_bridges: std.StringHashMapUnmanaged(Bridge) = .empty,
     media_bridges_mu: std.atomic.Mutex = .unlocked,
     /// Memo: per-account offline messages, delivered on next login.
@@ -4531,6 +4724,9 @@ pub const LinuxServer = struct {
     ocg2_runtime_terminal_logged: bool = false,
     /// Web Push delivery worker (borrowed; owned by main; null = disabled).
     webpush_worker: ?*webpush_mod.Worker = null,
+    /// Accepted downstream outputs remain here until source fanout and every
+    /// configured HTTP destination returns a real 2xx response.
+    webpush_overflow_deliveries: [webpush_overflow_delivery_slots]?WebpushOverflowDelivery = @splat(null),
     /// Monotonic millis captured at init, for STATS u uptime.
     start_ms: i64 = 0,
     /// Wall-clock Unix seconds captured at init, for the registration 003
@@ -4764,7 +4960,18 @@ pub const LinuxServer = struct {
         allocator: std.mem.Allocator,
         raw_config: Config,
     ) !void {
+        return self.initInPlaceWithAccountSource(allocator, raw_config, null);
+    }
+
+    fn initInPlaceWithAccountSource(self: *LinuxServer, allocator: std.mem.Allocator, raw_config: Config, stage: ?*ManagedLeasedCoreStage) !void {
         if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+
+        const accounts_available = if (stage) |source| blk: {
+            const b = managedLeasedStageBacking(source).core;
+            try source.requireOriginalSources(b.leased_authority orelse return error.ConfiguredOwnerMismatch, b.leased_loan);
+            if (raw_config.account_services != null) return error.InvalidAccountBinding;
+            break :blk true;
+        } else raw_config.account_services != null;
 
         const self_pidfd: linux.fd_t = if (comptime builtin.os.tag == .linux)
             try kernel_linux.openSelfPidfd()
@@ -4784,23 +4991,9 @@ pub const LinuxServer = struct {
         // Server but never call installUpgradeSignalHandler). Idempotent + global.
         ignoreSigpipe();
 
-        const runtime_features = try runtimeDisabledFeatures(allocator, raw_config);
+        const runtime_features = try normalizeServerPolicy(allocator, raw_config, accounts_available);
         errdefer if (runtime_features.owned_disabled_features) |owned| allocator.free(owned);
-        var config = runtime_features.config;
-        if ((config.ocg2_runtime == null) != (config.ocg2_runtime_monotonic_origin_ms == null))
-            return error.InvalidOcg2RuntimeClock;
-        if ((config.ocg2_projection == null) != (config.ocg2_projection_origin_ms == null))
-            return error.InvalidOcg2RuntimeClock;
-        if (config.ocg2_projection != null and config.ocg2_audit == null)
-            return error.InvalidOcg2RuntimeClock;
-        // A secured mesh identifies nodes by the self-certified short id of the
-        // configured key.  `[node].id` predates that identity and is still useful
-        // for plaintext deployments, but letting it remain the runtime mesh id
-        // makes every locally-authored MESSAGE unsigned: peers verify the key's
-        // short id while the message claims the unrelated configured integer.
-        // Canonicalize once at the Server boundary so every producer, route,
-        // dedup key, and secured-link handshake observes the same node handle.
-        if (config.node_identity) |ident| config.node_id = ident.shortId();
+        const config = runtime_features.config;
         const durable_plan = try validateDurableDeviceBoot(config);
         try validateMeshAdmissionSecurity(config);
         const boot_unix = @divTrunc(platform.realtimeMillis(), 1000);
@@ -5041,8 +5234,25 @@ pub const LinuxServer = struct {
         var raid_state = try raid_shield.Shield.init(allocator);
         errdefer raid_state.deinit();
 
+        // These tables allocate backing storage. Build every fallible leaf
+        // before publishing self so OOM refunds the unopened NEW graph instead
+        // of panicking with a partially initialized Server.
+        var thread_store = try thread_snapshot.Table.init(allocator);
+        errdefer thread_store.deinit();
+        var schedule_store = try schedule_snapshot.Table.init(allocator);
+        errdefer schedule_store.deinit();
+        var appeal_store = try appeal.Table.init(allocator);
+        errdefer appeal_store.deinit();
+        var first_hold_store = try first_hold.Table.init(allocator);
+        errdefer first_hold_store.deinit();
+        var slash_store = try slash_cmd.Table.init(allocator);
+        errdefer slash_store.deinit();
+        var prepared_media_plane = try media_plane_mod.MediaPlane.initFallible(allocator);
+        errdefer prepared_media_plane.deinit();
+
         self_pidfd_owned = false;
         self.* = .{
+            .runtime_inherited_image = config.resume_arena_fd != null or config.native_arena_bytes != null or config.inherited_state_fd_manifest_present,
             .allocator = allocator,
             .config = config,
             .owned_disabled_features = runtime_features.owned_disabled_features,
@@ -5092,11 +5302,11 @@ pub const LinuxServer = struct {
             .observe = observe_mod.Registry.init(allocator, .{}),
             .oper_motd = oper_motd_mod.OperMotd.init(allocator),
             .bot_registry = bot_registry_mod.BotRegistry.init(allocator),
-            .threads = thread_snapshot.Table.init(allocator) catch unreachable,
-            .schedules = schedule_snapshot.Table.init(allocator) catch unreachable,
-            .appeals = appeal.Table.init(allocator) catch unreachable,
-            .first_holds = first_hold.Table.init(allocator) catch unreachable,
-            .slash_cmds = slash_cmd.Table.init(allocator) catch unreachable,
+            .threads = thread_store,
+            .schedules = schedule_store,
+            .appeals = appeal_store,
+            .first_holds = first_hold_store,
+            .slash_cmds = slash_store,
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
@@ -5176,7 +5386,7 @@ pub const LinuxServer = struct {
                 .max_participants = config.media_max_participants,
                 .max_breakout_bytes = config.media_sfu_max_breakout_label_bytes,
             }),
-            .media_plane = media_plane_mod.MediaPlane.init(allocator),
+            .media_plane = prepared_media_plane,
             .native_media = native_media_mod.NativeMediaTransport.initConfig(allocator, config.media_max_participants),
             .memo = memo_mod.MemoBox.initWithConfig(allocator, config.memo_config),
             .memo_forward = svc_memo_forward.MemoForwardStore.init(allocator),
@@ -5222,6 +5432,8 @@ pub const LinuxServer = struct {
     /// (called by main after construction; init() returns by value so `self`
     /// is not stable inside it).
     pub fn start(self: *LinuxServer) void {
+        if (self.configured_cold_resources_prepared)
+            @panic("legacy startup cannot spawn behind the configured runtime Gate");
         self.bindFlightPanicTarget();
         // An inherited arena is an unpublished authoritative image. Starting
         // webhook/media/metrics workers before it is adopted lets off-reactor
@@ -5249,51 +5461,396 @@ pub const LinuxServer = struct {
         // Restore the Event Spine history ring (EVENT REPLAY) the same way.
         self.restoreEventHistoryAtStart();
         if (self.config.media_enabled) {
-            const frame_cap: usize = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, media_plane_mod.max_datagram)));
-            self.media_plane.max_frame_bytes = frame_cap;
-            self.media_plane.max_upload_bytes = self.config.media_max_upload_bytes;
-            self.native_media.max_frame_bytes = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, native_media_mod.max_datagram)));
-            self.native_media.max_upload_bytes = self.config.media_max_upload_bytes;
-            self.native_media.configureMac(&self.native_stream_key, self.config.native_media_require_mac);
-            // Optional STUN-based reflexive-candidate discovery at boot (before the
-            // pump thread starts). Configured as an IPv4 literal + port.
-            if (self.config.media_stun_port != 0) {
-                if (parseIp4(self.config.media_stun_host)) |ip4| {
-                    self.media_plane.stun_server = media_plane_mod.TransportAddress.fromBytes(&ip4, self.config.media_stun_port) catch null;
-                }
-            }
-
-            // Bring the native media transport online (our own CadenceVox/CadenceVis codec
-            // leg). Independent of the WebRTC plane below; a bind failure logs and
-            // the daemon keeps serving IRC.
-            self.native_media.start(native_media_mod.any_be, self.config.native_media_port) catch |e| {
-                srvLog("onyx-server: native media transport disabled ({s})\n", .{@errorName(e)});
+            self.startMediaRoutingLegacy() catch |err| {
+                srvLog("onyx-server: media routing disabled ({s})\n", .{@errorName(err)});
             };
-            if (self.native_media.port != 0) {
-                srvLog("onyx-server: native media on UDP :{d} (codec CadenceVox/CadenceVis)\n", .{self.native_media.port});
-                // Bridge native frames to any opt-in WebRTC members of each channel.
-                self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame, .on_native_feedback = bridgeOnNativeFeedback });
-            }
-
-            // Opt-in DTLS-SRTP termination (RFC 5764). Off = byte-identical pump.
-            self.media_plane.dtls_enabled = self.config.media_dtls_srtp;
-            // Independent opt-in for the DTLS 1.3 (RFC 9147) engine.
-            self.media_plane.dtls13_enabled = self.config.media_dtls13;
-
-            // Bring the media transport plane online (bind UDP + pump thread). Media
-            // is optional: a bind failure logs and the daemon keeps serving IRC.
-            self.media_plane.start(media_plane_mod.any_be, self.config.media_port) catch |e| {
-                srvLog("onyx-server: media plane disabled ({s})\n", .{@errorName(e)});
-                return;
+        } else {
+            // WS call membership is independent of UDP configuration. This
+            // owns actual empty typed sources, not a fake UDP readiness row.
+            self.prepareMediaRoutingOwner() catch |err| {
+                srvLog("onyx-server: media membership unavailable ({s})\n", .{@errorName(err)});
             };
-            var host_buf: [16]u8 = undefined;
-            const cand = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
-            srvLog("onyx-server: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
-            // Bridge WebRTC RTP frames to any native members of each channel.
-            self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame, .on_rtcp_feedback = bridgeOnRtcpFeedback });
         }
         self.startMetrics();
         self.startWebhook();
+    }
+
+    /// Actual source resources have been prepared at this final Server address.
+    /// Bind both typed owners and fund the complete fixed FIFO before any pump.
+    fn prepareMediaRoutingOwner(self: *LinuxServer) !void {
+        if (self.media_routing_owner != null) return error.RuntimeAlreadyPrepared;
+        const owned = try self.allocator.create(MediaRoutingBacking);
+        errdefer self.allocator.destroy(owned);
+        const domain = try media_routing.Domain.create(self.allocator);
+        errdefer domain.destroyQuiesced() catch @panic("failed routing construction retained a source row");
+        const native_binding = try domain.bindNative(&self.native_media);
+        errdefer domain.releaseNative(native_binding) catch @panic("failed routing construction retained Native custody");
+        const webrtc_binding = try domain.bindWebrtc(&self.media_plane);
+        errdefer domain.releaseWebrtc(webrtc_binding) catch @panic("failed routing construction retained WebRTC custody");
+        // This is a finite, funded admission bound, not an eviction policy or
+        // a claim that arbitrary configured populations can be accepted.
+        if (self.config.media_enabled) try self.media_plane.prepareRoutingEgress(domain, 64, media_plane_mod.max_datagram);
+        owned.* = .{ .server = self, .allocator = self.allocator, .domain = domain, .native_binding = native_binding, .webrtc_binding = webrtc_binding, .prepared_egress = if (self.media_plane.routing_egress) |queue| @ptrCast(queue) else null, .queue_retired = !self.config.media_enabled };
+        self.media_routing_owner = @ptrCast(owned);
+    }
+
+    /// Cold preparation rollback owns no admitted route or worker. Actual source
+    /// APIs verify that fact; no caller bool or mutable field clears custody.
+    fn rollbackPreparedMediaRouting(self: *LinuxServer) void {
+        const opaque_owner = self.media_routing_owner orelse return;
+        const owner = mediaRoutingBacking(opaque_owner);
+        if (!owner.queue_retired) self.media_plane.disposeRoutingEgress(owner.domain) catch @panic("cold rollback retained accepted routing output");
+        owner.domain.releaseWebrtc(owner.webrtc_binding.?) catch @panic("cold rollback retained WebRTC authority");
+        owner.domain.releaseNative(owner.native_binding.?) catch @panic("cold rollback retained Native authority");
+        owner.domain.destroyQuiesced() catch @panic("cold rollback retained routing authority");
+        self.media_routing_owner = null;
+        owner.allocator.destroy(owner);
+    }
+
+    /// Registered JOIN capability delivery uses the same actual dispatch owner
+    /// as OFFER/ANSWER. Membership and the complete MACKEY issuer publish once.
+    pub fn mediaJoinJoined(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, kind: media_room.MediaKind) !void {
+        const turn = try MediaAuthorityTurn.require(self, id, conn, .join, channel);
+        try turn.requireEmptyIssuer();
+        const owner = self.media_routing_owner orelse return self.failReply(conn, "MEDIA", "JOIN_FAILED", "Media routing is unavailable");
+        var first_kind: bool = undefined;
+        var stopped_recording: bool = undefined;
+        if (self.config.ws_media_relay and conn.ws != null) {
+            var plan = (PreparedMediaBrowserJoin.prepare(self, mediaRoutingBacking(owner).domain, id, conn, channel, kind, turn.label()) catch |err| switch (err) {
+                error.BadState => return self.failReply(conn, "MEDIA", "SECURE_SIGNALING_REQUIRED", "Browser media credentials require a live protected signaling connection"),
+                else => return err,
+            }) orelse return;
+            defer plan.deinit();
+            first_kind = plan.physical.first_kind;
+            stopped_recording = plan.stops_recording;
+            try plan.domain.withLocked(&plan, PreparedMediaBrowserJoin.publishLocked);
+            turn.published = true;
+        } else {
+            var plan = (try PreparedLogicalMediaJoin.prepare(turn, mediaRoutingBacking(owner).domain, kind)) orelse return;
+            defer plan.deinit();
+            first_kind = plan.physical.first_kind;
+            stopped_recording = plan.stops_recording;
+            try plan.domain.withLocked(&plan, PreparedLogicalMediaJoin.publishLocked);
+        }
+        conn.reply_capture = null;
+        if (first_kind) try self.broadcastMediaEvent(channel, "JOIN", conn.session.displayName(), media_room.kindName(kind));
+        if (stopped_recording) try self.broadcastMediaEvent(channel, "RECORD", conn.session.displayName(), "stopped");
+        if (first_kind) self.webpushNotifyCallInvite(channel, conn.session.displayName());
+    }
+
+    fn configureMediaColdPolicy(self: *LinuxServer) !void {
+        // Retain the configured Server callback lifetime at the final address.
+        // Typed routing-bound pumps use Domain authority; these callbacks keep
+        // the explicitly configured legacy bridge policy exact as well.
+        self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame, .on_native_feedback = bridgeOnNativeFeedback });
+        self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame, .on_rtcp_feedback = bridgeOnRtcpFeedback });
+        self.media_plane.max_frame_bytes = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, media_plane_mod.max_datagram)));
+        self.media_plane.max_upload_bytes = self.config.media_max_upload_bytes;
+        self.native_media.max_frame_bytes = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, native_media_mod.max_datagram)));
+        self.native_media.max_upload_bytes = self.config.media_max_upload_bytes;
+        self.native_media.configureMac(&self.native_stream_key, self.config.native_media_require_mac);
+        if (self.config.media_stun_port != 0) {
+            const ip4 = parseIp4(self.config.media_stun_host) orelse return error.InvalidMediaStunAddress;
+            self.media_plane.stun_server = try media_plane_mod.TransportAddress.fromBytes(&ip4, self.config.media_stun_port);
+        }
+        self.media_plane.dtls_enabled = self.config.media_dtls_srtp;
+        self.media_plane.dtls13_enabled = self.config.media_dtls13;
+    }
+
+    /// Legacy main startup also creates resources/routing/FIFO before spawning.
+    /// Configured main uses the same owned resources with its private Control.
+    fn startMediaRoutingLegacy(self: *LinuxServer) !void {
+        const io = self.config.crypto_io orelse return error.MissingCryptoIo;
+        try self.configureMediaColdPolicy();
+        try self.native_media.prepareColdResources(io, native_media_mod.any_be, self.config.native_media_port);
+        errdefer self.native_media.shutdown();
+        try self.media_plane.prepareColdResources(io, media_plane_mod.any_be, self.config.media_port);
+        errdefer self.media_plane.shutdown();
+        try self.prepareMediaRoutingOwner();
+        errdefer self.rollbackPreparedMediaRouting();
+        try self.native_media.startPreparedLegacyWorker();
+        errdefer {
+            self.native_media.requestStopAndWake();
+            self.native_media.joinLegacyAfterStop() catch @panic("failed media startup retained Native worker");
+        }
+        try self.media_plane.startPreparedLegacyWorker();
+    }
+
+    /// Fence actual accepted egress before stopping its consumer. Callers hold
+    /// graph/producer ownership, and wait outside World/Domain/backend locks.
+    pub fn settleMediaRoutingBeforeStop(self: *LinuxServer, deadline_ms: u64) !void {
+        const opaque_owner = self.media_routing_owner orelse return;
+        const owner = mediaRoutingBacking(opaque_owner);
+        if (owner.queue_retired) return;
+        const Cut = struct {
+            owner: *MediaRoutingBacking,
+            fn fence(scope: *media_routing.Locked, ctx: @This()) !media_plane_mod.RoutingProducerFence {
+                return ctx.owner.server.media_plane.fenceRoutingProducersLocked(ctx.owner.domain, scope);
+            }
+            fn settled(scope: *media_routing.Locked, ctx: @This()) !void {
+                try ctx.owner.server.media_plane.requireRoutingEgressSettledLocked(ctx.owner.domain, scope, ctx.owner.producer_fence.?);
+            }
+        };
+        if (owner.producer_fence == null) owner.producer_fence = try owner.domain.withLocked(Cut{ .owner = owner }, Cut.fence);
+        while (true) {
+            owner.domain.withLocked(Cut{ .owner = owner }, Cut.settled) catch |err| switch (err) {
+                error.Busy => {
+                    const now_ms = std.math.cast(u64, platform.monotonicMillis()) orelse return error.InvalidMonotonicClock;
+                    if (now_ms >= deadline_ms) return error.MediaSettlementPending;
+                    std.Thread.yield() catch {};
+                    continue;
+                },
+                else => return err,
+            };
+            return;
+        }
+    }
+
+    /// Every source worker must already be joined and its View detached. Exact
+    /// terminal retirement is source-checked and retains all resources on error.
+    fn finishMediaRoutingAfterJoined(self: *LinuxServer) !void {
+        return self.finishMediaRoutingAfterJoinedUntil(null);
+    }
+
+    fn finishMediaRoutingAfterJoinedUntil(self: *LinuxServer, deadline: ?std.Io.Clock.Timestamp) !void {
+        const opaque_owner = self.media_routing_owner orelse return;
+        const owner = mediaRoutingBacking(opaque_owner);
+        try self.requireMediaRetirementDeadline(deadline);
+        try owner.domain.closeForTerminal();
+        if (!owner.queue_retired) {
+            try self.media_plane.finishRoutingTerminalCleanup(owner.domain);
+            owner.queue_retired = true;
+        }
+        const previous = current_reactor;
+        defer current_reactor = previous;
+        for (self.reactors) |*reactor| {
+            current_reactor = reactor;
+            for (reactor.clients.slots.items, 0..) |*slot, index| {
+                if (!slot.occupied) continue;
+                try self.requireMediaRetirementDeadline(deadline);
+                const id: client_model.ClientId = .{ .shard = reactor.shard_id, .slot = @intCast(index), .gen = slot.gen };
+                try self.retireMediaRoutingClient(id, &slot.value, true);
+            }
+        }
+        // A failed later release retains exact remaining custody. Never reuse
+        // a binding whose source already detached and freed its issued record.
+        try self.requireMediaRetirementDeadline(deadline);
+        if (owner.webrtc_binding) |binding| {
+            try owner.domain.releaseWebrtc(binding);
+            owner.webrtc_binding = null;
+        }
+        if (owner.native_binding) |binding| {
+            try owner.domain.releaseNative(binding);
+            owner.native_binding = null;
+        }
+        try owner.domain.destroyQuiesced();
+        self.media_routing_owner = null;
+        owner.allocator.destroy(owner);
+    }
+
+    fn requireMediaRetirementDeadline(self: *LinuxServer, deadline: ?std.Io.Clock.Timestamp) !void {
+        const limit = deadline orelse return;
+        if (limit.clock != .awake) return error.InvalidDeadline;
+        const io = self.runtime_io orelse self.config.crypto_io orelse return error.MissingCryptoIo;
+        if (std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io, .awake), .gte, limit)) return error.Timeout;
+    }
+
+    /// Stop waits for the original World mutex with its original absolute
+    /// deadline. A live maintenance HTTP attempt must not make lock acquisition
+    /// an unbounded terminal wait; failure leaves source ownership untouched.
+    fn lockWorldUntil(self: *LinuxServer, deadline: std.Io.Clock.Timestamp) !void {
+        try self.requireMediaRetirementDeadline(deadline);
+        const io = self.runtime_io orelse self.config.crypto_io orelse return error.MissingCryptoIo;
+        while (!self.world.lock.tryLockExclusive()) {
+            try self.requireMediaRetirementDeadline(deadline);
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+        errdefer self.world.unlockWrite();
+        try self.requireMediaRetirementDeadline(deadline);
+    }
+
+    fn retireMediaRoutingClient(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, terminal: bool) !void {
+        const owner = mediaRoutingBacking(self.media_routing_owner orelse return error.BadState);
+        const domain = owner.domain;
+        const departure = try domain.prepareClientDeparture(id);
+        defer departure.deinit();
+        if (departure.isTerminal() != terminal) return error.BadState;
+        const native = try self.native_media.prepareClientDeparture(domain, departure);
+        defer native.deinit();
+        const webrtc = try self.media_plane.prepareClientDeparture(domain, departure);
+        defer webrtc.deinit();
+        const rooms = try self.media_rooms.prepareClientDeparture(departure);
+        defer rooms.deinit();
+        var physical = try PreparedMediaPhysicalClientDeparture.prepare(self, id, conn);
+        defer physical.deinit();
+        const Cut = struct {
+            domain: *media_routing.Domain,
+            departure: *media_routing.PreparedClientDeparture,
+            native: *native_media_mod.PreparedNativeClientDeparture,
+            webrtc: *media_plane_mod.PreparedWebrtcClientDeparture,
+            rooms: *media_room.PreparedRoomClientDeparture,
+            physical: *PreparedMediaPhysicalClientDeparture,
+            fn run(scope: *media_routing.Locked, ctx: @This()) !void {
+                try ctx.departure.validateLocked(ctx.domain, scope);
+                try ctx.native.validateLocked(ctx.domain, scope, ctx.departure);
+                try ctx.webrtc.validateLocked(ctx.domain, scope, ctx.departure);
+                try ctx.rooms.validateLocked(ctx.domain, scope, ctx.departure);
+                try ctx.physical.validateLocked(ctx.domain, scope, ctx.departure);
+                ctx.native.commitLocked(ctx.domain, scope);
+                ctx.webrtc.commitLocked(ctx.domain, scope);
+                ctx.rooms.commitLocked(ctx.domain, scope);
+                ctx.physical.commit();
+                ctx.departure.commitLocked(ctx.domain, scope);
+            }
+        };
+        const cut: Cut = .{ .domain = domain, .departure = departure, .native = native, .webrtc = webrtc, .rooms = rooms, .physical = &physical };
+        if (terminal) try domain.withTerminalLocked(cut, Cut.run) else try domain.withLocked(cut, Cut.run);
+    }
+
+    /// Bind complete cold companion resources at the final Server address.
+    /// No worker is spawned. The closed configured owner supplies every slot
+    /// to the shared Gate after this fallible preparation has finished.
+    pub fn prepareConfiguredColdResources(self: *LinuxServer, io: std.Io) !void {
+        if (self.runtime_inherited_image or !self.inheritedStateConsumedBeforeServices()) return error.InheritedRuntimeRequiresCarry;
+        if (self.configured_cold_resources_prepared or self.metrics_server != null or self.webhook_server != null or
+            self.native_media.thread != null or self.media_plane.thread != null or self.geo.thread != null)
+            return error.RuntimeAlreadyPrepared;
+        self.bindFlightPanicTarget();
+        self.driveLifecycle(.init);
+        self.driveLifecycle(.ready);
+        if (self.pending_migrations == null) self.pending_migrations = session_migrate.PendingMigrations.initWithConfig(self.allocator, .{
+            .max_entries = self.config.session_max_pending_migrations,
+            .max_per_account = self.config.session_max_per_account,
+        });
+        // These are source-owned cold loads on an unpublished new graph.
+        // Inherited constructors must use the mandatory captured state instead.
+        self.loadGrants();
+        self.loadChanstats();
+        self.restoreEventHistoryAtStart();
+        try self.geo.prepareColdResources(io);
+        if (self.config.media_enabled) {
+            try self.configureMediaColdPolicy();
+            try self.native_media.prepareColdResources(io, native_media_mod.any_be, self.config.native_media_port);
+            errdefer self.native_media.shutdown();
+            try self.media_plane.prepareColdResources(io, media_plane_mod.any_be, self.config.media_port);
+        }
+        errdefer if (self.config.media_enabled) {
+            self.media_plane.shutdown();
+            self.native_media.shutdown();
+        };
+        try self.prepareMediaRoutingOwner();
+        errdefer self.rollbackPreparedMediaRouting();
+        if (self.config.metrics_port != 0) {
+            try self.refreshMetricsSnapshotFallible();
+            self.metrics_server = try metrics_http.MetricsServer.initWithConfig(&self.metrics_snapshot, self.config.metrics_port, .{ .bind_addr = self.config.metrics_bind_addr });
+            errdefer {
+                self.metrics_server.?.shutdown();
+                self.metrics_server = null;
+            }
+            try self.metrics_server.?.prepareColdResources(io);
+        }
+        errdefer if (self.metrics_server) |*owner| {
+            owner.shutdown();
+            self.metrics_server = null;
+        };
+        if (self.config.webhook_enabled) {
+            self.restoreWebhooksAtStart();
+            self.webhook_server = try webhook_http.WebhookServer.init(&self.webhook_store, .{ .ctx = self, .submit = webhookSubmit }, self.config.webhook_port, .{
+                .bind_addr = self.config.webhook_bind_addr,
+                .handler = .{ .max_body = self.config.webhook_max_body, .rate = self.webhookRate() },
+            });
+            errdefer {
+                self.webhook_server.?.shutdown();
+                self.webhook_server = null;
+            }
+            try self.webhook_server.?.prepareColdResources(io);
+        }
+        errdefer if (self.webhook_server) |*owner| {
+            owner.shutdown();
+            self.webhook_server = null;
+        };
+        if (self.history_https) |*owner| try owner.prepareColdResources(io);
+        self.configured_cold_resources_prepared = true;
+    }
+
+    /// Validate actual cold resource owners and callback lifetimes at the
+    /// prepared cut. These checks never manufacture an activation receipt.
+    pub fn requireConfiguredColdResources(self: *LinuxServer) !void {
+        const owner_identity: *anyopaque = @ptrCast(self);
+        if (!self.configured_cold_resources_prepared or self.runtime_inherited_image) return error.ConfiguredResourcesNotPrepared;
+        if ((self.config.metrics_port != 0) != (self.metrics_server != null) or
+            self.config.webhook_enabled != (self.webhook_server != null)) return error.ConfiguredOwnerMismatch;
+        if (self.geo.opts.weather_enabled != self.config.geo_enabled or
+            self.geo.opts.news_enabled != self.config.geo_enabled or
+            self.geo.opts.news_insecure_tls != self.config.geo_news_insecure_tls or
+            !std.mem.eql(u8, self.geo.opts.news_cache_dir, self.config.geo_news_cache_dir) or
+            self.geo.opts.max_headlines != @min(self.config.news_count, 5)) return error.ConfiguredOwnerMismatch;
+        if (self.metrics_server) |*owner| {
+            if (owner.snapshot != &self.metrics_snapshot or owner.config.bind_addr != self.config.metrics_bind_addr or
+                owner.port != self.config.metrics_port or owner.thread != null) return error.ConfiguredOwnerMismatch;
+            _ = try metrics_http.observeListener(owner.listen_fd);
+        }
+        if (self.webhook_server) |*owner| {
+            if (owner.store != &self.webhook_store or owner.sink.ctx != owner_identity or owner.sink.submit != webhookSubmit or
+                owner.config.bind_addr != self.config.webhook_bind_addr or owner.handler.max_body != self.config.webhook_max_body or
+                !std.meta.eql(owner.handler.rate, self.webhookRate()) or owner.port == 0 or
+                (self.config.webhook_port != 0 and owner.port != self.config.webhook_port) or owner.thread != null)
+                return error.ConfiguredOwnerMismatch;
+            _ = try metrics_http.observeListener(owner.listen_fd);
+        }
+        if (self.history_https) |*owner| {
+            if (owner.reader.ptr != owner_identity or owner.reader.readFn != historyHttpsRead or owner.thread != null) return error.ConfiguredOwnerMismatch;
+            _ = try metrics_http.observeListener(owner.listen_fd);
+        }
+        // Callback presence alone is insufficient. The original source-issued
+        // Domain registrations and funded FIFO must still belong to this graph.
+        const routing_owner = mediaRoutingBacking(self.media_routing_owner orelse return error.ConfiguredOwnerMismatch);
+        if (routing_owner.server != self or self.native_media.routing_domain != routing_owner.domain or
+            self.media_plane.routing_domain != routing_owner.domain or
+            self.native_media.routing_binding != routing_owner.native_binding or
+            self.media_plane.routing_binding != routing_owner.webrtc_binding or
+            routing_owner.native_binding == null or routing_owner.webrtc_binding == null or
+            routing_owner.queue_retired != !self.config.media_enabled or
+            (if (self.media_plane.routing_egress) |queue| @as(*const anyopaque, @ptrCast(queue)) else null) != routing_owner.prepared_egress or
+            self.config.media_enabled != (routing_owner.prepared_egress != null)) return error.ConfiguredOwnerMismatch;
+        const RoutingRelation = struct {
+            owner: *MediaRoutingBacking,
+            fn require(scope: *media_routing.Locked, ctx: @This()) !void {
+                try ctx.owner.domain.requireNativeBindingLocked(scope, ctx.owner.native_binding.?, &ctx.owner.server.native_media);
+                try ctx.owner.domain.requireWebrtcBindingLocked(scope, ctx.owner.webrtc_binding.?, &ctx.owner.server.media_plane);
+            }
+        };
+        try routing_owner.domain.withLocked(RoutingRelation{ .owner = routing_owner }, RoutingRelation.require);
+        if (self.config.media_enabled) {
+            const native_cross = self.native_media.cross orelse return error.ConfiguredOwnerMismatch;
+            const rtp_cross = self.media_plane.cross orelse return error.ConfiguredOwnerMismatch;
+            if (native_cross.ctx != owner_identity or native_cross.on_native_frame != bridgeOnNativeFrame or
+                native_cross.on_native_feedback != bridgeOnNativeFeedback or rtp_cross.ctx != owner_identity or
+                rtp_cross.on_rtp_frame != bridgeOnRtpFrame or rtp_cross.on_rtcp_feedback != bridgeOnRtcpFeedback or
+                self.native_media.thread != null or self.media_plane.thread != null or
+                self.native_media.max_frame_bytes != @min(self.config.media_max_frame_bytes, @as(u64, native_media_mod.max_datagram)) or
+                self.media_plane.max_frame_bytes != @min(self.config.media_max_frame_bytes, @as(u64, media_plane_mod.max_datagram)) or
+                self.native_media.max_upload_bytes != self.config.media_max_upload_bytes or
+                self.media_plane.max_upload_bytes != self.config.media_max_upload_bytes or
+                self.native_media.max_participants != @min(self.config.media_max_participants, native_media_mod.max_call_participants) or
+                self.native_media.require_mac != self.config.native_media_require_mac or !self.native_media.mac_key_configured or
+                !std.crypto.timing_safe.eql([16]u8, self.native_media.mac_stream_key, self.native_stream_key) or
+                self.media_plane.dtls_requested != self.config.media_dtls_srtp or
+                self.media_plane.dtls13_requested != self.config.media_dtls13) return error.ConfiguredOwnerMismatch;
+            const expected_stun: ?media_plane_mod.TransportAddress = if (self.config.media_stun_port == 0) null else blk: {
+                const address = parseIp4(self.config.media_stun_host) orelse return error.InvalidMediaStunAddress;
+                break :blk try media_plane_mod.TransportAddress.fromBytes(&address, self.config.media_stun_port);
+            };
+            if (!std.meta.eql(expected_stun, self.media_plane.stun_server)) return error.ConfiguredOwnerMismatch;
+            const native_socket = if (self.native_media.socket) |*socket| socket else return error.ConfiguredOwnerMismatch;
+            const media_socket = if (self.media_plane.socket) |*socket| socket else return error.ConfiguredOwnerMismatch;
+            const native_observed = try native_socket.capture();
+            const media_observed = try media_socket.capture();
+            if (native_observed.address_be != native_media_mod.any_be or media_observed.address_be != media_plane_mod.any_be or
+                native_observed.port != self.native_media.port or media_observed.port != self.media_plane.port or
+                (self.config.native_media_port != 0 and native_observed.port != self.config.native_media_port) or
+                (self.config.media_port != 0 and media_observed.port != self.config.media_port)) return error.ConfiguredOwnerMismatch;
+        }
     }
 
     fn inheritedStateConsumedBeforeServices(self: *const LinuxServer) bool {
@@ -5336,17 +5893,20 @@ pub const LinuxServer = struct {
     /// and once at startup. Best-effort: a render/alloc failure leaves the prior
     /// snapshot intact so a scrape returns stale-but-valid data.
     fn refreshMetricsSnapshot(self: *LinuxServer) void {
+        self.refreshMetricsSnapshotFallible() catch return;
+    }
+    fn refreshMetricsSnapshotFallible(self: *LinuxServer) !void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
         if (self.isMaintenanceReactor()) self.latency_stats.mergeShards();
-        self.stats.writePrometheus(self.allocator, &out) catch return;
-        self.latency_stats.writePrometheus(self.allocator, &out) catch return;
-        self.writeNodeHealthPrometheus(self.allocator, &out) catch return;
-        self.peer_health.writePrometheus(self.allocator, &out) catch return;
-        self.writeE2eeGroupPrometheus(self.allocator, &out) catch return;
+        try self.stats.writePrometheus(self.allocator, &out);
+        try self.latency_stats.writePrometheus(self.allocator, &out);
+        try self.writeNodeHealthPrometheus(self.allocator, &out);
+        try self.peer_health.writePrometheus(self.allocator, &out);
+        try self.writeE2eeGroupPrometheus(self.allocator, &out);
         const webpush_dropped: usize = if (self.webpush_worker) |worker| worker.dropped.load(.monotonic) else 0;
-        webpush_mod.appendDroppedSample(&out, self.allocator, webpush_dropped) catch return;
-        self.metrics_snapshot.set(out.items) catch return;
+        try webpush_mod.appendDroppedSample(&out, self.allocator, webpush_dropped);
+        try self.metrics_snapshot.set(out.items);
     }
 
     fn writePromGauge(
@@ -6433,6 +6993,23 @@ pub const LinuxServer = struct {
     }
 
     pub fn deinit(self: *LinuxServer) void {
+        // Every reactor borrows World, sessions, TLS generations and fabric.
+        // Stop/wake/join before any of those owners can be destroyed. Main must
+        // settle companion producers before requesting this reactor stop.
+        if (self.runtime_gate) |view| view.requireAllJoined() catch
+            @panic("runtime owner must cancel/stop and join before Server destruction");
+        self.detachRuntimeAfterJoined() catch @panic("Server cleanup without actual runtime joins");
+        if (self.shutdown) |run| self.requestStop(run);
+        self.pool.deinit();
+        if (self.media_routing_owner != null) {
+            const deadline_ms = checkedMonotonicDeadlineMillis(5_000) catch @panic("invalid media teardown clock");
+            self.settleMediaRoutingBeforeStop(deadline_ms) catch @panic("media accepted output must settle before teardown");
+            self.native_media.requestStopAndWake();
+            self.media_plane.requestStopAndWake();
+            self.native_media.joinLegacyAfterStop() catch @panic("runtime owner must join and detach Native before Server teardown");
+            self.media_plane.joinLegacyAfterStop() catch @panic("runtime owner must join and detach WebRTC before Server teardown");
+            self.finishMediaRoutingAfterJoined() catch @panic("media source retirement must complete before Server teardown");
+        }
         self.clearFlightPanicTarget();
         // Stop + join the /metrics listener thread FIRST, before freeing the
         // snapshot it reads. shutdown() signals the stop flag, closes the
@@ -6493,6 +7070,7 @@ pub const LinuxServer = struct {
                     slot.value.session_list_cache.reset();
                     if (slot.value.send_overflow.capacity > 0)
                         slot.value.send_overflow.deinit(slot.value.overflow_allocator);
+                    if (slot.value.tls_deferred_plain.capacity > 0) slot.value.tls_deferred_plain.deinit(slot.value.overflow_allocator);
                     if (slot.value.recv_overflow.capacity > 0)
                         slot.value.recv_overflow.deinit(slot.value.overflow_allocator);
                     closeFd(slot.value.fd);
@@ -6514,6 +7092,10 @@ pub const LinuxServer = struct {
         if (self.policy_undo) |*undo| self.destroyPolicyUndo(undo);
         self.policy_undo = null;
         self.destroyOutboundWebhooks();
+        for (&self.webpush_overflow_deliveries) |*slot| if (slot.*) |*delivery| {
+            delivery.deinit(self.allocator);
+            slot.* = null;
+        };
         self.bot_registry.deinit();
         self.threads.deinit();
         self.schedules.deinit();
@@ -6644,9 +7226,8 @@ pub const LinuxServer = struct {
         self.monitor.deinit();
         self.whowas.deinit();
         self.world.deinit();
-        // Join any worker threads (no-op if runThreaded already joined), then tear
-        // down each reactor's ring/table/wake/listeners and free the slice + fabric.
-        self.pool.deinit();
+        // Reactor workers were joined before semantic teardown above; only
+        // backend tables/wakes/listeners and the drained fabric remain owned.
         // Media pumps are already stopped above, and reactor producers are now
         // joined, so no recorder can access a histogram after this point.
         self.latency_stats.deinit();
@@ -7032,6 +7613,12 @@ pub const LinuxServer = struct {
         self.abortPoisonedDeliveries();
         self.drainAttachmentSpoolForCurrentReactor();
         self.retryWebhookResumeIfPending();
+        if (self.isMaintenanceReactor()) {
+            self.reconcileWebpushOutcomesLocked(null) catch {};
+            // Network retry is outside the Worker mutex. The terminal consumer
+            // only observes this retained outbox; it never runs synchronous HTTP.
+            self.retryWebpushOverflowOutputsLocked();
+        }
         // SIGUSR2 → connection-preserving Helix UPGRADE. Polled here (out of
         // signal context) and gated to reactor 0 — the reactor that owns the
         // listener + every client connection the upgrade carries. `swap`
@@ -7181,8 +7768,7 @@ pub const LinuxServer = struct {
 
             // A send CQE may still hold a kernel reference to send_buf. The
             // ordinary send-completion path owns final teardown in that case.
-            if (slot.value.send_armed) continue;
-            if (slot.value.send_offset < slot.value.send_len or slot.value.send_overflow.items.len != 0) {
+            if (hasUnsentOutput(&slot.value)) {
                 self.armSendIfNeeded(&slot.value) catch {
                     // Arming failed, so no kernel reference was created and it
                     // is safe to drop the unsent tail during final close.
@@ -8394,51 +8980,177 @@ pub const LinuxServer = struct {
         return rows;
     }
 
-    /// Run the reactor loop on the calling thread until `run` is cleared. Wakes
-    /// on each io_uring completion and re-checks the flag, so a client
-    /// disconnect (or any I/O) lets a requested shutdown take effect. (T1 of the
-    /// threading plan — docs/planning/06-threading.md.)
-    pub fn runThreaded(self: *LinuxServer, run: *std.atomic.Value(bool)) void {
-        self.shutdown = run; // expose to DIE/RESTART
+    /// Allocate the complete configured fabric at the final Server address.
+    /// Failure leaves the candidate's live resources/run flag unchanged; no
+    /// reactor or command can run until the complete shared Gate is released.
+    pub fn prepareRuntimeResources(self: *LinuxServer, io: std.Io, run: *reactor_pool_mod.RunFlag) !void {
+        const phase = self.runtime_phase.load(.acquire);
+        if (phase != .idle and phase != .joined) return error.RuntimeAlreadyPrepared;
+        if (self.pool.count() != 0 or self.runtime_gate != null) return error.RuntimeAlreadyPrepared;
+        if (!run.load(.acquire) or self.reactors.len == 0) return error.InvalidRuntime;
+        if (self.reactors.len == 1) {
+            if (self.fabric != null) return error.InvalidRuntime;
+        } else if (self.fabric) |*fabric| {
+            if (fabric.inboxes.len != self.reactors.len or fabric.controls.len != self.reactors.len or
+                fabric.wakes.len != self.reactors.len or fabric.pools.len != self.reactors.len)
+                return error.InvalidRuntime;
+        } else {
+            // Detached fallible construction, then one no-fail ownership move.
+            const candidate = try reactor_fabric.ReactorFabric.init(self.allocator, self.reactors.len);
+            self.fabric = candidate;
+        }
+        for (self.reactors) |*reactor| reactor.runtime_activated.store(false, .release);
+        self.shutdown = run;
+        self.runtime_io = io;
+        self.runtime_phase.store(.resources, .release);
+    }
 
-        // Single reactor: run the loop in-line on the calling thread, byte-identical
-        // to the historical path (no pool, no fabric, no extra threads).
-        if (self.reactors.len <= 1) {
-            current_reactor = &self.reactors[0];
-            self.runLoopResilient(run);
+    /// Prepare actual reactor workers under MAIN's one runtime-wide Gate.
+    /// Single-shard is an explicit inline owner with zero reactor worker rows.
+    /// Any partial spawn error cancels/joins the entire candidate Gate before
+    /// main is permitted to free any borrowed companion or Server context.
+    pub fn prepareRuntimeWorkers(self: *LinuxServer, control: *reactor_pool_mod.runtime_start_gate.Control, view: *const reactor_pool_mod.runtime_start_gate.View, slots: []const reactor_pool_mod.runtime_start_gate.Slot) !void {
+        try control.requireView(view);
+        if (self.runtime_phase.load(.acquire) != .resources or self.runtime_gate != null) return error.RuntimeNotPrepared;
+        if (view.inspect().phase != .preparing) return error.RuntimeNotPreparing;
+        const run = self.shutdown orelse return error.RuntimeNotPrepared;
+        if (self.reactors.len == 1) {
+            if (slots.len != 0 or self.fabric != null or self.pool.count() != 0) return error.InvalidRuntime;
+        } else {
+            if (slots.len != self.reactors.len or self.fabric == null) return error.InvalidRuntime;
+            try self.pool.prepareDormant(control, view, slots, self, run, reactorWorker);
+        }
+        self.runtime_gate = view;
+        self.runtime_phase.store(.workers, .release);
+    }
+
+    /// Observe the creator's actual joins, then drop borrowed View references.
+    /// This does not cancel or join a handle and cannot release another owner.
+    pub fn detachRuntimeAfterJoined(self: *LinuxServer) !void {
+        if (self.runtime_gate) |view| try view.requireAllJoined();
+        try self.pool.detachAfterJoined();
+        self.runtime_gate = null;
+    }
+
+    /// Real core resources and all actual Gate arrivals. Main additionally
+    /// joins every configured companion/resource/state row before native READY.
+    pub fn requirePreparedRuntime(self: *const LinuxServer) !void {
+        if (self.runtime_phase.load(.acquire) != .workers or self.runtime_io == null or self.shutdown == null) return error.RuntimeNotPrepared;
+        const gate = self.runtime_gate orelse return error.RuntimeNotPrepared;
+        try gate.requireAllParked();
+        if (self.reactors.len == 1) {
+            if (self.fabric != null or self.pool.count() != 0) return error.InvalidRuntime;
+        } else {
+            const fabric = self.fabric orelse return error.InvalidRuntime;
+            if (fabric.inboxes.len != self.reactors.len or fabric.controls.len != self.reactors.len or
+                fabric.wakes.len != self.reactors.len or fabric.pools.len != self.reactors.len)
+                return error.InvalidRuntime;
+            try self.pool.requireParked();
+        }
+        for (self.reactors) |*reactor| {
+            if (reactor.runtime_activated.load(.acquire)) return error.InvalidRuntime;
+        }
+    }
+
+    /// Non-failing publication only after full preparation/adoption succeeds.
+    /// Never opens the Gate; main publishes ALL owners before its one release.
+    pub fn publishPreparedRuntime(self: *LinuxServer) void {
+        self.requirePreparedRuntime() catch @panic("runtime publication without exact prepared owners");
+        self.runtime_phase.store(.published, .release);
+    }
+
+    /// Standalone reactor-only owner. No allocation, bind, spawn or shard
+    /// fallback is possible here. A configured whole graph instead lets its
+    /// Runtime settle companions before the private Control joins all owners.
+    pub fn runPreparedRuntime(self: *LinuxServer, control: *reactor_pool_mod.runtime_start_gate.Control, run: *reactor_pool_mod.RunFlag) void {
+        if (self.runtime_phase.load(.acquire) != .published or self.shutdown != run or self.runtime_gate == null or
+            self.runtime_gate.?.inspect().phase != .released)
+        {
+            self.runtimePreparationFailed(run, error.RuntimeNotPublished);
             return;
         }
-
-        // Multi-reactor: stand up the shared cross-shard delivery fabric (one
-        // mailbox + wake per shard, one shared buffer pool), then spawn one worker
-        // thread per shard. Each worker owns exactly one reactor for its lifetime.
-        // If the fabric cannot be created (no eventfd, OOM) fall back to a single
-        // in-line reactor rather than running without cross-shard delivery.
-        self.fabric = reactor_fabric.ReactorFabric.init(self.allocator, self.reactors.len) catch |err| {
-            srvLog(
-                "onyx-server: cross-shard fabric init failed ({s}); running 1 reactor\n",
-                .{@errorName(err)},
-            );
-            current_reactor = &self.reactors[0];
-            self.runLoopResilient(run);
+        control.requireView(self.runtime_gate.?) catch |err| {
+            self.runtimePreparationFailed(run, err);
             return;
         };
-
-        srvLog("onyx-server: starting {d} reactor threads (SO_REUSEPORT)\n", .{self.reactors.len});
-        self.pool.start(self.reactors.len, self, run, reactorWorker) catch |err| {
-            srvLog(
-                "onyx-server: reactor pool spawn failed ({s}); running 1 reactor\n",
-                .{@errorName(err)},
-            );
-            if (self.fabric) |*f| f.deinit();
-            self.fabric = null;
+        const expected = if (self.reactors.len == 1) 0 else self.reactors.len;
+        if (self.runtime_gate.?.inspect().expected != expected) {
+            self.runtimePreparationFailed(run, error.InvalidRuntime);
+            return;
+        }
+        if (self.reactors.len == 1) {
             current_reactor = &self.reactors[0];
             self.runLoopResilient(run);
+        }
+        control.joinAll();
+        self.detachRuntimeAfterJoined() catch @panic("runtime returned before actual owner joins");
+        self.runtime_phase.store(.joined, .release);
+    }
+
+    /// Existing standalone callers prepare their OWN complete reactor-only
+    /// runtime before admission. Main's native transaction uses the explicit
+    /// preparation APIs before READY and calls runPreparedRuntime after COMMIT.
+    /// Preparation failure is terminal: it never runs a subset of the shards.
+    pub fn runThreaded(self: *LinuxServer, run: *reactor_pool_mod.RunFlag) void {
+        var local_io = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+        defer local_io.deinit();
+        const io = self.config.crypto_io orelse local_io.io();
+        self.prepareRuntimeResources(io, run) catch |err| {
+            self.runtimePreparationFailed(run, err);
             return;
         };
-        // Block here until the run flag clears and every worker has exited, so the
-        // caller's `runThreaded` returning means the daemon has fully stopped.
-        self.pool.join();
+        const gate_mod = reactor_pool_mod.runtime_start_gate;
+        var specs: [shard_mod.max_shards]gate_mod.ParticipantSpec = undefined;
+        var slots: [shard_mod.max_shards]gate_mod.Slot = undefined;
+        const count = if (self.reactors.len == 1) 0 else self.reactors.len;
+        for (specs[0..count], 0..) |*spec, index| spec.* = .{ .kind = .reactor, .instance = @intCast(index), .owner_identity = self };
+        const gate = gate_mod.create(self.allocator, io, specs[0..count]) catch |err| {
+            self.runtimePreparationFailed(run, err);
+            return;
+        };
+        defer {
+            if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else {
+                self.requestStop(run);
+                gate.control.joinAll();
+            }
+            self.detachRuntimeAfterJoined() catch @panic("standalone runtime cleanup without actual joins");
+            self.pool.deinit();
+            self.pool = reactor_pool_mod.ReactorPool(*LinuxServer).init(self.allocator);
+            gate.control.destroyJoined();
+        }
+        for (slots[0..count], 0..) |*slot, index| slot.* = gate.view.slot(.reactor, @intCast(index), self) catch unreachable;
+        self.prepareRuntimeWorkers(gate.control, gate.view, slots[0..count]) catch |err| {
+            self.runtimePreparationFailed(run, err);
+            return;
+        };
+        gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) })) catch |err| {
+            self.runtimePreparationFailed(run, err);
+            return;
+        };
+        self.publishPreparedRuntime();
+        gate.control.releaseAll();
+        self.runPreparedRuntime(gate.control, run);
+    }
+
+    fn runtimePreparationFailed(self: *LinuxServer, run: *reactor_pool_mod.RunFlag, err: anyerror) void {
+        srvLog("onyx-server: complete runtime preparation failed ({s}); no reactor admitted\n", .{@errorName(err)});
+        _ = self.runtime_failure.cmpxchgStrong(0, 3, .acq_rel, .acquire);
+        self.requestStop(run);
+    }
+
+    /// Actual owner activation, published only after a successful backend loop
+    /// turn, not from an arrival or a freely supplied service-ready boolean.
+    pub fn requireActivatedRuntime(self: *const LinuxServer) !void {
+        const run = self.shutdown orelse return error.RuntimeNotPrepared;
+        if (!run.load(.acquire)) return error.RuntimeStopped;
+        if (self.runtime_phase.load(.acquire) != .published) return error.RuntimeNotPublished;
+        const gate = self.runtime_gate orelse return error.RuntimeNotPrepared;
+        if (gate.inspect().phase != .released) return error.RuntimeNotPublished;
+        if (self.runtimeFailure()) |err| return err;
+        for (self.reactors) |*reactor| {
+            if (!reactor.runtime_activated.load(.acquire)) return error.RuntimeNotActivated;
+        }
+        if (!run.load(.acquire)) return error.RuntimeStopped;
     }
 
     /// Inspect only after runThreaded joins every worker. Terminal I/O failure
@@ -8447,7 +9159,8 @@ pub const LinuxServer = struct {
         return switch (self.runtime_failure.load(.acquire)) {
             0 => null,
             1 => error.BackendPoisoned,
-            else => error.ReactorGiveUp,
+            2 => error.ReactorGiveUp,
+            else => error.RuntimePreparationFailed,
         };
     }
 
@@ -8486,6 +9199,7 @@ pub const LinuxServer = struct {
             self.parkForUpgradeQuiesce(run);
             if (!run.load(.acquire)) break;
             if (self.runOnce()) |_| {
+                self.rx().runtime_activated.store(true, .release);
                 consecutive_failures = 0;
             } else |err| {
                 consecutive_failures += 1;
@@ -10427,99 +11141,211 @@ pub const LinuxServer = struct {
     /// logs). Bounded by `ktls_control_drain_max`; `MSG.DONTWAIT` keeps it off the
     /// blocking path.
     fn handleKtlsRxControl(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !KtlsRxDrain {
-        var survived = false;
-        var iters: usize = 0;
-        while (iters < ktls_control_drain_max) : (iters += 1) {
-            switch (tls_conn.drainKtlsRxControl(conn.fd, &conn.recv_buf, linux.MSG.DONTWAIT)) {
-                // Nothing (more) to read right now. In this single-threaded reactor
-                // nothing else drains the fd between the recv completion and here,
-                // so a genuine control record always surfaces as a record above —
-                // an EAGAIN on the FIRST pass means the recv error was NOT a
-                // demuxable control record (a real socket error), so close. After
-                // we've consumed ≥1 record, EAGAIN just means the queue is drained:
-                // keep the conn and re-arm recv.
-                .would_block => {
-                    if (survived) return .survived;
-                    conn.close_reason = "TLS RX error";
-                    return .close;
-                },
-                .key_update => |ku| {
-                    // The kernel consumed the client's KeyUpdate; the conn survives.
-                    conn.last_activity_ms = self.nowMs();
-                    if (ku.request_peer) {
-                        // RFC 8446 §4.6.3: an `update_requested` KeyUpdate obliges the
-                        // server to send its OWN KeyUpdate(update_not_requested) AND
-                        // rotate TX *before* its next application record. On a txrx
-                        // conn the server TX is kernel-offloaded, so that reply would
-                        // have to be injected as an in-order handshake control record
-                        // (sendmsg + TLS_SET_RECORD_TYPE) ahead of any io_uring-queued
-                        // app-data send AND paired with a TLS_TX re-install — an
-                        // ordering hazard against the async send path that this
-                        // surgical continuity change does not take on. The spec-safe
-                        // conservative choice is therefore to send NO further app data:
-                        // close cleanly (the reply obligation is honored by silence,
-                        // never violated). `update_not_requested` — the near-universal
-                        // client behavior (Chrome/BoringSSL, OpenSSL periodic rekey) —
-                        // is fully continued below with zero dropped bytes.
-                        conn.close_reason = "TLS RX key_update reply unsupported";
-                        return .close;
-                    }
-                    // Advance the RX key and re-install it on the kernel at seq 0 so the
-                    // client's post-KeyUpdate records (under its rotated send key)
-                    // decrypt. Fail-safe: on any error fall back to the existing clean
-                    // close (the kernel TLS_RX swap is atomic — no half-installed key).
-                    // Guard `conn.tls` rather than unwrap: an RX-offloaded conn always
-                    // holds its engine, but the recv path never panics on it.
-                    const t = conn.tls orelse {
-                        conn.close_reason = "TLS RX rekey failed";
-                        return .close;
-                    };
-                    t.rekeyKtlsRx(conn.fd) catch {
-                        conn.close_reason = "TLS RX rekey failed";
-                        return .close;
-                    };
-                    survived = true;
-                },
-                .app_data => |pt| {
-                    // Inbound app data proves liveness — mirror the normal recv path
-                    // (clear a pending ping-timeout) so a coalesced record here can't
-                    // false-trip an idle disconnect.
-                    conn.last_activity_ms = self.nowMs();
-                    conn.awaiting_pong = false;
-                    if (activeMeshPeerName(conn)) |peer_name| self.notePeerStillHere(peer_name, 0);
-                    self.stats.onBytesIn(pt.len);
-                    if (!try self.driveClientBytes(id, conn, pt)) return .freed;
-                    survived = true;
-                    if (conn.closing) return .survived;
-                },
-                .close_notify => {
-                    conn.close_reason = "TLS close_notify";
-                    return .close;
-                },
-                .eof => {
-                    conn.close_reason = "connection closed";
-                    return .close;
-                },
-                .needs_rekey => {
-                    // EKEYEXPIRED: the kernel needs a fresh RX key. In the ordered
-                    // single-reactor drain the preceding KeyUpdate is demuxed first
-                    // and re-installs the advanced key (`.key_update` above), so a
-                    // post-KeyUpdate app record decrypts and this arm is normally
-                    // unreachable. Reaching it means the rekey signal arrived without a
-                    // demuxable KeyUpdate to advance from — close cleanly, fail-safe,
-                    // rather than spin or corrupt the byte stream.
-                    conn.close_reason = "TLS RX rekey needed";
-                    return .close;
-                },
-                .fault => {
-                    conn.close_reason = "TLS RX control record";
-                    return .close;
-                },
-            }
+        _ = id;
+        const t = conn.tls orelse return .close;
+        if (t.control_phase != .kernel_control_read_held and conn.tls_tx_offloaded)
+            conn.tls_kernel_prefix_remaining = sendq.wireBacklog(conn);
+        t.control_phase = .kernel_control_read_held;
+        t.held_record_len = 0;
+        conn.io_activation_pending = true;
+        conn.activation_recv_required = false;
+        try self.progressTlsControl(conn);
+        return if (conn.closing) .close else .survived;
+    }
+
+    fn tlsControlWaiting(conn: *const ConnState) bool {
+        const t = conn.tls orelse return conn.tls_alert_pending;
+        return t.control_phase != .none or t.tx_ku_reply_pending or t.hasCompleteBufferedInbound() or conn.tls_alert_pending;
+    }
+
+    /// The only live control-progress owner. It waits for armed kernel custody,
+    /// replaces reserved credit with a real response, and drains one typed tail
+    /// as a complete TLS preparation. Every retry preserves the stable phase.
+    fn progressTlsControl(self: *LinuxServer, conn: *ConnState) anyerror!void {
+        return self.progressTlsControlWithBudget(conn, 5);
+    }
+
+    /// Control progress can release buffered application input from a SEND or
+    /// activation turn. Keep its parser policy local to this physical row, just
+    /// as driveClientBytes does on RECV, without freeing storage under the
+    /// control owner's active turn. The outer owner finalizes the closing row.
+    fn driveTlsControlInput(self: *LinuxServer, conn: *ConnState, bytes: []const u8, decrypted: bool) !void {
+        // A drain-close still completes its TLS control obligation. Its already
+        // decrypted application bytes have no remaining command authority.
+        if (decrypted and conn.closing) return;
+        const id = idFromToken(conn.token);
+        (if (!decrypted) self.driveTls(id, conn, bytes) else if (conn.ws != null)
+            self.driveWs(id, conn, bytes)
+        else
+            self.feedBytes(id, conn, bytes)) catch |err| switch (err) {
+            error.LineTooLong => {
+                conn.close_reason = "Line too long";
+                conn.closing = true;
+                conn.tls_terminal_failure = true;
+                discardTlsUnsealedTail(conn);
+                conn.tls_discard_unsent = true;
+                if (!conn.send_armed) {
+                    discardPoisonedSendTail(conn);
+                    conn.tls_discard_unsent = false;
+                }
+                conn.io_activation_pending = true;
+                conn.activation_recv_required = false;
+            },
+            else => return err,
+        };
+    }
+
+    /// A bounded owner control turn. The live scheduler budgets the whole KU;
+    /// smaller positive turns use the same custody/cursor path, without assuming
+    /// that a nonblocking syscall accepted the entire offered fragment.
+    fn progressTlsControlWithBudget(self: *LinuxServer, conn: *ConnState, fragment_budget: usize) anyerror!void {
+        if (self.rx().socket_io_quiescing or conn.send_armed or conn.tls_ingress_active or conn.tls_progress_active) return;
+        conn.tls_progress_active = true;
+        defer conn.tls_progress_active = false;
+        const t = conn.tls orelse return;
+        if (conn.tls_discard_unsent) {
+            discardPoisonedSendTail(conn);
+            conn.tls_discard_unsent = false;
         }
-        // Hit the drain cap while still making progress: keep the conn and let the
-        // next recv completion continue draining.
-        return if (survived) .survived else .close;
+        if (conn.tls_alert_pending) {
+            const accepted = ktls.sendControl(conn.fd, .alert, conn.tls_alert_bytes[conn.tls_alert_sent..]) catch |err| {
+                if (err == error.WouldBlock) return;
+                conn.tls_alert_pending = false;
+                return;
+            };
+            conn.tls_alert_sent += @intCast(accepted);
+            if (conn.tls_alert_sent == 2) conn.tls_alert_pending = false;
+            return;
+        }
+        if (conn.tls_terminal_failure or conn.delivery_gap.load(.acquire)) return;
+        if (t.tx_ku_reply_pending) {
+            if (conn.tls_kernel_prefix_remaining != 0) return;
+            const done = t.progressKernelReply(conn.fd, fragment_budget) catch |err| {
+                self.failTls(conn, err);
+                return;
+            };
+            sendq.consumeControlCharge(conn, done.accepted);
+            if (!done.completed) return;
+        }
+        if (t.control_phase == .userspace_requested_ku_held) {
+            // A sealed software prefix must reach the socket before new keys.
+            // An unfunded kernel hold drains old accepted plaintext for credit.
+            if (if (conn.tls_tx_offloaded) conn.tls_kernel_prefix_remaining != 0 else sendq.wireBacklog(conn) != 0) return;
+            try self.driveTlsControlInput(conn, &.{}, false);
+            if (conn.closing or t.control_phase == .userspace_requested_ku_held or t.tx_ku_reply_pending) return;
+        }
+        if (t.control_phase == .kernel_control_read_held) {
+            if (if (conn.tls_tx_offloaded) conn.tls_kernel_prefix_remaining != 0 else sendq.wireBacklog(conn) != 0) return;
+            const credit: usize = if (conn.tls_tx_offloaded) 5 else 27;
+            var reservation = sendq.prepareControlReservation(conn, credit) catch return;
+            reservation.commit();
+            // Reserve exact ciphertext custody before recvmsg can admit a KU.
+            var wire: ?sendq.PreparedReservedControlAppend(*ConnState) = null;
+            if (!conn.tls_tx_offloaded) wire = sendq.prepareReservedControlAppend(conn, 27) catch return;
+            defer if (wire) |*ticket| ticket.abort();
+            var iterations: usize = 0;
+            while (iterations < ktls_control_drain_max) : (iterations += 1) {
+                const received = t.readKernelControl(conn.fd, &conn.recv_buf) catch |err| {
+                    if (err == error.WouldBlock or err == error.OutOfMemory) return;
+                    self.failTls(conn, err);
+                    return;
+                };
+                switch (received) {
+                    .progress => {},
+                    .application => |plain| {
+                        // A control indication can coalesce a later app record.
+                        // The instance rejects interleaving before parser/liveness.
+                        sendq.cancelControlReservation(conn);
+                        conn.tls_kernel_prefix_remaining = 0;
+                        t.control_phase = if (conn.tls_deferred_plain.items.len != 0) .software_tail_ready else .none;
+                        if (conn.closing) break;
+                        conn.last_activity_ms = self.nowMs();
+                        conn.awaiting_pong = false;
+                        self.stats.onBytesIn(plain.len);
+                        try self.driveTlsControlInput(conn, plain, true);
+                        break;
+                    },
+                    .key_update => |ku| {
+                        if (ku.software_reply) |reply| {
+                            defer self.allocator.free(reply);
+                            wire.?.commit(reply);
+                        } else if (!ku.requested) sendq.cancelControlReservation(conn);
+                        conn.tls_kernel_prefix_remaining = 0;
+                        t.control_phase = if (conn.tls_deferred_plain.items.len != 0) .software_tail_ready else .none;
+                        conn.last_activity_ms = self.nowMs();
+                        conn.awaiting_pong = false;
+                        break;
+                    },
+                }
+            }
+            if (t.control_phase == .kernel_control_read_held or t.tx_ku_reply_pending) return;
+        }
+        if (t.control_phase == .software_tail_ready) {
+            var chunks: std.ArrayList([]const u8) = .empty;
+            defer chunks.deinit(self.allocator);
+            var iterator = sendq.DeferredIterator{ .bytes = conn.tls_deferred_plain.items };
+            while (iterator.next() catch {
+                self.failTls(conn, error.InvalidDeferred);
+                return;
+            }) |part| chunks.append(self.allocator, part) catch return;
+            var encrypted = t.prepareDeferredWriteBatch(chunks.items) catch |err| switch (err) {
+                error.OutOfMemory => return,
+                else => {
+                    self.failTls(conn, err);
+                    return;
+                },
+            };
+            defer encrypted.deinit();
+            if (encrypted.bytes().len != conn.tls_deferred_charge) {
+                self.failTls(conn, error.InvalidDeferred);
+                return;
+            }
+            var replacement = sendq.prepareDeferredReplacement(conn, encrypted.bytes().len) catch return;
+            replacement.commit(encrypted.bytes());
+            encrypted.commit();
+            t.control_phase = .none;
+        }
+        if (t.control_phase == .none and t.hasCompleteBufferedInbound()) {
+            try self.driveTlsControlInput(conn, &.{}, false);
+        }
+    }
+
+    fn discardTlsUnsealedTail(conn: *ConnState) void {
+        conn.tls_deferred_plain.clearRetainingCapacity();
+        conn.tls_deferred_charge = 0;
+        sendq.cancelControlReservation(conn);
+    }
+
+    fn failTls(self: *LinuxServer, conn: *ConnState, failure: anyerror) void {
+        const t = conn.tls orelse return;
+        conn.tls_terminal_failure = true;
+        conn.closing = true;
+        conn.close_reason = if (failure == error.TlsAlert) "TLS peer alert" else "TLS record failure";
+        discardTlsUnsealedTail(conn);
+        if (failure == error.TlsAlert) {
+            conn.tls_discard_unsent = true;
+        } else if (conn.tls_tx_offloaded) {
+            // No accepted plaintext suffix can continue after an ambiguous
+            // kernel epoch. Retain armed storage until its exact CQE, then
+            // dispose all unsent app/control liability before final teardown.
+            conn.tls_discard_unsent = true;
+            // Pending old-key KU failure has no coherent alert epoch. Close.
+            if (!t.tx_ku_reply_pending) if (tls_record.fatalAlertBytes(failure)) |bytes| {
+                conn.tls_alert_bytes = bytes;
+                conn.tls_alert_sent = 0;
+                conn.tls_alert_pending = true;
+                conn.tls_discard_unsent = true;
+            };
+        } else if (t.takeAlert(failure)) |alert| {
+            defer self.allocator.free(alert);
+            rawAppendToConn(conn, alert) catch {};
+        }
+        if (conn.tls_discard_unsent and !conn.send_armed) {
+            discardPoisonedSendTail(conn);
+            conn.tls_discard_unsent = false;
+        }
+        conn.io_activation_pending = true;
+        conn.activation_recv_required = false;
     }
 
     pub fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
@@ -10536,14 +11362,17 @@ pub const LinuxServer = struct {
         if (was_cancel_pending and
             event.res == -@as(i32, @intFromEnum(linux.E.CANCELED)))
         {
-            if (conn.closing) {
-                try self.closeConn(event.token, conn.close_reason);
-            } else if (!self.rx().socket_io_quiescing) {
+            if (!self.rx().socket_io_quiescing) {
                 // Failure-resume may have released the shared barrier before a
-                // cancel's original CQE arrived. Restore the quiet receive now;
-                // treating this late ECANCELED as EOF would drop the session.
-                try self.armRecv(conn);
+                // cancel's original CQE arrived. Retain accepted close output
+                // just as on SEND cancellation; ECANCELED is not a stream gap.
                 try self.armSendIfNeeded(conn);
+                if (conn.closing and !hasUnsentOutput(conn))
+                    try self.closeConn(event.token, conn.close_reason)
+                else if (!conn.closing)
+                    try self.armRecv(conn);
+            } else if (conn.closing and !hasUnsentOutput(conn)) {
+                try self.closeConn(event.token, conn.close_reason);
             }
             return;
         }
@@ -10553,7 +11382,9 @@ pub const LinuxServer = struct {
         // its payload and let the all-refs-clear finalizer decide whether the slot
         // can now be recycled.
         if (conn.closing) {
-            try self.closeConn(event.token, conn.close_reason);
+            try self.armSendIfNeeded(conn);
+            if (!hasUnsentOutput(conn))
+                try self.closeConn(event.token, conn.close_reason);
             return;
         }
 
@@ -10573,14 +11404,15 @@ pub const LinuxServer = struct {
                     try self.armSendIfNeeded(conn);
                     if (!conn.closing) {
                         try self.armRecv(conn);
-                    } else if (!conn.send_armed and conn.send_len == conn.send_offset) {
+                    } else if (!hasUnsentOutput(conn)) {
                         try self.closeConn(event.token, conn.close_reason);
                     }
                     return;
                 },
                 .close => {
                     conn.closing = true;
-                    if (!conn.send_armed and conn.send_len == conn.send_offset) {
+                    try self.armSendIfNeeded(conn);
+                    if (!hasUnsentOutput(conn)) {
                         try self.closeConn(event.token, conn.close_reason);
                     }
                     return;
@@ -10590,6 +11422,14 @@ pub const LinuxServer = struct {
 
         if (event.res <= 0) conn.closing = true;
         if (event.res > 0) {
+            if (conn.tls_rx_offloaded) {
+                const t = conn.tls orelse return error.ClientNotFound;
+                if (!t.kernelApplicationAllowed()) {
+                    self.failTls(conn, error.BadHandshake);
+                    try self.armSendIfNeeded(conn);
+                    return;
+                }
+            }
             const chunk = conn.recv_buf[0..@as(usize, @intCast(event.res))];
             self.stats.onBytesIn(chunk.len);
             // Any inbound traffic proves liveness: refresh the idle clock and
@@ -10608,7 +11448,7 @@ pub const LinuxServer = struct {
                 try self.armRecv(conn);
             }
         }
-        if (conn.closing and !conn.send_armed and conn.send_len == conn.send_offset) {
+        if (conn.closing and !hasUnsentOutput(conn)) {
             try self.closeConn(event.token, conn.close_reason);
         }
     }
@@ -10617,6 +11457,10 @@ pub const LinuxServer = struct {
         const id = idFromToken(event.token);
         const conn = try self.connForToken(event.token);
         const was_cancel_pending = conn.send_cancel_pending;
+        const submitted = conn.send_submitted_len;
+        const submitted_offset = conn.send_submitted_offset;
+        conn.send_submitted_len = 0;
+        conn.send_submitted_offset = 0;
         conn.send_armed = false;
         conn.send_cancel_pending = false;
         // Cancellation is not a stream error. No bytes were accepted, so retain
@@ -10624,11 +11468,12 @@ pub const LinuxServer = struct {
         if (was_cancel_pending and
             event.res == -@as(i32, @intFromEnum(linux.E.CANCELED)))
         {
-            if (conn.closing) {
-                try self.closeConn(event.token, conn.close_reason);
-            } else if (!self.rx().socket_io_quiescing) {
+            if (!self.rx().socket_io_quiescing) {
                 try self.armSendIfNeeded(conn);
-                try self.armRecv(conn);
+                if (conn.closing and !hasUnsentOutput(conn))
+                    try self.closeConn(event.token, conn.close_reason)
+                else if (!conn.closing)
+                    try self.armRecv(conn);
             }
             return;
         }
@@ -10644,7 +11489,25 @@ pub const LinuxServer = struct {
             return;
         }
 
-        self.stats.onBytesOut(@as(usize, @intCast(event.res)));
+        if (event.res == 0) {
+            try self.closeConn(event.token, "SEND made no progress");
+            return;
+        }
+        const accepted: usize = @intCast(event.res);
+        if (accepted > submitted or submitted_offset != conn.send_offset or
+            conn.send_offset > conn.send_len or accepted > conn.send_len - conn.send_offset)
+        {
+            try self.closeConn(event.token, "Invalid SEND completion");
+            return;
+        }
+        if (conn.tls_kernel_prefix_remaining != 0) {
+            if (accepted > conn.tls_kernel_prefix_remaining) {
+                try self.closeConn(event.token, "Invalid TLS prefix completion");
+                return;
+            }
+            conn.tls_kernel_prefix_remaining -= accepted;
+        }
+        self.stats.onBytesOut(accepted);
         conn.send_offset += @as(usize, @intCast(event.res));
         if (conn.send_offset >= conn.send_len) {
             conn.send_offset = 0;
@@ -10658,7 +11521,7 @@ pub const LinuxServer = struct {
         // Once the send stream is fully drained (armSendIfNeeded above re-armed if
         // the overflow still had data), a pending kTLS conn attaches TX offload.
         self.maybeAttachKtlsTx(conn);
-        if (conn.closing and !conn.send_armed and conn.send_len == conn.send_offset) {
+        if (conn.closing and !hasUnsentOutput(conn)) {
             try self.closeConn(event.token, conn.close_reason);
         }
     }
@@ -10706,9 +11569,13 @@ pub const LinuxServer = struct {
     fn discardPoisonedSendTail(conn: *ConnState) void {
         std.debug.assert(!conn.send_armed);
         conn.send_offset = 0;
+        conn.tls_kernel_prefix_remaining = 0;
         conn.send_len = 0;
         if (conn.send_overflow.capacity > 0)
             conn.send_overflow.clearAndFree(conn.overflow_allocator);
+        conn.tls_deferred_plain.clearAndFree(conn.overflow_allocator);
+        conn.tls_deferred_charge = 0;
+        conn.tls_control_charge = 0;
     }
 
     /// Observe and, when no send SQE owns the buffer, finish one poisoned
@@ -14226,7 +15093,7 @@ pub const LinuxServer = struct {
     /// in this server passes through here so close/finalization has one exact
     /// latch to consult.
     fn armRecv(self: *LinuxServer, conn: *ConnState) !void {
-        if (self.rx().socket_io_quiescing or conn.recv_armed or conn.closing) return;
+        if (self.rx().socket_io_quiescing or conn.recv_armed or conn.closing or tlsControlWaiting(conn)) return;
         io_backend.submitRecv(&self.rx().ring, conn.token, conn.fd, &conn.recv_buf) catch |err| {
             if (err == error.SubmissionQueueFull) {
                 conn.io_activation_pending = true;
@@ -14254,7 +15121,22 @@ pub const LinuxServer = struct {
         conn.connect_armed = true;
     }
 
+    /// One eligibility rule for the armer and activation scheduler. Reserved
+    /// control credit and a new-epoch kernel suffix are not sendable wire while
+    /// the old-key reply is waiting. Genuine SQ pressure remains retryable work.
+    fn tlsAllowsQueuedWire(conn: *const ConnState) bool {
+        if (conn.tls_alert_pending) return false;
+        if (conn.tls) |t| {
+            if (t.tx_ku_reply_pending or (conn.tls_tx_offloaded and
+                (t.control_phase == .userspace_requested_ku_held or t.control_phase == .kernel_control_read_held) and
+                conn.tls_kernel_prefix_remaining == 0)) return false;
+        }
+        return true;
+    }
+
     pub fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
+        try self.progressTlsControl(conn);
+        if (!tlsAllowsQueuedWire(conn)) return;
         if (comptime builtin.is_test) {
             if (conn.test_sendq_capture) {
                 std.debug.assert(conn.fd < 0);
@@ -14262,21 +15144,47 @@ pub const LinuxServer = struct {
             }
         }
         if (self.rx().socket_io_quiescing or conn.send_armed) return;
+        // A whole prepared TLS batch may enter overflow while inline storage
+        // is empty. Only the owner may refill, after any armed SEND releases its
+        // buffer; the empty-inline fast return must not strand accepted wire.
+        if (conn.send_offset >= conn.send_len and conn.send_overflow.items.len != 0)
+            refillFromOverflow(conn);
         if (conn.send_offset >= conn.send_len) return;
         // A staged activation that still owes RECV must acquire that ownership
         // first. This keeps inherited secured-link replay/burst helpers inert
         // even though they normally arm output as they append it.
         if (!conn.closing and conn.io_activation_pending and conn.activation_recv_required and !conn.recv_armed) return;
-        io_backend.submitSend(&self.rx().ring, conn.token, conn.fd, conn.send_buf[conn.send_offset..conn.send_len]) catch |err| {
+        var submitted_len = conn.send_len - conn.send_offset;
+        if (conn.tls_tx_offloaded) {
+            submitted_len = @min(submitted_len, tls_record.max_plaintext_len);
+            if (conn.tls.?.control_phase == .userspace_requested_ku_held or conn.tls.?.control_phase == .kernel_control_read_held)
+                submitted_len = @intCast(@min(submitted_len, conn.tls_kernel_prefix_remaining));
+        }
+        if (submitted_len == 0) return;
+        io_backend.submitSend(&self.rx().ring, conn.token, conn.fd, conn.send_buf[conn.send_offset..][0..submitted_len]) catch |err| {
             if (err == error.SubmissionQueueFull) {
                 conn.io_activation_pending = true;
-                conn.activation_recv_required = conn.activation_recv_required or (!conn.recv_armed and !conn.closing);
+                conn.activation_recv_required = !tlsControlWaiting(conn) and (conn.activation_recv_required or (!conn.recv_armed and !conn.closing));
                 self.wakeReactor();
                 return;
             }
             return err;
         };
+        conn.send_submitted_len = submitted_len;
+        conn.send_submitted_offset = conn.send_offset;
         conn.send_armed = true;
+    }
+
+    /// A healthy drain-close retains every accepted output domain, including
+    /// software plaintext waiting for retryable preparation and a KU obligation.
+    /// Terminal failure disposes those domains explicitly before finalization.
+    fn hasUnsentOutput(conn: *const ConnState) bool {
+        if (conn.send_armed or sendq.wireBacklog(conn) != 0 or conn.tls_alert_pending or
+            conn.tls_deferred_plain.items.len != 0 or conn.tls_deferred_charge != 0 or
+            conn.tls_control_charge != 0 or conn.tls_kernel_prefix_remaining != 0) return true;
+        if (conn.tls) |t| if (!conn.tls_terminal_failure and
+            (t.control_phase != .none or t.tx_ku_reply_pending or t.unpublished.items.len != 0)) return true;
+        return false;
     }
 
     inline fn kernelOwnsConnStorage(conn: *const ConnState) bool {
@@ -14285,7 +15193,7 @@ pub const LinuxServer = struct {
 
     fn hasPendingSocketActivation(self: *LinuxServer) bool {
         for (self.rx().clients.slots.items) |*slot| {
-            if (slot.occupied and (slot.value.io_activation_pending or slot.value.connect_rearm_pending)) return true;
+            if (slot.occupied and (slot.value.io_activation_pending or slot.value.connect_rearm_pending or tlsControlWaiting(&slot.value))) return true;
         }
         return false;
     }
@@ -14295,6 +15203,15 @@ pub const LinuxServer = struct {
     /// op has its ownership bit, and the slot remains pending until all required
     /// ops are armed. A quiet remainder is nudged through the eventfd wake.
     fn activatePendingSocketIo(self: *LinuxServer) !bool {
+        self.world.lockWrite();
+        defer self.world.unlockWrite();
+        return self.activatePendingSocketIoLocked();
+    }
+
+    /// Activation may release authenticated TLS/WS commands and finalize rows.
+    /// Hold the same outer graph exclusion as a completion for the whole turn;
+    /// progress/armer helpers must not reacquire this nonrecursive lock.
+    fn activatePendingSocketIoLocked(self: *LinuxServer) !bool {
         const slots = self.rx().clients.slots.items;
         if (slots.len == 0) return false;
 
@@ -14304,8 +15221,9 @@ pub const LinuxServer = struct {
         var index = self.rx().activation_cursor % slots.len;
         while (scanned < slots.len) : (scanned += 1) {
             const slot = &slots[index];
-            if (slot.occupied and (slot.value.io_activation_pending or slot.value.connect_rearm_pending)) {
+            if (slot.occupied and (slot.value.io_activation_pending or slot.value.connect_rearm_pending or tlsControlWaiting(&slot.value))) {
                 const conn = &slot.value;
+                try self.progressTlsControl(conn);
                 // A canceled outbound dial must reacquire CONNECT before any
                 // RECV/SEND can be staged. Keep it in the same fair cursor as
                 // inherited socket activation so SQ pressure cannot orphan it.
@@ -14337,19 +15255,16 @@ pub const LinuxServer = struct {
                     conn.io_activation_pending = true;
                     conn.activation_recv_required = false;
                 }
-                if (conn.closing and !conn.send_armed and conn.send_offset >= conn.send_len and
-                    !kernelOwnsConnStorage(conn))
-                {
+                if (conn.closing and !hasUnsentOutput(conn) and !kernelOwnsConnStorage(conn)) {
                     const token = conn.token;
                     conn.io_activation_pending = false;
                     conn.activation_recv_required = false;
                     index = (index + 1) % slots.len;
                     self.rx().activation_cursor = index;
-                    self.world.lockWrite();
                     self.closeConn(token, conn.close_reason) catch {};
-                    self.world.unlockWrite();
                     continue;
                 }
+                if (tlsControlWaiting(conn)) conn.activation_recv_required = false;
                 if (!conn.closing and conn.activation_recv_required and !conn.recv_armed) {
                     try self.armRecv(conn);
                     if (!conn.recv_armed) {
@@ -14361,7 +15276,7 @@ pub const LinuxServer = struct {
                 }
                 const recv_ready = conn.closing or !conn.activation_recv_required or conn.recv_armed;
                 if (recv_ready and
-                    conn.send_offset < conn.send_len and !conn.send_armed)
+                    tlsAllowsQueuedWire(conn) and sendq.wireBacklog(conn) != 0 and !conn.send_armed)
                 {
                     try self.armSendIfNeeded(conn);
                     if (!conn.send_armed) {
@@ -14372,9 +15287,9 @@ pub const LinuxServer = struct {
                     acquired += 1;
                 }
                 if (recv_ready and
-                    (conn.send_offset >= conn.send_len or conn.send_armed))
+                    (sendq.wireBacklog(conn) == 0 or conn.send_armed))
                 {
-                    conn.io_activation_pending = false;
+                    conn.io_activation_pending = tlsControlWaiting(conn);
                     conn.activation_recv_required = false;
                 }
             }
@@ -14466,6 +15381,10 @@ pub const LinuxServer = struct {
             // quiet recv/connect to complete, and recycle only after every exact
             // ownership latch has been cleared by its matching handler.
             if (kernelOwnsConnStorage(conn)) {
+                if (conn.tls != null) {
+                    conn.tls_terminal_failure = true;
+                    conn.tls_discard_unsent = true;
+                }
                 if (conn.closing)
                     retainCloseReason(conn, conn.close_reason)
                 else
@@ -14502,6 +15421,7 @@ pub const LinuxServer = struct {
             // Release any SendQ / RecvQ overflow heap before the slot is freed/reused
             // (covers every close path below, including S2S links that carry mesh bursts).
             if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+            if (conn.tls_deferred_plain.capacity > 0) conn.tls_deferred_plain.deinit(conn.overflow_allocator);
             if (conn.recv_overflow.capacity > 0) conn.recv_overflow.deinit(conn.overflow_allocator);
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
@@ -14776,21 +15696,52 @@ pub const LinuxServer = struct {
     /// decrypted plaintext into the normal line parser. A handshake/record fault
     /// closes only this connection.
     fn driveTls(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, chunk: []const u8) !void {
+        std.debug.assert(!conn.tls_ingress_active);
+        conn.tls_ingress_active = true;
+        defer conn.tls_ingress_active = false;
         const handshake_pending = !conn.tls.?.handshakeDone();
         const started_at_ms = self.nowMs();
-        const outcome = conn.tls.?.onInbound(chunk) catch |err| {
-            // RFC 8446 §6: send a fatal alert so the peer learns WHY the handshake
-            // failed instead of seeing a bare reset. `takeAlert` returns a plaintext
-            // alert pre-ServerHello and an encrypted one afterward (or null when it
-            // can't); it rides the normal drain-then-close path (armSendIfNeeded
-            // after this returns flushes it, then the conn closes).
-            if (conn.tls.?.takeAlert(err)) |alert_rec| {
-                defer self.allocator.free(alert_rec);
-                rawAppendToConn(conn, alert_rec) catch {};
-            }
-            conn.closing = true;
+        const t = conn.tls.?;
+        const connected13 = t.handshakeDone() and t.negotiatedVersion() == .tls13;
+        var control_custody: ?sendq.PreparedReservedControlAppend(*ConnState) = null;
+        defer if (control_custody) |*ticket| ticket.abort();
+        var funded = false;
+        if (connected13) {
+            const credit: usize = if (conn.tls_tx_offloaded) 5 else 27;
+            if (sendq.prepareControlReservation(conn, credit)) |candidate| {
+                var reservation = candidate;
+                reservation.commit();
+                funded = true;
+            } else |_| {}
+        }
+        const held_before = t.control_phase == .userspace_requested_ku_held;
+        const old_wire_before = sendq.wireBacklog(conn);
+        const old_prefix = if (conn.tls_tx_offloaded and held_before) conn.tls_kernel_prefix_remaining else old_wire_before;
+        var allow_requested = funded and !conn.send_armed and old_prefix == 0;
+        if (allow_requested and !conn.tls_tx_offloaded) {
+            control_custody = sendq.prepareReservedControlAppend(conn, 27) catch null;
+            if (control_custody == null) allow_requested = false;
+        }
+        const outcome = t.onInboundWithControlCustody(chunk, !connected13 or allow_requested) catch |err| {
+            self.failTls(conn, err);
             return;
         };
+        if (conn.tls_tx_offloaded and !held_before and t.control_phase == .userspace_requested_ku_held)
+            conn.tls_kernel_prefix_remaining = old_wire_before;
+        if (outcome.control_reply) {
+            std.debug.assert(outcome.handshake_bytes.len == 27 and control_custody != null);
+            control_custody.?.commit(outcome.handshake_bytes);
+            t.control_phase = if (conn.tls_deferred_plain.items.len != 0) .software_tail_ready else .none;
+        } else if (t.tx_ku_reply_pending) {
+            t.control_phase = .none;
+            t.held_record_len = 0;
+        } else if (t.control_phase != .userspace_requested_ku_held) {
+            sendq.cancelControlReservation(conn);
+        }
+        if (tlsControlWaiting(conn)) {
+            conn.io_activation_pending = true;
+            conn.activation_recv_required = false;
+        }
         if (handshake_pending and conn.tls.?.handshakeDone()) {
             self.recordElapsedLatency(.tls_handshake, started_at_ms);
         }
@@ -14832,7 +15783,7 @@ pub const LinuxServer = struct {
             conn.closing = true;
             return;
         }
-        if (outcome.handshake_bytes.len != 0) {
+        if (outcome.handshake_bytes.len != 0 and !outcome.control_reply) {
             // `handshake_bytes` are ALREADY-FORMED TLS records (the handshake
             // flight / post-handshake KeyUpdate) produced by the TLS engine, so
             // they go straight to the wire — NEVER through the app-data encrypt
@@ -14847,7 +15798,7 @@ pub const LinuxServer = struct {
                 return;
             };
         }
-        if (outcome.plaintext.len != 0) {
+        if (!conn.closing and outcome.plaintext.len != 0) {
             if (conn.ws != null) {
                 // wss browser client: decrypted bytes are HTTP-upgrade/WebSocket
                 // frames, not bare IRC lines.
@@ -14886,7 +15837,7 @@ pub const LinuxServer = struct {
         if (!conn.ktls_attach_pending) return;
         if (conn.send_offset < conn.send_len) return; // inline bytes still queued
         if (conn.send_overflow.items.len != 0) return; // overflow still queued
-        if (conn.send_armed) return; // a send is in flight
+        if (conn.send_armed or tlsControlWaiting(conn) or conn.tls_control_charge != 0 or conn.tls_deferred_charge != 0) return; // exact output owner still pending
         const t = conn.tls orelse {
             conn.ktls_attach_pending = false;
             return;
@@ -15213,6 +16164,7 @@ pub const LinuxServer = struct {
     }
 
     fn feedBytes(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, bytes: []const u8) !void {
+        if (conn.closing) return;
         for (bytes) |byte| {
             const line = (recvqPush(conn, byte) catch |err| switch (err) {
                 error.LineTooLong => {
@@ -15493,6 +16445,9 @@ pub const LinuxServer = struct {
         const want_label: ?[]const u8 =
             if (conn.session.hasCap(.labeled_response)) labelTagValue(parsed, &label_buf) else null;
 
+        if (MediaAuthorityTurn.selected(parsed) != null)
+            return self.dispatchMediaAuthority(id, conn, parsed, line, want_label);
+
         if (want_label) |label| {
             var cap_buf: [default_reply_bytes]u8 = undefined;
             const names_label = std.ascii.eqlIgnoreCase(parsed.command, "NAMES");
@@ -15541,6 +16496,56 @@ pub const LinuxServer = struct {
         // (dispatch.zig command_table: PASS/NICK/USER/CAP/AUTHENTICATE/PING/QUIT)
         // — those verbs must work both before and after registration, so they
         // live in the lower layer rather than the post-registration registry.
+        var sink = QueueSink{ .conn = conn };
+        try processLine(conn, line, &sink);
+    }
+
+    /// The real module spine still performs every registration/feature gate.
+    /// This original physical dispatch owns the label before any handler stages
+    /// its final bytes; a joined handler's issuer is never emitted a second time.
+    fn dispatchMediaAuthority(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView, line: []const u8, selected_label: ?[]const u8) !void {
+        const action = MediaAuthorityTurn.selected(parsed) orelse return error.BadState;
+        if (current_media_authority_turn != null or conn.reply_capture != null or
+            self.connFor(id) != conn) return error.BadState;
+        var storage: [default_reply_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &storage);
+        var capture: ReplyCapture = .{ .buf = &storage };
+        var turn: MediaAuthorityTurn = .{
+            .server = self,
+            .id = id,
+            .conn = conn,
+            .action = action,
+            .channel = parsed.paramSlice()[1],
+            .capture = &capture,
+        };
+        if (selected_label) |label| {
+            if (label.len == 0 or label.len > turn.label_storage.len) return error.BadState;
+            @memcpy(turn.label_storage[0..label.len], label);
+            turn.label_len = label.len;
+        }
+        conn.reply_capture = &capture;
+        current_media_authority_turn = &turn;
+        const outcome = blk: {
+            defer {
+                current_media_authority_turn = null;
+                conn.reply_capture = null;
+            }
+            break :blk try self.dispatchModules(id, conn, parsed, line);
+        };
+        if (turn.published) {
+            std.debug.assert(outcome == .handled and !capture.overflowed and capture.len == 0);
+            return;
+        }
+        if (outcome == .handled) {
+            if (selected_label) |label| {
+                emitLabeledIssuer(conn, label, &capture, self.allocator) catch self.poisonOwnedDelivery(conn);
+            } else {
+                if (capture.overflowed) return error.OutputTooSmall;
+                if (capture.len != 0) try LinuxServer.appendHistoryReplay(conn, capture.captured());
+            }
+            return;
+        }
+        // Preserve the normal lower dispatch behavior if no module owns it.
         var sink = QueueSink{ .conn = conn };
         try processLine(conn, line, &sink);
     }
@@ -27858,7 +28863,7 @@ pub const LinuxServer = struct {
             // CONNECT still borrows the inline sockaddr and is likewise refused;
             // listener ACCEPT owns no ConnState storage and stays outside this
             // per-connection boundary.
-            if (e.value.recv_armed or e.value.send_armed or e.value.connect_armed or
+            if (e.value.recv_armed or e.value.send_armed or e.value.send_submitted_len != 0 or e.value.send_submitted_offset != 0 or e.value.connect_armed or
                 e.value.recv_cancel_pending or e.value.send_cancel_pending or e.value.connect_cancel_pending) continue;
             std.debug.assert(!e.value.recv_armed and !e.value.send_armed and !e.value.connect_armed);
             std.debug.assert(!e.value.recv_cancel_pending and !e.value.send_cancel_pending and !e.value.connect_cancel_pending);
@@ -27880,34 +28885,34 @@ pub const LinuxServer = struct {
             // without its crypto state.
             var tls_blob: ?[]u8 = null;
             if (e.value.tls) |t| {
-                const rs = t.exportResume() catch continue;
-                // Wire bytes encrypted but not yet flushed: carried verbatim so the
-                // client's record sequence has no hole after the swap. The FULL
-                // SendQ is the inline tail plus any heap overflow, made contiguous.
-                const tail = e.value.send_buf[e.value.send_offset..e.value.send_len];
-                const ovf = e.value.send_overflow.items;
-                var pend_tmp: ?[]u8 = null;
-                var pending: []const u8 = tail;
-                if (ovf.len != 0) {
-                    const buf = self.allocator.alloc(u8, tail.len + ovf.len) catch continue;
-                    @memcpy(buf[0..tail.len], tail);
-                    @memcpy(buf[tail.len..], ovf);
-                    pend_tmp = buf;
-                    pending = buf;
-                }
-                defer if (pend_tmp) |p| self.allocator.free(p);
-                tls_blob = tls_snapshot.encode(self.allocator, .{
+                if (e.value.tls_ingress_active or e.value.tls_progress_active or e.value.tls_alert_pending or e.value.tls_discard_unsent) continue;
+                const wire_chunks = [_][]const u8{
+                    e.value.send_buf[e.value.send_offset..e.value.send_len],
+                    e.value.send_overflow.items,
+                };
+                var capture = t.prepareCapture(self.allocator, .{
                     .fd = e.value.fd,
-                    .state = rs,
-                    .pending_out = pending,
-                    .certfp = if (e.value.session.tls_certfp) |fp| fp else &.{},
-                    // For an offloaded conn `pending` is plaintext (the kernel
-                    // encrypts on send); the successor's inherited-fd kernel state
-                    // keeps encrypting, so it re-queues it as plaintext too.
                     .tx_offloaded = e.value.tls_tx_offloaded,
-                    // RX offload rides the inherited fd's kernel state the same way;
-                    // the successor resumes reading plaintext from recv().
                     .rx_offloaded = e.value.tls_rx_offloaded,
+                    .wire_chunks = &wire_chunks,
+                    .deferred_plain = e.value.tls_deferred_plain.items,
+                    .deferred_ciphertext_charge = e.value.tls_deferred_charge,
+                    .control_charge = std.math.cast(u32, e.value.tls_control_charge) orelse continue,
+                    .queue_cap = e.value.sendq_cap,
+                    .kernel_tx_prefix_remaining = e.value.tls_kernel_prefix_remaining,
+                }) catch continue;
+                defer capture.deinit();
+                tls_blob = tls_snapshot.encode(self.allocator, .{
+                    .kernel_tx_prefix_remaining = capture.kernel_tx_prefix_remaining,
+                    .fd = e.value.fd,
+                    .state = capture.state,
+                    .pending_out = capture.pending_out,
+                    .certfp = if (e.value.session.tls_certfp) |fp| fp else &.{},
+                    .tx_offloaded = e.value.tls_tx_offloaded,
+                    .rx_offloaded = e.value.tls_rx_offloaded,
+                    .control_charge = @intCast(e.value.tls_control_charge),
+                    .deferred_ciphertext_charge = e.value.tls_deferred_charge,
+                    .deferred_plain = e.value.tls_deferred_plain.items,
                 }) catch continue;
             }
             var snap = e.value.session.snapshot();
@@ -28197,6 +29202,7 @@ pub const LinuxServer = struct {
     const UpgradeContinuityBlocker = enum {
         session_drop_transaction,
         relay_v2_deferred,
+        webpush_overflow_delivery,
         webtransport_listener,
         acme_companion,
         media_rooms,
@@ -28216,6 +29222,7 @@ pub const LinuxServer = struct {
         // Deferred MESSAGE_V2 owns exact signed wire not yet published into
         // RVG2. Until it has a Helix capsule, exec must never discard it.
         if (self.relay_v2_deferred_len != 0) return .relay_v2_deferred;
+        if (self.hasRetainedWebpushOverflow()) return .webpush_overflow_delivery;
         if (self.config.webtransport_port != 0) return .webtransport_listener;
         if (self.acme_reload_tls != null) return .acme_companion;
         if (!self.media_rooms.upgradeContinuityReady()) return .media_rooms;
@@ -28234,6 +29241,7 @@ pub const LinuxServer = struct {
         return switch (blocker) {
             .session_drop_transaction => "SESSION DROP transaction",
             .relay_v2_deferred => "deferred MESSAGE_V2 authority",
+            .webpush_overflow_delivery => "accepted Webpush overflow delivery",
             .webtransport_listener => "WebTransport listener",
             .acme_companion => "ACME renewal companion",
             .media_rooms => "media room control state",
@@ -31149,6 +32157,9 @@ pub const LinuxServer = struct {
             self.clearDeferredSessionMeshParts(conn);
             conn.session_list_cache.reset();
             conn.send_overflow.clearAndFree(conn.overflow_allocator);
+            conn.tls_deferred_plain.clearAndFree(conn.overflow_allocator);
+            conn.tls_deferred_charge = 0;
+            conn.tls_control_charge = 0;
             conn.recv_overflow.clearAndFree(conn.overflow_allocator);
             conn.fd = -1;
         }
@@ -31164,6 +32175,9 @@ pub const LinuxServer = struct {
         conn.session_list_cache.reset();
         conn.recv_overflow.clearAndFree(conn.overflow_allocator);
         conn.send_overflow.clearAndFree(conn.overflow_allocator);
+        conn.tls_deferred_plain.clearAndFree(conn.overflow_allocator);
+        conn.tls_deferred_charge = 0;
+        conn.tls_control_charge = 0;
         if (conn.tls) |t| {
             t.deinit();
             self.allocator.destroy(t);
@@ -31192,6 +32206,9 @@ pub const LinuxServer = struct {
         }
         conn.recv_overflow.clearAndFree(conn.overflow_allocator);
         conn.send_overflow.clearAndFree(conn.overflow_allocator);
+        conn.tls_deferred_plain.clearAndFree(conn.overflow_allocator);
+        conn.tls_deferred_charge = 0;
+        conn.tls_control_charge = 0;
         conn.session_list_cache.reset();
         _ = self.rx().clients.free(id);
         if (close_fd) closeFd(fd);
@@ -31243,6 +32260,9 @@ pub const LinuxServer = struct {
         _ = conn.session.reconcileOperAuthority(configured_binding, .disabled, self.grantNowU64());
         self.applyOperAutoOverride(conn); // re-affirm +j across USR2 for auto_override admins
         self.injectSessionState(conn);
+        // Determine the destination physical cap before validating any carried
+        // wire/tail/control charge. A smaller new policy refuses the whole adopt.
+        self.assignConnClass(conn);
         // TLS client: rebuild the live engine BEFORE anything else can touch the
         // socket. Any failure cleans up the fd/slot and propagates whole-startup
         // refusal — a TLS connection must never be adopted as plaintext.
@@ -31405,55 +32425,53 @@ pub const LinuxServer = struct {
     /// is re-queued verbatim. Returns false on ANY failure; the caller cleans the
     /// client and rejects successor startup (TLS never falls back to plaintext).
     fn adoptTlsState(self: *LinuxServer, conn: *ConnState, ts: tls_snapshot.Snapshot) bool {
+        tls_snapshot.validate(ts) catch return false;
+        if (ts.fd != conn.fd) return false;
+        const tail_charge = std.math.cast(usize, ts.deferred_ciphertext_charge) orelse return false;
+        const charged = std.math.add(usize, std.math.add(usize, ts.pending_out.len, tail_charge) catch return false, ts.control_charge) catch return false;
+        if (charged > conn.sendq_cap) return false;
         const t = self.allocator.create(tls_conn.TlsConn) catch return false;
-        // Mirror the accept path's engine-config gate: the hardened 1.2 leg is
-        // only offered when its cert material is configured. A carried 1.2
-        // connection with no 1.2 config fails resume and refuses the handoff.
         const cfg12: ?tls12_server.Config = if (self.config.tls12_cert_chain.len != 0 and
-            (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null))
-            self.tls12Config()
-        else
-            null;
-        // Connected-state resume: the handshake is already complete, so the
-        // client-cert request flag has no on-wire effect here. Pass the global
-        // setting to mirror the original config exactly.
+            (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) self.tls12Config() else null;
         t.* = tls_conn.TlsConn.resumeFrom(self.allocator, self.tls13Config(self.config.tls_request_client_cert), cfg12, ts.state) catch {
             self.allocator.destroy(t);
             return false;
         };
+        // This candidate still owns no live transport. Every allocation/getter
+        // and mandatory exporter derivation completes before publication.
+        var success = false;
+        defer if (!success) {
+            t.deinit();
+            self.allocator.destroy(t);
+        };
+        t.restoreInheritedOffload(conn.fd, ts.tx_offloaded, ts.rx_offloaded) catch return false;
+        var exporter: [32]u8 = @splat(0);
+        defer std.crypto.secureZero(u8, &exporter);
+        if (ts.state.engine == .tls13) t.channelBindingTlsExporter(&exporter) catch return false;
+        conn.tls_deferred_plain.ensureTotalCapacityPrecise(conn.overflow_allocator, ts.deferred_plain.len) catch return false;
+        var wire = sendq.prepareAppend(conn, ts.pending_out.len) catch return false;
+        defer wire.abort();
+        // Allocation-free local publication; outer whole-adopt rollback retains
+        // predecessor FD custody and tears down every speculative candidate.
+        wire.commit(ts.pending_out);
+        conn.tls_deferred_plain.appendSliceAssumeCapacity(ts.deferred_plain);
+        conn.tls_deferred_charge = tail_charge;
+        conn.tls_control_charge = ts.control_charge;
+        conn.tls_kernel_prefix_remaining = ts.kernel_tx_prefix_remaining;
         conn.tls = t;
         conn.is_tls = true;
-        // kTLS: the predecessor's kernel TX/RX state rides the inherited fd across
-        // execve, so re-attach nothing — just resume treating this conn as
-        // offloaded (its send seam hands the kernel plaintext; recv() returns
-        // kernel-decrypted plaintext). `pending_out` was carried as plaintext
-        // accordingly.
         conn.tls_tx_offloaded = ts.tx_offloaded;
         conn.tls_rx_offloaded = ts.rx_offloaded;
-        // Re-bind the mTLS client-cert fingerprint (SASL EXTERNAL identity).
-        if (ts.certfp.len == certfp.fingerprint_len) {
+        if (ts.certfp.len != 0) {
             @memcpy(&conn.certfp_buf, ts.certfp);
             conn.session.tls_certfp = conn.certfp_buf[0..];
         }
-        if (t.channelBindingTlsExporter(&conn.tls_exporter_buf)) |_| {
-            conn.session.tls_exporter = conn.tls_exporter_buf;
-        } else |_| {}
-        // Wire bytes the predecessor encrypted but never flushed: re-queue them
-        // verbatim (already TLS records — bypass the encrypt seam). If they don't
-        // fit, the client's record stream would hole; refuse the handoff instead.
-        if (ts.pending_out.len != 0) {
-            // Carried SendQ (inline + overflow): lift the cap to cover it so the
-            // restore never truncates a legitimately-buffered burst. `assignConnClass`
-            // sets the real per-class cap afterward; the carried bytes still drain.
-            conn.sendq_cap = @max(conn.sendq_cap, ts.pending_out.len);
-            rawAppendToConn(conn, ts.pending_out) catch {
-                t.deinit();
-                self.allocator.destroy(t);
-                conn.tls = null;
-                conn.is_tls = false;
-                return false;
-            };
+        if (ts.state.engine == .tls13) {
+            conn.tls_exporter_buf = exporter;
+            conn.session.tls_exporter = exporter;
         }
+        conn.session.tls_cipher = t.cipherName();
+        success = true;
         return true;
     }
 
@@ -33067,7 +34085,16 @@ pub const LinuxServer = struct {
     /// credentials and MAC keys are intentionally targeted to the requesting
     /// session instead of published to all MEDIA subscribers.
     pub fn sendMediaEventReply(self: *LinuxServer, conn: *ConnState, action: []const u8, channel: []const u8, detail: []const u8) !void {
+        var line_buf: [event_spine.max_event_line_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &line_buf);
+        try appendToConn(conn, try self.renderMediaEventReply(conn, action, channel, detail, &line_buf));
+    }
+
+    /// Caller-owned rendering only. A capability candidate retains these exact
+    /// issuer bytes until protected output and authority can publish together.
+    fn renderMediaEventReply(self: *LinuxServer, conn: *const ConnState, action: []const u8, channel: []const u8, detail: []const u8, line_buf: []u8) ![]const u8 {
         var msg_buf: [event_spine.max_event_line_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &msg_buf);
         const message = if (detail.len != 0)
             std.fmt.bufPrint(&msg_buf, "MEDIA {s} {s} {s}", .{ action, channel, detail }) catch return error.OutputTooSmall
         else
@@ -33078,9 +34105,7 @@ pub const LinuxServer = struct {
             event_spine.buildEventTags(&tag_buf, .service, .notice) catch ""
         else
             "";
-        var line_buf: [event_spine.max_event_line_len]u8 = undefined;
-        const line = event_spine.renderEventTagged(tags, self.serverName(), conn.session.displayName(), message, &line_buf) catch return error.OutputTooSmall;
-        try appendToConn(conn, line);
+        return event_spine.renderEventTagged(tags, self.serverName(), conn.session.displayName(), message, line_buf) catch return error.OutputTooSmall;
     }
 
     /// CHANNEL, MEMBER, and MEDIA bodies put the channel in the third token.
@@ -39572,6 +40597,14 @@ pub const LinuxServer = struct {
     }
 
     pub fn replayServicesLiveState(self: *LinuxServer, svc: *services_mod.Services) void {
+        _ = self.replayServicesLiveStateFallible(svc) catch |err| {
+            srvLog("onyx-server: services live-state replay failed ({s})\n", .{@errorName(err)});
+        };
+    }
+
+    /// Unpublished cold graph: a replay error aborts its owner before READY.
+    /// Inherited state is restored from its strict capsule instead of replayed.
+    pub fn replayServicesLiveStateFallible(self: *LinuxServer, svc: *services_mod.Services) !services_mod.LiveReplaySummary {
         const ReplayCtx = struct {
             server: *LinuxServer,
 
@@ -39626,22 +40659,20 @@ pub const LinuxServer = struct {
         };
 
         var ctx = ReplayCtx{ .server = self };
-        const summary = svc.replayLiveState(.{
+        const summary = try svc.replayLiveState(.{
             .ptr = &ctx,
             .channel = ReplayCtx.onChannel,
             .akick = ReplayCtx.onAkick,
             .ward = ReplayCtx.onWard,
             .saccess = ReplayCtx.onSaccess,
-        }) catch |err| {
-            srvLog("onyx-server: services live-state replay failed ({s})\n", .{@errorName(err)});
-            return;
-        };
+        });
         if (summary.channels != 0 or summary.akicks != 0 or summary.wards != 0 or summary.saccesses != 0) {
             srvLog(
                 "onyx-server: services replay restored {d} channel(s), {d} MLOCK(s), {d} AKICK(s), {d} WARD(s), {d} SACCESS(es)\n",
                 .{ summary.channels, summary.mlocks, summary.akicks, summary.wards, summary.saccesses },
             );
         }
+        return summary;
     }
 
     /// Mark `conn` logged in as the canonical (lowercased) `account`.
@@ -48720,6 +49751,202 @@ pub const LinuxServer = struct {
         svc.webpushPut(account, blob) catch {};
     }
 
+    /// Source consumer cut, called under World. Worker retains its own mutex
+    /// through each callback; callbacks may enter Services, never this Worker.
+    /// A partial synced Services prefix is idempotent: retain the complete
+    /// original endpoint list until every account has reconciled successfully.
+    fn reconcileWebpushOutcomesLocked(self: *LinuxServer, deadline: ?std.Io.Clock.Timestamp) !void {
+        const worker = self.webpush_worker orelse return;
+        try self.requireMediaRetirementDeadline(deadline);
+        const Context = struct {
+            server: *LinuxServer,
+            deadline: ?std.Io.Clock.Timestamp,
+
+            fn prune(context: @This(), endpoints: []const []const u8) !void {
+                try context.server.requireMediaRetirementDeadline(context.deadline);
+                const svc = context.server.account_services orelse return error.MissingAccountServices;
+                if (context.deadline) |limit| {
+                    _ = try svc.webpushPruneDeadUntil(context.server.allocator, endpoints, limit);
+                } else {
+                    _ = try svc.webpushPruneDead(context.server.allocator, endpoints);
+                }
+                // If the deadline elapsed during synchronous storage work,
+                // retain the whole original cut for an idempotent later pass.
+                try context.server.requireMediaRetirementDeadline(context.deadline);
+            }
+            fn publish(context: @This(), message: []const u8) !void {
+                try context.server.requireMediaRetirementDeadline(context.deadline);
+                try context.server.acceptWebpushOverflowLocked(message);
+            }
+        };
+        const context: Context = .{ .server = self, .deadline = deadline };
+        // Accepted prefixes must fan out even if a later notice hit pressure.
+        // This defer runs after the leaf returned and unlocked its real mutex.
+        defer self.publishWebpushOverflowFanoutLocked();
+        try worker.reconcileDead(context, Context.prune);
+        try worker.reconcileOverflow(context, Context.publish);
+    }
+
+    fn acceptWebpushOverflowLocked(self: *LinuxServer, message: []const u8) !void {
+        if (!std.mem.eql(u8, message, webpush_mod.overflow_oper_message)) return error.InvalidValue;
+        const destination = for (&self.webpush_overflow_deliveries) |*slot| {
+            if (slot.* == null) break slot;
+        } else return error.Capacity;
+        var candidate: WebpushOverflowDelivery = .{
+            .origin = try self.allocator.dupe(u8, self.serverName()),
+            .origin_node = self.config.node_id,
+            .hlc = 0,
+        };
+        errdefer candidate.deinit(self.allocator);
+        const body = formatOutboundBody(&candidate.body, .service, .warn, candidate.origin, message) orelse return error.Capacity;
+        candidate.body_len = body.len;
+        for (self.outbound_webhooks, &candidate.destinations) |subscription, *owned| {
+            const sub = subscription orelse continue;
+            if (!sub.mask.contains(.service)) continue;
+            const url = try self.allocator.dupe(u8, sub.url);
+            errdefer self.allocator.free(url);
+            const secret = try self.allocator.dupe(u8, sub.secret);
+            owned.* = .{ .url = url, .secret = secret, .mask = sub.mask };
+        }
+        if (self.config.node_identity) |identity| {
+            // No identity has accepted before this cut. A staging/admission
+            // failure may retry with a fresh HLC, so later accepted events
+            // cannot retire a never-published candidate and wedge its notice.
+            candidate.hlc = self.nextMeshHlc();
+            var event = candidate.event();
+            try oper_event.stampOrigin(&event, &identity.sign_kp, &candidate.public_key, &candidate.signature);
+            candidate.event_id = (try self.admitEventSpineV2(event)) orelse return error.EventSpineAdmissionRejected;
+        } else {
+            // Legacy source append is allocation-free, with the same accepted
+            // local history semantics as the existing direct-leaf publisher.
+            self.event_history.record(@intFromEnum(event_spine.EventCategory.service), @intFromEnum(event_spine.EventSeverity.warn), platform.realtimeMillis(), candidate.origin, message);
+            self.event_stats.record(@intFromEnum(event_spine.EventCategory.service), @intFromEnum(event_spine.EventSeverity.warn));
+        }
+        // Every fallible candidate precedes source acceptance. Publish owned
+        // downstream work and consume exactly one Worker notice without failure.
+        destination.* = candidate;
+    }
+
+    fn publishWebpushOverflowFanoutLocked(self: *LinuxServer) void {
+        for (&self.webpush_overflow_deliveries) |*slot| {
+            const delivery = if (slot.*) |*value| value else continue;
+            if (!delivery.fanout_published) {
+                if (delivery.event_id) |event_id| {
+                    const event = delivery.event();
+                    self.deliverOperEventV2Local(event, event_id, .service, .warn, event.subject);
+                    self.meshBroadcastAuthoredOperEventV2(event);
+                } else {
+                    self.deliverOperEventLocal(delivery.origin, .service, .warn, webpush_mod.overflow_oper_message, webpush_mod.overflow_oper_message);
+                    self.meshBroadcastOperEvent(.service, .warn, webpush_mod.overflow_oper_message);
+                }
+                delivery.fanout_published = true;
+            }
+            while (delivery.next_destination < delivery.destinations.len and delivery.destinations[delivery.next_destination] == null)
+                delivery.next_destination += 1;
+            if (delivery.next_destination == delivery.destinations.len) {
+                delivery.deinit(self.allocator);
+                slot.* = null;
+            }
+        }
+    }
+
+    /// One synchronous destination attempt per maintenance turn, outside Worker.
+    /// Failure retains the exact body, URL, signing secret and destination cursor.
+    fn retryWebpushOverflowOutputsLocked(self: *LinuxServer) void {
+        for (&self.webpush_overflow_deliveries) |*slot| {
+            const delivery = if (slot.*) |*value| value else continue;
+            if (!delivery.fanout_published) continue;
+            const sub = delivery.destinations[delivery.next_destination].?;
+            const parsed = http_fetch.parseUrl(sub.url) catch return;
+            if (self.outboundDeliveryBlocked(parsed.host, parsed.port)) return;
+            var signature_buffer: [71]u8 = undefined;
+            const body = delivery.body[0..delivery.body_len];
+            const signature = outboundSignature(sub.secret, body, &signature_buffer);
+            self.outbound_webhook_attempts += 1;
+            const response = http_fetch.postSigned(self.allocator, parsed, body, signature, .{
+                .connect_timeout_ms = 400,
+                .recv_timeout_ms = 400,
+                .max_response_bytes = 4096,
+            }) catch return;
+            defer self.allocator.free(response);
+            if (!self.retainedWebhookResponseAccepted(response)) return;
+            self.outbound_webhook_delivered += 1;
+            // Only a real successful HTTP response releases this source output.
+            self.allocator.free(sub.url);
+            std.crypto.secureZero(u8, sub.secret);
+            self.allocator.free(sub.secret);
+            delivery.destinations[delivery.next_destination] = null;
+            delivery.next_destination += 1;
+            self.publishWebpushOverflowFanoutLocked();
+            return;
+        }
+    }
+
+    fn hasRetainedWebpushOverflow(self: *const LinuxServer) bool {
+        for (self.webpush_overflow_deliveries) |slot| if (slot != null) return true;
+        return false;
+    }
+
+    /// HTTP bytes at EOF alone are not a receipt. Refuse malformed status,
+    /// ambiguous framing and incomplete bodies before releasing accepted output.
+    fn retainedWebhookResponseAccepted(self: *LinuxServer, response: []u8) bool {
+        const client_http = @import("../proto/http1_client.zig");
+        const head_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return false;
+        const status_end = std.mem.indexOf(u8, response[0 .. head_end + 2], "\r\n") orelse return false;
+        const status_line = response[0..status_end];
+        if (status_line.len < 13 or status_line[8] != ' ' or status_line[12] != ' ') return false;
+        for (status_line) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+        const head = response[0 .. head_end + 4];
+        for (head, 0..) |byte, index| {
+            if (byte == '\r' and (index + 1 == head.len or head[index + 1] != '\n')) return false;
+            if (byte == '\n' and (index == 0 or head[index - 1] != '\r')) return false;
+        }
+        // Parse the complete original response only after strict framing and
+        // chunk validation of untouched bytes.
+        var content_length: ?usize = null;
+        var chunked = false;
+        const fields_start = if (status_end == head_end) head_end else status_end + 2;
+        var fields = std.mem.splitSequence(u8, response[fields_start..head_end], "\r\n");
+        var count: usize = 0;
+        while (fields.next()) |field| {
+            if (field.len == 0) continue;
+            count += 1;
+            if (count > 64) return false;
+            const colon = std.mem.indexOfScalar(u8, field, ':') orelse return false;
+            if (colon == 0) return false;
+            const name = field[0..colon];
+            for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", byte) == null) return false;
+            const value = std.mem.trim(u8, field[colon + 1 ..], " \t");
+            for (value) |byte| if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return false;
+            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+                if (content_length != null or chunked or value.len == 0) return false;
+                for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+                content_length = std.fmt.parseInt(usize, value, 10) catch return false;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                if (chunked or content_length != null or !std.ascii.eqlIgnoreCase(value, "chunked")) return false;
+                chunked = true;
+            }
+        }
+        const body = response[head_end + 4 ..];
+        if (content_length) |length| {
+            if (body.len != length) return false;
+        } else if (chunked) {
+            // This source decoder checks the final zero chunk, strict trailers,
+            // every chunk boundary and exact consumption, without accepting an
+            // apparent status from truncated or trailing bytes.
+            var decoded = @import("../proto/http1.zig").decodeChunked(self.allocator, body, .{ .max_body_bytes = 4096, .max_header_bytes = 4096 }) catch return false;
+            defer decoded.deinit(self.allocator);
+        }
+        var headers: [64]client_http.Header = undefined;
+        const parsed = client_http.parseResponse(response, &headers) catch return false;
+        if (parsed.status < 200 or parsed.status >= 300) return false;
+        if (parsed.status == 204) return !chunked and body.len == 0 and (content_length == null or content_length.? == 0);
+        // The fetcher can return immediately at a header without framing.
+        // Until it supplies a source EOF proof, that cannot retire this output.
+        return content_length != null or chunked;
+    }
+
     /// Fire a push for an offline/closed-tab recipient. Payload is compact JSON
     /// sealed to the push subscription:
     ///   `{"type":"dm|mention|call","from":…,"text":…[,"channel":…]}`
@@ -48740,28 +49967,13 @@ pub const LinuxServer = struct {
         const svc = self.account_services orelse return;
         if (account.len == 0 or kind.len == 0) return;
 
+        // All accounts share worker outcomes. Refuse new notification work on
+        // reconciliation failure, keeping the exact source outcomes for retry.
+        self.reconcileWebpushOutcomesLocked(null) catch return;
+
         const subs = self.webpushLoad(svc, account);
         defer webpush_mod.freeList(self.allocator, subs);
-
-        // Opportunistic pruning: drop this account's dead endpoints first.
-        const dead = worker.drainDead();
-        defer {
-            for (dead) |e| self.allocator.free(e);
-            if (dead.len != 0) self.allocator.free(dead);
-        }
-        var live: [webpush_mod.max_subscriptions_per_account]webpush_mod.Subscription = undefined;
-        var n: usize = 0;
-        outer: for (subs) |existing| {
-            for (dead) |gone| {
-                if (std.mem.eql(u8, existing.endpoint, gone)) continue :outer;
-            }
-            if (n < live.len) {
-                live[n] = existing;
-                n += 1;
-            }
-        }
-        if (n != subs.len) self.webpushStore(svc, account, live[0..n]);
-        if (n == 0) return;
+        if (subs.len == 0) return;
 
         // Payload: compact JSON, text truncated so it always encrypts in one record.
         var pb: [640]u8 = undefined;
@@ -48779,14 +49991,8 @@ pub const LinuxServer = struct {
         }
         w.writeAll("}") catch return;
 
-        for (live[0..n]) |s_| {
-            const queued = worker.enqueue(s_.endpoint, s_.ua_public, s_.auth, w.buffered());
-            if (queued == .dropped) {
-                if (worker.takeOverflowOperEvent()) |msg| {
-                    self.publishOperEvent(.service, .warn, msg) catch {};
-                }
-            }
-        }
+        for (subs) |subscription| _ = worker.enqueue(subscription.endpoint, subscription.ua_public, subscription.auth, w.buffered());
+        self.reconcileWebpushOutcomesLocked(null) catch {};
     }
 
     /// True when `hay` contains `needle` as a case-insensitive IRC nick token
@@ -49622,83 +50828,65 @@ pub const LinuxServer = struct {
         try std.testing.expect(parseOfferedFingerprint(&.{"fingerprint="}) == .malformed); // empty value
     }
 
+    /// Physical selectors are joined to the actual owned row and World here;
+    /// nick, fd, transport flags and a surviving sibling do not identify a caller.
+    /// The command owner holds World and its connection turn through publication.
+    fn requireMediaCaller(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8) !void {
+        if (id.isNone() or id.shard != self.rx().shard_id or self.connFor(id) != conn or
+            !conn.session.registered() or conn.closing or conn.tls_terminal_failure or
+            !self.world.isMember(channel, worldIdFromClient(id))) return error.BadState;
+    }
+
     /// `MEDIA OFFER <#chan> <codec[,codec...]>` — negotiate the call's codec + FEC
     /// set against the SFU's supported codecs (real sdp/media_session offer/answer),
     /// persist it as the channel's active call profile, and reply with the agreed
     /// set. The UDP transport plane (ICE/STUN/TURN/jitter) is a separate layer;
     /// this is the live signaling/negotiation half.
-    pub fn mediaOffer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8, extra_args: []const []const u8) !void {
-        var cbuf: [4]sdp.Codec = undefined;
-        const cn = parseCodecCsv(&cbuf, codec_csv);
-        if (cn == 0) {
-            try self.failReply(conn, "MEDIA", "NO_CODECS", "Offer at least one codec: cadencevox,cadencevis,raw");
-            return;
-        }
-
-        // RFC 8122 DTLS-SRTP request. Fail-closed BEFORE any wiring: a malformed
-        // fingerprint, or a DTLS request when DTLS-SRTP is disabled/down, is
-        // rejected here so a rejected offer leaves no half-negotiated state.
-        var dtls_mode = false;
-        switch (parseOfferedFingerprint(extra_args)) {
-            .none => {},
-            .malformed => {
-                try self.failReply(conn, "MEDIA", "BAD_FINGERPRINT", "Malformed fingerprint (expected fingerprint=sha-256:<colon-hex>)");
-                return;
-            },
-            .ok => |d| {
-                var fp_probe: [128]u8 = undefined;
-                if (!self.config.media_dtls_srtp or self.media_plane.dtlsFingerprint(&fp_probe) == null) {
-                    try self.failReply(conn, "MEDIA", "DTLS_UNAVAILABLE", "DTLS-SRTP keying is not enabled on this server");
-                    return;
-                }
-                // Store the peer's expected fingerprint BEFORE advertising
-                // setup=passive: if storage fails we must NOT advertise DTLS,
-                // because an unbound expectation would let the terminator export
-                // keys to an unverified peer (fail OPEN). Fail closed instead.
-                self.media_plane.bindOfferedFingerprint(channel, conn.session.displayName(), d) catch {
-                    try self.failReply(conn, "MEDIA", "DTLS_UNAVAILABLE", "Could not record the DTLS fingerprint");
-                    return;
-                };
-                dtls_mode = true;
-            },
-        }
-
-        const offered_fec = sdp.Fec{ .scheme = .rs_block, .redundancy = 1 };
-        const remote = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = offered_fec, .direction = .sendrecv };
-        const server_codecs = [_]sdp.Codec{
-            .{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 },
-            .{ .tag = .cadencevis, .clock_rate = 90000, .params = 0 },
-        };
-        const local = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = &server_codecs, .fec = offered_fec, .direction = .sendrecv };
-        var negotiated = media_session.negotiate(self.allocator, local, remote) catch {
-            self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], &.{}) catch {};
-            try self.failReply(conn, "MEDIA", "NEGOTIATE_FAILED", "No common codec");
-            return;
-        };
-        defer negotiated.deinit(self.allocator);
-        if (negotiated.codecs.len == 0) {
-            self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], &.{}) catch {};
-            try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the SFU");
-            return;
-        }
-        // Persist the agreed set as the call profile a later ANSWER negotiates against.
-        self.media_rooms.setProfile(channel, negotiated.codecs, negotiated.fec) catch {};
-        self.media_rooms.setParticipantProfile(channel, conn.session.displayName(), cbuf[0..cn], offered_fec) catch {};
-        self.publishMediaCaps(channel, conn.session.displayName(), cbuf[0..cn], offered_fec) catch {};
-        self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], negotiated.codecs) catch {};
-        try self.mediaNegotiatedReply(conn, channel, "OFFER-ACK", negotiated.codecs, negotiated.fec);
-        // Converge the negotiated codec profile across the whole channel via the
-        // MEDIA EVENT plane (typed, mesh-propagated, member-gated) — same path as
-        // call presence. The old local-only media notice never reached members
-        // on other mesh nodes, so they never learned the call's codec set. The
-        // offerer still gets its targeted OFFER-ACK above.
-        var pbuf: [256]u8 = undefined;
-        if (formatMediaCodecDetail(&pbuf, negotiated.codecs, negotiated.fec)) |detail|
-            self.publishMediaEvent("PROFILE", channel, conn.session.displayName(), detail) catch {};
-        try self.provisionMediaTransports(conn, channel, cbuf[0..cn], dtls_mode, extra_args);
+    pub fn mediaOffer(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, codec_csv: []const u8, extra_args: []const []const u8) !void {
+        try self.mediaNegotiateJoined(id, conn, channel, .offer, codec_csv, extra_args);
     }
 
-    fn provisionMediaTransports(self: *LinuxServer, conn: *ConnState, channel: []const u8, participant_codecs: []const sdp.Codec, dtls_mode: bool, extra_args: []const []const u8) !void {
+    fn mediaNegotiateJoined(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, action: PreparedMediaNegotiation.Action, codec_csv: []const u8, extra_args: []const []const u8) !void {
+        try self.requireMediaCaller(id, conn, channel);
+        const negotiation = PreparedMediaNegotiation.prepare(self, id, conn, channel, action, codec_csv, extra_args) catch |err| switch (err) {
+            error.NoCodecs => return self.failReply(conn, "MEDIA", "NO_CODECS", "Offer at least one codec: cadencevox,cadencevis,raw"),
+            error.NoOffer => return self.failReply(conn, "MEDIA", "NO_OFFER", "No active call profile; send MEDIA OFFER first"),
+            error.NoCommonCodec => return self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the SFU"),
+            error.BadFingerprint => return self.failReply(conn, "MEDIA", "BAD_FINGERPRINT", "Malformed fingerprint (expected fingerprint=sha-256:<colon-hex>)"),
+            error.DtlsUnavailable => return self.failReply(conn, "MEDIA", "DTLS_UNAVAILABLE", "DTLS-SRTP keying is not enabled on this server"),
+            else => return err,
+        };
+        const turn = try MediaAuthorityTurn.require(self, id, conn, if (action == .offer) .offer else .answer, channel);
+        const owner = self.media_routing_owner orelse return self.failReply(conn, "MEDIA", "TRANSPORT_UNAVAILABLE", "Media transport is unavailable");
+        var candidate: ?PreparedMediaOfferCommand = PreparedMediaOfferCommand.prepare(turn, mediaRoutingBacking(owner).domain, negotiation) catch |err| switch (err) {
+            error.NoTransportSelected, error.BrowserTransportUnroutable => null,
+            error.BadState => return self.failReply(conn, "MEDIA", "SECURE_SIGNALING_REQUIRED", "Endpoint credentials require a live protected signaling connection"),
+            error.DtlsUnavailable => return self.failReply(conn, "MEDIA", "DTLS_UNAVAILABLE", "DTLS-SRTP keying is not enabled on this server"),
+            else => return err,
+        };
+        if (candidate) |*plan| {
+            defer plan.deinit();
+            try plan.domain.withLocked(plan, PreparedMediaOfferCommand.publishLocked);
+        } else {
+            // Public-only negotiation creates neither an empty offer nor a
+            // credential. Its Room profile and complete reply still join once.
+            var plan = try PreparedPublicMediaNegotiation.prepare(turn, mediaRoutingBacking(owner).domain, negotiation);
+            defer plan.deinit();
+            try plan.domain.withLocked(&plan, PreparedPublicMediaNegotiation.publishLocked);
+        }
+        // Accepted issuer bytes already have protected SendQ custody. Subsequent
+        // channel events use the existing Event Spine and never a label capture.
+        conn.reply_capture = null;
+        try self.publishMediaCaps(channel, conn.session.displayName(), negotiation.offered.slice(), negotiation.offered.fec);
+        if (action == .offer) {
+            var detail_buf: [256]u8 = undefined;
+            const detail = formatMediaCodecDetail(&detail_buf, negotiation.agreed.slice(), negotiation.agreed.fec) orelse return error.OutputTooSmall;
+            try self.publishMediaEvent("PROFILE", channel, conn.session.displayName(), detail);
+        }
+    }
+
+    fn provisionMediaTransports(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, participant_codecs: []const sdp.Codec, dtls_mode: bool, extra_args: []const []const u8) !void {
+        try self.requireMediaCaller(id, conn, channel);
         const nick = conn.session.displayName();
         const want_webrtc = dtls_mode or isWebrtcTransport(extra_args);
 
@@ -49903,63 +51091,8 @@ pub const LinuxServer = struct {
     /// A DTLS-SRTP answerer may carry its own `fingerprint=sha-256:<hex>`; it is
     /// validated (fail-closed) and stored so the answerer's DTLS leg fails closed
     /// on a certificate mismatch, exactly as the OFFER path.
-    pub fn mediaAnswer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8, extra_args: []const []const u8) !void {
-        const prof = self.media_rooms.profileOf(channel) orelse {
-            try self.failReply(conn, "MEDIA", "NO_OFFER", "No active call profile; send MEDIA OFFER first");
-            return;
-        };
-
-        // Fail-closed fingerprint validation before any codec negotiation.
-        var answer_digest: ?[dtls_peer_verify_mod.digest_len]u8 = null;
-        switch (parseOfferedFingerprint(extra_args)) {
-            .none => {},
-            .malformed => {
-                try self.failReply(conn, "MEDIA", "BAD_FINGERPRINT", "Malformed fingerprint (expected fingerprint=sha-256:<colon-hex>)");
-                return;
-            },
-            .ok => |d| {
-                var fp_probe: [128]u8 = undefined;
-                if (!self.config.media_dtls_srtp or self.media_plane.dtlsFingerprint(&fp_probe) == null) {
-                    try self.failReply(conn, "MEDIA", "DTLS_UNAVAILABLE", "DTLS-SRTP keying is not enabled on this server");
-                    return;
-                }
-                answer_digest = d;
-            },
-        }
-
-        var cbuf: [4]sdp.Codec = undefined;
-        const cn = parseCodecCsv(&cbuf, codec_csv);
-        if (cn == 0) {
-            try self.failReply(conn, "MEDIA", "NO_CODECS", "Answer at least one codec: cadencevox,cadencevis,raw");
-            return;
-        }
-        const answer_fec = sdp.Fec{ .scheme = .rs_block, .redundancy = 1 };
-        const answerer = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = answer_fec, .direction = .sendrecv };
-        const offered = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = prof.slice(), .fec = prof.fec, .direction = .sendrecv };
-        var negotiated = media_session.negotiate(self.allocator, offered, answerer) catch {
-            self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], prof.slice()) catch {};
-            try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the call profile");
-            return;
-        };
-        defer negotiated.deinit(self.allocator);
-        if (negotiated.codecs.len == 0) {
-            self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], prof.slice()) catch {};
-            try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the call profile");
-            return;
-        }
-        // Store the answerer's DTLS fingerprint (if any) so its media leg is
-        // verified. Keyed by (channel, participant), consumed by the terminator.
-        // Fail closed on a storage failure rather than leaving the leg unverified.
-        if (answer_digest) |d| self.media_plane.bindOfferedFingerprint(channel, conn.session.displayName(), d) catch {
-            try self.failReply(conn, "MEDIA", "DTLS_UNAVAILABLE", "Could not record the DTLS fingerprint");
-            return;
-        };
-
-        self.media_rooms.setParticipantProfile(channel, conn.session.displayName(), cbuf[0..cn], answer_fec) catch {};
-        self.publishMediaCaps(channel, conn.session.displayName(), cbuf[0..cn], answer_fec) catch {};
-        self.sendDeniedMediaKinds(conn, channel, cbuf[0..cn], negotiated.codecs) catch {};
-        try self.mediaNegotiatedReply(conn, channel, "ANSWER-ACK", negotiated.codecs, negotiated.fec);
-        try self.provisionMediaTransports(conn, channel, cbuf[0..cn], answer_digest != null, extra_args);
+    pub fn mediaAnswer(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, codec_csv: []const u8, extra_args: []const []const u8) !void {
+        try self.mediaNegotiateJoined(id, conn, channel, .answer, codec_csv, extra_args);
     }
 
     /// `MEDIA STATS <#chan>` — per-participant transport state: ICE status and
@@ -51777,12 +52910,18 @@ pub const LinuxServer = struct {
     /// Called at boot and on REHASH. A missing dir / malformed plugin is logged,
     /// never fatal — the plugin system simply stays empty.
     pub fn loadWasmPlugins(self: *LinuxServer) void {
-        if (self.config.wasm_plugin_dir.len == 0) return;
-        const n = self.wasm.loadFromDir(self.config.wasm_plugin_dir) catch |err| {
+        const n = self.loadWasmPluginsFallible() catch |err| {
             srvLog("onyx-server: wasm plugin load from {s} failed: {s}\n", .{ self.config.wasm_plugin_dir, @errorName(err) });
             return;
         };
         if (n > 0) srvLog("onyx-server: loaded {d} OroWasm plugin(s) from {s}\n", .{ n, self.config.wasm_plugin_dir });
+    }
+
+    /// Parsing and registration only: Instance.init executes no exports or
+    /// hostcalls. Every non-absent load failure remains prepublication.
+    pub fn loadWasmPluginsFallible(self: *LinuxServer) !usize {
+        if (self.config.wasm_plugin_dir.len == 0) return 0;
+        return try self.wasm.loadFromDir(self.config.wasm_plugin_dir);
     }
 
     /// Outcome of the REHASH cert hot-reload, folded into the RPL_REHASHING note.
@@ -55159,6 +56298,2953 @@ pub const LinuxServer = struct {
 /// Public entry point. `LinuxServer` is the io_uring fast path. Other targets
 /// construct `PortableServer`, which serves on the native `IoBackend`.
 /// Helix USR2 adoption stays on `LinuxServer`.
+// Private implementation fragment for server.zig. Not an exported module.
+// Every allocation made through this storage is wiped, including allocations
+// freed before an OOM unwind. No arena metadata/default deinit hides secrets.
+const PolicyStorage = struct {
+    owner: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    first: ?*Allocation = null,
+    const Allocation = struct {
+        next: ?*Allocation,
+        bytes: []u8,
+        alignment: std.mem.Alignment,
+    };
+
+    fn allocator(self: *PolicyStorage) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn lock(self: *PolicyStorage) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PolicyStorage = @ptrCast(@alignCast(ctx));
+        const node = self.owner.create(Allocation) catch return null;
+        const bytes = self.owner.rawAlloc(len, alignment, ret_addr) orelse {
+            self.owner.destroy(node);
+            return null;
+        };
+        self.lock();
+        defer self.mutex.unlock();
+        node.* = .{ .next = self.first, .bytes = bytes[0..len], .alignment = alignment };
+        self.first = node;
+        return bytes;
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PolicyStorage = @ptrCast(@alignCast(ctx));
+        self.lock();
+        var cursor = &self.first;
+        while (cursor.*) |node| {
+            if (node.bytes.ptr == bytes.ptr) {
+                std.debug.assert(node.bytes.len == bytes.len and node.alignment == alignment);
+                cursor.* = node.next;
+                self.mutex.unlock();
+                std.crypto.secureZero(u8, node.bytes);
+                self.owner.rawFree(node.bytes, node.alignment, ret_addr);
+                self.owner.destroy(node);
+                return;
+            }
+            cursor = &node.next;
+        }
+        self.mutex.unlock();
+        @panic("foreign policy allocation");
+    }
+    /// Only after every policy borrower has joined/detached. This also handles
+    /// allocations not yet installed into a fully constructed typed object.
+    fn deinit(self: *PolicyStorage) void {
+        while (self.first) |node| {
+            self.first = node.next;
+            std.crypto.secureZero(u8, node.bytes);
+            self.owner.rawFree(node.bytes, node.alignment, @returnAddress());
+            self.owner.destroy(node);
+        }
+    }
+};
+
+/// Data-only recursive clone. A source pointer/allocator/Io must instead have
+/// an explicit typed lifetime binding; it cannot quietly pass through here.
+fn clonePolicyValue(allocator: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!@TypeOf(value) {
+    const T = @TypeOf(value);
+    return switch (@typeInfo(T)) {
+        .pointer => |info| blk: {
+            if (info.size != .slice or info.sentinel() != null) @compileError("policy clone requires an explicit source binding for this pointer");
+            const out = try allocator.alloc(info.child, value.len);
+            for (out, value) |*dst, src| dst.* = try clonePolicyValue(allocator, src);
+            break :blk out;
+        },
+        .optional => if (value) |inner| try clonePolicyValue(allocator, inner) else null,
+        .array => blk: {
+            var out: T = undefined;
+            for (&out, value) |*dst, src| dst.* = try clonePolicyValue(allocator, src);
+            break :blk out;
+        },
+        .@"struct" => |info| blk: {
+            var out: T = undefined;
+            inline for (info.field_names) |name| @field(out, name) = try clonePolicyValue(allocator, @field(value, name));
+            break :blk out;
+        },
+        .@"union" => |info| blk: {
+            if (info.tag_type == null) @compileError("policy clone refuses untagged union");
+            const tag = std.meta.activeTag(value);
+            inline for (info.field_names) |name| {
+                if (tag == @field(info.tag_type.?, name)) break :blk @unionInit(T, name, try clonePolicyValue(allocator, @field(value, name)));
+            }
+            unreachable;
+        },
+        .bool, .int, .float, .@"enum", .void => value,
+        else => @compileError("policy clone encountered non-data state"),
+    };
+}
+
+// Construction-owned private Server bridge. The configured Runtime retains
+// its opaque owner; no raw Server or bound Service leaves that owner.
+const managed_acme = @import("acme_renewal.zig");
+const managed_ocsp = @import("ocsp_staple.zig");
+const managed_wt = @import("webtransport_listener.zig");
+const managed_sasl = @import("sasl_bridge.zig");
+const managed_scram = @import("scram_store.zig");
+const managed_oauth = @import("oauth_jwt.zig");
+const managed_boot = @import("config_boot.zig");
+
+fn checkedMonotonicDeadlineMillis(timeout_ms: u64) !u64 {
+    const now_ms = std.math.cast(u64, platform.monotonicMillis()) orelse return error.InvalidMonotonicClock;
+    return std.math.add(u64, now_ms, timeout_ms);
+}
+
+/// Real external durable/source borrows, never preexisting service or worker
+/// ownership. Main holds them through the complete graph join. The managed
+/// bridge creates its own Services and ephemeral credential mirrors internally.
+pub const ManagedAccountInputs = struct {
+    store: *services_mod.OroStore,
+    durable_devices: ?*durable_credential_props.State = null,
+    durable_oper: ?*@import("durable_oper_authority.zig").State = null,
+};
+pub const ManagedCoreInputs = struct {
+    config: Config,
+    parsed: config_format.Config,
+    accounts: ?ManagedAccountInputs = null,
+    oauth_key: ?managed_oauth.Key = null,
+    ocsp_trust_anchors: []const []const u8 = &.{},
+};
+pub const ManagedLeasedMode = enum { provision, recover };
+pub const ManagedLeasedAccountInputs = struct {
+    mode: ManagedLeasedMode,
+    storage: delivery_authority.ProtectedStorage,
+};
+/// Internal constructor bindings created by Runtime. Public Runtime input
+/// contains no fields with these types and returns none of these addresses.
+pub const RuntimeCreatedBindings = struct {
+    rdns: *rdns.Resolver,
+    dnsbl: ?*dnsbl_resolver.Resolver,
+    mail: ?*mail_sender.Sender,
+    webpush: ?*webpush_mod.Worker,
+};
+pub const ManagedCoreObservation = struct {
+    bound_port: u16,
+    reactor_count: usize,
+    reactor_workers: usize,
+    acme: bool,
+    ocsp: bool,
+    metrics: bool,
+    webhook: bool,
+    history: bool,
+    media: bool,
+    geo: bool,
+    resources_prepared: bool,
+    webtransport_port: u16,
+};
+const ManagedCorePhase = enum { allocated, constructed, resources, workers, published, stopping_producers, producers_joined, stopping_reactors, joined, detached };
+const ManagedInlineExecution = enum(u8) { unpublished, idle, running, exited, closed };
+const ManagedInlineInvocationBacking = struct {
+    claimed: std.atomic.Value(bool) = .init(false),
+    returned: std.atomic.Value(bool) = .init(false),
+};
+const ManagedInlineCustodyBacking = struct { marker: u8 = 0 };
+const ManagedServicesContextBacking = struct { core: *ManagedCoreBacking };
+
+/// Private construction consistency records. Only the original Core factory
+/// issues them; no receipt, digest, source pointer or issuer is exported. The
+/// existing account input is explicitly a legacy Store borrow, not proof of a
+/// leased StateContext, a held World lane, durable event admission or readiness.
+const ManagedAccountSource = union(enum) { none, legacy_borrow: ManagedAccountInputs, leased };
+const ManagedCorePolicySeal = struct {
+    owner: *ManagedCoreBacking,
+    config_digest: [32]u8,
+    parsed_digest: [32]u8,
+    full_origin: ?crypto_sign.PublicKey,
+    canonical_name: []const u8,
+    accounts: ManagedAccountSource,
+
+    fn issue(b: *ManagedCoreBacking, accounts: ?ManagedAccountInputs) !ManagedCorePolicySeal {
+        const name = b.expected.server_name;
+        if (name.len == 0 or name.len > event_history_mod.max_origin_len) return error.InvalidManagedOrigin;
+        for (name) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidManagedOrigin;
+        const digest = try managedColdConfigDigest(b.expected);
+        const origin = if (b.expected.node_identity) |identity| blk: {
+            const actual = node_identity.nodeIdFromPublicKey(identity.sign_kp.public_key);
+            if (!std.crypto.timing_safe.eql([20]u8, actual, identity.node_id)) return error.InvalidManagedIdentity;
+            const signature = identity.sign_kp.signCtx("onyx/configured-runtime/core-key-proof/v1", &digest) catch return error.InvalidManagedIdentity;
+            if (!(crypto_sign.verifyCtx("onyx/configured-runtime/core-key-proof/v1", &digest, signature, identity.sign_kp.public_key) catch false)) return error.InvalidManagedIdentity;
+            break :blk identity.sign_kp.public_key;
+        } else null;
+        return .{
+            .owner = b,
+            .config_digest = digest,
+            .parsed_digest = try managedParsedPolicyDigest(b.parsed),
+            .full_origin = origin,
+            .canonical_name = name,
+            .accounts = if (accounts) |source| .{ .legacy_borrow = source } else if (b.leased_request != null) .leased else .none,
+        };
+    }
+
+    fn requireInstalled(self: ManagedCorePolicySeal, b: *ManagedCoreBacking) !void {
+        // Install validation compares full-server config absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const server = b.server orelse return error.ConfiguredOwnerMismatch;
+        if (self.owner != b or b.owned_identity != server.config.node_identity or
+            !std.mem.eql(u8, self.canonical_name, server.config.server_name) or
+            !std.mem.eql(u8, self.canonical_name, server.serverName()) or
+            !std.crypto.timing_safe.eql([32]u8, self.config_digest, try managedColdConfigDigest(server.config)) or
+            !std.crypto.timing_safe.eql([32]u8, self.parsed_digest, try managedParsedPolicyDigest(b.parsed))) return error.ConfiguredOwnerMismatch;
+        if (self.full_origin) |origin| {
+            const identity = server.config.node_identity orelse return error.ConfiguredOwnerMismatch;
+            if (!std.crypto.timing_safe.eql(crypto_sign.PublicKey, origin, identity.sign_kp.public_key) or
+                !std.crypto.timing_safe.eql([20]u8, node_identity.nodeIdFromPublicKey(origin), identity.node_id)) return error.ConfiguredOwnerMismatch;
+        } else if (server.config.node_identity != null) return error.ConfiguredOwnerMismatch;
+        switch (self.accounts) {
+            .none => if (b.accounts != null or b.services != null or server.config.account_services != null) return error.ConfiguredOwnerMismatch,
+            .legacy_borrow => |original| {
+                const actual = b.accounts orelse return error.ConfiguredOwnerMismatch;
+                const services = if (b.services) |*owner| owner else return error.ConfiguredOwnerMismatch;
+                if (!std.meta.eql(original, actual) or server.config.account_services != services or
+                    (try services.legacyStore()) != original.store) return error.ConfiguredOwnerMismatch;
+            },
+            .leased => {
+                if (b.accounts != null or b.services != null or server.config.account_services != null or
+                    server.leased_authority != b.leased_authority or server.leased_services != b.leased_loan)
+                    return error.ConfiguredOwnerMismatch;
+                const authority = b.leased_authority orelse return error.ConfiguredOwnerMismatch;
+                const loan = b.leased_loan orelse return error.ConfiguredOwnerMismatch;
+                try delivery_authority.StateContext.validateCoreSources(@ptrCast(&b.leased_stage), authority, loan);
+            },
+        }
+    }
+};
+
+const ManagedCoreInstallSeal = struct {
+    owner: *ManagedCoreBacking,
+    server: *Server,
+    world: *world_model.World,
+    services: ?*services_mod.Services,
+    services_lock: ?*@TypeOf(@as(services_mod.Services, undefined).lock),
+    services_config: ?services_mod.Config,
+    leased_authority: ?*delivery_authority.Authority,
+    leased_loan: ?*delivery_authority.ServicesLoan,
+
+    fn issue(b: *ManagedCoreBacking) !ManagedCoreInstallSeal {
+        // Install seals pin the full-server World; no portable equivalent exists.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        try (b.policy_seal orelse return error.ConfiguredOwnerMismatch).requireInstalled(b);
+        const services = if (b.services) |*owner| owner else null;
+        return .{ .owner = b, .server = b.server.?, .world = &b.server.?.world, .services = services, .services_lock = if (services) |owner| &owner.lock else null, .services_config = if (services) |owner| owner.cfg else null, .leased_authority = b.leased_authority, .leased_loan = b.leased_loan };
+    }
+
+    fn requireOriginal(self: ManagedCoreInstallSeal, b: *ManagedCoreBacking) !void {
+        // Install seals pin the full-server World; no portable equivalent exists.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        try (b.policy_seal orelse return error.ConfiguredOwnerMismatch).requireInstalled(b);
+        const server = b.server orelse return error.ConfiguredOwnerMismatch;
+        const services = if (b.services) |*owner| owner else null;
+        if (self.owner != b or self.server != server or self.world != &server.world or self.services != services or
+            self.services_lock != (if (services) |owner| &owner.lock else null) or
+            self.leased_authority != b.leased_authority or self.leased_loan != b.leased_loan) return error.ConfiguredOwnerMismatch;
+        if (services) |owner| {
+            if (!std.meta.eql(self.services_config.?, owner.cfg)) return error.ConfiguredOwnerMismatch;
+        } else if (self.services_config != null) return error.ConfiguredOwnerMismatch;
+    }
+};
+
+const ManagedCoreBacking = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    policy: PolicyStorage,
+    parsed: config_format.Config = undefined,
+    expected: Config = undefined,
+    policy_seal: ?ManagedCorePolicySeal = null,
+    install_seal: ?ManagedCoreInstallSeal = null,
+    leased_request: ?ManagedLeasedAccountInputs = null,
+    leased_stage: ManagedLeasedStageBacking = undefined,
+    leased_authority: ?*delivery_authority.Authority = null,
+    leased_loan: ?*delivery_authority.ServicesLoan = null,
+    leased_scope_tokens: ?*ManagedLeasedWorldScopeBacking = null,
+    leased_scope_count: usize = 0,
+    leased_active_scope: ?*ManagedLeasedWorldScopeBacking = null,
+    server: ?*Server = null,
+    phase: ManagedCorePhase = .allocated,
+    run: ?*reactor_pool_mod.RunFlag = null,
+    accounts: ?ManagedAccountInputs = null,
+    services: ?services_mod.Services = null,
+    scram: ?managed_scram.ScramStore = null,
+    certfp_binds: ?certfp_bind_mod.CertfpBindStore = null,
+    transparency: ?key_transparency.KeyTransparencyLog = null,
+    plain: managed_sasl.ServicesPlainChecker = undefined,
+    external: managed_sasl.ServicesExternalLookup = undefined,
+    session_token: managed_sasl.ServicesSessionTokenLookup = undefined,
+    oauth: ?managed_oauth.Verifier = null,
+    ocg2_observer: ?*ocg2_runtime_mod.Runtime = null,
+    ocg2_projection: ?*ocg2_projection_mod.Runtime = null,
+    ocg2_audit: ?audit_trail_mod.AuditTrail = null,
+    acme: ?*managed_acme.Service = null,
+    ocsp: ?*managed_ocsp.Service = null,
+    binding: RuntimeCreatedBindings,
+    services_context: ManagedServicesContextBacking = undefined,
+    owned_identity: ?*node_identity.NodeIdentity = null,
+    expected_config_digest: [32]u8 = undefined,
+    expected_acme_digest: ?[32]u8 = null,
+    expected_ocsp_digest: ?[32]u8 = null,
+    expected_metrics_listener: ?metrics_http.ListenerObservation = null,
+    expected_webhook_listener: ?metrics_http.ListenerObservation = null,
+    expected_history_listener: ?metrics_http.ListenerObservation = null,
+    expected_native_socket: ?@import("../substrate/media_socket.zig").Snapshot = null,
+    expected_media_socket: ?@import("../substrate/media_socket.zig").Snapshot = null,
+    graph_view: ?*const reactor_pool_mod.runtime_start_gate.View = null,
+    inline_execution: std.atomic.Value(ManagedInlineExecution) = .init(.unpublished),
+    inline_borrowed: std.atomic.Value(bool) = .init(false),
+    inline_reservation_issued: bool = false,
+    inline_invocation: ManagedInlineInvocationBacking = .{},
+    inline_custody: ManagedInlineCustodyBacking = .{},
+    geo_stop_fence: ?geo_services.runtime_pause.ProducerFence = null,
+};
+fn managedBacking(self: *ManagedCore) *ManagedCoreBacking {
+    return @ptrCast(@alignCast(self));
+}
+
+const ManagedLeasedStagePhase = enum { fresh, constructing, authority, loan, installed, aborted };
+const ManagedLeasedStageBacking = struct {
+    core: *ManagedCoreBacking,
+    phase: ManagedLeasedStagePhase = .fresh,
+    authority: ?*delivery_authority.Authority = null,
+    loan: ?*delivery_authority.ServicesLoan = null,
+};
+fn managedLeasedStageBacking(stage: *ManagedLeasedCoreStage) *ManagedLeasedStageBacking {
+    return @ptrCast(@alignCast(stage));
+}
+
+// Retained one-shot identities have a finite creator-lifetime budget, including
+// failed preparations. Exhaustion needs genuine quiescence and explicit cold
+// reconstruction; this prerequisite has no live scope-rotation authority.
+const managed_leased_scope_budget = 4096;
+const ManagedLeasedWorldScopeBacking = struct {
+    stage: *ManagedLeasedCoreStage,
+    core: *ManagedCoreBacking,
+    world: *world_model.World,
+    authority: *delivery_authority.Authority,
+    loan: ?*delivery_authority.ServicesLoan,
+    creator: std.Thread.Id,
+    acquisition: u64,
+    next: ?*ManagedLeasedWorldScopeBacking,
+    registered_channel_stage: ?*world_model.World.PreparedRegisteredChannel = null,
+    consumed: bool = false,
+};
+fn managedLeasedScopeBacking(scope: *ManagedLeasedWorldScope) *ManagedLeasedWorldScopeBacking {
+    return @ptrCast(@alignCast(scope));
+}
+
+fn requireManagedLeasedWorldSources(stage: *ManagedLeasedCoreStage, authority: *delivery_authority.Authority, loan: ?*delivery_authority.ServicesLoan) !*ManagedCoreBacking {
+    // Leased install seals reference the full LinuxServer World; no portable adoption exists.
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+    try stage.requireOriginalSources(authority, loan);
+    const original = managedLeasedStageBacking(stage);
+    const b = original.core;
+    const server = b.server orelse return error.CoreWorldNotInstalled;
+    const seal = b.install_seal orelse return error.CoreWorldNotInstalled;
+    // Never enter leaf validation or acquire Services from a World witness:
+    // these checks also execute while the original leaf context gate is held.
+    if (original.phase != .installed or seal.owner != b or seal.server != server or seal.world != &server.world or
+        b.leased_authority != authority or b.leased_loan != loan or loan == null or
+        seal.leased_authority != authority or seal.leased_loan != loan or
+        server.leased_authority != authority or server.leased_services != loan)
+        return error.ConfiguredOwnerMismatch;
+    return b;
+}
+
+/// Only the original private Core stage issues these tokens. No pointer,
+/// creator, acquisition number or issuer is returned by Core. A scope retains
+/// one exact actual World acquisition; a same-thread reacquisition cannot
+/// reauthorize its prepared candidate. Creator custody outlives every caller.
+pub const ManagedLeasedWorldScope = opaque {
+    /// Bind only the stage issued by this exact original World under the
+    /// acquisition already retained by Core. Aliases retain the same opaque
+    /// source-owned payload; no caller-supplied epoch or fields are accepted.
+    pub fn bindOriginalRegisteredChannelStage(self: *ManagedLeasedWorldScope, channel: *world_model.World.PreparedRegisteredChannel) !void {
+        const source = managedLeasedScopeBacking(self);
+        try self.requireOriginalAcquisition(source.stage, source.authority, source.loan);
+        try channel.requireReady();
+        try channel.requireOriginalWorld(source.world, source.creator, source.acquisition);
+        if (source.registered_channel_stage) |original| {
+            if (original != channel) return error.ChannelStageAlreadyBound;
+        } else source.registered_channel_stage = channel;
+    }
+
+    /// Cold disposal validates the still-original World stage without granting
+    /// its interrupted acquisition authority to commit or ordinarily abort.
+    pub fn requireOriginalRegisteredChannelColdCancellation(self: *ManagedLeasedWorldScope, channel: *world_model.World.PreparedRegisteredChannel) !void {
+        const source = managedLeasedScopeBacking(self);
+        const original = source.registered_channel_stage orelse return error.ChannelStageNotBound;
+        if (channel != original) return error.SourceIdentityMismatch;
+        try self.requireColdCancellation(source.stage, source.authority, source.loan);
+        try channel.requireOriginalWorld(source.world, source.creator, source.acquisition);
+    }
+
+    /// Ordinary event terminal paths must check this before their WAL action.
+    /// A channel plan has its own joined durable cut; it cannot be retired by
+    /// consuming the event scope while the original World stage is active.
+    pub fn requireNoActiveRegisteredChannelStage(self: *ManagedLeasedWorldScope) !void {
+        // Stage validation compares against the full-server World; no portable equivalent exists.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const source = managedLeasedScopeBacking(self);
+        const b = try requireManagedLeasedWorldSources(source.stage, source.authority, source.loan);
+        if (source.consumed or source.core != b or source.world != &b.server.?.world or b.leased_active_scope != source)
+            return error.ConsumedWorldScope;
+        if (source.creator != std.Thread.getCurrentId()) return error.WorldScopeWrongCaller;
+        try source.world.lock.requireExclusiveHeldByCurrentThread();
+        try source.world.requireNoActiveRegisteredChannelStage();
+    }
+
+    pub fn requireOriginalAcquisition(self: *ManagedLeasedWorldScope, stage: *ManagedLeasedCoreStage, authority: *delivery_authority.Authority, loan: ?*delivery_authority.ServicesLoan) !void {
+        // Scope acquisition compares against the full-server World; no portable equivalent exists.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const source = managedLeasedScopeBacking(self);
+        const b = try requireManagedLeasedWorldSources(stage, authority, loan);
+        if (source.consumed or source.stage != stage or source.core != b or source.world != &b.server.?.world or
+            source.authority != authority or source.loan != loan or b.leased_active_scope != source)
+            return error.ConsumedWorldScope;
+        if (source.creator != std.Thread.getCurrentId()) return error.WorldScopeWrongCaller;
+        try source.world.lock.requireExclusiveAcquisitionByCurrentThread(source.acquisition);
+    }
+
+    /// Fallible validation precedes any candidate retirement. This distinct
+    /// disposal path permits only a genuine unpublished Core whose original
+    /// creator holds a NEW World acquisition after interruption. It never
+    /// authorizes commit and does not mint a graph or thread-join receipt.
+    pub fn requireColdCancellation(self: *ManagedLeasedWorldScope, stage: *ManagedLeasedCoreStage, authority: *delivery_authority.Authority, loan: ?*delivery_authority.ServicesLoan) !void {
+        const source = managedLeasedScopeBacking(self);
+        const b = try requireManagedLeasedWorldSources(stage, authority, loan);
+        if (source.consumed or source.stage != stage or source.core != b or source.world != &b.server.?.world or
+            source.authority != authority or source.loan != loan or b.leased_active_scope != source)
+            return error.ConsumedWorldScope;
+        if (source.creator != std.Thread.getCurrentId()) return error.WorldScopeWrongCaller;
+        if (b.phase != .constructed or b.graph_view != null or b.run != null or
+            b.server.?.runtime_gate != null or b.server.?.pool.count() != 0 or
+            b.inline_borrowed.load(.acquire) or b.inline_reservation_issued or
+            b.inline_execution.load(.acquire) != .unpublished)
+            return error.CoreSourceActive;
+        // Exhaustion can follow the final valid scope without advancing the
+        // saturated counter. Only this cold disposal diagnostic recognizes
+        // that real later acquisition; ordinary commit/abort remain closed.
+        source.world.lock.requireExclusiveAcquisitionInterruptedByCurrentThread(source.acquisition) catch |err| switch (err) {
+            error.ExclusiveAcquisitionNotInterrupted => return error.WorldAcquisitionNotInterrupted,
+            else => return err,
+        };
+    }
+
+    // Source-only no-fail metadata retirement. Leaf checks this scope before
+    // terminal commit/abort; its lexical World lane cannot change in between.
+    // These methods expose no new authority and never unlock the caller's World.
+    pub fn releaseAfterTerminal(self: *ManagedLeasedWorldScope) void {
+        const source = managedLeasedScopeBacking(self);
+        self.requireOriginalAcquisition(source.stage, source.authority, source.loan) catch @panic("original World scope lost during source terminal cut");
+        self.requireNoActiveRegisteredChannelStage() catch @panic("original channel stage retained during scope terminal cut");
+        source.core.leased_active_scope = null;
+        source.consumed = true;
+    }
+    pub fn releaseAfterColdCancellation(self: *ManagedLeasedWorldScope) void {
+        const source = managedLeasedScopeBacking(self);
+        self.requireColdCancellation(source.stage, source.authority, source.loan) catch @panic("cold World scope changed during source cancellation");
+        self.requireNoActiveRegisteredChannelStage() catch @panic("original channel stage retained during cold scope cancellation");
+        source.core.leased_active_scope = null;
+        source.consumed = true;
+    }
+};
+
+/// Source-issued only inside createLeasedCold. There is no public issuer or
+/// getter on Core. Its named constructors derive all authority policy and key
+/// material from the original owned normalized stage, never caller Contexts.
+pub const ManagedLeasedCoreStage = opaque {
+    pub fn provisionOriginalAuthority(self: *ManagedLeasedCoreStage, storage: delivery_authority.ProtectedStorage) !*delivery_authority.Authority {
+        return self.createOriginalAuthority(storage, .provision);
+    }
+    pub fn recoverOriginalAuthority(self: *ManagedLeasedCoreStage, storage: delivery_authority.ProtectedStorage) !*delivery_authority.Authority {
+        return self.createOriginalAuthority(storage, .recover);
+    }
+    fn createOriginalAuthority(self: *ManagedLeasedCoreStage, storage: delivery_authority.ProtectedStorage, mode: ManagedLeasedMode) !*delivery_authority.Authority {
+        const stage = managedLeasedStageBacking(self);
+        const b = stage.core;
+        const original = b.leased_request orelse return error.InvalidAccountBinding;
+        if (stage != &b.leased_stage or b.phase != .allocated or stage.phase != .fresh) return error.ConsumedCoreStage;
+        if (mode != original.mode) return error.InvalidStorageMode;
+        if (storage.dir.handle != original.storage.dir.handle or !std.mem.eql(u8, storage.name, original.storage.name)) return error.ConfiguredOwnerMismatch;
+        const seal = b.policy_seal orelse return error.ConfiguredOwnerMismatch;
+        const identity = b.owned_identity orelse return error.InvalidManagedIdentity;
+        if (seal.owner != b or seal.full_origin == null or
+            !std.crypto.timing_safe.eql([32]u8, seal.config_digest, try managedColdConfigDigest(b.expected)) or
+            !std.crypto.timing_safe.eql([32]u8, seal.parsed_digest, try managedParsedPolicyDigest(b.parsed))) return error.ConfiguredOwnerMismatch;
+        const context: delivery_authority.Context = .{ .origin = identity.sign_kp.public_key, .canonical_name = seal.canonical_name, .config_digest = try managedLeasedContextDigest(b) };
+        const config: delivery_authority.Config = .{ .storage = b.parsed.storage };
+        stage.phase = .constructing;
+        errdefer stage.phase = .aborted;
+        const owner = switch (mode) {
+            .provision => try delivery_authority.Authority.initialize(b.allocator, b.io, storage.dir, storage.name, context, &identity.sign_kp, config),
+            .recover => try delivery_authority.Authority.openCold(b.allocator, b.io, storage.dir, storage.name, context, &identity.sign_kp, config),
+        };
+        stage.authority = owner;
+        stage.phase = .authority;
+        return owner;
+    }
+    pub fn attachOriginalServices(self: *ManagedLeasedCoreStage, owner: *delivery_authority.Authority) !*delivery_authority.ServicesLoan {
+        const stage = managedLeasedStageBacking(self);
+        const b = stage.core;
+        if (stage != &b.leased_stage or stage.phase != .authority or owner != stage.authority) return error.ConsumedCoreStage;
+        const loan = try owner.stateContext().attachServices(.{ .pbkdf2_rounds = b.parsed.accounts.pbkdf2_rounds, .password_min_len = @intCast(b.parsed.accounts.password_min_len), .password_max_len = @intCast(b.parsed.accounts.password_max_len) });
+        stage.loan = loan;
+        stage.phase = .loan;
+        return loan;
+    }
+    pub fn requireOriginalSources(self: *ManagedLeasedCoreStage, owner: *delivery_authority.Authority, loan: ?*delivery_authority.ServicesLoan) !void {
+        const stage = managedLeasedStageBacking(self);
+        const b = stage.core;
+        if (stage != &b.leased_stage or b.leased_request == null or owner != stage.authority or loan != stage.loan or
+            (stage.phase != .authority and stage.phase != .loan and stage.phase != .installed and stage.phase != .aborted)) return error.ConfiguredOwnerMismatch;
+    }
+    pub fn installOriginalSources(self: *ManagedLeasedCoreStage, owner: *delivery_authority.Authority, loan: *delivery_authority.ServicesLoan) !void {
+        const stage = managedLeasedStageBacking(self);
+        const b = stage.core;
+        if (stage.phase != .loan or b.phase != .allocated or b.server != null) return error.ConsumedCoreStage;
+        try self.requireOriginalSources(owner, loan);
+        try delivery_authority.StateContext.validateCoreSources(self, owner, loan);
+        // Original opaque ownership transfers only after every validation.
+        b.leased_authority = owner;
+        b.leased_loan = loan;
+        stage.phase = .installed;
+    }
+    pub fn requireOriginalWorldWrite(self: *ManagedLeasedCoreStage, owner: *delivery_authority.Authority, loan: ?*delivery_authority.ServicesLoan) !void {
+        // World write validation reads full-server gates absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const b = try requireManagedLeasedWorldSources(self, owner, loan);
+        try b.server.?.world.lock.requireExclusiveHeldByCurrentThread();
+        // An interrupted plan still owns Services. A new World caller must
+        // refuse before waiting for that mutex, so cold cancellation can take
+        // the original World without a World→Services / retained-plan cycle.
+        if (b.leased_active_scope != null) return error.WorldScopeActive;
+        try b.server.?.world.requireNoActiveRegisteredChannelStage();
+    }
+    pub fn reserveOriginalWorldScope(self: *ManagedLeasedCoreStage, owner: *delivery_authority.Authority, loan: ?*delivery_authority.ServicesLoan) !*ManagedLeasedWorldScope {
+        // World scope reservation reads full-server gates absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const b = try requireManagedLeasedWorldSources(self, owner, loan);
+        const world = &b.server.?.world;
+        const acquisition = try world.lock.captureExclusiveAcquisitionForCurrentThread();
+        if (b.leased_active_scope != null) return error.WorldScopeActive;
+        try world.requireNoActiveRegisteredChannelStage();
+        if (b.leased_scope_count == managed_leased_scope_budget) return error.WorldScopeCapacity;
+        const source = try b.allocator.create(ManagedLeasedWorldScopeBacking);
+        source.* = .{ .stage = self, .core = b, .world = world, .authority = owner, .loan = loan, .creator = std.Thread.getCurrentId(), .acquisition = acquisition, .next = b.leased_scope_tokens };
+        b.leased_scope_tokens = source;
+        b.leased_active_scope = source;
+        b.leased_scope_count += 1;
+        return @ptrCast(source);
+    }
+    pub fn requireSourceRelease(self: *ManagedLeasedCoreStage, owner: *delivery_authority.Authority, loan: ?*delivery_authority.ServicesLoan) !void {
+        // Source-release checks read full-server gates absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        try self.requireOriginalSources(owner, loan);
+        const b = managedLeasedStageBacking(self).core;
+        if (b.leased_active_scope != null) return error.SourceBorrowed;
+        if (b.inline_borrowed.load(.acquire) or b.inline_execution.load(.acquire) == .running) return error.InlineInvocationBorrowed;
+        if (b.phase != .allocated and b.phase != .constructed and b.phase != .detached) return error.CoreSourceActive;
+        if (b.graph_view) |view| try view.requireAllJoined();
+        if (b.server) |server| {
+            if (server.runtime_gate != null or server.pool.count() != 0) return error.CoreSourceActive;
+            if (server.leased_authority != null and server.leased_authority != owner) return error.ConfiguredOwnerMismatch;
+            if (server.leased_services != null and server.leased_services != loan) return error.ConfiguredOwnerMismatch;
+        }
+    }
+    pub fn abortInstallation(self: *ManagedLeasedCoreStage, owner: *delivery_authority.Authority, loan: ?*delivery_authority.ServicesLoan) !void {
+        // Abort clears full-server leases absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        try self.requireSourceRelease(owner, loan);
+        const stage = managedLeasedStageBacking(self);
+        if (stage.core.server) |server| {
+            server.leased_services = null;
+            server.leased_authority = null;
+        }
+        // Exact original records remain until leaf registration and loans have
+        // been released. No source caller or World callback is installed yet.
+        stage.phase = .aborted;
+    }
+};
+
+fn managedLeasedContextDigest(b: *ManagedCoreBacking) ![32]u8 {
+    const seal = b.policy_seal orelse return error.ConfiguredOwnerMismatch;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("onyx/configured-runtime/leased-state/v1\x00");
+    hash.update(&seal.config_digest);
+    hash.update(&seal.parsed_digest);
+    try hashManagedPolicyValue(&hash, b.leased_request.?.storage.name);
+    // Provision and recovery authenticate the same source policy and namespace.
+    return hash.finalResult();
+}
+
+fn releaseManagedLeasedSources(b: *ManagedCoreBacking) !void {
+    // Source release reads full-server leases absent from PortableServer.
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+    const owner = b.leased_authority orelse return;
+    const loan = b.leased_loan;
+    const stage: *ManagedLeasedCoreStage = @ptrCast(&b.leased_stage);
+    try delivery_authority.StateContext.requireCoreReleaseable(stage, owner, loan);
+    const original_phase = b.leased_stage.phase;
+    const original_server_authority = if (b.server) |server| server.leased_authority else null;
+    const original_server_loan = if (b.server) |server| server.leased_services else null;
+    try stage.abortInstallation(owner, loan);
+    delivery_authority.StateContext.releaseCoreSources(stage, owner, loan) catch |err| {
+        b.leased_stage.phase = original_phase;
+        if (b.server) |server| {
+            server.leased_authority = original_server_authority;
+            server.leased_services = original_server_loan;
+        }
+        return err;
+    };
+    if (loan) |source| try source.close();
+    b.leased_loan = null;
+    try owner.close();
+    b.leased_authority = null;
+}
+
+/// Reject ownership aliases BEFORE allocation, listener acquisition, source
+/// callbacks or construction. Inherited data has its separate strict factory.
+pub fn validateManagedColdConfig(config: Config) !void {
+    if (config.durable_device_boot != .inactive) return error.PreexistingRuntimeOwner;
+    if (config.rdns != null or config.dnsbl != null or config.mail_sender != null or
+        config.account_services != null or config.ocg2_runtime != null or config.ocg2_projection != null or
+        config.ocg2_audit != null or config.sasl_checker != null or config.sasl_scram256 != null or
+        config.sasl_scram512 != null or config.sasl_external != null or config.sasl_session_token != null or
+        config.sasl_oauthbearer != null) return error.PreexistingRuntimeOwner;
+    if (config.resume_arena_fd != null or config.native_arena_bytes != null or config.native_adopt_barrier != null or
+        config.inherited_listener_fd != null or config.inherited_listener_fds.len != 0 or
+        config.inherited_listener_companion_fds.len != 0 or config.native_listener_manifest.len != 0 or
+        config.inherited_state_fds.len != 0 or config.inherited_state_fd_manifest_present or
+        config.inherited_state_fd_manifest_valid) return error.InheritedRuntimeRequiresCarry;
+}
+
+fn cloneManagedConfig(b: *ManagedCoreBacking, input: Config) !Config {
+    @setEvalBranchQuota(20_000);
+    const allocator = b.policy.allocator();
+    var out: Config = undefined;
+    inline for (@typeInfo(Config).@"struct".field_names) |name| {
+        // Explicit source-lifetime borrows. These fields do not grant cleanup
+        // rights or return Server. All lifecycle/auth owner fields were refused.
+        if (comptime std.mem.eql(u8, name, "crypto_io") or std.mem.eql(u8, name, "reactor") or
+            std.mem.eql(u8, name, "native_upgrade_hooks") or std.mem.eql(u8, name, "native_adopt_barrier") or
+            std.mem.eql(u8, name, "config_resolver") or std.mem.eql(u8, name, "durable_device_boot") or
+            std.mem.eql(u8, name, "rdns") or std.mem.eql(u8, name, "dnsbl") or std.mem.eql(u8, name, "mail_sender") or
+            std.mem.eql(u8, name, "account_services") or std.mem.eql(u8, name, "ocg2_runtime") or
+            std.mem.eql(u8, name, "ocg2_projection") or std.mem.eql(u8, name, "ocg2_audit") or
+            std.mem.startsWith(u8, name, "sasl_") and !std.mem.eql(u8, name, "sasl_realm"))
+        {
+            @field(out, name) = @field(input, name);
+        } else if (comptime std.mem.eql(u8, name, "node_identity")) {
+            out.node_identity = if (input.node_identity) |identity| blk: {
+                const copy = try allocator.create(node_identity.NodeIdentity);
+                copy.* = identity.*;
+                copy.sign_kp = try identity.sign_kp.clone();
+                b.owned_identity = copy;
+                break :blk copy;
+            } else null;
+        } else if (comptime std.mem.eql(u8, name, "class_registry")) {
+            out.class_registry = if (input.class_registry) |registry| .{
+                .allocator = allocator,
+                .classes = try clonePolicyValue(allocator, registry.classes),
+                .user_idx = registry.user_idx,
+                .server_idx = registry.server_idx,
+            } else null;
+        } else @field(out, name) = try clonePolicyValue(allocator, @field(input, name));
+    }
+    // TLS1.2 OCSP selection intentionally recognizes a shared default leaf.
+    // Preserve that source alias relation in the private cloned graph.
+    for (input.tls12_cert_chain, 0..) |leaf, i| {
+        for (input.tls_cert_chain, 0..) |other, j| {
+            if (leaf.ptr == other.ptr and leaf.len == other.len) {
+                @constCast(out.tls12_cert_chain)[i] = out.tls_cert_chain[j];
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+/// Source primitive for a newly constructed Core, not a complete configured
+/// Runtime receipt. Callers serialize every operation and retain the exact Io,
+/// allocators, RunFlag and binding/WT borrows until Control cancellation/joins,
+/// source detach and Core destruction finish. Destroy Control only after every
+/// View borrower has detached. A new Core can issue its graph once; that does
+/// not authorize recovering owners or authority from an existing Runtime.
+pub const ManagedCore = opaque {
+    pub fn createCold(allocator: std.mem.Allocator, io: std.Io, inputs: ManagedCoreInputs, binding: RuntimeCreatedBindings) !*ManagedCore {
+        return createColdImpl(allocator, io, inputs, binding, null);
+    }
+    /// Closed, unpublished source prerequisite. Provision and strict recovery
+    /// are explicit; an ordinary account WAL is never silently migrated here.
+    /// The caller retains the input directory through this synchronous factory.
+    /// Provision may sync a valid new journal before a later Core allocation
+    /// fails. That journal remains owned by its protected namespace: retrying
+    /// provision refuses it, and the caller must explicitly request recovery.
+    pub fn createLeasedCold(allocator: std.mem.Allocator, io: std.Io, inputs: ManagedCoreInputs, leased: ManagedLeasedAccountInputs, binding: RuntimeCreatedBindings) !*ManagedCore {
+        if (inputs.accounts != null) return error.InvalidAccountBinding;
+        return createColdImpl(allocator, io, inputs, binding, leased);
+    }
+    fn createColdImpl(allocator: std.mem.Allocator, io: std.Io, inputs: ManagedCoreInputs, binding: RuntimeCreatedBindings, leased: ?ManagedLeasedAccountInputs) !*ManagedCore {
+        // Cold install constructs the full LinuxServer; PortableServer cannot host it.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        try validateManagedColdConfig(inputs.config);
+        const wants_accounts = inputs.config.sasl_enabled and inputs.parsed.sasl.account_db != null;
+        if (wants_accounts != (inputs.accounts != null or leased != null)) return error.InvalidAccountBinding;
+        if (leased != null and (inputs.config.node_identity == null or inputs.parsed.oper_ocg2.enabled or inputs.oauth_key != null))
+            return error.ClosedAuthorityNotIntegrated;
+        if (inputs.parsed.oper_ocg2.enabled and (!wants_accounts or inputs.parsed.oper_ocg2.authority_public_key == null)) return error.Ocg2RuntimeActivationFailed;
+        if (inputs.parsed.webpush.enabled != (binding.webpush != null) or
+            inputs.parsed.mail.enabled != (binding.mail != null) or
+            (inputs.parsed.dnsbl.enabled and inputs.parsed.dnsbl.zones.len != 0) != (binding.dnsbl != null))
+            return error.ConfiguredOwnerMismatch;
+        const b = try allocator.create(ManagedCoreBacking);
+        b.* = .{ .allocator = allocator, .io = io, .policy = .{ .owner = allocator }, .binding = binding };
+        errdefer {
+            destroyManagedCoreBacking(b);
+            std.crypto.secureZero(u8, std.mem.asBytes(b));
+            allocator.destroy(b);
+        }
+        const policy_allocator = b.policy.allocator();
+        if (leased) |source| {
+            b.leased_request = .{ .mode = source.mode, .storage = .{ .dir = source.storage.dir, .name = try policy_allocator.dupe(u8, source.storage.name) } };
+            b.leased_stage = .{ .core = b };
+        }
+        b.parsed = try clonePolicyValue(policy_allocator, inputs.parsed);
+        b.expected = try cloneManagedConfig(b, inputs.config);
+        b.expected.crypto_io = io;
+        b.expected.rdns = binding.rdns;
+        b.expected.dnsbl = binding.dnsbl;
+        b.expected.mail_sender = binding.mail;
+        // Policy normalization and actual full-key proof precede the first
+        // Services callback or listener. The policy arena retains staged tags.
+        b.expected = (try normalizeServerPolicy(policy_allocator, b.expected, wants_accounts)).config;
+        b.policy_seal = try ManagedCorePolicySeal.issue(b, inputs.accounts);
+        if (b.leased_request) |source| {
+            const stage: *ManagedLeasedCoreStage = @ptrCast(&b.leased_stage);
+            switch (source.mode) {
+                .provision => try delivery_authority.StateContext.provisionForCore(stage, source.storage),
+                .recover => try delivery_authority.StateContext.recoverForCore(stage, source.storage),
+            }
+        } else if (inputs.accounts) |accounts| try constructManagedAccounts(b, accounts);
+        if (inputs.oauth_key) |key| {
+            if (!b.expected.sasl_enabled) return error.InvalidAccountBinding;
+            b.oauth = .{ .key = try clonePolicyValue(policy_allocator, key), .issuer = b.parsed.sasl.oauth_issuer, .audience = b.parsed.sasl.oauth_audience, .account_claim = b.parsed.sasl.oauth_account_claim orelse "sub" };
+            b.expected.sasl_oauthbearer = b.oauth.?.lookup();
+        }
+        const server = blk: {
+            const owner = try allocator.create(Server);
+            errdefer allocator.destroy(owner);
+            try owner.initInPlaceWithAccountSource(allocator, b.expected, if (b.leased_loan != null) @ptrCast(&b.leased_stage) else null);
+            break :blk owner;
+        };
+        b.server = server;
+        server.leased_authority = b.leased_authority;
+        server.leased_services = b.leased_loan;
+        // Source construction canonicalizes platform availability and mesh ID.
+        // Freeze its exact policy before any wrapper or application body exists.
+        b.expected = server.config;
+        b.expected_config_digest = try managedConfigDigest(server.config);
+        b.services_context = .{ .core = b };
+        server.webpush_worker = binding.webpush;
+        if (b.services) |*services| {
+            services.state = .{ .ptr = &b.services_context, .create_channel = managedCreateChannel, .drop_channel = managedDropChannel };
+            _ = try server.replayServicesLiveStateFallible(services);
+        }
+        if (b.parsed.acme.enabled) {
+            server.setAcmeTlsReloadConfig(&b.parsed.tls);
+            const owner = try allocator.create(managed_acme.Service);
+            owner.* = managed_acme.Service.init(allocator, io, server, b.parsed.acme, &b.parsed.tls);
+            b.acme = owner;
+            b.expected_acme_digest = try managed_acme.configDigest(b.parsed.acme, &b.parsed.tls);
+        }
+        if (b.parsed.ocsp.enabled) {
+            if (!b.parsed.tls.enabled or b.parsed.tls.cert_path == null) return error.OcspRequiresCertificate;
+            const owner = try allocator.create(managed_ocsp.Service);
+            owner.* = managed_ocsp.Service.init(allocator, io, server, &b.parsed.tls, .{ .check_interval_ms = b.parsed.ocsp.check_interval_ms });
+            b.ocsp = owner;
+            owner.trust_anchors = try clonePolicyValue(policy_allocator, inputs.ocsp_trust_anchors);
+            b.expected_ocsp_digest = try managed_ocsp.configDigest(&b.parsed.tls, owner.opts, owner.trust_anchors);
+        }
+        _ = try server.loadWasmPluginsFallible();
+        b.install_seal = try ManagedCoreInstallSeal.issue(b);
+        b.phase = .constructed;
+        return @ptrCast(b);
+    }
+
+    pub fn prepareColdResources(self: *ManagedCore, run: *reactor_pool_mod.RunFlag) !void {
+        // Cold resource preparation drives full-server transports absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const b = managedBacking(self);
+        if (b.leased_request != null) return error.ClosedAuthorityNotIntegrated;
+        if (b.phase != .constructed) return error.AlreadyPrepared;
+        const server = b.server.?;
+        try server.prepareConfiguredColdResources(b.io);
+        if (b.acme) |owner| try owner.prepareColdResources(b.io);
+        if (b.ocsp) |owner| try owner.prepareColdResources(b.io);
+        try server.prepareRuntimeResources(b.io, run);
+        // Retain the observations of exactly the NEW resources acquired here.
+        // This is construction custody, not authenticated inherited OFD proof.
+        if (server.metrics_server) |owner| b.expected_metrics_listener = try metrics_http.observeListener(owner.listen_fd);
+        if (server.webhook_server) |owner| b.expected_webhook_listener = try metrics_http.observeListener(owner.listen_fd);
+        if (server.history_https) |owner| b.expected_history_listener = try metrics_http.observeListener(owner.listen_fd);
+        if (server.config.media_enabled) {
+            b.expected_native_socket = try server.native_media.socket.?.capture();
+            b.expected_media_socket = try server.media_plane.socket.?.capture();
+        }
+        b.run = run;
+        b.phase = .resources;
+    }
+
+    /// Create authority only for this caller's newly constructed graph. The
+    /// private owner identities never leave this stack in caller-owned data.
+    /// Existing Runtime/Core state cannot be queried for a Control or owners.
+    pub fn createGraphControl(self: *ManagedCore, allocator: std.mem.Allocator, webtransport: ?*managed_wt.WebTransportListener) !reactor_pool_mod.runtime_start_gate.Created {
+        const b = managedBacking(self);
+        if (b.leased_request != null) return error.ClosedAuthorityNotIntegrated;
+        if (b.phase != .resources or b.graph_view != null) return error.NotPrepared;
+        const gate = reactor_pool_mod.runtime_start_gate;
+        var specs: [shard_mod.max_shards + 15]gate.ParticipantSpec = undefined;
+        var count: usize = 0;
+        try self.appendParticipantSpecs(&specs, &count);
+        if (b.binding.rdns.cfg.nameserver_count != 0)
+            try managedAppendSpec(&specs, &count, .rdns, 0, b.binding.rdns, rdns.dormant_spawn_options);
+        if (b.binding.dnsbl) |owner| if (owner.cfg.nameserver_count != 0)
+            try managedAppendSpec(&specs, &count, .dnsbl, 0, owner, dnsbl_resolver.dormant_spawn_options);
+        if (b.binding.mail) |owner| try managedAppendSpec(&specs, &count, .mail, 0, owner, mail_sender.dormant_spawn_options);
+        if (b.binding.webpush) |owner| try managedAppendSpec(&specs, &count, .webpush, 0, owner, webpush_mod.dormant_spawn_options);
+        if (webtransport) |owner| try managedAppendSpec(&specs, &count, .webtransport, 0, owner, managed_wt.dormant_spawn_options);
+        std.mem.sort(gate.ParticipantSpec, specs[0..count], {}, managedSpecBefore);
+        const created = try gate.create(allocator, b.io, specs[0..count]);
+        b.graph_view = created.view;
+        return created;
+    }
+    fn appendParticipantSpecs(self: *ManagedCore, out: []reactor_pool_mod.runtime_start_gate.ParticipantSpec, count: *usize) !void {
+        const b = managedBacking(self);
+        if (b.phase != .resources) return error.NotPrepared;
+        const server = b.server.?;
+        const workers = if (server.reactors.len == 1) 0 else server.reactors.len;
+        for (0..workers) |i| try managedAppendSpec(out, count, .reactor, @intCast(i), server, reactor_pool_mod.dormant_spawn_options);
+        if (b.acme) |owner| try managedAppendSpec(out, count, .acme, 0, owner, managed_acme.dormant_spawn_options);
+        if (b.ocsp) |owner| try managedAppendSpec(out, count, .ocsp, 0, owner, managed_ocsp.dormant_spawn_options);
+        if (server.metrics_server) |*owner| try managedAppendSpec(out, count, .metrics, 0, owner, metrics_http.dormant_spawn_options);
+        if (server.webhook_server) |*owner| try managedAppendSpec(out, count, .webhook, 0, owner, webhook_http.dormant_spawn_options);
+        if (server.history_https) |*owner| try managedAppendSpec(out, count, .history, @intFromBool(owner.v6), owner, history_http.dormant_spawn_options);
+        if (server.config.media_enabled) {
+            try managedAppendSpec(out, count, .native_media, 0, &server.native_media, native_media_mod.dormant_spawn_options);
+            try managedAppendSpec(out, count, .media_plane, 0, &server.media_plane, media_plane_mod.dormant_spawn_options);
+        }
+        if (server.geo.opts.weather_enabled or server.geo.opts.news_enabled)
+            try managedAppendSpec(out, count, .geo, 0, server.geo, geo_services.dormant_spawn_options);
+    }
+
+    pub fn prepareWorkers(self: *ManagedCore, control: *reactor_pool_mod.runtime_start_gate.Control, view: *const reactor_pool_mod.runtime_start_gate.View) !void {
+        try control.requireView(view);
+        const b = managedBacking(self);
+        if (b.leased_request != null) return error.ClosedAuthorityNotIntegrated;
+        if (b.phase != .resources or b.graph_view != view) return error.NotPrepared;
+        const server = b.server.?;
+        var slots: [shard_mod.max_shards]reactor_pool_mod.runtime_start_gate.Slot = undefined;
+        const workers = if (server.reactors.len == 1) 0 else server.reactors.len;
+        for (slots[0..workers], 0..) |*slot, i| slot.* = try view.slot(.reactor, @intCast(i), server);
+        // All source registrations validate before the first wrapper is spawned.
+        for (slots[0..workers], 0..) |slot, i| try view.requireSlot(slot, .reactor, @intCast(i), server, reactor_pool_mod.dormant_spawn_options);
+        if (b.acme) |owner| try owner.validateDormantRegistration(control, view, try view.slot(.acme, 0, owner));
+        if (b.ocsp) |owner| try owner.validateDormantRegistration(control, view, try view.slot(.ocsp, 0, owner));
+        if (server.metrics_server) |*owner| try owner.validateDormantRegistration(control, view, try view.slot(.metrics, 0, owner));
+        if (server.webhook_server) |*owner| try owner.validateDormantRegistration(control, view, try view.slot(.webhook, 0, owner));
+        if (server.history_https) |*owner| try owner.validateDormantRegistration(control, view, try view.slot(.history, @intFromBool(owner.v6), owner));
+        if (server.config.media_enabled) {
+            try server.native_media.validateDormantRegistration(control, view, try view.slot(.native_media, 0, &server.native_media));
+            try server.media_plane.validateDormantRegistration(control, view, try view.slot(.media_plane, 0, &server.media_plane));
+        }
+        if (server.geo.opts.weather_enabled or server.geo.opts.news_enabled)
+            try server.geo.validateDormantRegistration(control, view, try view.slot(.geo, 0, server.geo));
+        try server.prepareRuntimeWorkers(control, view, slots[0..workers]);
+        if (b.acme) |owner| try owner.prepareDormantWorker(control, view, try view.slot(.acme, 0, owner));
+        if (b.ocsp) |owner| try owner.prepareDormantWorker(control, view, try view.slot(.ocsp, 0, owner));
+        if (server.metrics_server) |*owner| try owner.prepareDormantWorker(control, view, try view.slot(.metrics, 0, owner));
+        if (server.webhook_server) |*owner| try owner.prepareDormantWorker(control, view, try view.slot(.webhook, 0, owner));
+        if (server.history_https) |*owner| try owner.prepareDormantWorker(control, view, try view.slot(.history, @intFromBool(owner.v6), owner));
+        if (server.config.media_enabled) {
+            try server.native_media.prepareDormantWorker(control, view, try view.slot(.native_media, 0, &server.native_media));
+            try server.media_plane.prepareDormantWorker(control, view, try view.slot(.media_plane, 0, &server.media_plane));
+        }
+        if (server.geo.opts.weather_enabled or server.geo.opts.news_enabled)
+            try server.geo.prepareDormantWorker(control, view, try view.slot(.geo, 0, server.geo));
+        b.phase = .workers;
+    }
+
+    pub fn requirePrepared(self: *ManagedCore) !void {
+        const b = managedBacking(self);
+        if (b.leased_request != null) return error.ClosedAuthorityNotIntegrated;
+        if (b.phase != .workers or b.run == null or !b.run.?.load(.acquire)) return error.NotPrepared;
+        if (b.inline_invocation.claimed.load(.acquire)) return error.InlineAlreadyEntered;
+        try (b.install_seal orelse return error.ConfiguredOwnerMismatch).requireOriginal(b);
+        if (!std.crypto.timing_safe.eql([32]u8, b.expected_config_digest, try managedConfigDigest(b.server.?.config)) or
+            !managedSourceBindingsEqual(b.expected, b.server.?.config)) return error.ConfiguredOwnerMismatch;
+        try b.server.?.requirePreparedRuntime();
+        try b.server.?.requireConfiguredColdResources();
+        if (b.acme) |owner| try owner.requireParked();
+        if (b.ocsp) |owner| try owner.requireParked();
+        const server = b.server.?;
+        if (server.metrics_server) |owner| {
+            if (!std.meta.eql(b.expected_metrics_listener.?, try metrics_http.observeListener(owner.listen_fd))) return error.ConfiguredOwnerMismatch;
+        }
+        if (server.webhook_server) |owner| {
+            if (!std.meta.eql(b.expected_webhook_listener.?, try metrics_http.observeListener(owner.listen_fd))) return error.ConfiguredOwnerMismatch;
+        }
+        if (server.history_https) |owner| {
+            if (!std.meta.eql(b.expected_history_listener.?, try metrics_http.observeListener(owner.listen_fd))) return error.ConfiguredOwnerMismatch;
+        }
+        if (server.config.media_enabled) {
+            if (!std.meta.eql(b.expected_native_socket.?, try server.native_media.socket.?.capture()) or
+                !std.meta.eql(b.expected_media_socket.?, try server.media_plane.socket.?.capture())) return error.ConfiguredOwnerMismatch;
+        }
+        if (server.metrics_server) |*owner| try owner.requireParked();
+        if (server.webhook_server) |*owner| try owner.requireParked();
+        if (server.history_https) |*owner| try owner.requireParked();
+        if (server.config.media_enabled) {
+            try server.native_media.requireParked();
+            try server.media_plane.requireParked();
+        }
+        if (server.geo.opts.weather_enabled or server.geo.opts.news_enabled) try server.geo.requireParked();
+        if (b.acme) |owner| {
+            if (owner.server != server or owner.tls != &b.parsed.tls) return error.ConfiguredOwnerMismatch;
+            if (!std.mem.eql(u8, &try managed_acme.configDigest(owner.acme, owner.tls), &b.expected_acme_digest.?)) return error.ConfiguredOwnerMismatch;
+        }
+        if (b.ocsp) |owner| {
+            if (owner.server != server or owner.tls != &b.parsed.tls or owner.opts.check_interval_ms != b.parsed.ocsp.check_interval_ms)
+                return error.ConfiguredOwnerMismatch;
+            if (!std.mem.eql(u8, &try managed_ocsp.configDigest(owner.tls, owner.opts, owner.trust_anchors), &b.expected_ocsp_digest.?)) return error.ConfiguredOwnerMismatch;
+        }
+    }
+
+    pub fn publishPrepared(self: *ManagedCore, control: *reactor_pool_mod.runtime_start_gate.Control, view: *const reactor_pool_mod.runtime_start_gate.View) void {
+        control.requireView(view) catch @panic("foreign runtime publication control");
+        self.requirePrepared() catch @panic("runtime publication before complete source preparation");
+        const b = managedBacking(self);
+        std.debug.assert(b.server.?.runtime_gate == view);
+        b.server.?.publishPreparedRuntime();
+        b.phase = .published;
+        if (b.server.?.reactors.len == 1) b.inline_execution.store(.idle, .release);
+    }
+    /// Main's inline reactor is explicit. Multi-shard workers already own the
+    /// loop and this never joins the shared Control or stops a companion.
+    /// Reserve on the serialized creator thread before it starts or calls the
+    /// one inline invocation. Every caller retains Core for its whole API call.
+    /// The creator keeps custody through the actual thread join (or synchronous
+    /// return), including a rejected invocation; no atomic is a join receipt.
+    pub fn reserveInlineInvocation(self: *ManagedCore) !struct { invocation: *ManagedInlineInvocation, custody: *ManagedInlineCustody } {
+        const b = managedBacking(self);
+        if (b.server.?.reactors.len != 1) return error.NotInline;
+        switch (b.phase) {
+            .workers => try self.requirePrepared(),
+            .published => try (b.graph_view orelse return error.NotPublished).requireReleased(),
+            else => return error.NotPrepared,
+        }
+        const execution = b.inline_execution.load(.acquire);
+        if ((execution != .unpublished and execution != .idle) or b.inline_invocation.claimed.load(.acquire)) return error.InlineAlreadyEntered;
+        if (b.inline_reservation_issued) return error.InlineAlreadyReserved;
+        if (b.inline_borrowed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.InlineAlreadyReserved;
+        b.inline_reservation_issued = true;
+        return .{ .invocation = @ptrCast(&b.inline_invocation), .custody = @ptrCast(&b.inline_custody) };
+    }
+    fn runInlinePrepared(self: *ManagedCore) !void {
+        const b = managedBacking(self);
+        // Invocation reservation protects even this rejected entry until its
+        // creator joins the real caller and releases the separate custody.
+        if (b.inline_execution.cmpxchgStrong(.idle, .running, .acq_rel, .acquire)) |state|
+            return switch (state) {
+                .unpublished => error.NotPublished,
+                .closed => error.InlineClosedBeforeEntry,
+                else => error.InlineAlreadyEntered,
+            };
+        defer b.inline_execution.store(.exited, .release);
+        try (b.graph_view orelse return error.NotPublished).requireReleased();
+        const server = b.server.?;
+        const previous = current_reactor;
+        defer current_reactor = previous;
+        current_reactor = &server.reactors[0];
+        server.runLoopResilient(b.run.?);
+    }
+    pub fn requireActivated(self: *ManagedCore) !void {
+        const b = managedBacking(self);
+        if (b.phase != .published) return error.NotPublished;
+        try b.server.?.requireActivatedRuntime();
+        if (b.acme) |owner| try owner.requireActivated();
+        if (b.ocsp) |owner| try owner.requireActivated();
+        const server = b.server.?;
+        if (server.metrics_server) |*owner| try owner.requireActivated();
+        if (server.webhook_server) |*owner| try owner.requireActivated();
+        if (server.history_https) |*owner| try owner.requireActivated();
+        if (server.config.media_enabled) {
+            try server.native_media.requireActivated();
+            try server.media_plane.requireActivated();
+        }
+        if (server.geo.opts.weather_enabled or server.geo.opts.news_enabled) try server.geo.requireActivated();
+        if (!b.run.?.load(.acquire)) return error.Stopped;
+    }
+    /// Retire Core's producers while reactor and media consumers remain live.
+    /// The creator serializes these calls outside lifecycle/Controller/World
+    /// locks. All owner/slot joins validate before the first stop is published.
+    pub fn requestProducerStopAndWake(self: *ManagedCore, control: *reactor_pool_mod.runtime_start_gate.Control) !void {
+        const b = managedBacking(self);
+        var slots: [6]reactor_pool_mod.runtime_start_gate.Slot = undefined;
+        _ = try self.producerSlots(control, &slots);
+        switch (b.phase) {
+            .published => {},
+            .stopping_producers, .producers_joined, .stopping_reactors => return,
+            else => return error.NotPublished,
+        }
+        const server = b.server.?;
+        const geo_fence = try server.geo.fenceProducers();
+        // Deny a late inline invocation before publishing any producer stop.
+        // An already entered invocation retains custody through its exit.
+        _ = b.inline_execution.cmpxchgStrong(.idle, .closed, .acq_rel, .acquire);
+        b.geo_stop_fence = geo_fence;
+        b.phase = .stopping_producers;
+        if (b.acme) |owner| owner.requestStopAndWake();
+        if (b.ocsp) |owner| owner.requestStopAndWake();
+        if (server.metrics_server) |*owner| owner.requestStopAndWake();
+        if (server.webhook_server) |*owner| owner.requestStopAndWake();
+        if (server.history_https) |*owner| owner.requestStopAndWake();
+        server.geo.requestStopAndWake();
+    }
+
+    /// A stop flag or exited body is insufficient: every selected producer
+    /// must have its real thread handle joined by the original graph Control.
+    pub fn joinProducers(self: *ManagedCore, control: *reactor_pool_mod.runtime_start_gate.Control, deadline: std.Io.Clock.Timestamp) !void {
+        if (deadline.clock != .awake) return error.InvalidDeadline;
+        const b = managedBacking(self);
+        var slots: [6]reactor_pool_mod.runtime_start_gate.Slot = undefined;
+        const count = try self.producerSlots(control, &slots);
+        switch (b.phase) {
+            .stopping_producers => {},
+            .producers_joined, .stopping_reactors => {
+                try b.server.?.geo.requireProducersFrozen(b.geo_stop_fence orelse return error.ProducersNotStopping);
+                for (slots[0..count]) |slot| try b.graph_view.?.requireSlotJoined(slot);
+                return;
+            },
+            else => return error.ProducersNotStopping,
+        }
+        try b.server.?.geo.requireProducersFrozen(b.geo_stop_fence orelse return error.ProducersNotStopping);
+        for (slots[0..count]) |slot| try control.joinParticipantUntil(slot, deadline);
+        for (slots[0..count]) |slot| try b.graph_view.?.requireSlotJoined(slot);
+        b.phase = .producers_joined;
+    }
+
+    fn producerSlots(self: *ManagedCore, control: *reactor_pool_mod.runtime_start_gate.Control, slots: []reactor_pool_mod.runtime_start_gate.Slot) !usize {
+        const b = managedBacking(self);
+        const view = b.graph_view orelse return error.NotPrepared;
+        try control.requireView(view);
+        if (view.inspect().phase != .released) return error.NotPublished;
+        const server = b.server.?;
+        var count: usize = 0;
+        if (b.acme) |owner| try managedAppendSlot(view, slots, &count, .acme, 0, owner, managed_acme.dormant_spawn_options);
+        if (b.ocsp) |owner| try managedAppendSlot(view, slots, &count, .ocsp, 0, owner, managed_ocsp.dormant_spawn_options);
+        if (server.metrics_server) |*owner| try managedAppendSlot(view, slots, &count, .metrics, 0, owner, metrics_http.dormant_spawn_options);
+        if (server.webhook_server) |*owner| try managedAppendSlot(view, slots, &count, .webhook, 0, owner, webhook_http.dormant_spawn_options);
+        if (server.history_https) |*owner| try managedAppendSlot(view, slots, &count, .history, @intFromBool(owner.v6), owner, history_http.dormant_spawn_options);
+        if (b.expected.geo_enabled)
+            try managedAppendSlot(view, slots, &count, .geo, 0, server.geo, geo_services.dormant_spawn_options);
+        return count;
+    }
+
+    /// Reconcile real Webpush outputs after its original graph thread joined.
+    /// Runtime retains its source producer fence and calls requireTerminalSettled
+    /// afterward; neither queue emptiness nor this consumer pass mints that proof.
+    pub fn reconcileWebpushTerminal(self: *ManagedCore, deadline: std.Io.Clock.Timestamp) !void {
+        const b = managedBacking(self);
+        if (deadline.clock != .awake) return error.InvalidDeadline;
+        if (b.phase != .producers_joined and b.phase != .stopping_reactors) return error.ProducersNotJoined;
+        const view = b.graph_view orelse return error.NotPrepared;
+        try view.requireReleased();
+        const owner = b.binding.webpush orelse return;
+        try view.requireSlotJoined(try view.slot(.webpush, 0, owner));
+        if (!owner.stop_flag.load(.acquire)) return error.WebpushNotStopped;
+        const server = b.server.?;
+        if (server.webpush_worker != owner) return error.ConfiguredOwnerMismatch;
+        try server.requireMediaRetirementDeadline(deadline);
+        // World serializes maintenance/admission with this terminal pass.
+        // The leaf callbacks then take Worker and Services in that order.
+        try server.lockWorldUntil(deadline);
+        defer server.world.unlockWrite();
+        const previous = current_reactor;
+        defer current_reactor = previous;
+        current_reactor = &server.reactors[0];
+        try server.reconcileWebpushOutcomesLocked(deadline);
+        if (server.hasRetainedWebpushOverflow()) return error.OperationActive;
+    }
+
+    /// Producer completion precedes the fallible accepted-egress settlement.
+    /// On pressure/deadline failure the graph, live consumers and fenced work
+    /// remain owned for retry; no reactor or media stop flag has been changed.
+    pub fn requestReactorStopAndWake(self: *ManagedCore, control: *reactor_pool_mod.runtime_start_gate.Control, deadline_ms: u64) !void {
+        const b = managedBacking(self);
+        var slots: [6]reactor_pool_mod.runtime_start_gate.Slot = undefined;
+        const count = try self.producerSlots(control, &slots);
+        if (b.phase != .producers_joined and b.phase != .stopping_reactors) return error.ProducersNotJoined;
+        try b.server.?.geo.requireProducersFrozen(b.geo_stop_fence orelse return error.ProducersNotJoined);
+        for (slots[0..count]) |slot| try b.graph_view.?.requireSlotJoined(slot);
+        if (b.phase == .stopping_reactors) return;
+        const server = b.server.?;
+        try server.settleMediaRoutingBeforeStop(deadline_ms);
+        b.phase = .stopping_reactors;
+        if (server.config.media_enabled) {
+            server.native_media.requestStopAndWake();
+            server.media_plane.requestStopAndWake();
+        }
+        if (b.run) |run| server.requestStop(run);
+    }
+    pub fn detachAfterJoined(self: *ManagedCore) !void {
+        const b = managedBacking(self);
+        const server = b.server.?;
+        if (server.runtime_gate) |view| try view.requireAllJoined();
+        if (b.inline_borrowed.load(.acquire)) return error.InlineInvocationBorrowed;
+        if (b.graph_view) |view| if (view.inspect().phase == .released and b.phase != .stopping_reactors and b.phase != .detached)
+            return error.RuntimeNotStopped;
+        while (true) {
+            const state = b.inline_execution.load(.acquire);
+            if (state == .running) return error.InlineStillRunning;
+            if (state == .closed) break;
+            if (b.inline_execution.cmpxchgWeak(state, .closed, .acq_rel, .acquire) == null) break;
+        }
+        if (b.acme) |owner| try owner.detachAfterJoined();
+        if (b.ocsp) |owner| try owner.detachAfterJoined();
+        if (server.metrics_server) |*owner| try owner.detachAfterJoined();
+        if (server.webhook_server) |*owner| try owner.detachAfterJoined();
+        if (server.history_https) |*owner| try owner.detachAfterJoined();
+        try server.native_media.detachAfterJoined();
+        try server.media_plane.detachAfterJoined();
+        try server.geo.detachAfterJoined();
+        try server.detachRuntimeAfterJoined();
+        b.phase = .detached;
+    }
+    pub fn destroyDetached(self: *ManagedCore) void {
+        // Detached teardown walks full-server gates absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return;
+        const b = managedBacking(self);
+        if (b.inline_borrowed.load(.acquire) or b.server.?.runtime_gate != null or
+            b.server.?.hasRetainedWebpushOverflow() or
+            (b.phase == .detached and b.server.?.media_routing_owner != null and b.graph_view != null and b.graph_view.?.inspect().phase == .released) or
+            (b.phase != .constructed and b.phase != .resources and b.phase != .detached))
+            @panic("managed core destruction before exact detach");
+        const allocator = b.allocator;
+        destroyManagedCoreBacking(b);
+        std.crypto.secureZero(u8, std.mem.asBytes(b));
+        allocator.destroy(b);
+    }
+    /// Fallible disposal of this deliberately unpublished leased prerequisite.
+    /// A source loan/plan failure retains the same Core for cleanup retry.
+    pub fn discardLeasedCold(self: *ManagedCore) !void {
+        const b = managedBacking(self);
+        if (b.leased_request == null or b.phase != .constructed or b.graph_view != null) return error.CoreSourceActive;
+        try releaseManagedLeasedSources(b);
+        self.destroyDetached();
+    }
+
+    /// A separate original-creator disposal operation for an interrupted
+    /// unpublished transaction. A new actual World lane only authorizes
+    /// discarding the retained uncommitted candidate. Normal commit/abort
+    /// remain bound to the old acquisition and are never reauthorized here.
+    pub fn cancelLeasedColdPreparation(self: *ManagedCore) !void {
+        // Cold cancellation inspects full-server gates absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const b = managedBacking(self);
+        const source = b.leased_active_scope orelse return error.NoPreparedWorldScope;
+        if (source.creator != std.Thread.getCurrentId()) return error.WorldScopeWrongCaller;
+        const authority = b.leased_authority orelse return error.ConfiguredOwnerMismatch;
+        const stage: *ManagedLeasedCoreStage = @ptrCast(&b.leased_stage);
+        _ = try requireManagedLeasedWorldSources(stage, authority, b.leased_loan);
+        if (b.phase != .constructed or b.graph_view != null or b.run != null or
+            b.server.?.runtime_gate != null or b.server.?.pool.count() != 0 or
+            b.inline_borrowed.load(.acquire) or b.inline_reservation_issued or
+            b.inline_execution.load(.acquire) != .unpublished)
+            return error.CoreSourceActive;
+        const world = &b.server.?.world;
+        const already_held = if (world.lock.requireExclusiveHeldByCurrentThread()) |_| true else |_| false;
+        if (!already_held) world.lockWrite();
+        defer if (!already_held) world.unlockWrite();
+        const scope: *ManagedLeasedWorldScope = @ptrCast(source);
+        try scope.requireColdCancellation(stage, authority, b.leased_loan);
+        try delivery_authority.StateContext.cancelCorePreparedForCold(stage, authority, b.leased_loan);
+    }
+    /// Fallible semantic retirement precedes a successful terminal outcome.
+    /// Timeout/OOM retains every remaining media owner in this detached Core;
+    /// destruction is forbidden until the exact source retirement completes.
+    pub fn finishStoppedRetirement(self: *ManagedCore, deadline: std.Io.Clock.Timestamp) !void {
+        const b = managedBacking(self);
+        if (b.phase != .detached or b.inline_borrowed.load(.acquire) or b.run == null or b.run.?.load(.acquire)) return error.RuntimeNotStopped;
+        try (b.graph_view orelse return error.NotPrepared).requireAllJoined();
+        if (deadline.clock != .awake) return error.InvalidDeadline;
+        try b.server.?.finishMediaRoutingAfterJoinedUntil(deadline);
+    }
+    /// Resource retirement and actual terminal runtime outcome are separate.
+    /// A backend failure remains observable after joins and safe retirement.
+    pub fn requireStoppedOutcome(self: *ManagedCore) !void {
+        const b = managedBacking(self);
+        if (b.phase != .detached or b.inline_borrowed.load(.acquire) or b.run == null or b.run.?.load(.acquire)) return error.RuntimeNotStopped;
+        try (b.graph_view orelse return error.NotPrepared).requireAllJoined();
+        if (b.server.?.media_routing_owner != null) return error.MediaRetirementPending;
+        if (b.server.?.hasRetainedWebpushOverflow()) return error.OperationActive;
+        if (b.server.?.runtimeFailure()) |err| return err;
+    }
+    pub fn observe(self: *ManagedCore) !ManagedCoreObservation {
+        const b = managedBacking(self);
+        const server = b.server.?;
+        return .{ .bound_port = try server.boundPort(), .reactor_count = server.reactors.len, .reactor_workers = if (server.reactors.len == 1) 0 else server.reactors.len, .acme = b.acme != null, .ocsp = b.ocsp != null, .metrics = server.metrics_server != null, .webhook = server.webhook_server != null, .history = server.history_https != null, .media = server.config.media_enabled, .geo = server.geo.opts.weather_enabled or server.geo.opts.news_enabled, .resources_prepared = server.configured_cold_resources_prepared, .webtransport_port = server.config.webtransport_port };
+    }
+};
+
+/// Worker-only capability. It cannot release the creator's lexical borrow.
+pub const ManagedInlineInvocation = opaque {
+    pub fn run(self: *ManagedInlineInvocation) !void {
+        const record: *ManagedInlineInvocationBacking = @ptrCast(@alignCast(self));
+        const b: *ManagedCoreBacking = @alignCast(@fieldParentPtr("inline_invocation", record));
+        if (!b.inline_borrowed.load(.acquire)) return error.InlineNotReserved;
+        if (record.claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.InlineAlreadyEntered;
+        defer record.returned.store(true, .release);
+        try @as(*ManagedCore, @ptrCast(b)).runInlinePrepared();
+    }
+};
+
+/// Held only by the serialized creator. The caller's real Thread handle and
+/// every invocation capability remain live until Thread.join completes, then
+/// releaseAfterReturn drops this lexical borrow. Synchronous callers release
+/// only after run returns. This primitive does not authenticate a supplied join.
+pub const ManagedInlineCustody = opaque {
+    pub fn releaseAfterReturn(self: *ManagedInlineCustody) !void {
+        const record: *ManagedInlineCustodyBacking = @ptrCast(@alignCast(self));
+        const b: *ManagedCoreBacking = @alignCast(@fieldParentPtr("inline_custody", record));
+        if (!b.inline_invocation.returned.load(.acquire)) return error.InlineNotReturned;
+        if (b.inline_execution.load(.acquire) == .running) return error.InlineStillRunning;
+        if (b.inline_borrowed.cmpxchgStrong(true, false, .acq_rel, .acquire) != null) return error.InlineNotReserved;
+    }
+    /// Only before spawning/calling the invocation, e.g. a failed Thread.spawn.
+    /// The creator guarantees no caller holds a scheduled invocation reference.
+    pub fn cancelUncalled(self: *ManagedInlineCustody) !void {
+        const record: *ManagedInlineCustodyBacking = @ptrCast(@alignCast(self));
+        const b: *ManagedCoreBacking = @alignCast(@fieldParentPtr("inline_custody", record));
+        if (b.inline_invocation.claimed.load(.acquire)) return error.InlineAlreadyEntered;
+        if (b.inline_borrowed.cmpxchgStrong(true, false, .acq_rel, .acquire) != null) return error.InlineNotReserved;
+    }
+};
+
+fn constructManagedAccounts(b: *ManagedCoreBacking, inputs: ManagedAccountInputs) !void {
+    const allocator = b.policy.allocator();
+    b.accounts = inputs;
+    b.services = services_mod.Services.initWithConfig(inputs.store, null, .{
+        .pbkdf2_rounds = b.parsed.accounts.pbkdf2_rounds,
+        .password_min_len = @intCast(b.parsed.accounts.password_min_len),
+        .password_max_len = @intCast(b.parsed.accounts.password_max_len),
+    });
+    b.scram = managed_scram.ScramStore.init(allocator);
+    b.certfp_binds = certfp_bind_mod.CertfpBindStore.init(allocator);
+    b.transparency = key_transparency.KeyTransparencyLog.init(allocator);
+    const services = &b.services.?;
+    services.attachScramStore(&b.scram.?);
+    services.attachCertfpBinds(&b.certfp_binds.?);
+    services.attachKeyTransparencyLog(&b.transparency.?);
+    if (inputs.durable_devices) |state| {
+        const identity = b.expected.node_identity orelse return error.DurableDeviceActivationFailed;
+        const local_origin = identity.shortId();
+        if (local_origin == 0) return error.DurableDeviceActivationFailed;
+        services.attachDurableCredentialProps(state);
+        b.expected.durable_device_boot = .{ .authoritative = .{ .state = state, .local_origin_node = local_origin } };
+    }
+    if (b.parsed.oper_ocg2.enabled) {
+        const cfg = managed_boot.mapOcg2BootConfig(b.parsed);
+        const role = try managed_boot.validateOcg2LocalIdentity(cfg, b.expected.node_identity);
+        const state = inputs.durable_oper orelse return error.Ocg2RuntimeActivationFailed;
+        try services.activateDurableOperAuthority(state);
+        const realtime: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+        const monotonic: u64 = @intCast(@max(@as(i64, 0), platform.monotonicMillis()));
+        switch (cfg.mode) {
+            .disabled => return error.Ocg2RuntimeActivationFailed,
+            .observe => {
+                const observer = try ocg2_runtime_mod.createObserve(allocator, services);
+                b.ocg2_observer = observer;
+                switch (observer.tick(realtime, 0)) {
+                    .complete => {},
+                    else => return error.Ocg2RuntimeActivationFailed,
+                }
+                b.expected.ocg2_runtime = observer;
+                b.expected.ocg2_runtime_monotonic_origin_ms = monotonic;
+            },
+            .project, .mint => {
+                if (cfg.mode == .mint and role != .authority) return error.Ocg2MintingRequiresAuthority;
+                const projection = try ocg2_projection_mod.Runtime.initDefault(allocator, services);
+                b.ocg2_projection = projection;
+                b.ocg2_audit = audit_trail_mod.AuditTrail.init(allocator);
+                switch (try ocg2_live_projection.projectOnce(allocator, projection, &.{}, &b.ocg2_audit.?, realtime, 0)) {
+                    .committed, .unchanged => {},
+                    else => return error.Ocg2RuntimeActivationFailed,
+                }
+                b.expected.ocg2_projection = projection;
+                b.expected.ocg2_projection_origin_ms = monotonic;
+                b.expected.ocg2_audit = &b.ocg2_audit.?;
+            },
+        }
+    } else if (inputs.durable_oper != null) return error.InvalidAccountBinding;
+    _ = managed_boot.seedOperCertfpBinds(&b.certfp_binds.?, b.parsed.opers);
+    b.scram.?.setLoader(services.scramLoader());
+    b.plain = .{ .services = services };
+    b.external = .{ .services = services };
+    b.session_token = .{ .services = services };
+    b.expected.sasl_checker = b.plain.checker();
+    b.expected.sasl_scram256 = b.scram.?.scram256Lookup();
+    b.expected.sasl_scram512 = b.scram.?.scram512Lookup();
+    b.expected.sasl_external = b.external.lookup();
+    b.expected.sasl_session_token = b.session_token.lookup();
+    b.expected.account_services = services;
+}
+
+fn isManagedSourceField(comptime name: []const u8) bool {
+    return std.mem.eql(u8, name, "crypto_io") or std.mem.eql(u8, name, "reactor") or
+        std.mem.eql(u8, name, "native_upgrade_hooks") or std.mem.eql(u8, name, "native_adopt_barrier") or
+        std.mem.eql(u8, name, "config_resolver") or std.mem.eql(u8, name, "durable_device_boot") or
+        std.mem.eql(u8, name, "rdns") or std.mem.eql(u8, name, "dnsbl") or std.mem.eql(u8, name, "mail_sender") or
+        std.mem.eql(u8, name, "account_services") or std.mem.eql(u8, name, "ocg2_runtime") or
+        std.mem.eql(u8, name, "ocg2_projection") or std.mem.eql(u8, name, "ocg2_audit") or
+        std.mem.eql(u8, name, "sasl_checker") or std.mem.eql(u8, name, "sasl_scram256") or
+        std.mem.eql(u8, name, "sasl_scram512") or std.mem.eql(u8, name, "sasl_external") or
+        std.mem.eql(u8, name, "sasl_session_token") or std.mem.eql(u8, name, "sasl_oauthbearer");
+}
+fn managedSourceBindingsEqual(expected: Config, actual: Config) bool {
+    @setEvalBranchQuota(20_000);
+    inline for (@typeInfo(Config).@"struct".field_names) |name| {
+        if (comptime isManagedSourceField(name)) {
+            if (!std.meta.eql(@field(expected, name), @field(actual, name))) return false;
+        }
+    }
+    return expected.node_identity == actual.node_identity;
+}
+fn managedConfigDigest(config: Config) ![32]u8 {
+    return managedConfigDigestFor(config, false);
+}
+fn managedColdConfigDigest(config: Config) ![32]u8 {
+    return managedConfigDigestFor(config, true);
+}
+fn managedParsedPolicyDigest(parsed: config_format.Config) ![32]u8 {
+    @setEvalBranchQuota(20_000);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("onyx/configured-runtime/parsed-policy/v1\x00");
+    try hashManagedPolicyValue(&hash, parsed);
+    return hash.finalResult();
+}
+fn managedConfigDigestFor(config: Config, comptime cold: bool) ![32]u8 {
+    @setEvalBranchQuota(20_000);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(if (cold) "onyx/configured-runtime/cold-policy/v1\x00" else "onyx/configured-runtime/core-policy/v1\x00");
+    inline for (@typeInfo(Config).@"struct".field_names) |name| {
+        if (comptime isManagedSourceField(name)) continue;
+        // These epochs are acquired by the original OCG2 constructors after
+        // cold policy staging. The existing runtime digest still binds them.
+        if (comptime cold and (std.mem.eql(u8, name, "ocg2_runtime_monotonic_origin_ms") or
+            std.mem.eql(u8, name, "ocg2_projection_origin_ms"))) continue;
+        try hashManagedPolicyValue(&hash, name);
+        if (comptime std.mem.eql(u8, name, "node_identity")) {
+            hash.update(&.{@intFromBool(config.node_identity != null)});
+            if (config.node_identity) |identity| {
+                hash.update(&identity.sign_kp.public_key);
+                hash.update(identity.sign_kp.secret_key.expose());
+                try hashManagedPolicyValue(&hash, identity.kem_kp);
+                hash.update(&identity.node_id);
+                hash.update(&identity.realm);
+            }
+        } else if (comptime std.mem.eql(u8, name, "class_registry")) {
+            hash.update(&.{@intFromBool(config.class_registry != null)});
+            if (config.class_registry) |registry| {
+                try hashManagedPolicyValue(&hash, registry.classes);
+                try hashManagedPolicyValue(&hash, registry.user_idx);
+                try hashManagedPolicyValue(&hash, registry.server_idx);
+            }
+        } else try hashManagedPolicyValue(&hash, @field(config, name));
+    }
+    return hash.finalResult();
+}
+fn hashManagedPolicyValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) !void {
+    switch (@typeInfo(@TypeOf(value))) {
+        .bool => hash.update(&.{@intFromBool(value)}),
+        .int => |info| {
+            const width = comptime std.mem.alignForward(usize, info.bits, 8);
+            const I = @Int(info.signedness, width);
+            const U = @Int(.unsigned, width);
+            var bytes: [width / 8]u8 = undefined;
+            std.mem.writeInt(U, &bytes, @bitCast(@as(I, value)), .little);
+            hash.update(&bytes);
+        },
+        .float => |info| try hashManagedPolicyValue(hash, @as(@Int(.unsigned, info.bits), @bitCast(value))),
+        .@"enum" => try hashManagedPolicyValue(hash, @intFromEnum(value)),
+        .optional => {
+            hash.update(&.{@intFromBool(value != null)});
+            if (value) |inner| try hashManagedPolicyValue(hash, inner);
+        },
+        .pointer => |info| {
+            if (info.size != .slice) @compileError("core policy digest requires an explicit source pointer binding");
+            try hashManagedPolicyValue(hash, @as(u64, @intCast(value.len)));
+            for (value) |inner| try hashManagedPolicyValue(hash, inner);
+        },
+        .array => for (value) |inner| try hashManagedPolicyValue(hash, inner),
+        .@"struct" => |info| inline for (info.field_names) |name| try hashManagedPolicyValue(hash, @field(value, name)),
+        .@"union" => |info| {
+            const tag = std.meta.activeTag(value);
+            try hashManagedPolicyValue(hash, tag);
+            inline for (info.field_names) |name| if (tag == @field(info.tag_type.?, name)) {
+                try hashManagedPolicyValue(hash, @field(value, name));
+                return;
+            };
+        },
+        .void => {},
+        else => @compileError("unsupported private core policy data"),
+    }
+}
+
+/// Builtin-test-only source observations/tamper controls. No raw core owner,
+/// Server, companion, Control or allocator escapes in a returned value.
+pub const ManagedCoreFixture = if (builtin.is_test) struct {
+    fn leasedBacking(core: *ManagedCore) !*ManagedCoreBacking {
+        const b = managedBacking(core);
+        if (b.phase != .constructed or b.leased_request == null or b.leased_stage.phase != .installed) return error.CoreSourceActive;
+        try (b.install_seal orelse return error.ConfiguredOwnerMismatch).requireOriginal(b);
+        return b;
+    }
+    pub fn borrowLeasedAuthority(core: *ManagedCore) !*delivery_authority.ReadBorrow {
+        const b = try leasedBacking(core);
+        return b.leased_authority.?.borrow();
+    }
+    pub fn prepareLeasedEvent(core: *ManagedCore, event: oper_event.SignedOperEventV2, destinations: []const delivery_authority.DestinationInput, now: u64) !*delivery_authority.Prepared {
+        // Leased event preparation locks the full-server World absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const b = try leasedBacking(core);
+        b.server.?.world.lockWrite();
+        errdefer b.server.?.world.unlockWrite();
+        return b.leased_authority.?.prepareEvent(event, destinations, now, &b.owned_identity.?.sign_kp);
+    }
+    pub fn commitLeasedEvent(core: *ManagedCore, plan: *delivery_authority.Prepared) !?oper_event.EventId {
+        // Leased commit unlocks the full-server World absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const b = managedBacking(core);
+        const stage: *ManagedLeasedCoreStage = @ptrCast(&b.leased_stage);
+        const authority = b.leased_authority orelse return error.ConfiguredOwnerMismatch;
+        _ = try requireManagedLeasedWorldSources(stage, authority, b.leased_loan);
+        try plan.requireOriginalCore(stage, authority);
+        const result = try plan.commit();
+        b.server.?.world.unlockWrite();
+        return result;
+    }
+    pub fn abortLeasedEvent(core: *ManagedCore, plan: *delivery_authority.Prepared) !void {
+        // Leased abort unlocks the full-server World absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const b = managedBacking(core);
+        const stage: *ManagedLeasedCoreStage = @ptrCast(&b.leased_stage);
+        const authority = b.leased_authority orelse return error.ConfiguredOwnerMismatch;
+        _ = try requireManagedLeasedWorldSources(stage, authority, b.leased_loan);
+        try plan.requireOriginalCore(stage, authority);
+        try plan.abort();
+        b.server.?.world.unlockWrite();
+    }
+    pub fn releaseLeasedEventWorld(core: *ManagedCore, plan: *delivery_authority.Prepared) !void {
+        // Leased release unlocks the full-server World absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const b = managedBacking(core);
+        const stage: *ManagedLeasedCoreStage = @ptrCast(&b.leased_stage);
+        const authority = b.leased_authority orelse return error.ConfiguredOwnerMismatch;
+        _ = try requireManagedLeasedWorldSources(stage, authority, b.leased_loan);
+        try plan.requireOriginalCore(stage, authority);
+        const source = b.leased_active_scope orelse return error.NoPreparedWorldScope;
+        const scope: *ManagedLeasedWorldScope = @ptrCast(source);
+        try scope.requireOriginalAcquisition(stage, authority, b.leased_loan);
+        b.server.?.world.unlockWrite();
+    }
+    pub fn requireLeasedReacquisitionRefusal(core: *ManagedCore, plan: *delivery_authority.Prepared) !void {
+        // Reacquisition refusal inspects the full-server World absent from PortableServer.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const b = managedBacking(core);
+        const stage: *ManagedLeasedCoreStage = @ptrCast(&b.leased_stage);
+        const authority = b.leased_authority orelse return error.ConfiguredOwnerMismatch;
+        _ = try requireManagedLeasedWorldSources(stage, authority, b.leased_loan);
+        try plan.requireOriginalCore(stage, authority);
+        b.server.?.world.lockWrite();
+        defer b.server.?.world.unlockWrite();
+        try std.testing.expectError(error.ExclusiveAcquisitionChanged, plan.commit());
+        try std.testing.expectError(error.ExclusiveAcquisitionChanged, plan.abort());
+    }
+    pub fn requireLeasedFreshWorldLoanRefusal(core: *ManagedCore, plan: *delivery_authority.Prepared) !void {
+        const b = managedBacking(core);
+        const stage: *ManagedLeasedCoreStage = @ptrCast(&b.leased_stage);
+        const authority = b.leased_authority orelse return error.ConfiguredOwnerMismatch;
+        _ = try requireManagedLeasedWorldSources(stage, authority, b.leased_loan);
+        try plan.requireOriginalCore(stage, authority);
+        b.server.?.world.lockWrite();
+        defer b.server.?.world.unlockWrite();
+        var scratch: [1024]u8 = undefined;
+        try std.testing.expectError(error.WorldScopeActive, b.leased_loan.?.registerAccount("blocked", "source-password", &scratch));
+    }
+    fn seedFinalLeasedWorldAcquisition(core: *ManagedCore) !void {
+        const b = try leasedBacking(core);
+        const world = &b.server.?.world;
+        if (b.leased_scope_tokens != null or b.leased_scope_count != 0 or b.leased_active_scope != null or
+            b.graph_view != null or b.run != null or b.server.?.runtime_gate != null or b.server.?.pool.count() != 0 or
+            world.lock.state.load(.acquire) != 0 or world.lock.writers_waiting.load(.acquire) != 0 or
+            world.lock.exclusive_owner_valid.load(.acquire) or world.lock.exclusive_generation_exhausted.load(.acquire))
+            return error.CoreSourceActive;
+        // Private builtin-only fault setup of the actual original unlocked
+        // World, before any scope exists. Subsequent acquisitions are real.
+        world.lock.exclusive_generation.store(std.math.maxInt(u64) - 1, .monotonic);
+    }
+    pub fn registerLeasedAccount(core: *ManagedCore, name: []const u8, password: []const u8, scratch: []u8) !services_mod.CommandResult {
+        const b = try leasedBacking(core);
+        b.server.?.world.lockWrite();
+        defer b.server.?.world.unlockWrite();
+        return b.leased_loan.?.registerAccount(name, password, scratch);
+    }
+    pub fn identifyLeasedAccount(core: *ManagedCore, name: []const u8, password: []const u8) !services_mod.CommandResult {
+        const b = try leasedBacking(core);
+        b.server.?.world.lockWrite();
+        defer b.server.?.world.unlockWrite();
+        return b.leased_loan.?.identifyAccount(name, password);
+    }
+    pub fn requireLeasedDirectCloseRefusal(core: *ManagedCore) !void {
+        const b = try leasedBacking(core);
+        try std.testing.expectError(error.SourceBorrowed, b.leased_loan.?.close());
+        try std.testing.expectError(error.SourceBorrowed, b.leased_authority.?.close());
+    }
+    pub fn requireLeasedForeignRefusal(core: *ManagedCore, storage: delivery_authority.ProtectedStorage) !void {
+        const b = try leasedBacking(core);
+        const seal = b.policy_seal.?;
+        const key = &b.owned_identity.?.sign_kp;
+        const owner = try delivery_authority.Authority.initialize(b.allocator, b.io, storage.dir, storage.name, .{ .origin = key.public_key, .canonical_name = seal.canonical_name, .config_digest = try managedLeasedContextDigest(b) }, key, .{ .storage = b.parsed.storage });
+        defer owner.close() catch @panic("foreign leased authority cleanup");
+        const loan = try owner.stateContext().attachServices(.{ .pbkdf2_rounds = b.parsed.accounts.pbkdf2_rounds, .password_min_len = @intCast(b.parsed.accounts.password_min_len), .password_max_len = @intCast(b.parsed.accounts.password_max_len) });
+        defer loan.close() catch @panic("foreign leased Services cleanup");
+        const stage: *ManagedLeasedCoreStage = @ptrCast(&b.leased_stage);
+        try std.testing.expectError(error.ConfiguredOwnerMismatch, stage.requireOriginalSources(owner, loan));
+        try std.testing.expectError(error.ConfiguredOwnerMismatch, delivery_authority.StateContext.validateCoreSources(stage, owner, loan));
+        try std.testing.expectError(error.ConsumedCoreStage, stage.installOriginalSources(owner, loan));
+        try b.install_seal.?.requireOriginal(b);
+    }
+    pub const Inspection = struct {
+        port: u16,
+        fabric_present: bool,
+        pool_count: usize,
+        webhook_fd: ?linux.fd_t,
+        webhook_port: ?u16,
+        geo_entered: bool,
+        webhook_entered: bool,
+        any_reactor_entered: bool,
+        private_sign_page: ?usize,
+    };
+    pub const Tamper = enum {
+        webhook_sink,
+        webhook_limit,
+        geo_weather,
+        acme_interval,
+        ocsp_interval,
+        server_name,
+        native_frame,
+        native_upload,
+        native_participants,
+        native_mac_key,
+        native_mac_enabled,
+        media_frame,
+        media_upload,
+        media_stun,
+        media_dtls_requested,
+        media_dtls13_requested,
+        native_cross,
+        media_cross,
+        native_routing_domain,
+        native_routing_binding,
+        media_routing_domain,
+        media_routing_binding,
+        media_routing_fifo,
+    };
+    pub fn inspect(core: *ManagedCore) !Inspection {
+        const b = managedBacking(core);
+        const server = b.server.?;
+        var entered = false;
+        for (server.reactors) |*reactor| entered = entered or reactor.runtime_activated.load(.acquire);
+        return .{
+            .port = try server.boundPort(),
+            .fabric_present = server.fabric != null,
+            .pool_count = server.pool.count(),
+            .webhook_fd = if (server.webhook_server) |owner| owner.listen_fd else null,
+            .webhook_port = if (server.webhook_server) |owner| owner.port else null,
+            .geo_entered = server.geo.runtime.entered.load(.acquire),
+            .webhook_entered = if (server.webhook_server) |owner| owner.runtime.entered.load(.acquire) else false,
+            .any_reactor_entered = entered,
+            .private_sign_page = if (b.owned_identity) |identity| if (identity.sign_kp.secretPage()) |page| @intFromPtr(page) else null else null,
+        };
+    }
+    /// Exercise the real notification consumer in a source-owned World cut.
+    /// No production raw pointers or alternate publication authority escape.
+    pub fn notifyWebpush(core: *ManagedCore, account: []const u8, from: []const u8, message: []const u8) !void {
+        const b = managedBacking(core);
+        const server = b.server.?;
+        if (b.binding.webpush == null or server.webpush_worker != b.binding.webpush) return error.ConfiguredOwnerMismatch;
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        const previous = current_reactor;
+        defer current_reactor = previous;
+        current_reactor = &server.reactors[0];
+        server.webpushNotify(account, from, message);
+    }
+    pub fn seedWebpushDeadWithStoreFailure(core: *ManagedCore, endpoint: []const u8, failing: *std.testing.FailingAllocator) ![]const u8 {
+        const b = managedBacking(core);
+        const owner = b.binding.webpush orelse return error.ConfiguredOwnerMismatch;
+        const server = b.server.?;
+        if (server.webpush_worker != owner) return error.ConfiguredOwnerMismatch;
+        const store = (b.accounts orelse return error.MissingAccountServices).store;
+        const allocator = failing.allocator();
+        if (store.allocator.ptr != allocator.ptr or store.allocator.vtable != allocator.vtable) return error.ConfiguredOwnerMismatch;
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        lockSpin(&owner.mutex);
+        defer owner.mutex.unlock();
+        const owned = try owner.allocator.dupe(u8, endpoint);
+        errdefer owner.allocator.free(owned);
+        try owner.dead.append(owner.allocator, owned);
+        failing.fail_index = failing.alloc_index;
+        return owned;
+    }
+    pub fn setWebpushStoreFailure(core: *ManagedCore, failing: *std.testing.FailingAllocator, fail_next: bool) !void {
+        const b = managedBacking(core);
+        const server = b.server.?;
+        const store = (b.accounts orelse return error.MissingAccountServices).store;
+        const allocator = failing.allocator();
+        if (store.allocator.ptr != allocator.ptr or store.allocator.vtable != allocator.vtable) return error.ConfiguredOwnerMismatch;
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        failing.fail_index = if (fail_next) failing.alloc_index else std.math.maxInt(usize);
+    }
+    pub fn holdWorld(core: *ManagedCore, entered: *std.Io.Event, release: *std.Io.Event) void {
+        const b = managedBacking(core);
+        const server = b.server.?;
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        entered.set(b.io);
+        release.waitUncancelable(b.io);
+    }
+    pub fn tamper(core: *ManagedCore, kind: Tamper, invalid: bool) !void {
+        const b = managedBacking(core);
+        const server = b.server.?;
+        switch (kind) {
+            .webhook_sink => server.webhook_server.?.sink.ctx = if (invalid) @ptrCast(b) else @ptrCast(server),
+            .webhook_limit => server.webhook_server.?.handler.max_body = b.expected.webhook_max_body + @as(usize, @intFromBool(invalid)),
+            .geo_weather => server.geo.opts.weather_enabled = if (invalid) !b.expected.geo_enabled else b.expected.geo_enabled,
+            .acme_interval => b.acme.?.acme.check_interval_ms = b.parsed.acme.check_interval_ms + @as(u64, @intFromBool(invalid)),
+            .ocsp_interval => b.ocsp.?.opts.check_interval_ms = b.parsed.ocsp.check_interval_ms + @as(u64, @intFromBool(invalid)),
+            .server_name => server.config.server_name = if (invalid) "changed-by-source-fixture" else b.expected.server_name,
+            .native_frame => server.native_media.max_frame_bytes = @intCast(@min(b.expected.media_max_frame_bytes, @as(u64, native_media_mod.max_datagram)) - @as(u64, @intFromBool(invalid))),
+            .native_upload => server.native_media.max_upload_bytes = b.expected.media_max_upload_bytes - @as(u64, @intFromBool(invalid)),
+            .native_participants => server.native_media.max_participants = @min(b.expected.media_max_participants, native_media_mod.max_call_participants) - @as(usize, @intFromBool(invalid)),
+            .native_mac_key => server.native_media.mac_stream_key = if (invalid) @splat(0) else server.native_stream_key,
+            .native_mac_enabled => server.native_media.mac_key_configured = !invalid,
+            .media_frame => server.media_plane.max_frame_bytes = @intCast(@min(b.expected.media_max_frame_bytes, @as(u64, media_plane_mod.max_datagram)) - @as(u64, @intFromBool(invalid))),
+            .media_upload => server.media_plane.max_upload_bytes = b.expected.media_max_upload_bytes - @as(u64, @intFromBool(invalid)),
+            .media_stun => server.media_plane.stun_server = if (invalid) try media_plane_mod.TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, 3478) else null,
+            .media_dtls_requested => server.media_plane.dtls_requested = if (invalid) !b.expected.media_dtls_srtp else b.expected.media_dtls_srtp,
+            .media_dtls13_requested => server.media_plane.dtls13_requested = if (invalid) !b.expected.media_dtls13 else b.expected.media_dtls13,
+            .native_cross => server.native_media.cross = if (invalid) null else .{ .ctx = server, .on_native_frame = bridgeOnNativeFrame, .on_native_feedback = bridgeOnNativeFeedback },
+            .media_cross => server.media_plane.cross = if (invalid) null else .{ .ctx = server, .on_rtp_frame = bridgeOnRtpFrame, .on_rtcp_feedback = bridgeOnRtcpFeedback },
+            .native_routing_domain => server.native_media.routing_domain = if (invalid) null else mediaRoutingBacking(server.media_routing_owner.?).domain,
+            .native_routing_binding => server.native_media.routing_binding = if (invalid) null else mediaRoutingBacking(server.media_routing_owner.?).native_binding,
+            .media_routing_domain => server.media_plane.routing_domain = if (invalid) null else mediaRoutingBacking(server.media_routing_owner.?).domain,
+            .media_routing_binding => server.media_plane.routing_binding = if (invalid) null else mediaRoutingBacking(server.media_routing_owner.?).webrtc_binding,
+            .media_routing_fifo => server.media_plane.routing_egress = if (invalid) null else @ptrCast(@alignCast(@constCast(mediaRoutingBacking(server.media_routing_owner.?).prepared_egress.?))),
+        }
+    }
+    /// Swap only the source fixture's actual prepared sockets, preserving both
+    /// allocations and descriptors so refusal and restoration share the OFDs.
+    pub fn swapPreparedMediaSockets(core: *ManagedCore) void {
+        const server = managedBacking(core).server.?;
+        std.mem.swap(?native_media_mod.MediaSocket, &server.native_media.socket, &server.media_plane.socket);
+        std.mem.swap(u16, &server.native_media.port, &server.media_plane.port);
+    }
+} else struct {};
+
+fn managedSpecBefore(_: void, a: reactor_pool_mod.runtime_start_gate.ParticipantSpec, b: reactor_pool_mod.runtime_start_gate.ParticipantSpec) bool {
+    return @intFromEnum(a.kind) < @intFromEnum(b.kind) or (a.kind == b.kind and a.instance < b.instance);
+}
+fn managedAppendSpec(out: []reactor_pool_mod.runtime_start_gate.ParticipantSpec, count: *usize, kind: reactor_pool_mod.runtime_start_gate.Kind, instance: u16, owner: *const anyopaque, options: std.Thread.SpawnConfig) !void {
+    if (count.* == out.len) return error.ParticipantCapacity;
+    out[count.*] = .{ .kind = kind, .instance = instance, .owner_identity = owner, .options = options };
+    count.* += 1;
+}
+fn managedAppendSlot(view: *const reactor_pool_mod.runtime_start_gate.View, out: []reactor_pool_mod.runtime_start_gate.Slot, count: *usize, kind: reactor_pool_mod.runtime_start_gate.Kind, instance: u16, owner: *const anyopaque, options: std.Thread.SpawnConfig) !void {
+    if (count.* == out.len) return error.ParticipantCapacity;
+    const slot = try view.slot(kind, instance, owner);
+    try view.requireSlot(slot, kind, instance, owner, options);
+    out[count.*] = slot;
+    count.* += 1;
+}
+
+fn managedStopTestDeadline() std.Io.Clock.Timestamp {
+    return std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(5000) });
+}
+
+fn managedLeasedTestDirectory(dir: std.Io.Dir) !void {
+    const owned = try dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer owned.close(std.testing.io);
+    try owned.setPermissions(std.testing.io, .fromMode(0o700));
+}
+fn managedLeasedTestInputs(identity: *const node_identity.NodeIdentity, name: []const u8) ManagedCoreInputs {
+    return .{ .config = .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .server_name = "leased.core.test", .node_identity = identity, .sasl_enabled = true, .crypto_io = std.testing.io }, .parsed = .{ .sasl = .{ .enabled = true, .account_db = name }, .accounts = .{ .pbkdf2_rounds = 1, .password_min_len = 4, .password_max_len = 128 } } };
+}
+
+test "managed leased core: genuine provision and recovery install original sources and refuse graph work" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    var identity = try node_identity.fromSeed(@splat(0x51), "managed-leased");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "leased-core.wal" };
+    const inputs = managedLeasedTestInputs(&identity, storage.name);
+    try std.testing.expectError(error.FileNotFound, ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding));
+    const core = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding);
+    var closed = false;
+    defer if (!closed) core.discardLeasedCold() catch @panic("leased provision cleanup");
+    const b = managedBacking(core);
+    try std.testing.expect(b.server.?.config.account_services == null and b.services == null);
+    try std.testing.expect(!disabledFeaturePresent(b.server.?.config.disabled_features, "accounts"));
+    try ManagedCoreFixture.requireLeasedDirectCloseRefusal(core);
+    try ManagedCoreFixture.requireLeasedForeignRefusal(core, .{ .dir = temporary.dir, .name = "foreign-core.wal" });
+    var run: reactor_pool_mod.RunFlag = .init(true);
+    try std.testing.expectError(error.ClosedAuthorityNotIntegrated, core.prepareColdResources(&run));
+    try std.testing.expectError(error.ClosedAuthorityNotIntegrated, core.createGraphControl(std.testing.allocator, null));
+    try std.testing.expectError(error.ClosedAuthorityNotIntegrated, core.requirePrepared());
+    try std.testing.expect(b.graph_view == null and b.run == null and b.server.?.pool.count() == 0);
+    for (b.server.?.reactors) |*reactor| try std.testing.expect(!reactor.runtime_activated.load(.acquire));
+    var scratch: [1024]u8 = undefined;
+    const registered = try ManagedCoreFixture.registerLeasedAccount(core, "alice", "source-password", &scratch);
+    try std.testing.expect(registered == .registered_account);
+    const original = try ManagedCoreFixture.borrowLeasedAuthority(core);
+    const original_observation = try original.observe();
+    try original.release();
+    try core.discardLeasedCold();
+    closed = true;
+    try std.testing.expectError(error.AlreadyInitialized, ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding));
+    const cold = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding);
+    defer cold.discardLeasedCold() catch @panic("leased recovery cleanup");
+    const identified = try ManagedCoreFixture.identifyLeasedAccount(cold, "alice", "source-password");
+    try std.testing.expect(identified == .identified);
+    const borrowed = try ManagedCoreFixture.borrowLeasedAuthority(cold);
+    defer borrowed.release() catch @panic("leased recovery read release");
+    const recovered = try borrowed.observe();
+    try std.testing.expectEqualSlices(u8, &original_observation.logical_store_id, &recovered.logical_store_id);
+    try std.testing.expectEqualSlices(u8, &original_observation.logical_store_epoch, &recovered.logical_store_epoch);
+    try std.testing.expectEqual(original_observation.generation + 1, recovered.generation);
+}
+
+test "managed leased core: actual read and transaction custody retain exact placement across disposal refusal" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    var identity = try node_identity.fromSeed(@splat(0x52), "managed-leased-custody");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "leased-custody.wal" };
+    const inputs = managedLeasedTestInputs(&identity, storage.name);
+    const core = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding);
+    var closed = false;
+    defer if (!closed) core.discardLeasedCold() catch @panic("leased custody cleanup");
+    const b = managedBacking(core);
+    const original_authority = b.server.?.leased_authority;
+    const original_loan = b.server.?.leased_services;
+    const read = try ManagedCoreFixture.borrowLeasedAuthority(core);
+    var read_released = false;
+    defer if (!read_released) read.release() catch @panic("held read cleanup");
+    try std.testing.expectError(error.SourceBorrowed, core.discardLeasedCold());
+    try std.testing.expect(b.server.?.leased_authority == original_authority and b.server.?.leased_services == original_loan and b.leased_stage.phase == .installed);
+    try read.release();
+    read_released = true;
+    try b.install_seal.?.requireOriginal(b);
+    var public_key: crypto_sign.PublicKey = undefined;
+    var signature: crypto_sign.Signature = undefined;
+    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "source custody", .message = "retained source transaction" };
+    try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
+    const plan = try ManagedCoreFixture.prepareLeasedEvent(core, event, &.{}, 1000);
+    var plan_aborted = false;
+    defer if (!plan_aborted) ManagedCoreFixture.abortLeasedEvent(core, plan) catch @panic("held source plan cleanup");
+    try std.testing.expectError(error.SourceBorrowed, core.discardLeasedCold());
+    try std.testing.expect(b.server.?.leased_authority == original_authority and b.server.?.leased_services == original_loan and b.leased_stage.phase == .installed);
+    try ManagedCoreFixture.abortLeasedEvent(core, plan);
+    plan_aborted = true;
+    try b.install_seal.?.requireOriginal(b);
+    try core.discardLeasedCold();
+    closed = true;
+    const cold = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding);
+    defer cold.discardLeasedCold() catch @panic("custody cold cleanup");
+    const borrowed = try ManagedCoreFixture.borrowLeasedAuthority(cold);
+    defer borrowed.release() catch @panic("custody cold read release");
+    try std.testing.expectEqual(@as(u64, 0), (try borrowed.observe()).max_accepted_hlc);
+}
+
+test "managed leased core: ordinary account WAL never becomes a provision or recovery fallback" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    {
+        var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, temporary.dir, "ordinary.wal");
+        defer store.deinit();
+        var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1, .password_min_len = 4 });
+        var scratch: [1024]u8 = undefined;
+        _ = try services.registerAccount("alice", "original-password", &scratch);
+    }
+    var identity = try node_identity.fromSeed(@splat(0x53), "ordinary-refusal");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "ordinary.wal" };
+    const inputs = managedLeasedTestInputs(&identity, storage.name);
+    try std.testing.expectError(error.AlreadyInitialized, ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding));
+    try std.testing.expectError(error.FileNotFound, ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding));
+    var unchanged = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, temporary.dir, "ordinary.wal");
+    defer unchanged.deinit();
+    var services = services_mod.Services.initWithConfig(&unchanged, null, .{ .pbkdf2_rounds = 1, .password_min_len = 4 });
+    try std.testing.expect((try services.identifyAccount("alice", "original-password")) == .identified);
+}
+
+fn managedLeasedRecoveryAllocationCampaign(allocator: std.mem.Allocator, inputs: ManagedCoreInputs, storage: delivery_authority.ProtectedStorage, binding: RuntimeCreatedBindings, store_id: [16]u8, event_id: oper_event.EventId) !void {
+    const core = ManagedCore.createLeasedCold(allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding) catch |err| {
+        if (err != error.OutOfMemory) return err;
+        // Cold recovery can commit a valid successor before a later Core
+        // allocation fails. Prove original lease cleanup and accepted rows via
+        // another explicit recovery; no ordinary-WAL or provision fallback.
+        const retry = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding);
+        defer retry.discardLeasedCold() catch @panic("leased OOM recovery retry cleanup");
+        const read = try ManagedCoreFixture.borrowLeasedAuthority(retry);
+        defer read.release() catch @panic("leased OOM recovery retry read");
+        const observed = try read.observe();
+        const output = try read.delivery(0);
+        try std.testing.expectEqualSlices(u8, &store_id, &observed.logical_store_id);
+        try std.testing.expectEqualSlices(u8, &event_id, &output.id);
+        return err;
+    };
+    defer core.discardLeasedCold() catch @panic("leased allocation source cleanup");
+    const b = managedBacking(core);
+    try b.install_seal.?.requireOriginal(b);
+    // This source loan also uses the injected allocator. An allocation failure
+    // after construction still releases the original Core through the defer.
+    const read = try b.leased_authority.?.borrow();
+    defer read.release() catch @panic("leased allocation read cleanup");
+    const observed = try read.observe();
+    const output = try read.delivery(0);
+    try std.testing.expectEqualSlices(u8, &store_id, &observed.logical_store_id);
+    try std.testing.expectEqualSlices(u8, &event_id, &output.id);
+}
+
+test "managed leased core: every actual recovery factory allocation failure releases original lease and preserves accepted rows" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    var identity = try node_identity.fromSeed(@splat(0x54), "leased-allocation");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "leased-allocation.wal" };
+    const inputs = managedLeasedTestInputs(&identity, storage.name);
+    const original = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding);
+    var closed = false;
+    defer if (!closed) original.discardLeasedCold() catch @panic("leased allocation seed cleanup");
+    var public_key: crypto_sign.PublicKey = undefined;
+    var signature: crypto_sign.Signature = undefined;
+    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "source allocation", .message = "original accepted durable output" };
+    try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
+    const plan = try ManagedCoreFixture.prepareLeasedEvent(original, event, &.{.{ .url = "https://delivery.example.test/leased", .secret = "exact original source secret" }}, 1000);
+    var committed = false;
+    defer if (!committed) ManagedCoreFixture.abortLeasedEvent(original, plan) catch @panic("leased allocation seed plan cleanup");
+    const accepted = try ManagedCoreFixture.commitLeasedEvent(original, plan);
+    committed = true;
+    const event_id = accepted orelse return error.MissingAcceptedEvent;
+    const read = try ManagedCoreFixture.borrowLeasedAuthority(original);
+    const store_id = (try read.observe()).logical_store_id;
+    try read.release();
+    try original.discardLeasedCold();
+    closed = true;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, managedLeasedRecoveryAllocationCampaign, .{ inputs, storage, binding, store_id, event_id });
+    // A normal final recovery demonstrates the same source namespace remains
+    // usable after the complete constructor/installation failure sweep.
+    const retry = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding);
+    defer retry.discardLeasedCold() catch @panic("leased final allocation retry cleanup");
+    const borrowed = try ManagedCoreFixture.borrowLeasedAuthority(retry);
+    defer borrowed.release() catch @panic("leased final allocation read cleanup");
+    const output = try borrowed.delivery(0);
+    try std.testing.expectEqualSlices(u8, &event_id, &output.id);
+    try std.testing.expectEqualStrings("exact original source secret", output.secret);
+}
+
+const ManagedLeasedProvisionFaults = struct { before_commit: usize = 0, retained_journal: usize = 0 };
+
+fn managedLeasedProvisionAllocationCampaign(allocator: std.mem.Allocator, identity: *const node_identity.NodeIdentity, binding: RuntimeCreatedBindings, faults: *ManagedLeasedProvisionFaults) !void {
+    // Each injected index gets a genuinely new protected namespace. Namespace
+    // setup uses the harness allocator, outside the Core allocation sweep.
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "provision-allocation.wal" };
+    const inputs = managedLeasedTestInputs(identity, storage.name);
+    const core = ManagedCore.createLeasedCold(allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding) catch |err| {
+        if (err != error.OutOfMemory) return err;
+        const original_wal = temporary.dir.readFileAlloc(std.testing.io, storage.name, std.testing.allocator, .unlimited) catch |read_err| switch (read_err) {
+            error.FileNotFound => {
+                faults.before_commit += 1;
+                const retry = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding);
+                defer retry.discardLeasedCold() catch @panic("leased precommit provision retry cleanup");
+                const observed = try managedBacking(retry).leased_authority.?.observe();
+                try std.testing.expectEqual(@as(u64, 1), observed.generation);
+                try std.testing.expectEqual(@as(usize, 0), observed.pending_deliveries);
+                return err;
+            },
+            else => return read_err,
+        };
+        defer std.testing.allocator.free(original_wal);
+        faults.retained_journal += 1;
+        try std.testing.expect(original_wal.len != 0);
+        // Repeated provision neither deletes nor rewrites the genuine newly
+        // committed source. Equal policy cannot turn this into a cold fallback.
+        try std.testing.expectError(error.AlreadyInitialized, ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding));
+        const refused_wal = try temporary.dir.readFileAlloc(std.testing.io, storage.name, std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(refused_wal);
+        try std.testing.expectEqualSlices(u8, original_wal, refused_wal);
+        // Strict recovery authenticates all four original rows before its
+        // successor commit and proves the failed Core released its real lease.
+        const retry = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding);
+        defer retry.discardLeasedCold() catch @panic("leased retained provision recovery cleanup");
+        const observed = try managedBacking(retry).leased_authority.?.observe();
+        try std.testing.expectEqual(@as(u64, 2), observed.generation);
+        try std.testing.expectEqual(@as(u64, 0), observed.max_accepted_hlc);
+        try std.testing.expectEqual(@as(usize, 0), observed.pending_deliveries);
+        return err;
+    };
+    defer core.discardLeasedCold() catch @panic("leased provision allocation cleanup");
+    const observed = try managedBacking(core).leased_authority.?.observe();
+    try std.testing.expectEqual(@as(u64, 1), observed.generation);
+}
+
+test "managed leased core: every provision allocation failure preserves explicit storage mode and actual namespace outcome" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var identity = try node_identity.fromSeed(@splat(0x55), "leased-provision-allocation");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    var faults: ManagedLeasedProvisionFaults = .{};
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, managedLeasedProvisionAllocationCampaign, .{ &identity, binding, &faults });
+    try std.testing.expect(faults.before_commit != 0);
+    try std.testing.expect(faults.retained_journal != 0);
+}
+
+test "managed leased core: real failed preparations refund active World custody and exhaust a finite scope budget before WAL mutation" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    var identity = try node_identity.fromSeed(@splat(0x56), "leased-world-budget");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "world-budget.wal" };
+    const inputs = managedLeasedTestInputs(&identity, storage.name);
+    const core = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding);
+    var closed = false;
+    defer if (!closed) core.discardLeasedCold() catch @panic("World budget Core cleanup");
+    const before = try temporary.dir.readFileAlloc(std.testing.io, storage.name, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before);
+    var public_key: crypto_sign.PublicKey = undefined;
+    var signature: crypto_sign.Signature = undefined;
+    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "scope budget", .message = "uncommitted scope attempts" };
+    try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
+    var invalid = event;
+    invalid.origin_server = "foreign.core.test";
+    for (0..managed_leased_scope_budget) |_| {
+        try std.testing.expectError(error.OriginMismatch, ManagedCoreFixture.prepareLeasedEvent(core, invalid, &.{}, 1000));
+        try std.testing.expect(managedBacking(core).leased_active_scope == null);
+    }
+    try std.testing.expectError(error.WorldScopeCapacity, ManagedCoreFixture.prepareLeasedEvent(core, event, &.{}, 1000));
+    const after = try temporary.dir.readFileAlloc(std.testing.io, storage.name, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try ManagedCoreFixture.requireLeasedDirectCloseRefusal(core);
+    try core.discardLeasedCold();
+    closed = true;
+    // Genuine cold reconstruction gives a new bounded creator lifetime. It
+    // does not reuse any consumed scope or alter an old plan's acquisition.
+    const cold = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding);
+    defer cold.discardLeasedCold() catch @panic("World budget cold cleanup");
+    const plan = try ManagedCoreFixture.prepareLeasedEvent(cold, event, &.{}, 1000);
+    var consumed = false;
+    defer if (!consumed) ManagedCoreFixture.abortLeasedEvent(cold, plan) catch @panic("World budget cold plan cleanup");
+    const accepted = try ManagedCoreFixture.commitLeasedEvent(cold, plan);
+    consumed = true;
+    try std.testing.expect(accepted != null);
+}
+
+test "managed leased core: bound prepare allocation failures retain original WAL and refund the actual World and Services custody" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    var identity = try node_identity.fromSeed(@splat(0x57), "leased-world-oom");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "world-oom.wal" };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    const core = try ManagedCore.createLeasedCold(failing.allocator(), std.testing.io, managedLeasedTestInputs(&identity, storage.name), .{ .mode = .provision, .storage = storage }, binding);
+    defer core.discardLeasedCold() catch @panic("World prepare OOM cleanup");
+    // This branch is genuinely unpublished: no other caller can mutate the
+    // source allocator while the creator induces and disarms each failure.
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+    }
+    const before = try temporary.dir.readFileAlloc(std.testing.io, storage.name, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before);
+    var public_key: crypto_sign.PublicKey = undefined;
+    var signature: crypto_sign.Signature = undefined;
+    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "scope allocation", .message = "all fallible source preparation" };
+    try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
+    var induced: usize = 0;
+    var succeeded = false;
+    for (0..512) |index| {
+        failing.fail_index = failing.alloc_index + index;
+        failing.has_induced_failure = false;
+        const result = ManagedCoreFixture.prepareLeasedEvent(core, event, &.{.{ .url = "https://delivery.example.test/world", .secret = "retained source output" }}, 1000);
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |plan| {
+            var consumed = false;
+            defer if (!consumed) ManagedCoreFixture.abortLeasedEvent(core, plan) catch @panic("World OOM normal plan cleanup");
+            try std.testing.expect(!failing.has_induced_failure);
+            try ManagedCoreFixture.abortLeasedEvent(core, plan);
+            consumed = true;
+            succeeded = true;
+            break;
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+            try std.testing.expect(failing.has_induced_failure);
+            induced += 1;
+            try std.testing.expect(managedBacking(core).leased_active_scope == null);
+            // Genuine original source validation takes its actual Services
+            // mutex; leaked transaction custody would refuse this operation.
+            try ManagedCoreFixture.requireLeasedDirectCloseRefusal(core);
+            const unchanged = try temporary.dir.readFileAlloc(std.testing.io, storage.name, std.testing.allocator, .unlimited);
+            defer std.testing.allocator.free(unchanged);
+            try std.testing.expectEqualSlices(u8, before, unchanged);
+        }
+    }
+    try std.testing.expect(induced != 0 and succeeded);
+    const after = try temporary.dir.readFileAlloc(std.testing.io, storage.name, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "managed leased core: real other caller holding fresh World refuses before retained Services mutex and joins before cold cancellation" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    var identity = try node_identity.fromSeed(@splat(0x58), "leased-world-caller");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "world-caller.wal" };
+    const core = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, managedLeasedTestInputs(&identity, storage.name), .{ .mode = .provision, .storage = storage }, binding);
+    defer core.discardLeasedCold() catch @panic("World caller Core cleanup");
+    const before = try temporary.dir.readFileAlloc(std.testing.io, storage.name, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before);
+    var public_key: crypto_sign.PublicKey = undefined;
+    var signature: crypto_sign.Signature = undefined;
+    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "World caller", .message = "original candidate stays retained" };
+    try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
+    const plan = try ManagedCoreFixture.prepareLeasedEvent(core, event, &.{}, 1000);
+    var interrupted = false;
+    var consumed = false;
+    defer if (!consumed) {
+        if (interrupted) core.cancelLeasedColdPreparation() catch @panic("interrupted caller candidate cleanup") else ManagedCoreFixture.abortLeasedEvent(core, plan) catch @panic("caller candidate cleanup");
+    };
+    try ManagedCoreFixture.releaseLeasedEventWorld(core, plan);
+    interrupted = true;
+    const Caller = struct {
+        core: *ManagedCore,
+        plan: *delivery_authority.Prepared,
+        returned: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            std.testing.expectError(error.WorldScopeWrongCaller, self.core.cancelLeasedColdPreparation()) catch |err| {
+                self.failure = err;
+                self.returned.set(std.testing.io);
+                return;
+            };
+            ManagedCoreFixture.requireLeasedFreshWorldLoanRefusal(self.core, self.plan) catch |err| {
+                self.failure = err;
+            };
+            self.returned.set(std.testing.io);
+        }
+    };
+    var caller: Caller = .{ .core = core, .plan = plan };
+    const thread = try std.Thread.spawn(.{}, Caller.run, .{&caller});
+    // Failure must never unwind and free a live caller or blindly join a
+    // World→Services deadlock. A regression fails this process at the bound.
+    caller.returned.waitTimeout(std.testing.io, .{ .deadline = managedStopTestDeadline() }) catch
+        @panic("fresh World caller did not return before the actual join bound");
+    thread.join();
+    if (caller.failure) |err| return err;
+    try std.testing.expectError(error.SourceBorrowed, core.discardLeasedCold());
+    const retained = try temporary.dir.readFileAlloc(std.testing.io, storage.name, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualSlices(u8, before, retained);
+    try core.cancelLeasedColdPreparation();
+    consumed = true;
+    const after = try temporary.dir.readFileAlloc(std.testing.io, storage.name, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try ManagedCoreFixture.requireLeasedDirectCloseRefusal(core);
+}
+
+const ManagedLeasedDiskTestCut = if (builtin.is_test) struct {
+    const row_keys = [_][]const u8{ "oda\x00esg2", "oda\x00oeh1", "oda\x00deliveries", "oda\x00head" };
+    rows: [4][]u8,
+    wal: []u8,
+
+    fn capture(storage: delivery_authority.ProtectedStorage) !@This() {
+        const allocator = std.testing.allocator;
+        const wal = try storage.dir.readFileAlloc(std.testing.io, storage.name, allocator, .unlimited);
+        errdefer allocator.free(wal);
+        var inspection = try services_mod.OroStore.openReadOnlyWithConfig(allocator, std.testing.io, storage.dir, storage.name, .{ .changefeed_capacity = 0 });
+        defer inspection.deinit();
+        var rows: [4][]u8 = undefined;
+        var count: usize = 0;
+        errdefer for (rows[0..count]) |row| allocator.free(row);
+        for (row_keys, 0..) |key, index| {
+            rows[index] = try allocator.dupe(u8, inspection.get(.props, key) orelse return error.MissingLeasedState);
+            count += 1;
+        }
+        return .{ .rows = rows, .wal = wal };
+    }
+    fn deinit(self: *@This()) void {
+        for (self.rows) |row| {
+            std.crypto.secureZero(u8, row);
+            std.testing.allocator.free(row);
+        }
+        std.crypto.secureZero(u8, self.wal);
+        std.testing.allocator.free(self.wal);
+    }
+    fn expectUnchanged(self: *const @This(), storage: delivery_authority.ProtectedStorage) !void {
+        var actual = try capture(storage);
+        defer actual.deinit();
+        try std.testing.expectEqualSlices(u8, self.wal, actual.wal);
+        for (self.rows, actual.rows) |expected, row| try std.testing.expectEqualSlices(u8, expected, row);
+    }
+} else struct {};
+
+test "managed leased core: actual final valid World acquisition permits cold-only cancellation after real exhaustion and preserves strict cold state" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    var identity = try node_identity.fromSeed(@splat(0x59), "leased-world-final");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "world-final.wal" };
+    const inputs = managedLeasedTestInputs(&identity, storage.name);
+    const core = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding);
+    var closed = false;
+    defer if (!closed) core.discardLeasedCold() catch @panic("final World Core cleanup");
+    const b = managedBacking(core);
+    const original = try b.leased_authority.?.observe();
+    var before = try ManagedLeasedDiskTestCut.capture(storage);
+    defer before.deinit();
+    try ManagedCoreFixture.seedFinalLeasedWorldAcquisition(core);
+    var public_key: crypto_sign.PublicKey = undefined;
+    var signature: crypto_sign.Signature = undefined;
+    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "final source scope", .message = "retained candidate at final acquisition" };
+    try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
+    const plan = try ManagedCoreFixture.prepareLeasedEvent(core, event, &.{.{ .url = "https://delivery.example.test/final", .secret = "uncommitted final output" }}, 1000);
+    var interrupted = false;
+    var consumed = false;
+    defer if (!consumed) {
+        if (interrupted) core.cancelLeasedColdPreparation() catch @panic("final interrupted candidate cleanup") else ManagedCoreFixture.abortLeasedEvent(core, plan) catch @panic("final candidate cleanup");
+    };
+    const world = &b.server.?.world;
+    const original_scope = b.leased_active_scope.?;
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), original_scope.acquisition);
+    try std.testing.expect(!world.lock.exclusive_generation_exhausted.load(.acquire));
+    try std.testing.expectError(error.WorldAcquisitionNotInterrupted, core.cancelLeasedColdPreparation());
+    try before.expectUnchanged(storage);
+    try ManagedCoreFixture.releaseLeasedEventWorld(core, plan);
+    interrupted = true;
+
+    // This actual CAS acquisition is later than the final valid captured
+    // scope, even though the generation can no longer advance beyond MAX.
+    world.lockWrite();
+    var exhausted_world_held = true;
+    defer if (exhausted_world_held) world.unlockWrite();
+    try std.testing.expect(world.lock.exclusive_generation_exhausted.load(.acquire));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), world.lock.exclusive_generation.load(.acquire));
+    try std.testing.expectError(error.ExclusiveAcquisitionExhausted, plan.commit());
+    try std.testing.expectError(error.ExclusiveAcquisitionExhausted, plan.abort());
+    try std.testing.expect(b.leased_active_scope == original_scope and !original_scope.consumed);
+    try std.testing.expectError(error.SourceBorrowed, core.discardLeasedCold());
+    try before.expectUnchanged(storage);
+    try core.cancelLeasedColdPreparation();
+    consumed = true;
+    try std.testing.expect(b.leased_active_scope == null and original_scope.consumed);
+    world.unlockWrite();
+    exhausted_world_held = false;
+    try before.expectUnchanged(storage);
+    // Source validation tries the original private Services mutex and checks
+    // all leaf custody; successful validation proves terminal refund occurred.
+    try ManagedCoreFixture.requireLeasedDirectCloseRefusal(core);
+    try std.testing.expectError(error.ConsumedPlan, plan.commit());
+    try std.testing.expectError(error.ConsumedPlan, plan.abort());
+    try std.testing.expectError(error.ExclusiveAcquisitionExhausted, ManagedCoreFixture.prepareLeasedEvent(core, event, &.{}, 1000));
+    try std.testing.expect(world.lock.exclusive_generation_exhausted.load(.acquire));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), world.lock.exclusive_generation.load(.acquire));
+    try before.expectUnchanged(storage);
+    const retained = try b.leased_authority.?.observe();
+    try std.testing.expectEqual(original.generation, retained.generation);
+    try std.testing.expectEqual(original.poisoned, retained.poisoned);
+    try std.testing.expectEqual(@as(u64, 0), retained.max_accepted_hlc);
+    try std.testing.expectEqual(@as(usize, 0), retained.pending_deliveries);
+    try core.discardLeasedCold();
+    closed = true;
+    try before.expectUnchanged(storage);
+
+    // A different, genuine strict cold owner authenticates the original head.
+    // The canceled signed identity was never consumed by the old source.
+    const cold = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding);
+    defer cold.discardLeasedCold() catch @panic("final World strict cold cleanup");
+    const recovered = try managedBacking(cold).leased_authority.?.observe();
+    try std.testing.expectEqualSlices(u8, &original.logical_store_id, &recovered.logical_store_id);
+    try std.testing.expectEqualSlices(u8, &original.logical_store_epoch, &recovered.logical_store_epoch);
+    try std.testing.expectEqual(original.generation + 1, recovered.generation);
+    try std.testing.expectEqual(original.poisoned, recovered.poisoned);
+    try std.testing.expectEqual(@as(u64, 0), recovered.max_accepted_hlc);
+    try std.testing.expectEqual(@as(usize, 0), recovered.pending_deliveries);
+    const retry = try ManagedCoreFixture.prepareLeasedEvent(cold, event, &.{}, 1000);
+    var retried = false;
+    defer if (!retried) ManagedCoreFixture.abortLeasedEvent(cold, retry) catch @panic("final World cold retry cleanup");
+    const id = try ManagedCoreFixture.commitLeasedEvent(cold, retry);
+    retried = true;
+    try std.testing.expect(id != null);
+}
+
+fn managedLeasedRegisteredChannelSameLaneTest(core: *ManagedCore, event: oper_event.SignedOperEventV2, storage: delivery_authority.ProtectedStorage, before: *const ManagedLeasedDiskTestCut) !void {
+    const b = managedBacking(core);
+    const world = &b.server.?.world;
+    const candidate = try ManagedCoreFixture.prepareLeasedEvent(core, event, &.{}, 1000);
+    var candidate_consumed = false;
+    defer {
+        if (!candidate_consumed) candidate.abort() catch |err| {
+            std.debug.print("successor stage candidate cleanup: {s}\n", .{@errorName(err)});
+        };
+        world.unlockWrite();
+    }
+    const source = b.leased_active_scope.?;
+    const scope: *ManagedLeasedWorldScope = @ptrCast(source);
+    const channel = try world.prepareRegisteredChannel("#original", true);
+    defer channel.abort();
+    // No binding has occurred: actual active World custody alone must fence
+    // the original event before either commit or ordinary abort touches WAL.
+    try std.testing.expect(source.registered_channel_stage == null);
+    try std.testing.expectError(error.ChannelStageScopeMismatch, channel.requireColdCancellation(scope));
+    try std.testing.expectError(error.ChannelStageActive, candidate.commit());
+    try std.testing.expectError(error.ChannelStageActive, candidate.abort());
+    try before.expectUnchanged(storage);
+    try channel.bindOriginalCoreScope(scope);
+    channel.abort();
+    const successor = try world.prepareRegisteredChannel("#successor", true);
+    defer successor.abort();
+    try std.testing.expect(successor != channel and source.registered_channel_stage == channel);
+    try std.testing.expectError(error.ChannelStageScopeMismatch, successor.requireColdCancellation(scope));
+    // The source-recorded identity is retired, but a genuine same-lane
+    // successor still cannot be left behind by consuming this event Scope.
+    try std.testing.expectError(error.ChannelStageActive, candidate.commit());
+    try std.testing.expectError(error.ChannelStageActive, candidate.abort());
+    try std.testing.expectError(error.ChannelStageActive, scope.requireNoActiveRegisteredChannelStage());
+    try std.testing.expectError(error.ChannelStageAlreadyBound, successor.bindOriginalCoreScope(scope));
+    try std.testing.expectError(error.ChannelStageScopeMismatch, successor.requireColdCancellation(scope));
+    try std.testing.expect(b.leased_active_scope == source and !source.consumed);
+    try before.expectUnchanged(storage);
+    successor.abort();
+    try candidate.abort();
+    candidate_consumed = true;
+    try std.testing.expect(source.consumed and b.leased_active_scope == null);
+    try world.requireNoActiveRegisteredChannelStage();
+    try std.testing.expectEqual(@as(usize, 0), world.channelCount());
+    try before.expectUnchanged(storage);
+}
+
+fn managedLeasedRegisteredChannelColdTest(exhaustion: bool) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    var identity = try node_identity.fromSeed(@splat(0x5a), "leased-channel-source");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "channel-source.wal" };
+    const inputs = managedLeasedTestInputs(&identity, storage.name);
+    const core = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding);
+    var closed = false;
+    defer if (!closed) core.discardLeasedCold() catch |err| {
+        std.debug.print("channel source Core cleanup: {s}\n", .{@errorName(err)});
+    };
+    const b = managedBacking(core);
+    const world = &b.server.?.world;
+    const original = try b.leased_authority.?.observe();
+    var before = try ManagedLeasedDiskTestCut.capture(storage);
+    defer before.deinit();
+    if (exhaustion) try ManagedCoreFixture.seedFinalLeasedWorldAcquisition(core);
+    var public_key: crypto_sign.PublicKey = undefined;
+    var signature: crypto_sign.Signature = undefined;
+    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "channel source custody", .message = "uncommitted source scope" };
+    try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
+    if (!exhaustion) try managedLeasedRegisteredChannelSameLaneTest(core, event, storage, &before);
+    // An actual leaf candidate retains the genuine issued Scope and original
+    // Services mutex. This control is not a channel WAL transaction receipt.
+    const candidate = try ManagedCoreFixture.prepareLeasedEvent(core, event, &.{}, 1000);
+    var world_held = true;
+    var interrupted = false;
+    var candidate_consumed = false;
+    defer {
+        if (!candidate_consumed) {
+            if (interrupted) {
+                if (!world_held) {
+                    world.lockWrite();
+                    world_held = true;
+                }
+                core.cancelLeasedColdPreparation() catch |err| {
+                    std.debug.print("channel source cold candidate cleanup: {s}\n", .{@errorName(err)});
+                };
+            } else candidate.abort() catch |err| {
+                std.debug.print("channel source candidate cleanup: {s}\n", .{@errorName(err)});
+            };
+        }
+        if (world_held) world.unlockWrite();
+    }
+    const source = b.leased_active_scope.?;
+    const scope: *ManagedLeasedWorldScope = @ptrCast(source);
+    const next_oid = world.next_oid;
+    const channel = try world.prepareRegisteredChannel("#source", true);
+    var channel_retired = false;
+    defer if (!channel_retired) {
+        if (interrupted) {
+            if (!world_held) {
+                world.lockWrite();
+                world_held = true;
+            }
+            channel.abortForColdCore(scope) catch |err| {
+                std.debug.print("channel source cold World cleanup: {s}\n", .{@errorName(err)});
+            };
+        } else channel.abort();
+    };
+    try channel.bindOriginalCoreScope(scope);
+    try std.testing.expect(source.registered_channel_stage == channel);
+    try channel.requireReady();
+    try std.testing.expect(!world.channelExists("#source") and world.rcu_channels == null);
+    try std.testing.expectEqual(next_oid, world.next_oid);
+    try std.testing.expectError(error.ChannelStageActive, candidate.commit());
+    try std.testing.expectError(error.ChannelStageActive, candidate.abort());
+    try std.testing.expectError(error.WorldAcquisitionNotInterrupted, channel.requireColdCancellation(scope));
+    try before.expectUnchanged(storage);
+
+    // A real independently issued World stage cannot claim this Core scope,
+    // even while both actual write locks belong to the same creator.
+    {
+        var foreign = world_model.World.init(std.testing.allocator);
+        defer foreign.deinit();
+        foreign.lockWrite();
+        defer foreign.unlockWrite();
+        const foreign_channel = try foreign.prepareRegisteredChannel("#foreign", true);
+        defer foreign_channel.abort();
+        try std.testing.expectError(error.ChannelStageSourceMismatch, foreign_channel.bindOriginalCoreScope(scope));
+        try std.testing.expectError(error.ChannelStageScopeMismatch, foreign_channel.requireColdCancellation(scope));
+        try foreign_channel.requireReady();
+        try std.testing.expect(source.registered_channel_stage == channel);
+    }
+
+    try ManagedCoreFixture.releaseLeasedEventWorld(core, candidate);
+    world_held = false;
+    interrupted = true;
+    try std.testing.expectError(error.ExclusiveLockNotHeldByCaller, channel.requireReady());
+    world.lockWrite();
+    world_held = true;
+    const ordinary_refusal: anyerror = if (exhaustion) error.ExclusiveAcquisitionExhausted else error.ExclusiveAcquisitionChanged;
+    try std.testing.expectError(ordinary_refusal, channel.requireReady());
+    try std.testing.expectError(ordinary_refusal, candidate.commit());
+    try std.testing.expectError(ordinary_refusal, candidate.abort());
+    // The cold leaf selector cannot consume its Scope while the exact bound
+    // World stage is still active. Refusal precedes batch abort or retirement.
+    try std.testing.expectError(error.ChannelStageActive, core.cancelLeasedColdPreparation());
+    try std.testing.expectError(error.SourceBorrowed, core.discardLeasedCold());
+    try channel.requireOriginalWorld(world, source.creator, source.acquisition);
+    try std.testing.expect(b.leased_active_scope == source and !source.consumed);
+    try before.expectUnchanged(storage);
+    try channel.abortForColdCore(scope);
+    channel_retired = true;
+    try world.requireNoActiveRegisteredChannelStage();
+    try std.testing.expect(!world.channelExists("#source") and world.rcu_channels == null);
+    try std.testing.expectEqual(next_oid, world.next_oid);
+    try std.testing.expectError(error.ConsumedChannelStage, channel.requireReady());
+    try core.cancelLeasedColdPreparation();
+    candidate_consumed = true;
+    try std.testing.expect(source.consumed and b.leased_active_scope == null);
+    world.unlockWrite();
+    world_held = false;
+    try before.expectUnchanged(storage);
+    try ManagedCoreFixture.requireLeasedDirectCloseRefusal(core);
+    try std.testing.expectError(error.ConsumedPlan, candidate.commit());
+    try std.testing.expectError(error.ConsumedPlan, candidate.abort());
+    if (exhaustion) {
+        try std.testing.expect(world.lock.exclusive_generation_exhausted.load(.acquire));
+        try std.testing.expectError(error.ExclusiveAcquisitionExhausted, ManagedCoreFixture.prepareLeasedEvent(core, event, &.{}, 1000));
+    }
+    try before.expectUnchanged(storage);
+    try core.discardLeasedCold();
+    closed = true;
+    try before.expectUnchanged(storage);
+
+    const cold = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding);
+    defer cold.discardLeasedCold() catch @panic("channel source strict cold cleanup");
+    const cold_b = managedBacking(cold);
+    const recovered = try cold_b.leased_authority.?.observe();
+    try std.testing.expectEqualSlices(u8, &original.logical_store_id, &recovered.logical_store_id);
+    try std.testing.expectEqualSlices(u8, &original.logical_store_epoch, &recovered.logical_store_epoch);
+    try std.testing.expectEqual(original.generation + 1, recovered.generation);
+    try std.testing.expectEqual(original.poisoned, recovered.poisoned);
+    try std.testing.expectEqual(@as(u64, 0), recovered.max_accepted_hlc);
+    try std.testing.expectEqual(@as(usize, 0), recovered.pending_deliveries);
+    try std.testing.expectEqual(@as(usize, 0), cold_b.server.?.world.channelCount());
+}
+
+test "managed leased core: exact bound World channel stage fences event WAL and cold selector through real interruption and MAX exhaustion" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    try managedLeasedRegisteredChannelColdTest(false);
+    try managedLeasedRegisteredChannelColdTest(true);
+    try managedLeasedRegisteredChannelFirstTest();
+}
+
+fn managedLeasedRegisteredChannelFirstTest() !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try managedLeasedTestDirectory(temporary.dir);
+    var identity = try node_identity.fromSeed(@splat(0x5b), "leased-channel-first");
+    defer identity.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    const storage: delivery_authority.ProtectedStorage = .{ .dir = temporary.dir, .name = "channel-first.wal" };
+    const inputs = managedLeasedTestInputs(&identity, storage.name);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    const core = try ManagedCore.createLeasedCold(failing.allocator(), std.testing.io, inputs, .{ .mode = .provision, .storage = storage }, binding);
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        core.discardLeasedCold() catch |err| {
+            std.debug.print("stage-first Core cleanup: {s}\n", .{@errorName(err)});
+        };
+    }
+    const b = managedBacking(core);
+    const world = &b.server.?.world;
+    var before = try ManagedLeasedDiskTestCut.capture(storage);
+    defer before.deinit();
+    var public_key: crypto_sign.PublicKey = undefined;
+    var signature: crypto_sign.Signature = undefined;
+    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "stage-first admission", .message = "no funded event candidate" };
+    try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
+    var invalid = event;
+    invalid.origin_server = "foreign.core.test";
+    world.lockWrite();
+    var world_held = true;
+    defer if (world_held) world.unlockWrite();
+    const channel = try world.prepareRegisteredChannel("#first", true);
+    defer channel.abort();
+    const allocations = failing.alloc_index;
+    // Every armed point remains untouched: source refusal precedes Scope
+    // allocation, event validation/candidate construction and Loan entry.
+    for (0..8) |offset| {
+        failing.fail_index = allocations + offset;
+        try std.testing.expectError(error.ChannelStageActive, b.leased_authority.?.prepareEvent(invalid, &.{}, 1000, &b.owned_identity.?.sign_kp));
+        try std.testing.expectError(error.ChannelStageActive, b.leased_authority.?.prepareEvent(event, &.{}, 1000, &b.owned_identity.?.sign_kp));
+        var scratch: [1024]u8 = undefined;
+        try std.testing.expectError(error.ChannelStageActive, b.leased_loan.?.registerAccount("blocked", "source-password", &scratch));
+        try std.testing.expectEqual(allocations, failing.alloc_index);
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expect(b.leased_active_scope == null and b.leased_scope_tokens == null and b.leased_scope_count == 0);
+        try channel.requireReady();
+        try before.expectUnchanged(storage);
+    }
+    failing.fail_index = std.math.maxInt(usize);
+    channel.abort();
+    try world.requireNoActiveRegisteredChannelStage();
+    try std.testing.expectEqual(@as(usize, 0), world.channelCount());
+    world.unlockWrite();
+    world_held = false;
+    // This genuine original validation takes the private Services mutex and
+    // confirms no refused Loan/event call left transaction or entry custody.
+    try ManagedCoreFixture.requireLeasedDirectCloseRefusal(core);
+    try before.expectUnchanged(storage);
+}
+
+const ManagedStopTest = if (builtin.is_test) struct {
+    resolver: ?*rdns.Resolver = null,
+    core: ?*ManagedCore = null,
+    graph: ?reactor_pool_mod.runtime_start_gate.Created = null,
+    run: reactor_pool_mod.RunFlag = .init(true),
+    inline_thread: ?std.Thread = null,
+    inline_invocation: ?*ManagedInlineInvocation = null,
+    inline_custody: ?*ManagedInlineCustody = null,
+    inline_error: ?anyerror = null,
+
+    fn init(self: *@This(), shards: u16, fail_spawn: ?usize) !void {
+        return self.initWithMedia(shards, fail_spawn, false);
+    }
+    fn initWithMedia(self: *@This(), shards: u16, fail_spawn: ?usize, media: bool) !void {
+        return self.initWithInputs(.{
+            .config = .{ .host = "127.0.0.1", .port = 0, .num_shards = shards, .max_clients = 16, .webhook_enabled = true, .crypto_io = std.testing.io, .media_enabled = media, .media_port = 0, .native_media_port = 0, .media_dtls_srtp = false, .media_dtls13 = false },
+            .parsed = .{},
+        }, fail_spawn);
+    }
+    fn initWithInputs(self: *@This(), inputs: ManagedCoreInputs, fail_spawn: ?usize) !void {
+        const a = std.testing.allocator;
+        self.* = .{};
+        errdefer self.deinit() catch |cleanup_error| {
+            std.debug.print("managed core fixture cleanup after init failure: {s}\n", .{@errorName(cleanup_error)});
+        };
+        const resolver = try a.create(rdns.Resolver);
+        errdefer if (self.resolver == null) a.destroy(resolver);
+        resolver.* = try rdns.Resolver.initConfigured(a, std.testing.io, .{});
+        self.resolver = resolver;
+        self.core = try ManagedCore.createCold(a, std.testing.io, inputs, .{ .rdns = resolver, .dnsbl = null, .mail = null, .webpush = null });
+        try self.core.?.prepareColdResources(&self.run);
+        self.graph = try self.core.?.createGraphControl(a, null);
+        if (fail_spawn) |index| reactor_pool_mod.runtime_start_gate.Fixture.failSpawn(self.graph.?.control, index);
+        try self.core.?.prepareWorkers(self.graph.?.control, self.graph.?.view);
+        try self.graph.?.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(5000) }));
+        try self.core.?.requirePrepared();
+    }
+    fn publish(self: *@This()) void {
+        self.core.?.publishPrepared(self.graph.?.control, self.graph.?.view);
+        self.graph.?.control.releaseAll();
+    }
+    fn inlineMain(self: *@This()) void {
+        self.inline_invocation.?.run() catch |err| {
+            self.inline_error = err;
+        };
+    }
+    fn awaitActivated(self: *@This()) !void {
+        const deadline = platform.monotonicMillis() + 5000;
+        while (true) {
+            self.core.?.requireActivated() catch {
+                if (platform.monotonicMillis() >= deadline) return error.TestActivationTimeout;
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+                continue;
+            };
+            return;
+        }
+    }
+    fn deinit(self: *@This()) !void {
+        const deadline = managedStopTestDeadline();
+        if (self.graph) |graph| {
+            if (graph.view.inspect().phase != .released) graph.control.cancelAllAndJoin() else if (managedBacking(self.core.?).phase != .detached) {
+                try self.core.?.requestProducerStopAndWake(graph.control);
+                try self.core.?.joinProducers(graph.control, deadline);
+                const deadline_ms = try checkedMonotonicDeadlineMillis(5000);
+                try self.core.?.requestReactorStopAndWake(graph.control, deadline_ms);
+                try graph.control.joinAllUntil(deadline);
+            }
+            if (self.inline_thread) |thread| {
+                while (!managedBacking(self.core.?).inline_invocation.returned.load(.acquire)) {
+                    if (std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(std.testing.io, .awake), .gte, deadline)) return error.Timeout;
+                    try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+                }
+                thread.join();
+                self.inline_thread = null;
+            }
+            if (self.inline_custody) |custody| {
+                if (managedBacking(self.core.?).inline_invocation.returned.load(.acquire)) try custody.releaseAfterReturn() else try custody.cancelUncalled();
+                self.inline_custody = null;
+                self.inline_invocation = null;
+            }
+            try self.core.?.detachAfterJoined();
+            if (graph.view.inspect().phase == .released) try self.core.?.finishStoppedRetirement(deadline);
+        }
+        if (self.core) |core| core.destroyDetached();
+        if (self.resolver) |resolver| {
+            resolver.deinit();
+            std.testing.allocator.destroy(resolver);
+        }
+        if (self.graph) |graph| graph.control.destroyJoined();
+        self.core = null;
+        self.resolver = null;
+        self.graph = null;
+    }
+} else struct {};
+
+test "managed core: original policy and install seals normalize before actual Services and live IRC" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, temporary.dir, "core-policy.wal");
+    defer store.deinit();
+    var identity = try node_identity.fromSeed(@splat(0x32), "core-policy");
+    defer identity.deinit();
+    var fixture: ManagedStopTest = .{};
+    try fixture.initWithInputs(.{
+        .config = .{ .host = "127.0.0.1", .port = 0, .num_shards = 2, .max_clients = 16, .server_name = "", .node_id = 999, .node_identity = &identity, .sasl_enabled = true, .crypto_io = std.testing.io },
+        .parsed = .{ .sasl = .{ .enabled = true, .account_db = "core-policy.wal" } },
+        .accounts = .{ .store = &store },
+    }, null);
+    defer fixture.deinit() catch |err| std.debug.panic("core policy fixture cleanup: {s}", .{@errorName(err)});
+    const b = managedBacking(fixture.core.?);
+    try std.testing.expectEqual(identity.shortId(), b.server.?.config.node_id);
+    try std.testing.expectEqualStrings(server_name, b.server.?.serverName());
+    try std.testing.expect(!disabledFeaturePresent(b.server.?.config.disabled_features, "accounts"));
+    try std.testing.expect(disabledFeaturePresent(b.server.?.config.disabled_features, "webhook"));
+
+    const original_graph = fixture.graph.?.view.inspect();
+    const original_rounds = b.parsed.accounts.pbkdf2_rounds;
+    b.parsed.accounts.pbkdf2_rounds += 1;
+    var restored = false;
+    defer if (!restored) {
+        b.parsed.accounts.pbkdf2_rounds = original_rounds;
+    };
+    try std.testing.expectError(error.ConfiguredOwnerMismatch, fixture.core.?.requirePrepared());
+    try std.testing.expect(std.meta.eql(original_graph, fixture.graph.?.view.inspect()));
+    b.parsed.accounts.pbkdf2_rounds = original_rounds;
+    restored = true;
+    try fixture.core.?.requirePrepared();
+
+    // A distinct genuine Core's install record must not authorize this graph,
+    // even when the original runtime policy and source bindings are unchanged.
+    var other: ManagedStopTest = .{};
+    try other.init(2, null);
+    defer other.deinit() catch |err| std.debug.panic("foreign core fixture cleanup: {s}", .{@errorName(err)});
+    const original_install = b.install_seal;
+    b.install_seal = managedBacking(other.core.?).install_seal;
+    var install_restored = false;
+    defer if (!install_restored) {
+        b.install_seal = original_install;
+    };
+    try std.testing.expectError(error.ConfiguredOwnerMismatch, fixture.core.?.requirePrepared());
+    try std.testing.expect(std.meta.eql(original_graph, fixture.graph.?.view.inspect()));
+    b.install_seal = original_install;
+    install_restored = true;
+    try fixture.core.?.requirePrepared();
+
+    fixture.publish();
+    try fixture.awaitActivated();
+    const fd = try connectLoopback((try fixture.core.?.observe()).bound_port);
+    defer closeFd(fd);
+    var client: LiveClient = .{ .fd = fd };
+    try writeAllFd(fd, "NICK PolicyProof\r\nUSER policy 0 * :Policy proof\r\n");
+    try recvUntil(&client, " 001 PolicyProof ", 200);
+    try expectContains(client.written(), ":onyx.local 001 PolicyProof ");
+    client.reset();
+    try writeAllFd(fd, "PING :original-policy-live\r\n");
+    try recvUntil(&client, "original-policy-live", 200);
+    try expectContains(client.written(), "PONG");
+}
+
+test "managed core: inconsistent actual full key refuses before occupied listener acquisition" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const listener = try bindLoopback(true);
+    defer closeFd(listener.fd);
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    var identity = try node_identity.fromSeed(@splat(0x41), "core-key-proof");
+    defer identity.deinit();
+    const original_node = identity.node_id;
+    identity.node_id[0] ^= 1;
+    const input: ManagedCoreInputs = .{
+        .config = .{ .host = "127.0.0.1", .port = listener.port, .max_clients = 16, .node_identity = &identity, .crypto_io = std.testing.io },
+        .parsed = .{},
+    };
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    try std.testing.expectError(error.InvalidManagedIdentity, ManagedCore.createCold(std.testing.allocator, std.testing.io, input, binding));
+    identity.node_id = original_node;
+    var unrelated = try node_identity.fromSeed(@splat(0x42), "core-key-proof");
+    defer unrelated.deinit();
+    // The cached ID agrees with the substituted public key; only proof using
+    // the actual retained secret detects this inconsistent key pair.
+    identity.sign_kp.public_key = unrelated.sign_kp.public_key;
+    identity.node_id = unrelated.node_id;
+    try std.testing.expectError(error.InvalidManagedIdentity, ManagedCore.createCold(std.testing.allocator, std.testing.io, input, binding));
+    try std.testing.expect(os_runtime.fdValid(listener.fd));
+    try std.testing.expectEqual(listener.port, try socketPort(listener.fd));
+}
+
+fn managedPolicyAllocationCampaign(allocator: std.mem.Allocator, resolver: *rdns.Resolver, store: *services_mod.OroStore, identity: *const node_identity.NodeIdentity) !void {
+    const core = try ManagedCore.createCold(allocator, std.testing.io, .{
+        .config = .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .server_name = "", .node_identity = identity, .sasl_enabled = true, .crypto_io = std.testing.io },
+        .parsed = .{ .sasl = .{ .enabled = true, .account_db = "core-policy-oom.wal" } },
+        .accounts = .{ .store = store },
+    }, .{ .rdns = resolver, .dnsbl = null, .mail = null, .webpush = null });
+    defer core.destroyDetached();
+    const b = managedBacking(core);
+    try b.install_seal.?.requireOriginal(b);
+    try std.testing.expect(!disabledFeaturePresent(b.server.?.config.disabled_features, "accounts"));
+}
+
+test "managed core: actual policy normalization and install construction unwind every allocation failure" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, temporary.dir, "core-policy-oom.wal");
+    defer store.deinit();
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    var identity = try node_identity.fromSeed(@splat(0x43), "core-policy-oom");
+    defer identity.deinit();
+    const public_key = identity.sign_kp.public_key;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, managedPolicyAllocationCampaign, .{ &resolver, &store, &identity });
+    try std.testing.expectEqualSlices(u8, &public_key, &identity.sign_kp.public_key);
+    const retry = try ManagedCore.createCold(std.testing.allocator, std.testing.io, .{
+        .config = .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .node_identity = &identity, .sasl_enabled = true, .crypto_io = std.testing.io },
+        .parsed = .{ .sasl = .{ .enabled = true, .account_db = "core-policy-oom.wal" } },
+        .accounts = .{ .store = &store },
+    }, .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null });
+    retry.destroyDetached();
+}
+
+test "managed core: ordered stop joins actual producers while real IRC reactors still serve" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var fixture: ManagedStopTest = .{};
+    try fixture.init(2, null);
+    errdefer fixture.deinit() catch |cleanup_error| {
+        // Preserve the original assertion/error; cleanup must not replace it
+        // with a panic. Failed custody remains intact and leak-visible.
+        std.debug.print("managed core fixture cleanup after test failure: {s}\n", .{@errorName(cleanup_error)});
+    };
+    const graph = fixture.graph.?;
+    const gate = reactor_pool_mod.runtime_start_gate;
+    const foreign = try gate.create(std.testing.allocator, std.testing.io, &.{});
+    defer foreign.control.destroyJoined();
+    foreign.control.releaseAll();
+    fixture.publish();
+    try fixture.awaitActivated();
+    const before = graph.view.inspect();
+    try std.testing.expectError(error.InvalidGate, fixture.core.?.requestProducerStopAndWake(foreign.control));
+    try fixture.core.?.requireActivated();
+    try std.testing.expect(std.meta.eql(before, graph.view.inspect()));
+    try std.testing.expectError(error.ProducersNotJoined, fixture.core.?.requestReactorStopAndWake(graph.control, try checkedMonotonicDeadlineMillis(0)));
+    try std.testing.expect(fixture.run.load(.acquire));
+    const fd = try connectLoopback((try fixture.core.?.observe()).bound_port);
+    defer closeFd(fd);
+    var client: LiveClient = .{ .fd = fd };
+    try writeAllFd(fd, "NICK StopProof\r\nUSER stop 0 * :Stop proof\r\n");
+    try recvUntil(&client, " 001 StopProof ", 200);
+    try fixture.core.?.requestProducerStopAndWake(graph.control);
+    try fixture.core.?.joinProducers(graph.control, managedStopTestDeadline());
+    const joined = graph.view.inspect();
+    try std.testing.expectEqual(@as(usize, 1), joined.joined);
+    try std.testing.expect(fixture.run.load(.acquire));
+    try std.testing.expectError(error.NotPublished, fixture.core.?.requireActivated());
+    try fixture.core.?.requestProducerStopAndWake(graph.control);
+    try fixture.core.?.joinProducers(graph.control, managedStopTestDeadline());
+    try std.testing.expectEqual(joined.joined, graph.view.inspect().joined);
+    client.reset();
+    try writeAllFd(fd, "PING :after-real-producer-join\r\n");
+    try recvUntil(&client, "after-real-producer-join", 200);
+    try expectContains(client.written(), "PONG");
+    try fixture.deinit();
+}
+
+test "managed core: ordered stop owns actual inline invocation until exit and rejects late entry" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var fixture: ManagedStopTest = .{};
+    try fixture.init(1, null);
+    errdefer fixture.deinit() catch |cleanup_error| {
+        // Preserve the original assertion/error; cleanup must not replace it
+        // with a panic. Failed custody remains intact and leak-visible.
+        std.debug.print("managed core fixture cleanup after test failure: {s}\n", .{@errorName(cleanup_error)});
+    };
+    const reservation = try fixture.core.?.reserveInlineInvocation();
+    fixture.inline_invocation = reservation.invocation;
+    fixture.inline_custody = reservation.custody;
+    try std.testing.expectError(error.InlineAlreadyReserved, fixture.core.?.reserveInlineInvocation());
+    fixture.publish();
+    fixture.inline_thread = try std.Thread.spawn(.{}, ManagedStopTest.inlineMain, .{&fixture});
+    try fixture.awaitActivated();
+    try std.testing.expectError(error.InlineAlreadyEntered, fixture.inline_invocation.?.run());
+    const graph = fixture.graph.?;
+    try fixture.core.?.requestProducerStopAndWake(graph.control);
+    try fixture.core.?.joinProducers(graph.control, managedStopTestDeadline());
+    try std.testing.expect(fixture.run.load(.acquire));
+    try std.testing.expectEqual(ManagedInlineExecution.running, managedBacking(fixture.core.?).inline_execution.load(.acquire));
+    try std.testing.expectError(error.InlineInvocationBorrowed, fixture.core.?.detachAfterJoined());
+    try fixture.core.?.requestReactorStopAndWake(graph.control, try checkedMonotonicDeadlineMillis(5000));
+    graph.control.joinAll();
+    fixture.inline_thread.?.join();
+    fixture.inline_thread = null;
+    try std.testing.expect(fixture.inline_error == null);
+    try std.testing.expectEqual(ManagedInlineExecution.exited, managedBacking(fixture.core.?).inline_execution.load(.acquire));
+    try std.testing.expectError(error.InlineInvocationBorrowed, fixture.core.?.detachAfterJoined());
+    try fixture.inline_custody.?.releaseAfterReturn();
+    fixture.inline_custody = null;
+    fixture.inline_invocation = null;
+    try std.testing.expectError(error.NotPrepared, fixture.core.?.reserveInlineInvocation());
+    try fixture.deinit();
+}
+
+test "managed core: rejected late inline invocation retains custody through its actual caller join" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var fixture: ManagedStopTest = .{};
+    try fixture.init(1, null);
+    errdefer fixture.deinit() catch |cleanup_error| {
+        // Preserve the original assertion/error; cleanup must not replace it
+        // with a panic. Failed custody remains intact and leak-visible.
+        std.debug.print("managed core fixture cleanup after test failure: {s}\n", .{@errorName(cleanup_error)});
+    };
+    const reservation = try fixture.core.?.reserveInlineInvocation();
+    fixture.inline_invocation = reservation.invocation;
+    fixture.inline_custody = reservation.custody;
+    fixture.publish();
+    const graph = fixture.graph.?;
+    try fixture.core.?.requestProducerStopAndWake(graph.control);
+    try fixture.core.?.joinProducers(graph.control, managedStopTestDeadline());
+    try fixture.core.?.requestReactorStopAndWake(graph.control, try checkedMonotonicDeadlineMillis(5000));
+    graph.control.joinAll();
+    try std.testing.expectError(error.InlineInvocationBorrowed, fixture.core.?.detachAfterJoined());
+    fixture.inline_thread = try std.Thread.spawn(.{}, ManagedStopTest.inlineMain, .{&fixture});
+    fixture.inline_thread.?.join();
+    fixture.inline_thread = null;
+    try std.testing.expectEqual(error.InlineClosedBeforeEntry, fixture.inline_error.?);
+    try std.testing.expectError(error.InlineInvocationBorrowed, fixture.core.?.detachAfterJoined());
+    try fixture.inline_custody.?.releaseAfterReturn();
+    fixture.inline_custody = null;
+    fixture.inline_invocation = null;
+    try fixture.deinit();
+}
+
+test "managed core: actual second-spawn cancellation unwinds every fixture source and handle" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var fixture: ManagedStopTest = .{};
+    try std.testing.expectError(error.SystemResources, fixture.init(2, 1));
+    try std.testing.expect(fixture.core == null and fixture.graph == null and fixture.resolver == null);
+}
+
+test "managed core: prepared media retains original callbacks Domain registrations and funded FIFO" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var fixture: ManagedStopTest = .{};
+    try fixture.initWithMedia(2, null, true);
+    errdefer fixture.deinit() catch |cleanup_error| {
+        std.debug.print("managed core media fixture cleanup after test failure: {s}\n", .{@errorName(cleanup_error)});
+    };
+    try fixture.core.?.requirePrepared();
+    const before = fixture.graph.?.view.inspect();
+    for ([_]ManagedCoreFixture.Tamper{
+        .native_cross,         .media_cross,           .native_routing_domain, .native_routing_binding,
+        .media_routing_domain, .media_routing_binding, .media_routing_fifo,
+    }) |kind| {
+        try ManagedCoreFixture.tamper(fixture.core.?, kind, true);
+        var restored = false;
+        defer if (!restored) ManagedCoreFixture.tamper(fixture.core.?, kind, false) catch {};
+        try std.testing.expectError(error.ConfiguredOwnerMismatch, fixture.core.?.requirePrepared());
+        try ManagedCoreFixture.tamper(fixture.core.?, kind, false);
+        restored = true;
+        try fixture.core.?.requirePrepared();
+        try std.testing.expect(std.meta.eql(before, fixture.graph.?.view.inspect()));
+    }
+    try fixture.deinit();
+}
+
+fn managedCreateChannel(ptr: *anyopaque, channel: []const u8) services_mod.ServiceError!void {
+    const context: *ManagedServicesContextBacking = @ptrCast(@alignCast(ptr));
+    try context.core.server.?.markChannelRegistered(channel, true);
+}
+fn managedDropChannel(ptr: *anyopaque, channel: []const u8) services_mod.ServiceError!void {
+    const context: *ManagedServicesContextBacking = @ptrCast(@alignCast(ptr));
+    try context.core.server.?.markChannelRegistered(channel, false);
+}
+fn destroyManagedCoreBacking(b: *ManagedCoreBacking) void {
+    // No wrapper/companion can still borrow these objects. Constructor errors
+    // are pre-spawn; prepared errors first cancel/join/detach in Runtime.
+    if (b.acme) |owner| {
+        owner.stop();
+        std.crypto.secureZero(u8, std.mem.asBytes(owner));
+        b.allocator.destroy(owner);
+        b.acme = null;
+    }
+    if (b.ocsp) |owner| {
+        owner.stop();
+        std.crypto.secureZero(u8, std.mem.asBytes(owner));
+        b.allocator.destroy(owner);
+        b.ocsp = null;
+    }
+    if (b.services) |*services| services.state = null;
+    // Drop the actual leaf registration and loans before original World
+    // destruction. This closed branch cannot have entered a runtime graph.
+    releaseManagedLeasedSources(b) catch |err| std.debug.panic("managed leased source cleanup: {s}", .{@errorName(err)});
+    std.debug.assert(b.leased_active_scope == null);
+    var scope = b.leased_scope_tokens;
+    while (scope) |source| {
+        scope = source.next;
+        std.debug.assert(source.consumed);
+        b.allocator.destroy(source);
+    }
+    b.leased_scope_tokens = null;
+    if (b.server) |server| {
+        server.deinit();
+        std.crypto.secureZero(u8, std.mem.asBytes(server));
+        b.allocator.destroy(server);
+        b.server = null;
+    }
+    if (b.ocg2_observer) |owner| ocg2_runtime_mod.destroy(owner);
+    if (b.ocg2_projection) |owner| owner.deinit();
+    if (b.ocg2_audit) |*owner| owner.deinit();
+    if (b.scram) |*owner| owner.deinit();
+    if (b.certfp_binds) |*owner| owner.deinit();
+    if (b.transparency) |*owner| owner.deinit();
+    if (b.owned_identity) |identity| {
+        identity.deinit();
+        b.owned_identity = null;
+    }
+    b.policy.deinit();
+}
+
 pub const Server = if (builtin.os.tag == .linux or builtin.os.tag == .openbsd) LinuxServer else PortableServer;
 
 const PortableChan = struct {
@@ -56620,6 +60706,1275 @@ fn emitLabeledIssuer(
     return LinuxServer.appendHistoryReplay(conn, sink.written());
 }
 
+/// The same labeled-response renderer used by dispatch, before any authority or
+/// output publication. Owned final bytes are wiped after preparation/abort; the
+/// bounded capture must never turn overflow into a successful media reply.
+fn prepareMediaIssuerBytes(allocator: std.mem.Allocator, capture: *const ReplyCapture, label: ?[]const u8) ![]u8 {
+    if (capture.overflowed) return error.OutputTooSmall;
+    const selected = label orelse return allocator.dupe(u8, capture.captured());
+    const lines = std.mem.count(u8, capture.captured(), "\n");
+    const slack = std.math.mul(usize, lines + 3, 256) catch return error.OutputTooSmall;
+    const capacity = std.math.add(usize, capture.captured().len, slack) catch return error.OutputTooSmall;
+    const storage = try allocator.alloc(u8, @max(capacity, default_reply_bytes));
+    defer {
+        std.crypto.secureZero(u8, storage);
+        allocator.free(storage);
+    }
+    var sink = FrameBufSink{ .buf = storage };
+    const existing_batch = try emitLabeledApplicableHistoryBatch(&sink, selected, capture.captured());
+    if (!existing_batch) {
+        var it = CrlfReplyIterator{ .bytes = capture.captured() };
+        try labeled_response.emitIterator(&sink, selected, labeled_batch_ref, &it);
+    }
+    return allocator.dupe(u8, sink.written());
+}
+
+/// Source-private, one physical owner turn. Preparation owns the final labeled
+/// IRC bytes and WS frames before TLS/deferred/kernel queue admission. Endpoint
+/// candidates are validated separately; this plan cannot publish media authority.
+const PreparedMediaOutput = struct {
+    server: *LinuxServer,
+    id: client_model.ClientId,
+    conn: *ConnState,
+    adapter: *tls_conn.TlsConn,
+    allocator: std.mem.Allocator,
+    channel: [128]u8 = @splat(0),
+    channel_len: usize,
+    plaintext: []u8,
+    raw_chunk: [1][]const u8,
+    framed: ?ws_output.Prepared,
+    snapshot: Snapshot,
+    newly_funded_control: bool,
+    done: bool = false,
+    custody: union(enum) {
+        software: struct {
+            write: tls_conn.TlsConn.PreparedWrite,
+            queue: sendq.PreparedAppend(*ConnState),
+        },
+        kernel: sendq.PreparedAppend(*ConnState),
+        deferred: sendq.PreparedDeferred(*ConnState),
+    },
+
+    const Snapshot = struct {
+        fd: linux.fd_t,
+        token: RingFdToken,
+        send_len: usize,
+        send_offset: usize,
+        send_overflow_len: usize,
+        send_overflow_ptr: usize,
+        send_overflow_capacity: usize,
+        sendq_cap: usize,
+        send_armed: bool,
+        submitted_len: usize,
+        submitted_offset: usize,
+        deferred_len: usize,
+        deferred_ptr: usize,
+        deferred_capacity: usize,
+        deferred_charge: usize,
+        control_charge: usize,
+        kernel_prefix: u64,
+        overflow_allocator: std.mem.Allocator,
+        ws: ?*WsState,
+        tx_offloaded: bool,
+        rx_offloaded: bool,
+        version: ?tls_conn.Version,
+        read_sequence: u64,
+        write_sequence: u64,
+        control_phase: tls_conn.ControlBarrierPhase,
+        held_len: u32,
+        reply_pending: bool,
+        reply_sent: u8,
+        open_control: u8,
+        alert_prefix_len: u8,
+        alert_prefix_byte: u8,
+
+        fn capture(c: *const ConnState, t: *const tls_conn.TlsConn) Snapshot {
+            return .{
+                .fd = c.fd,
+                .token = c.token,
+                .send_len = c.send_len,
+                .send_offset = c.send_offset,
+                .send_overflow_len = c.send_overflow.items.len,
+                .send_overflow_ptr = @intFromPtr(c.send_overflow.items.ptr),
+                .send_overflow_capacity = c.send_overflow.capacity,
+                .sendq_cap = c.sendq_cap,
+                .send_armed = c.send_armed,
+                .submitted_len = c.send_submitted_len,
+                .submitted_offset = c.send_submitted_offset,
+                .deferred_len = c.tls_deferred_plain.items.len,
+                .deferred_ptr = @intFromPtr(c.tls_deferred_plain.items.ptr),
+                .deferred_capacity = c.tls_deferred_plain.capacity,
+                .deferred_charge = c.tls_deferred_charge,
+                .control_charge = c.tls_control_charge,
+                .kernel_prefix = c.tls_kernel_prefix_remaining,
+                .overflow_allocator = c.overflow_allocator,
+                .ws = c.ws,
+                .tx_offloaded = c.tls_tx_offloaded,
+                .rx_offloaded = c.tls_rx_offloaded,
+                .version = t.negotiatedVersion(),
+                .read_sequence = switch (t.engine) {
+                    inline .tls12, .tls13 => |*s| s.app_read_seq,
+                    .undecided => 0,
+                },
+                .write_sequence = switch (t.engine) {
+                    inline .tls12, .tls13 => |*s| s.app_write_seq,
+                    .undecided => 0,
+                },
+                .control_phase = t.control_phase,
+                .held_len = t.held_record_len,
+                .reply_pending = t.tx_ku_reply_pending,
+                .reply_sent = t.tx_ku_reply_sent,
+                .open_control = t.rx_open_control_type,
+                .alert_prefix_len = t.alert_prefix_len,
+                .alert_prefix_byte = t.alert_prefix_byte,
+            };
+        }
+    };
+
+    fn requireCaller(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8) !*tls_conn.TlsConn {
+        try server.requireMediaCaller(id, conn, channel);
+        if (conn.fd < 0) return error.BadState;
+        const t = conn.tls orelse return error.BadState;
+        if (!t.handshakeDone() or t.terminal_error != null or t.control_turn_active or
+            t.unpublished.items.len != 0 or conn.tls_tx_offloaded != t.ktls_tx_offloaded or
+            conn.tls_rx_offloaded != t.ktls_rx_offloaded) return error.BadState;
+        if (conn.ws) |ws| if (ws.phase != .open) return error.BadState;
+        return t;
+    }
+
+    fn prepare(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, final_plaintext: []const u8) !PreparedMediaOutput {
+        const t = try requireCaller(server, id, conn, channel);
+        if (channel.len > 128 or final_plaintext.len == 0 or !std.mem.endsWith(u8, final_plaintext, "\r\n") or
+            t.hasPreparedWrite()) return error.BadState;
+        // Backend observation is outside the final routing cut. The original
+        // owner retains this exact fd/adapter turn through publication. Kernel
+        // sequence may advance under an armed SEND; its key epoch may not.
+        if (conn.tls_tx_offloaded) {
+            try t.validateKernelTxEpoch(conn.fd);
+            try tls_conn.validateKernelTxPrefix(true, t.control_phase, t.tx_ku_reply_pending, @intCast(conn.tls_control_charge), conn.tls_kernel_prefix_remaining, sendq.wireBacklog(conn));
+        }
+        const allocator = server.allocator;
+        const plaintext = try allocator.dupe(u8, final_plaintext);
+        errdefer {
+            std.crypto.secureZero(u8, plaintext);
+            allocator.free(plaintext);
+        }
+        var framed: ?ws_output.Prepared = null;
+        errdefer if (framed) |*frames| {
+            std.crypto.secureZero(u8, frames.initial);
+            std.crypto.secureZero(u8, frames.wire.items);
+            std.crypto.secureZero(u8, frames.suffix.items);
+            frames.deinit();
+        };
+        if (conn.ws) |ws| {
+            const backlog = sendq.backlog(conn);
+            if (backlog > conn.sendq_cap) return error.OutputTooSmall;
+            framed = try ws_output.prepareSensitive(WsState.max_frame, conn.overflow_allocator, ws.tx_buf[0..ws.tx_len], &.{plaintext}, ws.tx_buf.len, conn.sendq_cap - @as(usize, @intCast(backlog)));
+            if (framed.?.tail().len != 0 or framed.?.frameChunks().len == 0) return error.BadState;
+        }
+        const plaintext_chunks: []const []const u8 = if (framed) |*frames| frames.frameChunks() else &.{plaintext};
+        const wire_plaintext = if (framed) |*frames| frames.bytes() else plaintext;
+        const holding = t.control_phase == .userspace_requested_ku_held or t.control_phase == .kernel_control_read_held;
+        var funded = false;
+        errdefer if (funded) sendq.cancelControlReservation(conn);
+        const custody: @FieldType(PreparedMediaOutput, "custody") = if (conn.tls_tx_offloaded) blk: {
+            if (holding and conn.tls_control_charge == 0) {
+                var credit = try sendq.prepareControlReservation(conn, 5);
+                credit.commit();
+                funded = true;
+            }
+            break :blk .{ .kernel = try sendq.prepareAppend(conn, wire_plaintext.len) };
+        } else if (t.applicationOutputDeferred() or conn.tls_deferred_plain.items.len != 0) blk: {
+            const charge = try t.applicationWireCharge(plaintext_chunks);
+            if (holding and conn.tls_control_charge == 0 and charge != 0) {
+                var credit = try sendq.prepareControlReservation(conn, 27);
+                credit.commit();
+                funded = true;
+            }
+            break :blk .{ .deferred = try sendq.prepareDeferredAppend(conn, plaintext_chunks, charge) };
+        } else blk: {
+            var write = try t.prepareWriteBatch(plaintext_chunks);
+            errdefer write.deinit();
+            break :blk .{ .software = .{ .write = write, .queue = try sendq.prepareAppend(conn, write.bytes().len) } };
+        };
+        var result: PreparedMediaOutput = .{
+            .server = server,
+            .id = id,
+            .conn = conn,
+            .adapter = t,
+            .allocator = allocator,
+            .channel_len = channel.len,
+            .plaintext = plaintext,
+            .raw_chunk = .{plaintext},
+            .framed = framed,
+            .snapshot = Snapshot.capture(conn, t),
+            .newly_funded_control = funded,
+            .custody = custody,
+        };
+        @memcpy(result.channel[0..channel.len], channel);
+        return result;
+    }
+
+    /// Pure revalidation inside the final Domain cut; no getters, allocations,
+    /// arming, callbacks or destructor. The enclosing command holds World and
+    /// the same original connection owner turn throughout prepare/validate/commit.
+    fn validate(self: *const PreparedMediaOutput) !void {
+        if (self.done or try requireCaller(self.server, self.id, self.conn, self.channel[0..self.channel_len]) != self.adapter or
+            !std.meta.eql(self.snapshot, Snapshot.capture(self.conn, self.adapter))) return error.BadState;
+        if (self.framed) |*frames| {
+            const ws = self.conn.ws orelse return error.BadState;
+            if (ws.tx_len != frames.initial.len or !std.mem.eql(u8, ws.tx_buf[0..ws.tx_len], frames.initial)) return error.BadState;
+        }
+        switch (self.custody) {
+            .software => |*prepared| if (!prepared.write.canCommit()) return error.BadState,
+            .kernel => {
+                if (self.adapter.hasPreparedWrite()) return error.BadState;
+                try tls_conn.validateKernelTxPrefix(true, self.adapter.control_phase, self.adapter.tx_ku_reply_pending, @intCast(self.conn.tls_control_charge), self.conn.tls_kernel_prefix_remaining, sendq.wireBacklog(self.conn));
+            },
+            .deferred => |*prepared| {
+                if (self.adapter.hasPreparedWrite() or try self.adapter.applicationWireCharge(self.chunks()) != prepared.charge) return error.BadState;
+            },
+        }
+    }
+
+    fn chunks(self: *const PreparedMediaOutput) []const []const u8 {
+        return if (self.framed) |*frames| frames.frameChunks() else &self.raw_chunk;
+    }
+
+    /// Caller has validated every endpoint/profile/JOIN/output plan under ONE
+    /// cut. All accepted storage publication is pure; retirement is deferred.
+    fn commit(self: *PreparedMediaOutput) void {
+        self.validate() catch unreachable;
+        switch (self.custody) {
+            .software => |*prepared| {
+                prepared.queue.commit(prepared.write.bytes());
+                prepared.write.commit();
+            },
+            .kernel => |*queue| queue.commit(if (self.framed) |*frames| frames.bytes() else self.plaintext),
+            .deferred => |*retained| retained.commitRetainingMetadata(self.chunks()),
+        }
+        if (self.framed) |*frames| frames.commitTail(self.conn.ws.?);
+        self.done = true;
+    }
+
+    /// Outside Domain, while source lifetimes still hold. Abort cancels only
+    /// this unadmitted speculative credit; previously admitted obligations stay.
+    fn deinit(self: *PreparedMediaOutput) void {
+        switch (self.custody) {
+            .software => |*prepared| {
+                if (!self.done) prepared.queue.abort();
+                prepared.write.deinit();
+            },
+            .kernel => |*queue| if (!self.done) queue.abort(),
+            .deferred => |*retained| retained.deinit(),
+        }
+        if (!self.done and self.newly_funded_control) sendq.cancelControlReservation(self.conn);
+        if (self.framed) |*frames| {
+            std.crypto.secureZero(u8, frames.initial);
+            std.crypto.secureZero(u8, frames.wire.items);
+            std.crypto.secureZero(u8, frames.suffix.items);
+            frames.deinit();
+        }
+        std.crypto.secureZero(u8, self.plaintext);
+        self.allocator.free(self.plaintext);
+        self.* = undefined;
+    }
+};
+
+/// One private command-owned value constructs every agreed transport candidate
+/// and the separate caller-offered Room capability profile. It is data, never
+/// an endpoint, protected-output or source readiness receipt. World and the
+/// original ConnState owner remain held through all preparation/publication.
+const PreparedMediaNegotiation = struct {
+    server: *LinuxServer,
+    id: client_model.ClientId,
+    conn: *ConnState,
+    action: Action,
+    channel: [128]u8 = @splat(0),
+    channel_len: usize,
+    offered: media_room.CallProfile,
+    agreed: media_room.CallProfile,
+    shared_before: ?media_room.CallProfile,
+    expected_fp: ?[dtls_peer_verify_mod.digest_len]u8,
+    wants_webrtc: bool,
+    ws: ?*WsState,
+    tx_denied: bool,
+    media_enabled: bool,
+    dtls_enabled: bool,
+    ws_relay: bool,
+    fallback_host: [255]u8 = @splat(0),
+    fallback_host_len: usize,
+
+    const Action = enum { offer, answer };
+
+    /// CallProfile intentionally leaves unused codec tails uninitialized. Only
+    /// semantic initialized values participate in the captured source relation.
+    fn sameProfile(a: media_room.CallProfile, b: media_room.CallProfile) bool {
+        return a.eql(b);
+    }
+
+    fn sameOptionalProfile(a: ?media_room.CallProfile, b: ?media_room.CallProfile) bool {
+        if ((a == null) != (b == null)) return false;
+        return if (a) |first| sameProfile(first, b.?) else true;
+    }
+
+    fn copyProfile(codecs: []const sdp.Codec, fec: sdp.Fec) !media_room.CallProfile {
+        if (codecs.len == 0 or codecs.len > media_room.max_profile_codecs) return error.NoCommonCodec;
+        var result: media_room.CallProfile = .{ .fec = fec, .codec_count = @intCast(codecs.len) };
+        @memcpy(result.codecs[0..codecs.len], codecs);
+        return result;
+    }
+
+    fn prepare(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, action: Action, codec_csv: []const u8, extra_args: []const []const u8) !PreparedMediaNegotiation {
+        try server.requireMediaCaller(id, conn, channel);
+        if (channel.len == 0 or channel.len > 128) return error.BadState;
+        const host = server.config.media_host;
+        if (host.len == 0 or host.len > 255 or std.mem.indexOfAny(u8, host, "\r\n\x00") != null) return error.BadState;
+        var offered_storage: [media_room.max_profile_codecs]sdp.Codec = undefined;
+        const offered_count = LinuxServer.parseCodecCsv(&offered_storage, codec_csv);
+        if (offered_count == 0) return error.NoCodecs;
+        const offered_fec: sdp.Fec = .{ .scheme = .rs_block, .redundancy = 1 };
+        const offered = try copyProfile(offered_storage[0..offered_count], offered_fec);
+        const shared = server.media_rooms.transportProfileOf(channel);
+        if (shared) |profile| {
+            if (profile.codec_count == 0 or profile.codec_count > media_room.max_profile_codecs) return error.BadState;
+        }
+        var expected_fp: ?[dtls_peer_verify_mod.digest_len]u8 = null;
+        switch (LinuxServer.parseOfferedFingerprint(extra_args)) {
+            .none => {},
+            .malformed => return error.BadFingerprint,
+            .ok => |digest| {
+                if (!server.config.media_dtls_srtp) return error.DtlsUnavailable;
+                expected_fp = digest;
+            },
+        }
+        // Preserve the actual command's supported SFU profile. Raw offered
+        // capabilities remain recorded even when this agreement denies them.
+        const supported_codecs = [_]sdp.Codec{
+            .{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 },
+            .{ .tag = .cadencevis, .clock_rate = 90000, .params = 0 },
+        };
+        const basis: media_room.CallProfile = switch (action) {
+            .offer => try copyProfile(&supported_codecs, offered_fec),
+            .answer => shared orelse return error.NoOffer,
+        };
+        const local: sdp.MediaDescription = .{ .band_id = 64, .kind = .audio, .codecs = basis.slice(), .fec = basis.fec, .direction = .sendrecv };
+        const remote: sdp.MediaDescription = .{ .band_id = 64, .kind = .audio, .codecs = offered.slice(), .fec = offered.fec, .direction = .sendrecv };
+        var negotiated = try media_session.negotiate(server.allocator, local, remote);
+        defer negotiated.deinit(server.allocator);
+        var result: PreparedMediaNegotiation = .{
+            .server = server,
+            .id = id,
+            .conn = conn,
+            .action = action,
+            .channel_len = channel.len,
+            .offered = offered,
+            .agreed = try copyProfile(negotiated.codecs, negotiated.fec),
+            .shared_before = shared,
+            .expected_fp = expected_fp,
+            .wants_webrtc = expected_fp != null or LinuxServer.isWebrtcTransport(extra_args),
+            .ws = conn.ws,
+            .tx_denied = conn.session.hasUmode(.media_tx_deny),
+            .media_enabled = server.config.media_enabled,
+            .dtls_enabled = server.config.media_dtls_srtp,
+            .ws_relay = server.config.ws_media_relay,
+            .fallback_host_len = host.len,
+        };
+        @memcpy(result.channel[0..channel.len], channel);
+        @memcpy(result.fallback_host[0..host.len], host);
+        return result;
+    }
+
+    fn channelSlice(self: *const PreparedMediaNegotiation) []const u8 {
+        return self.channel[0..self.channel_len];
+    }
+
+    /// Pure current-source check in the final routing cut. This does not replace
+    /// required leaf advertisement/negotiation, Profiles, Bridge or output joins.
+    fn validate(self: *const PreparedMediaNegotiation) !void {
+        try self.server.requireMediaCaller(self.id, self.conn, self.channelSlice());
+        if (self.conn.ws != self.ws or
+            self.conn.session.hasUmode(.media_tx_deny) != self.tx_denied or
+            self.server.config.media_enabled != self.media_enabled or
+            self.server.config.media_dtls_srtp != self.dtls_enabled or
+            self.server.config.ws_media_relay != self.ws_relay or
+            !std.mem.eql(u8, self.server.config.media_host, self.fallback_host[0..self.fallback_host_len]) or
+            !sameOptionalProfile(self.shared_before, self.server.media_rooms.transportProfileOf(self.channelSlice()))) return error.BadState;
+    }
+};
+
+/// Private ownership of the source-issued advertisement relation used to render
+/// ONE command's final issuer bytes. Endpoint candidates and their parent offers
+/// outlive this value and its final validation. It publishes no route or output.
+/// Server retains only an opaque owned routing lifetime. A saved construction
+/// pointer exposes neither a Domain nor release/join authority through this type.
+const OwnedMediaRouting = opaque {};
+const MediaRoutingBacking = struct {
+    server: *LinuxServer,
+    allocator: std.mem.Allocator,
+    domain: *media_routing.Domain,
+    native_binding: ?*media_routing.NativeBinding,
+    webrtc_binding: ?*media_routing.WebrtcBinding,
+    producer_fence: ?media_plane_mod.RoutingProducerFence = null,
+    prepared_egress: ?*const anyopaque = null,
+    queue_retired: bool = false,
+};
+fn mediaRoutingBacking(owner: *OwnedMediaRouting) *MediaRoutingBacking {
+    return @ptrCast(@alignCast(owner));
+}
+
+/// Exclusive command ownership. Every source plan and final issuer allocation
+/// is prepared before the one routing cut; no candidate can rebind after render.
+/// Public codec negotiation may use plaintext signaling. This distinct plan
+/// contains no endpoint credential and can never satisfy a secret output join.
+const PreparedPublicMediaOutput = struct {
+    protected: ?PreparedMediaOutput = null,
+    plain: ?Plain = null,
+    const Plain = struct {
+        server: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        channel: []const u8,
+        bytes: []u8,
+        framed: ?ws_output.Prepared,
+        queue: sendq.PreparedAppend(*ConnState),
+        fd: linux.fd_t,
+        token: RingFdToken,
+        send_len: usize,
+        send_offset: usize,
+        overflow_len: usize,
+        overflow_ptr: usize,
+        overflow_capacity: usize,
+        cap: usize,
+        ws: ?*WsState,
+        overflow_allocator: std.mem.Allocator,
+        send_armed: bool,
+        submitted_len: usize,
+        submitted_offset: usize,
+        done: bool = false,
+    };
+
+    fn prepare(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, bytes: []const u8) !PreparedPublicMediaOutput {
+        if (conn.tls != null) return .{ .protected = try PreparedMediaOutput.prepare(server, id, conn, channel, bytes) };
+        try server.requireMediaCaller(id, conn, channel);
+        if (conn.fd < 0 or conn.tls_tx_offloaded or conn.tls_rx_offloaded or conn.tls_control_charge != 0 or conn.tls_deferred_charge != 0 or conn.tls_deferred_plain.items.len != 0) return error.BadState;
+        const owned = try server.allocator.dupe(u8, bytes);
+        errdefer server.allocator.free(owned);
+        var framed: ?ws_output.Prepared = null;
+        errdefer if (framed) |*frames| frames.deinit();
+        if (conn.ws) |ws| {
+            if (ws.phase != .open) return error.BadState;
+            const backlog = sendq.backlog(conn);
+            if (backlog > conn.sendq_cap) return error.OutputTooSmall;
+            framed = try ws_output.prepareSensitive(WsState.max_frame, conn.overflow_allocator, ws.tx_buf[0..ws.tx_len], &.{owned}, ws.tx_buf.len, conn.sendq_cap - @as(usize, @intCast(backlog)));
+            if (framed.?.tail().len != 0) return error.BadState;
+        }
+        const wire = if (framed) |*frames| frames.bytes() else owned;
+        var queue = try sendq.prepareAppend(conn, wire.len);
+        errdefer queue.abort();
+        return .{ .plain = .{ .server = server, .id = id, .conn = conn, .channel = channel, .bytes = owned, .framed = framed, .queue = queue, .fd = conn.fd, .token = conn.token, .send_len = conn.send_len, .send_offset = conn.send_offset, .overflow_len = conn.send_overflow.items.len, .overflow_ptr = @intFromPtr(conn.send_overflow.items.ptr), .overflow_capacity = conn.send_overflow.capacity, .cap = conn.sendq_cap, .ws = conn.ws, .overflow_allocator = conn.overflow_allocator, .send_armed = conn.send_armed, .submitted_len = conn.send_submitted_len, .submitted_offset = conn.send_submitted_offset } };
+    }
+
+    fn validate(self: *const PreparedPublicMediaOutput) !void {
+        if (self.protected) |*output| return output.validate();
+        const plain = if (self.plain) |*owned| owned else return error.BadState;
+        const conn = plain.conn;
+        try plain.server.requireMediaCaller(plain.id, conn, plain.channel);
+        if (plain.done or conn.fd != plain.fd or !std.meta.eql(conn.token, plain.token) or conn.tls != null or conn.tls_tx_offloaded or conn.tls_rx_offloaded or conn.tls_control_charge != 0 or conn.tls_deferred_charge != 0 or conn.tls_deferred_plain.items.len != 0 or conn.send_len != plain.send_len or conn.send_offset != plain.send_offset or conn.send_overflow.items.len != plain.overflow_len or @intFromPtr(conn.send_overflow.items.ptr) != plain.overflow_ptr or conn.send_overflow.capacity != plain.overflow_capacity or conn.sendq_cap != plain.cap or conn.ws != plain.ws or conn.overflow_allocator.ptr != plain.overflow_allocator.ptr or conn.overflow_allocator.vtable != plain.overflow_allocator.vtable or conn.send_armed != plain.send_armed or conn.send_submitted_len != plain.submitted_len or conn.send_submitted_offset != plain.submitted_offset) return error.BadState;
+        if (plain.framed) |*frames| {
+            const ws = conn.ws orelse return error.BadState;
+            if (ws.phase != .open or ws.tx_len != frames.initial.len or !std.mem.eql(u8, ws.tx_buf[0..ws.tx_len], frames.initial)) return error.BadState;
+        } else if (conn.ws != null) return error.BadState;
+    }
+
+    fn commit(self: *PreparedPublicMediaOutput) void {
+        self.validate() catch unreachable;
+        if (self.protected) |*output| return output.commit();
+        const plain = &self.plain.?;
+        plain.queue.commit(if (plain.framed) |*frames| frames.bytes() else plain.bytes);
+        if (plain.framed) |*frames| frames.commitTail(plain.conn.ws.?);
+        plain.done = true;
+    }
+
+    fn deinit(self: *PreparedPublicMediaOutput) void {
+        if (self.protected) |*output| output.deinit();
+        if (self.plain) |*plain| {
+            if (!plain.done) plain.queue.abort();
+            if (plain.framed) |*frames| frames.deinit();
+            plain.server.allocator.free(plain.bytes);
+        }
+        self.* = undefined;
+    }
+};
+
+const PreparedPublicMediaNegotiation = struct {
+    turn: *MediaAuthorityTurn,
+    domain: *media_routing.Domain,
+    negotiation: PreparedMediaNegotiation,
+    profile: ?*media_room.PreparedSharedProfile,
+    output: PreparedPublicMediaOutput,
+    done: bool = false,
+
+    fn prepare(turn: *MediaAuthorityTurn, domain: *media_routing.Domain, negotiation: PreparedMediaNegotiation) !PreparedPublicMediaNegotiation {
+        try turn.requireEmptyIssuer();
+        if (negotiation.expected_fp != null) return error.DtlsUnavailable;
+        const server = negotiation.server;
+        const profile = if (negotiation.action == .offer) try server.media_rooms.prepareSharedProfile(negotiation.channelSlice(), negotiation.agreed) else null;
+        errdefer if (profile) |plan| plan.deinit();
+        var storage: [default_reply_bytes]u8 = undefined;
+        var capture: ReplyCapture = .{ .buf = &storage };
+        var line: [event_spine.max_event_line_len]u8 = undefined;
+        var detail_buf: [256]u8 = undefined;
+        const detail = LinuxServer.formatMediaCodecDetail(&detail_buf, negotiation.agreed.slice(), negotiation.agreed.fec) orelse return error.OutputTooSmall;
+        capture.append(try server.renderMediaEventReply(negotiation.conn, if (negotiation.action == .offer) "OFFER-ACK" else "ANSWER-ACK", negotiation.channelSlice(), detail, &line));
+        for ([_]media_room.MediaKind{ .voice, .video }) |kind| {
+            if (!LinuxServer.codecSetHasKind(negotiation.offered.slice(), kind) or LinuxServer.codecSetHasKind(negotiation.agreed.slice(), kind)) continue;
+            const denied = try std.fmt.bufPrint(&detail_buf, "kind={s} reason=no_common_codec", .{media_room.kindName(kind)});
+            capture.append(try server.renderMediaEventReply(negotiation.conn, "KIND-DENIED", negotiation.channelSlice(), denied, &line));
+        }
+        const final_bytes = try prepareMediaIssuerBytes(server.allocator, &capture, turn.label());
+        defer server.allocator.free(final_bytes);
+        return .{ .turn = turn, .domain = domain, .negotiation = negotiation, .profile = profile, .output = try PreparedPublicMediaOutput.prepare(server, negotiation.id, negotiation.conn, negotiation.channelSlice(), final_bytes) };
+    }
+
+    fn publishLocked(scope: *media_routing.Locked, self: *PreparedPublicMediaNegotiation) !void {
+        if (self.done) return error.BadState;
+        const expected: MediaAuthorityTurn.Action = if (self.negotiation.action == .offer) .offer else .answer;
+        if (try MediaAuthorityTurn.require(self.negotiation.server, self.negotiation.id, self.negotiation.conn, expected, self.negotiation.channelSlice()) != self.turn) return error.BadState;
+        try self.turn.requireEmptyIssuer();
+        try self.negotiation.validate();
+        if (self.profile) |plan| try plan.validateLocked(self.domain, scope, self.negotiation.agreed);
+        try self.output.validate();
+        self.output.commit();
+        if (self.profile) |plan| plan.commitLocked(self.domain, scope);
+        self.done = true;
+        self.turn.published = true;
+    }
+
+    fn deinit(self: *PreparedPublicMediaNegotiation) void {
+        self.output.deinit();
+        if (self.profile) |plan| plan.deinit();
+        self.* = undefined;
+    }
+};
+
+/// A non-browser JOIN publishes actual physical and logical membership without
+/// deriving a MACKEY or creating a UDP offer. Labels are admitted before commit.
+const PreparedLogicalMediaJoin = struct {
+    turn: *MediaAuthorityTurn,
+    domain: *media_routing.Domain,
+    physical: PreparedMediaPhysicalJoin,
+    membership: *media_routing.PreparedMembership,
+    room: *media_room.PreparedJoin,
+    output: ?PreparedPublicMediaOutput,
+    recording: ?PreparedMediaBrowserJoin.RecordingBinding,
+    consent: bool,
+    stops_recording: bool,
+    done: bool = false,
+    fn prepare(turn: *MediaAuthorityTurn, domain: *media_routing.Domain, kind: media_room.MediaKind) !?PreparedLogicalMediaJoin {
+        try turn.requireEmptyIssuer();
+        var physical = try PreparedMediaPhysicalJoin.prepare(turn.server, turn.id, turn.conn, turn.channel, kind);
+        errdefer physical.deinit();
+        if (physical.browser) return error.BadState;
+        if (!physical.changed) {
+            physical.deinit();
+            return null;
+        }
+        const membership = try domain.prepareMembership(turn.channel, turn.id, mediaKindBit(kind));
+        errdefer membership.deinit();
+        const room = try turn.server.media_rooms.prepareJoin(membership.preview(), turn.channel, turn.conn.session.displayName(), kind);
+        errdefer room.deinit();
+        const recording = PreparedMediaBrowserJoin.RecordingBinding.capture(turn.server, turn.channel);
+        const consent = turn.server.media_rooms.hasConsent(turn.channel, turn.conn.session.displayName());
+        const stops_recording = physical.first_kind and recording != null and recording.?.active and !consent;
+        var output: ?PreparedPublicMediaOutput = null;
+        errdefer if (output) |*plan| plan.deinit();
+        if (stops_recording or turn.label() != null) {
+            var storage: [default_reply_bytes]u8 = undefined;
+            var capture: ReplyCapture = .{ .buf = &storage };
+            var line: [event_spine.max_event_line_len]u8 = undefined;
+            if (stops_recording) capture.append(try turn.server.renderMediaEventReply(turn.conn, "RECORD", turn.channel, "stopped", &line));
+            const bytes = try prepareMediaIssuerBytes(turn.server.allocator, &capture, turn.label());
+            defer turn.server.allocator.free(bytes);
+            output = try PreparedPublicMediaOutput.prepare(turn.server, turn.id, turn.conn, turn.channel, bytes);
+        }
+        return .{ .turn = turn, .domain = domain, .physical = physical, .membership = membership, .room = room, .output = output, .recording = recording, .consent = consent, .stops_recording = stops_recording };
+    }
+    fn publishLocked(scope: *media_routing.Locked, self: *PreparedLogicalMediaJoin) !void {
+        if (self.done or try MediaAuthorityTurn.require(self.turn.server, self.turn.id, self.turn.conn, .join, self.turn.channel) != self.turn) return error.BadState;
+        try self.turn.requireEmptyIssuer();
+        try self.physical.validate();
+        try self.membership.validateLocked(self.domain, scope);
+        try self.room.validateLocked(self.domain, scope, self.membership);
+        if (!std.meta.eql(self.recording, PreparedMediaBrowserJoin.RecordingBinding.capture(self.turn.server, self.turn.channel)) or self.consent != self.turn.server.media_rooms.hasConsent(self.turn.channel, self.turn.conn.session.displayName())) return error.BadState;
+        if (self.output) |*plan| try plan.validate();
+        if (self.output) |*plan| plan.commit();
+        self.physical.commit();
+        self.room.commitLocked(self.domain, scope);
+        self.membership.commitLocked(self.domain, scope);
+        if (self.stops_recording) {
+            const stopped = self.turn.server.media_rooms.stopRecording(self.turn.channel);
+            std.debug.assert(stopped);
+        }
+        self.done = true;
+        self.turn.published = true;
+    }
+    fn deinit(self: *PreparedLogicalMediaJoin) void {
+        if (self.output) |*plan| plan.deinit();
+        self.room.deinit();
+        self.membership.deinit();
+        self.physical.deinit();
+        self.* = undefined;
+    }
+};
+
+const PreparedMediaOfferCommand = struct {
+    turn: *MediaAuthorityTurn,
+    domain: *media_routing.Domain,
+    negotiation: PreparedMediaNegotiation,
+    offers: *media_routing.PreparedOffers,
+    native: ?*native_media_mod.PreparedNativeOffer,
+    webrtc: ?*media_plane_mod.PreparedWebrtcOffer,
+    profiles: *media_room.PreparedProfiles,
+    bridge: *media_routing.PreparedPhysicalBridge,
+    advertisements: PreparedMediaAdvertisements,
+    output: PreparedMediaOutput,
+    done: bool = false,
+
+    fn acceptedKinds(profile: media_room.CallProfile) !u8 {
+        return media_room.agreedKindBits(profile) catch return error.NoCommonCodec;
+    }
+
+    fn prepare(turn: *MediaAuthorityTurn, domain: *media_routing.Domain, negotiation: PreparedMediaNegotiation) !PreparedMediaOfferCommand {
+        try turn.requireEmptyIssuer();
+        const server = negotiation.server;
+        const is_ws = negotiation.ws != null;
+        var legs: [2]media_routing.OfferLeg = undefined;
+        var count: usize = 0;
+        if (!is_ws and server.native_media.port != 0) {
+            legs[count] = .{ .leg = .native, .mode = .legacy_group };
+            count += 1;
+        }
+        if (server.media_plane.port != 0 and (!is_ws or negotiation.wants_webrtc)) {
+            legs[count] = .{ .leg = .webrtc, .mode = if (negotiation.expected_fp != null) .dtls_required else .legacy_group };
+            count += 1;
+        }
+        if (count == 0) return error.NoTransportSelected;
+        _ = try PreparedMediaOutput.requireCaller(negotiation.server, negotiation.id, negotiation.conn, negotiation.channelSlice());
+
+        if (negotiation.expected_fp != null and legs[count - 1].leg != .webrtc) return error.DtlsUnavailable;
+        const offers = try domain.prepareOffers(negotiation.channelSlice(), negotiation.id, legs[0..count]);
+        errdefer offers.deinit();
+        const kinds = try acceptedKinds(negotiation.agreed);
+        var native: ?*native_media_mod.PreparedNativeOffer = null;
+        errdefer if (native) |plan| plan.deinit();
+        var webrtc: ?*media_plane_mod.PreparedWebrtcOffer = null;
+        errdefer if (webrtc) |plan| plan.deinit();
+        for (legs[0..count]) |leg| switch (leg.leg) {
+            .native => native = try server.native_media.prepareOffer(domain, offers, negotiation.channelSlice(), negotiation.conn.session.displayName(), negotiation.agreed, kinds),
+            .webrtc => webrtc = try server.media_plane.prepareOffer(domain, offers, negotiation.channelSlice(), negotiation.agreed, kinds, negotiation.expected_fp),
+        };
+        const preview = offers.preview();
+        var keys: [2]media_room.PhysicalProfileKey = undefined;
+        for (preview.endpoints[0..preview.count], 0..) |endpoint, n| keys[n] = .{
+            .call = preview.call,
+            .client = negotiation.id,
+            .leg = endpoint.reference.endpoint.leg,
+        };
+        const profiles = try server.media_rooms.prepareTransportProfiles(keys[0..preview.count], negotiation.channelSlice(), negotiation.conn.session.displayName(), if (negotiation.action == .offer) negotiation.agreed else null, negotiation.offered);
+        errdefer profiles.deinit();
+        const bridge = try domain.preparePhysicalBridge(offers, negotiation.channelSlice(), native, webrtc);
+        errdefer bridge.deinit();
+        var advertisements = try PreparedMediaAdvertisements.prepare(&negotiation, domain, offers, native, webrtc, kinds);
+        errdefer advertisements.deinit();
+        var output = try prepareMediaTransportIssuerOutput(&advertisements, turn.label());
+        errdefer output.deinit();
+        return .{ .turn = turn, .domain = domain, .negotiation = negotiation, .offers = offers, .native = native, .webrtc = webrtc, .profiles = profiles, .bridge = bridge, .advertisements = advertisements, .output = output };
+    }
+
+    fn publishLocked(scope: *media_routing.Locked, self: *PreparedMediaOfferCommand) !void {
+        if (self.done) return error.BadState;
+        const action: MediaAuthorityTurn.Action = if (self.negotiation.action == .offer) .offer else .answer;
+        if (try MediaAuthorityTurn.require(self.negotiation.server, self.negotiation.id, self.negotiation.conn, action, self.negotiation.channelSlice()) != self.turn) return error.BadState;
+        try self.turn.requireEmptyIssuer();
+        try self.negotiation.validate();
+        try self.offers.validateLocked(self.domain, scope);
+        if (self.native) |plan| try plan.validateLocked(self.domain, scope, self.offers);
+        if (self.webrtc) |plan| try plan.validateLocked(self.domain, scope, self.offers);
+        try self.profiles.validateLocked(self.domain, scope, self.offers);
+        try self.bridge.validateLocked(self.domain, scope, self.offers, self.native, self.webrtc);
+        try self.advertisements.validateLocked(scope);
+        try self.output.validate();
+        // No allocator callback, backend syscall, SEND or external notification
+        // can intervene between accepted output and exact authority publication.
+        self.output.commit();
+        if (self.native) |plan| plan.commitLocked(self.domain, scope);
+        if (self.webrtc) |plan| plan.commitLocked(self.domain, scope);
+        self.profiles.commitLocked(self.domain, scope);
+        self.bridge.commitLocked(self.domain, scope);
+        self.offers.commitLocked(self.domain, scope);
+        self.done = true;
+        self.turn.published = true;
+    }
+
+    fn deinit(self: *PreparedMediaOfferCommand) void {
+        self.output.deinit();
+        self.advertisements.deinit();
+        self.bridge.deinit();
+        self.profiles.deinit();
+        if (self.webrtc) |plan| plan.deinit();
+        if (self.native) |plan| plan.deinit();
+        self.offers.deinit();
+        self.* = undefined;
+    }
+};
+
+const PreparedMediaAdvertisements = struct {
+    negotiation: PreparedMediaNegotiation,
+    domain: *media_routing.Domain,
+    offers: *media_routing.PreparedOffers,
+    native: ?*native_media_mod.PreparedNativeOffer,
+    webrtc: ?*media_plane_mod.PreparedWebrtcOffer,
+    native_ad: ?native_media_mod.NativeAdvertisement,
+    webrtc_ad: ?media_plane_mod.WebrtcAdvertisement,
+    native_host: ?*media_plane_mod.PreparedAdvertisementHost,
+    native_host_ad: ?media_plane_mod.HostAdvertisement,
+    accepted_kind_bits: u8,
+
+    fn requirePreview(negotiation: *const PreparedMediaNegotiation, offers: *media_routing.PreparedOffers, native: ?*native_media_mod.PreparedNativeOffer, webrtc: ?*media_plane_mod.PreparedWebrtcOffer) !void {
+        try negotiation.validate();
+        const preview = offers.preview();
+        if (preview.count == 0 or preview.count > preview.endpoints.len) return error.BadState;
+        var expected_native: ?media_routing.EndpointObservation = null;
+        var expected_webrtc: ?media_routing.EndpointObservation = null;
+        for (preview.endpoints[0..preview.count]) |endpoint| {
+            if (!endpoint.reference.offering_client.eql(negotiation.id) or
+                !std.meta.eql(endpoint.reference.endpoint.call, preview.call)) return error.BadState;
+            switch (endpoint.reference.endpoint.leg) {
+                .native => {
+                    if (expected_native != null or negotiation.ws != null) return error.BadState;
+                    expected_native = endpoint;
+                },
+                .webrtc => {
+                    if (expected_webrtc != null or
+                        (negotiation.ws != null and !negotiation.wants_webrtc)) return error.BadState;
+                    const expected_mode: media_routing.SecurityMode = if (negotiation.expected_fp != null) .dtls_required else .legacy_group;
+                    if (endpoint.mode != expected_mode) return error.BadState;
+                    expected_webrtc = endpoint;
+                },
+            }
+        }
+        if ((native == null) != (expected_native == null) or
+            (webrtc == null) != (expected_webrtc == null) or
+            (negotiation.expected_fp != null and webrtc == null)) return error.BadState;
+        if (native) |candidate| if (!std.meta.eql(candidate.preview().identity, expected_native.?)) return error.BadState;
+        if (webrtc) |candidate| if (!std.meta.eql(candidate.preview().identity, expected_webrtc.?)) return error.BadState;
+    }
+
+    /// The enclosing private command candidate builder supplies accepted kinds
+    /// from its actual source policy. This mask is only the relation checked
+    /// against genuine leaf plans; it is not an independent admission proof.
+    fn prepare(negotiation: *const PreparedMediaNegotiation, domain: *media_routing.Domain, offers: *media_routing.PreparedOffers, native: ?*native_media_mod.PreparedNativeOffer, webrtc: ?*media_plane_mod.PreparedWebrtcOffer, accepted_kind_bits: u8) !PreparedMediaAdvertisements {
+        try requirePreview(negotiation, offers, native, webrtc);
+        _ = try PreparedMediaOutput.requireCaller(negotiation.server, negotiation.id, negotiation.conn, negotiation.channelSlice());
+        if (accepted_kind_bits == 0 or accepted_kind_bits & ~@as(u8, 7) != 0) return error.BadState;
+        var native_ad: ?native_media_mod.NativeAdvertisement = null;
+        if (native) |candidate| {
+            try candidate.captureAdvertisement();
+            native_ad = try candidate.advertisement();
+        }
+        var webrtc_ad: ?media_plane_mod.WebrtcAdvertisement = null;
+        var host: ?*media_plane_mod.PreparedAdvertisementHost = null;
+        errdefer if (host) |candidate| candidate.deinit();
+        const fallback = negotiation.fallback_host[0..negotiation.fallback_host_len];
+        if (webrtc) |candidate| {
+            try candidate.captureAdvertisement(fallback);
+            webrtc_ad = try candidate.advertisement();
+        } else {
+            // The Server owns this real final-address inline Plane even when no
+            // RTC leg/socket/credentials were selected. Its issued binding and
+            // pending pin supply host lifetime; a scalar fallback never does.
+            host = try negotiation.server.media_plane.prepareAdvertisementHost(domain, offers, negotiation.channelSlice(), fallback);
+        }
+        const result: PreparedMediaAdvertisements = .{
+            .negotiation = negotiation.*,
+            .domain = domain,
+            .offers = offers,
+            .native = native,
+            .webrtc = webrtc,
+            .native_ad = native_ad,
+            .webrtc_ad = webrtc_ad,
+            .native_host = host,
+            .native_host_ad = if (host) |candidate| candidate.preview() else null,
+            .accepted_kind_bits = accepted_kind_bits,
+        };
+        if (result.negotiation.ws != null and LinuxServer.mediaHostIsLoopback(result.hostSlice())) return error.BrowserTransportUnroutable;
+        return result;
+    }
+
+    fn hostSlice(self: *const PreparedMediaAdvertisements) []const u8 {
+        if (self.webrtc_ad) |*advertisement| return advertisement.hostSlice();
+        if (self.native_host_ad) |*advertisement| return advertisement.hostSlice();
+        unreachable;
+    }
+
+    /// EVERY related leaf/Room/Bridge/output validator must finish before the
+    /// enclosing authority turn's first no-fail publication. No getter syscall,
+    /// preparation, cleanup, SEND or backend callback occurs in this function.
+    fn validateLocked(self: *const PreparedMediaAdvertisements, scope: *const media_routing.Locked) !void {
+        try requirePreview(&self.negotiation, self.offers, self.native, self.webrtc);
+        try self.offers.validateLocked(self.domain, scope);
+        if (self.native) |candidate| {
+            try candidate.requireAdvertisementLocked(self.domain, scope, self.offers);
+            try candidate.requireNegotiationLocked(self.domain, scope, self.offers, self.negotiation.agreed, self.accepted_kind_bits);
+        }
+        if (self.webrtc) |candidate| {
+            try candidate.requireAdvertisementLocked(self.domain, scope, self.offers);
+            try candidate.requireNegotiationLocked(self.domain, scope, self.offers, self.negotiation.agreed, self.accepted_kind_bits, self.negotiation.expected_fp);
+        } else {
+            try self.native_host.?.validateLocked(self.domain, scope, self.offers, self.negotiation.fallback_host[0..self.negotiation.fallback_host_len]);
+        }
+    }
+
+    /// Outside Domain while the actual parent offers, leaf owner, config and
+    /// original physical connection lifetimes are retained. Other plans remain
+    /// exclusively owned by the enclosing command transaction.
+    fn deinit(self: *PreparedMediaAdvertisements) void {
+        if (self.native_host) |candidate| candidate.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Final issuer bytes use the same private command negotiation plus owned
+/// source-issued advertisement copies. A copy is a rendering value only. The
+/// outer command must validate these original source plans and EVERY related
+/// Room/Bridge/output participant before one no-fail joined publication.
+fn prepareMediaTransportIssuerOutput(advertisements: *const PreparedMediaAdvertisements, label: ?[]const u8) !PreparedMediaOutput {
+    const negotiation = &advertisements.negotiation;
+    try PreparedMediaAdvertisements.requirePreview(negotiation, advertisements.offers, advertisements.native, advertisements.webrtc);
+    const server = negotiation.server;
+    const id = negotiation.id;
+    const conn = negotiation.conn;
+    const channel = negotiation.channelSlice();
+    _ = try PreparedMediaOutput.requireCaller(server, id, conn, channel);
+    const native = advertisements.native;
+    const webrtc = advertisements.webrtc;
+    const action = negotiation.action;
+    const offered = negotiation.offered.slice();
+    const negotiated = negotiation.agreed.slice();
+    const fec = negotiation.agreed.fec;
+    var storage: [default_reply_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &storage);
+    var capture: ReplyCapture = .{ .buf = &storage };
+    var line: [event_spine.max_event_line_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &line);
+    var detail_buf: [512]u8 = undefined;
+    defer std.crypto.secureZero(u8, &detail_buf);
+    const detail = LinuxServer.formatMediaCodecDetail(&detail_buf, negotiated, fec) orelse return error.OutputTooSmall;
+    capture.append(try server.renderMediaEventReply(conn, switch (action) {
+        .offer => "OFFER-ACK",
+        .answer => "ANSWER-ACK",
+    }, channel, detail, &line));
+    for ([_]media_room.MediaKind{ .voice, .video }) |kind| {
+        if (!LinuxServer.codecSetHasKind(offered, kind) or LinuxServer.codecSetHasKind(negotiated, kind)) continue;
+        const denied = try std.fmt.bufPrint(&detail_buf, "kind={s} reason=no_common_codec", .{media_room.kindName(kind)});
+        capture.append(try server.renderMediaEventReply(conn, "KIND-DENIED", channel, denied, &line));
+    }
+    const host = advertisements.hostSlice();
+    if (webrtc) |candidate| {
+        const credentials = candidate.preview();
+        if (conn.ws != null and LinuxServer.mediaHostIsLoopback(host)) return error.BadState;
+        const transport = if (credentials.identity.mode == .dtls_required) blk: {
+            if (credentials.group_key != null) return error.BadState;
+            const fp = advertisements.webrtc_ad.?.fingerprintSlice();
+            if (fp.len == 0) return error.BadState;
+            break :blk try std.fmt.bufPrint(&detail_buf, "ufrag={s} pwd={s} candidate={s}:{d} fingerprint={s} setup=passive", .{
+                credentials.ufrag, credentials.pwd, host, advertisements.webrtc_ad.?.port, fp,
+            });
+        } else blk: {
+            const key = credentials.group_key orelse return error.BadState;
+            var encoded_key: [std.base64.standard.Encoder.calcSize(@sizeOf(@TypeOf(key.*)))]u8 = undefined;
+            defer std.crypto.secureZero(u8, &encoded_key);
+            const encoded = std.base64.standard.Encoder.encode(&encoded_key, key);
+            break :blk try std.fmt.bufPrint(&detail_buf, "ufrag={s} pwd={s} candidate={s}:{d} srtp={s}", .{
+                credentials.ufrag, credentials.pwd, host, advertisements.webrtc_ad.?.port, encoded,
+            });
+        };
+        capture.append(try server.renderMediaEventReply(conn, "TRANSPORT", channel, transport, &line));
+    }
+    if (native) |candidate| {
+        const credentials = candidate.preview();
+        const description = try std.fmt.bufPrint(&detail_buf, "candidate={s}:{d} stream={d} codec=CadenceVox/CadenceVis mac=hmac-sha256-128", .{
+            host, advertisements.native_ad.?.port, credentials.identity.stream_id,
+        });
+        capture.append(try server.renderMediaEventReply(conn, "NATIVE", channel, description, &line));
+        var encoded_key: [std.base64.standard.Encoder.calcSize(@sizeOf(@TypeOf(credentials.master.*)))]u8 = undefined;
+        defer std.crypto.secureZero(u8, &encoded_key);
+        const encoded = std.base64.standard.Encoder.encode(&encoded_key, credentials.master);
+        const secret = try std.fmt.bufPrint(&detail_buf, "stream={d} key={s}", .{ credentials.identity.stream_id, encoded });
+        capture.append(try server.renderMediaEventReply(conn, "NATIVE-MACKEY", channel, secret, &line));
+    }
+    // Overflow, labels/BATCH, WS framing, TLS epochs, control credit and complete
+    // queue admission all fail before any endpoint/profile publication. Every
+    // temporary secret buffer is wiped on ordinary and allocation-failure exit.
+    const final_bytes = try prepareMediaIssuerBytes(server.allocator, &capture, label);
+    defer {
+        std.crypto.secureZero(u8, final_bytes);
+        server.allocator.free(final_bytes);
+    }
+    return PreparedMediaOutput.prepare(server, id, conn, channel, final_bytes);
+}
+
+/// Server-owned half of browser JOIN. Domain/Room source plans still validate
+/// their own authority; this private plan stages the existing physical/E2EE and
+/// WS-call fields without publishing them during reply/capacity preparation.
+const PreparedMediaPhysicalJoin = struct {
+    server: *LinuxServer,
+    id: client_model.ClientId,
+    conn: *ConnState,
+    requested: MediaPhysicalAttachment,
+    kind: media_room.MediaKind,
+    old_index: ?usize,
+    old_kind_bits: u8,
+    old_len: usize,
+    old_capacity: usize,
+    old_ptr: usize,
+    first_kind: bool,
+    changed: bool,
+    browser: bool,
+    binding: Binding,
+    replacement: ?std.ArrayList(MediaPhysicalAttachment) = null,
+    done: bool = false,
+
+    const Binding = struct {
+        channel: [media_call_chan_max]u8 = @splat(0),
+        channel_len: usize,
+        participant: [media_call_part_max]u8 = @splat(0),
+        participant_len: usize,
+        attachment: [LinuxServer.media_e2ee_attachment_bytes]u8,
+        attachment_bound: bool,
+        ws: ?*WsState,
+
+        fn capture(conn: *const ConnState) Binding {
+            var result: Binding = .{
+                .channel_len = conn.media_call_channel_len,
+                .participant_len = conn.media_call_participant_len,
+                .attachment = conn.media_e2ee_attachment,
+                .attachment_bound = conn.media_e2ee_attachment_bound,
+                .ws = conn.ws,
+            };
+            @memcpy(result.channel[0..result.channel_len], conn.media_call_channel[0..result.channel_len]);
+            @memcpy(result.participant[0..result.participant_len], conn.media_call_participant[0..result.participant_len]);
+            return result;
+        }
+    };
+
+    fn arrayPtr(attachments: *const std.ArrayList(MediaPhysicalAttachment)) usize {
+        return if (attachments.capacity == 0) 0 else @intFromPtr(attachments.items.ptr);
+    }
+
+    fn prepare(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, kind: media_room.MediaKind) !PreparedMediaPhysicalJoin {
+        try server.requireMediaCaller(id, conn, channel);
+        const nick = conn.session.displayName();
+        const requested = MediaPhysicalAttachment.init(id, channel, nick, kind) orelse return error.NameTooLong;
+        const index = server.mediaPhysicalIndex(id, channel, nick);
+        const old_bits = if (index) |idx| server.media_physical_attachments.items[idx].kind_bits else 0;
+        const changed = (old_bits & mediaKindBit(kind)) == 0;
+        const browser = server.config.ws_media_relay and conn.ws != null;
+        if (browser and (channel.len > conn.media_call_channel.len or nick.len > conn.media_call_participant.len)) return error.NameTooLong;
+        var plan: PreparedMediaPhysicalJoin = .{
+            .server = server,
+            .id = id,
+            .conn = conn,
+            .requested = requested,
+            .kind = kind,
+            .old_index = index,
+            .old_kind_bits = old_bits,
+            .old_len = server.media_physical_attachments.items.len,
+            .old_capacity = server.media_physical_attachments.capacity,
+            .old_ptr = arrayPtr(&server.media_physical_attachments),
+            .first_kind = !server.mediaPhysicalKindPresent(channel, nick, kind),
+            .changed = changed,
+            .browser = browser,
+            .binding = Binding.capture(conn),
+        };
+        if (changed and index == null and plan.old_len == plan.old_capacity) {
+            const required = std.math.add(usize, plan.old_len, 1) catch return error.OutOfMemory;
+            var detached: std.ArrayList(MediaPhysicalAttachment) = .empty;
+            errdefer detached.deinit(server.allocator);
+            try detached.ensureTotalCapacity(server.allocator, required);
+            plan.replacement = detached;
+        }
+        return plan;
+    }
+
+    /// World and original connection ownership are retained through this cut.
+    /// No byte comparison touches undefined padding in the inline name buffers.
+    fn validate(self: *const PreparedMediaPhysicalJoin) !void {
+        if (self.done) return error.BadState;
+        const channel = self.requested.channelSlice();
+        const nick = self.requested.nickSlice();
+        try self.server.requireMediaCaller(self.id, self.conn, channel);
+        if (!std.mem.eql(u8, nick, self.conn.session.displayName()) or
+            self.server.media_physical_attachments.items.len != self.old_len or
+            self.server.media_physical_attachments.capacity != self.old_capacity or
+            arrayPtr(&self.server.media_physical_attachments) != self.old_ptr or
+            self.server.mediaPhysicalIndex(self.id, channel, nick) != self.old_index or
+            self.browser != (self.server.config.ws_media_relay and self.conn.ws != null) or
+            !std.meta.eql(self.binding, Binding.capture(self.conn)) or
+            self.first_kind == self.server.mediaPhysicalKindPresent(channel, nick, self.kind)) return error.BadState;
+        if (self.old_index) |idx| {
+            if (self.server.media_physical_attachments.items[idx].kind_bits != self.old_kind_bits) return error.BadState;
+        }
+    }
+
+    /// Pure publication alongside actual Domain/Room/output commits. Retired
+    /// physical backing stays owned here until the caller leaves Domain.
+    fn commit(self: *PreparedMediaPhysicalJoin) void {
+        self.validate() catch unreachable;
+        if (self.changed) {
+            if (self.replacement) |*detached| {
+                detached.appendSliceAssumeCapacity(self.server.media_physical_attachments.items);
+                std.mem.swap(std.ArrayList(MediaPhysicalAttachment), &self.server.media_physical_attachments, detached);
+            }
+            if (self.old_index) |idx| self.server.media_physical_attachments.items[idx].kind_bits |= mediaKindBit(self.kind) else self.server.media_physical_attachments.appendAssumeCapacity(self.requested);
+            if (self.server.media_physical_attachments.items.len == 1 or self.first_kind) self.conn.clearMediaE2eeAttachment();
+            if (self.browser) self.conn.setMediaCall(self.requested.channelSlice(), self.requested.nickSlice());
+        }
+        self.done = true;
+    }
+
+    fn deinit(self: *PreparedMediaPhysicalJoin) void {
+        if (self.replacement) |*retired| retired.deinit(self.server.allocator);
+        self.* = undefined;
+    }
+};
+
+/// Server-owned physical membership retirement for ONE complete ClientId cut.
+/// The command/close owner retains World and the original slab row throughout.
+/// This candidate alone cannot revoke transport, Bridge or pending FIFO work.
+/// Every genuine Domain/leaf/Room/Bridge plan must validate before this commit.
+const PreparedMediaPhysicalClientDeparture = struct {
+    server: *LinuxServer,
+    id: client_model.ClientId,
+    conn: *ConnState,
+    allocator: std.mem.Allocator,
+    old_ptr: usize,
+    old_capacity: usize,
+    old_rows: []MediaPhysicalAttachment,
+    remaining: std.ArrayList(MediaPhysicalAttachment) = .empty,
+    removed: usize,
+    binding: PreparedMediaPhysicalJoin.Binding,
+    nick: [client_model.MAX_NICK_BYTES]u8 = @splat(0),
+    nick_len: usize,
+    done: bool = false,
+
+    fn sameRow(a: *const MediaPhysicalAttachment, b: *const MediaPhysicalAttachment) bool {
+        // Inline names have undefined unused tails. Compare logical initialized
+        // fields only; hashing/comparing struct padding is not a revision proof.
+        return a.client.eql(b.client) and a.kind_bits == b.kind_bits and
+            std.mem.eql(u8, a.channelSlice(), b.channelSlice()) and
+            std.mem.eql(u8, a.nickSlice(), b.nickSlice());
+    }
+
+    fn requireOwner(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
+        // Closing is legal here: retirement precedes slab/World removal. An
+        // active signalling requirement would strand a just-closed owner.
+        if (id.isNone() or id.shard != server.rx().shard_id or
+            server.connFor(id) != conn or !conn.session.registered()) return error.BadState;
+    }
+
+    fn prepare(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !PreparedMediaPhysicalClientDeparture {
+        try requireOwner(server, id, conn);
+        const allocator = server.allocator;
+        const rows = server.media_physical_attachments.items;
+        var removed: usize = 0;
+        for (rows) |row| if (row.client.eql(id)) {
+            removed += 1;
+        };
+        var result: PreparedMediaPhysicalClientDeparture = .{
+            .server = server,
+            .id = id,
+            .conn = conn,
+            .allocator = allocator,
+            .old_ptr = PreparedMediaPhysicalJoin.arrayPtr(&server.media_physical_attachments),
+            .old_capacity = server.media_physical_attachments.capacity,
+            .old_rows = try allocator.dupe(MediaPhysicalAttachment, rows),
+            .removed = removed,
+            .binding = PreparedMediaPhysicalJoin.Binding.capture(conn),
+            .nick_len = conn.session.displayName().len,
+        };
+        errdefer allocator.free(result.old_rows);
+        @memcpy(result.nick[0..result.nick_len], conn.session.displayName());
+        if (removed != 0) {
+            try result.remaining.ensureTotalCapacity(allocator, rows.len - removed);
+            errdefer result.remaining.deinit(allocator);
+            for (rows) |row| if (!row.client.eql(id)) {
+                result.remaining.appendAssumeCapacity(row);
+            };
+        }
+        return result;
+    }
+
+    fn validate(self: *const PreparedMediaPhysicalClientDeparture) !void {
+        if (self.done) return error.BadState;
+        try requireOwner(self.server, self.id, self.conn);
+        const source = &self.server.media_physical_attachments;
+        if (!std.meta.eql(self.allocator, self.server.allocator) or
+            PreparedMediaPhysicalJoin.arrayPtr(source) != self.old_ptr or
+            source.capacity != self.old_capacity or source.items.len != self.old_rows.len or
+            !std.meta.eql(self.binding, PreparedMediaPhysicalJoin.Binding.capture(self.conn)) or
+            !std.mem.eql(u8, self.nick[0..self.nick_len], self.conn.session.displayName())) return error.BadState;
+        for (source.items, self.old_rows) |*current, *old| {
+            if (!sameRow(current, old)) return error.BadState;
+        }
+    }
+
+    fn hasPart(actual: *media_routing.PreparedClientDeparture, channel: []const u8) bool {
+        for (0..actual.count()) |n| {
+            if (std.ascii.eqlIgnoreCase(actual.part(n).channel(), channel)) return true;
+        }
+        return false;
+    }
+
+    fn validateLocked(self: *const PreparedMediaPhysicalClientDeparture, domain: *media_routing.Domain, scope: *media_routing.Locked, actual: *media_routing.PreparedClientDeparture) !void {
+        try self.validate();
+        try actual.validateLocked(domain, scope);
+        for (0..actual.count()) |n| {
+            const part = actual.part(n);
+            try actual.requirePartLocked(domain, scope, n, part);
+            if (!part.ownerKey(.native).client.eql(self.id) or
+                !part.ownerKey(.webrtc).client.eql(self.id)) return error.BadState;
+        }
+        // Server rows missing from the actual Domain census are an explicit
+        // join failure. Never remove them using nick or a caller remaining bit.
+        for (self.old_rows) |*row| {
+            if (row.client.eql(self.id) and !hasPart(actual, row.channelSlice())) return error.BadState;
+        }
+        if (self.binding.channel_len != 0 and
+            !hasPart(actual, self.binding.channel[0..self.binding.channel_len])) return error.BadState;
+    }
+
+    /// Pure after ALL participants validate. Detached OLD storage stays owned
+    /// by this plan until deinit OUTSIDE routing exclusion.
+    fn commit(self: *PreparedMediaPhysicalClientDeparture) void {
+        self.validate() catch unreachable;
+        if (self.removed != 0)
+            std.mem.swap(std.ArrayList(MediaPhysicalAttachment), &self.server.media_physical_attachments, &self.remaining);
+        self.conn.clearMediaCall();
+        self.done = true;
+    }
+
+    fn deinit(self: *PreparedMediaPhysicalClientDeparture) void {
+        self.remaining.deinit(self.allocator);
+        self.allocator.free(self.old_rows);
+        std.crypto.secureZero(u8, &self.binding.attachment);
+        self.* = undefined;
+    }
+};
+
+/// Browser JOIN joins actual Domain and Room candidates, Server physical/E2EE
+/// binding, and final protected issuer bytes. The original World/connection turn
+/// and every allocator outlive cleanup; this plan grants no Domain lifetime.
+const PreparedMediaBrowserJoin = struct {
+    server: *LinuxServer,
+    domain: *media_routing.Domain,
+    physical: PreparedMediaPhysicalJoin,
+    membership: *media_routing.PreparedMembership,
+    room: *media_room.PreparedJoin,
+    output: PreparedMediaOutput,
+    recording: ?RecordingBinding,
+    consent: bool,
+    stops_recording: bool,
+    done: bool = false,
+
+    const RecordingBinding = struct {
+        active: bool,
+        by: [64]u8 = @splat(0),
+        by_len: usize,
+        fn capture(server: *LinuxServer, channel: []const u8) ?RecordingBinding {
+            const note = server.media_rooms.recordingOf(channel) orelse return null;
+            var result: RecordingBinding = .{ .active = note.active, .by_len = note.by_len };
+            @memcpy(result.by[0..note.by_len], note.by());
+            return result;
+        }
+    };
+
+    fn prepare(server: *LinuxServer, domain: *media_routing.Domain, id: client_model.ClientId, conn: *ConnState, channel: []const u8, kind: media_room.MediaKind, label: ?[]const u8) !?PreparedMediaBrowserJoin {
+        // A WS label, TLS flag or authenticated IRC nick cannot grant capability
+        // delivery. Refuse before preparing membership or deriving its key.
+        _ = try PreparedMediaOutput.requireCaller(server, id, conn, channel);
+        var physical = try PreparedMediaPhysicalJoin.prepare(server, id, conn, channel, kind);
+        errdefer physical.deinit();
+        if (!physical.browser) return error.BadState;
+        if (!physical.changed) {
+            physical.deinit();
+            return null;
+        }
+        const membership = try domain.prepareMembership(channel, id, mediaKindBit(kind));
+        errdefer membership.deinit();
+        const room = try server.media_rooms.prepareJoin(membership.preview(), channel, conn.session.displayName(), kind);
+        errdefer room.deinit();
+        const recording = RecordingBinding.capture(server, channel);
+        const consent = server.media_rooms.hasConsent(channel, conn.session.displayName());
+        const stops_recording = physical.first_kind and recording != null and recording.?.active and !consent;
+        var storage: [default_reply_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &storage);
+        var capture: ReplyCapture = .{ .buf = &storage };
+        var line_buf: [event_spine.max_event_line_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &line_buf);
+        if (stops_recording) capture.append(try server.renderMediaEventReply(conn, "RECORD", channel, "stopped", &line_buf));
+        var key: [cadence_frame.MAC_KEY_BYTES]u8 = undefined;
+        defer std.crypto.secureZero(u8, &key);
+        cadence_frame.deriveNativeMediaMacKey(&server.native_stream_key, channel, conn.session.displayName(), &key);
+        var b64: [std.base64.standard.Encoder.calcSize(cadence_frame.MAC_KEY_BYTES)]u8 = undefined;
+        defer std.crypto.secureZero(u8, &b64);
+        const encoded = std.base64.standard.Encoder.encode(&b64, &key);
+        capture.append(try server.renderMediaEventReply(conn, "MACKEY", channel, encoded, &line_buf));
+        const final_bytes = try prepareMediaIssuerBytes(server.allocator, &capture, label);
+        defer {
+            std.crypto.secureZero(u8, final_bytes);
+            server.allocator.free(final_bytes);
+        }
+        const output = try PreparedMediaOutput.prepare(server, id, conn, channel, final_bytes);
+        return .{ .server = server, .domain = domain, .physical = physical, .membership = membership, .room = room, .output = output, .recording = recording, .consent = consent, .stops_recording = stops_recording };
+    }
+
+    fn validateLocked(self: *PreparedMediaBrowserJoin, scope: *media_routing.Locked) !void {
+        if (self.done) return error.BadState;
+        try self.membership.validateLocked(self.domain, scope);
+        try self.room.validateLocked(self.domain, scope, self.membership);
+        try self.physical.validate();
+        try self.output.validate();
+        const channel = self.physical.requested.channelSlice();
+        if (!std.meta.eql(self.recording, RecordingBinding.capture(self.server, channel)) or
+            self.consent != self.server.media_rooms.hasConsent(channel, self.physical.requested.nickSlice())) return error.BadState;
+    }
+
+    /// All validation precedes the first publication. No destructor, allocator,
+    /// entropy, getter, SEND arming or external notification occurs inside cut.
+    fn publishLocked(scope: *media_routing.Locked, self: *PreparedMediaBrowserJoin) !void {
+        try self.validateLocked(scope);
+        self.output.commit();
+        self.physical.commit();
+        self.membership.commitLocked(self.domain, scope);
+        self.room.commitLocked(self.domain, scope);
+        if (self.stops_recording) {
+            const stopped = self.server.media_rooms.stopRecording(self.physical.requested.channelSlice());
+            std.debug.assert(stopped);
+        }
+        self.done = true;
+    }
+
+    fn deinit(self: *PreparedMediaBrowserJoin) void {
+        self.output.deinit();
+        self.room.deinit();
+        self.membership.deinit();
+        self.physical.deinit();
+        self.* = undefined;
+    }
+};
+
 /// Guarded choke point for the inline reply-line builders that embed
 /// user/oper-influenced fields directly into a complete `... NOTICE ...\r\n`
 /// wire line, bypassing both `noticeTo` and the `ReplyCtx` control-byte guard.
@@ -56675,52 +62030,70 @@ fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
 fn appendSecuredToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
     if (conn.tls) |t| {
         if (t.handshakeDone()) {
-            // kTLS TX offload: the kernel encrypts server→client bytes on send(),
-            // so hand it the plaintext directly and skip the userspace AEAD. Only
-            // set once the offload has attached to a drained, TLS-1.3 conn.
-            if (conn.tls_tx_offloaded) return rawAppendToConn(conn, bytes);
-            const ciphertext = t.write(bytes) catch return error.OutputTooSmall;
-            return rawAppendToConn(conn, ciphertext);
+            if (!conn.tls_tx_offloaded) return appendTlsBatchToConn(conn, t, &.{bytes});
+            return appendKernelPlainToConn(conn, bytes);
         }
     }
+    // Plain/kTLS and the server's pre-handshake flight are already wire bytes.
     return rawAppendToConn(conn, bytes);
 }
 
-/// Cut the outbound byte stream on CRLF boundaries and emit one WebSocket text
-/// frame per complete IRC line (CRLF stripped, per the IRCv3 WebSocket
-/// convention). A line delivered across several appends (tag prefix + body) is
-/// accumulated in `tx_buf` until its terminator arrives.
-fn wsAppendToConn(conn: *ConnState, ws: *WsState, bytes: []const u8) ServerError!void {
-    var rest = bytes;
-    while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
-        const seg = rest[0 .. nl + 1];
-        rest = rest[nl + 1 ..];
-        var line: []const u8 = seg;
-        if (ws.tx_len != 0) {
-            if (ws.tx_len + seg.len > ws.tx_buf.len) return error.OutputTooSmall;
-            @memcpy(ws.tx_buf[ws.tx_len..][0..seg.len], seg);
-            line = ws.tx_buf[0 .. ws.tx_len + seg.len];
-            ws.tx_len = 0;
-        }
-        // Strip the terminator ('\n', plus a preceding '\r' when present).
-        var end = line.len - 1;
-        if (end > 0 and line[end - 1] == '\r') end -= 1;
-        try wsFrameOut(conn, line[0..end]);
+/// Kernel plaintext suffix custody funds the speculative five-byte response
+/// first. Queue failure restores only a previously absent, unadmitted credit.
+fn appendKernelPlainToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
+    const t = conn.tls.?;
+    const holding = t.control_phase == .userspace_requested_ku_held or t.control_phase == .kernel_control_read_held;
+    const fund = holding and conn.tls_control_charge == 0 and bytes.len != 0;
+    if (fund) {
+        var reservation = try sendq.prepareControlReservation(conn, 5);
+        reservation.commit();
     }
-    if (rest.len != 0) {
-        if (ws.tx_len + rest.len > ws.tx_buf.len) return error.OutputTooSmall;
-        @memcpy(ws.tx_buf[ws.tx_len..][0..rest.len], rest);
-        ws.tx_len += rest.len;
-    }
+    errdefer if (fund) sendq.cancelControlReservation(conn);
+    return rawAppendToConn(conn, bytes);
 }
 
-/// Wrap one finished IRC line in an unmasked server-to-client text frame and
-/// hand it to the TLS seam (one frame = one TLS record on a wss leg).
-fn wsFrameOut(conn: *ConnState, line: []const u8) ServerError!void {
-    var frame_buf: [WsState.max_frame + 10]u8 = undefined;
-    const frame = websocket.encodeFrame(WsState.max_frame, .{ .opcode = .text }, line, &frame_buf) catch
+/// Same exclusive physical connection turn throughout: ciphertext is owned
+/// before exact queue admission, then queue custody and TX publication cannot
+/// allocate/fail. Nothing arms SEND or yields between these operations.
+fn appendTlsBatchToConn(conn: *ConnState, t: *tls_conn.TlsConn, chunks: []const []const u8) ServerError!void {
+    if (t.applicationOutputDeferred() or conn.tls_deferred_plain.items.len != 0) {
+        const charge = t.applicationWireCharge(chunks) catch return error.OutputTooSmall;
+        const holding = t.control_phase == .userspace_requested_ku_held or t.control_phase == .kernel_control_read_held;
+        const fund = holding and conn.tls_control_charge == 0 and charge != 0;
+        if (fund) {
+            var reservation = try sendq.prepareControlReservation(conn, 27);
+            reservation.commit();
+        }
+        errdefer if (fund) sendq.cancelControlReservation(conn);
+        var retained = try sendq.prepareDeferredAppend(conn, chunks, charge);
+        defer retained.deinit();
+        retained.commit(chunks);
+        return;
+    }
+    var prepared = t.prepareWriteBatch(chunks) catch return error.OutputTooSmall;
+    defer prepared.deinit();
+    var custody = try sendq.prepareAppend(conn, prepared.bytes().len);
+    custody.commit(prepared.bytes());
+    prepared.commit();
+}
+
+/// Stage every completed frame and the final partial line as one transaction.
+/// The live prefix changes only after complete physical queue custody succeeds.
+fn wsAppendToConn(conn: *ConnState, ws: *WsState, bytes: []const u8) ServerError!void {
+    const backlog = connSendBacklog(conn);
+    if (backlog > conn.sendq_cap) return error.OutputTooSmall;
+    const remaining = conn.sendq_cap - @as(usize, @intCast(backlog));
+    var framed = ws_output.prepare(WsState.max_frame, conn.overflow_allocator, ws.tx_buf[0..ws.tx_len], &.{bytes}, ws.tx_buf.len, remaining) catch
         return error.OutputTooSmall;
-    return appendSecuredToConn(conn, frame);
+    defer framed.deinit();
+    if (conn.tls) |t| {
+        if (t.handshakeDone() and !conn.tls_tx_offloaded) {
+            try appendTlsBatchToConn(conn, t, framed.frameChunks());
+        } else if (t.handshakeDone() and conn.tls_tx_offloaded) {
+            try appendKernelPlainToConn(conn, framed.bytes());
+        } else try rawAppendToConn(conn, framed.bytes());
+    } else try rawAppendToConn(conn, framed.bytes());
+    framed.commitTail(ws);
 }
 
 /// Queue a small control frame (pong / close echo; payload <= 125 bytes per
@@ -58711,8 +64084,8 @@ test "client active gauge follows physical slot ownership through close and refu
 
     // A slot that never acquired gauge ownership (for example, an older
     // pre-admission error path) must not subtract some other live connection.
-    var uncounted_pair: [2]linux.fd_t = undefined;
-    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &uncounted_pair)) != .SUCCESS)
+    var uncounted_pair: [2]i32 = undefined;
+    if (posix.errno(socket_system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &uncounted_pair)) != .SUCCESS)
         return error.SkipZigTest;
     defer closeFd(uncounted_pair[1]);
     const uncounted_id = try server.rx().clients.alloc(ConnState.init(uncounted_pair[0]));
@@ -58730,8 +64103,8 @@ test "client active gauge follows physical slot ownership through close and refu
     try server.stats.writePrometheus(allocator, &metrics);
     try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_connections_active 0\n") != null);
 
-    var refused_pair: [2]linux.fd_t = undefined;
-    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &refused_pair)) != .SUCCESS)
+    var refused_pair: [2]i32 = undefined;
+    if (posix.errno(socket_system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &refused_pair)) != .SUCCESS)
         return error.SkipZigTest;
     defer closeFd(refused_pair[1]);
     server.draining = true;
@@ -70259,6 +75632,8 @@ test "UPGRADE send completion and exact cancel retain the unsent suffix" {
     conn.send_len = 6;
     conn.send_armed = true;
     conn.send_cancel_pending = true;
+    conn.send_submitted_len = 6;
+    conn.send_submitted_offset = 0;
     server.reactors[0].socket_io_quiescing = true;
 
     try server.handleSend(.{ .token = conn.token, .res = 2, .more = false, .notif = false });
@@ -70266,6 +75641,8 @@ test "UPGRADE send completion and exact cancel retain the unsent suffix" {
     try std.testing.expectEqualStrings("cdef", conn.send_buf[conn.send_offset..conn.send_len]);
     conn.send_armed = true;
     conn.send_cancel_pending = true;
+    conn.send_submitted_len = 4;
+    conn.send_submitted_offset = 2;
     try server.handleSend(.{
         .token = conn.token,
         .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
@@ -84930,7 +90307,9 @@ test "threaded server: SESSIONTOKEN refuses non-TLS transport" {
     defer store.deinit();
     var services = services_mod.Services.init(&store, null);
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -84938,7 +90317,7 @@ test "threaded server: SESSIONTOKEN refuses non-TLS transport" {
     const port = try server.boundPort();
 
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -85978,6 +91357,9 @@ test "expired SESSION RESUME retry hold clears TOKEN latch and restores UPGRADE 
     conn.send_len = 0;
     conn.send_offset = 0;
     conn.send_overflow.clearAndFree(conn.overflow_allocator);
+    conn.tls_deferred_plain.clearAndFree(conn.overflow_allocator);
+    conn.tls_deferred_charge = 0;
+    conn.tls_control_charge = 0;
     var token_line = try irc_line.parseLine("SESSION TOKEN");
     try server.handleSession(id, conn, &token_line);
     try expectContains(conn.send_buf[0..conn.send_len], "SESSION TOKEN ");
@@ -86275,7 +91657,7 @@ test "SESSION DROP #n cannot retarget after list snapshot mutation" {
 
 test "SESSION DROP sid revokes exactly one physical attachment and leaves shared-token siblings live" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{
+    const server = createTestServer(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .crypto_io = std.testing.io,
@@ -86283,14 +91665,17 @@ test "SESSION DROP sid revokes exactly one physical attachment and leaves shared
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
-    defer server.deinit();
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
 
-    const a_id = try addTestLocalClient(&server, "sidA", "sidacct");
-    const b_id = try addTestLocalClient(&server, "sidB", "sidacct");
-    const c_id = try addTestLocalClient(&server, "sidC", "sidacct");
-    try assignTestSessionAttachment(&server, "sidacct", a_id, 0xa2);
-    try assignTestSessionAttachment(&server, "sidacct", b_id, 0xb2);
-    try assignTestSessionAttachment(&server, "sidacct", c_id, 0xc2);
+    const a_id = try addTestLocalClient(server, "sidA", "sidacct");
+    const b_id = try addTestLocalClient(server, "sidB", "sidacct");
+    const c_id = try addTestLocalClient(server, "sidC", "sidacct");
+    try assignTestSessionAttachment(server, "sidacct", a_id, 0xa2);
+    try assignTestSessionAttachment(server, "sidacct", b_id, 0xb2);
+    try assignTestSessionAttachment(server, "sidacct", c_id, 0xc2);
     const a_conn = server.connFor(a_id).?;
     const b_conn = server.connFor(b_id).?;
     const c_conn = server.connFor(c_id).?;
@@ -86369,7 +91754,7 @@ test "SESSION DROP sid revokes exactly one physical attachment and leaves shared
 
 test "SESSION DROP crosses two live reactors and preserves an exact-token sibling identity" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{
+    const server = createTestServer(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
         .num_shards = 2,
@@ -86378,7 +91763,10 @@ test "SESSION DROP crosses two live reactors and preserves an exact-token siblin
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
         else => return err,
     };
-    defer server.deinit();
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
     if (server.reactors.len < 2) return error.SkipZigTest;
     server.fabric = reactor_fabric.ReactorFabric.init(server.allocator, server.reactors.len) catch |err| switch (err) {
         error.ReactorWakeUnsupported => return error.SkipZigTest,
@@ -86392,15 +91780,15 @@ test "SESSION DROP crosses two live reactors and preserves an exact-token siblin
     // exact row being revoked is a real live shard-1 ConnState, not a fabricated
     // SessionStore row with an unreachable ClientId.
     current_reactor = &server.reactors[0];
-    const requester_id = try addTestLocalClient(&server, "CrossObserver", "crossdrop-live");
-    const sibling_id = try addTestLocalClient(&server, "CrossSibling", "crossdrop-live");
+    const requester_id = try addTestLocalClient(server, "CrossObserver", "crossdrop-live");
+    const sibling_id = try addTestLocalClient(server, "CrossSibling", "crossdrop-live");
     const requester = server.connFor(requester_id) orelse return error.TestUnexpectedResult;
     const sibling = server.connFor(sibling_id) orelse return error.TestUnexpectedResult;
 
     current_reactor = &server.reactors[1];
-    const target_id = try addTestLocalClient(&server, "CrossTarget", "crossdrop-live");
+    const target_id = try addTestLocalClient(server, "CrossTarget", "crossdrop-live");
     try std.testing.expectEqual(@as(u12, 1), target_id.shard);
-    try assignTestSessionAttachment(&server, "crossdrop-live", target_id, 0xd1);
+    try assignTestSessionAttachment(server, "crossdrop-live", target_id, 0xd1);
     const target = server.connFor(target_id) orelse return error.TestUnexpectedResult;
     const target_cid = monitorIdFromClient(target_id);
     const target_handle = server.sessions.resumeHandleForClient("crossdrop-live", target_cid) orelse
@@ -89637,9 +95025,7 @@ test "threaded server: REGISTER star uses current nick and ACCOUNTSET rejects li
     defer store.deinit();
     var services = services_mod.Services.init(&store, null);
 
-    const server = try std.testing.allocator.create(Server);
-    defer std.testing.allocator.destroy(server);
-    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -89647,7 +95033,7 @@ test "threaded server: REGISTER star uses current nick and ACCOUNTSET rejects li
     const port = try server.boundPort();
 
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -93458,6 +98844,2414 @@ test "threaded server: tagged PRIVMSG to a userspace-TLS member seals one TLS re
         try std.testing.expect(cbytes[line_start] == '@');
         try expectContains(cbytes[line_start..], "@time=");
     } else return error.SkipZigTest;
+}
+
+// Heap-owned real TLS peers for the physical daemon application-output seam.
+const DaemonOutputTestPair = struct {
+    const Client = union(tls_conn.Version) {
+        tls12: @import("../crypto/tls12_client.zig").Client,
+        tls13: @import("../crypto/tls_client.zig").Client,
+    };
+    conn: ConnState,
+    tls: tls_conn.TlsConn,
+    client: Client,
+    cert13: [2048]u8,
+    cert12: [4096]u8,
+    chain13: [1][]const u8,
+    chain12: [1][]const u8,
+
+    fn create(version: tls_conn.Version) !*DaemonOutputTestPair {
+        return createSuite(version, null);
+    }
+
+    fn createSuite(version: tls_conn.Version, suite: ?u16) !*DaemonOutputTestPair {
+        const a = std.testing.allocator;
+        const pair = try a.create(DaemonOutputTestPair);
+        errdefer a.destroy(pair);
+        pair.conn = .{ .overflow_allocator = a, .test_sendq_capture = true };
+        pair.conn.tls = &pair.tls;
+        const Ed25519 = std.crypto.sign.Ed25519;
+        const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x5d)));
+        const x509 = @import("../proto/x509_selfsign.zig");
+        pair.chain13[0] = try x509.buildSelfSigned(&pair.cert13, .{
+            .common_name = "irc.test",
+            .not_before = 1_704_067_200,
+            .not_after = 1_893_456_000,
+            .serial = &.{1},
+            .key_pair = kp,
+            .dns_names = &.{"irc.test"},
+            .is_ca = true,
+        });
+        const cfg13 = tls_server.Config{ .cert_chain = &pair.chain13, .signing_key = kp };
+        switch (version) {
+            .tls13 => {
+                pair.tls = try tls_conn.TlsConn.init(a, cfg13);
+                errdefer pair.tls.deinit();
+                pair.client = .{ .tls13 = try @import("../crypto/tls_client.zig").Client.init(a, .{ .server_name = "irc.test", .trust_anchors = &pair.chain13 }) };
+            },
+            .tls12 => {
+                const ec = ecdsa_p256.KeyPair.generate(std.testing.io);
+                pair.chain12[0] = try x509.buildSelfSignedEcdsaP256(&pair.cert12, .{
+                    .common_name = "irc.test",
+                    .not_before = 1_704_067_200,
+                    .not_after = 1_893_456_000,
+                    .serial = &.{1},
+                    .key_pair = ec,
+                    .dns_names = &.{"irc.test"},
+                    .is_ca = true,
+                });
+                pair.tls = tls_conn.TlsConn.initDual(a, cfg13, .{ .cert_chain = &pair.chain12, .ecdsa_p256_signing_key = ec });
+                errdefer pair.tls.deinit();
+                pair.client = .{ .tls12 = try @import("../crypto/tls12_client.zig").Client.init(a, .{ .server_name = "irc.test", .trust_anchors = &pair.chain12, .now_unix_seconds = 1_735_689_600 }) };
+            },
+        }
+        errdefer {
+            pair.tls.deinit();
+            switch (pair.client) {
+                inline else => |*client| client.deinit(),
+            }
+        }
+        if (suite) |chosen| {
+            std.debug.assert(version == .tls13);
+            pair.client.tls13.force_aes256_only_for_test = chosen == 0x1302;
+            pair.client.tls13.force_chacha_only_for_test = chosen == 0x1303;
+        }
+        const hello = switch (pair.client) {
+            inline else => |*client| try client.start(),
+        };
+        defer a.free(hello);
+        const flight = try pair.tls.onInbound(hello);
+        const finished = switch (pair.client) {
+            inline else => |*client| switch (try client.feed(flight.handshake_bytes)) {
+                .bytes_to_send => |bytes| bytes,
+                .need_more => return error.TestUnexpectedResult,
+            },
+        };
+        defer a.free(finished);
+        const final = try pair.tls.onInbound(finished);
+        if (version == .tls12) _ = try pair.client.tls12.feed(final.handshake_bytes);
+        try std.testing.expect(pair.tls.handshakeDone());
+        return pair;
+    }
+
+    fn destroy(self: *DaemonOutputTestPair) void {
+        self.conn.send_overflow.deinit(std.testing.allocator);
+        self.conn.tls_deferred_plain.deinit(std.testing.allocator);
+        self.tls.deinit();
+        switch (self.client) {
+            inline else => |*client| client.deinit(),
+        }
+        std.testing.allocator.destroy(self);
+    }
+
+    fn sequence(self: *const DaemonOutputTestPair) u64 {
+        return switch (self.tls.engine) {
+            inline .tls12, .tls13 => |engine| engine.app_write_seq,
+            .undecided => unreachable,
+        };
+    }
+
+    fn generation(self: *const DaemonOutputTestPair) u64 {
+        return switch (self.tls.engine) {
+            inline .tls12, .tls13 => |engine| engine.app_write_generation,
+            .undecided => unreachable,
+        };
+    }
+
+    fn decode(self: *DaemonOutputTestPair, bytes: []const u8) ![]u8 {
+        const a = std.testing.allocator;
+        var decoded: std.ArrayList(u8) = .empty;
+        errdefer decoded.deinit(a);
+        var at: usize = 0;
+        while (at != bytes.len) {
+            if (bytes.len - at < 5) return error.TestUnexpectedResult;
+            const len = 5 + @as(usize, std.mem.readInt(u16, bytes[at..][3..5], .big));
+            if (len > bytes.len - at) return error.TestUnexpectedResult;
+            const payload = switch (self.client) {
+                inline else => |*client| try client.decrypt(bytes[at..][0..len]),
+            };
+            defer a.free(payload);
+            try decoded.appendSlice(a, payload);
+            at += len;
+        }
+        return decoded.toOwnedSlice(a);
+    }
+};
+
+fn daemonOutputQueued(a: std.mem.Allocator, conn: *const ConnState) ![]u8 {
+    var queued: std.ArrayList(u8) = .empty;
+    errdefer queued.deinit(a);
+    try queued.appendSlice(a, conn.send_buf[conn.send_offset..conn.send_len]);
+    try queued.appendSlice(a, conn.send_overflow.items);
+    return queued.toOwnedSlice(a);
+}
+
+// The declared sink owns a real slab connection and socket. The test explicitly
+// drives the physical FIFO; no armed operation or fake kernel custody is used.
+const Tls3ServerFixture = struct {
+    server: *Server,
+    pair: *DaemonOutputTestPair,
+    id: client_model.ClientId,
+    peer_fd: i32,
+
+    fn create(suite: u16) !Tls3ServerFixture {
+        return createTransport(suite, false);
+    }
+
+    fn createTransport(suite: u16, tcp: bool) !Tls3ServerFixture {
+        // The TLS fixture drives full-server reactors; no portable equivalent exists.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        const a = std.testing.allocator;
+        const pair = try DaemonOutputTestPair.createSuite(.tls13, suite);
+        errdefer pair.destroy();
+        const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &pair.chain13, .tls_signing_key = pair.tls.cfg13.signing_key });
+        errdefer {
+            server.deinit();
+            a.destroy(server);
+        }
+        const sockets = if (tcp) blk: {
+            if (comptime builtin.os.tag != .linux) return error.Unsupported;
+            const peer = try connectLoopback(try server.boundPort());
+            errdefer closeFd(peer);
+            var ready = [_]posix.pollfd{.{ .fd = server.reactors[0].listener_fd, .events = posix.POLL.IN, .revents = 0 }};
+            if (try posix.poll(&ready, 2000) == 0) return error.TestTimeout;
+            const accepted = linux.accept4(server.reactors[0].listener_fd, null, null, linux.SOCK.CLOEXEC);
+            if (posix.errno(accepted) != .SUCCESS) return error.TestUnexpectedResult;
+            break :blk [2]i32{ @intCast(accepted), peer };
+        } else try sameIPTestSocketPair();
+        errdefer closeFd(sockets[0]);
+        errdefer closeFd(sockets[1]);
+        try os_runtime.setNonblocking(sockets[0]);
+        const id = try addTestLocalClient(server, "Tls3Owner", null);
+        const conn = server.rx().clients.get(id).?;
+        conn.session.restore(.{ .nick = "Tls3Owner", .username = "owner", .realname = "TLS3 owner" });
+        conn.test_sendq_capture = true;
+        // Move the authenticated adapter into the same heap custody used by a
+        // live accepted connection. Real close/CQE paths may destroy this row.
+        var empty_adapter = try tls_conn.TlsConn.init(a, pair.tls.cfg13);
+        errdefer empty_adapter.deinit();
+        const owned_adapter = try a.create(tls_conn.TlsConn);
+        owned_adapter.* = pair.tls;
+        pair.tls = empty_adapter;
+        conn.fd = sockets[0];
+        conn.tls = owned_adapter;
+        conn.is_tls = true;
+        return .{ .server = server, .pair = pair, .id = id, .peer_fd = sockets[1] };
+    }
+
+    fn connection(self: *Tls3ServerFixture) *ConnState {
+        return self.server.reactors[0].clients.get(self.id).?;
+    }
+
+    fn deinit(self: *Tls3ServerFixture) void {
+        // The first adapter and any adopted adapters have ordinary Server
+        // ownership, including when a real completion already retired the row.
+        self.server.deinit();
+        std.testing.allocator.destroy(self.server);
+        closeFd(self.peer_fd);
+        self.pair.destroy();
+    }
+};
+
+fn tls3ServerDrain(fixture: *Tls3ServerFixture, conn: *ConnState) ![]u8 {
+    const a = std.testing.allocator;
+    try std.testing.expect(!conn.send_armed);
+    const queued = try daemonOutputQueued(a, conn);
+    defer a.free(queued);
+    try std.testing.expect(queued.len != 0);
+    // These bounded fixtures fit the socket buffer. Compare actual received
+    // ciphertext before the owner retires the queue prefix.
+    try writeAllFd(conn.fd, queued);
+    const received = try a.alloc(u8, queued.len);
+    defer a.free(received);
+    var offset: usize = 0;
+    while (offset != received.len) {
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2000) == 0) return error.TestTimeout;
+        const n = try readFd(fixture.peer_fd, received[offset..]);
+        if (n == 0) return error.TestUnexpectedResult;
+        offset += n;
+    }
+    try std.testing.expectEqualSlices(u8, queued, received);
+    const decoded = try fixture.pair.decode(received);
+    conn.send_len = 0;
+    conn.send_offset = 0;
+    conn.send_overflow.clearRetainingCapacity();
+    return decoded;
+}
+
+fn tls3ServerCapture(conn: *ConnState) ![]u8 {
+    return tls3ServerCaptureWithAllocator(conn, std.testing.allocator);
+}
+
+fn tls3ServerCaptureWithAllocator(conn: *ConnState, a: std.mem.Allocator) ![]u8 {
+    var captured = try conn.tls.?.prepareCapture(a, .{
+        .fd = conn.fd,
+        .tx_offloaded = conn.tls_tx_offloaded,
+        .rx_offloaded = conn.tls_rx_offloaded,
+        .wire_chunks = &.{ conn.send_buf[conn.send_offset..conn.send_len], conn.send_overflow.items },
+        .deferred_plain = conn.tls_deferred_plain.items,
+        .deferred_ciphertext_charge = conn.tls_deferred_charge,
+        .control_charge = @intCast(conn.tls_control_charge),
+        .queue_cap = conn.sendq_cap,
+        .kernel_tx_prefix_remaining = conn.tls_kernel_prefix_remaining,
+    });
+    defer captured.deinit();
+    return tls_snapshot.encode(a, .{
+        .kernel_tx_prefix_remaining = captured.kernel_tx_prefix_remaining,
+        .fd = conn.fd,
+        .state = captured.state,
+        .pending_out = captured.pending_out,
+        .tx_offloaded = conn.tls_tx_offloaded,
+        .rx_offloaded = conn.tls_rx_offloaded,
+        .control_charge = @intCast(conn.tls_control_charge),
+        .deferred_ciphertext_charge = conn.tls_deferred_charge,
+        .deferred_plain = conn.tls_deferred_plain.items,
+    });
+}
+
+fn tls3ServerSoftwareBarrier(suite: u16) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(suite);
+    defer fixture.deinit();
+    const conn = fixture.connection();
+    const t = conn.tls.?;
+    const ws = try a.create(WsState);
+    defer a.destroy(ws);
+    ws.* = .{ .phase = .open };
+    conn.ws = ws;
+    defer conn.ws = null;
+    try appendSecuredToConn(conn, "old sealed prefix");
+    const tx_before = t.engine.tls13.app_write_seq;
+    const old_rx_secret = t.engine.tls13.client_app_secret;
+    const old_tx_secret = t.engine.tls13.server_app_secret;
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 1, 4 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    try fixture.server.driveTls(fixture.id, conn, request);
+    try std.testing.expect(!conn.closing);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.userspace_requested_ku_held, t.control_phase);
+    try std.testing.expectEqual(@as(usize, 27), conn.tls_control_charge);
+    try std.testing.expectEqual(tx_before, t.engine.tls13.app_write_seq);
+    try std.testing.expectEqualSlices(u8, &old_rx_secret, &t.engine.tls13.client_app_secret);
+    try std.testing.expectEqualSlices(u8, &old_tx_secret, &t.engine.tls13.server_app_secret);
+    const held = try a.dupe(u8, t.recv_buf.items);
+    defer a.free(held);
+
+    // Complete WS frames gain deferred custody; their unframed suffix remains
+    // in WsState and no TLS sequence moves until the reply has wire custody.
+    @memcpy(ws.tx_buf[0..4], "held");
+    ws.tx_len = 4;
+    const cap_before = conn.sendq_cap;
+    conn.sendq_cap = @intCast(sendq.backlog(conn));
+    try std.testing.expectError(error.OutputTooSmall, appendToConn(conn, " line\r\nsecond\r\nsuffix"));
+    try std.testing.expectEqualStrings("held", ws.tx_buf[0..ws.tx_len]);
+    try std.testing.expectEqual(@as(usize, 0), conn.tls_deferred_plain.items.len);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    conn.sendq_cap = cap_before;
+    conn.overflow_allocator = failing.allocator();
+    try std.testing.expectError(error.OutputTooSmall, appendToConn(conn, " line\r\nsecond\r\nsuffix"));
+    conn.overflow_allocator = a;
+    try std.testing.expectEqualStrings("held", ws.tx_buf[0..ws.tx_len]);
+    try appendToConn(conn, " line\r\nsecond\r\nsuffix");
+    try std.testing.expectEqualStrings("suffix", ws.tx_buf[0..ws.tx_len]);
+    try std.testing.expectEqual(tx_before, t.engine.tls13.app_write_seq);
+    try std.testing.expectEqualSlices(u8, held, t.recv_buf.items);
+    const tail = try a.dupe(u8, conn.tls_deferred_plain.items);
+    defer a.free(tail);
+    const charge = conn.tls_deferred_charge;
+    try std.testing.expectEqual(try tls_conn.deferredCiphertextCharge(.{ .tls13 = (try t.engine.tls13.captureWithPending()).state }, tail), charge);
+
+    const phase1_wire = try tls3ServerCapture(conn);
+    defer a.free(phase1_wire);
+    const phase1 = try tls_snapshot.decodeCurrent(phase1_wire);
+    try std.testing.expectEqualSlices(u8, tail, phase1.deferred_plain);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.userspace_requested_ku_held, phase1.state.barrier_phase);
+    const old_plain = try tls3ServerDrain(&fixture, conn);
+    defer a.free(old_plain);
+    try std.testing.expectEqualStrings("old sealed prefix", old_plain);
+    // A retryable allocation failure after reply custody leaves a drainable
+    // phase3 rather than pretending that the already admitted request is held.
+    var after_reply_fault = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    fixture.server.allocator = after_reply_fault.allocator();
+    try fixture.server.progressTlsControl(conn);
+    fixture.server.allocator = a;
+    try std.testing.expect(!conn.closing);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.software_tail_ready, t.control_phase);
+    try std.testing.expectEqual(@as(usize, 0), conn.tls_control_charge);
+    try std.testing.expectEqualSlices(u8, tail, conn.tls_deferred_plain.items);
+    try std.testing.expectEqual(@as(u64, 0), t.engine.tls13.app_write_seq);
+    const phase3_wire = try tls3ServerCapture(conn);
+    defer a.free(phase3_wire);
+    const phase3 = try tls_snapshot.decodeCurrent(phase3_wire);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.software_tail_ready, phase3.state.barrier_phase);
+    try std.testing.expectEqualSlices(u8, tail, phase3.deferred_plain);
+    const reply_plain = try tls3ServerDrain(&fixture, conn);
+    defer a.free(reply_plain);
+    try std.testing.expectEqual(@as(usize, 0), reply_plain.len);
+    try fixture.server.progressTlsControl(conn);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.none, t.control_phase);
+    try std.testing.expectEqual(@as(usize, 0), conn.tls_deferred_plain.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.tls_deferred_charge);
+    const frames = try tls3ServerDrain(&fixture, conn);
+    defer a.free(frames);
+    const first = try websocket.decodeFrame(WsState.max_frame, .server_to_client, frames, &.{});
+    try std.testing.expectEqualStrings("held line", first.frame.payload);
+    const second = try websocket.decodeFrame(WsState.max_frame, .server_to_client, frames[first.consumed..], &.{});
+    try std.testing.expectEqualStrings("second", second.frame.payload);
+    try std.testing.expectEqual(frames.len, first.consumed + second.consumed);
+    try std.testing.expectEqualStrings("suffix", ws.tx_buf[0..ws.tx_len]);
+}
+
+test "TLS3: Server software requested KU retains WSS tail through cap OOM and two capture phases" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| try tls3ServerSoftwareBarrier(suite);
+}
+
+fn tls3ServerAdoptBarrier(suite: u16) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(suite);
+    defer fixture.deinit();
+    const original = fixture.connection();
+    const original_fd = original.fd;
+    const ws = try a.create(WsState);
+    defer a.destroy(ws);
+    ws.* = .{ .phase = .open };
+    original.ws = ws;
+    defer original.ws = null;
+    try appendSecuredToConn(original, "preserved physical ciphertext");
+    var exporter: [32]u8 = undefined;
+    try original.tls.?.channelBindingTlsExporter(&exporter);
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 4, 1 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    try fixture.server.driveTls(fixture.id, original, request);
+    try appendToConn(original, "first framed\r\nsecond framed\r\nheld suffix");
+    const tail = try a.dupe(u8, original.tls_deferred_plain.items);
+    defer a.free(tail);
+    const phase1 = try tls3ServerCapture(original);
+    defer a.free(phase1);
+    const ts1 = try tls_snapshot.decodeCurrent(phase1);
+    const successor1 = try createTestServer(a, fixture.server.config);
+    defer a.destroy(successor1);
+    defer successor1.deinit();
+    current_reactor = &successor1.reactors[0];
+    const ws1: ws_snapshot.Snapshot = .{ .fd = original_fd, .phase_open = true, .tx = ws.tx_buf[0..ws.tx_len] };
+    var client1 = original.session.snapshot();
+    client1.fd = original_fd;
+    client1.was_secured = true;
+    client1.was_websocket = true;
+
+    // A correctly framed but unauthenticated held request is refused before
+    // candidate publication, without closing the predecessor's descriptor.
+    const bad_request = try a.dupe(u8, ts1.state.pending_recv);
+    defer a.free(bad_request);
+    bad_request[ts1.state.held_record_len - 1] ^= 1;
+    var bad_tls = ts1;
+    bad_tls.state.pending_recv = bad_request;
+    const before_clock = successor1.mesh_clock;
+    try std.testing.expect(!successor1.adoptInheritedClient(client1, bad_tls, ws1, false));
+    try std.testing.expectEqual(@as(usize, 0), successor1.reactors[0].clients.len());
+    try std.testing.expect(successor1.world.findNick("Tls3Owner") == null);
+    try std.testing.expectEqual(before_clock.last_stamp, successor1.mesh_clock.last_stamp);
+    try std.testing.expect(successor1.adoptInheritedClient(client1, ts1, ws1, false));
+    original.fd = -1; // same live descriptor now belongs to the inert successor
+    var first_it = successor1.reactors[0].clients.iterator();
+    const first = first_it.next().?;
+    const c1 = first.value;
+    c1.test_sendq_capture = true;
+    try std.testing.expectEqual(original_fd, c1.fd);
+    try std.testing.expect(!c1.recv_armed and !c1.send_armed);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.userspace_requested_ku_held, c1.tls.?.control_phase);
+    try std.testing.expectEqualSlices(u8, tail, c1.tls_deferred_plain.items);
+    try std.testing.expectEqualStrings("held suffix", c1.ws.?.tx_buf[0..c1.ws.?.tx_len]);
+    try std.testing.expectEqualSlices(u8, &exporter, &c1.tls_exporter_buf);
+    const prefix = try tls3ServerDrain(&fixture, c1);
+    defer a.free(prefix);
+    try std.testing.expectEqualStrings("preserved physical ciphertext", prefix);
+    var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    successor1.allocator = fault.allocator();
+    defer successor1.allocator = a;
+    try successor1.progressTlsControl(c1);
+    successor1.allocator = a;
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.software_tail_ready, c1.tls.?.control_phase);
+    const phase3 = try tls3ServerCapture(c1);
+    defer a.free(phase3);
+    const ts3 = try tls_snapshot.decodeCurrent(phase3);
+    const successor2 = try createTestServer(a, fixture.server.config);
+    defer a.destroy(successor2);
+    defer successor2.deinit();
+    current_reactor = &successor2.reactors[0];
+    var client2 = c1.session.snapshot();
+    client2.fd = original_fd;
+    client2.was_secured = true;
+    client2.was_websocket = true;
+    const ws2: ws_snapshot.Snapshot = .{ .fd = original_fd, .phase_open = true, .tx = c1.ws.?.tx_buf[0..c1.ws.?.tx_len] };
+    try std.testing.expect(successor2.adoptInheritedClient(client2, ts3, ws2, false));
+    c1.fd = -1;
+    var second_it = successor2.reactors[0].clients.iterator();
+    const second = second_it.next().?;
+    const c2 = second.value;
+    c2.test_sendq_capture = true;
+    try std.testing.expectEqual(original_fd, c2.fd);
+    try std.testing.expect(!c2.recv_armed and !c2.send_armed);
+    try std.testing.expectEqualSlices(u8, &exporter, &c2.tls_exporter_buf);
+    try std.testing.expectEqualSlices(u8, tail, c2.tls_deferred_plain.items);
+    const reply = try tls3ServerDrain(&fixture, c2);
+    defer a.free(reply);
+    try std.testing.expectEqual(@as(usize, 0), reply.len);
+    try successor2.progressTlsControl(c2);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.none, c2.tls.?.control_phase);
+    const frames = try tls3ServerDrain(&fixture, c2);
+    defer a.free(frames);
+    const one = try websocket.decodeFrame(WsState.max_frame, .server_to_client, frames, &.{});
+    const two = try websocket.decodeFrame(WsState.max_frame, .server_to_client, frames[one.consumed..], &.{});
+    try std.testing.expectEqualStrings("first framed", one.frame.payload);
+    try std.testing.expectEqualStrings("second framed", two.frame.payload);
+    try std.testing.expectEqual(frames.len, one.consumed + two.consumed);
+    try std.testing.expectEqualStrings("held suffix", c2.ws.?.tx_buf[0..c2.ws.?.tx_len]);
+}
+
+test "TLS3: Server authentic held request and framed tail survive two inert physical adoptions" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| try tls3ServerAdoptBarrier(suite);
+}
+
+fn tls3ServerArmedBarrier(suite: u16) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(suite);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    conn.test_sendq_capture = false;
+    const small_buffer: u32 = 1024;
+    if (posix.errno(portable_test_system.setsockopt(conn.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small_buffer), @sizeOf(u32))) != .SUCCESS) return error.Unexpected;
+    const prefix: [32768]u8 = @splat('p');
+    try appendSecuredToConn(conn, &prefix);
+    const tx_before = conn.tls.?.engine.tls13.app_write_seq;
+    try fixture.server.armSendIfNeeded(conn);
+    try std.testing.expect(conn.send_armed);
+    const submitted_prefix = try a.dupe(u8, conn.send_buf[conn.send_offset..conn.send_len]);
+    defer a.free(submitted_prefix);
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 3, 2 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    try fixture.server.driveTls(fixture.id, conn, request);
+    try appendSecuredToConn(conn, "tail after armed prefix");
+    try fixture.server.armSendIfNeeded(conn);
+    try std.testing.expect(conn.send_armed);
+    try std.testing.expectEqual(tx_before, conn.tls.?.engine.tls13.app_write_seq);
+    try std.testing.expectEqualSlices(u8, submitted_prefix, conn.send_buf[conn.send_offset..conn.send_len]);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.userspace_requested_ku_held, conn.tls.?.control_phase);
+
+    const Observed = struct {
+        handler: CompletionHandler,
+        connection: *ConnState,
+        partial: bool = false,
+        sends: usize = 0,
+        pub fn onCompletion(self: *@This(), c: ringlane.Completion) void {
+            switch (c) {
+                .send => |event| {
+                    if (event.token.slot == self.connection.token.slot and event.token.gen == self.connection.token.gen and event.res > 0) {
+                        self.partial = self.partial or @as(usize, @intCast(event.res)) < self.connection.send_len - self.connection.send_offset;
+                        self.sends += 1;
+                    }
+                },
+                else => {},
+            }
+            self.handler.onCompletion(c);
+        }
+    };
+    var observed: Observed = .{ .handler = .{ .server = fixture.server }, .connection = conn };
+    var completions: [8]reactor_backend.CompletionBuffer = undefined;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    var scratch: [1024]u8 = undefined;
+    var finished = false;
+    for (0..2000) |_| {
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &observed);
+        if (observed.handler.err) |err| return err;
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) return error.TestUnexpectedResult;
+            try wire.appendSlice(a, scratch[0..n]);
+        }
+        if (!conn.send_armed and sendq.wireBacklog(conn) == 0 and conn.tls_deferred_charge == 0 and
+            conn.tls.?.control_phase == .none and wire.items.len == 32768 + 2 * 22 + 27 + "tail after armed prefix".len + 22)
+        {
+            finished = true;
+            break;
+        }
+    }
+    try std.testing.expect(finished);
+    try std.testing.expect(observed.sends >= 3);
+    // Linux io_uring reports a genuine partial send under this socket pressure.
+    // Native kqueue may internally own retries and report the complete request.
+    if (comptime builtin.os.tag == .linux) try std.testing.expect(observed.partial);
+    const plaintext = try fixture.pair.decode(wire.items);
+    defer a.free(plaintext);
+    try std.testing.expectEqual(@as(usize, prefix.len + "tail after armed prefix".len), plaintext.len);
+    try std.testing.expectEqualSlices(u8, &prefix, plaintext[0..prefix.len]);
+    try std.testing.expectEqualStrings("tail after armed prefix", plaintext[prefix.len..]);
+    try std.testing.expectEqual(@as(usize, 0), conn.tls_control_charge);
+    try std.testing.expect(!conn.closing);
+}
+
+test "TLS3: Server armed SEND and real partial CQEs drain old ciphertext before requested KU tail" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| try tls3ServerArmedBarrier(suite);
+}
+
+// This fixture uses real TCP kTLS, submits the physical queue to the owner
+// ring and lets actual CQEs retire it. The peer proves the control did not
+// overtake any previously accepted plaintext, including an overflow suffix.
+fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bool, sq_pressure: bool, clean_close: bool, quiesce_pressure: bool) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.createTransport(suite, true);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    const t = conn.tls.?;
+    conn.test_sendq_capture = false;
+    try t.enableKtlsTx(conn.fd);
+    conn.tls_tx_offloaded = true;
+    if (kernel_rx) {
+        try t.enableKtlsRx(conn.fd);
+        conn.tls_rx_offloaded = true;
+    }
+    var small: i32 = 1024;
+    try posix.setsockopt(conn.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small));
+    const prefix = try a.alloc(u8, if (overflow) 32768 else 128);
+    defer a.free(prefix);
+    @memset(prefix, 'k');
+    try appendSecuredToConn(conn, prefix);
+    const old_secret = t.engine.tls13.server_app_secret;
+    if (armed) {
+        try fixture.server.armSendIfNeeded(conn);
+        try std.testing.expect(conn.send_armed);
+    }
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 2, 3 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    if (kernel_rx) {
+        try writeAllFd(fixture.peer_fd, request);
+        var ready = [_]posix.pollfd{.{ .fd = conn.fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2000) == 0) return error.TestTimeout;
+        const rc = linux.recvfrom(conn.fd, conn.recv_buf[0..].ptr, conn.recv_buf.len, linux.MSG.DONTWAIT, null, null);
+        try std.testing.expectEqual(posix.E.IO, posix.errno(rc));
+        try std.testing.expectEqual(Server.KtlsRxDrain.survived, try fixture.server.handleKtlsRxControl(fixture.id, conn));
+    } else try fixture.server.driveTls(fixture.id, conn, request);
+    const prefix_before_append = conn.tls_kernel_prefix_remaining;
+    const submitted_before_append = conn.send_submitted_len;
+    if (clean_close) {
+        try std.testing.expectEqual(Server.DeliveryOutcome.delivered, fixture.server.enqueueDeliveryMaybeClose(fixture.id, "new suffix held behind kernel prefix", true, "completed drain-close"));
+        try std.testing.expect(conn.closing);
+    } else try appendSecuredToConn(conn, "new suffix held behind kernel prefix");
+    try std.testing.expectEqual(prefix_before_append, conn.tls_kernel_prefix_remaining);
+    try std.testing.expectEqual(submitted_before_append, conn.send_submitted_len);
+    if (armed) {
+        // The real armed physical row cannot be silently omitted or exported
+        // as quiescent merely because engine metadata itself is copyable.
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(a);
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |blob| a.free(blob);
+            blobs.deinit(a);
+        }
+        var fds: [1]i32 = undefined;
+        var fd_count: usize = 0;
+        var counts = Server.SealCounts{};
+        const flags = linux.fcntl(conn.fd, linux.F.GETFD, 0);
+        fixture.server.sealShardClients(&fixture.server.reactors[0], &pieces, &blobs, &fds, &fd_count, &counts);
+        try std.testing.expectEqual(@as(usize, 1), counts.clients_expected);
+        try std.testing.expectEqual(@as(usize, 0), counts.clients);
+        try std.testing.expectEqual(@as(usize, 0), fd_count);
+        try std.testing.expectEqual(@as(usize, 0), pieces.items.len);
+        try std.testing.expectEqual(flags, linux.fcntl(conn.fd, linux.F.GETFD, 0));
+    }
+    var timeout = linux.kernel_timespec{ .sec = 60, .nsec = 0 };
+    if (sq_pressure) {
+        var full = false;
+        for (0..128) |_| {
+            fixture.server.rx().ring.submitTimeout(timer_token, &timeout) catch |err| switch (err) {
+                error.SubmissionQueueFull => {
+                    full = true;
+                    break;
+                },
+                else => return err,
+            };
+        }
+        try std.testing.expect(full);
+        try std.testing.expect(try fixture.server.activatePendingSocketIo());
+        try std.testing.expect(!conn.send_armed and !conn.recv_armed);
+        try std.testing.expectEqual(@as(usize, 0), conn.send_submitted_len);
+        try std.testing.expect(!conn.activation_recv_required);
+        try std.testing.expectEqual(prefix_before_append, conn.tls_kernel_prefix_remaining);
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.activatePendingSocketIo();
+        try std.testing.expect(conn.send_armed);
+        try std.testing.expect(!conn.recv_armed);
+    } else {
+        try fixture.server.progressTlsControl(conn);
+        try fixture.server.armSendIfNeeded(conn);
+    }
+
+    if (quiesce_pressure) {
+        // Submit into real socket pressure without reading the peer. Let one
+        // positive CQE retire its exact span, then cancel the still-owned retry.
+        var pressure_handler: CompletionHandler = .{ .server = fixture.server };
+        var pressure_cqes: [8]reactor_backend.CompletionBuffer = undefined;
+        for (0..2000) |_| {
+            _ = try fixture.server.rx().ring.submit();
+            _ = try fixture.server.rx().ring.reapCompletions(&pressure_cqes, 0, &pressure_handler);
+            if (pressure_handler.err) |err| return err;
+            if (conn.tls_kernel_prefix_remaining < prefix_before_append and conn.send_armed) break;
+        }
+        try std.testing.expect(conn.tls_kernel_prefix_remaining > 0 and conn.tls_kernel_prefix_remaining < prefix_before_append);
+        try std.testing.expect(conn.send_armed);
+        const remaining = conn.tls_kernel_prefix_remaining;
+        try fixture.server.quiesceOwnedSocketIo();
+        try std.testing.expect(fixture.server.ownedSocketIoQuiesced());
+        try std.testing.expect(!conn.send_armed and !conn.recv_armed and !conn.send_cancel_pending);
+        try std.testing.expectEqual(@as(usize, 0), conn.send_submitted_len);
+        try std.testing.expectEqual(@as(usize, 0), conn.send_submitted_offset);
+        try std.testing.expect(conn.tls_kernel_prefix_remaining <= remaining);
+        try std.testing.expectEqual(@as(usize, "new suffix held behind kernel prefix".len), sendq.wireBacklog(conn) - @as(usize, @intCast(conn.tls_kernel_prefix_remaining)));
+        const capture = try tls3ServerCapture(conn);
+        defer a.free(capture);
+        const snapshot = try tls_snapshot.decodeCurrent(capture);
+        try std.testing.expectEqual(conn.tls_kernel_prefix_remaining, snapshot.kernel_tx_prefix_remaining);
+        // This production failure-resume path rearms the remaining OLD prefix,
+        // never a forbidden RECV prerequisite or the accepted new suffix.
+        fixture.server.resumeOwnedSocketIo();
+        try std.testing.expect(!fixture.server.rx().socket_io_quiescing);
+    }
+
+    var handler: CompletionHandler = .{ .server = fixture.server };
+    var completions: [8]reactor_backend.CompletionBuffer = undefined;
+    var cipher: std.ArrayList(u8) = .empty;
+    defer cipher.deinit(a);
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(a);
+    var replies: usize = 0;
+    var suffix: std.ArrayList(u8) = .empty;
+    defer suffix.deinit(a);
+    var scratch: [1024]u8 = undefined;
+    var complete = false;
+    for (0..2000) |_| {
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &handler);
+        if (handler.err) |err| return err;
+        _ = try fixture.server.activatePendingSocketIo();
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) return error.TestUnexpectedResult;
+            try cipher.appendSlice(a, scratch[0..n]);
+        }
+        while (cipher.items.len >= 5) {
+            const len = 5 + @as(usize, std.mem.readInt(u16, cipher.items[3..5], .big));
+            if (cipher.items.len < len) break;
+            switch (try fixture.pair.client.tls13.decryptApp(cipher.items[0..len])) {
+                .application_data => |bytes| {
+                    defer a.free(bytes);
+                    if (replies == 0) try plain.appendSlice(a, bytes) else {
+                        try std.testing.expectEqual(@as(usize, 1), replies);
+                        try suffix.appendSlice(a, bytes);
+                    }
+                },
+                .control => {
+                    // An actual authenticated reply under the old epoch must
+                    // follow the whole old plaintext prefix, never just its
+                    // first inline portion or the first partial CQE.
+                    try std.testing.expectEqualSlices(u8, prefix, plain.items);
+                    try std.testing.expectEqual(@as(usize, 0), suffix.items.len);
+                    replies += 1;
+                },
+            }
+            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - len], cipher.items[len..]);
+            cipher.shrinkRetainingCapacity(cipher.items.len - len);
+        }
+        if (clean_close and fixture.server.rx().clients.get(fixture.id) == null) {
+            complete = plain.items.len == prefix.len and replies == 1 and
+                suffix.items.len == "new suffix held behind kernel prefix".len and cipher.items.len == 0;
+            break;
+        }
+        if (!conn.send_armed and sendq.wireBacklog(conn) == 0 and !t.tx_ku_reply_pending and
+            t.control_phase == .none and plain.items.len == prefix.len and replies == 1 and
+            suffix.items.len == "new suffix held behind kernel prefix".len and cipher.items.len == 0)
+        {
+            complete = true;
+            break;
+        }
+    }
+    if (!complete and fixture.server.rx().clients.get(fixture.id) != null) std.debug.print("kernel prefix suite={x} rx={} armed={} overflow={} plain={} replies={} phase={s} prefix={} credit={} wire={} sendarmed={}\n", .{ suite, kernel_rx, armed, overflow, plain.items.len, replies, @tagName(t.control_phase), conn.tls_kernel_prefix_remaining, conn.tls_control_charge, sendq.wireBacklog(conn), conn.send_armed });
+    try std.testing.expect(complete);
+    try std.testing.expectEqualStrings("new suffix held behind kernel prefix", suffix.items);
+    if (clean_close) {
+        try std.testing.expect(fixture.server.rx().clients.get(fixture.id) == null);
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2000) == 0) return error.TestTimeout;
+        try std.testing.expectEqual(@as(usize, 0), try readFd(fixture.peer_fd, &scratch));
+        return;
+    }
+    try tls3ServerAssertKernelTuple(suite, conn.fd, .tx, &fixture.pair.client.tls13.server_app_secret, 1);
+    try std.testing.expectEqual(@as(usize, 0), conn.tls_control_charge);
+    try std.testing.expectEqualSlices(u8, &fixture.pair.client.tls13.server_app_secret, &t.engine.tls13.server_app_secret);
+    try std.testing.expect(!std.mem.eql(u8, &old_secret, &t.engine.tls13.server_app_secret));
+    try std.testing.expect(!conn.closing);
+    try appendSecuredToConn(conn, "new epoch after kernel prefix");
+    try fixture.server.armSendIfNeeded(conn);
+    for (0..2000) |_| {
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &handler);
+        if (handler.err) |err| return err;
+        _ = try fixture.server.activatePendingSocketIo();
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) return error.TestUnexpectedResult;
+            try cipher.appendSlice(a, scratch[0..n]);
+        }
+        if (cipher.items.len >= 5 and cipher.items.len == 5 + @as(usize, std.mem.readInt(u16, cipher.items[3..5], .big)) and !conn.send_armed) break;
+    }
+    const after = try fixture.pair.decode(cipher.items);
+    defer a.free(after);
+    try std.testing.expectEqualStrings("new epoch after kernel prefix", after);
+}
+
+test "TLS3: funded kernel TX old inline and overflow FIFO precede KU under actual CQEs" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        for ([_]bool{ false, true }) |rx| {
+            for ([_]bool{ false, true }) |armed| {
+                for ([_]bool{ false, true }) |overflow| try tls3ServerKernelPrefix(suite, rx, armed, overflow, false, false, false);
+            }
+        }
+    }
+}
+
+test "TLS3: actual SQ-full kernel old-prefix retry bypasses forbidden receive and overflow fast-return" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| try tls3ServerKernelPrefix(suite, false, false, true, true, false, false);
+}
+
+test "TLS3: actual clean close progresses held KU before accepted kernel suffix and EOF" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |rx| try tls3ServerKernelPrefix(suite, rx, true, true, false, true, false);
+}
+
+test "TLS3: actual positive SEND cancel race carries kernel prefix and resumes exact FIFO" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |rx| try tls3ServerKernelPrefix(suite, rx, true, true, false, false, true);
+}
+
+// Independent AEAD verification remains usable after the real peer has
+// entered its terminal fatal-alert state. Keys came from the signed handshake.
+fn tls3ServerOpenTerminalPrefixT(comptime A: type, key: []const u8, iv: [12]u8, seq: u64, wire: []const u8) ![]u8 {
+    const a = std.testing.allocator;
+    const record = try tls_record.parseCiphertext(wire);
+    if (record.encrypted_record.len < A.tag_length) return error.TestUnexpectedResult;
+    const n = record.encrypted_record.len - A.tag_length;
+    const inner = try a.alloc(u8, n);
+    defer a.free(inner);
+    const aad = record.headerBytes();
+    try A.decrypt(inner, record.encrypted_record[0..n], record.encrypted_record[n..][0..A.tag_length].*, &aad, tls_record.deriveNonce(iv, seq), key[0..A.key_length].*);
+    const plain = try tls_record.decodeInnerPlaintext(inner);
+    try std.testing.expectEqual(tls_record.ContentType.application_data, plain.content_type);
+    return a.dupe(u8, plain.content);
+}
+
+fn tls3ServerPeerFatal(suite: u16, kernel_tx: bool) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.createTransport(suite, true);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const physical = fixture.connection();
+    const token = physical.token;
+    const id = fixture.id;
+    const t = physical.tls.?;
+    physical.test_sendq_capture = false;
+    if (kernel_tx) {
+        try t.enableKtlsTx(physical.fd);
+        physical.tls_tx_offloaded = true;
+    }
+    try t.enableKtlsRx(physical.fd);
+    physical.tls_rx_offloaded = true;
+    const keys = fixture.pair.client.tls13.server_app_keys;
+    const rx_seq = fixture.pair.client.tls13.app_read_seq;
+    const prefix: [128]u8 = @splat('f');
+    try appendSecuredToConn(physical, &prefix);
+    try fixture.server.armSendIfNeeded(physical);
+    try std.testing.expect(physical.send_armed);
+    const submitted = physical.send_submitted_len;
+    const fatal = fixture.pair.client.tls13.takeAlert(error.RecordAuthenticationFailed).?;
+    defer a.free(fatal);
+    try writeAllFd(fixture.peer_fd, fatal);
+    var readable = [_]posix.pollfd{.{ .fd = physical.fd, .events = posix.POLL.IN, .revents = 0 }};
+    if (try posix.poll(&readable, 2000) == 0) return error.TestTimeout;
+    const rc = linux.recvfrom(physical.fd, physical.recv_buf[0..].ptr, physical.recv_buf.len, linux.MSG.DONTWAIT, null, null);
+    try std.testing.expectEqual(posix.E.IO, posix.errno(rc));
+    try std.testing.expectEqual(Server.KtlsRxDrain.survived, try fixture.server.handleKtlsRxControl(id, physical));
+    try std.testing.expect(physical.send_armed);
+    try std.testing.expectEqual(submitted, physical.send_submitted_len);
+    try appendSecuredToConn(physical, "unpublished fatal suffix must disappear");
+    try std.testing.expectEqual(submitted, physical.send_submitted_len);
+    var handler: CompletionHandler = .{ .server = fixture.server };
+    var completions: [8]reactor_backend.CompletionBuffer = undefined;
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(a);
+    var scratch: [1024]u8 = undefined;
+    var eof = false;
+    for (0..2000) |_| {
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &handler);
+        if (handler.err) |err| return err;
+        _ = try fixture.server.activatePendingSocketIo();
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) {
+                eof = true;
+                break;
+            }
+            try received.appendSlice(a, scratch[0..n]);
+        }
+    }
+    try std.testing.expect(eof);
+    try std.testing.expect(fixture.server.rx().clients.get(id) == null);
+    try std.testing.expectError(error.ClientNotFound, fixture.server.connForToken(token));
+    // Only the already submitted prefix survives. There is no response alert,
+    // KU or unsubmitted application suffix in either transmit mode.
+    try std.testing.expectEqual(@as(usize, prefix.len + 22), received.items.len);
+    const decoded = switch (suite) {
+        0x1301 => try tls3ServerOpenTerminalPrefixT(std.crypto.aead.aes_gcm.Aes128Gcm, &keys.key, keys.iv, rx_seq, received.items),
+        0x1302 => try tls3ServerOpenTerminalPrefixT(std.crypto.aead.aes_gcm.Aes256Gcm, &keys.key, keys.iv, rx_seq, received.items),
+        0x1303 => try tls3ServerOpenTerminalPrefixT(std.crypto.aead.chacha_poly.ChaCha20Poly1305, &keys.key, keys.iv, rx_seq, received.items),
+        else => unreachable,
+    };
+    defer a.free(decoded);
+    try std.testing.expectEqualSlices(u8, &prefix, decoded);
+}
+
+test "TLS3: authenticated peer fatal after armed prefix retires exact physical generation without reply or suffix" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |tx| try tls3ServerPeerFatal(suite, tx);
+}
+
+fn tls3ServerCaptureAdoptFaults(suite: u16, kernel: bool) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.createTransport(suite, kernel);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const original = fixture.connection();
+    const original_fd = original.fd;
+    if (kernel) {
+        try original.tls.?.enableKtlsTx(original_fd);
+        original.tls_tx_offloaded = true;
+        try original.tls.?.enableKtlsRx(original_fd);
+        original.tls_rx_offloaded = true;
+    }
+    const prefix = try a.alloc(u8, 20000);
+    defer a.free(prefix);
+    @memset(prefix, 'o');
+    try appendSecuredToConn(original, prefix);
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 1, 4 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    if (kernel) {
+        try writeAllFd(fixture.peer_fd, request);
+        var ready = [_]posix.pollfd{.{ .fd = original_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2000) == 0) return error.TestTimeout;
+        const rc = linux.recvfrom(original_fd, original.recv_buf[0..].ptr, original.recv_buf.len, linux.MSG.DONTWAIT, null, null);
+        try std.testing.expectEqual(posix.E.IO, posix.errno(rc));
+        try std.testing.expectEqual(Server.KtlsRxDrain.survived, try fixture.server.handleKtlsRxControl(fixture.id, original));
+    } else try fixture.server.driveTls(fixture.id, original, request);
+    try appendSecuredToConn(original, "accepted staged suffix");
+    const exact = try tls3ServerCapture(original);
+    defer a.free(exact);
+    const queue = try daemonOutputQueued(a, original);
+    defer a.free(queue);
+    const before_b = original.tls_kernel_prefix_remaining;
+    const before_credit = original.tls_control_charge;
+    const fd_flags = portable_test_system.fcntl(original_fd, posix.F.GETFD, @as(c_int, 0));
+    var capture_success = false;
+    var capture_failures: usize = 0;
+    for (0..256) |index| {
+        var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        if (tls3ServerCaptureWithAllocator(original, fault.allocator())) |bytes| {
+            defer fault.allocator().free(bytes);
+            try std.testing.expectEqualSlices(u8, exact, bytes);
+            capture_success = true;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            capture_failures += 1;
+        }
+        const after = try tls3ServerCapture(original);
+        defer a.free(after);
+        try std.testing.expectEqualSlices(u8, exact, after);
+        try std.testing.expectEqual(before_b, original.tls_kernel_prefix_remaining);
+        try std.testing.expectEqual(before_credit, original.tls_control_charge);
+        try std.testing.expectEqual(fd_flags, portable_test_system.fcntl(original_fd, posix.F.GETFD, @as(c_int, 0)));
+        if (capture_success) break;
+    }
+    try std.testing.expect(capture_success and capture_failures > 1);
+    var session = original.session.snapshot();
+    session.fd = original_fd;
+    session.was_secured = true;
+    session.was_websocket = true;
+    const ws: ws_snapshot.Snapshot = .{ .fd = original_fd, .phase_open = true, .tx = "retained WS suffix" };
+    const ts = try tls_snapshot.decodeCurrent(exact);
+    var adopt_success = false;
+    var adopt_failures: usize = 0;
+    for (0..256) |index| {
+        var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = std.math.maxInt(usize) });
+        const successor = try createTestServer(fault.allocator(), fixture.server.config);
+        defer {
+            successor.deinit();
+            fault.allocator().destroy(successor);
+        }
+        current_reactor = &successor.reactors[0];
+        fault.fail_index = fault.alloc_index + index;
+        const accepted = successor.adoptInheritedClient(session, ts, ws, false);
+        fault.fail_index = std.math.maxInt(usize);
+        if (accepted) {
+            const adopted = successor.adoptedConnByFd(original_fd).?;
+            adopted.fd = -1; // leave predecessor descriptor custody unchanged
+            try std.testing.expect(!adopted.send_armed and !adopted.recv_armed);
+            try std.testing.expectEqual(before_b, adopted.tls_kernel_prefix_remaining);
+            try std.testing.expectEqual(before_credit, adopted.tls_control_charge);
+            try std.testing.expectEqualStrings("retained WS suffix", adopted.ws.?.tx_buf[0..adopted.ws.?.tx_len]);
+            const adopted_queue = try daemonOutputQueued(a, adopted);
+            defer a.free(adopted_queue);
+            try std.testing.expectEqualSlices(u8, queue, adopted_queue);
+            adopt_success = true;
+        } else {
+            adopt_failures += 1;
+            try std.testing.expectEqual(@as(usize, 0), successor.reactors[0].clients.len());
+            try std.testing.expect(successor.world.findNick("Tls3Owner") == null);
+        }
+        current_reactor = &fixture.server.reactors[0];
+        const after = try tls3ServerCapture(original);
+        defer a.free(after);
+        try std.testing.expectEqualSlices(u8, exact, after);
+        // Successful inert adoption deliberately restores exec hygiene after
+        // its final fallible stage; every refused attempt leaves flags exact.
+        const expected_flags = if (accepted) fd_flags | posix.FD_CLOEXEC else fd_flags;
+        try std.testing.expectEqual(expected_flags, portable_test_system.fcntl(original_fd, posix.F.GETFD, @as(c_int, 0)));
+        if (adopt_success) break;
+    }
+    try std.testing.expect(adopt_success and adopt_failures >= 4);
+}
+
+test "TLS3: paired capture and physical adoption every allocation fault retains queue cursor keys FD and WS suffix" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        try tls3ServerCaptureAdoptFaults(suite, false);
+        if (comptime builtin.os.tag == .linux) try tls3ServerCaptureAdoptFaults(suite, true);
+    }
+}
+
+fn tls3ServerBufferedParser(suite: u16, oversized: bool) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(suite);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const physical = fixture.connection();
+    const token = physical.token;
+    physical.test_sendq_capture = false;
+    physical.recvq_cap = 32;
+    const sibling_id = try addTestLocalClient(fixture.server, "Tls3Sibling", null);
+    const sibling = fixture.server.connFor(sibling_id).?;
+    sibling.session.restore(.{ .nick = "Tls3Sibling", .username = "sibling", .realname = "TLS3 sibling" });
+    try appendSecuredToConn(physical, "old prefix before buffered parser");
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 1, 4 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    const overlong: [64]u8 = @splat('x');
+    const application = try fixture.pair.client.tls13.encrypt(if (oversized) &overlong else "PONG :healthy\r\n");
+    defer a.free(application);
+    const receive = try std.mem.concat(a, u8, &.{ request, application });
+    defer a.free(receive);
+    try fixture.server.driveTls(fixture.id, physical, receive);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.userspace_requested_ku_held, physical.tls.?.control_phase);
+    try std.testing.expect(physical.tls.?.hasCompleteBufferedInbound());
+    try std.testing.expect(!physical.closing);
+    try fixture.server.armSendIfNeeded(physical);
+    try std.testing.expect(physical.send_armed);
+    var handler: CompletionHandler = .{ .server = fixture.server };
+    var cqes: [8]reactor_backend.CompletionBuffer = undefined;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    var scratch: [1024]u8 = undefined;
+    var completed = false;
+    for (0..2000) |_| {
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.rx().ring.reapCompletions(&cqes, 0, &handler);
+        // A malformed line must retire this generation, never stop the reactor.
+        try std.testing.expect(handler.err == null);
+        _ = try fixture.server.activatePendingSocketIo();
+        var readable = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&readable, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) {
+                try std.testing.expect(oversized);
+                completed = true;
+                break;
+            }
+            try wire.appendSlice(a, scratch[0..n]);
+        }
+        if (!oversized) if (fixture.server.connFor(fixture.id)) |current| {
+            if (!current.send_armed and sendq.wireBacklog(current) == 0 and !current.tls.?.hasCompleteBufferedInbound()) {
+                completed = true;
+                break;
+            }
+        };
+    }
+    try std.testing.expect(completed);
+    if (oversized) {
+        try std.testing.expect(fixture.server.connFor(fixture.id) == null);
+        try std.testing.expectError(error.ClientNotFound, fixture.server.connForToken(token));
+    } else try std.testing.expect(!fixture.connection().closing);
+    try std.testing.expect(!sibling.closing);
+    try std.testing.expect(try fixture.server.driveClientBytes(sibling_id, sibling, "PONG :sibling-still-live\r\n"));
+    try std.testing.expect(!sibling.closing);
+    const plaintext = try fixture.pair.decode(wire.items);
+    defer a.free(plaintext);
+    try std.testing.expectEqualStrings("old prefix before buffered parser", plaintext);
+}
+
+test "TLS3: SEND completion buffered parser failure retires one generation and keeps sibling live" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        try tls3ServerBufferedParser(suite, false);
+        try tls3ServerBufferedParser(suite, true);
+    }
+}
+
+fn tls3ServerBufferedRetirement(suite: u16, closing_before: bool) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(suite);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const physical = fixture.connection();
+    const token = physical.token;
+    const prefix = "old prefix before buffered retirement";
+    const suffix = "accepted suffix before buffered retirement";
+    try appendSecuredToConn(physical, prefix);
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 1, 4 });
+    const first = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(first);
+    const overlong: [64]u8 = @splat('x');
+    const command = if (closing_before) try a.dupe(u8, "JOIN #after-close\r\n") else try std.mem.concat(a, u8, &.{ "PING :retained-output\r\n", &overlong });
+    defer a.free(command);
+    const application = try fixture.pair.client.tls13.encrypt(command);
+    defer a.free(application);
+    var inbound: std.ArrayList(u8) = .empty;
+    defer inbound.deinit(a);
+    try inbound.appendSlice(a, first);
+    try inbound.appendSlice(a, application);
+    if (!closing_before) {
+        physical.recvq_cap = 32;
+        // The second authenticated request is held behind newly published wire
+        // while its preceding PING creates another accepted deferred response.
+        try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 2, 3 });
+        const second = (try fixture.pair.client.tls13.takePendingSend()).?;
+        defer a.free(second);
+        try inbound.appendSlice(a, second);
+    }
+    try fixture.server.driveTls(fixture.id, physical, inbound.items);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.userspace_requested_ku_held, physical.tls.?.control_phase);
+    try std.testing.expect(physical.tls.?.hasCompleteBufferedInbound());
+    try std.testing.expect(!physical.closing);
+    physical.test_sendq_capture = false;
+    if (closing_before) {
+        try std.testing.expectEqual(Server.DeliveryOutcome.delivered, fixture.server.enqueueDeliveryMaybeClose(fixture.id, suffix, true, "accepted preexisting close"));
+        try std.testing.expect(physical.closing);
+    } else {
+        try appendSecuredToConn(physical, suffix);
+        try fixture.server.armSendIfNeeded(physical);
+    }
+    try std.testing.expect(physical.send_armed);
+    try std.testing.expect(physical.tls_deferred_plain.items.len != 0);
+    try std.testing.expect(physical.tls_deferred_charge != 0);
+    try std.testing.expect(try fixture.server.connForToken(token) == physical);
+    var handler: CompletionHandler = .{ .server = fixture.server };
+    var completions: [8]reactor_backend.CompletionBuffer = undefined;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    var scratch: [2048]u8 = undefined;
+    var eof = false;
+    for (0..2_000) |_| {
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &handler);
+        if (handler.err) |err| return err;
+        _ = try fixture.server.activatePendingSocketIo();
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) {
+                eof = true;
+                break;
+            }
+            try wire.appendSlice(a, scratch[0..n]);
+        }
+    }
+    try std.testing.expect(eof);
+    try std.testing.expectError(error.ClientNotFound, fixture.server.connForToken(token));
+    const Usage = struct {
+        joins: u64 = 0,
+        pings: u64 = 0,
+        fn collect(self: *@This(), row: command_usage.CommandUsage.Row) anyerror!void {
+            if (std.mem.eql(u8, row.name, "JOIN")) self.joins += row.count;
+            if (std.mem.eql(u8, row.name, "PING")) self.pings += row.count;
+        }
+    };
+    var usage: Usage = .{};
+    try fixture.server.command_usage.forEach(&usage, Usage.collect);
+    try std.testing.expectEqual(@as(u64, 0), usage.joins);
+    try std.testing.expectEqual(@as(u64, if (closing_before) 0 else 1), usage.pings);
+    try std.testing.expect(!fixture.server.world.channelExists("#after-close"));
+    const plain = try fixture.pair.decode(wire.items);
+    defer a.free(plain);
+    // Healthy close completes every accepted output. Terminal IRC policy
+    // disposes unsent output rather than publishing a response after failure.
+    try std.testing.expectEqualStrings(if (closing_before) prefix ++ suffix else prefix, plain);
+}
+
+test "TLS3: buffered overlong input terminally disposes a second held KU and its accepted plaintext" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| try tls3ServerBufferedRetirement(suite, false);
+}
+
+test "TLS3: drain-close completes requested KU without dispatching buffered application commands" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| try tls3ServerBufferedRetirement(suite, true);
+}
+
+const Tls3DrainFault = enum { metadata, tls, sendq };
+
+fn tls3ServerSoftwareCloseRetry(suite: u16, point: Tls3DrainFault, kernel_rx: bool) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.createTransport(suite, kernel_rx);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const physical = fixture.connection();
+    if (kernel_rx) {
+        try physical.tls.?.enableKtlsRx(physical.fd);
+        physical.tls_rx_offloaded = true;
+    }
+    const token = physical.token;
+    const prefix = "old prefix before software close";
+    const suffix = try a.alloc(u8, 32_768);
+    defer a.free(suffix);
+    @memset(suffix, 's');
+    try appendSecuredToConn(physical, prefix);
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 3, 2 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    if (kernel_rx) {
+        try writeAllFd(fixture.peer_fd, request);
+        var ready = [_]posix.pollfd{.{ .fd = physical.fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2_000) == 0) return error.TestTimeout;
+        const rc = linux.recvfrom(physical.fd, physical.recv_buf[0..].ptr, physical.recv_buf.len, linux.MSG.DONTWAIT, null, null);
+        try std.testing.expectEqual(posix.E.IO, posix.errno(rc));
+        try std.testing.expectEqual(Server.KtlsRxDrain.survived, try fixture.server.handleKtlsRxControl(fixture.id, physical));
+    } else try fixture.server.driveTls(fixture.id, physical, request);
+    try std.testing.expectEqual(if (kernel_rx) tls_conn.ControlBarrierPhase.kernel_control_read_held else .userspace_requested_ku_held, physical.tls.?.control_phase);
+    physical.test_sendq_capture = false;
+    try std.testing.expectEqual(Server.DeliveryOutcome.delivered, fixture.server.enqueueDeliveryMaybeClose(fixture.id, suffix, true, "accepted software close suffix"));
+    try std.testing.expect(physical.closing and physical.send_armed);
+    const retained = try a.dupe(u8, physical.tls_deferred_plain.items);
+    defer a.free(retained);
+    const charge = physical.tls_deferred_charge;
+    // Reach the ready phase with a metadata failure after real reply custody;
+    // a TLS allocator failure before that point would target KU admission.
+    var reaching = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    fixture.server.allocator = reaching.allocator();
+    var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    defer {
+        fixture.server.allocator = a;
+        if (fixture.server.connFor(fixture.id)) |live| {
+            live.overflow_allocator = a;
+            live.tls.?.engine.tls13.allocator = a;
+        }
+    }
+    var handler: CompletionHandler = .{ .server = fixture.server };
+    var completions: [8]reactor_backend.CompletionBuffer = undefined;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    var scratch: [4096]u8 = undefined;
+    var stalled = false;
+    for (0..2_000) |_| {
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &handler);
+        if (handler.err) |err| return err;
+        _ = try fixture.server.activatePendingSocketIo();
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) break;
+            try wire.appendSlice(a, scratch[0..n]);
+        }
+        const live = fixture.server.connFor(fixture.id) orelse break;
+        if (!live.send_armed and sendq.wireBacklog(live) == 0 and live.tls.?.control_phase == .software_tail_ready) {
+            stalled = true;
+            break;
+        }
+    }
+    try std.testing.expect(reaching.has_induced_failure);
+    try std.testing.expect(stalled);
+    const live = try fixture.server.connForToken(token);
+    fixture.server.allocator = a;
+    switch (point) {
+        .metadata => fixture.server.allocator = fault.allocator(),
+        .tls => live.tls.?.engine.tls13.allocator = fault.allocator(),
+        .sendq => live.overflow_allocator = fault.allocator(),
+    }
+    try std.testing.expect(live.closing and !live.tls_terminal_failure);
+    try std.testing.expectEqualSlices(u8, retained, live.tls_deferred_plain.items);
+    try std.testing.expectEqual(charge, live.tls_deferred_charge);
+    try std.testing.expectEqual(@as(u64, 0), live.tls.?.engine.tls13.app_write_seq);
+    // A second actual activation under pressure must retain the complete row.
+    _ = try fixture.server.activatePendingSocketIo();
+    try std.testing.expect(fault.has_induced_failure);
+    try std.testing.expect(fixture.server.connFor(fixture.id) != null);
+    try std.testing.expectEqualSlices(u8, retained, live.tls_deferred_plain.items);
+    try std.testing.expectEqual(charge, live.tls_deferred_charge);
+    try std.testing.expectEqual(@as(u64, 0), live.tls.?.engine.tls13.app_write_seq);
+    fixture.server.allocator = a;
+    live.overflow_allocator = a;
+    live.tls.?.engine.tls13.allocator = a;
+    var eof = false;
+    for (0..2_000) |_| {
+        _ = try fixture.server.activatePendingSocketIo();
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &handler);
+        if (handler.err) |err| return err;
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) {
+                eof = true;
+                break;
+            }
+            try wire.appendSlice(a, scratch[0..n]);
+        }
+    }
+    try std.testing.expect(eof);
+    try std.testing.expect(fixture.server.connFor(fixture.id) == null);
+    try std.testing.expectError(error.ClientNotFound, fixture.server.connForToken(token));
+    const plain = try fixture.pair.decode(wire.items);
+    defer a.free(plain);
+    try std.testing.expectEqual(prefix.len + suffix.len, plain.len);
+    try std.testing.expectEqualStrings(prefix, plain[0..prefix.len]);
+    try std.testing.expectEqualSlices(u8, suffix, plain[prefix.len..]);
+}
+
+test "TLS3: clean software drain-close retains accepted phase3 plaintext through metadata TLS and SendQ OOM" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]Tls3DrainFault{ .metadata, .tls, .sendq }) |point|
+        try tls3ServerSoftwareCloseRetry(suite, point, false);
+}
+
+test "TLS3: kernel RX with software TX retains clean-close plaintext through every phase3 preparation OOM" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]Tls3DrainFault{ .metadata, .tls, .sendq }) |point|
+        try tls3ServerSoftwareCloseRetry(suite, point, true);
+}
+
+test "TLS3: an exhausted software tail epoch terminates rather than retrying accepted close output forever" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        current_reactor = null;
+        var fixture = try Tls3ServerFixture.create(suite);
+        defer fixture.deinit();
+        current_reactor = &fixture.server.reactors[0];
+        const physical = fixture.connection();
+        try appendSecuredToConn(physical, "prefix before exhausted epoch");
+        try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 2, 3 });
+        const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+        defer a.free(request);
+        try fixture.server.driveTls(fixture.id, physical, request);
+        try appendSecuredToConn(physical, "accepted tail at counter boundary");
+        const prefix = try tls3ServerDrain(&fixture, physical);
+        defer a.free(prefix);
+        try std.testing.expectEqualStrings("prefix before exhausted epoch", prefix);
+        var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        fixture.server.allocator = fault.allocator();
+        try fixture.server.progressTlsControl(physical);
+        fixture.server.allocator = a;
+        try std.testing.expect(fault.has_induced_failure);
+        try std.testing.expectEqual(tls_conn.ControlBarrierPhase.software_tail_ready, physical.tls.?.control_phase);
+        const reply = try tls3ServerDrain(&fixture, physical);
+        defer a.free(reply);
+        try std.testing.expectEqual(@as(usize, 0), reply.len);
+        // Exercise the supported canonical exhausted-counter state without
+        // pretending to have transmitted 2^64 records in this bounded fixture.
+        physical.tls.?.engine.tls13.app_write_seq = std.math.maxInt(u64);
+        try std.testing.expectError(error.SequenceExhausted, physical.tls.?.prepareDeferredWriteBatch(&.{"accepted tail at counter boundary"}));
+        physical.test_sendq_capture = false;
+        physical.closing = true;
+        physical.close_reason = "counter-boundary close";
+        const token = physical.token;
+        try fixture.server.progressTlsControl(physical);
+        try std.testing.expect(physical.tls_terminal_failure);
+        try std.testing.expectEqual(@as(usize, 0), physical.tls_deferred_plain.items.len);
+        try std.testing.expectEqual(@as(usize, 0), physical.tls_deferred_charge);
+        try std.testing.expectEqual(@as(usize, 0), sendq.wireBacklog(physical));
+        _ = try fixture.server.activatePendingSocketIo();
+        try std.testing.expectError(error.ClientNotFound, fixture.server.connForToken(token));
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2_000) == 0) return error.TestTimeout;
+        var scratch: [128]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try readFd(fixture.peer_fd, &scratch));
+    }
+}
+
+const Tls3ActivationEntry = enum { activation, run_once, failure_resume };
+
+fn tls3ServerActivationWorldExclusion(suite: u16, entry: Tls3ActivationEntry) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(suite);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const physical = fixture.connection();
+    try appendSecuredToConn(physical, "old prefix before graph admission");
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 1, 4 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    const command = try fixture.pair.client.tls13.encrypt("JOIN #activation-cut\r\n");
+    defer a.free(command);
+    var inbound: std.ArrayList(u8) = .empty;
+    defer inbound.deinit(a);
+    try inbound.appendSlice(a, request);
+    try inbound.appendSlice(a, command);
+    try fixture.server.driveTls(fixture.id, physical, inbound.items);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.userspace_requested_ku_held, physical.tls.?.control_phase);
+    try std.testing.expect(physical.tls.?.hasCompleteBufferedInbound());
+    try std.testing.expect(!fixture.server.world.channelExists("#activation-cut"));
+    const prefix = try tls3ServerDrain(&fixture, physical);
+    defer a.free(prefix);
+    try std.testing.expectEqualStrings("old prefix before graph admission", prefix);
+    physical.test_sendq_capture = false;
+    physical.io_activation_pending = true;
+    physical.activation_recv_required = false;
+    if (entry == .failure_resume) fixture.server.reactors[0].socket_io_quiescing = true;
+
+    const Activation = struct {
+        server: *Server,
+        entry: Tls3ActivationEntry,
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            current_reactor = &self.server.reactors[0];
+            defer current_reactor = null;
+            switch (self.entry) {
+                .failure_resume => self.server.resumeOwnedSocketIo(),
+                .activation => {
+                    _ = self.server.activatePendingSocketIo() catch |err| {
+                        self.failure = err;
+                    };
+                },
+                .run_once => self.server.runOnce() catch |err| {
+                    self.failure = err;
+                },
+            }
+            self.done.store(true, .release);
+        }
+    };
+    var activation: Activation = .{ .server = fixture.server, .entry = entry };
+    fixture.server.world.lockWrite();
+    var held = true;
+    var worker = std.Thread.spawn(.{}, Activation.run, .{&activation}) catch |err| {
+        fixture.server.world.unlockWrite();
+        return err;
+    };
+    var joined = false;
+    defer {
+        if (held) fixture.server.world.unlockWrite();
+        if (!joined) worker.join();
+    }
+    const deadline = fixture.server.nowMs() + 2_000;
+    // The lock's actual waiter counter proves the owner reached exclusion;
+    // old code instead completes the authenticated graph mutation under our
+    // retained write lock. No scheduler sleep is used as the success oracle.
+    while (!activation.done.load(.acquire) and fixture.server.world.lock.writers_waiting.load(.acquire) == 0) {
+        if (fixture.server.nowMs() >= deadline) return error.TestTimeout;
+        std.Thread.yield() catch {};
+    }
+    const excluded = !activation.done.load(.acquire) and fixture.server.world.lock.writers_waiting.load(.acquire) != 0;
+    if (excluded) try std.testing.expect(!fixture.server.world.channelExists("#activation-cut"));
+    fixture.server.world.unlockWrite();
+    held = false;
+    worker.join();
+    joined = true;
+    if (activation.failure) |err| return err;
+    try std.testing.expect(activation.done.load(.acquire));
+    try std.testing.expect(fixture.server.world.isMember("#activation-cut", worldIdFromClient(fixture.id)));
+    // A separately declared local sink reads the committed graph through the
+    // actual WHO parser after exclusion ends, rather than a fixture-only getter.
+    const observer_id = try addTestLocalClient(fixture.server, "GraphObserver", null);
+    const observer = fixture.server.connFor(observer_id).?;
+    observer.test_sendq_capture = true;
+    observer.session.restore(.{ .nick = "GraphObserver", .username = "observer", .realname = "graph observer" });
+    fixture.server.world.lockWrite();
+    const observed = fixture.server.driveClientBytes(observer_id, observer, "WHO #activation-cut\r\n") catch |err| {
+        fixture.server.world.unlockWrite();
+        return err;
+    };
+    fixture.server.world.unlockWrite();
+    try std.testing.expect(observed);
+    const observer_wire = try daemonOutputQueued(a, observer);
+    defer a.free(observer_wire);
+    try expectContains(observer_wire, " 352 GraphObserver #activation-cut ");
+    try expectContains(observer_wire, " Tls3Owner ");
+    try std.testing.expect(!physical.closing);
+    try std.testing.expect(physical.send_armed);
+
+    var handler: CompletionHandler = .{ .server = fixture.server };
+    var completions: [8]reactor_backend.CompletionBuffer = undefined;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    var scratch: [2048]u8 = undefined;
+    var complete = false;
+    for (0..2_000) |_| {
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &handler);
+        if (handler.err) |err| return err;
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) return error.TestUnexpectedResult;
+            try wire.appendSlice(a, scratch[0..n]);
+        }
+        if (!physical.send_armed and sendq.wireBacklog(physical) == 0 and wire.items.len != 0) {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    const plaintext = try fixture.pair.decode(wire.items);
+    defer a.free(plaintext);
+    try expectContains(plaintext, "JOIN #activation-cut");
+    try std.testing.expect(excluded);
+}
+
+test "TLS3: activation and failed-upgrade resume exclude authenticated buffered JOIN under World lock" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]Tls3ActivationEntry{ .activation, .run_once, .failure_resume }) |entry|
+        try tls3ServerActivationWorldExclusion(suite, entry);
+}
+
+fn tls3ServerPartialReplyAdopt(suite: u16, kernel_rx: bool, first: usize) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.createTransport(suite, true);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const original = fixture.connection();
+    const fd = original.fd;
+    original.test_sendq_capture = false;
+    try original.tls.?.enableKtlsTx(fd);
+    original.tls_tx_offloaded = true;
+    if (kernel_rx) {
+        try original.tls.?.enableKtlsRx(fd);
+        original.tls_rx_offloaded = true;
+    }
+    const old_tx = fixture.pair.client.tls13.server_app_secret;
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 1, 4 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    if (kernel_rx) {
+        try writeAllFd(fixture.peer_fd, request);
+        var readable = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&readable, 2000) == 0) return error.TestTimeout;
+        const rc = linux.recvfrom(fd, original.recv_buf[0..].ptr, original.recv_buf.len, linux.MSG.DONTWAIT, null, null);
+        try std.testing.expectEqual(posix.E.IO, posix.errno(rc));
+        try std.testing.expectEqual(Server.KtlsRxDrain.survived, try fixture.server.handleKtlsRxControl(fixture.id, original));
+    } else try fixture.server.driveTls(fixture.id, original, request);
+    try std.testing.expect(original.tls.?.tx_ku_reply_pending);
+    try appendSecuredToConn(original, "kernel plaintext after partial typed reply");
+    if (first != 0) try fixture.server.progressTlsControlWithBudget(original, first);
+    try std.testing.expectEqual(@as(u3, @intCast(first)), original.tls.?.tx_ku_reply_sent);
+    try std.testing.expectEqual(@as(usize, 5 - first), original.tls_control_charge);
+    try std.testing.expect(!original.send_armed);
+    try tls3ServerAssertKernelTuple(suite, fd, .tx, &old_tx, if (first == 0) 0 else 1);
+    const initial = try tls3ServerCapture(original);
+    defer a.free(initial);
+    const snapshot1 = try tls_snapshot.decodeCurrent(initial);
+    const successor1 = try createTestServer(a, fixture.server.config);
+    defer {
+        successor1.deinit();
+        a.destroy(successor1);
+    }
+    current_reactor = &successor1.reactors[0];
+    var session1 = original.session.snapshot();
+    session1.fd = fd;
+    session1.was_secured = true;
+    try std.testing.expect(successor1.adoptInheritedClient(session1, snapshot1, null, false));
+    original.fd = -1;
+    const c1 = successor1.adoptedConnByFd(fd).?;
+    c1.test_sendq_capture = false;
+    try std.testing.expectEqual(@as(u3, @intCast(first)), c1.tls.?.tx_ku_reply_sent);
+    try std.testing.expect(!c1.send_armed and !c1.recv_armed);
+    const second = if (first < 4) first + 1 else first;
+    if (first < 4) try successor1.progressTlsControlWithBudget(c1, 1);
+    try std.testing.expectEqual(@as(u3, @intCast(second)), c1.tls.?.tx_ku_reply_sent);
+    try std.testing.expectEqual(@as(usize, 5 - second), c1.tls_control_charge);
+    try tls3ServerAssertKernelTuple(suite, fd, .tx, &old_tx, @as(u64, if (first == 0) 0 else 1) + @as(u64, if (first < 4) 1 else 0));
+    const next = try tls3ServerCapture(c1);
+    defer a.free(next);
+    const snapshot2 = try tls_snapshot.decodeCurrent(next);
+    const successor2 = try createTestServer(a, fixture.server.config);
+    defer {
+        successor2.deinit();
+        a.destroy(successor2);
+    }
+    current_reactor = &successor2.reactors[0];
+    var session2 = c1.session.snapshot();
+    session2.fd = fd;
+    session2.was_secured = true;
+    try std.testing.expect(successor2.adoptInheritedClient(session2, snapshot2, null, false));
+    c1.fd = -1;
+    const c2 = successor2.adoptedConnByFd(fd).?;
+    c2.test_sendq_capture = false;
+    try std.testing.expectEqual(@as(u3, @intCast(second)), c2.tls.?.tx_ku_reply_sent);
+    try std.testing.expectEqualStrings("kernel plaintext after partial typed reply", snapshot2.pending_out);
+    try successor2.armSendIfNeeded(c2);
+    var handler: CompletionHandler = .{ .server = successor2 };
+    var cqes: [8]reactor_backend.CompletionBuffer = undefined;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    var scratch: [1024]u8 = undefined;
+    const chunks: usize = @as(usize, if (first == 0) 0 else 1) + @as(usize, if (first < 4) 1 else 0) + 1;
+    const expected = 5 + chunks * 22 + "kernel plaintext after partial typed reply".len + 22;
+    var complete = false;
+    for (0..2000) |_| {
+        _ = try successor2.rx().ring.submit();
+        _ = try successor2.rx().ring.reapCompletions(&cqes, 0, &handler);
+        if (handler.err) |err| return err;
+        _ = try successor2.activatePendingSocketIo();
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) return error.TestUnexpectedResult;
+            try wire.appendSlice(a, scratch[0..n]);
+        }
+        if (!c2.send_armed and sendq.wireBacklog(c2) == 0 and wire.items.len == expected) {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    const plain = try fixture.pair.decode(wire.items);
+    defer a.free(plain);
+    try std.testing.expectEqualStrings("kernel plaintext after partial typed reply", plain);
+    try std.testing.expectEqual(@as(usize, 0), c2.tls_control_charge);
+    try std.testing.expect(!c2.tls.?.tx_ku_reply_pending);
+    try std.testing.expectEqualSlices(u8, &fixture.pair.client.tls13.server_app_secret, &c2.tls.?.engine.tls13.server_app_secret);
+    try tls3ServerAssertKernelTuple(suite, fd, .tx, &fixture.pair.client.tls13.server_app_secret, 1);
+}
+
+test "TLS3: real typed TX reply offsets zero through four and plaintext suffix survive two physical adoptions" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |rx| for (0..5) |first| try tls3ServerPartialReplyAdopt(suite, rx, first);
+}
+
+fn tls3ServerKernelReplyPressure(suite: u16, kernel_rx: bool) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.createTransport(suite, true);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    conn.test_sendq_capture = false;
+    try conn.tls.?.enableKtlsTx(conn.fd);
+    conn.tls_tx_offloaded = true;
+    if (kernel_rx) {
+        try conn.tls.?.enableKtlsRx(conn.fd);
+        conn.tls_rx_offloaded = true;
+    }
+    var small: i32 = 1024;
+    try posix.setsockopt(conn.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small));
+    try posix.setsockopt(fixture.peer_fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&small));
+    const body: [1024]u8 = @splat('p');
+    var accepted: usize = 0;
+    var full = false;
+    // These records are already kernel-accepted history before the request.
+    // A real nonblocking send fills the socket; no synthetic WouldBlock hook.
+    for (0..4096) |_| {
+        const n = linux.sendto(conn.fd, &body, body.len, linux.MSG.DONTWAIT, null, 0);
+        switch (posix.errno(n)) {
+            .SUCCESS => {
+                if (n == 0) return error.TestUnexpectedResult;
+                accepted += n;
+            },
+            .AGAIN => {
+                var writable = [_]posix.pollfd{.{ .fd = conn.fd, .events = posix.POLL.OUT, .revents = 0 }};
+                if (try posix.poll(&writable, 100) == 0) {
+                    full = true;
+                    break;
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expect(full and accepted != 0);
+    // Fill any smaller remaining old-epoch slot before admitting the request.
+    // All records remain pre-request history, never post-request app bypass.
+    full = false;
+    for (0..32768) |_| {
+        const n = linux.sendto(conn.fd, &body, 1, linux.MSG.DONTWAIT, null, 0);
+        switch (posix.errno(n)) {
+            .SUCCESS => {
+                if (n != 1) return error.TestUnexpectedResult;
+                accepted += n;
+            },
+            .AGAIN => {
+                var writable = [_]posix.pollfd{.{ .fd = conn.fd, .events = posix.POLL.OUT, .revents = 0 }};
+                if (try posix.poll(&writable, 100) == 0) {
+                    full = true;
+                    break;
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expect(full);
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 2, 3 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    if (kernel_rx) {
+        try writeAllFd(fixture.peer_fd, request);
+        var readable = [_]posix.pollfd{.{ .fd = conn.fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&readable, 2000) == 0) return error.TestTimeout;
+        const rc = linux.recvfrom(conn.fd, conn.recv_buf[0..].ptr, conn.recv_buf.len, linux.MSG.DONTWAIT, null, null);
+        try std.testing.expectEqual(posix.E.IO, posix.errno(rc));
+        try std.testing.expectEqual(Server.KtlsRxDrain.survived, try fixture.server.handleKtlsRxControl(fixture.id, conn));
+    } else try fixture.server.driveTls(fixture.id, conn, request);
+    try std.testing.expect(conn.tls.?.tx_ku_reply_pending);
+    const old_secret = conn.tls.?.engine.tls13.server_app_secret;
+    const sent_before = conn.tls.?.tx_ku_reply_sent;
+    try appendSecuredToConn(conn, "suffix after actual typed WouldBlock");
+    const charge_before = conn.tls_control_charge;
+    try fixture.server.progressTlsControl(conn);
+    try std.testing.expectEqual(sent_before, conn.tls.?.tx_ku_reply_sent);
+    try std.testing.expectEqual(charge_before, conn.tls_control_charge);
+    try std.testing.expectEqualSlices(u8, &old_secret, &conn.tls.?.engine.tls13.server_app_secret);
+    try std.testing.expect(!conn.send_armed and conn.tls.?.tx_ku_reply_pending);
+    const wake = fixture.server.rx().wake orelse return error.TestUnexpectedResult;
+    wake.drain();
+    try std.testing.expect(try fixture.server.activatePendingSocketIo());
+    try std.testing.expect(conn.tls.?.tx_ku_reply_pending and !conn.send_armed);
+    var wake_ready = [_]posix.pollfd{.{ .fd = wake.fd(), .events = posix.POLL.IN, .revents = 0 }};
+    // No eligible app SEND exists yet. Retained control waits for the existing
+    // timer or genuine owner activity instead of repeatedly waking itself.
+    try std.testing.expectEqual(@as(usize, 0), try posix.poll(&wake_ready, 0));
+    var handler: CompletionHandler = .{ .server = fixture.server };
+    var cqes: [8]reactor_backend.CompletionBuffer = undefined;
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(a);
+    var plaintext: std.ArrayList(u8) = .empty;
+    defer plaintext.deinit(a);
+    var scratch: [8192]u8 = undefined;
+    var complete = false;
+    for (0..4000) |_| {
+        var readable = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&readable, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) return error.TestUnexpectedResult;
+            try pending.appendSlice(a, scratch[0..n]);
+        }
+        var consumed: usize = 0;
+        while (pending.items.len - consumed >= 5) {
+            const len = 5 + @as(usize, std.mem.readInt(u16, pending.items[consumed..][3..5], .big));
+            if (len > pending.items.len - consumed) break;
+            const opened = try fixture.pair.client.tls13.decrypt(pending.items[consumed..][0..len]);
+            defer a.free(opened);
+            try plaintext.appendSlice(a, opened);
+            consumed += len;
+        }
+        if (consumed != 0) {
+            std.mem.copyForwards(u8, pending.items, pending.items[consumed..]);
+            pending.items.len -= consumed;
+        }
+        _ = try fixture.server.activatePendingSocketIo();
+        _ = try fixture.server.rx().ring.submit();
+        _ = try fixture.server.rx().ring.reapCompletions(&cqes, 0, &handler);
+        if (handler.err) |err| return err;
+        if (!conn.send_armed and !conn.tls.?.tx_ku_reply_pending and sendq.wireBacklog(conn) == 0 and
+            plaintext.items.len == accepted + "suffix after actual typed WouldBlock".len and pending.items.len == 0)
+        {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    for (plaintext.items[0..accepted]) |byte| try std.testing.expectEqual(@as(u8, 'p'), byte);
+    try std.testing.expectEqualStrings("suffix after actual typed WouldBlock", plaintext.items[accepted..]);
+    try std.testing.expectEqual(@as(usize, 0), conn.tls_control_charge);
+    try tls3ServerAssertKernelTuple(suite, conn.fd, .tx, &fixture.pair.client.tls13.server_app_secret, 1);
+}
+
+test "TLS3: actual typed reply WouldBlock retains epoch credit and accepted suffix until peer drains" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |rx| try tls3ServerKernelReplyPressure(suite, rx);
+}
+
+test "TLS3: staged physical adoption rejects wrong actual kernel secret and sequence before FD publication" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        current_reactor = null;
+        var fixture = try Tls3ServerFixture.createTransport(suite, true);
+        defer fixture.deinit();
+        current_reactor = &fixture.server.reactors[0];
+        const conn = fixture.connection();
+        try conn.tls.?.enableKtlsTx(conn.fd);
+        try conn.tls.?.enableKtlsRx(conn.fd);
+        conn.tls_tx_offloaded = true;
+        conn.tls_rx_offloaded = true;
+        try appendSecuredToConn(conn, "unchanged physical plaintext");
+        const exact = try tls3ServerCapture(conn);
+        defer a.free(exact);
+        const decoded = try tls_snapshot.decodeCurrent(exact);
+        const flags = linux.fcntl(conn.fd, linux.F.GETFD, 0);
+        for (0..4) |fault| {
+            var candidate = decoded;
+            switch (fault) {
+                0 => candidate.state.engine.tls13.server_app_secret[0] ^= 1,
+                1 => candidate.state.engine.tls13.client_app_secret[0] ^= 1,
+                2 => candidate.state.engine.tls13.app_write_seq += 1,
+                3 => candidate.state.engine.tls13.app_read_seq += 1,
+                else => unreachable,
+            }
+            const successor = try createTestServer(a, fixture.server.config);
+            defer {
+                successor.deinit();
+                a.destroy(successor);
+            }
+            current_reactor = &successor.reactors[0];
+            var session = conn.session.snapshot();
+            session.fd = conn.fd;
+            session.was_secured = true;
+            try std.testing.expect(!successor.adoptInheritedClient(session, candidate, null, false));
+            try std.testing.expect(successor.adoptedConnByFd(conn.fd) == null);
+            try std.testing.expect(successor.world.nicks.count() == 0);
+            try std.testing.expectEqual(flags, linux.fcntl(conn.fd, linux.F.GETFD, 0));
+            current_reactor = &fixture.server.reactors[0];
+            const after = try tls3ServerCapture(conn);
+            defer a.free(after);
+            try std.testing.expectEqualSlices(u8, exact, after);
+        }
+    }
+}
+
+test "TLS3: actual kernel getter failure before and after accepted reply prefix disposes terminal suffix" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |partial| {
+        current_reactor = null;
+        var fixture = try Tls3ServerFixture.createTransport(suite, true);
+        defer fixture.deinit();
+        current_reactor = &fixture.server.reactors[0];
+        const physical = fixture.connection();
+        const token = physical.token;
+        physical.test_sendq_capture = false;
+        try physical.tls.?.enableKtlsTx(physical.fd);
+        physical.tls_tx_offloaded = true;
+        try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 2, 3 });
+        const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+        defer a.free(request);
+        try fixture.server.driveTls(fixture.id, physical, request);
+        try appendSecuredToConn(physical, "terminal suffix must not survive ambiguous TX custody");
+        if (partial) try fixture.server.progressTlsControlWithBudget(physical, 1);
+        try std.testing.expectEqual(@as(u3, if (partial) 1 else 0), physical.tls.?.tx_ku_reply_sent);
+        try std.testing.expect(!physical.send_armed and physical.tls.?.tx_ku_reply_pending);
+        // A real descriptor failure makes the next full getter fail. Earlier
+        // positive control acceptance is irreversible; no fabricated new epoch
+        // or terminal alert can make the remaining app suffix deliverable.
+        closeFd(physical.fd);
+        physical.fd = -1;
+        try fixture.server.progressTlsControl(physical);
+        try std.testing.expect(physical.closing and physical.tls_terminal_failure);
+        try std.testing.expectEqual(@as(usize, 0), sendq.wireBacklog(physical));
+        try std.testing.expectEqual(@as(usize, 0), physical.tls_control_charge);
+        try std.testing.expectEqual(@as(u64, 0), physical.tls_kernel_prefix_remaining);
+        try std.testing.expect(!physical.tls_alert_pending);
+        _ = try fixture.server.activatePendingSocketIo();
+        try std.testing.expect(fixture.server.connFor(fixture.id) == null);
+        try std.testing.expectError(error.ClientNotFound, fixture.server.connForToken(token));
+        var received: std.ArrayList(u8) = .empty;
+        defer received.deinit(a);
+        var scratch: [128]u8 = undefined;
+        var eof = false;
+        for (0..100) |_| {
+            var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+            if (try posix.poll(&ready, 20) == 0) continue;
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) {
+                eof = true;
+                break;
+            }
+            try received.appendSlice(a, scratch[0..n]);
+        }
+        try std.testing.expect(eof);
+        try std.testing.expectEqual(@as(usize, if (partial) 23 else 0), received.items.len);
+        if (partial) {
+            const empty = try fixture.pair.client.tls13.decrypt(received.items);
+            defer a.free(empty);
+            try std.testing.expectEqual(@as(usize, 0), empty.len);
+            try std.testing.expectEqual(@as(usize, 1), fixture.pair.client.tls13.post_handshake_recv.items.len);
+        }
+    };
+}
+
+fn tls3ServerCloseAfterAcceptedReply(ctx: *anyopaque, fd: i32) void {
+    const conn: *ConnState = @ptrCast(@alignCast(ctx));
+    std.debug.assert(conn.fd == fd and !conn.send_armed);
+    closeFd(fd);
+    conn.fd = -1;
+}
+
+test "TLS3: real TX install failure after full accepted KU refuses replay and disposes plaintext suffix" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |partial| {
+        current_reactor = null;
+        var fixture = try Tls3ServerFixture.createTransport(suite, true);
+        defer fixture.deinit();
+        current_reactor = &fixture.server.reactors[0];
+        const physical = fixture.connection();
+        const token = physical.token;
+        physical.test_sendq_capture = false;
+        try physical.tls.?.enableKtlsTx(physical.fd);
+        physical.tls_tx_offloaded = true;
+        const old_secret = physical.tls.?.engine.tls13.server_app_secret;
+        try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 1, 4 });
+        const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+        defer a.free(request);
+        try fixture.server.driveTls(fixture.id, physical, request);
+        try appendSecuredToConn(physical, "suffix must not cross failed TX install");
+        if (partial) try fixture.server.progressTlsControlWithBudget(physical, 4);
+        physical.tls.?.test_after_kernel_reply = .{ .ctx = physical, .call = tls3ServerCloseAfterAcceptedReply };
+        try fixture.server.progressTlsControl(physical);
+        try std.testing.expectEqual(@as(i32, -1), physical.fd);
+        try std.testing.expectEqual(error.KtlsTxUnsupported, physical.tls.?.terminal_error.?);
+        try std.testing.expect(physical.closing and physical.tls_terminal_failure);
+        try std.testing.expectEqualSlices(u8, &old_secret, &physical.tls.?.engine.tls13.server_app_secret);
+        try std.testing.expectEqual(@as(usize, 0), sendq.wireBacklog(physical));
+        try std.testing.expectEqual(@as(usize, 0), physical.tls_control_charge);
+        try std.testing.expect(!physical.tls_alert_pending);
+        try std.testing.expectError(error.BadState, physical.tls.?.progressKernelReply(-1, 5));
+        _ = try fixture.server.activatePendingSocketIo();
+        try std.testing.expect(fixture.server.connFor(fixture.id) == null);
+        try std.testing.expectError(error.ClientNotFound, fixture.server.connForToken(token));
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(a);
+        var scratch: [128]u8 = undefined;
+        var eof = false;
+        for (0..100) |_| {
+            var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+            if (try posix.poll(&ready, 20) == 0) continue;
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) {
+                eof = true;
+                break;
+            }
+            try wire.appendSlice(a, scratch[0..n]);
+        }
+        try std.testing.expect(eof);
+        try std.testing.expectEqual(@as(usize, 5 + 22 * @as(usize, if (partial) 2 else 1)), wire.items.len);
+        const empty = try fixture.pair.decode(wire.items);
+        defer a.free(empty);
+        try std.testing.expectEqual(@as(usize, 0), empty.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.pair.client.tls13.post_handshake_recv.items.len);
+        try std.testing.expect(!std.mem.eql(u8, &old_secret, &fixture.pair.client.tls13.server_app_secret));
+    };
+}
+
+fn tls3ServerAssertKernelTupleT(comptime KS: type, fd: i32, direction: ktls.Direction, cipher: ktls.Cipher, peer_secret: []const u8, sequence: u64) !void {
+    var raw: [KS.hash_len]u8 = undefined;
+    @memcpy(&raw, peer_secret[0..KS.hash_len]);
+    defer std.crypto.secureZero(u8, &raw);
+    var secret = KS.SecretBytes.init(raw);
+    defer secret.wipe();
+    var key: [32]u8 = @splat(0);
+    defer std.crypto.secureZero(u8, &key);
+    var iv: [12]u8 = undefined;
+    defer std.crypto.secureZero(u8, &iv);
+    try KS.hkdfExpandLabel(&secret, "key", "", key[0..cipher.keyLen()]);
+    try KS.hkdfExpandLabel(&secret, "iv", "", &iv);
+    const info = try ktls.tls13CryptoInfo(cipher, &iv, key[0..cipher.keyLen()], sequence);
+    var encoded: [ktls.max_crypto_info_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &encoded);
+    var actual = try ktls.getTuple(fd, direction, cipher);
+    defer actual.wipe();
+    try std.testing.expectEqualSlices(u8, try info.encode(&encoded), actual.encoded());
+}
+
+fn tls3ServerAssertKernelTuple(suite: u16, fd: i32, direction: ktls.Direction, peer_secret: []const u8, sequence: u64) !void {
+    const hkdf = @import("../crypto/hkdf_tls13.zig");
+    const cipher: ktls.Cipher = switch (suite) {
+        0x1301 => .aes_gcm_128,
+        0x1302 => .aes_gcm_256,
+        0x1303 => .chacha20_poly1305,
+        else => unreachable,
+    };
+    if (suite == 0x1302) return tls3ServerAssertKernelTupleT(hkdf.Sha384, fd, direction, cipher, peer_secret, sequence);
+    return tls3ServerAssertKernelTupleT(hkdf.Sha256, fd, direction, cipher, peer_secret, sequence);
+}
+
+fn tls3ServerPumpPrefix(fixture: *Tls3ServerFixture, owner: *Server, conn: *ConnState, expected: []const u8) !void {
+    const a = std.testing.allocator;
+    current_reactor = &owner.reactors[0];
+    conn.test_sendq_capture = false;
+    try owner.armSendIfNeeded(conn);
+    var handler: CompletionHandler = .{ .server = owner };
+    var completions: [8]reactor_backend.CompletionBuffer = undefined;
+    var cipher: std.ArrayList(u8) = .empty;
+    defer cipher.deinit(a);
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(a);
+    var scratch: [1024]u8 = undefined;
+    var complete = false;
+    for (0..2000) |_| {
+        _ = try owner.rx().ring.submit();
+        _ = try owner.rx().ring.reapCompletions(&completions, 0, &handler);
+        if (handler.err) |err| return err;
+        _ = try owner.activatePendingSocketIo();
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) return error.TestUnexpectedResult;
+            try cipher.appendSlice(a, scratch[0..n]);
+        }
+        while (cipher.items.len >= 5) {
+            const len = 5 + @as(usize, std.mem.readInt(u16, cipher.items[3..5], .big));
+            if (cipher.items.len < len) break;
+            switch (try fixture.pair.client.tls13.decryptApp(cipher.items[0..len])) {
+                .application_data => |bytes| {
+                    defer a.free(bytes);
+                    try plain.appendSlice(a, bytes);
+                },
+                .control => return error.TestUnexpectedResult,
+            }
+            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - len], cipher.items[len..]);
+            cipher.shrinkRetainingCapacity(cipher.items.len - len);
+        }
+        if (!conn.send_armed and conn.tls_kernel_prefix_remaining == 0 and
+            conn.tls.?.engine.tls13.post_handshake_recv_len == 2 and
+            plain.items.len == expected.len and cipher.items.len == 0)
+        {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectEqualSlices(u8, expected, plain.items);
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.kernel_control_read_held, conn.tls.?.control_phase);
+}
+
+fn tls3ServerKernelAdopt(suite: u16, kernel_tx: bool) !void {
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.createTransport(suite, true);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const original = fixture.connection();
+    const fd = original.fd;
+    const t = original.tls.?;
+    try t.enableKtlsRx(fd);
+    original.tls_rx_offloaded = true;
+    if (kernel_tx) {
+        try t.enableKtlsTx(fd);
+        original.tls_tx_offloaded = true;
+    }
+    const old_rx = fixture.pair.client.tls13.client_app_secret;
+    const old_tx = fixture.pair.client.tls13.server_app_secret;
+    var exporter: [32]u8 = undefined;
+    try t.channelBindingTlsExporter(&exporter);
+    try appendSecuredToConn(original, "old before native cursor");
+    original.sendq_cap = @intCast(sendq.wireBacklog(original));
+    try fixture.pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 2, 3 });
+    const request = (try fixture.pair.client.tls13.takePendingSend()).?;
+    defer a.free(request);
+    const first_len = 5 + @as(usize, std.mem.readInt(u16, request[3..5], .big));
+    try writeAllFd(fixture.peer_fd, request[0..first_len]);
+    var ready = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    if (try posix.poll(&ready, 2000) == 0) return error.TestTimeout;
+    const rc = linux.recvfrom(fd, original.recv_buf[0..].ptr, original.recv_buf.len, linux.MSG.DONTWAIT, null, null);
+    try std.testing.expectEqual(posix.E.IO, posix.errno(rc));
+    try std.testing.expectEqual(Server.KtlsRxDrain.survived, try fixture.server.handleKtlsRxControl(fixture.id, original));
+    try std.testing.expectEqual(tls_conn.ControlBarrierPhase.kernel_control_read_held, t.control_phase);
+    try std.testing.expectEqual(@as(usize, 0), original.tls_control_charge);
+    const initial = try tls3ServerCapture(original);
+    defer a.free(initial);
+    const ts1 = try tls_snapshot.decodeCurrent(initial);
+    try std.testing.expectEqual(if (kernel_tx) sendq.wireBacklog(original) else @as(u64, 0), ts1.kernel_tx_prefix_remaining);
+    try tls3ServerAssertKernelTuple(suite, fd, .rx, &old_rx, ts1.state.engine.tls13.app_read_seq);
+    const successor1 = try createTestServer(a, fixture.server.config);
+    defer a.destroy(successor1);
+    defer successor1.deinit();
+    current_reactor = &successor1.reactors[0];
+    var client1 = original.session.snapshot();
+    client1.fd = fd;
+    client1.was_secured = true;
+    var wrong = ts1;
+    wrong.state.engine.tls13.client_app_secret[0] ^= 1;
+    try std.testing.expect(!successor1.adoptInheritedClient(client1, wrong, null, false));
+    try std.testing.expectEqual(@as(usize, 0), successor1.reactors[0].clients.len());
+    try std.testing.expect(successor1.world.findNick("Tls3Owner") == null);
+    try tls3ServerAssertKernelTuple(suite, fd, .rx, &old_rx, ts1.state.engine.tls13.app_read_seq);
+    try std.testing.expect(successor1.adoptInheritedClient(client1, ts1, null, false));
+    original.fd = -1;
+    var first_it = successor1.reactors[0].clients.iterator();
+    const c1 = first_it.next().?.value;
+    try std.testing.expectEqual(fd, c1.fd);
+    try std.testing.expect(!c1.recv_armed and !c1.send_armed);
+    try std.testing.expectEqualSlices(u8, &exporter, &c1.tls_exporter_buf);
+    // The suffix gains complete custody after funding credit; it is never
+    // included in the inherited old-prefix cursor, even in the same inline buf.
+    try appendSecuredToConn(c1, "suffix after two inherited cursors");
+    const funded = try tls3ServerCapture(c1);
+    defer a.free(funded);
+    const funded_state = try tls_snapshot.decodeCurrent(funded);
+    try std.testing.expectEqual(@as(u32, if (kernel_tx) 5 else 27), funded_state.control_charge);
+    if (kernel_tx) {
+        try std.testing.expect(funded_state.kernel_tx_prefix_remaining != 0);
+        try std.testing.expect(funded_state.kernel_tx_prefix_remaining < funded_state.pending_out.len);
+    }
+    try tls3ServerPumpPrefix(&fixture, successor1, c1, "old before native cursor");
+    try std.testing.expectEqual(@as(u3, 2), c1.tls.?.engine.tls13.post_handshake_recv_len);
+    const partial = try tls3ServerCapture(c1);
+    defer a.free(partial);
+    const ts2 = try tls_snapshot.decodeCurrent(partial);
+    try std.testing.expectEqual(@as(u3, 2), ts2.state.engine.tls13.ku_prefix_len);
+    try std.testing.expectEqualSlices(u8, request[0..0], ts2.state.pending_recv); // kernel owns the remaining wire
+    try std.testing.expectEqual(@as(u64, 0), ts2.kernel_tx_prefix_remaining);
+    try tls3ServerAssertKernelTuple(suite, fd, .rx, &old_rx, ts2.state.engine.tls13.app_read_seq);
+    const successor2 = try createTestServer(a, fixture.server.config);
+    defer a.destroy(successor2);
+    defer successor2.deinit();
+    current_reactor = &successor2.reactors[0];
+    var client2 = c1.session.snapshot();
+    client2.fd = fd;
+    client2.was_secured = true;
+    try std.testing.expect(successor2.adoptInheritedClient(client2, ts2, null, false));
+    c1.fd = -1;
+    var second_it = successor2.reactors[0].clients.iterator();
+    const c2 = second_it.next().?.value;
+    c2.test_sendq_capture = false;
+    try std.testing.expectEqual(fd, c2.fd);
+    try std.testing.expectEqualSlices(u8, &exporter, &c2.tls_exporter_buf);
+    try tls3ServerAssertKernelTuple(suite, fd, .rx, &old_rx, ts2.state.engine.tls13.app_read_seq);
+    if (kernel_tx) try tls3ServerAssertKernelTuple(suite, fd, .tx, &old_tx, ts2.state.engine.tls13.app_write_seq);
+    try writeAllFd(fixture.peer_fd, request[first_len..]);
+    var handler: CompletionHandler = .{ .server = successor2 };
+    var completions: [8]reactor_backend.CompletionBuffer = undefined;
+    var cipher: std.ArrayList(u8) = .empty;
+    defer cipher.deinit(a);
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(a);
+    var replies: usize = 0;
+    var scratch: [1024]u8 = undefined;
+    var complete = false;
+    for (0..2000) |_| {
+        _ = try successor2.activatePendingSocketIo();
+        _ = try successor2.rx().ring.submit();
+        _ = try successor2.rx().ring.reapCompletions(&completions, 0, &handler);
+        if (handler.err) |err| return err;
+        var peer_ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&peer_ready, 1) != 0) {
+            const n = try readFd(fixture.peer_fd, &scratch);
+            if (n == 0) return error.TestUnexpectedResult;
+            try cipher.appendSlice(a, scratch[0..n]);
+        }
+        while (cipher.items.len >= 5) {
+            const len = 5 + @as(usize, std.mem.readInt(u16, cipher.items[3..5], .big));
+            if (cipher.items.len < len) break;
+            switch (try fixture.pair.client.tls13.decryptApp(cipher.items[0..len])) {
+                .application_data => |bytes| {
+                    defer a.free(bytes);
+                    try std.testing.expectEqual(@as(usize, 1), replies);
+                    try plain.appendSlice(a, bytes);
+                },
+                .control => {
+                    try std.testing.expectEqual(@as(usize, 0), plain.items.len);
+                    replies += 1;
+                },
+            }
+            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - len], cipher.items[len..]);
+            cipher.shrinkRetainingCapacity(cipher.items.len - len);
+        }
+        if (!c2.send_armed and sendq.wireBacklog(c2) == 0 and c2.tls_deferred_charge == 0 and
+            c2.tls.?.control_phase == .none and !c2.tls.?.tx_ku_reply_pending and
+            plain.items.len == "suffix after two inherited cursors".len and replies == 1 and cipher.items.len == 0)
+        {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectEqualStrings("suffix after two inherited cursors", plain.items);
+    try std.testing.expectEqualSlices(u8, &fixture.pair.client.tls13.client_app_secret, &c2.tls.?.engine.tls13.client_app_secret);
+    try std.testing.expectEqualSlices(u8, &fixture.pair.client.tls13.server_app_secret, &c2.tls.?.engine.tls13.server_app_secret);
+    try tls3ServerAssertKernelTuple(suite, fd, .rx, &fixture.pair.client.tls13.client_app_secret, 0);
+    if (kernel_tx) try tls3ServerAssertKernelTuple(suite, fd, .tx, &fixture.pair.client.tls13.server_app_secret, 1);
+    try std.testing.expectEqual(@as(usize, 0), c2.tls_control_charge);
+    try std.testing.expect(!c2.closing);
+}
+
+test "TLS3: real kernel phase2 and partial KU preserve physical FD through two strict adoptions" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        for ([_]bool{ false, true }) |tx| try tls3ServerKernelAdopt(suite, tx);
+    }
+}
+
+fn daemonTlsOutputFailure(version: tls_conn.Version, cap_failure: bool) !void {
+    const a = std.testing.allocator;
+    const pair = try DaemonOutputTestPair.create(version);
+    defer pair.destroy();
+    // Preserve a previously returned scratch while the physical wire is drained.
+    const warm = try pair.tls.write("warm");
+    const warm_plain = try pair.decode(warm);
+    defer a.free(warm_plain);
+    try std.testing.expectEqualStrings("warm", warm_plain);
+    const scratch = try a.dupe(u8, pair.tls.write_buf.items);
+    defer a.free(scratch);
+    const before = pair.sequence();
+    const payload: [16 * 1024 + 100]u8 = @splat(0x67);
+    if (cap_failure) pair.conn.sendq_cap = 1;
+    var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    if (!cap_failure) pair.conn.overflow_allocator = fault.allocator();
+    try std.testing.expectError(error.OutputTooSmall, appendSecuredToConn(&pair.conn, &payload));
+    try std.testing.expectEqual(before, pair.sequence());
+    try std.testing.expectEqualSlices(u8, scratch, pair.tls.write_buf.items);
+    try std.testing.expectEqual(@as(usize, 0), pair.conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), pair.conn.send_offset);
+    try std.testing.expectEqual(@as(usize, 0), pair.conn.send_overflow.items.len);
+    pair.conn.sendq_cap = default_sendq_cap;
+    pair.conn.overflow_allocator = a;
+    try appendSecuredToConn(&pair.conn, &payload);
+    const wire = try daemonOutputQueued(a, &pair.conn);
+    defer a.free(wire);
+    const decoded = try pair.decode(wire);
+    defer a.free(decoded);
+    try std.testing.expectEqualSlices(u8, &payload, decoded);
+}
+
+test "prepared daemon output TLS1.3 physical SendQ cap rejects whole batch before TX" {
+    try daemonTlsOutputFailure(.tls13, true);
+}
+test "prepared daemon output TLS1.2 physical SendQ cap rejects whole batch before TX" {
+    try daemonTlsOutputFailure(.tls12, true);
+}
+test "prepared daemon output TLS1.3 physical SendQ OOM rejects whole batch before TX" {
+    try daemonTlsOutputFailure(.tls13, false);
+}
+test "prepared daemon output TLS1.2 physical SendQ OOM rejects whole batch before TX" {
+    try daemonTlsOutputFailure(.tls12, false);
+}
+
+fn daemonWsOutputFailure(version: ?tls_conn.Version, cap_failure: bool, fail_index: usize, saw_custody_failure: ?*bool) !bool {
+    const a = std.testing.allocator;
+    const conn = try a.create(ConnState);
+    defer a.destroy(conn);
+    conn.* = .{ .overflow_allocator = a, .test_sendq_capture = true };
+    const pair: ?*DaemonOutputTestPair = if (version) |v| try DaemonOutputTestPair.create(v) else null;
+    defer if (pair) |p| p.destroy();
+    if (pair) |p| conn.tls = &p.tls;
+    defer conn.send_overflow.deinit(a);
+    const ws = try a.create(WsState);
+    defer a.destroy(ws);
+    ws.* = .{ .phase = .open };
+    conn.ws = ws;
+    @memcpy(ws.tx_buf[0..6], "PREFIX");
+    ws.tx_len = 6;
+    const before = if (pair) |p| p.sequence() else 0;
+    const body: [WsState.max_frame - 4]u8 = @splat(0x68);
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(a);
+    try input.appendSlice(a, " tail\r\n");
+    try input.appendSlice(a, &body);
+    try input.appendSlice(a, "\r\nsuffix");
+    // First frame fits; second needs overflow (including WSS record overhead).
+    // In the cap case the first fits within a deliberately small total cap.
+    if (cap_failure) {
+        if (pair) |p| {
+            var first_buf: [WsState.max_frame + 10]u8 = undefined;
+            var second_buf: [WsState.max_frame + 10]u8 = undefined;
+            const first = try websocket.encodeFrame(WsState.max_frame, .{ .opcode = .text }, "PREFIX tail", &first_buf);
+            const second = try websocket.encodeFrame(WsState.max_frame, .{ .opcode = .text }, &body, &second_buf);
+            var sizing = try p.tls.prepareWriteBatch(&.{ first, second });
+            conn.sendq_cap = sizing.bytes().len - 1;
+            try std.testing.expect(first.len + second.len <= conn.sendq_cap);
+            sizing.abort();
+        } else conn.sendq_cap = 100;
+    }
+    const generation_before = if (pair) |p| p.generation() else 0;
+    var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+    if (!cap_failure) conn.overflow_allocator = fault.allocator();
+    const rejected = blk: {
+        appendToConn(conn, input.items) catch |err| {
+            try std.testing.expectEqual(error.OutputTooSmall, err);
+            break :blk true;
+        };
+        break :blk false;
+    };
+    if (rejected) {
+        try std.testing.expectEqual(before, if (pair) |p| p.sequence() else 0);
+        try std.testing.expectEqual(@as(usize, 6), ws.tx_len);
+        try std.testing.expectEqualStrings("PREFIX", ws.tx_buf[0..ws.tx_len]);
+        try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+        try std.testing.expectEqual(@as(usize, 0), conn.send_offset);
+        try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
+        if (pair) |p| {
+            try std.testing.expect(!p.tls.hasPreparedWrite());
+            if (p.generation() > generation_before) {
+                if (saw_custody_failure) |flag| flag.* = true;
+            }
+        }
+        conn.sendq_cap = default_sendq_cap;
+        conn.overflow_allocator = a;
+        try appendToConn(conn, input.items);
+    } else try std.testing.expect(!cap_failure);
+    try std.testing.expectEqualStrings("suffix", ws.tx_buf[0..ws.tx_len]);
+    const queued = try daemonOutputQueued(a, conn);
+    defer a.free(queued);
+    const wire = if (pair) |p| try p.decode(queued) else try a.dupe(u8, queued);
+    defer a.free(wire);
+    const first = try websocket.decodeFrame(WsState.max_frame, .server_to_client, wire, &.{});
+    try std.testing.expectEqual(websocket.Opcode.text, first.frame.opcode);
+    try std.testing.expectEqualStrings("PREFIX tail", first.frame.payload);
+    const second = try websocket.decodeFrame(WsState.max_frame, .server_to_client, wire[first.consumed..], &.{});
+    try std.testing.expectEqual(websocket.Opcode.text, second.frame.opcode);
+    try std.testing.expectEqualSlices(u8, &body, second.frame.payload);
+    try std.testing.expectEqual(wire.len, first.consumed + second.consumed);
+    return !rejected;
+}
+
+fn daemonWsOutputOomSweep(version: ?tls_conn.Version) !void {
+    var saw_custody_failure = false;
+    for (0..64) |index| {
+        if (try daemonWsOutputFailure(version, false, index, &saw_custody_failure)) {
+            try std.testing.expect(index >= 4);
+            // A genuine WSS failure after TX preparation proves final SendQ
+            // rejection aborts the candidate, not only early WS allocation.
+            if (version != null) try std.testing.expect(saw_custody_failure);
+            return;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "prepared daemon output WS second frame cap failure preserves prefix queue and suffix retry" {
+    try std.testing.expect(!try daemonWsOutputFailure(null, true, 0, null));
+}
+test "prepared daemon output WS second frame OOM preserves prefix queue and suffix retry" {
+    try daemonWsOutputOomSweep(null);
+}
+test "prepared daemon output WSS TLS1.3 second frame cap failure preserves TX prefix and queue" {
+    try std.testing.expect(!try daemonWsOutputFailure(.tls13, true, 0, null));
+}
+test "prepared daemon output WSS TLS1.2 second frame cap failure preserves TX prefix and queue" {
+    try std.testing.expect(!try daemonWsOutputFailure(.tls12, true, 0, null));
+}
+test "prepared daemon output WSS TLS1.3 second frame OOM preserves TX prefix and queue" {
+    try daemonWsOutputOomSweep(.tls13);
+}
+test "prepared daemon output WSS TLS1.2 second frame OOM preserves TX prefix and queue" {
+    try daemonWsOutputOomSweep(.tls12);
+}
+
+test "prepared daemon output capture and WS control retain exact adapter boundaries" {
+    const a = std.testing.allocator;
+    const pair = try DaemonOutputTestPair.create(.tls13);
+    defer pair.destroy();
+    const ws = try a.create(WsState);
+    defer a.destroy(ws);
+    ws.* = .{ .phase = .open };
+    pair.conn.ws = ws;
+    @memcpy(ws.tx_buf[0..4], "held");
+    ws.tx_len = 4;
+    const before = pair.sequence();
+    var captured: [128]u8 = undefined;
+    var capture = ReplyCapture{ .buf = &captured };
+    pair.conn.reply_capture = &capture;
+    pair.conn.sendq_cap = 0;
+    try appendToConn(&pair.conn, "PING :captured\r\n");
+    try std.testing.expectEqualStrings("PING :captured\r\n", capture.captured());
+    try std.testing.expectEqual(before, pair.sequence());
+    try std.testing.expectEqualStrings("held", ws.tx_buf[0..ws.tx_len]);
+    try std.testing.expectEqual(@as(usize, 0), pair.conn.send_len);
+    pair.conn.reply_capture = null;
+
+    // A failed control frame retains no prefix ciphertext/nonce and still
+    // requests the established drain-close behavior.
+    wsQueueControl(&pair.conn, .pong, "control");
+    try std.testing.expect(pair.conn.closing);
+    try std.testing.expectEqual(before, pair.sequence());
+    try std.testing.expectEqual(@as(usize, 0), pair.conn.send_len);
+    try std.testing.expectEqualStrings("held", ws.tx_buf[0..ws.tx_len]);
+    pair.conn.sendq_cap = default_sendq_cap;
+    wsQueueControl(&pair.conn, .pong, "control");
+    const wire = try daemonOutputQueued(a, &pair.conn);
+    defer a.free(wire);
+    const decoded = try pair.decode(wire);
+    defer a.free(decoded);
+    const control = try websocket.decodeFrame(125, .server_to_client, decoded, &.{});
+    try std.testing.expectEqual(websocket.Opcode.pong, control.frame.opcode);
+    try std.testing.expectEqualStrings("control", control.frame.payload);
+    try std.testing.expectEqual(decoded.len, control.consumed);
+    try std.testing.expectEqualStrings("held", ws.tx_buf[0..ws.tx_len]);
+}
+
+test "prepared daemon output pre-handshake and declared kTLS preserve raw custody" {
+    const a = std.testing.allocator;
+    const pair = try DaemonOutputTestPair.create(.tls13);
+    defer pair.destroy();
+    const before = pair.sequence();
+    // Branch-state proof only: no kernel offload syscall is asserted here.
+    pair.conn.tls_tx_offloaded = true;
+    pair.tls.ktls_tx_offloaded = true;
+    try appendSecuredToConn(&pair.conn, "kernel plaintext");
+    try std.testing.expectEqualStrings("kernel plaintext", pair.conn.send_buf[0..pair.conn.send_len]);
+    try std.testing.expectEqual(before, pair.sequence());
+
+    const fresh = try a.create(tls_conn.TlsConn);
+    defer a.destroy(fresh);
+    fresh.* = try tls_conn.TlsConn.init(a, pair.tls.cfg13);
+    defer fresh.deinit();
+    pair.conn.tls = fresh;
+    pair.conn.tls_tx_offloaded = false;
+    pair.conn.send_len = 0;
+    const alert = fresh.takeAlert(error.BadHandshake) orelse return error.TestUnexpectedResult;
+    defer a.free(alert);
+    try std.testing.expect(!fresh.handshakeDone());
+    try appendSecuredToConn(&pair.conn, alert);
+    try std.testing.expectEqualSlices(u8, alert, pair.conn.send_buf[0..pair.conn.send_len]);
 }
 
 test "threaded server: implicit-TLS raw public key negotiates and registers" {
@@ -97340,17 +105134,20 @@ test "threaded server: account logout and replacement retire old physical media 
 
     var cfg = multiOperTestConfig(0);
     cfg.account_services = &services;
-    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+    const server = createTestServer(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
-    defer server.deinit();
-    const admin_identity = try enrollTestMediaIdentity(&server, "admin", "account-old", 0x77);
-    const bob_identity = try enrollTestMediaIdentity(&server, "bob", "account-new", 0x78);
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    const admin_identity = try enrollTestMediaIdentity(server, "admin", "account-old", 0x77);
+    const bob_identity = try enrollTestMediaIdentity(server, "bob", "account-new", 0x78);
     const port = try server.boundPort();
 
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -98192,7 +105989,7 @@ test "MEDIA WS OFFER suppresses unroutable NATIVE/TRANSPORT; non-WS still gets U
 
     // WS browser OFFER without transport=webrtc: no TRANSPORT, no NATIVE, no bridge seat.
     resetTestSendQ(ws_conn);
-    try server.mediaOffer(ws_conn, "#ws-offer", "cadencevox", &.{});
+    try server.mediaOffer(ws_id, ws_conn, "#ws-offer", "cadencevox", &.{});
     const ws_plain = ws_conn.send_buf[0..ws_conn.send_len];
     try std.testing.expect(std.mem.indexOf(u8, ws_plain, "OFFER-ACK") != null);
     try std.testing.expect(std.mem.indexOf(u8, ws_plain, " MEDIA TRANSPORT ") == null);
@@ -98206,14 +106003,14 @@ test "MEDIA WS OFFER suppresses unroutable NATIVE/TRANSPORT; non-WS still gets U
     // Explicit transport=webrtc with loopback media_host is still suppressed
     // (unroutable from a remote browser).
     resetTestSendQ(ws_conn);
-    try server.mediaOffer(ws_conn, "#ws-offer", "cadencevox", &.{"transport=webrtc"});
+    try server.mediaOffer(ws_id, ws_conn, "#ws-offer", "cadencevox", &.{"transport=webrtc"});
     const ws_webrtc = ws_conn.send_buf[0..ws_conn.send_len];
     try std.testing.expect(std.mem.indexOf(u8, ws_webrtc, " MEDIA TRANSPORT ") == null);
     try std.testing.expect(std.mem.indexOf(u8, ws_webrtc, " MEDIA NATIVE ") == null);
 
     // Non-WS native client still receives TRANSPORT + NATIVE and is bridge-registered.
     resetTestSendQ(native_conn);
-    try server.mediaOffer(native_conn, "#ws-offer", "cadencevox", &.{});
+    try server.mediaOffer(native_id, native_conn, "#ws-offer", "cadencevox", &.{});
     const native_out = native_conn.send_buf[0..native_conn.send_len];
     try std.testing.expect(std.mem.indexOf(u8, native_out, " MEDIA TRANSPORT ") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_out, " MEDIA NATIVE ") != null);
@@ -99074,17 +106871,20 @@ test "reusable attachment SendQ pressure retains tagged event without poisoning"
 
 test "detached reusable attachment transfers retained event to resumed physical id" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    var server = Server.init(std.testing.allocator, .{
+    const server = createTestServer(std.testing.allocator, .{
         .host = "127.0.0.1",
         .port = 0,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
         else => return err,
     };
-    defer server.deinit();
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
 
-    const old_id = try addTestLocalClient(&server, "OldAttachment", null);
-    const new_id = try addTestLocalClient(&server, "NewAttachment", null);
+    const old_id = try addTestLocalClient(server, "OldAttachment", null);
+    const new_id = try addTestLocalClient(server, "NewAttachment", null);
     const event_id: attachment_delivery_spool.EventId = @splat(0x5a);
     _ = try server.attachment_delivery_spool.reserveBatch(&.{.{
         .client = monitorIdFromClient(old_id),
@@ -108325,13 +116125,22 @@ test "failed inherited TLS plus WebSocket adoption frees carried SendQ overflow"
         .realname = "Rollback WSS",
         .was_secured = true,
     }, .{
+        .kernel_tx_prefix_remaining = 0,
         .fd = sockets[0],
-        .state = .{ .engine = .{ .tls13 = .{
-            .suite = 0x1301,
+        .state = .{ .barrier_phase = .none, .held_record_len = 0, .engine = .{ .tls13 = .{
+            .suite = 0x1302,
             .client_app_secret = @splat(0x11),
             .server_app_secret = @splat(0x22),
             .app_read_seq = 7,
             .app_write_seq = 9,
+            .peer_record_size_limit_raw = 16385,
+            .local_receive_policy = 16385,
+            .record_size_limit_negotiated = false,
+            .selected_alpn = &.{},
+            .exporter_master_secret = @splat(0),
+            .exporter_master_secret_ready = true,
+            .ku_prefix_len = 0,
+            .ku_prefix = @splat(0),
         } } },
         .pending_out = carried,
     }, .{
@@ -110035,6 +117844,265 @@ const SameIPPeerProof = struct {
         return error.TestTimeout;
     }
 };
+
+const FarOrdinaryNickCase = enum { whois, direct_message };
+
+fn expectOrdinaryGuestForFarPresenceTest(server: *Server, nick: []const u8) !void {
+    server.world.lockWrite();
+    defer server.world.unlockWrite();
+    const wid = server.world.findNick(nick) orelse return error.TestUnexpectedResult;
+    const id = clientIdFromWorld(wid);
+    const conn = server.connFor(id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(conn.session.registered());
+    try std.testing.expect(conn.session.account() == null);
+    try std.testing.expect(server.portableSessionTokenForClient(id, conn) == null);
+    try std.testing.expect(server.detachedReplicaTokenForNick(nick) == null);
+    const now: i64 = @intCast(server.meshWallMs());
+    try std.testing.expectEqual(@as(usize, 0), server.session_replica_store.retainedCount(now));
+    var channels = server.world.channelIterator();
+    try std.testing.expect(channels.next() == null);
+}
+
+/// Exercise truthful legacy ingress on one actual secured leg only. This is a
+/// transport diagnostic, not a client-authoring route or an unknown-DM flood.
+fn sendFarPresenceLegacyDiagnostic(server: *Server, peer_key: [32]u8) !u64 {
+    server.world.lockWrite();
+    defer server.world.unlockWrite();
+    current_reactor = &server.reactors[0];
+    defer current_reactor = null;
+    const wid = server.world.findNick("GuestC") orelse return error.TestUnexpectedResult;
+    const author = server.connFor(clientIdFromWorld(wid)) orelse return error.TestUnexpectedResult;
+    var prefix_buf: [320]u8 = undefined;
+    var msg = s2s_link.RelayMessage{
+        .verb = .privmsg,
+        .target = "GuestA",
+        .source_nick = "GuestC",
+        .source_prefix = try clientPrefix(author, &prefix_buf),
+        .text = "legacy-terminal-control",
+        .origin_node = server.config.node_id,
+        .hlc = server.nextMeshHlc(),
+    };
+    var pubkey_buf: [message_relay.pubkey_len]u8 = undefined;
+    var signature_buf: [message_relay.sig_len]u8 = undefined;
+    server.signRelayOrigin(&msg, &pubkey_buf, &signature_buf);
+    try std.testing.expectEqual(message_relay.VerifyOutcome.verified, try message_relay.verifyOrigin(server.allocator, msg));
+    var peers = server.reactors[0].clients.iterator();
+    while (peers.next()) |entry| {
+        const link = entry.value.s2s_secured orelse continue;
+        if (!entry.value.ownsActiveMeshLink(link)) continue;
+        const key = link.peerNodeKey() orelse continue;
+        if (!std.mem.eql(u8, &key, &peer_key)) continue;
+        try link.sendMessage(msg);
+        try std.testing.expect(server.flushSecuredS2sOutboundTo(entry.id, link));
+        return msg.hlc;
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Actual TCP/Mooring A-B-C, with independent ordinary clients and no A-C leg.
+/// The two intended-behavior assertions below are deliberately RED until the
+/// separate signed presence and exact guest-DM contracts are integrated.
+fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const acceptance_lock = if (builtin.os.tag == .linux) try acquireHeavyMeshAcceptanceTestLock() else -1;
+    defer if (acceptance_lock >= 0) closeFd(acceptance_lock);
+    const ports = try reserveThreeLoopbackPorts();
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    var tmp_c = std.testing.tmpDir(.{});
+    defer tmp_c.cleanup();
+    var store_a = try services_mod.OroStore.open(allocator, std.testing.io, tmp_a.dir, "far-guest-a.wal");
+    defer store_a.deinit();
+    var store_b = try services_mod.OroStore.open(allocator, std.testing.io, tmp_b.dir, "far-guest-b.wal");
+    defer store_b.deinit();
+    var store_c = try services_mod.OroStore.open(allocator, std.testing.io, tmp_c.dir, "far-guest-c.wal");
+    defer store_c.deinit();
+    var services_a = services_mod.Services.init(&store_a, null);
+    var services_b = services_mod.Services.init(&store_b, null);
+    var services_c = services_mod.Services.init(&store_c, null);
+    var identity_a = try node_identity.fromSeed(@as([32]u8, @splat(0xf1)), "far-ordinary-presence-test");
+    defer identity_a.deinit();
+    var identity_b = try node_identity.fromSeed(@as([32]u8, @splat(0xf2)), "far-ordinary-presence-test");
+    defer identity_b.deinit();
+    var identity_c = try node_identity.fromSeed(@as([32]u8, @splat(0xf3)), "far-ordinary-presence-test");
+    defer identity_c.deinit();
+    const root_a = std.fmt.bytesToHex(identity_a.sign_kp.public_key, .lower);
+    const root_b = std.fmt.bytesToHex(identity_b.sign_kp.public_key, .lower);
+    const root_c = std.fmt.bytesToHex(identity_c.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &root_a, &root_b, &root_c };
+    const roots_a = [_][]const u8{ &root_b, &root_c };
+    const roots_b = [_][]const u8{ &root_a, &root_c };
+    const roots_c = [_][]const u8{ &root_a, &root_b };
+    var peer_buf: [32]u8 = undefined;
+    const dial_b = [_][]const u8{try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{ports[1]})};
+    const config_b = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = ports[1],
+        .node_id = identity_b.shortId(),
+        .node_identity = &identity_b,
+        .crypto_io = std.testing.io,
+        .server_name = "far-presence-b.test",
+        .mesh_pass = "far-presence-secret",
+        .mesh_trust_roots = &roots_b,
+        .require_secured = true,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roots,
+        .session_resume_composite_issuance = true,
+        .account_services = &services_b,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+    };
+    var config_a = config_b;
+    config_a.s2s_port = ports[0];
+    config_a.node_id = identity_a.shortId();
+    config_a.node_identity = &identity_a;
+    config_a.server_name = "far-presence-a.test";
+    config_a.mesh_connect = &dial_b;
+    config_a.mesh_trust_roots = &roots_a;
+    config_a.account_services = &services_a;
+    var config_c = config_a;
+    config_c.s2s_port = ports[2];
+    config_c.node_id = identity_c.shortId();
+    config_c.node_identity = &identity_c;
+    config_c.server_name = "far-presence-c.test";
+    config_c.mesh_trust_roots = &roots_c;
+    config_c.account_services = &services_c;
+    var b = try LiveUpgradeTestNode.init(allocator, config_b);
+    defer b.deinit();
+    var a = try LiveUpgradeTestNode.init(allocator, config_a);
+    defer a.deinit();
+    var c = try LiveUpgradeTestNode.init(allocator, config_c);
+    defer c.deinit();
+    try b.start();
+    try a.start();
+    try c.start();
+    const servers = [_]*Server{ a.server, b.server, c.server };
+    const names = [_][]const u8{ "GuestA", "GuestB", "GuestC" };
+    const live = try allocator.alloc(LiveClient, 3);
+    defer allocator.free(live);
+    var initialized: usize = 0;
+    defer for (live[0..initialized]) |client| closeFd(client.fd);
+    for (servers, live, names) |server, *client, nick| {
+        client.* = .{ .fd = try connectLoopback(try server.boundPort()) };
+        initialized += 1;
+        var registration_buf: [200]u8 = undefined;
+        const registration = try std.fmt.bufPrint(&registration_buf, "CAP REQ :echo-message message-tags server-time\r\nNICK {s}\r\nUSER ordinary 0 * :Independent {s}\r\nCAP END\r\n", .{ nick, nick });
+        try writeAllFd(client.fd, registration);
+        var welcome_buf: [40]u8 = undefined;
+        try recvUntil(client, try std.fmt.bufPrint(&welcome_buf, " 001 {s} ", .{nick}), 200);
+        try expectContains(client.written(), " ACK :echo-message message-tags server-time");
+        try expectOrdinaryGuestForFarPresenceTest(server, nick);
+    }
+    _ = try SameIPPeerProof.wait(a.server, identity_b.sign_kp.public_key);
+    _ = try SameIPPeerProof.wait(b.server, identity_a.sign_kp.public_key);
+    _ = try SameIPPeerProof.wait(b.server, identity_c.sign_kp.public_key);
+    _ = try SameIPPeerProof.wait(c.server, identity_b.sign_kp.public_key);
+    try std.testing.expect(SameIPPeerProof.read(a.server, identity_c.sign_kp.public_key) == null);
+    try std.testing.expect(SameIPPeerProof.read(c.server, identity_a.sign_kp.public_key) == null);
+
+    // Wait for actual origin-owned PRESENCE on every direct leg. No route-table
+    // seed, token, common channel, or foreign MEMBERSHIP exception supplies it.
+    const roster_deadline = platform.monotonicMillis() + 20_000;
+    while (true) {
+        b.server.world.lockWrite();
+        const middle_ready = b.server.meshNickHomeNode("GuestA") == identity_a.shortId() and
+            b.server.meshNickHomeNode("GuestC") == identity_c.shortId();
+        b.server.world.unlockWrite();
+        a.server.world.lockWrite();
+        const a_ready = a.server.meshNickHomeNode("GuestB") == identity_b.shortId();
+        a.server.world.unlockWrite();
+        c.server.world.lockWrite();
+        const c_ready = c.server.meshNickHomeNode("GuestB") == identity_b.shortId();
+        c.server.world.unlockWrite();
+        if (middle_ready and a_ready and c_ready) break;
+        if (platform.monotonicMillis() >= roster_deadline) return error.TestTimeout;
+        testSleepMs(10);
+    }
+    live[1].reset();
+    try writeAllFd(live[1].fd, "WHOIS GuestC\r\nPING :direct-whois-fence\r\n");
+    try recvUntil(&live[1], "PONG onyx.local :direct-whois-fence", 200);
+    try expectContains(live[1].written(), " 311 GuestB GuestC ordinary ");
+    try expectContains(live[1].written(), " 312 GuestB GuestC far-presence-c.test ");
+    try expectContains(live[1].written(), " 318 GuestB GuestC ");
+
+    for (live) |*client| client.reset();
+    try writeAllFd(live[1].fd, "PRIVMSG GuestC :ordinary-direct-control\r\n");
+    try recvUntil(&live[2], "PRIVMSG GuestC :ordinary-direct-control", 200);
+    try recvUntil(&live[1], "PRIVMSG GuestC :ordinary-direct-control", 200);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[2].written(), "PRIVMSG GuestC :ordinary-direct-control"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[1].written(), "PRIVMSG GuestC :ordinary-direct-control"));
+    for (live) |*client| client.reset();
+
+    switch (case) {
+        .whois => {
+            try writeAllFd(live[0].fd, "WHOIS GuestC\r\nPING :far-whois-fence\r\n");
+            try recvUntil(&live[0], "PONG onyx.local :far-whois-fence", 200);
+            std.debug.print("far ordinary nickname WHOIS proof: {s}\n", .{live[0].written()});
+            try expectContains(live[0].written(), " 311 GuestA GuestC ordinary ");
+            try expectContains(live[0].written(), " 312 GuestA GuestC far-presence-c.test ");
+            try expectContains(live[0].written(), " 318 GuestA GuestC ");
+        },
+        .direct_message => {
+            // A presence-only change cannot make a legacy DM transit. Prove the
+            // genuine signed C->B frame reached B, where BOTH endpoint homes
+            // are already known, while preserving legacy local-only semantics.
+            const legacy_hlc = try sendFarPresenceLegacyDiagnostic(c.server, identity_b.sign_kp.public_key);
+            const ingress_deadline = platform.monotonicMillis() + 5_000;
+            while (true) {
+                b.server.world.lockWrite();
+                const admitted = b.server.relay_seen.seen.contains(.{
+                    .origin_node = identity_c.shortId(),
+                    .hlc = legacy_hlc,
+                    .authenticated = true,
+                });
+                const home_matches = b.server.meshNickHomeNode("GuestC") == identity_c.shortId();
+                b.server.world.unlockWrite();
+                try std.testing.expect(home_matches);
+                if (admitted) break;
+                if (platform.monotonicMillis() >= ingress_deadline) return error.TestTimeout;
+                testSleepMs(10);
+            }
+            live[0].reset();
+            try writeAllFd(live[0].fd, "PING :legacy-terminal-fence\r\n");
+            try recvUntil(&live[0], "PONG onyx.local :legacy-terminal-fence", 200);
+            const legacy_deadline = platform.monotonicMillis() + 200;
+            while (platform.monotonicMillis() < legacy_deadline) {
+                try live[0].readAvailable();
+                testSleepMs(10);
+            }
+            try std.testing.expectEqual(@as(usize, 0), countOccurrences(live[0].written(), "legacy-terminal-control"));
+            std.debug.print("far ordinary nickname legacy control: signed C->B ingested; terminal transit, no GuestA delivery\n", .{});
+            live[0].reset();
+            try writeAllFd(live[0].fd, "PRIVMSG GuestC :ordinary-far-direct\r\nPING :far-dm-fence\r\n");
+            try recvUntil(&live[0], "PONG onyx.local :far-dm-fence", 200);
+            const delivery_deadline = platform.monotonicMillis() + 2_000;
+            while (platform.monotonicMillis() < delivery_deadline) {
+                try live[2].readAvailable();
+                if (std.mem.indexOf(u8, live[2].written(), "PRIVMSG GuestC :ordinary-far-direct") != null) break;
+                testSleepMs(10);
+            }
+            std.debug.print("far ordinary nickname DM author={s}\nrecipient={s}\n", .{ live[0].written(), live[2].written() });
+            try expectContains(live[2].written(), "PRIVMSG GuestC :ordinary-far-direct");
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[2].written(), "PRIVMSG GuestC :ordinary-far-direct"));
+            try expectContains(live[0].written(), "PRIVMSG GuestC :ordinary-far-direct");
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[0].written(), "PRIVMSG GuestC :ordinary-far-direct"));
+        },
+    }
+}
+
+test "threaded server: far ordinary nickname WHOIS crosses secured A-B-C without portable tokens" {
+    try runFarOrdinaryNickRegression(.whois);
+}
+
+test "threaded server: far ordinary nickname direct DM crosses secured A-B-C without portable tokens" {
+    try runFarOrdinaryNickRegression(.direct_message);
+}
 
 test "threaded server: same-IP mesh dial partition heals after inbound binding and sequential Helix" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
@@ -111816,6 +119884,7 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
 
     // Seal the arena exactly like handleUpgrade does (TLS piece + session piece).
     const tls_blob = try tls_snapshot.encode(alloc, .{
+        .kernel_tx_prefix_remaining = 0,
         .fd = sp[0],
         .state = rs,
         .pending_out = pend_copy,
@@ -116227,24 +124296,19 @@ fn bindLoopback(do_listen: bool) ServerError!BoundTcp {
     const fd = try socketTcp();
     errdefer closeFd(fd);
     var yes: u32 = 1;
-    _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
-    var addr = linux.sockaddr.in{
+    try setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes));
+    const addr = posix.sockaddr.in{
         .port = 0,
         .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
     };
-    if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
-        return error.Unexpected;
+    try bindSocket(fd, &addr);
     if (do_listen) {
-        if (posix.errno(linux.listen(fd, 16)) != .SUCCESS) return error.Unexpected;
-        var tv = linux.timeval{ .sec = 0, .usec = 200_000 };
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        try listenSocket(fd, 16);
+        // Readiness can disappear before the probe's accept. Keep that syscall
+        // nonblocking on both targets; accepted Linux connections stay blocking.
+        os_runtime.setNonblocking(fd) catch return error.Unexpected;
     }
-    var storage: posix.sockaddr.storage = undefined;
-    var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    if (posix.errno(linux.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS)
-        return error.Unexpected;
-    const bound: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
-    return .{ .fd = fd, .port = std.mem.bigToNative(u16, bound.port) };
+    return .{ .fd = fd, .port = try socketPort(fd) };
 }
 
 const OutboundHookProbe = struct {
@@ -116254,8 +124318,11 @@ const OutboundHookProbe = struct {
     hits: usize = 0,
     req: [2][1500]u8 = undefined,
     req_len: [2]usize = .{ 0, 0 },
+    responses: [2]?[]const u8 = @splat(null),
     started: bool = false,
     thread: std.Thread = undefined,
+    ready_pause: ?struct { arrived: *std.Io.Event, proceed: *std.Io.Event, returned: *std.Io.Event } = null,
+    accept_wouldblock: bool = false,
 
     fn headerContentLength(head: []const u8) ?usize {
         var it = std.mem.splitScalar(u8, head, '\n');
@@ -116271,13 +124338,28 @@ const OutboundHookProbe = struct {
     }
 
     fn serve(self: *OutboundHookProbe, fd: linux.fd_t) void {
-        var tv = linux.timeval{ .sec = 1, .usec = 0 };
-        _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+        if (comptime builtin.os.tag == .openbsd) {
+            // The native listener is nonblocking. This newly accepted probe
+            // connection has no other owner; give its bounded reads/writes
+            // blocking semantics rather than inheriting listener flags.
+            const old = socket_system.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+            if (posix.errno(old) != .SUCCESS) return;
+            var flags: posix.O = @bitCast(@as(u32, @intCast(old)));
+            flags.NONBLOCK = false;
+            if (posix.errno(socket_system.fcntl(fd, posix.F.SETFL, @as(usize, @as(u32, @bitCast(flags))))) != .SUCCESS) return;
+        }
+        const tv = socket_system.timeval{ .sec = 1, .usec = 0 };
+        if (posix.errno(socket_system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(@TypeOf(tv)))) != .SUCCESS or
+            posix.errno(socket_system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(@TypeOf(tv)))) != .SUCCESS) return;
         var buf: [1500]u8 = undefined;
         var n: usize = 0;
         while (n < buf.len) {
-            const rc = linux.read(fd, buf[n..].ptr, buf.len - n);
-            if (posix.errno(rc) != .SUCCESS) break;
+            const rc = socket_system.read(fd, buf[n..].ptr, buf.len - n);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => break,
+            }
             const got: usize = @intCast(rc);
             if (got == 0) break;
             n += got;
@@ -116295,14 +124377,23 @@ const OutboundHookProbe = struct {
         }
         self.hits += 1;
         self.mu.unlock();
-        const resp = if (hit == 0)
+        const resp = if (hit < self.responses.len and self.responses[hit] != null)
+            self.responses[hit].?
+        else if (hit == 0)
             "HTTP/1.1 500 No\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         else
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         var off: usize = 0;
         while (off < resp.len) {
-            const rc = linux.write(fd, resp[off..].ptr, resp.len - off);
-            if (posix.errno(rc) != .SUCCESS) break;
+            const rc = if (comptime builtin.os.tag == .openbsd)
+                socket_system.send(fd, resp[off..].ptr, resp.len - off, posix.MSG.NOSIGNAL)
+            else
+                linux.sendto(fd, resp[off..].ptr, resp.len - off, posix.MSG.NOSIGNAL, null, 0);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => break,
+            }
             const wrote: usize = @intCast(rc);
             if (wrote == 0) break;
             off += wrote;
@@ -116310,15 +124401,142 @@ const OutboundHookProbe = struct {
     }
 
     fn run(self: *OutboundHookProbe) void {
+        defer if (self.ready_pause) |pause| pause.returned.set(std.testing.io);
         while (!self.stop.load(.acquire)) {
-            const rc = linux.accept4(self.listen_fd, null, null, posix.SOCK.CLOEXEC);
-            if (posix.errno(rc) != .SUCCESS) continue;
+            var ready = [_]posix.pollfd{.{ .fd = self.listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+            const count = posix.poll(&ready, 100) catch return;
+            if (self.stop.load(.acquire)) return;
+            if (count == 0) continue;
+            if (ready[0].revents & posix.POLL.IN == 0) return;
+            if (self.ready_pause) |pause| {
+                pause.arrived.set(std.testing.io);
+                pause.proceed.waitUncancelable(std.testing.io);
+            }
+            const rc = if (comptime builtin.os.tag == .openbsd)
+                socket_system.accept(self.listen_fd, null, null)
+            else
+                linux.accept4(self.listen_fd, null, null, posix.SOCK.CLOEXEC);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                .AGAIN => {
+                    self.accept_wouldblock = true;
+                    continue;
+                },
+                .INTR => continue,
+                else => return,
+            }
             const fd: linux.fd_t = @intCast(rc);
+            if (comptime builtin.os.tag == .openbsd) os_runtime.setCloexec(fd, true) catch {
+                closeFd(fd);
+                continue;
+            };
             self.serve(fd);
             closeFd(fd);
         }
     }
 };
+
+const ProbeCleanupObservation = struct { woke_and_joined: bool = false, hits: usize = 0 };
+
+fn connectProbeWakeUntil(port: u16, deadline: std.Io.Clock.Timestamp) !linux.fd_t {
+    const fd = try socketTcp();
+    errdefer closeFd(fd);
+    try os_runtime.setNonblocking(fd);
+    const addr = try sockaddrIn("127.0.0.1", port);
+    const rc = socket_system.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    switch (posix.errno(rc)) {
+        .SUCCESS => return fd,
+        .INPROGRESS, .ALREADY => {},
+        else => return error.ProbeWakeFailed,
+    }
+    while (true) {
+        if (std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(std.testing.io, .awake), .gte, deadline)) return error.Timeout;
+        var ready = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+        if (try posix.poll(&ready, 20) == 0) continue;
+        var pending: c_int = 0;
+        var pending_len: posix.socklen_t = @sizeOf(c_int);
+        if (posix.errno(socket_system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&pending), &pending_len)) != .SUCCESS or
+            pending_len != @sizeOf(c_int) or pending != 0) return error.ProbeWakeFailed;
+        return fd;
+    }
+}
+
+fn wakeAndJoinProbe(probe: *OutboundHookProbe, port: u16, proceed: *std.Io.Event, returned: *std.Io.Event, thread: std.Thread) !void {
+    probe.stop.store(true, .release);
+    proceed.set(std.testing.io);
+    const deadline = managedStopTestDeadline();
+    // A blocking accept needs a real pending connection. Keep this owned peer
+    // alive through the probe's bounded I/O and actual return, then join. A
+    // failure to prove return must abort this fixture, never blindly join or
+    // let a thread retain references into a returned stack frame.
+    const wake = try connectProbeWakeUntil(port, deadline);
+    defer closeFd(wake);
+    try returned.waitTimeout(std.testing.io, .{ .deadline = deadline });
+    thread.join();
+}
+
+fn exerciseDrainedProbeReadiness(force_blocking: bool, cleanup: *ProbeCleanupObservation) !void {
+    const listener = try bindLoopback(true);
+    defer closeFd(listener.fd);
+    if (force_blocking) {
+        const old = socket_system.fcntl(listener.fd, posix.F.GETFL, @as(c_int, 0));
+        if (posix.errno(old) != .SUCCESS) return error.Unexpected;
+        var flags: posix.O = @bitCast(@as(u32, @intCast(old)));
+        flags.NONBLOCK = false;
+        if (posix.errno(socket_system.fcntl(listener.fd, posix.F.SETFL, @as(usize, @as(u32, @bitCast(flags))))) != .SUCCESS) return error.Unexpected;
+    }
+    const client = try connectLoopback(listener.port);
+    defer closeFd(client);
+    var arrived: std.Io.Event = .unset;
+    var proceed: std.Io.Event = .unset;
+    var returned: std.Io.Event = .unset;
+    var probe: OutboundHookProbe = .{ .listen_fd = listener.fd, .ready_pause = .{ .arrived = &arrived, .proceed = &proceed, .returned = &returned } };
+    const thread = try std.Thread.spawn(.{}, OutboundHookProbe.run, .{&probe});
+    var joined = false;
+    defer if (!joined) {
+        wakeAndJoinProbe(&probe, listener.port, &proceed, &returned, thread) catch |err|
+            std.debug.panic("outbound probe could not prove bounded cleanup return: {s}", .{@errorName(err)});
+        cleanup.* = .{ .woke_and_joined = true, .hits = probe.hits };
+    };
+    const deadline = managedStopTestDeadline();
+    try arrived.waitTimeout(std.testing.io, .{ .deadline = deadline });
+    // A second actual accept consumes the sole pending connection while the
+    // original probe is stopped exactly between readiness and its own accept.
+    const drained = if (comptime builtin.os.tag == .openbsd)
+        socket_system.accept(listener.fd, null, null)
+    else
+        linux.accept4(listener.fd, null, null, posix.SOCK.CLOEXEC);
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(drained));
+    defer closeFd(@intCast(drained));
+    probe.stop.store(true, .release);
+    proceed.set(std.testing.io);
+    const return_deadline = if (force_blocking)
+        std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(100) })
+    else
+        deadline;
+    try returned.waitTimeout(std.testing.io, .{ .deadline = return_deadline });
+    thread.join();
+    joined = true;
+    try std.testing.expect(probe.accept_wouldblock);
+    try std.testing.expectEqual(@as(usize, 0), probe.hits);
+    try std.testing.expect(os_runtime.fdValid(listener.fd));
+    try std.testing.expectEqual(listener.port, try socketPort(listener.fd));
+}
+
+test "webpush consumer: actual drained probe readiness returns before listener closes" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var cleanup: ProbeCleanupObservation = .{};
+    try exerciseDrainedProbeReadiness(false, &cleanup);
+    try std.testing.expect(!cleanup.woke_and_joined);
+}
+
+test "webpush consumer: blocking accept fault has bounded real connection cleanup" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var cleanup: ProbeCleanupObservation = .{};
+    try std.testing.expectError(error.Timeout, exerciseDrainedProbeReadiness(true, &cleanup));
+    try std.testing.expect(cleanup.woke_and_joined);
+    try std.testing.expectEqual(@as(usize, 1), cleanup.hits);
+}
 
 fn outboundRequestBody(raw: []const u8) ?[]const u8 {
     const mark = "\r\n\r\n";
@@ -118593,4 +126811,1901 @@ test "GAP-K4 a sealed room refuses the clear roster and an ordinary room still l
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "dormant runtime actual fabric OOM never admits an inherited candidate while OLD remains serving" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const old = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io });
+    defer alloc.destroy(old);
+    defer old.deinit();
+    var old_run: reactor_pool_mod.RunFlag = .init(true);
+    const old_thread = try std.Thread.spawn(.{}, Server.runThreaded, .{ old, &old_run });
+    defer stopThreadedServer(old, &old_run, old_thread);
+    const old_fd = try connectLoopback(try old.boundPort());
+    defer closeFd(old_fd);
+    var original: LiveClient = .{ .fd = old_fd };
+    try writeAllFd(old_fd, "NICK Original\r\nUSER original 0 * :Original\r\n");
+    try recvUntil(&original, " 001 Original ", 200);
+    original.reset();
+    try writeAllFd(old_fd, "PING :old-before-candidate\r\n");
+    try recvUntil(&original, "old-before-candidate", 200);
+
+    const candidate = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2, .crypto_io = std.testing.io });
+    defer alloc.destroy(candidate);
+    defer candidate.deinit();
+    try std.testing.expectEqual(@as(usize, 2), candidate.reactors.len);
+    const sockets = try sameIPTestSocketPair();
+    defer closeFd(sockets[1]);
+    try os_runtime.setNonblocking(sockets[0]);
+    const physical = try candidate.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+    const conn = candidate.reactors[0].clients.get(physical).?;
+    conn.token = try tokenFromId(physical);
+    conn.overflow_allocator = alloc;
+    try conn.session.setNick("InheritedCandidate");
+    try std.testing.expect(candidate.fabric == null);
+    try std.testing.expect(!conn.recv_armed);
+    // Input is already kernel-owned on one inherited physical socket before
+    // attempting the actual old runThreaded resource/preparation boundary.
+    try writeAllFd(sockets[1], "PING :candidate-must-stay-inert\r\n");
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    candidate.allocator = failing.allocator();
+    defer candidate.allocator = alloc;
+    var candidate_run: reactor_pool_mod.RunFlag = .init(true);
+    var returned: std.atomic.Value(bool) = .init(false);
+    const Runner = struct {
+        fn run(server_value: *Server, flag: *reactor_pool_mod.RunFlag, done: *std.atomic.Value(bool)) void {
+            server_value.runThreaded(flag);
+            done.store(true, .release);
+        }
+    };
+    const candidate_thread = try std.Thread.spawn(.{}, Runner.run, .{ candidate, &candidate_run, &returned });
+    defer stopThreadedServer(candidate, &candidate_run, candidate_thread);
+    var inherited: LiveClient = .{ .fd = sockets[1] };
+    const deadline = platform.monotonicMillis() + 10_000;
+    while (!returned.load(.acquire) and inherited.len == 0) {
+        if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+        var fds = [_]posix.pollfd{.{ .fd = inherited.fd, .events = posix.POLL.IN, .revents = 0 }};
+        _ = try posix.poll(&fds, 10);
+        try inherited.readAvailable();
+    }
+    try std.testing.expect(failing.has_induced_failure);
+    original.reset();
+    try writeAllFd(old_fd, "PING :old-after-candidate\r\n");
+    try recvUntil(&original, "old-after-candidate", 200);
+    try std.testing.expect(old_run.load(.acquire));
+    // The causal OLD path emits this PONG after fabric OOM and silently runs
+    // only shard0. A rejected candidate must not consume any buffered command.
+    try std.testing.expectEqual(@as(usize, 0), inherited.len);
+    try std.testing.expect(returned.load(.acquire));
+    try std.testing.expect(candidate.runtimeFailure() != null);
+    try std.testing.expect(candidate.fabric == null);
+}
+
+fn exercisePreparedCoreRuntime(comptime count: usize) !void {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    const gate_mod = reactor_pool_mod.runtime_start_gate;
+    var gate: ?gate_mod.Created = null;
+    // Gate owns every handle and must outlive both the Server and its pool.
+    defer if (gate) |g| g.control.destroyJoined();
+    var run: reactor_pool_mod.RunFlag = .init(true);
+    const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = count, .max_clients = 16, .crypto_io = std.testing.io });
+    defer alloc.destroy(server);
+    defer {
+        if (gate) |g| {
+            if (g.view.inspect().phase == .preparing) g.control.cancelAllAndJoin() else {
+                server.requestStop(&run);
+                g.control.joinAll();
+            }
+        }
+        server.deinit();
+    }
+    try std.testing.expectEqual(count, server.reactors.len);
+    const clients = try alloc.alloc(LiveClient, count);
+    defer alloc.free(clients);
+    for (clients) |*c| c.* = .{ .fd = -1 };
+    defer for (clients) |c| if (c.fd >= 0) closeFd(c.fd);
+    for (server.reactors, clients, 0..) |*reactor, *c, index| {
+        const sockets = try sameIPTestSocketPair();
+        c.fd = sockets[1];
+        errdefer closeFd(sockets[0]);
+        try os_runtime.setNonblocking(sockets[0]);
+        const id = try reactor.clients.alloc(ConnState.init(sockets[0]));
+        const conn = reactor.clients.get(id).?;
+        conn.token = try tokenFromId(id);
+        conn.overflow_allocator = alloc;
+        // Match actual inert adoption: the first owner turn must acquire RECV
+        // before output, and the retained admission clock is already valid.
+        conn.io_activation_pending = true;
+        conn.activation_recv_required = true;
+        conn.connected_at_ms = server.nowMs();
+        conn.last_activity_ms = conn.connected_at_ms;
+        var name: [32]u8 = undefined;
+        try conn.session.setNick(try std.fmt.bufPrint(&name, "Prepared{d}", .{index}));
+        try writeAllFd(c.fd, "PING :parked-all-shards\r\n");
+    }
+    try server.prepareRuntimeResources(std.testing.io, &run);
+    const workers = if (count == 1) 0 else count;
+    var specs: [count]gate_mod.ParticipantSpec = undefined;
+    var slots: [count]gate_mod.Slot = undefined;
+    for (specs[0..workers], 0..) |*spec, index| spec.* = .{ .kind = .reactor, .instance = @intCast(index), .owner_identity = server };
+    gate = try gate_mod.create(alloc, std.testing.io, specs[0..workers]);
+    for (slots[0..workers], 0..) |*slot, index| slot.* = try gate.?.view.slot(.reactor, @intCast(index), server);
+    try server.prepareRuntimeWorkers(gate.?.control, gate.?.view, slots[0..workers]);
+    try gate.?.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(3000) }));
+    try server.requirePreparedRuntime();
+    try std.testing.expectEqual(workers, gate.?.view.inspect().arrived);
+    try std.testing.expectEqual(workers, server.pool.count());
+    try std.testing.expectEqual(count != 1, server.fabric != null);
+    for (server.reactors, clients) |*reactor, *c| {
+        try std.testing.expect(!reactor.runtime_activated.load(.acquire));
+        for (reactor.clients.slots.items) |slot| if (slot.occupied) {
+            try std.testing.expect(!slot.value.recv_armed and !slot.value.send_armed);
+            try std.testing.expectEqual(@as(usize, 0), slot.value.send_len);
+        };
+        try c.readAvailable();
+        try std.testing.expectEqual(@as(usize, 0), c.len);
+    }
+    try std.testing.expectError(error.RuntimeNotPublished, server.requireActivatedRuntime());
+    server.publishPreparedRuntime();
+    try std.testing.expectEqual(gate_mod.Phase.preparing, gate.?.view.inspect().phase);
+    try std.testing.expectError(error.RuntimeNotPublished, server.requireActivatedRuntime());
+    // Publication alone does not dispatch even one already-buffered command.
+    for (clients) |*c| {
+        try c.readAvailable();
+        try std.testing.expectEqual(@as(usize, 0), c.len);
+    }
+    gate.?.control.releaseAll();
+    const thread = try std.Thread.spawn(.{}, Server.runPreparedRuntime, .{ server, gate.?.control, &run });
+    var joined = false;
+    defer if (!joined) stopThreadedServer(server, &run, thread);
+    for (clients) |*c| try recvUntil(c, "parked-all-shards", 200);
+    const deadline = platform.monotonicMillis() + 3000;
+    while (true) {
+        server.requireActivatedRuntime() catch |err| {
+            if (err != error.RuntimeNotActivated) return err;
+            if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+            os_runtime.sleepMillis(1);
+            continue;
+        };
+        break;
+    }
+    try std.testing.expect(run.load(.acquire));
+    server.requestStop(&run);
+    try std.testing.expectError(error.RuntimeStopped, server.requireActivatedRuntime());
+    stopThreadedServer(server, &run, thread);
+    joined = true;
+    try std.testing.expectEqual(workers, gate.?.view.inspect().joined);
+    try std.testing.expectEqual(RuntimePhase.joined, server.runtime_phase.load(.acquire));
+    try std.testing.expectError(error.RuntimeStopped, server.requireActivatedRuntime());
+}
+
+test "dormant runtime actual single shard stays inline and inert until shared release" {
+    try exercisePreparedCoreRuntime(1);
+}
+
+test "dormant runtime actual every configured shard stays parked and dispatches after one release" {
+    try exercisePreparedCoreRuntime(3);
+}
+
+test "dormant runtime actual fabric allocation sweep leaves candidate unchanged until complete" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2, .max_clients = 16, .crypto_io = std.testing.io });
+        defer alloc.destroy(server);
+        defer server.deinit();
+        const original_port = try server.boundPort();
+        const original_listener = server.reactors[0].listener_fd;
+        const original_reactor = &server.reactors[0];
+        var run: reactor_pool_mod.RunFlag = .init(true);
+        server.allocator = failing.allocator();
+        const result = server.prepareRuntimeResources(std.testing.io, &run);
+        server.allocator = alloc;
+        if (result) |_| {
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expect(fail_index > 0);
+            try std.testing.expect(server.fabric != null);
+            try std.testing.expectEqual(@as(usize, 2), server.fabric.?.inboxes.len);
+            try std.testing.expectEqual(RuntimePhase.resources, server.runtime_phase.load(.acquire));
+            try std.testing.expect(server.shutdown == &run);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expect(server.fabric == null);
+            try std.testing.expect(server.runtime_io == null and server.shutdown == null);
+            try std.testing.expectEqual(RuntimePhase.idle, server.runtime_phase.load(.acquire));
+            try std.testing.expect(run.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), server.pool.count());
+            try std.testing.expectEqual(original_port, try server.boundPort());
+            // Retry the SAME candidate after each allocation failure. The
+            // listener, final owner address and reactor remain the original
+            // resources; only the previously absent fabric is published.
+            try server.prepareRuntimeResources(std.testing.io, &run);
+            try std.testing.expectEqual(original_port, try server.boundPort());
+            try std.testing.expectEqual(original_listener, server.reactors[0].listener_fd);
+            try std.testing.expect(original_reactor == &server.reactors[0]);
+            try std.testing.expectEqual(@as(usize, 2), server.fabric.?.inboxes.len);
+            try std.testing.expectEqual(RuntimePhase.resources, server.runtime_phase.load(.acquire));
+            try std.testing.expect(server.shutdown == &run and run.load(.acquire));
+        }
+    }
+}
+
+test "dormant runtime actual second spawn failure joins first parked owner without dispatch" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const gate_mod = reactor_pool_mod.runtime_start_gate;
+    var gate: ?gate_mod.Created = null;
+    defer if (gate) |g| g.control.destroyJoined();
+    var run: reactor_pool_mod.RunFlag = .init(true);
+    const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2, .max_clients = 16, .crypto_io = std.testing.io });
+    defer alloc.destroy(server);
+    defer server.deinit();
+    try server.prepareRuntimeResources(std.testing.io, &run);
+    var specs: [2]gate_mod.ParticipantSpec = undefined;
+    var slots: [2]gate_mod.Slot = undefined;
+    for (&specs, 0..) |*spec, index| spec.* = .{ .kind = .reactor, .instance = @intCast(index), .owner_identity = server };
+    gate = try gate_mod.create(alloc, std.testing.io, &specs);
+    for (&slots, 0..) |*slot, index| slot.* = try gate.?.view.slot(.reactor, @intCast(index), server);
+    gate_mod.Fixture.failSpawn(gate.?.control, 1);
+    try std.testing.expectError(error.SystemResources, server.prepareRuntimeWorkers(gate.?.control, gate.?.view, &slots));
+    try std.testing.expectEqual(gate_mod.Phase.canceled, gate.?.view.inspect().phase);
+    try std.testing.expectEqual(@as(usize, 1), gate.?.view.inspect().spawned);
+    try std.testing.expectEqual(@as(usize, 1), gate.?.view.inspect().joined);
+    try std.testing.expect(run.load(.acquire));
+    try std.testing.expectEqual(RuntimePhase.resources, server.runtime_phase.load(.acquire));
+    for (server.reactors) |*reactor| try std.testing.expect(!reactor.runtime_activated.load(.acquire));
+}
+
+test "dormant runtime actual runtime owner abort joins parked Gate before Server destruction" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const gate_mod = reactor_pool_mod.runtime_start_gate;
+    var gate: ?gate_mod.Created = null;
+    defer if (gate) |g| g.control.destroyJoined();
+    var run: reactor_pool_mod.RunFlag = .init(true);
+    const server = try createTestServer(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2, .max_clients = 16, .crypto_io = std.testing.io });
+    defer alloc.destroy(server);
+    var destroyed = false;
+    defer if (!destroyed) {
+        if (gate) |g| g.control.cancelAllAndJoin();
+        server.deinit();
+    };
+    try server.prepareRuntimeResources(std.testing.io, &run);
+    var specs: [2]gate_mod.ParticipantSpec = undefined;
+    var slots: [2]gate_mod.Slot = undefined;
+    for (&specs, 0..) |*spec, index| spec.* = .{ .kind = .reactor, .instance = @intCast(index), .owner_identity = server };
+    gate = try gate_mod.create(alloc, std.testing.io, &specs);
+    for (&slots, 0..) |*slot, index| slot.* = try gate.?.view.slot(.reactor, @intCast(index), server);
+    try server.prepareRuntimeWorkers(gate.?.control, gate.?.view, &slots);
+    try gate.?.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(3000) }));
+    try server.requirePreparedRuntime();
+    gate.?.control.cancelAllAndJoin();
+    server.deinit();
+    destroyed = true;
+    try std.testing.expectEqual(gate_mod.Phase.canceled, gate.?.view.inspect().phase);
+    try std.testing.expectEqual(@as(usize, 2), gate.?.view.inspect().joined);
+    try std.testing.expect(!run.load(.acquire));
+}
+
+test "protected MEDIA output: final labeled batch has actual TLS custody before sequence publication" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        var fixture = try Tls3ServerFixture.create(suite);
+        defer fixture.deinit();
+        current_reactor = &fixture.server.reactors[0];
+        const conn = fixture.connection();
+        _ = try fixture.server.world.join("#protected", worldIdFromClient(fixture.id));
+        var storage: [1024]u8 = undefined;
+        defer std.crypto.secureZero(u8, &storage);
+        var capture: ReplyCapture = .{ .buf = &storage };
+        conn.reply_capture = &capture;
+        errdefer conn.reply_capture = null;
+        try fixture.server.sendMediaEventReply(conn, "NATIVE-MACKEY", "#protected", "stream=19 key=fixture-owned-secret");
+        try fixture.server.sendMediaEventReply(conn, "OFFER-ACK", "#protected", "cadencevox");
+        conn.reply_capture = null;
+        const before = conn.tls.?.engine.tls13.app_write_seq;
+        const final_bytes = try prepareMediaIssuerBytes(a, &capture, "media-proof");
+        defer {
+            std.crypto.secureZero(u8, final_bytes);
+            a.free(final_bytes);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, final_bytes, "label=media-proof") != null);
+        var output = try PreparedMediaOutput.prepare(fixture.server, fixture.id, conn, "#protected", final_bytes);
+        defer output.deinit();
+        try output.validate();
+        try std.testing.expectEqual(before, conn.tls.?.engine.tls13.app_write_seq);
+        try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+        try std.testing.expect(conn.tls.?.hasPreparedWrite());
+        output.commit();
+        try std.testing.expect(conn.tls.?.engine.tls13.app_write_seq > before);
+        const actual = try tls3ServerDrain(&fixture, conn);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(u8, final_bytes, actual);
+    }
+}
+
+test "protected MEDIA output: queue refusal and abort preserve actual TLS sequence and owner" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    _ = try fixture.server.world.join("#protected", worldIdFromClient(fixture.id));
+    const before = conn.tls.?.engine.tls13.app_write_seq;
+    const old_cap = conn.sendq_cap;
+    conn.sendq_cap = 0;
+    try std.testing.expectError(error.OutputTooSmall, PreparedMediaOutput.prepare(fixture.server, fixture.id, conn, "#protected", ":proof EVENT Tls3Owner :MEDIA MACKEY #protected owned-fixture-secret\r\n"));
+    try std.testing.expectEqual(before, conn.tls.?.engine.tls13.app_write_seq);
+    try std.testing.expect(!conn.tls.?.hasPreparedWrite());
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    conn.sendq_cap = old_cap;
+    var retry = try PreparedMediaOutput.prepare(fixture.server, fixture.id, conn, "#protected", ":proof EVENT Tls3Owner :MEDIA MACKEY #protected owned-fixture-secret\r\n");
+    try retry.validate();
+    retry.deinit();
+    try std.testing.expectEqual(before, conn.tls.?.engine.tls13.app_write_seq);
+    try std.testing.expect(!conn.tls.?.hasPreparedWrite());
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    try std.testing.expect(fixture.server.connFor(fixture.id) == conn);
+    const tls_owner = conn.tls;
+    conn.tls = null;
+    // The real descriptor/current row plus is_tls label is insufficient without
+    // the actual connected crypto source. Restore custody before fixture teardown.
+    const missing = PreparedMediaOutput.prepare(fixture.server, fixture.id, conn, "#protected", "secret\r\n");
+    conn.tls = tls_owner;
+    try std.testing.expectError(error.BadState, missing);
+}
+
+test "protected MEDIA caller: OFFER refuses another physical selector before profile publication" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    _ = try fixture.server.world.join("#physical", worldIdFromClient(fixture.id));
+    const foreign = try addTestLocalClient(fixture.server, "OtherPhysical", null);
+    _ = try fixture.server.world.join("#physical", worldIdFromClient(foreign));
+    try std.testing.expect(fixture.server.connFor(foreign) != conn);
+    try std.testing.expectError(error.BadState, fixture.server.mediaOffer(foreign, conn, "#physical", "cadencevox", &.{}));
+    try std.testing.expect(fixture.server.media_rooms.profileOf("#physical") == null);
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    const stale = client_model.ClientId{ .shard = fixture.id.shard, .slot = fixture.id.slot, .gen = fixture.id.gen + 1 };
+    try std.testing.expectError(error.BadState, fixture.server.mediaOffer(stale, conn, "#physical", "cadencevox", &.{}));
+    try std.testing.expect(fixture.server.media_rooms.profileOf("#physical") == null);
+    try fixture.server.requireMediaCaller(fixture.id, conn, "#physical");
+}
+
+test "protected MEDIA physical JOIN: abort preserves attachment and browser binding; retry commits one kind" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    _ = try fixture.server.world.join("#browser", worldIdFromClient(fixture.id));
+    fixture.server.config.ws_media_relay = true;
+    conn.ws = try std.testing.allocator.create(WsState);
+    conn.ws.?.* = .{ .phase = .open, .subprotocol = .onyx_irc_media };
+    const old_attachment = @as([LinuxServer.media_e2ee_attachment_bytes]u8, @splat(0x3c));
+    conn.bindMediaE2eeAttachment(old_attachment);
+    var aborted = try PreparedMediaPhysicalJoin.prepare(fixture.server, fixture.id, conn, "#browser", .voice);
+    try aborted.validate();
+    try std.testing.expect(aborted.changed and aborted.first_kind);
+    try std.testing.expectEqual(@as(usize, 0), fixture.server.media_physical_attachments.items.len);
+    try std.testing.expect(conn.mediaCallChannel() == null);
+    aborted.deinit();
+    try std.testing.expect(conn.mediaE2eeAttachmentMatches(old_attachment));
+    try std.testing.expectEqual(@as(usize, 0), fixture.server.media_physical_attachments.items.len);
+    var retry = try PreparedMediaPhysicalJoin.prepare(fixture.server, fixture.id, conn, "#browser", .voice);
+    defer retry.deinit();
+    try retry.validate();
+    retry.commit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.server.media_physical_attachments.items.len);
+    try std.testing.expectEqualStrings("#browser", conn.mediaCallChannel().?);
+    try std.testing.expect(!conn.media_e2ee_attachment_bound);
+    var duplicate = try PreparedMediaPhysicalJoin.prepare(fixture.server, fixture.id, conn, "#browser", .voice);
+    defer duplicate.deinit();
+    try std.testing.expect(!duplicate.changed and !duplicate.first_kind);
+    duplicate.commit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.server.media_physical_attachments.items.len);
+    var second_kind = try PreparedMediaPhysicalJoin.prepare(fixture.server, fixture.id, conn, "#browser", .video);
+    defer second_kind.deinit();
+    try std.testing.expect(second_kind.changed and second_kind.first_kind);
+    second_kind.commit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.server.media_physical_attachments.items.len);
+    try std.testing.expect(fixture.server.mediaPhysicalCanPublish(fixture.id, "#browser", conn.session.displayName(), .voice));
+    try std.testing.expect(fixture.server.mediaPhysicalCanPublish(fixture.id, "#browser", conn.session.displayName(), .video));
+}
+
+test "protected MEDIA physical JOIN: changed original binding refuses before membership mutation" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    _ = try fixture.server.world.join("#browser", worldIdFromClient(fixture.id));
+    var plan = try PreparedMediaPhysicalJoin.prepare(fixture.server, fixture.id, conn, "#browser", .voice);
+    defer plan.deinit();
+    conn.bindMediaE2eeAttachment(@splat(0x5d));
+    try std.testing.expectError(error.BadState, plan.validate());
+    try std.testing.expectEqual(@as(usize, 0), fixture.server.media_physical_attachments.items.len);
+    try std.testing.expect(conn.mediaE2eeAttachmentMatches(@splat(0x5d)));
+}
+
+const BrowserJoinMembershipRetirementForTest = struct {
+    domain: *media_routing.Domain,
+    membership: media_routing.MembershipPreview,
+    fn run(scope: *media_routing.Locked, self: @This()) media_routing.Error!void {
+        try self.domain.revokeMembershipLocked(scope, self.membership.call, self.membership.client);
+    }
+};
+
+fn prepareBrowserJoinConnectionForTest(fixture: *Tls3ServerFixture, channel: []const u8) !*ConnState {
+    const conn = fixture.connection();
+    _ = try fixture.server.world.join(channel, worldIdFromClient(fixture.id));
+    fixture.server.config.ws_media_relay = true;
+    conn.ws = try std.testing.allocator.create(WsState);
+    conn.ws.?.* = .{ .phase = .open, .subprotocol = .onyx_irc_media };
+    return conn;
+}
+
+test "protected MEDIA browser JOIN: joined source plans publish only final labeled WS TLS custody" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        var fixture = try Tls3ServerFixture.create(suite);
+        defer fixture.deinit();
+        current_reactor = &fixture.server.reactors[0];
+        const conn = try prepareBrowserJoinConnectionForTest(&fixture, "#joined-browser");
+        conn.bindMediaE2eeAttachment(@splat(0x4c));
+        const domain = try media_routing.Domain.create(a);
+        defer domain.destroyQuiesced() catch @panic("test retained actual Domain membership");
+        var plan = (try PreparedMediaBrowserJoin.prepare(fixture.server, domain, fixture.id, conn, "#joined-browser", .voice, "joined-proof")).?;
+        defer plan.deinit();
+        defer if (plan.done) domain.withLocked(BrowserJoinMembershipRetirementForTest{ .domain = domain, .membership = plan.membership.preview() }, BrowserJoinMembershipRetirementForTest.run) catch @panic("test membership retirement failed");
+        const before = conn.tls.?.engine.tls13.app_write_seq;
+        try std.testing.expect(conn.mediaCallChannel() == null);
+        try std.testing.expect(conn.mediaE2eeAttachmentMatches(@splat(0x4c)));
+        try std.testing.expect(fixture.server.media_rooms.room("#joined-browser") == null);
+        try std.testing.expectEqual(@as(usize, 0), fixture.server.media_physical_attachments.items.len);
+        try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+        try std.testing.expectEqual(before, conn.tls.?.engine.tls13.app_write_seq);
+        try domain.withLocked(&plan, PreparedMediaBrowserJoin.publishLocked);
+        try std.testing.expectEqualStrings("#joined-browser", conn.mediaCallChannel().?);
+        try std.testing.expect(!conn.media_e2ee_attachment_bound);
+        try std.testing.expect(fixture.server.media_rooms.isParticipant("#joined-browser", conn.session.displayName()));
+        try std.testing.expectEqual(@as(usize, 1), fixture.server.media_physical_attachments.items.len);
+        try std.testing.expect(conn.tls.?.engine.tls13.app_write_seq > before);
+        const actual = try tls3ServerDrain(&fixture, conn);
+        defer {
+            std.crypto.secureZero(u8, actual);
+            a.free(actual);
+        }
+        const frame = try websocket.decodeFrame(WsState.max_frame, .server_to_client, actual, &.{});
+        try std.testing.expectEqual(websocket.Opcode.text, frame.frame.opcode);
+        try std.testing.expectEqual(actual.len, frame.consumed);
+        try std.testing.expect(std.mem.indexOf(u8, frame.frame.payload, "label=joined-proof") != null);
+        var key: [cadence_frame.MAC_KEY_BYTES]u8 = undefined;
+        defer std.crypto.secureZero(u8, &key);
+        cadence_frame.deriveNativeMediaMacKey(&fixture.server.native_stream_key, "#joined-browser", conn.session.displayName(), &key);
+        var b64: [std.base64.standard.Encoder.calcSize(cadence_frame.MAC_KEY_BYTES)]u8 = undefined;
+        defer std.crypto.secureZero(u8, &b64);
+        const encoded = std.base64.standard.Encoder.encode(&b64, &key);
+        try std.testing.expect(std.mem.indexOf(u8, frame.frame.payload, "MEDIA MACKEY #joined-browser ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, frame.frame.payload, encoded) != null);
+    }
+}
+
+test "protected MEDIA browser JOIN: protected queue refusal leaves all original authority retryable" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = try prepareBrowserJoinConnectionForTest(&fixture, "#joined-browser");
+    conn.bindMediaE2eeAttachment(@splat(0x7a));
+    const domain = try media_routing.Domain.create(a);
+    defer domain.destroyQuiesced() catch @panic("test retained actual Domain membership");
+    const before = conn.tls.?.engine.tls13.app_write_seq;
+    const old_cap = conn.sendq_cap;
+    conn.sendq_cap = 0;
+    const refused = PreparedMediaBrowserJoin.prepare(fixture.server, domain, fixture.id, conn, "#joined-browser", .voice, null);
+    conn.sendq_cap = old_cap;
+    try std.testing.expectError(error.OutputTooSmall, refused);
+    try std.testing.expectEqual(before, conn.tls.?.engine.tls13.app_write_seq);
+    try std.testing.expect(!conn.tls.?.hasPreparedWrite());
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    try std.testing.expect(conn.mediaCallChannel() == null);
+    try std.testing.expect(conn.mediaE2eeAttachmentMatches(@splat(0x7a)));
+    try std.testing.expect(fixture.server.media_rooms.room("#joined-browser") == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.server.media_physical_attachments.items.len);
+    var retry = (try PreparedMediaBrowserJoin.prepare(fixture.server, domain, fixture.id, conn, "#joined-browser", .voice, null)).?;
+    defer retry.deinit();
+    defer if (retry.done) domain.withLocked(BrowserJoinMembershipRetirementForTest{ .domain = domain, .membership = retry.membership.preview() }, BrowserJoinMembershipRetirementForTest.run) catch @panic("test membership retirement failed");
+    try std.testing.expectEqual(@as(u64, 1), retry.membership.preview().call.serial);
+    try domain.withLocked(&retry, PreparedMediaBrowserJoin.publishLocked);
+    const actual = try tls3ServerDrain(&fixture, conn);
+    defer {
+        std.crypto.secureZero(u8, actual);
+        a.free(actual);
+    }
+    const frame = try websocket.decodeFrame(WsState.max_frame, .server_to_client, actual, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, frame.frame.payload, "MEDIA MACKEY #joined-browser ") != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.server.media_physical_attachments.items.len);
+}
+
+test "protected MEDIA browser JOIN: changed Room or foreign Domain refuses before output and physical publication" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = try prepareBrowserJoinConnectionForTest(&fixture, "#joined-browser");
+    const domain = try media_routing.Domain.create(a);
+    defer domain.destroyQuiesced() catch @panic("test retained actual Domain membership");
+    const foreign = try media_routing.Domain.create(a);
+    defer foreign.destroyQuiesced() catch @panic("test changed foreign Domain");
+    const before = conn.tls.?.engine.tls13.app_write_seq;
+    var plan = (try PreparedMediaBrowserJoin.prepare(fixture.server, domain, fixture.id, conn, "#joined-browser", .voice, null)).?;
+    defer plan.deinit();
+    try std.testing.expectError(error.InvalidScope, foreign.withLocked(&plan, PreparedMediaBrowserJoin.publishLocked));
+    try fixture.server.media_rooms.join("#joined-browser", "existing", .video);
+    try std.testing.expectError(error.StaleCandidate, domain.withLocked(&plan, PreparedMediaBrowserJoin.publishLocked));
+    try std.testing.expectEqual(before, conn.tls.?.engine.tls13.app_write_seq);
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    try std.testing.expect(conn.mediaCallChannel() == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.server.media_physical_attachments.items.len);
+    try std.testing.expect(!fixture.server.media_rooms.isParticipant("#joined-browser", conn.session.displayName()));
+    try std.testing.expect(fixture.server.media_rooms.isParticipant("#joined-browser", "existing"));
+}
+
+test "protected MEDIA negotiation: offered capability is separate from agreement and no authority publishes" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    _ = try fixture.server.world.join("#negotiation", worldIdFromClient(fixture.id));
+    const sequence = conn.tls.?.engine.tls13.app_write_seq;
+    const plan = try PreparedMediaNegotiation.prepare(fixture.server, fixture.id, conn, "#negotiation", .offer, "cadencevox,cadencevis,raw", &.{});
+    try plan.validate();
+    try std.testing.expectEqual(@as(u8, 3), plan.offered.codec_count);
+    try std.testing.expectEqual(sdp.CodecTag.raw, plan.offered.slice()[2].tag);
+    try std.testing.expectEqual(@as(u8, 2), plan.agreed.codec_count);
+    try std.testing.expectEqual(sdp.CodecTag.cadencevox, plan.agreed.slice()[0].tag);
+    try std.testing.expectEqual(sdp.CodecTag.cadencevis, plan.agreed.slice()[1].tag);
+    try std.testing.expectEqual(sdp.FecScheme.rs_block, plan.offered.fec.scheme);
+    try std.testing.expectEqual(@as(u8, 1), plan.offered.fec.redundancy);
+    try std.testing.expect(PreparedMediaNegotiation.sameProfile(plan.agreed, plan.agreed));
+    try std.testing.expect(!PreparedMediaNegotiation.sameProfile(plan.offered, plan.agreed));
+    try std.testing.expect(fixture.server.media_rooms.transportProfileOf("#negotiation") == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.server.media_physical_attachments.items.len);
+    try std.testing.expectEqual(sequence, conn.tls.?.engine.tls13.app_write_seq);
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    // This is command-data preparation only. No credential candidate, protected
+    // reply, transport/Room/Bridge or Domain publication is installed here.
+}
+
+test "protected MEDIA negotiation: actual shared profile rejects changed used values and ignores unused codec tails" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    _ = try fixture.server.world.join("#agreement", worldIdFromClient(fixture.id));
+    const shared = [_]sdp.Codec{.{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 }};
+    try fixture.server.media_rooms.setProfile("#agreement", &shared, .{ .scheme = .rs_block, .redundancy = 1 });
+    const plan = try PreparedMediaNegotiation.prepare(fixture.server, fixture.id, conn, "#agreement", .answer, "cadencevox,cadencevis,raw", &.{});
+    try std.testing.expectEqual(@as(u8, 3), plan.offered.codec_count);
+    try std.testing.expectEqual(@as(u8, 1), plan.agreed.codec_count);
+    try std.testing.expectEqual(sdp.CodecTag.cadencevox, plan.agreed.slice()[0].tag);
+    try plan.validate();
+    const current = fixture.server.media_rooms.profiles.getPtr("#agreement").?;
+    // Both values are valid CallProfiles. Unused initialized tails deliberately
+    // differ, so equality cannot depend on padding or unused array elements.
+    var same = plan.shared_before.?;
+    same.codecs[1] = .{ .tag = .raw, .clock_rate = 3, .params = 19 };
+    same.codecs[2] = .{ .tag = .cadencevis, .clock_rate = 17, .params = 21 };
+    same.codecs[3] = .{ .tag = .cadencevox, .clock_rate = 31, .params = 43 };
+    current.codecs[1] = .{ .tag = .cadencevox, .clock_rate = 500, .params = 700 };
+    current.codecs[2] = .{ .tag = .raw, .clock_rate = 900, .params = 1100 };
+    current.codecs[3] = .{ .tag = .cadencevis, .clock_rate = 1300, .params = 1500 };
+    try std.testing.expect(PreparedMediaNegotiation.sameProfile(same, current.*));
+    try plan.validate();
+    current.codecs[0].clock_rate += 1;
+    try std.testing.expectError(error.BadState, plan.validate());
+    current.codecs[0].clock_rate -= 1;
+    current.fec.redundancy += 1;
+    try std.testing.expectError(error.BadState, plan.validate());
+    current.fec.redundancy -= 1;
+    try plan.validate();
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+}
+
+test "protected MEDIA negotiation: exact caller membership config and malformed input refuse before output" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    _ = try fixture.server.world.join("#policy", worldIdFromClient(fixture.id));
+    try std.testing.expectError(error.NoOffer, PreparedMediaNegotiation.prepare(fixture.server, fixture.id, conn, "#policy", .answer, "cadencevox", &.{}));
+    try std.testing.expectError(error.NoCodecs, PreparedMediaNegotiation.prepare(fixture.server, fixture.id, conn, "#policy", .offer, "unknown", &.{}));
+    try std.testing.expectError(error.NoCommonCodec, PreparedMediaNegotiation.prepare(fixture.server, fixture.id, conn, "#policy", .offer, "raw", &.{}));
+    try std.testing.expectError(error.BadFingerprint, PreparedMediaNegotiation.prepare(fixture.server, fixture.id, conn, "#policy", .offer, "cadencevox", &.{"fingerprint=bad"}));
+    const plan = try PreparedMediaNegotiation.prepare(fixture.server, fixture.id, conn, "#policy", .offer, "cadencevox", &.{"transport=webrtc"});
+    try std.testing.expect(plan.wants_webrtc);
+    try std.testing.expect(plan.expected_fp == null);
+    const old_host = fixture.server.config.media_host;
+    fixture.server.config.media_host = "other.example.test";
+    try std.testing.expectError(error.BadState, plan.validate());
+    fixture.server.config.media_host = old_host;
+    try plan.validate();
+    try fixture.server.world.part("#policy", worldIdFromClient(fixture.id));
+    try std.testing.expectError(error.BadState, plan.validate());
+    _ = try fixture.server.world.join("#policy", worldIdFromClient(fixture.id));
+    try plan.validate();
+    conn.closing = true;
+    try std.testing.expectError(error.BadState, plan.validate());
+    conn.closing = false;
+    try plan.validate();
+    try std.testing.expect(fixture.server.media_rooms.transportProfileOf("#policy") == null);
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+}
+
+test "protected MEDIA negotiation: every actual agreement OOM keeps source and retries on the same owner" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    _ = try fixture.server.world.join("#oom-agreement", worldIdFromClient(fixture.id));
+    const original_allocator = fixture.server.allocator;
+    var census = std.testing.FailingAllocator.init(original_allocator, .{});
+    fixture.server.allocator = census.allocator();
+    {
+        defer fixture.server.allocator = original_allocator;
+        const plan = try PreparedMediaNegotiation.prepare(fixture.server, fixture.id, conn, "#oom-agreement", .offer, "cadencevox,cadencevis,raw", &.{});
+        try plan.validate();
+    }
+    try std.testing.expect(census.allocations != 0);
+    try std.testing.expectEqual(census.allocations, census.deallocations);
+    for (0..census.allocations) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(original_allocator, .{ .fail_index = fail_index });
+        fixture.server.allocator = failing.allocator();
+        {
+            defer fixture.server.allocator = original_allocator;
+            try std.testing.expectError(error.OutOfMemory, PreparedMediaNegotiation.prepare(fixture.server, fixture.id, conn, "#oom-agreement", .offer, "cadencevox,cadencevis,raw", &.{}));
+            try std.testing.expectEqual(failing.allocations, failing.deallocations);
+            try std.testing.expect(fixture.server.media_rooms.transportProfileOf("#oom-agreement") == null);
+            try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+            failing.fail_index = std.math.maxInt(usize);
+            const retry = try PreparedMediaNegotiation.prepare(fixture.server, fixture.id, conn, "#oom-agreement", .offer, "cadencevox,cadencevis,raw", &.{});
+            try retry.validate();
+            try std.testing.expect(fixture.server.connFor(fixture.id) == conn);
+            try std.testing.expectEqual(@as(u8, 2), retry.agreed.codec_count);
+            try std.testing.expectEqual(failing.allocations, failing.deallocations);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.server.media_physical_attachments.items.len);
+}
+
+/// Test-only source fixture. The native UDP resource is real and no pump or
+/// Reactor/companion activation is claimed. It publishes no physical endpoint.
+const MediaAdvertisementsTestFixture = struct {
+    tls: Tls3ServerFixture,
+    domain: *media_routing.Domain,
+    native_binding: *media_routing.NativeBinding,
+    webrtc_binding: *media_routing.WebrtcBinding,
+
+    fn create() !MediaAdvertisementsTestFixture {
+        if (!builtin.is_test) @compileError("MEDIA advertisement fixture is test-only");
+        var tls = try Tls3ServerFixture.create(0x1301);
+        errdefer tls.deinit();
+        tls.server.config.media_host = "native.example.test";
+        tls.server.config.media_enabled = true;
+        try tls.server.native_media.prepareColdResources(std.testing.io, native_media_mod.loopback_be, 0);
+        const domain = try media_routing.Domain.create(std.testing.allocator);
+        errdefer domain.destroyQuiesced() catch @panic("advertisement fixture retained failed Domain");
+        const native_binding = try domain.bindNative(&tls.server.native_media);
+        errdefer domain.releaseNative(native_binding) catch @panic("advertisement fixture retained failed Native binding");
+        const webrtc_binding = try domain.bindWebrtc(&tls.server.media_plane);
+        return .{ .tls = tls, .domain = domain, .native_binding = native_binding, .webrtc_binding = webrtc_binding };
+    }
+
+    fn deinit(self: *MediaAdvertisementsTestFixture) void {
+        self.domain.releaseWebrtc(self.webrtc_binding) catch @panic("advertisement fixture retained actual Plane source custody");
+        self.domain.releaseNative(self.native_binding) catch @panic("advertisement fixture retained actual Native source custody");
+        self.domain.destroyQuiesced() catch @panic("advertisement fixture published an endpoint");
+        self.tls.deinit();
+    }
+};
+
+const MediaAdvertisementsValidationTest = struct {
+    advertisements: *const PreparedMediaAdvertisements,
+    output: ?*const PreparedMediaOutput = null,
+    fn run(scope: *media_routing.Locked, self: @This()) !void {
+        try self.advertisements.validateLocked(scope);
+        if (self.output) |output| try output.validate();
+    }
+};
+
+test "protected MEDIA advertisement: actual native-only resource host and labeled secret bytes stage without RTC or authority publication" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try MediaAdvertisementsTestFixture.create();
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.tls.connection();
+    _ = try server.world.join("#native-ad", worldIdFromClient(fixture.tls.id));
+    const negotiation = try PreparedMediaNegotiation.prepare(server, fixture.tls.id, conn, "#native-ad", .offer, "cadencevox", &.{});
+    const offers = try fixture.domain.prepareOffers("#native-ad", fixture.tls.id, &.{.{ .leg = .native, .mode = .legacy_group }});
+    defer offers.deinit();
+    const native = try server.native_media.prepareOffer(fixture.domain, offers, "#native-ad", conn.session.displayName(), negotiation.agreed, 1);
+    defer native.deinit();
+    var advertisements = try PreparedMediaAdvertisements.prepare(&negotiation, fixture.domain, offers, native, null, 1);
+    defer advertisements.deinit();
+    try std.testing.expectEqualStrings("native.example.test", advertisements.hostSlice());
+    try std.testing.expectEqual(server.native_media.port, advertisements.native_ad.?.port);
+    try std.testing.expect(server.native_media.port != 0);
+    try std.testing.expect(server.media_plane.socket == null);
+    try std.testing.expectEqual(@as(u32, 0), server.media_plane.physical_rows.count());
+    try std.testing.expectEqual(@as(u32, 0), server.media_plane.physical_groups.count());
+    const sequence = conn.tls.?.engine.tls13.app_write_seq;
+    var output = try prepareMediaTransportIssuerOutput(&advertisements, "native-proof");
+    defer output.deinit();
+    try fixture.domain.withLocked(MediaAdvertisementsValidationTest{ .advertisements = &advertisements, .output = &output }, MediaAdvertisementsValidationTest.run);
+    var encoded_key: [std.base64.standard.Encoder.calcSize(32)]u8 = undefined;
+    defer std.crypto.secureZero(u8, &encoded_key);
+    const encoded = std.base64.standard.Encoder.encode(&encoded_key, native.preview().master);
+    try std.testing.expect(std.mem.indexOf(u8, output.plaintext, "NATIVE-MACKEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.plaintext, encoded) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.plaintext, "native.example.test:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.plaintext, "label=native-proof") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.plaintext, "TRANSPORT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.plaintext, "ufrag=") == null);
+    try std.testing.expectEqual(sequence, conn.tls.?.engine.tls13.app_write_seq);
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    try std.testing.expectEqual(@as(u32, 0), server.native_media.physical_endpoints.count());
+    try std.testing.expect(server.media_rooms.transportProfileOf("#native-ad") == null);
+    // Actual source capture and encrypted output preparation are exercised;
+    // no dispatch, endpoint/Room/Bridge/FIFO commit, peer delivery or runtime
+    // activation is performed or accepted by this fixture.
+}
+
+test "protected MEDIA advertisement: missing actual TLS refuses before capture and original owner retries" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try MediaAdvertisementsTestFixture.create();
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.tls.connection();
+    _ = try server.world.join("#protected-ad", worldIdFromClient(fixture.tls.id));
+    const negotiation = try PreparedMediaNegotiation.prepare(server, fixture.tls.id, conn, "#protected-ad", .offer, "cadencevox", &.{});
+    const offers = try fixture.domain.prepareOffers("#protected-ad", fixture.tls.id, &.{.{ .leg = .native, .mode = .legacy_group }});
+    defer offers.deinit();
+    const native = try server.native_media.prepareOffer(fixture.domain, offers, "#protected-ad", conn.session.displayName(), negotiation.agreed, 1);
+    defer native.deinit();
+    {
+        const adapter = conn.tls;
+        conn.tls = null;
+        defer conn.tls = adapter;
+        try std.testing.expectError(error.BadState, PreparedMediaAdvertisements.prepare(&negotiation, fixture.domain, offers, native, null, 1));
+        try std.testing.expectError(error.NotPrepared, native.advertisement());
+        try std.testing.expectEqual(@as(usize, 0), server.media_plane.physical_pending);
+        try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    }
+    var retry = try PreparedMediaAdvertisements.prepare(&negotiation, fixture.domain, offers, native, null, 1);
+    defer retry.deinit();
+    try fixture.domain.withLocked(MediaAdvertisementsValidationTest{ .advertisements = &retry }, MediaAdvertisementsValidationTest.run);
+    try std.testing.expect(server.connFor(fixture.tls.id) == conn);
+    try std.testing.expectEqual(@as(u32, 0), server.native_media.physical_endpoints.count());
+}
+
+test "protected MEDIA advertisement: actual held port discovery and config changes refuse final relation then original plans retry" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try MediaAdvertisementsTestFixture.create();
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.tls.connection();
+    _ = try server.world.join("#changing-ad", worldIdFromClient(fixture.tls.id));
+    const negotiation = try PreparedMediaNegotiation.prepare(server, fixture.tls.id, conn, "#changing-ad", .offer, "cadencevox", &.{});
+    const offers = try fixture.domain.prepareOffers("#changing-ad", fixture.tls.id, &.{.{ .leg = .native, .mode = .legacy_group }});
+    defer offers.deinit();
+    const native = try server.native_media.prepareOffer(fixture.domain, offers, "#changing-ad", conn.session.displayName(), negotiation.agreed, 1);
+    defer native.deinit();
+    var advertisements = try PreparedMediaAdvertisements.prepare(&negotiation, fixture.domain, offers, native, null, 1);
+    defer advertisements.deinit();
+    const cut = MediaAdvertisementsValidationTest{ .advertisements = &advertisements };
+    {
+        const port = server.native_media.port;
+        server.native_media.port = if (port == std.math.maxInt(u16)) port - 1 else port + 1;
+        defer server.native_media.port = port;
+        try std.testing.expectError(error.StaleCandidate, fixture.domain.withLocked(cut, MediaAdvertisementsValidationTest.run));
+    }
+    try fixture.domain.withLocked(cut, MediaAdvertisementsValidationTest.run);
+    {
+        const address = server.media_plane.discovered;
+        server.media_plane.discovered = .{ .ip = .{ 203, 0, 113, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .ip_len = 4, .port = 9 };
+        defer server.media_plane.discovered = address;
+        try std.testing.expectError(error.StaleCandidate, fixture.domain.withLocked(cut, MediaAdvertisementsValidationTest.run));
+    }
+    try fixture.domain.withLocked(cut, MediaAdvertisementsValidationTest.run);
+    {
+        const host = server.config.media_host;
+        server.config.media_host = "foreign.example.test";
+        defer server.config.media_host = host;
+        try std.testing.expectError(error.BadState, fixture.domain.withLocked(cut, MediaAdvertisementsValidationTest.run));
+    }
+    try fixture.domain.withLocked(cut, MediaAdvertisementsValidationTest.run);
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    try std.testing.expectEqual(@as(u32, 0), server.native_media.physical_endpoints.count());
+}
+
+test "protected MEDIA advertisement: independently valid foreign agreed FEC refuses before output or route publishes" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try MediaAdvertisementsTestFixture.create();
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.tls.connection();
+    _ = try server.world.join("#foreign-ad", worldIdFromClient(fixture.tls.id));
+    const negotiation = try PreparedMediaNegotiation.prepare(server, fixture.tls.id, conn, "#foreign-ad", .offer, "cadencevox", &.{});
+    const offers = try fixture.domain.prepareOffers("#foreign-ad", fixture.tls.id, &.{.{ .leg = .native, .mode = .legacy_group }});
+    defer offers.deinit();
+    var foreign = negotiation.agreed;
+    foreign.fec = .{ .scheme = .none, .redundancy = 0 };
+    const native = try server.native_media.prepareOffer(fixture.domain, offers, "#foreign-ad", conn.session.displayName(), foreign, 1);
+    defer native.deinit();
+    var advertisements = try PreparedMediaAdvertisements.prepare(&negotiation, fixture.domain, offers, native, null, 1);
+    defer advertisements.deinit();
+    var output = try prepareMediaTransportIssuerOutput(&advertisements, null);
+    defer output.deinit();
+    try std.testing.expectError(error.InvalidProfile, fixture.domain.withLocked(MediaAdvertisementsValidationTest{ .advertisements = &advertisements, .output = &output }, MediaAdvertisementsValidationTest.run));
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    try std.testing.expectEqual(@as(u32, 0), server.native_media.physical_endpoints.count());
+    try std.testing.expect(server.media_rooms.transportProfileOf("#foreign-ad") == null);
+}
+
+const PhysicalDepartureMembershipForTest = struct {
+    domain: *media_routing.Domain,
+    plan: *media_routing.PreparedMembership,
+    fn run(scope: *media_routing.Locked, self: @This()) !void {
+        try self.plan.validateLocked(self.domain, scope);
+        self.plan.commitLocked(self.domain, scope);
+    }
+};
+
+fn physicalDepartureAddMembershipForTest(domain: *media_routing.Domain, id: client_model.ClientId, channel: []const u8, kind: media_room.MediaKind) !void {
+    const plan = try domain.prepareMembership(channel, id, mediaKindBit(kind));
+    defer plan.deinit();
+    try domain.withLocked(PhysicalDepartureMembershipForTest{ .domain = domain, .plan = plan }, PhysicalDepartureMembershipForTest.run);
+}
+
+const PhysicalDepartureOnlyForTest = struct {
+    domain: *media_routing.Domain,
+    plan: *media_routing.PreparedClientDeparture,
+    fn run(scope: *media_routing.Locked, self: @This()) !void {
+        try self.plan.validateLocked(self.domain, scope);
+        self.plan.commitLocked(self.domain, scope);
+    }
+};
+
+fn physicalDepartureRetireDomainForTest(domain: *media_routing.Domain, id: client_model.ClientId) !void {
+    const plan = try domain.prepareClientDeparture(id);
+    defer plan.deinit();
+    try domain.withLocked(PhysicalDepartureOnlyForTest{ .domain = domain, .plan = plan }, PhysicalDepartureOnlyForTest.run);
+}
+
+const PhysicalDeparturePairForTest = struct {
+    physical: *PreparedMediaPhysicalClientDeparture,
+    domain: *media_routing.Domain,
+    actual: *media_routing.PreparedClientDeparture,
+    fn run(scope: *media_routing.Locked, self: @This()) !void {
+        try self.physical.validateLocked(self.domain, scope, self.actual);
+        self.physical.commit();
+        self.actual.commitLocked(self.domain, scope);
+    }
+};
+
+fn physicalDepartureSiblingForTest(fixture: *Tls3ServerFixture) !client_model.ClientId {
+    const sibling_id = try addTestLocalClient(fixture.server, "DepartureSibling", null);
+    const sibling = fixture.server.connFor(sibling_id).?;
+    fixture.server.world.unregisterNick(worldIdFromClient(sibling_id));
+    sibling.session.restore(.{ .nick = fixture.connection().session.displayName(), .username = "sibling", .realname = "Same nick physical sibling" });
+    return sibling_id;
+}
+
+fn physicalDepartureRowsForTest(fixture: *Tls3ServerFixture, sibling_id: client_model.ClientId) !void {
+    const conn = fixture.connection();
+    const sibling = fixture.server.connFor(sibling_id).?;
+    inline for (.{ "#departure-one", "#departure-two" }) |channel| {
+        _ = try fixture.server.world.join(channel, worldIdFromClient(fixture.id));
+        try fixture.server.world.restoreMember(channel, worldIdFromClient(sibling_id), world_model.MemberModes.empty());
+        _ = try fixture.server.addMediaPhysicalAttachment(fixture.id, channel, conn.session.displayName(), .voice);
+        _ = try fixture.server.addMediaPhysicalAttachment(sibling_id, channel, sibling.session.displayName(), .video);
+    }
+    conn.setMediaCall("#departure-one", conn.session.displayName());
+    conn.bindMediaE2eeAttachment(@splat(0x45));
+    sibling.setMediaCall("#departure-one", sibling.session.displayName());
+    sibling.bindMediaE2eeAttachment(@splat(0x87));
+}
+
+test "protected MEDIA complete departure: all actual physical rows retire in one cut and same-nick sibling survives" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const sibling_id = try physicalDepartureSiblingForTest(&fixture);
+    try physicalDepartureRowsForTest(&fixture, sibling_id);
+    const conn = fixture.connection();
+    const sibling = fixture.server.connFor(sibling_id).?;
+    const domain = try media_routing.Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("test retained real Domain state");
+    defer physicalDepartureRetireDomainForTest(domain, sibling_id) catch @panic("test sibling Domain cleanup failed");
+    defer physicalDepartureRetireDomainForTest(domain, fixture.id) catch @panic("test owner Domain cleanup failed");
+    inline for (.{ "#departure-one", "#departure-two" }) |channel| {
+        try physicalDepartureAddMembershipForTest(domain, fixture.id, channel, .voice);
+        try physicalDepartureAddMembershipForTest(domain, sibling_id, channel, .video);
+    }
+    conn.closing = true; // Normal close retirement still owns the original row.
+    const old_sequence = conn.tls.?.engine.tls13.app_write_seq;
+    const sibling_binding = PreparedMediaPhysicalJoin.Binding.capture(sibling);
+    const old_pointer = PreparedMediaPhysicalJoin.arrayPtr(&fixture.server.media_physical_attachments);
+    const actual = try domain.prepareClientDeparture(fixture.id);
+    defer actual.deinit();
+    try std.testing.expectEqual(@as(usize, 2), actual.count());
+    var plan = try PreparedMediaPhysicalClientDeparture.prepare(fixture.server, fixture.id, conn);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plan.removed);
+    try std.testing.expectEqual(@as(usize, 4), fixture.server.media_physical_attachments.items.len);
+    try std.testing.expectEqual(old_pointer, PreparedMediaPhysicalJoin.arrayPtr(&fixture.server.media_physical_attachments));
+    try std.testing.expect(conn.mediaE2eeAttachmentMatches(@splat(0x45)));
+    // Bounded Server+Domain membership proof only: no transport/Room/Bridge/FIFO
+    // owner is installed by this fixture, and no live handler calls this helper.
+    try domain.withLocked(PhysicalDeparturePairForTest{ .physical = &plan, .domain = domain, .actual = actual }, PhysicalDeparturePairForTest.run);
+    try std.testing.expectEqual(@as(usize, 2), fixture.server.media_physical_attachments.items.len);
+    for (fixture.server.media_physical_attachments.items) |row| try std.testing.expect(row.client.eql(sibling_id));
+    try std.testing.expect(conn.mediaCallChannel() == null);
+    try std.testing.expect(!conn.media_e2ee_attachment_bound);
+    try std.testing.expect(std.meta.eql(sibling_binding, PreparedMediaPhysicalJoin.Binding.capture(sibling)));
+    try std.testing.expectEqual(old_sequence, conn.tls.?.engine.tls13.app_write_seq);
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+    try std.testing.expect(fixture.server.world.isMember("#departure-two", worldIdFromClient(sibling_id)));
+}
+
+test "protected MEDIA complete departure: changed sibling row or original attachment refuses before any retirement" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const sibling_id = try physicalDepartureSiblingForTest(&fixture);
+    try physicalDepartureRowsForTest(&fixture, sibling_id);
+    const conn = fixture.connection();
+    const domain = try media_routing.Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("test retained real Domain state");
+    defer physicalDepartureRetireDomainForTest(domain, fixture.id) catch @panic("test owner Domain cleanup failed");
+    inline for (.{ "#departure-one", "#departure-two" }) |channel| try physicalDepartureAddMembershipForTest(domain, fixture.id, channel, .voice);
+    const actual = try domain.prepareClientDeparture(fixture.id);
+    defer actual.deinit();
+    var plan = try PreparedMediaPhysicalClientDeparture.prepare(fixture.server, fixture.id, conn);
+    defer plan.deinit();
+    const context = PhysicalDeparturePairForTest{ .physical = &plan, .domain = domain, .actual = actual };
+    const sibling_index = fixture.server.mediaPhysicalIndex(sibling_id, "#departure-two", conn.session.displayName()).?;
+    const old_bits = fixture.server.media_physical_attachments.items[sibling_index].kind_bits;
+    fixture.server.media_physical_attachments.items[sibling_index].kind_bits |= mediaKindBit(.voice);
+    try std.testing.expectError(error.BadState, domain.withLocked(context, PhysicalDeparturePairForTest.run));
+    fixture.server.media_physical_attachments.items[sibling_index].kind_bits = old_bits;
+    conn.bindMediaE2eeAttachment(@splat(0x24));
+    try std.testing.expectError(error.BadState, domain.withLocked(context, PhysicalDeparturePairForTest.run));
+    try std.testing.expectEqual(@as(usize, 4), fixture.server.media_physical_attachments.items.len);
+    try std.testing.expect(conn.mediaE2eeAttachmentMatches(@splat(0x24)));
+    try std.testing.expect(!plan.done);
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+}
+
+test "protected MEDIA complete departure: mismatched genuine Domain census refuses Server row removal" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const sibling_id = try physicalDepartureSiblingForTest(&fixture);
+    try physicalDepartureRowsForTest(&fixture, sibling_id);
+    const conn = fixture.connection();
+    const domain = try media_routing.Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("test retained real Domain state");
+    defer physicalDepartureRetireDomainForTest(domain, fixture.id) catch @panic("test owner Domain cleanup failed");
+    try physicalDepartureAddMembershipForTest(domain, fixture.id, "#departure-one", .voice);
+    const actual = try domain.prepareClientDeparture(fixture.id);
+    defer actual.deinit();
+    var plan = try PreparedMediaPhysicalClientDeparture.prepare(fixture.server, fixture.id, conn);
+    defer plan.deinit();
+    try std.testing.expectError(error.BadState, domain.withLocked(PhysicalDeparturePairForTest{ .physical = &plan, .domain = domain, .actual = actual }, PhysicalDeparturePairForTest.run));
+    try std.testing.expectEqual(@as(usize, 4), fixture.server.media_physical_attachments.items.len);
+    try std.testing.expect(conn.mediaE2eeAttachmentMatches(@splat(0x45)));
+    try std.testing.expect(!plan.done);
+}
+
+test "protected MEDIA complete departure: every metadata OOM keeps exact original row and same-owner retry" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const sibling_id = try physicalDepartureSiblingForTest(&fixture);
+    try physicalDepartureRowsForTest(&fixture, sibling_id);
+    const conn = fixture.connection();
+    const original_allocator = fixture.server.allocator;
+    const old_pointer = PreparedMediaPhysicalJoin.arrayPtr(&fixture.server.media_physical_attachments);
+    const old_capacity = fixture.server.media_physical_attachments.capacity;
+    const old_binding = PreparedMediaPhysicalJoin.Binding.capture(conn);
+    var census = std.testing.FailingAllocator.init(original_allocator, .{});
+    fixture.server.allocator = census.allocator();
+    {
+        defer fixture.server.allocator = original_allocator;
+        var plan = try PreparedMediaPhysicalClientDeparture.prepare(fixture.server, fixture.id, conn);
+        defer plan.deinit();
+        try plan.validate();
+    }
+    try std.testing.expect(census.allocations >= 2);
+    try std.testing.expectEqual(census.allocations, census.deallocations);
+    for (0..census.allocations) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(original_allocator, .{ .fail_index = fail_index });
+        fixture.server.allocator = failing.allocator();
+        {
+            defer fixture.server.allocator = original_allocator;
+            if (PreparedMediaPhysicalClientDeparture.prepare(fixture.server, fixture.id, conn)) |unexpected| {
+                var owned = unexpected;
+                defer owned.deinit();
+                return error.TestExpectedOutOfMemory;
+            } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(failing.allocations, failing.deallocations);
+            try std.testing.expectEqual(old_pointer, PreparedMediaPhysicalJoin.arrayPtr(&fixture.server.media_physical_attachments));
+            try std.testing.expectEqual(old_capacity, fixture.server.media_physical_attachments.capacity);
+            try std.testing.expectEqual(@as(usize, 4), fixture.server.media_physical_attachments.items.len);
+            try std.testing.expect(std.meta.eql(old_binding, PreparedMediaPhysicalJoin.Binding.capture(conn)));
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try PreparedMediaPhysicalClientDeparture.prepare(fixture.server, fixture.id, conn);
+            {
+                defer retry.deinit();
+                try retry.validate();
+                try std.testing.expectEqual(@as(usize, 2), retry.removed);
+                try std.testing.expect(fixture.server.connFor(fixture.id) == conn);
+            }
+            try std.testing.expectEqual(failing.allocations, failing.deallocations);
+        }
+    }
+    try std.testing.expectEqual(old_pointer, PreparedMediaPhysicalJoin.arrayPtr(&fixture.server.media_physical_attachments));
+    try std.testing.expectEqual(old_capacity, fixture.server.media_physical_attachments.capacity);
+    try std.testing.expect(std.meta.eql(old_binding, PreparedMediaPhysicalJoin.Binding.capture(conn)));
+    try std.testing.expectEqual(@as(u64, 0), sendq.wireBacklog(conn));
+}
+
+test "protected MEDIA dispatch: actual disabled module retains label and refuses before handler authority" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    const server = fixture.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.connection();
+    conn.session.addCap(.labeled_response);
+    server.config.disabled_features = &.{"media"};
+    _ = try server.world.join("#turn-gate", worldIdFromClient(fixture.id));
+    const line = "@label=source-gate MEDIA OFFER #turn-gate cadencevox";
+    var parsed = try irc_line.parseLine(line);
+    try server.dispatchRegistered(fixture.id, conn, &parsed, line);
+    try std.testing.expect(current_media_authority_turn == null and conn.reply_capture == null);
+    const plaintext = try tls3ServerDrain(&fixture, conn);
+    defer std.testing.allocator.free(plaintext);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plaintext, "label=source-gate"));
+    try std.testing.expect(std.mem.indexOf(u8, plaintext, "MEDIA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plaintext, "MACKEY") == null);
+    try std.testing.expect(server.media_rooms.transportProfileOf("#turn-gate") == null);
+    try std.testing.expectEqual(@as(usize, 0), server.media_physical_attachments.items.len);
+}
+
+test "protected MEDIA dispatch: malformed real OFFER uses actual spine with one labeled or unlabeled TLS reply and restores turn" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    for ([_]bool{ false, true }) |labeled| {
+        var fixture = try Tls3ServerFixture.create(0x1301);
+        defer fixture.deinit();
+        const server = fixture.server;
+        current_reactor = &server.reactors[0];
+        const conn = fixture.connection();
+        if (labeled) conn.session.addCap(.labeled_response);
+        _ = try server.world.join("#turn-refusal", worldIdFromClient(fixture.id));
+        const line = if (labeled) "@label=source-refusal MEDIA OFFER #turn-refusal unknown" else "MEDIA OFFER #turn-refusal unknown";
+        var parsed = try irc_line.parseLine(line);
+        try server.dispatchRegistered(fixture.id, conn, &parsed, line);
+        try std.testing.expect(current_media_authority_turn == null and conn.reply_capture == null);
+        const plaintext = try tls3ServerDrain(&fixture, conn);
+        defer std.testing.allocator.free(plaintext);
+        try std.testing.expect(std.mem.indexOf(u8, plaintext, "NO_CODECS") != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plaintext, "\r\n"));
+        try std.testing.expectEqual(@as(usize, if (labeled) 1 else 0), std.mem.count(u8, plaintext, "label=source-refusal"));
+        try std.testing.expect(std.mem.indexOf(u8, plaintext, "MACKEY") == null);
+        try std.testing.expect(server.media_rooms.transportProfileOf("#turn-refusal") == null);
+    }
+}
+
+// These fixtures use the actual registered dispatch, real authenticated TLS
+// adapters/socket pairs, and held UDP resources. They never claim worker
+// activation, configured-runtime readiness or network delivery of UDP media.
+const RegisteredMediaCallerFixture = struct {
+    tls: Tls3ServerFixture,
+
+    fn create(native_udp: bool) !RegisteredMediaCallerFixture {
+        if (!builtin.is_test) @compileError("registered MEDIA fixture is test-only");
+        var tls = try Tls3ServerFixture.create(0x1301);
+        errdefer tls.deinit();
+        tls.server.config.media_host = "media.example.test";
+        tls.server.config.media_enabled = native_udp;
+        tls.server.config.crypto_io = std.testing.io;
+        if (native_udp) {
+            try tls.server.configureMediaColdPolicy();
+            try tls.server.native_media.prepareColdResources(std.testing.io, native_media_mod.loopback_be, 0);
+        }
+        try tls.server.prepareMediaRoutingOwner();
+        return .{ .tls = tls };
+    }
+
+    fn dispatch(self: *RegisteredMediaCallerFixture, line: []const u8) !void {
+        var parsed = try irc_line.parseLine(line);
+        try self.tls.server.dispatchRegistered(self.tls.id, self.tls.connection(), &parsed, line);
+    }
+
+    fn joinChannel(self: *RegisteredMediaCallerFixture, channel: []const u8) !void {
+        _ = try self.tls.server.world.join(channel, worldIdFromClient(self.tls.id));
+    }
+
+    fn deinit(self: *RegisteredMediaCallerFixture) void {
+        self.tls.deinit();
+    }
+};
+
+fn drainActualPlainMediaForTest(fixture: *Tls3ServerFixture, conn: *ConnState) ![]u8 {
+    try std.testing.expect(conn.tls == null and !conn.send_armed);
+    const bytes = try daemonOutputQueued(std.testing.allocator, conn);
+    errdefer std.testing.allocator.free(bytes);
+    try std.testing.expect(bytes.len != 0);
+    try writeAllFd(conn.fd, bytes);
+    const received = try std.testing.allocator.alloc(u8, bytes.len);
+    defer std.testing.allocator.free(received);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2000) == 0) return error.TestTimeout;
+        const count = try readFd(fixture.peer_fd, received[offset..]);
+        if (count == 0) return error.TestUnexpectedResult;
+        offset += count;
+    }
+    try std.testing.expectEqualSlices(u8, bytes, received);
+    conn.send_len = 0;
+    conn.send_offset = 0;
+    conn.send_overflow.clearRetainingCapacity();
+    return bytes;
+}
+
+fn decodeMediaWsForTest(bytes: []const u8) ![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(std.testing.allocator);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const decoded = try websocket.decodeFrame(WsState.max_frame, .server_to_client, bytes[offset..], &.{});
+        try std.testing.expect(decoded.frame.opcode == .text);
+        try std.testing.expect(decoded.consumed != 0);
+        try text.appendSlice(std.testing.allocator, decoded.frame.payload);
+        offset += decoded.consumed;
+    }
+    return text.toOwnedSlice(std.testing.allocator);
+}
+
+test "protected MEDIA caller: registered OFFER and reduced ANSWER publish exact encrypted native credentials without JOIN" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try RegisteredMediaCallerFixture.create(true);
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.tls.connection();
+    conn.session.addCap(.labeled_response);
+    try fixture.joinChannel("#actual-offer");
+    try fixture.dispatch("@label=offer-owner MEDIA OFFER #actual-offer cadencevox,cadencevis,raw");
+    try std.testing.expect(current_media_authority_turn == null and conn.reply_capture == null);
+    try std.testing.expectEqual(@as(u32, 1), server.native_media.physical_endpoints.count());
+    try std.testing.expectEqual(@as(usize, 0), server.media_physical_attachments.items.len);
+    var first_iterator = server.native_media.physical_endpoints.valueIterator();
+    var first = first_iterator.next().?.*;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&first));
+    try std.testing.expect(first.identity.reference.offering_client.eql(fixture.tls.id));
+    try std.testing.expectEqual(@as(u8, 7), first.kind_bits);
+    try std.testing.expectEqual(@as(u8, 2), first.profile.codec_count);
+    const plaintext = try tls3ServerDrain(&fixture.tls, conn);
+    defer {
+        std.crypto.secureZero(u8, plaintext);
+        std.testing.allocator.free(plaintext);
+    }
+    var b64: [std.base64.standard.Encoder.calcSize(32)]u8 = undefined;
+    defer std.crypto.secureZero(u8, &b64);
+    const key = std.base64.standard.Encoder.encode(&b64, &first.master);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plaintext, "MEDIA NATIVE-MACKEY #actual-offer "));
+    try std.testing.expect(std.mem.indexOf(u8, plaintext, key) != null);
+    try std.testing.expect(std.mem.indexOf(u8, plaintext, "label=offer-owner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plaintext, "MEDIA TRANSPORT") == null);
+    try fixture.dispatch("MEDIA ANSWER #actual-offer cadencevox,raw");
+    var second_iterator = server.native_media.physical_endpoints.valueIterator();
+    var second = second_iterator.next().?.*;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&second));
+    try std.testing.expectEqual(@as(u32, 1), server.native_media.physical_endpoints.count());
+    try std.testing.expectEqual(@as(u8, 1), second.kind_bits);
+    try std.testing.expectEqual(@as(u8, 1), second.profile.codec_count);
+    try std.testing.expect(!std.meta.eql(first.identity.reference.endpoint, second.identity.reference.endpoint));
+    try std.testing.expect(first.identity.stream_id != second.identity.stream_id);
+    try std.testing.expect(!std.mem.eql(u8, &first.master, &second.master));
+    const answer = try tls3ServerDrain(&fixture.tls, conn);
+    defer {
+        std.crypto.secureZero(u8, answer);
+        std.testing.allocator.free(answer);
+    }
+    const answer_key = std.base64.standard.Encoder.encode(&b64, &second.master);
+    try std.testing.expect(std.mem.indexOf(u8, answer, "ANSWER-ACK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answer, answer_key) != null);
+    try std.testing.expectEqual(@as(u8, 2), server.media_rooms.transportProfileOf("#actual-offer").?.codec_count);
+}
+
+test "protected MEDIA caller: actual plaintext OFFER refuses native publication despite TLS label then same owner succeeds" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try RegisteredMediaCallerFixture.create(true);
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.tls.connection();
+    try fixture.joinChannel("#plain-native");
+    {
+        const adapter = conn.tls;
+        conn.tls = null;
+        defer conn.tls = adapter;
+        try std.testing.expect(conn.is_tls);
+        try fixture.dispatch("MEDIA OFFER #plain-native cadencevox");
+        const bytes = try drainActualPlainMediaForTest(&fixture.tls, conn);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "SECURE_SIGNALING_REQUIRED") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "NATIVE-MACKEY") == null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "OFFER-ACK") == null);
+        try std.testing.expectEqual(@as(u32, 0), server.native_media.physical_endpoints.count());
+        try std.testing.expect(server.media_rooms.transportProfileOf("#plain-native") == null);
+    }
+    try fixture.dispatch("MEDIA OFFER #plain-native cadencevox");
+    const actual = try tls3ServerDrain(&fixture.tls, conn);
+    defer {
+        std.crypto.secureZero(u8, actual);
+        std.testing.allocator.free(actual);
+    }
+    try std.testing.expectEqual(@as(u32, 1), server.native_media.physical_endpoints.count());
+    try std.testing.expect(std.mem.indexOf(u8, actual, "NATIVE-MACKEY") != null);
+}
+
+test "protected MEDIA caller: late real protected queue refusal leaves route profile TLS and label retryable" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try RegisteredMediaCallerFixture.create(true);
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.tls.connection();
+    conn.session.addCap(.labeled_response);
+    try fixture.joinChannel("#queue-refusal");
+    const sequence = conn.tls.?.engine.tls13.app_write_seq;
+    const cap = conn.sendq_cap;
+    conn.sendq_cap = 1;
+    defer conn.sendq_cap = cap;
+    try std.testing.expectError(error.OutputTooSmall, fixture.dispatch("@label=retry-owner MEDIA OFFER #queue-refusal cadencevox"));
+    try std.testing.expect(current_media_authority_turn == null and conn.reply_capture == null);
+    try std.testing.expectEqual(sequence, conn.tls.?.engine.tls13.app_write_seq);
+    try std.testing.expect(!conn.tls.?.hasPreparedWrite());
+    try std.testing.expectEqual(@as(u64, 0), sendq.backlog(conn));
+    try std.testing.expectEqual(@as(u32, 0), server.native_media.physical_endpoints.count());
+    try std.testing.expectEqual(@as(usize, 0), server.native_media.physical_pending);
+    try std.testing.expectEqual(@as(usize, 0), server.media_plane.physical_pending);
+    try std.testing.expect(server.media_rooms.transportProfileOf("#queue-refusal") == null);
+    conn.sendq_cap = cap;
+    try fixture.dispatch("@label=retry-owner MEDIA OFFER #queue-refusal cadencevox");
+    const actual = try tls3ServerDrain(&fixture.tls, conn);
+    defer {
+        std.crypto.secureZero(u8, actual);
+        std.testing.allocator.free(actual);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, actual, "label=retry-owner") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, actual, "NATIVE-MACKEY"));
+}
+
+test "protected MEDIA caller: actual browser JOIN refuses plaintext before physical Room E2EE and MACKEY then retries securely" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try RegisteredMediaCallerFixture.create(false);
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = try prepareBrowserJoinConnectionForTest(&fixture.tls, "#actual-browser");
+    conn.session.addCap(.labeled_response);
+    conn.bindMediaE2eeAttachment(@splat(0x65));
+    {
+        const adapter = conn.tls;
+        conn.tls = null;
+        defer conn.tls = adapter;
+        try fixture.dispatch("@label=browser-owner MEDIA JOIN #actual-browser voice");
+        const raw = try drainActualPlainMediaForTest(&fixture.tls, conn);
+        defer std.testing.allocator.free(raw);
+        const text = try decodeMediaWsForTest(raw);
+        defer std.testing.allocator.free(text);
+        try std.testing.expect(std.mem.indexOf(u8, text, "SECURE_SIGNALING_REQUIRED") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "MEDIA MACKEY") == null);
+        try std.testing.expectEqual(@as(usize, 0), server.media_physical_attachments.items.len);
+        try std.testing.expect(server.media_rooms.room("#actual-browser") == null);
+        try std.testing.expect(conn.mediaCallChannel() == null and conn.mediaE2eeAttachmentMatches(@splat(0x65)));
+    }
+    try fixture.dispatch("@label=browser-owner MEDIA JOIN #actual-browser voice");
+    const raw = try tls3ServerDrain(&fixture.tls, conn);
+    defer {
+        std.crypto.secureZero(u8, raw);
+        std.testing.allocator.free(raw);
+    }
+    const text = try decodeMediaWsForTest(raw);
+    defer {
+        std.crypto.secureZero(u8, text);
+        std.testing.allocator.free(text);
+    }
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "MEDIA MACKEY #actual-browser "));
+    try std.testing.expect(std.mem.indexOf(u8, text, "label=browser-owner") != null);
+    try std.testing.expectEqual(@as(usize, 1), server.media_physical_attachments.items.len);
+    try std.testing.expect(server.media_physical_attachments.items[0].client.eql(fixture.tls.id));
+    try std.testing.expectEqualStrings("#actual-browser", conn.mediaCallChannel().?);
+    try std.testing.expect(!conn.media_e2ee_attachment_bound);
+}
+
+test "protected MEDIA caller: public plaintext negotiation retains exact agreement without endpoint secrets or UDP authority" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try RegisteredMediaCallerFixture.create(false);
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.tls.connection();
+    conn.session.addCap(.labeled_response);
+    try fixture.joinChannel("#public-only");
+    const adapter = conn.tls;
+    conn.tls = null;
+    defer conn.tls = adapter;
+    try fixture.dispatch("@label=public-owner MEDIA OFFER #public-only cadencevox,raw");
+    const raw = try drainActualPlainMediaForTest(&fixture.tls, conn);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "OFFER-ACK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "label=public-owner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "MACKEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "ufrag=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "srtp=") == null);
+    try std.testing.expectEqual(@as(u8, 1), server.media_rooms.transportProfileOf("#public-only").?.codec_count);
+    try std.testing.expectEqual(@as(u32, 0), server.native_media.physical_endpoints.count());
+    try std.testing.expectEqual(@as(u32, 0), server.media_plane.physical_rows.count());
+    try std.testing.expectEqual(@as(usize, 0), server.media_physical_attachments.items.len);
+    try fixture.dispatch("MEDIA OFFER #public-only raw");
+    const denied = try drainActualPlainMediaForTest(&fixture.tls, conn);
+    defer std.testing.allocator.free(denied);
+    try std.testing.expect(std.mem.indexOf(u8, denied, "NO_COMMON_CODEC") != null);
+    try std.testing.expectEqual(@as(u8, 1), server.media_rooms.transportProfileOf("#public-only").?.codec_count);
+}
+
+test "protected MEDIA caller: real logical JOIN binds exact physical membership without MACKEY or transport offer" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try RegisteredMediaCallerFixture.create(false);
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.tls.connection();
+    conn.session.addCap(.labeled_response);
+    try fixture.joinChannel("#logical-join");
+    try fixture.dispatch("@label=logical-owner MEDIA JOIN #logical-join video");
+    const bytes = try tls3ServerDrain(&fixture.tls, conn);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "label=logical-owner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "MACKEY") == null);
+    try std.testing.expectEqual(@as(usize, 1), server.media_physical_attachments.items.len);
+    try std.testing.expect(server.media_physical_attachments.items[0].client.eql(fixture.tls.id));
+    try std.testing.expectEqual(mediaKindBit(.video), server.media_physical_attachments.items[0].kind_bits);
+    try std.testing.expect(server.media_rooms.isParticipant("#logical-join", conn.session.displayName()));
+    try std.testing.expectEqual(@as(u32, 0), server.native_media.physical_endpoints.count());
+    try std.testing.expectEqual(@as(u32, 0), server.media_plane.physical_rows.count());
+}
+
+test "protected MEDIA caller: actual command allocation refusal publishes nothing and retries on the original source" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var fixture = try RegisteredMediaCallerFixture.create(true);
+    defer fixture.deinit();
+    const server = fixture.tls.server;
+    current_reactor = &server.reactors[0];
+    const conn = fixture.tls.connection();
+    try fixture.joinChannel("#command-oom");
+    const sequence = conn.tls.?.engine.tls13.app_write_seq;
+    const original = server.allocator;
+    var failing = std.testing.FailingAllocator.init(original, .{ .fail_index = 0 });
+    server.allocator = failing.allocator();
+    {
+        defer server.allocator = original;
+        try std.testing.expectError(error.OutOfMemory, fixture.dispatch("MEDIA OFFER #command-oom cadencevox"));
+    }
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocations, failing.deallocations);
+    try std.testing.expect(current_media_authority_turn == null and conn.reply_capture == null);
+    try std.testing.expectEqual(sequence, conn.tls.?.engine.tls13.app_write_seq);
+    try std.testing.expectEqual(@as(u64, 0), sendq.backlog(conn));
+    try std.testing.expectEqual(@as(u32, 0), server.native_media.physical_endpoints.count());
+    try std.testing.expect(server.media_rooms.transportProfileOf("#command-oom") == null);
+    try fixture.dispatch("MEDIA OFFER #command-oom cadencevox");
+    const bytes = try tls3ServerDrain(&fixture.tls, conn);
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        std.testing.allocator.free(bytes);
+    }
+    try std.testing.expect(server.connFor(fixture.tls.id) == conn);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "NATIVE-MACKEY") != null);
+}
+
+const WebpushConsumerFixture = if (builtin.is_test) struct {
+    const accounts = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon", "theta", "zeta" };
+    const gone = "https://gone.push.invalid/shared";
+    const live = "https://live.push.invalid/remaining";
+
+    fn worker(allocator: std.mem.Allocator, resolver: *@import("acme_runner.zig").SystemResolver) !webpush_mod.Worker {
+        const secret = try ecdsa_p256.SecretKey.fromBytes(@splat(1));
+        return .{ .allocator = allocator, .vapid = try ecdsa_p256.KeyPair.fromSecretKey(secret), .subject = "mailto:source-consumer@example.invalid", .resolver = resolver.resolver(), .trust_anchors = &.{} };
+    }
+    fn seed(services: *services_mod.Services, owner: *webpush_mod.Worker) !void {
+        const subs = [_]webpush_mod.Subscription{
+            .{ .endpoint = @constCast(gone), .ua_public = owner.vapid.public_key.toUncompressedSec1(), .auth = @splat(1) },
+            .{ .endpoint = @constCast(live), .ua_public = owner.vapid.public_key.toUncompressedSec1(), .auth = @splat(2) },
+        };
+        const blob = try webpush_mod.encodeList(std.testing.allocator, &subs);
+        defer std.testing.allocator.free(blob);
+        for (accounts) |account| try services.webpushPut(account, blob);
+        // Seed a native delivery outcome, not an HTTP 410 receipt. Ownership
+        // follows the real Worker allocator and real reconciliation methods.
+        const endpoint = try owner.allocator.dupe(u8, gone);
+        errdefer owner.allocator.free(endpoint);
+        try owner.dead.append(owner.allocator, endpoint);
+    }
+    fn expectRows(services: *services_mod.Services, pruned: bool) !void {
+        for (accounts) |account| {
+            const blob = services.webpushGetAlloc(std.testing.allocator, account) orelse return error.MissingWebpushSubscription;
+            defer std.testing.allocator.free(blob);
+            const subs = try webpush_mod.decodeList(std.testing.allocator, blob);
+            defer webpush_mod.freeList(std.testing.allocator, subs);
+            try std.testing.expectEqual(@as(usize, if (pruned) 1 else 2), subs.len);
+            try std.testing.expectEqualStrings(live, subs[subs.len - 1].endpoint);
+            if (!pruned) try std.testing.expectEqualStrings(gone, subs[0].endpoint);
+        }
+    }
+    fn fillAndDrop(owner: *webpush_mod.Worker) !void {
+        const key = owner.vapid.public_key.toUncompressedSec1();
+        for (0..webpush_mod.max_queued_jobs) |_| try std.testing.expectEqual(webpush_mod.Worker.EnqueueResult.queued, owner.enqueue(live, key, @splat(1), "queued push"));
+        try std.testing.expectEqual(webpush_mod.Worker.EnqueueResult.dropped, owner.enqueue(live, key, @splat(1), "overflow push"));
+    }
+    fn reconcile(server: *Server, deadline: ?std.Io.Clock.Timestamp) !void {
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        const previous = current_reactor;
+        defer current_reactor = previous;
+        current_reactor = &server.reactors[0];
+        try server.reconcileWebpushOutcomesLocked(deadline);
+    }
+    fn historyCount(server: *Server) usize {
+        var records: [512]event_history_mod.StoredEvent = undefined;
+        const count = server.event_history.collect(null, 0, &records);
+        var matched: usize = 0;
+        for (records[0..count]) |record| if (std.mem.eql(u8, record.message(), webpush_mod.overflow_oper_message)) {
+            matched += 1;
+        };
+        return matched;
+    }
+} else void;
+
+test "webpush consumer: original dead outcome survives every staging OOM and prunes all actual accounts" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try services_mod.OroStore.open(allocator, std.testing.io, temporary.dir, "source-webpush.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var resolver: @import("acme_runner.zig").SystemResolver = .{ .allocator = allocator, .io = std.testing.io };
+    var worker = try WebpushConsumerFixture.worker(allocator, &resolver);
+    defer worker.shutdown();
+    try WebpushConsumerFixture.seed(&services, &worker);
+    const original = worker.dead.items[0].ptr;
+    const server = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .account_services = &services, .crypto_io = std.testing.io });
+    defer allocator.destroy(server);
+    defer server.deinit();
+    server.webpush_worker = &worker;
+    var succeeded = false;
+    for (0..512) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        server.allocator = failing.allocator();
+        const result = WebpushConsumerFixture.reconcile(server, null);
+        server.allocator = allocator;
+        if (result) |_| {
+            succeeded = true;
+            try std.testing.expect(fail_index > 0);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 1), worker.dead.items.len);
+            try std.testing.expect(worker.dead.items[0].ptr == original);
+            try WebpushConsumerFixture.expectRows(&services, false);
+        }
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expectEqual(@as(usize, 0), worker.dead.items.len);
+    try WebpushConsumerFixture.expectRows(&services, true);
+    try WebpushConsumerFixture.reconcile(server, null);
+    try WebpushConsumerFixture.expectRows(&services, true);
+}
+
+test "webpush consumer: accepted signed overflow retains exact downstream body and secret until real HTTP receipt" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x3b)), "webpush-consumer");
+    defer identity.deinit();
+    var resolver: @import("acme_runner.zig").SystemResolver = .{ .allocator = allocator, .io = std.testing.io };
+    var worker = try WebpushConsumerFixture.worker(allocator, &resolver);
+    defer worker.shutdown();
+    try WebpushConsumerFixture.fillAndDrop(&worker);
+    const server = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .node_identity = &identity, .crypto_io = std.testing.io, .webhook_allow_private = true });
+    defer allocator.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    server.webpush_worker = &worker;
+
+    var probe: OutboundHookProbe = .{};
+    defer {
+        probe.stop.store(true, .release);
+        if (probe.listen_fd >= 0) closeFd(probe.listen_fd);
+        if (probe.started) probe.thread.join();
+    }
+    const listener = try bindLoopback(true);
+    probe.listen_fd = listener.fd;
+    probe.thread = try std.Thread.spawn(.{}, OutboundHookProbe.run, .{&probe});
+    probe.started = true;
+    var url_buffer: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/retained", .{listener.port});
+    const url_copy = try allocator.dupe(u8, url);
+    errdefer if (server.outbound_webhooks[0] == null) allocator.free(url_copy);
+    server.outbound_webhooks[0] = .{ .url = url_copy, .secret = try allocator.dupe(u8, "original-output-secret"), .mask = event_spine.CategoryMask.all() };
+    const guard_before = try server.event_spine_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_before);
+    var succeeded = false;
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    for (0..128) |fail_index| {
+        failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        server.allocator = failing.allocator();
+        const result = WebpushConsumerFixture.reconcile(server, managedStopTestDeadline());
+        server.allocator = allocator;
+        if (result) |_| {
+            succeeded = true;
+            try std.testing.expect(fail_index > 0);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 1), worker.overflow_events);
+            try std.testing.expectEqual(@as(usize, 0), WebpushConsumerFixture.historyCount(server));
+            const guard_after = try server.event_spine_replay_guard.encodeCheckpoint(allocator);
+            defer allocator.free(guard_after);
+            try std.testing.expectEqualSlices(u8, guard_before, guard_after);
+            try std.testing.expect(!server.hasRetainedWebpushOverflow());
+        }
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expectEqual(@as(usize, 0), worker.overflow_events);
+    try std.testing.expectEqual(@as(usize, 1), WebpushConsumerFixture.historyCount(server));
+    try std.testing.expect(server.hasRetainedWebpushOverflow());
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.webpush_overflow_delivery, server.upgradeContinuityBlockerLocked().?);
+    lockSpin(&probe.mu);
+    const hits_before = probe.hits;
+    probe.mu.unlock();
+    try std.testing.expectEqual(@as(usize, 0), hits_before); // reconciliation performed no HTTP
+    const original_id = gapA4HistoryId(server, webpush_mod.overflow_oper_message).?;
+    // Removing/replacing a live subscription must not change accepted outputs.
+    server.clearOutboundSlot(&server.outbound_webhooks[0]);
+    const retained = &server.webpush_overflow_deliveries[0].?;
+    try std.testing.expectEqualStrings(url, retained.destinations[0].?.url);
+    try std.testing.expectEqualStrings("original-output-secret", retained.destinations[0].?.secret);
+    const original_body = try allocator.dupe(u8, retained.body[0..retained.body_len]);
+    defer allocator.free(original_body);
+    const expired: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = .{ .nanoseconds = 0 } };
+    try std.testing.expectError(error.Timeout, WebpushConsumerFixture.reconcile(server, expired));
+    try std.testing.expect(server.hasRetainedWebpushOverflow());
+    server.retryWebpushOverflowOutputsLocked(); // actual 500
+    try std.testing.expect(server.hasRetainedWebpushOverflow());
+    try std.testing.expectEqual(@as(usize, 0), retained.next_destination);
+    try std.testing.expectEqualSlices(u8, original_body, retained.body[0..retained.body_len]);
+    try WebpushConsumerFixture.reconcile(server, managedStopTestDeadline());
+    try std.testing.expectEqual(@as(usize, 1), WebpushConsumerFixture.historyCount(server));
+    server.retryWebpushOverflowOutputsLocked(); // actual 200
+    try std.testing.expect(!server.hasRetainedWebpushOverflow());
+    try std.testing.expectEqual(@as(u64, 2), server.outbound_webhook_attempts);
+    try std.testing.expectEqual(@as(u64, 1), server.outbound_webhook_delivered);
+    try std.testing.expectEqual(@as(u64, 0), server.outbound_webhook_dropped);
+    try std.testing.expectEqualSlices(u8, &original_id, &(gapA4HistoryId(server, webpush_mod.overflow_oper_message).?));
+    lockSpin(&probe.mu);
+    defer probe.mu.unlock();
+    try std.testing.expectEqual(@as(usize, 2), probe.hits);
+    for (0..2) |index| {
+        const request = probe.req[index][0..probe.req_len[index]];
+        try std.testing.expect(outboundRequestSigned("original-output-secret", request));
+        try std.testing.expectEqualSlices(u8, original_body, outboundRequestBody(request).?);
+    }
+}
+
+test "webpush consumer: real IRC oper receives one maintenance notice while all accounts reconcile" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try services_mod.OroStore.open(allocator, std.testing.io, temporary.dir, "live-source-webpush.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var resolver: @import("acme_runner.zig").SystemResolver = .{ .allocator = allocator, .io = std.testing.io };
+    var worker = try WebpushConsumerFixture.worker(allocator, &resolver);
+    defer worker.shutdown();
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x3c)), "live-webpush-consumer");
+    defer identity.deinit();
+    var config = operTestConfig(0);
+    config.max_clients = 16;
+    config.account_services = &services;
+    config.crypto_io = std.testing.io;
+    config.node_identity = &identity;
+    const server = try createTestServer(allocator, config);
+    defer allocator.destroy(server);
+    defer server.deinit();
+    server.webpush_worker = &worker;
+    const port = try server.boundPort();
+    var run: std.atomic.Value(bool) = .init(true);
+    const thread = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
+    defer stopThreadedServer(server, &run, thread);
+    const fd = try connectLoopback(port);
+    defer closeFd(fd);
+    var client: LiveClient = .{ .fd = fd };
+    try saslAdminPrelude(fd);
+    try writeAllFd(fd, "NICK PushOper\r\nUSER push 0 * :Push Oper\r\n");
+    try recvUntil(&client, " 001 PushOper ", 200);
+    try writeAllFd(fd, "EVENT +SERVICE\r\nPING :push-registered\r\n");
+    try recvUntil(&client, "push-registered", 200);
+    client.reset();
+    // Worker is dormant, but real queue pressure generates the source notice;
+    // the reactor timer performs the production consumer and real IRC delivery.
+    lockSpin(&worker.mutex);
+    const seeded = WebpushConsumerFixture.seed(&services, &worker);
+    worker.mutex.unlock();
+    try seeded;
+    try WebpushConsumerFixture.fillAndDrop(&worker);
+    try recvUntil(&client, webpush_mod.overflow_oper_message, 200);
+    try writeAllFd(fd, "PING :push-after-output\r\n");
+    try recvUntil(&client, "push-after-output", 200);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(client.written(), webpush_mod.overflow_oper_message));
+    try WebpushConsumerFixture.expectRows(&services, true);
+    lockSpin(&worker.mutex);
+    const dead_count = worker.dead.items.len;
+    const notice_count = worker.overflow_events;
+    worker.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), dead_count);
+    try std.testing.expectEqual(@as(usize, 0), notice_count);
+    server.world.lockWrite();
+    const accepted = WebpushConsumerFixture.historyCount(server);
+    server.world.unlockWrite();
+    try std.testing.expectEqual(@as(usize, 1), accepted);
+}
+
+test "webpush consumer: held real World times out with original output intact then retries" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try services_mod.OroStore.open(allocator, std.testing.io, temporary.dir, "held-webpush-world.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var resolver: @import("acme_runner.zig").SystemResolver = .{ .allocator = allocator, .io = std.testing.io };
+    var worker = try WebpushConsumerFixture.worker(allocator, &resolver);
+    defer worker.shutdown();
+    try WebpushConsumerFixture.seed(&services, &worker);
+    const original = worker.dead.items[0].ptr;
+    const server = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .account_services = &services, .crypto_io = std.testing.io });
+    defer allocator.destroy(server);
+    defer server.deinit();
+    server.webpush_worker = &worker;
+    const Holder = struct {
+        fn hold(source: *Server, entered: *std.Io.Event, release: *std.Io.Event) void {
+            source.world.lockWrite();
+            defer source.world.unlockWrite();
+            entered.set(std.testing.io);
+            release.waitUncancelable(std.testing.io);
+        }
+    };
+    var entered: std.Io.Event = .unset;
+    var release: std.Io.Event = .unset;
+    var holder: ?std.Thread = try std.Thread.spawn(.{}, Holder.hold, .{ server, &entered, &release });
+    defer if (holder) |thread| {
+        release.set(std.testing.io);
+        thread.join();
+    };
+    try entered.waitTimeout(std.testing.io, .{ .deadline = managedStopTestDeadline() });
+    const short = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(10) });
+    try std.testing.expectError(error.Timeout, server.lockWorldUntil(short));
+    try std.testing.expectEqual(@as(usize, 1), worker.dead.items.len);
+    try std.testing.expect(worker.dead.items[0].ptr == original);
+    try WebpushConsumerFixture.expectRows(&services, false);
+    release.set(std.testing.io);
+    holder.?.join();
+    holder = null;
+    try server.lockWorldUntil(managedStopTestDeadline());
+    const previous = current_reactor;
+    current_reactor = &server.reactors[0];
+    const reconciled = server.reconcileWebpushOutcomesLocked(managedStopTestDeadline());
+    current_reactor = previous;
+    server.world.unlockWrite();
+    try reconciled;
+    try std.testing.expectEqual(@as(usize, 0), worker.dead.items.len);
+    try WebpushConsumerFixture.expectRows(&services, true);
+}
+
+test "webpush consumer: never accepted notice retries after later source events retire its failed candidate" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x3d)), "late-webpush-consumer");
+    defer identity.deinit();
+    var resolver: @import("acme_runner.zig").SystemResolver = .{ .allocator = allocator, .io = std.testing.io };
+    var worker = try WebpushConsumerFixture.worker(allocator, &resolver);
+    defer worker.shutdown();
+    try WebpushConsumerFixture.fillAndDrop(&worker);
+    const server = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .node_identity = &identity, .crypto_io = std.testing.io });
+    defer allocator.destroy(server);
+    defer server.deinit();
+    server.webpush_worker = &worker;
+    current_reactor = &server.reactors[0];
+    // Candidate origin allocated; source replay checkpoint staging fails after
+    // HLC minting. No accepted history, downstream outbox or count publication.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    server.allocator = failing.allocator();
+    const failed = WebpushConsumerFixture.reconcile(server, null);
+    server.allocator = allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expectEqual(@as(usize, 1), worker.overflow_events);
+    try std.testing.expectEqual(@as(usize, 0), WebpushConsumerFixture.historyCount(server));
+    try std.testing.expect(!server.hasRetainedWebpushOverflow());
+    for (0..65) |_| try server.publishOperEvent(.service, .warn, "later accepted source notice");
+    var records: [512]event_history_mod.StoredEvent = undefined;
+    try std.testing.expectEqual(@as(usize, 65), server.event_history.collect(null, 0, &records));
+    try WebpushConsumerFixture.reconcile(server, managedStopTestDeadline());
+    try std.testing.expectEqual(@as(usize, 0), worker.overflow_events);
+    try std.testing.expectEqual(@as(usize, 1), WebpushConsumerFixture.historyCount(server));
+    try std.testing.expect(!server.hasRetainedWebpushOverflow());
+    try WebpushConsumerFixture.reconcile(server, managedStopTestDeadline());
+    try std.testing.expectEqual(@as(usize, 1), WebpushConsumerFixture.historyCount(server));
+}
+
+test "webpush consumer: malformed and truncated apparent HTTP receipts retain exact destination until complete response" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    for ([_][]const u8{
+        "junk 200 anything\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200",
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nx",
+    }) |malformed| {
+        var resolver: @import("acme_runner.zig").SystemResolver = .{ .allocator = allocator, .io = std.testing.io };
+        var worker = try WebpushConsumerFixture.worker(allocator, &resolver);
+        defer worker.shutdown();
+        try WebpushConsumerFixture.fillAndDrop(&worker);
+        const server = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .crypto_io = std.testing.io, .webhook_allow_private = true });
+        defer allocator.destroy(server);
+        defer server.deinit();
+        current_reactor = &server.reactors[0];
+        server.webpush_worker = &worker;
+        var probe: OutboundHookProbe = .{ .responses = .{ malformed, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" } };
+        defer {
+            probe.stop.store(true, .release);
+            if (probe.listen_fd >= 0) closeFd(probe.listen_fd);
+            if (probe.started) probe.thread.join();
+        }
+        const listener = try bindLoopback(true);
+        probe.listen_fd = listener.fd;
+        probe.thread = try std.Thread.spawn(.{}, OutboundHookProbe.run, .{&probe});
+        probe.started = true;
+        var url_buffer: [96]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/framed", .{listener.port});
+        const copied_url = try allocator.dupe(u8, url);
+        errdefer if (server.outbound_webhooks[0] == null) allocator.free(copied_url);
+        server.outbound_webhooks[0] = .{ .url = copied_url, .secret = try allocator.dupe(u8, "retained-framing-secret"), .mask = event_spine.CategoryMask.all() };
+        try WebpushConsumerFixture.reconcile(server, managedStopTestDeadline());
+        const delivery = &server.webpush_overflow_deliveries[0].?;
+        const original_url = delivery.destinations[0].?.url.ptr;
+        const original_secret = delivery.destinations[0].?.secret.ptr;
+        const body = try allocator.dupe(u8, delivery.body[0..delivery.body_len]);
+        defer allocator.free(body);
+        server.retryWebpushOverflowOutputsLocked();
+        try std.testing.expect(server.hasRetainedWebpushOverflow());
+        try std.testing.expectEqual(@as(usize, 0), delivery.next_destination);
+        try std.testing.expect(delivery.destinations[0].?.url.ptr == original_url);
+        try std.testing.expect(delivery.destinations[0].?.secret.ptr == original_secret);
+        try std.testing.expectEqualSlices(u8, body, delivery.body[0..delivery.body_len]);
+        try std.testing.expectEqual(@as(u64, 0), server.outbound_webhook_delivered);
+        server.retryWebpushOverflowOutputsLocked();
+        try std.testing.expect(!server.hasRetainedWebpushOverflow());
+        try std.testing.expectEqual(@as(u64, 1), server.outbound_webhook_delivered);
+        try std.testing.expectEqual(@as(usize, 1), WebpushConsumerFixture.historyCount(server));
+    }
 }

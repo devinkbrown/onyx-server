@@ -71,6 +71,62 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
         len: usize = 0,
         max_participants_runtime: usize = max_participants,
 
+        pub const SnapshotEntry = struct {
+            id: ParticipantId = .{},
+            kind: MediaKind = .voice,
+            stream_id: u32 = 0,
+            addr: TransportAddress = .{},
+            addr_bound: bool = false,
+            live: bool = false,
+            rx_packets: u64 = 0,
+            rx_bytes: u64 = 0,
+        };
+        pub const Snapshot = struct {
+            plane: native_plane.NativeMediaPlane(max_participants).Snapshot = .{},
+            entries: [max_participants]SnapshotEntry = @splat(.{}),
+            len: usize = 0,
+            max_participants_runtime: usize = 0,
+
+            pub fn validate(self: *const Snapshot, expected_capacity: usize) error{InvalidSnapshot}!void {
+                if (self.max_participants_runtime != @min(expected_capacity, max_participants) or self.len > self.max_participants_runtime or self.len > max_participants) return error.InvalidSnapshot;
+                try self.plane.validate();
+                if (self.plane.session.len != self.len) return error.InvalidSnapshot;
+                for (self.entries[0..self.len], 0..) |entry, i| {
+                    try @import("../substrate/undertow/media.zig").validateParticipantId(entry.id);
+                    if (!entry.live or (entry.addr.ip_len != 0 and entry.addr.ip_len != 4 and entry.addr.ip_len != 16)) return error.InvalidSnapshot;
+                    for (entry.addr.ip[entry.addr.ip_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+                    for (self.entries[0..i]) |prior| if (prior.id.eql(&entry.id)) return error.InvalidSnapshot;
+                    var found = false;
+                    for (self.plane.session.participants[0..self.plane.session.len]) |row| {
+                        if (row.id.eql(&entry.id)) {
+                            if (row.joined.bits != @as(u8, 1) << @intCast(@intFromEnum(entry.kind))) return error.InvalidSnapshot;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return error.InvalidSnapshot;
+                    // Duplicate stream IDs retain source order/first-match
+                    // behavior. updateAddress may preserve a bound empty addr.
+                }
+                for (self.entries[self.len..]) |entry| if (!std.meta.eql(entry, SnapshotEntry{})) return error.InvalidSnapshot;
+            }
+        };
+
+        pub fn capture(self: *const Self) error{InvalidSnapshot}!Snapshot {
+            if (self.len > max_participants) return error.InvalidSnapshot;
+            var snapshot: Snapshot = .{ .plane = try self.plane.capture(), .len = self.len, .max_participants_runtime = self.max_participants_runtime };
+            for (self.entries[0..self.len], snapshot.entries[0..self.len]) |entry, *out| out.* = .{ .id = entry.id, .kind = entry.kind, .stream_id = entry.stream_id, .addr = entry.addr, .addr_bound = entry.addr_bound, .live = entry.live, .rx_packets = entry.rx_packets, .rx_bytes = entry.rx_bytes };
+            try snapshot.validate(self.max_participants_runtime);
+            return snapshot;
+        }
+
+        pub fn prepareRestore(snapshot: *const Snapshot, expected_capacity: usize) error{InvalidSnapshot}!Self {
+            try snapshot.validate(expected_capacity);
+            var candidate: Self = .{ .plane = try native_plane.NativeMediaPlane(max_participants).prepareRestore(&snapshot.plane), .len = snapshot.len, .max_participants_runtime = snapshot.max_participants_runtime };
+            for (snapshot.entries[0..snapshot.len], candidate.entries[0..snapshot.len]) |entry, *out| out.* = .{ .id = entry.id, .kind = entry.kind, .stream_id = entry.stream_id, .addr = entry.addr, .addr_bound = entry.addr_bound, .live = entry.live, .rx_packets = entry.rx_packets, .rx_bytes = entry.rx_bytes };
+            return candidate;
+        }
+
         pub fn init() Self {
             return initConfig(max_participants);
         }
@@ -475,4 +531,61 @@ test "updateAddress redirects a receiver's copies" {
     const n = link.inbound(frame(1, floor, 1, false, &fbuf), &out);
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expect(out[0].eql(mkAddr(9, 8001)));
+}
+
+test "active media DTO native link preserves ordered aliases counters and address binding" {
+    const L = NativeMediaLink(4);
+    var old = L.initConfig(3);
+    const addr = TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, 9080) catch unreachable;
+    try old.register("A", .voice, 7, addr);
+    try old.register("B", .video, 7, addr); // supported ordered stream alias
+    old.setSelection("orphan", .{ .max_spatial = 2, .max_temporal = 1 });
+    var encoded: [64]u8 = undefined;
+    var recipients: [4]TransportAddress = undefined;
+    _ = old.inboundFrom(frame(7, cadence_frame.MEDIA_BAND_FLOOR, 1, false, &encoded), addr, &recipients);
+    _ = old.inboundFrom(frame(7, cadence_frame.MEDIA_BAND_FLOOR, 2, false, &encoded), addr, &recipients);
+    old.updateAddress("A", .{}); // source keeps addr_bound, exact negative fact
+    const carry = try old.capture();
+    var candidate = try L.prepareRestore(&carry, 3);
+    try testing.expectEqualDeep(carry, try candidate.capture());
+    try testing.expectEqualStrings("A", candidate.idForStream(7).?);
+    try testing.expect(candidate.entries[0].addr_bound);
+    try testing.expectEqual(@as(u8, 0), candidate.addrFor("A").?.ip_len);
+    try testing.expectEqual(@as(u64, 2), candidate.entries[0].rx_packets);
+    try testing.expectError(error.InvalidSnapshot, L.prepareRestore(&carry, 2));
+    var bad = carry;
+    bad.len = 5;
+    try testing.expectError(error.InvalidSnapshot, L.prepareRestore(&bad, 3));
+    bad = carry;
+    bad.entries[1].id = bad.entries[0].id;
+    try testing.expectError(error.InvalidSnapshot, L.prepareRestore(&bad, 3));
+    bad = carry;
+    bad.entries[0].addr.ip_len = 5;
+    try testing.expectError(error.InvalidSnapshot, L.prepareRestore(&bad, 3));
+    bad = carry;
+    bad.plane.session.participants[0].joined.bits = 4;
+    try testing.expectError(error.InvalidSnapshot, L.prepareRestore(&bad, 3));
+    candidate.unregister("A");
+    try testing.expectEqualStrings("B", candidate.idForStream(7).?);
+    try testing.expectEqualDeep(carry, try old.capture());
+}
+
+test "active media DTO native link next genuine cadence datagram preserves forwarding and spoof refusal" {
+    const L = NativeMediaLink(4);
+    var old = L.init();
+    const source = mkAddr(1, 9300);
+    const receiver = mkAddr(2, 9301);
+    try old.register("A", .voice, 100, source);
+    try old.register("B", .voice, 101, receiver);
+    const carry = try old.capture();
+    var candidate = try L.prepareRestore(&carry, 4);
+    var encoded: [64]u8 = undefined;
+    const packet = frame(100, cadence_frame.MEDIA_BAND_FLOOR, 5, false, &encoded);
+    var a: [4]TransportAddress = undefined;
+    var b: [4]TransportAddress = undefined;
+    try testing.expectEqual(@as(usize, 0), candidate.inboundFrom(packet, mkAddr(3, 9302), &b));
+    try testing.expectEqual(@as(usize, 1), old.inboundFrom(packet, source, &a));
+    try testing.expectEqual(@as(usize, 1), candidate.inboundFrom(packet, source, &b));
+    try testing.expect(a[0].eql(receiver) and b[0].eql(receiver));
+    try testing.expectEqualDeep(try old.capture(), try candidate.capture());
 }

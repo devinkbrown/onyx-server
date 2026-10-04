@@ -193,11 +193,10 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
     // and a missing secured/framed transport checkpoint.
     for (capsules, 0..) |item, index| switch (item.header.kind) {
         .tls_session => {
-            // Rolling-compatible like `.s2s_link`: a pre-bump predecessor stamps a
-            // lower version (e.g. the flag-widened-but-still-v1 TLS blob), so the
-            // relation pass must negotiate and decode per version, not pin current.
-            const bytes = canonicalRollingPayload(item, .tls_session) orelse return error.InvalidTls;
-            const tls = tls_snapshot.decode(bytes, item.header.version) catch return error.InvalidTls;
+            // Mandatory exact TLS3 carries record policy, exporter, control
+            // cursors and typed queue custody. No hot legacy normalization.
+            const bytes = canonicalPayload(item, .tls_session) orelse return error.InvalidTls;
+            const tls = tls_snapshot.decodeCurrent(bytes) catch return error.InvalidTls;
             const client = findClient(capsules, tls.fd) orelse return error.OrphanTls;
             if (!client.was_secured) return error.UnexpectedTls;
             for (capsules[0..index]) |prior| {
@@ -586,14 +585,9 @@ test "current handoff relations accept exact mixed client sidecars S2S and redia
     const client_b = try session_snapshot.encode(allocator, .{ .nick = "bob", .fd = 11 });
     defer allocator.free(client_b);
     const tls = try tls_snapshot.encode(allocator, .{
+        .kernel_tx_prefix_remaining = 0,
         .fd = 10,
-        .state = .{ .engine = .{ .tls13 = tls_server.Server.ResumeState{
-            .suite = 0x1301,
-            .client_app_secret = @splat(1),
-            .server_app_secret = @splat(2),
-            .app_read_seq = 3,
-            .app_write_seq = 4,
-        } } },
+        .state = .{ .barrier_phase = .none, .held_record_len = 0, .engine = .{ .tls13 = tls_server.Server.ResumeState{ .suite = 0x1302, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 3, .app_write_seq = 4, .peer_record_size_limit_raw = 16385, .local_receive_policy = 16385, .record_size_limit_negotiated = false, .selected_alpn = &.{}, .exporter_master_secret = @splat(0), .exporter_master_secret_ready = true, .ku_prefix_len = 0, .ku_prefix = @splat(0) } } },
     });
     defer allocator.free(tls);
     const websocket = try ws_snapshot.encode(allocator, .{ .fd = 10, .phase_open = true });
@@ -706,14 +700,9 @@ test "current handoff relations accept a pre-bump v1 TLS sidecar (netsplit guard
     // still stamping capsule version 1. The relation preflight must negotiate and
     // decode it as v1 rather than pinning current, or the next USR2 netsplits.
     const tls = try tls_snapshot.encode(allocator, .{
+        .kernel_tx_prefix_remaining = 0,
         .fd = 10,
-        .state = .{ .engine = .{ .tls13 = tls_server.Server.ResumeState{
-            .suite = 0x1301,
-            .client_app_secret = @splat(1),
-            .server_app_secret = @splat(2),
-            .app_read_seq = 3,
-            .app_write_seq = 4,
-        } } },
+        .state = .{ .barrier_phase = .none, .held_record_len = 0, .engine = .{ .tls13 = tls_server.Server.ResumeState{ .suite = 0x1302, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 3, .app_write_seq = 4, .peer_record_size_limit_raw = 16385, .local_receive_policy = 16385, .record_size_limit_negotiated = false, .selected_alpn = &.{}, .exporter_master_secret = @splat(0), .exporter_master_secret_ready = true, .ku_prefix_len = 0, .ku_prefix = @splat(0) } } },
         .tx_offloaded = true,
     });
     defer allocator.free(tls);
@@ -757,9 +746,7 @@ test "current handoff relations accept a pre-bump v1 TLS sidecar (netsplit guard
     caps[1].header.version = 1;
     caps[1].header.min_supported = 1;
     caps[1].header.max_supported = 1;
-    const summary = try validateCurrent(&caps, &.{10});
-    try std.testing.expectEqual(@as(usize, 1), summary.tls);
-    try std.testing.expectEqual(@as(usize, 1), summary.clients);
+    try std.testing.expectError(error.InvalidTls, validateCurrent(&caps, &.{10}));
 }
 
 test "current handoff relations reject missing duplicate orphan and unexpected transport sidecars" {
@@ -769,11 +756,11 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     defer allocator.free(secured);
     const plain = try session_snapshot.encode(allocator, .{ .nick = "b", .fd = 11 });
     defer allocator.free(plain);
-    const tls10 = try tls_snapshot.encode(allocator, .{ .fd = 10, .state = .{ .engine = .{ .tls13 = tls_server.Server.ResumeState{ .suite = 0x1301, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 0, .app_write_seq = 0 } } } });
+    const tls10 = try tls_snapshot.encode(allocator, .{ .kernel_tx_prefix_remaining = 0, .fd = 10, .state = .{ .barrier_phase = .none, .held_record_len = 0, .engine = .{ .tls13 = tls_server.Server.ResumeState{ .suite = 0x1302, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 0, .app_write_seq = 0, .peer_record_size_limit_raw = 16385, .local_receive_policy = 16385, .record_size_limit_negotiated = false, .selected_alpn = &.{}, .exporter_master_secret = @splat(0), .exporter_master_secret_ready = true, .ku_prefix_len = 0, .ku_prefix = @splat(0) } } } });
     defer allocator.free(tls10);
-    const tls11 = try tls_snapshot.encode(allocator, .{ .fd = 11, .state = .{ .engine = .{ .tls13 = tls_server.Server.ResumeState{ .suite = 0x1301, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 0, .app_write_seq = 0 } } } });
+    const tls11 = try tls_snapshot.encode(allocator, .{ .kernel_tx_prefix_remaining = 0, .fd = 11, .state = .{ .barrier_phase = .none, .held_record_len = 0, .engine = .{ .tls13 = tls_server.Server.ResumeState{ .suite = 0x1302, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 0, .app_write_seq = 0, .peer_record_size_limit_raw = 16385, .local_receive_policy = 16385, .record_size_limit_negotiated = false, .selected_alpn = &.{}, .exporter_master_secret = @splat(0), .exporter_master_secret_ready = true, .ku_prefix_len = 0, .ku_prefix = @splat(0) } } } });
     defer allocator.free(tls11);
-    const tls99 = try tls_snapshot.encode(allocator, .{ .fd = 99, .state = .{ .engine = .{ .tls13 = tls_server.Server.ResumeState{ .suite = 0x1301, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 0, .app_write_seq = 0 } } } });
+    const tls99 = try tls_snapshot.encode(allocator, .{ .kernel_tx_prefix_remaining = 0, .fd = 99, .state = .{ .barrier_phase = .none, .held_record_len = 0, .engine = .{ .tls13 = tls_server.Server.ResumeState{ .suite = 0x1302, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 0, .app_write_seq = 0, .peer_record_size_limit_raw = 16385, .local_receive_policy = 16385, .record_size_limit_negotiated = false, .selected_alpn = &.{}, .exporter_master_secret = @splat(0), .exporter_master_secret_ready = true, .ku_prefix_len = 0, .ku_prefix = @splat(0) } } } });
     defer allocator.free(tls99);
     const ws10 = try ws_snapshot.encode(allocator, .{ .fd = 10 });
     defer allocator.free(ws10);

@@ -8,6 +8,11 @@ behavior on OpenBSD, including secured mesh sessions and connection-preserving
 Helix. The native plaintext evidence in the continuation audit is an accepted
 starting point; it is not full-port acceptance.
 
+The acceptance tables below describe historical frozen artifacts. They do not
+grade the current combined tree or close the requested full port. See the
+[2026-10-02 full-record review](../audit/full-record-review-2026-10-02.md) for
+current failures, missing production joins and required service journeys. The [current implementation frontier](openbsd-port-resume-2026-10-02.md) records the newer frozen factory, World-scope and native lifecycle checks without closing the full port.
+
 ## Architecture and ownership
 
 Use the existing complete server lifecycle on OpenBSD. Keep Linux's Ringlane
@@ -197,3 +202,57 @@ original plain/TLS 1.2/TLS 1.3/WSS sockets through sequential upgrades. Message
 counts describe a bounded observation window; they are combined with the
 server's deterministic relay/replay gates, rather than treated as a proof that
 no duplicate could arrive at any future time.
+
+
+## Current continuation (2026-10-02)
+
+The latest [transaction and presence record](../audit/mesh-presence-2026-10-01.md)
+tracks the source-owned lifecycle work that remains before full-port acceptance.
+The earlier runtime results above grade their frozen artifacts, not the current
+combined worktree.
+
+The NEW allocation-role snapshot ran on OpenBSD7.9 at the normal8192KiB stack:
+Debug and ReleaseSafe each passed107/107 selected module tests, plus separate
+CLI2/2. Frozen source and artifact hashes, actual logs and VM cleanup were checked
+independently. These tests cover admission, original allocator homes, explicit
+retain/discard roles and binding/free accounting. They do not execute the daemon
+or establish actual owner-loan, seal, durable publication or full-product support.
+The [native receipt](../audit/evidence/mesh-presence-2026-10-01/physical-roles-native-final-native-receipt.txt)
+retains the exact counts and limits.
+
+The software-TLS fixture snapshot separately passed921/945 selected native module
+tests in each mode, with24 existing platform skips and zero failures. OpenBSD
+ran the multi-send/FIFO case; the partial-completion observation assertion is
+Linux-only. Its independent review and exact skip identities remain in the
+transaction and presence record.
+
+The participant planning and loan-release snapshot also ran on OpenBSD7.9:
+Debug and ReleaseSafe each passed123/123 module tests and separate CLI2/2, with
+zero skips or failures at8192KiB. Source, artifacts, raw test counts and cleanup
+were independently checked, and fresh Astra evidence review approved this cut. Its
+source bindings remain fixture-only, so this is not actual production owner
+registration or daemon runtime acceptance.
+
+Store final4 closes the reproduced Batch publication-selector omission before
+WAL publication. Linux Store tests pass196/196 and consumer tests374/374 in both
+modes. Actual OpenBSD7.9 Store tests pass196/196, plus separate CLI2/2, in Debug
+and ReleaseSafe with zero skips at the normal8192KiB stack. Fresh Astra source
+and native reviews approve this frozen cut; neither daemon binary was executed
+in this Store campaign. Actual source ownership/read leases/exclusion/census are
+now being implemented. Production loans, ownership seals, joined durable cuts,
+the still-failing far WHOIS/direct-message cases and a fresh full composition
+remain required.
+
+Native service operation still needs an actual committed service-control owner.
+The earlier systemd-only packaging observation is superseded: target-aware
+packaging stages the OpenBSD rc.d script, helper and policy compiler, with bounded
+build/install checks under restrictive umask. Current runtime pledge also includes
+the Unix descriptor-transport promise. The protected root-bound endpoint,
+inherited lifetime lease and helper-backed dispatch have bounded leaf evidence;
+actual readiness, stop/reload outcomes, Helix descriptor custody, complete sandbox
+joins and installed native service journeys require subsequent integration.
+The [full record review](../audit/full-record-review-2026-10-02.md) retains the exact
+accepted and failed cuts, including the current helper failure and unexecuted retry.
+No deployment or push has occurred.
+
+Current continuation, 2026-10-02: independent Astra review approves Store S1's opaque source owner/read/exclusion/census foundation at `17f0e225`. Full Store206, consumers374 and Services590 pass in both Debug and ReleaseSafe; OpenBSD artifact builds pass. Native tests for this frozen slice pass206/206 plus CLI2/2 in both modes, zero skips at8192KiB; fresh independent source and native reviews approve the bounded S1 cut. This does not establish production ownership or full-port completion. Astra implemented the opaque Coordinator/private backing boundary after compiled controls exposed ordinary public-field construction bypasses. Independent source and native review approves that bounded conversion:124/124 plus CLI2/2 each mode, zero skips. Actual Store enrollment remains open. Native service transport leaves are separately frozen for verification; real daemon lifecycle wiring and OpenBSD packaging/service journeys remain required.

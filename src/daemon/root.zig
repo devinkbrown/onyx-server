@@ -102,6 +102,13 @@ pub const s2s_link = @import("s2s_link.zig");
 pub const sasl_bridge = @import("sasl_bridge.zig");
 pub const scoped_access = @import("scoped_access.zig");
 pub const scram_store = @import("scram_store.zig");
+pub const mesh_presence_issuer = @import("mesh_presence_issuer.zig");
+pub const mesh_presence_lease = @import("mesh_presence_lease.zig");
+pub const mesh_presence_store = @import("mesh_presence_store.zig");
+pub const mesh_presence_retained = @import("mesh_presence_retained.zig");
+pub const mesh_presence_image = @import("mesh_presence_image.zig");
+pub const mesh_presence_package = @import("mesh_presence_package.zig");
+pub const mesh_presence_authority = @import("mesh_presence_authority.zig");
 pub const mesh_search = @import("mesh_search.zig");
 pub const search_index = @import("search_index.zig");
 pub const unfurl = @import("unfurl.zig");
@@ -145,6 +152,11 @@ pub const webauthn_creds = @import("webauthn_creds.zig");
 pub const tiered_keys = @import("tiered_keys.zig");
 pub const tls_certs = @import("tls_certs.zig");
 pub const tls_conn = @import("tls_conn.zig");
+pub const sendq = @import("sendq.zig");
+pub const ws_output = @import("ws_output.zig");
+pub const lifecycle_output = @import("lifecycle_output.zig");
+pub const physical_lifecycle = @import("physical_lifecycle.zig");
+pub const account_authority = @import("account_authority.zig");
 pub const tls_sni_load = @import("tls_sni_load.zig");
 pub const totp_auth = @import("totp_auth.zig");
 pub const transcript = @import("transcript.zig");
@@ -164,6 +176,11 @@ pub const kernel_other = @import("kernel_other.zig");
 pub const openbsd_sandbox = @import("openbsd_sandbox.zig");
 pub const os_runtime = @import("os_runtime.zig");
 pub const native_network = @import("native_network.zig");
+pub const native_service = @import("native_service.zig");
+pub const native_service_helper = @import("native_service_helper.zig");
+pub const configured_runtime = @import("configured_runtime.zig");
+/// Leased local signed-event journal prerequisite; production binding remains open.
+pub const delivery_authority = @import("delivery_authority.zig");
 pub const doctor = @import("doctor.zig");
 pub const backup_set = @import("backup_set.zig");
 pub const gap_holds = @import("gap_holds.zig");
@@ -467,6 +484,13 @@ test {
     _ = sasl_bridge;
     _ = scoped_access;
     _ = scram_store;
+    _ = mesh_presence_issuer;
+    _ = mesh_presence_lease;
+    _ = mesh_presence_store;
+    _ = mesh_presence_retained;
+    _ = mesh_presence_image;
+    _ = mesh_presence_package;
+    _ = mesh_presence_authority;
     _ = mesh_search;
     _ = search_index;
     _ = unfurl;
@@ -510,6 +534,14 @@ test {
     _ = tiered_keys;
     _ = tls_certs;
     _ = tls_conn;
+    _ = sendq;
+    _ = ws_output;
+    _ = lifecycle_output;
+    _ = physical_lifecycle;
+    _ = account_authority;
+    _ = native_service;
+    _ = native_service_helper;
+    _ = configured_runtime;
     _ = tls_sni_load;
     _ = totp_auth;
     _ = transcript;
@@ -680,4 +712,8 @@ test "S6C6 external import cannot reach runtime privilege surface" {
     }) |name| {
         try std.testing.expect(!@hasDecl(dst, name));
     }
+}
+
+test {
+    _ = delivery_authority;
 }

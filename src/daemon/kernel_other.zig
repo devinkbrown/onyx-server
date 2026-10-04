@@ -74,7 +74,7 @@ pub const job_limit_kill_on_close: u32 = 0x00002000;
 pub const daemon_pledge = "stdio rpath wpath cpath inet dns";
 /// Full runtime promises include the transactional Helix candidate process
 /// and descriptor transport. Paths remain independently restricted by unveil.
-pub const runtime_pledge = "stdio rpath wpath cpath inet dns proc exec sendfd recvfd fattr flock getpw";
+pub const runtime_pledge = "stdio rpath wpath cpath inet unix dns proc exec sendfd recvfd fattr flock getpw";
 pub const RuntimeAccess = struct { path: [:0]const u8, perms: [:0]const u8 };
 pub const unveil_paths = [_]struct { path: [:0]const u8, perms: [:0]const u8 }{
     .{ .path = "/etc", .perms = "r" },
@@ -406,6 +406,46 @@ extern "c" fn cap_rights_limit(fd: i32, rights: *const Rights) i32;
 extern "c" fn fcntl(fd: i32, cmd: i32) i32;
 extern "c" fn pledge(promises: ?[*:0]const u8, execpromises: ?[*:0]const u8) i32;
 extern "c" fn unveil(path: ?[*:0]const u8, permissions: ?[*:0]const u8) i32;
+
+// OpenBSD 7.9 unistd.h/socket.h. These three target OS entrypoints are absent
+// from this SDK's std.c; keep them at the existing required-libc boundary.
+extern "c" fn getgroups(count: c_int, groups: ?[*]std.posix.gid_t) c_int;
+extern "c" fn getrtable() c_int;
+extern "c" fn closefrom(first: c_int) c_int;
+
+pub const ContextError = error{ Unsupported, GroupBufferTooSmall, ObservationFailed, DescriptorClosureFailed };
+
+pub fn openBsdGroups(storage: []std.posix.gid_t) ContextError![]std.posix.gid_t {
+    if (comptime builtin.os.tag != .openbsd) return error.Unsupported;
+    const count = getgroups(0, null);
+    if (count < 0) return error.ObservationFailed;
+    if (@as(usize, @intCast(count)) > storage.len) return error.GroupBufferTooSmall;
+    if (count == 0) return storage[0..0];
+    const got = getgroups(count, storage.ptr);
+    if (got < 0 or got > count) return error.ObservationFailed;
+    return storage[0..@intCast(got)];
+}
+
+pub fn openBsdRoutingTable() ContextError!u32 {
+    if (comptime builtin.os.tag != .openbsd) return error.Unsupported;
+    const table = getrtable();
+    if (table < 0) return error.ObservationFailed;
+    return @intCast(table);
+}
+
+/// Intended for the single-threaded, pre-exec child. Preserve descriptors below
+/// first, including the one explicitly authorized private service channel.
+pub fn openBsdCloseFrom(first: c_int) ContextError!void {
+    if (comptime builtin.os.tag != .openbsd) return error.Unsupported;
+    if (first < 0) return error.DescriptorClosureFailed;
+    while (true) {
+        switch (std.posix.errno(closefrom(first))) {
+            .SUCCESS, .BADF => return,
+            .INTR => continue,
+            else => return error.DescriptorClosureFailed,
+        }
+    }
+}
 
 extern "ntdll" fn NtCreateJobObject(
     JobHandle: *std.os.windows.HANDLE,

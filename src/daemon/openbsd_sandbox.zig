@@ -51,6 +51,15 @@ pub const Plan = struct {
         try self.addDirectory(std.fs.path.dirname(resolved) orelse return error.MissingExecutablePath, "rx");
     }
 
+    /// This grants observation of the one root-created service namespace, not
+    /// authority to create it. The managed owner separately validates its actual
+    /// directory, endpoint and lease before installing the sandbox.
+    pub fn addNativeServiceNamespace(self: *Plan) !void {
+        const owned = try self.allocator.dupeSentinel(u8, "/var/run/onyx_server", 0);
+        errdefer self.allocator.free(owned);
+        try self.appendOwned(owned, "r");
+    }
+
     fn appendOwned(self: *Plan, path: [:0]const u8, perms: [:0]const u8) !void {
         for (self.entries.items) |*entry| {
             if (!std.mem.eql(u8, entry.path, path)) continue;
@@ -82,4 +91,18 @@ test "OpenBSD confinement plan merges exact paths and unwinds owned names" {
     try std.testing.expectEqualStrings("rwc", plan.entries.items[0].perms);
     try std.testing.expectEqualStrings("rx", plan.entries.items[1].perms);
     try std.testing.expectEqualStrings("rwcx", mergePermissions("rwc", "rx"));
+}
+
+fn serviceNamespaceAllocation(allocator: std.mem.Allocator) !void {
+    var plan: Plan = .{ .allocator = allocator, .io = std.testing.io };
+    defer plan.deinit();
+    try plan.addNativeServiceNamespace();
+    try std.testing.expectEqual(@as(usize, 1), plan.entries.items.len);
+    try std.testing.expectEqualStrings("/var/run/onyx_server", plan.entries.items[0].path);
+    try std.testing.expectEqualStrings("r", plan.entries.items[0].perms);
+    try plan.addNativeServiceNamespace();
+    try std.testing.expectEqual(@as(usize, 1), plan.entries.items.len);
+}
+test "OpenBSD service confinement is exact read only and every allocation unwinds" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, serviceNamespaceAllocation, .{});
 }

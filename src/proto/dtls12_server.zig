@@ -51,11 +51,14 @@ pub const cert_der_cap: usize = 1024;
 /// ServerHelloDone. Sized to always fit (and thus always cache) the largest
 /// cert, so a retransmitted ClientHello never re-derives a fresh handshake.
 pub const flight4_cap: usize = cert_der_cap + 600;
-pub const flight6_cap: usize = 64;
+/// ChangeCipherSpec plus the GCM-protected Finished, cached byte-identically.
+pub const flight6_cap: usize = 2 * record.record_header_len + 1 +
+    dhs.handshake_header_len + kx.verify_data_length + record.gcm_overhead;
 comptime {
     // Guard the flight-4 retransmit cache against silently not-caching (which
     // would break an in-flight handshake on a retransmitted ClientHello).
     std.debug.assert(flight4_cap >= cert_der_cap + 512);
+    std.debug.assert(flight6_cap == 75);
 }
 /// Message_seq the server assigns to its handshake-proper flight (HVR is 0).
 const server_hello_seq: u16 = 1;
@@ -164,6 +167,221 @@ pub const Terminator = struct {
     /// this the moment DTLS-SRTP is enabled.
     request_client_cert: bool = false,
 
+    pub const SessionSnapshot = struct {
+        addr: TransportAddress,
+        state: State,
+        last_activity_ms: i64,
+        client_random: [32]u8,
+        server_random: [32]u8,
+        ecdhe_secret: [32]u8,
+        ecdhe_public: [65]u8,
+        srtp_profile: u16,
+        transcript: peer_verify.TranscriptState,
+        master_secret: [kx.master_secret_length]u8,
+        key_block: ?msg.KeyBlock,
+        have_keys: bool,
+        got_cke: bool,
+        got_ccs: bool,
+        srtp_keys: ?dtls_srtp.ExportedKeys,
+        fp_verified: bool,
+        mutual_auth: bool,
+        got_client_cert: bool,
+        got_client_cv: bool,
+        client_cert_verified: bool,
+        client_public: ?[65]u8,
+        have_client_pubkey: bool,
+        client_cert_digest: [peer_verify.digest_len]u8,
+        flight4: [flight4_cap]u8,
+        flight4_len: u16,
+        flight6: [flight6_cap]u8,
+        flight6_len: u16,
+        epoch0_write_seq: u48,
+
+        fn capture(source: *const Session) !SessionSnapshot {
+            if (source.flight4_len > flight4_cap or source.flight6_len > flight6_cap) return error.InvalidSnapshot;
+            const transcript = try peer_verify.TranscriptState.capture(&source.transcript);
+            var carry: SessionSnapshot = .{
+                .addr = source.addr,
+                .state = source.state,
+                .last_activity_ms = source.last_activity_ms,
+                .client_random = source.client_random,
+                .server_random = source.server_random,
+                .srtp_profile = source.srtp_profile,
+                .master_secret = source.master_secret,
+                .have_keys = source.have_keys,
+                .got_cke = source.got_cke,
+                .got_ccs = source.got_ccs,
+                .fp_verified = source.fp_verified,
+                .mutual_auth = source.mutual_auth,
+                .got_client_cert = source.got_client_cert,
+                .got_client_cv = source.got_client_cv,
+                .client_cert_verified = source.client_cert_verified,
+                .have_client_pubkey = source.have_client_pubkey,
+                .client_cert_digest = source.client_cert_digest,
+                .epoch0_write_seq = source.epoch0_write_seq,
+                .ecdhe_secret = source.ecdhe.secret,
+                .ecdhe_public = source.ecdhe.public,
+                .transcript = transcript,
+                .key_block = if (source.have_keys) source.key_block else null,
+                .srtp_keys = if (source.state == .established) source.srtp_keys else null,
+                .client_public = if (source.have_client_pubkey) source.client_pubkey.toUncompressedSec1() else null,
+                .flight4 = @splat(0),
+                .flight4_len = @intCast(source.flight4_len),
+                .flight6 = @splat(0),
+                .flight6_len = @intCast(source.flight6_len),
+            };
+            errdefer carry.wipe();
+            @memcpy(carry.flight4[0..source.flight4_len], source.flight4[0..source.flight4_len]);
+            @memcpy(carry.flight6[0..source.flight6_len], source.flight6[0..source.flight6_len]);
+            try carry.validate();
+            return carry;
+        }
+        pub fn validate(self: *const SessionSnapshot) !void {
+            if ((self.addr.ip_len != 4 and self.addr.ip_len != 16) or self.addr.port == 0 or
+                self.flight4_len == 0 or self.flight4_len > flight4_cap or self.flight6_len > flight6_cap or
+                self.epoch0_write_seq == 0 or self.srtp_profile != dtls_srtp.profile_aes128_cm_sha1_80) return error.InvalidSnapshot;
+            for (self.addr.ip[self.addr.ip_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+            for (self.flight4[self.flight4_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+            for (self.flight6[self.flight6_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+            try self.transcript.validate();
+            const P256 = std.crypto.ecc.P256;
+            P256.scalar.rejectNonCanonical(self.ecdhe_secret, .big) catch return error.InvalidSnapshot;
+            const public = P256.basePoint.mul(self.ecdhe_secret, .big) catch return error.InvalidSnapshot;
+            public.rejectIdentity() catch return error.InvalidSnapshot;
+            if (!std.crypto.timing_safe.eql([65]u8, public.toUncompressedSec1(), self.ecdhe_public)) return error.InvalidSnapshot;
+            if (self.have_keys != self.got_cke or self.have_keys != (self.key_block != null) or self.have_client_pubkey != (self.client_public != null)) return error.InvalidSnapshot;
+            if (self.client_public) |point| _ = try ecdsa_p256.parsePublicKeySec1(&point);
+            if (self.client_cert_verified and (!self.have_client_pubkey or !self.got_client_cv)) return error.InvalidSnapshot;
+            if (self.have_keys) {
+                var keys = msg.deriveKeyBlock(&self.master_secret, self.client_random, self.server_random);
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&keys));
+                if (!std.meta.eql(keys, self.key_block.?)) return error.InvalidSnapshot;
+            } else {
+                for (self.master_secret) |byte| if (byte != 0) return error.InvalidSnapshot;
+            }
+            if (self.state == .established) {
+                if (!self.have_keys or !self.got_ccs or self.srtp_keys == null) return error.InvalidSnapshot;
+                var exported = dtls_srtp.exportSrtpKeys(&self.master_secret, self.client_random, self.server_random);
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&exported));
+                if (!std.meta.eql(exported, self.srtp_keys.?)) return error.InvalidSnapshot;
+            } else if (self.srtp_keys != null or self.flight6_len != 0) return error.InvalidSnapshot;
+            // fp_verified preserves the existing recordPeerCertificate hook's
+            // semantics; it is never inferred from an address or mere presence.
+        }
+        fn restore(self: *const SessionSnapshot) !Session {
+            try self.validate();
+            var session: Session = .{ .active = true };
+            errdefer session.reset();
+            session.addr = self.addr;
+            session.state = self.state;
+            session.last_activity_ms = self.last_activity_ms;
+            session.client_random = self.client_random;
+            session.server_random = self.server_random;
+            session.srtp_profile = self.srtp_profile;
+            session.master_secret = self.master_secret;
+            session.have_keys = self.have_keys;
+            session.got_cke = self.got_cke;
+            session.got_ccs = self.got_ccs;
+            session.fp_verified = self.fp_verified;
+            session.mutual_auth = self.mutual_auth;
+            session.got_client_cert = self.got_client_cert;
+            session.got_client_cv = self.got_client_cv;
+            session.client_cert_verified = self.client_cert_verified;
+            session.have_client_pubkey = self.have_client_pubkey;
+            session.client_cert_digest = self.client_cert_digest;
+            session.epoch0_write_seq = self.epoch0_write_seq;
+            session.ecdhe = .{ .secret = self.ecdhe_secret, .public = self.ecdhe_public };
+            session.transcript = try self.transcript.restore();
+            if (self.key_block) |keys| session.key_block = keys;
+            if (self.srtp_keys) |keys| session.srtp_keys = keys;
+            if (self.client_public) |point| session.client_pubkey = try ecdsa_p256.parsePublicKeySec1(&point);
+            session.flight4_len = self.flight4_len;
+            session.flight6_len = self.flight6_len;
+            @memcpy(session.flight4[0..self.flight4_len], self.flight4[0..self.flight4_len]);
+            @memcpy(session.flight6[0..self.flight6_len], self.flight6[0..self.flight6_len]);
+            return session;
+        }
+        fn wipe(self: *SessionSnapshot) void {
+            std.crypto.secureZero(u8, std.mem.asBytes(self));
+        }
+    };
+
+    /// Complete source-owned state, including in-progress handshakes and the
+    /// exact slot order. Aggregate authentication and graph joins precede use.
+    pub const Snapshot = struct {
+        allocator: std.mem.Allocator,
+        identity: peer_verify.EngineIdentity,
+        bindings: peer_verify.Bindings(default_max_sessions).Snapshot,
+        request_client_cert: bool,
+        sessions: []?SessionSnapshot,
+        pub fn deinit(self: *Snapshot) void {
+            for (self.sessions) |*slot| if (slot.*) |*session| session.wipe();
+            self.allocator.free(self.sessions);
+            self.identity.wipe();
+            self.bindings.deinit();
+            self.* = undefined;
+        }
+        pub fn validate(self: *const Snapshot, policy: peer_verify.EnginePolicy) !void {
+            if (self.sessions.len != policy.session_capacity or self.sessions.len == 0 or self.sessions.len > default_max_sessions or self.request_client_cert != policy.request_client_cert) return error.ConfigMismatch;
+            try self.identity.validate(policy.cert_digest);
+            try self.bindings.validate();
+            for (self.sessions, 0..) |slot, i| if (slot) |session| {
+                try session.validate();
+                for (self.sessions[0..i]) |prior| if (prior) |entry| if (entry.addr.eql(session.addr)) return error.InvalidSnapshot;
+            };
+        }
+    };
+
+    pub const Restoration = struct {
+        allocator: std.mem.Allocator,
+        term: Terminator,
+        pub fn deinit(self: *Restoration) void {
+            const sessions = self.term.sessions;
+            self.term.deinit();
+            self.allocator.free(sessions);
+            self.* = undefined;
+        }
+    };
+
+    pub fn capture(self: *const Terminator, allocator: std.mem.Allocator) !Snapshot {
+        if (self.sessions.len == 0 or self.sessions.len > default_max_sessions) return error.InvalidSnapshot;
+        var identity = try peer_verify.EngineIdentity.capture(self);
+        errdefer identity.wipe();
+        var bindings = try self.verify_bindings.capture();
+        errdefer bindings.deinit();
+        const sessions = try allocator.alloc(?SessionSnapshot, self.sessions.len);
+        @memset(sessions, null);
+        errdefer {
+            for (sessions) |*slot| if (slot.*) |*session| session.wipe();
+            allocator.free(sessions);
+        }
+        for (self.sessions, sessions) |*source, *target| if (source.active) {
+            target.* = try SessionSnapshot.capture(source);
+        };
+        const snapshot: Snapshot = .{ .allocator = allocator, .identity = identity, .bindings = bindings, .sessions = sessions, .request_client_cert = self.request_client_cert };
+        try snapshot.validate(.{ .cert_digest = peer_verify.certDigest(self.certDer()), .session_capacity = self.sessions.len, .request_client_cert = self.request_client_cert });
+        return snapshot;
+    }
+
+    pub fn prepareRestore(allocator: std.mem.Allocator, snapshot: *const Snapshot, policy: peer_verify.EnginePolicy) !Restoration {
+        try snapshot.validate(policy);
+        var key = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(snapshot.identity.secret_key));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&key));
+        var random = try snapshot.identity.random.restore();
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&random));
+        const bindings = try peer_verify.Bindings(default_max_sessions).prepareRestore(&snapshot.bindings);
+        const sessions = try allocator.alloc(Session, snapshot.sessions.len);
+        for (sessions) |*session| session.* = .{};
+        errdefer {
+            for (sessions) |*session| session.reset();
+            allocator.free(sessions);
+        }
+        for (snapshot.sessions, sessions) |source, *target| if (source) |session| {
+            target.* = try session.restore();
+        };
+        return .{ .allocator = allocator, .term = .{ .sessions = sessions, .cert_der = snapshot.identity.cert_der, .cert_len = snapshot.identity.cert_len, .cert_key = key, .cookie_secret = snapshot.identity.cookie_secret, .csprng = random, .verify_bindings = bindings, .request_client_cert = snapshot.request_client_cert } };
+    }
+
     /// Initialise from a 32-byte entropy seed: mints the self-signed
     /// ECDSA-P256 cert, the cookie secret, and seeds the per-handshake CSPRNG.
     /// `sessions` is a caller-owned, caller-freed backing array.
@@ -226,8 +444,14 @@ pub const Terminator = struct {
         return fingerprint.format(.sha256, self.certDer(), out);
     }
 
+    /// Exact source ownership (including an incomplete or denied session).
+    pub fn owns(self: *const Terminator, addr: TransportAddress) bool {
+        return self.find(addr) != null;
+    }
+
     /// Whether the handshake with `addr` has completed (SRTP keys ready).
     pub fn established(self: *const Terminator, addr: TransportAddress) bool {
+        if (self.verify_bindings.exhausted) return false;
         const s = self.find(addr) orelse return false;
         return s.state == .established;
     }
@@ -257,12 +481,16 @@ pub const Terminator = struct {
     /// verified, or when verification was never engaged for this session. Once a
     /// session commits to mutual auth (`mutual_auth`, set at flight-4 emission
     /// when a fingerprint was bound), it REQUIRES `fp_verified` — independent of
-    /// the live binding table — so an evicted binding can never re-open the gate.
-    /// Otherwise it is live-evaluated off the binding table (a binding set any
-    /// time before key export still gates).
+    /// whether the binding remains present. A current binding also must match
+    /// the retained certificate digest, including after signaling rebinds.
     fn peerVerifiedSession(self: *const Terminator, addr: TransportAddress, s: *const Session) bool {
-        if (s.mutual_auth) return s.fp_verified;
-        return self.verify_bindings.expectedFor(addr) == null or s.fp_verified;
+        if (self.verify_bindings.exhausted) return false;
+        // fp_verified records the certificate verdict at admission. Current
+        // signaling can rebind this address, so every export rechecks the
+        // retained certificate digest against the current expectation.
+        if (self.verify_bindings.expectedFor(addr)) |expected|
+            return s.fp_verified and peer_verify.digestEql(expected, s.client_cert_digest);
+        return !s.mutual_auth or s.fp_verified;
     }
 
     /// Bind the RFC 8122 fingerprint the peer signaled for `addr` (SHA-256 of
@@ -278,8 +506,9 @@ pub const Terminator = struct {
     /// no-op when no session exists for `addr`.
     pub fn recordPeerCertificate(self: *Terminator, addr: TransportAddress, cert_der: []const u8) void {
         const s = self.find(addr) orelse return;
+        s.client_cert_digest = peer_verify.certDigest(cert_der);
         if (self.verify_bindings.expectedFor(addr)) |exp| {
-            s.fp_verified = peer_verify.digestEql(exp, peer_verify.certDigest(cert_der));
+            s.fp_verified = peer_verify.digestEql(exp, s.client_cert_digest);
         } else {
             s.fp_verified = false;
         }
@@ -291,6 +520,13 @@ pub const Terminator = struct {
     pub fn peerVerified(self: *const Terminator, addr: TransportAddress) bool {
         const s = self.find(addr) orelse return false;
         return self.peerVerifiedSession(addr, s);
+    }
+
+    /// Retire exactly this address after the physical owner has closed its
+    /// source operations. Reoffer must never inherit an old session verdict.
+    pub fn retirePeer(self: *Terminator, addr: TransportAddress) void {
+        if (self.find(addr)) |session| session.reset();
+        self.verify_bindings.clear(addr);
     }
 
     // -- session table -----------------------------------------------------
@@ -970,6 +1206,10 @@ const ClientAuth = struct {
 };
 
 const ClientDriver = struct {
+    sent_flight5: [4096]u8 = undefined,
+    sent_flight5_len: usize = 0,
+    received_flight6: [256]u8 = undefined,
+    received_flight6_len: usize = 0,
     client_random: [32]u8,
     server_random: [32]u8 = @splat(0),
     cookie: [64]u8 = @splat(0),
@@ -1207,6 +1447,8 @@ fn driveLoopbackHandshakeAuth(
         feedTranscript(&client.transcript, .finished, finished_seq, &client_vd);
     }
 
+    @memcpy(client.sent_flight5[0..f5_len], flight5[0..f5_len]);
+    client.sent_flight5_len = f5_len;
     const flight6_opt = term.handleDatagram(addr, flight5[0..f5_len], 102, &out);
     if (mode != .normal) {
         // Fail-closed mutual auth: the server must NOT complete (no flight 6).
@@ -1214,6 +1456,8 @@ fn driveLoopbackHandshakeAuth(
         return client;
     }
     const flight6 = flight6_opt orelse return error.TestUnexpectedResult;
+    @memcpy(client.received_flight6[0..flight6.len], flight6);
+    client.received_flight6_len = flight6.len;
 
     // 6) Parse flight 6: ChangeCipherSpec + encrypted server Finished; verify it.
     {
@@ -1275,6 +1519,31 @@ test "full DTLS-SRTP loopback handshake: both sides derive identical SRTP keys" 
     const wire = try srtp.protect(sk, 0, &rtp, &prot);
     var back: [rtp.len]u8 = undefined;
     try testing.expectEqualSlices(u8, &rtp, try srtp.unprotect(sk, 0, wire, &back));
+}
+
+test "active media DTO DTLS12 exhausted binding cannot export through discarded bind result" {
+    var setup = try makeTerminator(0xA4);
+    defer testing.allocator.free(setup.sessions);
+    defer setup.term.deinit();
+    const addr = testAddr(9, 7901);
+    _ = try driveLoopbackHandshake(&setup.term, addr);
+    try testing.expect(setup.term.exportedKeys(addr) != null);
+    // Reach the real checked last-counter boundary without billions of binds.
+    // bindExpectedFingerprint is the actual production void/discarded-bool seam.
+    setup.term.verify_bindings.tick = std.math.maxInt(u64);
+    setup.term.bindExpectedFingerprint(testAddr(10, 7902), peer_verify.certDigest("required-new-peer"));
+    try testing.expect(!setup.term.established(addr));
+    try testing.expect(!setup.term.peerVerified(addr));
+    try testing.expect(setup.term.exportedKeys(addr) == null);
+    try testing.expect(setup.term.srtpProfile(addr) == null);
+    var snapshot = try setup.term.verify_bindings.capture();
+    defer snapshot.deinit();
+    const candidate = try @TypeOf(setup.term.verify_bindings).prepareRestore(&snapshot);
+    setup.term.verify_bindings = candidate;
+    // Installing the exact negative binding candidate into SAME owner must not
+    // reopen a completed session merely because its previous keys still exist.
+    try testing.expect(setup.term.exportedKeys(addr) == null);
+    try testing.expect(!setup.term.peerVerified(addr));
 }
 
 test "RFC 8122: an established session with no bound fingerprint exports keys (byte-identical default)" {
@@ -1527,4 +1796,369 @@ test "retransmitted second ClientHello resends the cached flight 4 verbatim" {
     // Retransmit the identical CH2 → identical flight 4, no new session slot.
     const f4b = term.handleDatagram(addr, ch2, 102, &out) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, first_copy[0..f4a.len], f4b);
+}
+
+fn dtls12DtoSweep(allocator: std.mem.Allocator) !void {
+    var old = try makeTerminator(0xB1);
+    defer testing.allocator.free(old.sessions);
+    defer old.term.deinit();
+    const addr = testAddr(8, 8012);
+    _ = try driveLoopbackHandshake(&old.term, addr);
+    old.term.verify_bindings.tick = std.math.maxInt(u64);
+    old.term.bindExpectedFingerprint(testAddr(9, 8013), @splat(8));
+    const policy: peer_verify.EnginePolicy = .{ .cert_digest = peer_verify.certDigest(old.term.certDer()), .session_capacity = old.sessions.len, .request_client_cert = false };
+    const before_ptr = old.term.sessions.ptr;
+    const before_cookie = old.term.cookie_secret;
+    var before = try old.term.capture(testing.allocator);
+    defer before.deinit();
+    defer {
+        std.debug.assert(old.term.sessions.ptr == before_ptr and std.meta.eql(before_cookie, old.term.cookie_secret));
+        var current = old.term.capture(testing.allocator) catch unreachable;
+        defer current.deinit();
+        testing.expectEqualDeep(before.sessions, current.sessions) catch unreachable;
+        testing.expectEqualDeep(before.identity, current.identity) catch unreachable;
+        testing.expectEqualDeep(before.bindings, current.bindings) catch unreachable;
+    }
+    var carry = old.term.capture(allocator) catch |err| {
+        var retry = try old.term.capture(testing.allocator);
+        defer retry.deinit();
+        return err;
+    };
+    defer carry.deinit();
+    var candidate = Terminator.prepareRestore(allocator, &carry, policy) catch |err| {
+        var retry = try Terminator.prepareRestore(testing.allocator, &carry, policy);
+        defer retry.deinit();
+        try testing.expect(retry.term.exportedKeys(addr) == null);
+        return err;
+    };
+    defer candidate.deinit();
+    try testing.expect(candidate.term.sessions.ptr != old.term.sessions.ptr);
+    try testing.expect(candidate.term.exportedKeys(addr) == null);
+    try testing.expect(candidate.term.verify_bindings.exhausted);
+    var after = try candidate.term.capture(testing.allocator);
+    defer after.deinit();
+    try testing.expectEqualDeep(carry.sessions, after.sessions);
+    try testing.expectEqualDeep(carry.identity, after.identity);
+}
+
+test "active media DTO DTLS12 established exhausted authority complete ownership all OOM retry" {
+    try testing.checkAllAllocationFailures(testing.allocator, dtls12DtoSweep, .{});
+}
+
+test "active media DTO DTLS12 real half handshake resumes cached flight with exact transcript and keys" {
+    var old = try makeTerminator(0xB2);
+    defer testing.allocator.free(old.sessions);
+    defer old.term.deinit();
+    const addr = testAddr(8, 8112);
+    var client = ClientDriver.init();
+    var out: [2048]u8 = undefined;
+    var scratch: [2048]u8 = undefined;
+    const ch1 = try client.buildClientHello(0, 0, &scratch);
+    const response = old.term.handleDatagram(addr, ch1, 100, &out) orelse return error.TestUnexpectedResult;
+    const rec = try record.RecordHeader.decode(response);
+    const hh = try dhs.Header.decode(rec.fragment);
+    const cookie = try dhs.parseHelloVerifyRequest(rec.fragment[dhs.handshake_header_len..][0..hh.hdr.length]);
+    @memcpy(client.cookie[0..cookie.len], cookie);
+    client.cookie_len = cookie.len;
+    const ch2 = try client.buildClientHello(1, 1, &scratch);
+    const flight = old.term.handleDatagram(addr, ch2, 101, &out) orelse return error.TestUnexpectedResult;
+    var cached: [2048]u8 = undefined;
+    @memcpy(cached[0..flight.len], flight);
+    var carry = try old.term.capture(testing.allocator);
+    defer carry.deinit();
+    const policy: peer_verify.EnginePolicy = .{ .cert_digest = peer_verify.certDigest(old.term.certDer()), .session_capacity = old.sessions.len, .request_client_cert = false };
+    var candidate = try Terminator.prepareRestore(testing.allocator, &carry, policy);
+    defer candidate.deinit();
+    var new_out: [2048]u8 = undefined;
+    try testing.expectEqualSlices(u8, cached[0..flight.len], candidate.term.handleDatagram(addr, ch2, 102, &new_out).?);
+    _ = try driveLoopbackHandshake(&candidate.term, addr);
+    _ = try driveLoopbackHandshake(&old.term, addr);
+    try testing.expectEqualDeep(old.term.exportedKeys(addr).?, candidate.term.exportedKeys(addr).?);
+    var old_random = old.term.csprng;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&old_random));
+    var new_random = candidate.term.csprng;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&new_random));
+    var a: [600]u8 = undefined;
+    var b: [600]u8 = undefined;
+    old_random.random().bytes(&a);
+    new_random.random().bytes(&b);
+    try testing.expectEqualSlices(u8, &a, &b);
+    // Independent configured identity and malformed continuation refuse before
+    // candidate backing allocation, while the OLD engines remain established.
+    var wrong = policy;
+    wrong.cert_digest[0] ^= 1;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.ConfigMismatch, Terminator.prepareRestore(failing.allocator(), &carry, wrong));
+    carry.sessions[0].?.transcript.buffered = 64;
+    try testing.expectError(error.InvalidSnapshot, Terminator.prepareRestore(failing.allocator(), &carry, policy));
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try testing.expect(old.term.established(addr) and candidate.term.established(addr));
+}
+
+test "active media DTO DTLS12 actual encrypted client Finished retransmission receives exact cached server flight" {
+    var old = try makeTerminator(0xB5);
+    defer testing.allocator.free(old.sessions);
+    defer old.term.deinit();
+    const addr = testAddr(8, 8412);
+    const client = try driveLoopbackHandshake(&old.term, addr);
+    try testing.expect(old.term.established(addr));
+    try testing.expectEqual(@as(usize, 75), client.received_flight6_len);
+    var out: [2048]u8 = undefined;
+    const retransmitted = old.term.handleDatagram(addr, client.sent_flight5[0..client.sent_flight5_len], 103, &out) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, client.received_flight6[0..client.received_flight6_len], retransmitted);
+    try testing.expectEqual(client.received_flight6_len, old.term.find(addr).?.flight6_len);
+    var carry = try old.term.capture(testing.allocator);
+    defer carry.deinit();
+    var candidate = try Terminator.prepareRestore(testing.allocator, &carry, .{ .cert_digest = peer_verify.certDigest(old.term.certDer()), .session_capacity = old.sessions.len, .request_client_cert = false });
+    defer candidate.deinit();
+    const resumed = candidate.term.handleDatagram(addr, client.sent_flight5[0..client.sent_flight5_len], 104, &out) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, client.received_flight6[0..client.received_flight6_len], resumed);
+}
+
+test "active media DTO DTLS12 actual mutual fingerprint rebind never exports stale certificate verdict" {
+    var old = try makeTerminator(0xB6);
+    defer testing.allocator.free(old.sessions);
+    defer old.term.deinit();
+    old.term.request_client_cert = true;
+    const addr = testAddr(8, 8512);
+    var cert: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth(0x51, &cert);
+    const actual = peer_verify.certDigest(auth.cert_der);
+    old.term.bindExpectedFingerprint(addr, actual);
+    _ = try driveLoopbackHandshakeAuth(&old.term, addr, auth, .normal);
+    try testing.expect(old.term.peerVerified(addr));
+    try testing.expect(old.term.exportedKeys(addr) != null);
+    old.term.bindExpectedFingerprint(addr, actual);
+    try testing.expect(old.term.exportedKeys(addr) != null);
+    var changed = actual;
+    changed[0] ^= 1;
+    old.term.bindExpectedFingerprint(addr, changed);
+    try testing.expect(old.term.exportedKeys(addr) == null);
+    try testing.expect(old.term.srtpProfile(addr) == null);
+    try testing.expect(!old.term.peerVerified(addr));
+    try testing.expect(old.term.find(addr).?.mutual_auth);
+    var carry = try old.term.capture(testing.allocator);
+    defer carry.deinit();
+    var candidate = try Terminator.prepareRestore(testing.allocator, &carry, .{ .cert_digest = peer_verify.certDigest(old.term.certDer()), .session_capacity = old.sessions.len, .request_client_cert = true });
+    defer candidate.deinit();
+    try testing.expect(candidate.term.exportedKeys(addr) == null);
+    try testing.expect(!candidate.term.peerVerified(addr));
+}
+
+fn dtls12RebindDtoSweep(allocator: std.mem.Allocator) !void {
+    var old = try makeTerminator(0xC8);
+    defer testing.allocator.free(old.sessions);
+    defer old.term.deinit();
+    const addr = testAddr(8, 8700 + 12);
+    _ = try driveLoopbackHandshake(&old.term, addr);
+    const certificate = "existing trusted certificate hook A";
+    const actual = peer_verify.certDigest(certificate);
+    old.term.bindExpectedFingerprint(addr, actual);
+    old.term.recordPeerCertificate(addr, certificate);
+    try testing.expect(old.term.exportedKeys(addr) != null);
+    old.term.bindExpectedFingerprint(addr, actual);
+    try testing.expect(old.term.exportedKeys(addr) != null);
+    var changed = actual;
+    changed[1] ^= 1;
+    old.term.bindExpectedFingerprint(addr, changed);
+    try testing.expect(old.term.exportedKeys(addr) == null);
+    var before = try old.term.capture(testing.allocator);
+    defer before.deinit();
+    const before_ptr = old.term.sessions.ptr;
+    defer {
+        std.debug.assert(before_ptr == old.term.sessions.ptr);
+        var current = old.term.capture(testing.allocator) catch unreachable;
+        defer current.deinit();
+        testing.expectEqualDeep(before.sessions, current.sessions) catch unreachable;
+        testing.expectEqualDeep(before.bindings, current.bindings) catch unreachable;
+        testing.expectEqualDeep(before.identity, current.identity) catch unreachable;
+    }
+    const policy: peer_verify.EnginePolicy = .{ .cert_digest = peer_verify.certDigest(old.term.certDer()), .session_capacity = old.sessions.len, .request_client_cert = false };
+    var carry = old.term.capture(allocator) catch |err| {
+        var retry = try old.term.capture(testing.allocator);
+        defer retry.deinit();
+        return err;
+    };
+    defer carry.deinit();
+    var candidate = Terminator.prepareRestore(allocator, &carry, policy) catch |err| {
+        var retry = try Terminator.prepareRestore(testing.allocator, &carry, policy);
+        defer retry.deinit();
+        try testing.expect(retry.term.exportedKeys(addr) == null);
+        return err;
+    };
+    defer candidate.deinit();
+    try testing.expect(candidate.term.exportedKeys(addr) == null);
+    try testing.expect(candidate.term.srtpProfile(addr) == null);
+    try testing.expect(!candidate.term.peerVerified(addr));
+    // Reapproval of the SAME retained certificate may restore the verdict;
+    // changing the policy never substitutes a different presented certificate.
+    candidate.term.bindExpectedFingerprint(addr, actual);
+    try testing.expect(candidate.term.exportedKeys(addr) != null);
+    try testing.expectEqualDeep(old.term.find(addr).?.srtp_keys, candidate.term.exportedKeys(addr).?);
+}
+
+test "active media DTO DTLS12 legacy certificate hook rebind and allocation rollback" {
+    try testing.checkAllAllocationFailures(testing.allocator, dtls12RebindDtoSweep, .{});
+}
+
+test "active media dispatch causal DTLS12 actual mutual current signaling rebind never plaintext" {
+    var old = try makeTerminator(0xCC);
+    defer testing.allocator.free(old.sessions);
+    defer old.term.deinit();
+    old.term.request_client_cert = true;
+    const addr = testAddr(8, 8812);
+    var cert: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth(0x55, &cert);
+    const actual = peer_verify.certDigest(auth.cert_der);
+    old.term.bindExpectedFingerprint(addr, actual);
+    _ = try driveLoopbackHandshakeAuth(&old.term, addr, auth, .normal);
+    var owner = try @import("../daemon/media_plane.zig").MediaPlane.initFallible(testing.allocator);
+    defer owner.deinit();
+    owner.dtls_enabled = true;
+    owner.dtls = &old.term;
+    defer owner.dtls = null; // fixture borrows an actual separately-owned engine
+    var random = std.Random.DefaultPrng.init(0xCC);
+    _ = try owner.transport.allocate("#dispatch", "A", random.random());
+    try testing.expect(owner.transport.bindRemote("#dispatch", "A", addr));
+    try owner.bindOfferedFingerprint("#dispatch", "A", actual);
+    try testing.expectEqual(.ready, owner.testOnlyDtlsDisposition(addr));
+    var changed = actual;
+    changed[0] ^= 1;
+    try owner.bindOfferedFingerprint("#dispatch", "A", changed);
+    try testing.expectEqual(.unavailable, owner.testOnlyDtlsDisposition(addr));
+}
+
+test "active media dispatch causal DTLS12 actual mutual denied exporter never plaintext" {
+    var old = try makeTerminator(0xCC);
+    defer testing.allocator.free(old.sessions);
+    defer old.term.deinit();
+    old.term.request_client_cert = true;
+    const addr = testAddr(8, 8812);
+    var cert: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth(0x55, &cert);
+    const actual = peer_verify.certDigest(auth.cert_der);
+    old.term.bindExpectedFingerprint(addr, actual);
+    _ = try driveLoopbackHandshakeAuth(&old.term, addr, auth, .normal);
+    var owner = try @import("../daemon/media_plane.zig").MediaPlane.initFallible(testing.allocator);
+    defer owner.deinit();
+    owner.dtls_enabled = true;
+    owner.dtls = &old.term;
+    defer owner.dtls = null; // fixture borrows an actual separately-owned engine
+    var random = std.Random.DefaultPrng.init(0xCC);
+    _ = try owner.transport.allocate("#dispatch", "A", random.random());
+    try testing.expect(owner.transport.bindRemote("#dispatch", "A", addr));
+    // No newer signaling expectation supersedes the engine's actual negative
+    // binding below. The separate signaling-rebind control tests that join.
+    try testing.expectEqual(.ready, owner.testOnlyDtlsDisposition(addr));
+    var changed = actual;
+    changed[0] ^= 1;
+    old.term.bindExpectedFingerprint(addr, changed);
+    try testing.expectEqual(.unavailable, owner.testOnlyDtlsDisposition(addr));
+}
+
+test "active media dispatch packet DTLS12 real ingress denial reapproval incomplete and exhaustion" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var old = try makeTerminator(0xDD);
+    defer testing.allocator.free(old.sessions);
+    defer old.term.deinit();
+    old.term.request_client_cert = true;
+    const media = @import("../substrate/media_socket.zig");
+    var peer = try media.MediaSocket.bind(media.loopback_be, 0);
+    defer peer.deinit();
+    const addr = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, try peer.localPort());
+    var cert: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth(0x55, &cert);
+    const actual = peer_verify.certDigest(auth.cert_der);
+    old.term.bindExpectedFingerprint(addr, actual);
+    _ = try driveLoopbackHandshakeAuth(&old.term, addr, auth, .normal);
+    const material = old.term.exportedKeys(addr) orelse return error.TestUnexpectedResult;
+    var owner = try @import("../daemon/media_plane.zig").MediaPlane.initFallible(testing.allocator);
+    defer owner.deinit();
+    owner.dtls_enabled = true;
+    owner.dtls = &old.term;
+    defer owner.dtls = null;
+    try owner.bindOfferedFingerprint("#packet-proof", "source", actual);
+    try owner.testOnlyPacketPath(addr, material, false, 10, true);
+    try owner.testOnlyPacketPath(addr, material, true, 10, true);
+    var changed = actual;
+    changed[0] ^= 1;
+    try owner.bindOfferedFingerprint("#packet-proof", "source", changed);
+    try owner.testOnlyPacketPath(addr, material, false, 11, false);
+    try owner.testOnlyPacketPath(addr, material, true, 11, false);
+    try owner.bindOfferedFingerprint("#packet-proof", "source", actual);
+    // Same-key reapproval cannot replay the packets already accepted before
+    // denial, but the next authentic packets remain admissible.
+    try owner.testOnlyPacketPath(addr, material, false, 10, false);
+    try owner.testOnlyPacketPath(addr, material, true, 10, false);
+    try owner.testOnlyPacketPath(addr, material, false, 11, true);
+    try owner.testOnlyPacketPath(addr, material, true, 11, true);
+    try owner.bindOfferedFingerprint("#egress-proof", "recipient", actual);
+    try owner.testOnlyEncryptedEgressPaths(&peer, material, 30, true);
+    try owner.bindOfferedFingerprint("#egress-proof", "recipient", changed);
+    try owner.testOnlyEncryptedEgressPaths(&peer, material, 32, false);
+    try owner.bindOfferedFingerprint("#egress-proof", "recipient", actual);
+    try owner.testOnlyEncryptedEgressPaths(&peer, material, 32, true);
+    const pending = testAddr(9, 8813);
+    _ = try captureFlight4(&old.term, pending);
+    try testing.expect(old.term.owns(pending));
+    try testing.expect(!old.term.established(pending));
+    try owner.testOnlyPacketPath(pending, material, false, 12, false);
+    try owner.testOnlyPacketPath(pending, material, true, 12, false);
+    old.term.verify_bindings.tick = std.math.maxInt(u64);
+    old.term.bindExpectedFingerprint(addr, actual);
+    try testing.expect(old.term.verify_bindings.exhausted);
+    try owner.testOnlyPacketPath(addr, material, false, 12, false);
+    try owner.testOnlyPacketPath(addr, material, true, 12, false);
+    try owner.testOnlyEncryptedEgressPaths(&peer, material, 34, false);
+}
+
+test "physical media five-blocker causal genuine mutual SRTP cache OOM preserves identical packet retry" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const plane = @import("../daemon/media_plane.zig");
+    var peer = try plane.MediaSocket.bind(plane.loopback_be, 0);
+    defer peer.deinit();
+    const address = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, try peer.localPort());
+    var setup = try makeTerminator(0xe1);
+    defer testing.allocator.free(setup.sessions);
+    defer setup.term.deinit();
+    setup.term.request_client_cert = true;
+    var certificate: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth(0x61, &certificate);
+    const expected_fp = peer_verify.certDigest(auth.cert_der);
+    setup.term.bindExpectedFingerprint(address, expected_fp);
+    var client = try driveLoopbackHandshakeAuth(&setup.term, address, auth, .normal);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&client));
+    try testing.expect(client.saw_certificate_request);
+    try testing.expect(setup.term.peerVerified(address));
+    const material = setup.term.exportedKeys(address) orelse return error.TestUnexpectedResult;
+    try plane.MediaPlane.testOnlyPhysicalCacheOom(&setup.term, &peer, expected_fp, client.sent_flight5[0..client.sent_flight5_len], material);
+}
+
+test "physical media genuine mutual SRTP every NEW cache allocation refusal preserves identical authentic retry" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const plane = @import("../daemon/media_plane.zig");
+    // Plan, stable SSRC cell, detached map, packet plan, payload and row backing.
+    // Each fresh real handshake isolates one exact allocation, not replay reset.
+    for (1..6) |fault_index| {
+        var peer = try plane.MediaSocket.bind(plane.loopback_be, 0);
+        defer peer.deinit();
+        const address = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, try peer.localPort());
+        var setup = try makeTerminator(0xe1);
+        defer testing.allocator.free(setup.sessions);
+        defer setup.term.deinit();
+        setup.term.request_client_cert = true;
+        var certificate: [cert_der_cap]u8 = undefined;
+        const auth = try makeClientAuth(0x61, &certificate);
+        const expected_fp = peer_verify.certDigest(auth.cert_der);
+        setup.term.bindExpectedFingerprint(address, expected_fp);
+        var client = try driveLoopbackHandshakeAuth(&setup.term, address, auth, .normal);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&client));
+        try testing.expect(client.saw_certificate_request);
+        try testing.expect(setup.term.peerVerified(address));
+        const material = setup.term.exportedKeys(address) orelse return error.TestUnexpectedResult;
+        try plane.MediaPlane.testOnlyPhysicalCacheOomIndex(&setup.term, &peer, expected_fp, client.sent_flight5[0..client.sent_flight5_len], material, fault_index);
+    }
 }

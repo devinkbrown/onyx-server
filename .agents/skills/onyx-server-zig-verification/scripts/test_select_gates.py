@@ -58,6 +58,55 @@ class GateSelectionTests(unittest.TestCase):
     def test_build_change_selects_full_release_safe_test(self) -> None:
         self.assert_selection("build.zig", {"test"}, {"test"})
 
+    def test_store_includes_module_tests_and_auth_consumers(self) -> None:
+        self.assert_selection(
+            "src/daemon/store.zig",
+            {"test-mod", "test-services"},
+            {"test-mod", "test-services"},
+        )
+
+    def test_physical_lifecycle_includes_module_release_safe(self) -> None:
+        self.assert_selection(
+            "src/daemon/physical_lifecycle.zig", {"test-mod"}, {"test-mod"}
+        )
+
+    def test_output_leaves_include_all_tests_and_critical_callers(self) -> None:
+        for path in ("src/daemon/sendq.zig", "src/daemon/ws_output.zig"):
+            with self.subTest(path=path):
+                self.assert_selection(
+                    path,
+                    {"test-mod", "test-server", "test-tls"},
+                    {"test-mod", "test-server", "test-tls"},
+                )
+
+    def test_media_transport_paths_are_release_safe(self) -> None:
+        for path in (
+            "src/daemon/native_media_transport.zig",
+            "src/daemon/sfu_srtp.zig",
+            "src/substrate/rtp_nack.zig",
+        ):
+            with self.subTest(path=path):
+                self.assert_selection(path, {"test-media"}, {"test-media"})
+
+    def test_capability_keys_include_full_import_regressions(self) -> None:
+        self.assert_selection(
+            "src/substrate/media_capability.zig",
+            {"test-media", "test-mod"},
+            {"test-media", "test-mod"},
+        )
+
+    def test_native_codecs_include_media_callers_and_import_regressions(self) -> None:
+        for path in (
+            "src/substrate/cadence_frame.zig",
+            "src/substrate/native_feedback.zig",
+        ):
+            with self.subTest(path=path):
+                self.assert_selection(
+                    path,
+                    {"test-media", "test-mod"},
+                    {"test-media", "test-mod"},
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -197,6 +197,214 @@ pub const Terminator = struct {
     /// byte-identical. The media plane sets this when DTLS-SRTP is enabled.
     request_client_cert: bool = false,
 
+    pub const SessionSnapshot = struct {
+        addr: TransportAddress,
+        state: State,
+        last_activity_ms: i64,
+        client_random: [32]u8,
+        srtp_profile: u16,
+        server_hs_keys: record13.Aes128GcmKeys,
+        client_hs_keys: record13.Aes128GcmKeys,
+        client_finished_key: [hash_len]u8,
+        transcript_through_server_finished: [hash_len]u8,
+        exporter_master: [hash_len]u8,
+        have_secrets: bool,
+        srtp_keys: ?dtls_srtp.ExportedKeys,
+        fp_verified: bool,
+        mutual_auth: bool,
+        transcript: peer_verify.TranscriptState,
+        got_client_cert: bool,
+        got_client_cv: bool,
+        client_cert_verified: bool,
+        client_public: ?[65]u8,
+        have_client_pubkey: bool,
+        client_cert_digest: [peer_verify.digest_len]u8,
+        epoch0_write_seq: u48,
+        server_epoch2_seq: u64,
+        client_epoch2_top: u64,
+        client_epoch2_seen: bool,
+        flight: [flight_cap]u8,
+        flight_len: u16,
+        ack: [ack_cap]u8,
+        ack_len: u16,
+
+        fn capture(source: *const Session) !SessionSnapshot {
+            if (!source.have_secrets or source.flight_len > flight_cap or source.ack_len > ack_cap) return error.InvalidSnapshot;
+            const transcript = try peer_verify.TranscriptState.capture(&source.transcript);
+            var carry: SessionSnapshot = .{
+                .addr = source.addr,
+                .state = source.state,
+                .last_activity_ms = source.last_activity_ms,
+                .client_random = source.client_random,
+                .srtp_profile = source.srtp_profile,
+                .server_hs_keys = source.server_hs_keys,
+                .client_hs_keys = source.client_hs_keys,
+                .client_finished_key = source.client_finished_key,
+                .transcript_through_server_finished = source.transcript_through_server_finished,
+                .exporter_master = source.exporter_master,
+                .have_secrets = source.have_secrets,
+                .fp_verified = source.fp_verified,
+                .mutual_auth = source.mutual_auth,
+                .got_client_cert = source.got_client_cert,
+                .got_client_cv = source.got_client_cv,
+                .client_cert_verified = source.client_cert_verified,
+                .have_client_pubkey = source.have_client_pubkey,
+                .client_cert_digest = source.client_cert_digest,
+                .epoch0_write_seq = source.epoch0_write_seq,
+                .server_epoch2_seq = source.server_epoch2_seq,
+                .client_epoch2_top = source.client_epoch2_top,
+                .client_epoch2_seen = source.client_epoch2_seen,
+                .transcript = transcript,
+                .srtp_keys = if (source.state == .established) source.srtp_keys else null,
+                .client_public = if (source.have_client_pubkey) source.client_pubkey.toUncompressedSec1() else null,
+                .flight = @splat(0),
+                .flight_len = @intCast(source.flight_len),
+                .ack = @splat(0),
+                .ack_len = @intCast(source.ack_len),
+            };
+            errdefer carry.wipe();
+            @memcpy(carry.flight[0..source.flight_len], source.flight[0..source.flight_len]);
+            @memcpy(carry.ack[0..source.ack_len], source.ack[0..source.ack_len]);
+            try carry.validate();
+            return carry;
+        }
+        pub fn validate(self: *const SessionSnapshot) !void {
+            if ((self.addr.ip_len != 4 and self.addr.ip_len != 16) or self.addr.port == 0 or
+                self.flight_len == 0 or self.flight_len > flight_cap or self.ack_len > ack_cap or !self.have_secrets or
+                self.epoch0_write_seq == 0 or self.server_epoch2_seq == 0 or self.srtp_profile != dtls_srtp.profile_aes128_cm_sha1_80) return error.InvalidSnapshot;
+            for (self.addr.ip[self.addr.ip_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+            for (self.flight[self.flight_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+            for (self.ack[self.ack_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+            try self.transcript.validate();
+            if (!self.client_epoch2_seen and self.client_epoch2_top != 0) return error.InvalidSnapshot;
+            if (self.have_client_pubkey != (self.client_public != null)) return error.InvalidSnapshot;
+            if (self.client_public) |point| _ = try ecdsa_p256.parsePublicKeySec1(&point);
+            if (self.client_cert_verified and (!self.have_client_pubkey or !self.got_client_cv)) return error.InvalidSnapshot;
+            if (self.state == .established) {
+                if (self.srtp_keys == null or !self.client_epoch2_seen) return error.InvalidSnapshot;
+                var exported = try dtls_srtp.exportSrtpKeysTls13(self.exporter_master);
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&exported));
+                if (!std.meta.eql(exported, self.srtp_keys.?)) return error.InvalidSnapshot;
+            } else if (self.srtp_keys != null or self.ack_len != 0) return error.InvalidSnapshot;
+            // Do not recompute nonce counters or replace the post-flight keys.
+            // They are retained source facts authenticated by the outer capsule.
+        }
+        fn restore(self: *const SessionSnapshot) !Session {
+            try self.validate();
+            var session: Session = .{ .active = true };
+            errdefer session.reset();
+            session.addr = self.addr;
+            session.state = self.state;
+            session.last_activity_ms = self.last_activity_ms;
+            session.client_random = self.client_random;
+            session.srtp_profile = self.srtp_profile;
+            session.server_hs_keys = self.server_hs_keys;
+            session.client_hs_keys = self.client_hs_keys;
+            session.client_finished_key = self.client_finished_key;
+            session.transcript_through_server_finished = self.transcript_through_server_finished;
+            session.exporter_master = self.exporter_master;
+            session.have_secrets = self.have_secrets;
+            session.fp_verified = self.fp_verified;
+            session.mutual_auth = self.mutual_auth;
+            session.got_client_cert = self.got_client_cert;
+            session.got_client_cv = self.got_client_cv;
+            session.client_cert_verified = self.client_cert_verified;
+            session.have_client_pubkey = self.have_client_pubkey;
+            session.client_cert_digest = self.client_cert_digest;
+            session.epoch0_write_seq = self.epoch0_write_seq;
+            session.server_epoch2_seq = self.server_epoch2_seq;
+            session.client_epoch2_top = self.client_epoch2_top;
+            session.client_epoch2_seen = self.client_epoch2_seen;
+            session.transcript = try self.transcript.restore();
+            if (self.srtp_keys) |keys| session.srtp_keys = keys;
+            if (self.client_public) |point| session.client_pubkey = try ecdsa_p256.parsePublicKeySec1(&point);
+            session.flight_len = self.flight_len;
+            session.ack_len = self.ack_len;
+            @memcpy(session.flight[0..self.flight_len], self.flight[0..self.flight_len]);
+            @memcpy(session.ack[0..self.ack_len], self.ack[0..self.ack_len]);
+            return session;
+        }
+        fn wipe(self: *SessionSnapshot) void {
+            std.crypto.secureZero(u8, std.mem.asBytes(self));
+        }
+    };
+
+    /// Complete source-owned state, including in-progress handshakes and the
+    /// exact slot order. Aggregate authentication and graph joins precede use.
+    pub const Snapshot = struct {
+        allocator: std.mem.Allocator,
+        identity: peer_verify.EngineIdentity,
+        bindings: peer_verify.Bindings(default_max_sessions).Snapshot,
+        request_client_cert: bool,
+        sessions: []?SessionSnapshot,
+        pub fn deinit(self: *Snapshot) void {
+            for (self.sessions) |*slot| if (slot.*) |*session| session.wipe();
+            self.allocator.free(self.sessions);
+            self.identity.wipe();
+            self.bindings.deinit();
+            self.* = undefined;
+        }
+        pub fn validate(self: *const Snapshot, policy: peer_verify.EnginePolicy) !void {
+            if (self.sessions.len != policy.session_capacity or self.sessions.len == 0 or self.sessions.len > default_max_sessions or self.request_client_cert != policy.request_client_cert) return error.ConfigMismatch;
+            try self.identity.validate(policy.cert_digest);
+            try self.bindings.validate();
+            for (self.sessions, 0..) |slot, i| if (slot) |session| {
+                try session.validate();
+                for (self.sessions[0..i]) |prior| if (prior) |entry| if (entry.addr.eql(session.addr)) return error.InvalidSnapshot;
+            };
+        }
+    };
+
+    pub const Restoration = struct {
+        allocator: std.mem.Allocator,
+        term: Terminator,
+        pub fn deinit(self: *Restoration) void {
+            const sessions = self.term.sessions;
+            self.term.deinit();
+            self.allocator.free(sessions);
+            self.* = undefined;
+        }
+    };
+
+    pub fn capture(self: *const Terminator, allocator: std.mem.Allocator) !Snapshot {
+        if (self.sessions.len == 0 or self.sessions.len > default_max_sessions) return error.InvalidSnapshot;
+        var identity = try peer_verify.EngineIdentity.capture(self);
+        errdefer identity.wipe();
+        var bindings = try self.verify_bindings.capture();
+        errdefer bindings.deinit();
+        const sessions = try allocator.alloc(?SessionSnapshot, self.sessions.len);
+        @memset(sessions, null);
+        errdefer {
+            for (sessions) |*slot| if (slot.*) |*session| session.wipe();
+            allocator.free(sessions);
+        }
+        for (self.sessions, sessions) |*source, *target| if (source.active) {
+            target.* = try SessionSnapshot.capture(source);
+        };
+        const snapshot: Snapshot = .{ .allocator = allocator, .identity = identity, .bindings = bindings, .sessions = sessions, .request_client_cert = self.request_client_cert };
+        try snapshot.validate(.{ .cert_digest = peer_verify.certDigest(self.certDer()), .session_capacity = self.sessions.len, .request_client_cert = self.request_client_cert });
+        return snapshot;
+    }
+
+    pub fn prepareRestore(allocator: std.mem.Allocator, snapshot: *const Snapshot, policy: peer_verify.EnginePolicy) !Restoration {
+        try snapshot.validate(policy);
+        var key = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(snapshot.identity.secret_key));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&key));
+        var random = try snapshot.identity.random.restore();
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&random));
+        const bindings = try peer_verify.Bindings(default_max_sessions).prepareRestore(&snapshot.bindings);
+        const sessions = try allocator.alloc(Session, snapshot.sessions.len);
+        for (sessions) |*session| session.* = .{};
+        errdefer {
+            for (sessions) |*session| session.reset();
+            allocator.free(sessions);
+        }
+        for (snapshot.sessions, sessions) |source, *target| if (source) |session| {
+            target.* = try session.restore();
+        };
+        return .{ .allocator = allocator, .term = .{ .sessions = sessions, .cert_der = snapshot.identity.cert_der, .cert_len = snapshot.identity.cert_len, .cert_key = key, .cookie_secret = snapshot.identity.cookie_secret, .csprng = random, .verify_bindings = bindings, .request_client_cert = snapshot.request_client_cert } };
+    }
+
     /// Initialise from a 32-byte entropy seed plus the SHARED cert DER + key
     /// (typically the 1.2 terminator's, so both engines present one fingerprint).
     /// `sessions` is a caller-owned, caller-freed backing array.
@@ -245,6 +453,7 @@ pub const Terminator = struct {
     }
 
     pub fn established(self: *const Terminator, addr: TransportAddress) bool {
+        if (self.verify_bindings.exhausted) return false;
         const s = self.find(addr) orelse return false;
         return s.state == .established;
     }
@@ -266,8 +475,13 @@ pub const Terminator = struct {
     }
 
     fn peerVerifiedSession(self: *const Terminator, addr: TransportAddress, s: *const Session) bool {
-        if (s.mutual_auth) return s.fp_verified;
-        return self.verify_bindings.expectedFor(addr) == null or s.fp_verified;
+        if (self.verify_bindings.exhausted) return false;
+        // fp_verified records the certificate verdict at admission. Current
+        // signaling can rebind this address, so every export rechecks the
+        // retained certificate digest against the current expectation.
+        if (self.verify_bindings.expectedFor(addr)) |expected|
+            return s.fp_verified and peer_verify.digestEql(expected, s.client_cert_digest);
+        return !s.mutual_auth or s.fp_verified;
     }
 
     /// Bind the RFC 8122 fingerprint the peer signaled for `addr`. Idempotent.
@@ -280,8 +494,9 @@ pub const Terminator = struct {
     /// session exists for `addr`.
     pub fn recordPeerCertificate(self: *Terminator, addr: TransportAddress, cert_der: []const u8) void {
         const s = self.find(addr) orelse return;
+        s.client_cert_digest = peer_verify.certDigest(cert_der);
         if (self.verify_bindings.expectedFor(addr)) |exp| {
-            s.fp_verified = peer_verify.digestEql(exp, peer_verify.certDigest(cert_der));
+            s.fp_verified = peer_verify.digestEql(exp, s.client_cert_digest);
         } else {
             s.fp_verified = false;
         }
@@ -291,6 +506,13 @@ pub const Terminator = struct {
     pub fn peerVerified(self: *const Terminator, addr: TransportAddress) bool {
         const s = self.find(addr) orelse return false;
         return self.peerVerifiedSession(addr, s);
+    }
+
+    /// Retire exactly this address after the physical owner has closed its
+    /// source operations. Reoffer must never inherit an old session verdict.
+    pub fn retirePeer(self: *Terminator, addr: TransportAddress) void {
+        if (self.find(addr)) |session| session.reset();
+        self.verify_bindings.clear(addr);
     }
 
     // -- session table -----------------------------------------------------
@@ -1224,6 +1446,26 @@ test "full DTLS 1.3 loopback handshake: both sides derive identical SRTP keys, t
     try driveFullHandshake(&setup.term, testAddr(5, 7000), false);
 }
 
+test "active media DTO DTLS13 exhausted binding cannot export through discarded bind result" {
+    var setup = try makeTerminator(0xA5);
+    defer setup.deinit();
+    const addr = testAddr(9, 7903);
+    try driveFullHandshake(&setup.term, addr, false);
+    try testing.expect(setup.term.exportedKeys(addr) != null);
+    setup.term.verify_bindings.tick = std.math.maxInt(u64);
+    setup.term.bindExpectedFingerprint(testAddr(10, 7904), peer_verify.certDigest("required-new-peer"));
+    try testing.expect(!setup.term.established(addr));
+    try testing.expect(!setup.term.peerVerified(addr));
+    try testing.expect(setup.term.exportedKeys(addr) == null);
+    try testing.expect(setup.term.srtpProfile(addr) == null);
+    var snapshot = try setup.term.verify_bindings.capture();
+    defer snapshot.deinit();
+    const candidate = try @TypeOf(setup.term.verify_bindings).prepareRestore(&snapshot);
+    setup.term.verify_bindings = candidate;
+    try testing.expect(setup.term.exportedKeys(addr) == null);
+    try testing.expect(!setup.term.peerVerified(addr));
+}
+
 test "full DTLS 1.3 handshake when the client leads with a non-P-256 key_share (HRR group selection)" {
     var setup = try makeTerminator(0x79);
     defer setup.deinit();
@@ -1827,4 +2069,250 @@ test "retransmitted second ClientHello resends the cached server flight verbatim
     // Retransmit the identical CH2 → identical flight, no new session slot.
     const f2 = term.handleDatagram(addr, scratch[0..ch2_dlen], 102, &out) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, first_copy[0..f1.len], f2);
+}
+
+fn dtls13DtoSweep(allocator: std.mem.Allocator) !void {
+    var old = try makeTerminator(0xB3);
+    defer old.deinit();
+    const addr = testAddr(8, 8213);
+    try driveFullHandshake(&old.term, addr, false);
+    old.term.verify_bindings.tick = std.math.maxInt(u64);
+    old.term.bindExpectedFingerprint(testAddr(9, 8214), @splat(8));
+    const policy: peer_verify.EnginePolicy = .{ .cert_digest = peer_verify.certDigest(old.term.certDer()), .session_capacity = old.sessions.len, .request_client_cert = false };
+    const before_ptr = old.term.sessions.ptr;
+    var before = try old.term.capture(testing.allocator);
+    defer before.deinit();
+    defer {
+        std.debug.assert(old.term.sessions.ptr == before_ptr);
+        var current = old.term.capture(testing.allocator) catch unreachable;
+        defer current.deinit();
+        testing.expectEqualDeep(before.sessions, current.sessions) catch unreachable;
+        testing.expectEqualDeep(before.identity, current.identity) catch unreachable;
+        testing.expectEqualDeep(before.bindings, current.bindings) catch unreachable;
+    }
+    var carry = old.term.capture(allocator) catch |err| {
+        var retry = try old.term.capture(testing.allocator);
+        defer retry.deinit();
+        return err;
+    };
+    defer carry.deinit();
+    var candidate = Terminator.prepareRestore(allocator, &carry, policy) catch |err| {
+        var retry = try Terminator.prepareRestore(testing.allocator, &carry, policy);
+        defer retry.deinit();
+        try testing.expect(retry.term.exportedKeys(addr) == null);
+        return err;
+    };
+    defer candidate.deinit();
+    try testing.expect(candidate.term.sessions.ptr != old.term.sessions.ptr);
+    try testing.expect(candidate.term.exportedKeys(addr) == null);
+    try testing.expect(candidate.term.verify_bindings.exhausted);
+    var after = try candidate.term.capture(testing.allocator);
+    defer after.deinit();
+    try testing.expectEqualDeep(carry.sessions, after.sessions);
+    try testing.expectEqualDeep(carry.identity, after.identity);
+}
+
+test "active media DTO DTLS13 established exhausted authority complete ownership all OOM retry" {
+    try testing.checkAllAllocationFailures(testing.allocator, dtls13DtoSweep, .{});
+}
+
+test "active media DTO DTLS13 real half handshake retains flight transcript nonce counters and keys" {
+    var old = try makeTerminator(0xB4);
+    defer old.deinit();
+    const addr = testAddr(8, 8313);
+    const client = Client13.init();
+    var out: [2048]u8 = undefined;
+    var scratch: [2048]u8 = undefined;
+    var body1: [512]u8 = undefined;
+    const ch1 = try msg13.buildClientHello13(&body1, .{ .random = client.client_random, .key_share_point = client.ecdhe.public, .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80} });
+    const n1 = try framePlaintext13(&scratch, .client_hello, 0, 0, ch1);
+    const response = old.term.handleDatagram(addr, scratch[0..n1], 100, &out) orelse return error.TestUnexpectedResult;
+    const rec = try p_record.RecordHeader.decode(response);
+    const hh = try dhs.Header.decode(rec.fragment);
+    const hello = try msg13.parseServerHello13(rec.fragment[dhs.handshake_header_len..][0..hh.hdr.length]);
+    var cookie: [cookie_len]u8 = undefined;
+    @memcpy(&cookie, hello.cookie[0..cookie_len]);
+    var body2: [600]u8 = undefined;
+    const ch2 = try msg13.buildClientHello13(&body2, .{ .random = client.client_random, .key_share_point = client.ecdhe.public, .srtp_profiles = &.{dtls_srtp.profile_aes128_cm_sha1_80}, .cookie = &cookie });
+    const n2 = try framePlaintext13(&scratch, .client_hello, 1, 1, ch2);
+    const flight = old.term.handleDatagram(addr, scratch[0..n2], 101, &out) orelse return error.TestUnexpectedResult;
+    var cached: [2048]u8 = undefined;
+    @memcpy(cached[0..flight.len], flight);
+    var carry = try old.term.capture(testing.allocator);
+    defer carry.deinit();
+    const policy: peer_verify.EnginePolicy = .{ .cert_digest = peer_verify.certDigest(old.term.certDer()), .session_capacity = old.sessions.len, .request_client_cert = false };
+    var candidate = try Terminator.prepareRestore(testing.allocator, &carry, policy);
+    defer candidate.deinit();
+    var new_out: [2048]u8 = undefined;
+    try testing.expectEqualSlices(u8, cached[0..flight.len], candidate.term.handleDatagram(addr, scratch[0..n2], 102, &new_out).?);
+    try driveFullHandshake(&candidate.term, addr, false);
+    try driveFullHandshake(&old.term, addr, false);
+    try testing.expectEqualDeep(old.term.exportedKeys(addr).?, candidate.term.exportedKeys(addr).?);
+    var old_finished = try old.term.capture(testing.allocator);
+    defer old_finished.deinit();
+    var new_finished = try candidate.term.capture(testing.allocator);
+    defer new_finished.deinit();
+    try testing.expectEqualDeep(old_finished.sessions, new_finished.sessions);
+    var wrong = policy;
+    wrong.request_client_cert = true;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.ConfigMismatch, Terminator.prepareRestore(failing.allocator(), &carry, wrong));
+    carry.sessions[0].?.have_secrets = false;
+    try testing.expectError(error.InvalidSnapshot, Terminator.prepareRestore(failing.allocator(), &carry, policy));
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try testing.expect(old.term.established(addr) and candidate.term.established(addr));
+}
+
+test "active media DTO DTLS13 actual mutual fingerprint rebind never exports stale certificate verdict" {
+    var old = try makeTerminator(0xB7);
+    defer old.deinit();
+    old.term.request_client_cert = true;
+    const addr = testAddr(8, 8613);
+    var cert: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth13(0x52, &cert);
+    const actual = peer_verify.certDigest(auth.cert_der);
+    old.term.bindExpectedFingerprint(addr, actual);
+    try driveFullHandshakeAuth(&old.term, addr, false, auth, .normal);
+    try testing.expect(old.term.peerVerified(addr));
+    try testing.expect(old.term.exportedKeys(addr) != null);
+    old.term.bindExpectedFingerprint(addr, actual);
+    try testing.expect(old.term.exportedKeys(addr) != null);
+    var changed = actual;
+    changed[0] ^= 1;
+    old.term.bindExpectedFingerprint(addr, changed);
+    try testing.expect(old.term.exportedKeys(addr) == null);
+    try testing.expect(old.term.srtpProfile(addr) == null);
+    try testing.expect(!old.term.peerVerified(addr));
+    try testing.expect(old.term.find(addr).?.mutual_auth);
+    var carry = try old.term.capture(testing.allocator);
+    defer carry.deinit();
+    var candidate = try Terminator.prepareRestore(testing.allocator, &carry, .{ .cert_digest = peer_verify.certDigest(old.term.certDer()), .session_capacity = old.sessions.len, .request_client_cert = true });
+    defer candidate.deinit();
+    try testing.expect(candidate.term.exportedKeys(addr) == null);
+    try testing.expect(!candidate.term.peerVerified(addr));
+}
+
+fn dtls13RebindDtoSweep(allocator: std.mem.Allocator) !void {
+    var old = try makeTerminator(0xC9);
+    defer old.deinit();
+    const addr = testAddr(8, 8700 + 13);
+    try driveFullHandshake(&old.term, addr, false);
+    const certificate = "existing trusted certificate hook A";
+    const actual = peer_verify.certDigest(certificate);
+    old.term.bindExpectedFingerprint(addr, actual);
+    old.term.recordPeerCertificate(addr, certificate);
+    try testing.expect(old.term.exportedKeys(addr) != null);
+    old.term.bindExpectedFingerprint(addr, actual);
+    try testing.expect(old.term.exportedKeys(addr) != null);
+    var changed = actual;
+    changed[1] ^= 1;
+    old.term.bindExpectedFingerprint(addr, changed);
+    try testing.expect(old.term.exportedKeys(addr) == null);
+    var before = try old.term.capture(testing.allocator);
+    defer before.deinit();
+    const before_ptr = old.term.sessions.ptr;
+    defer {
+        std.debug.assert(before_ptr == old.term.sessions.ptr);
+        var current = old.term.capture(testing.allocator) catch unreachable;
+        defer current.deinit();
+        testing.expectEqualDeep(before.sessions, current.sessions) catch unreachable;
+        testing.expectEqualDeep(before.bindings, current.bindings) catch unreachable;
+        testing.expectEqualDeep(before.identity, current.identity) catch unreachable;
+    }
+    const policy: peer_verify.EnginePolicy = .{ .cert_digest = peer_verify.certDigest(old.term.certDer()), .session_capacity = old.sessions.len, .request_client_cert = false };
+    var carry = old.term.capture(allocator) catch |err| {
+        var retry = try old.term.capture(testing.allocator);
+        defer retry.deinit();
+        return err;
+    };
+    defer carry.deinit();
+    var candidate = Terminator.prepareRestore(allocator, &carry, policy) catch |err| {
+        var retry = try Terminator.prepareRestore(testing.allocator, &carry, policy);
+        defer retry.deinit();
+        try testing.expect(retry.term.exportedKeys(addr) == null);
+        return err;
+    };
+    defer candidate.deinit();
+    try testing.expect(candidate.term.exportedKeys(addr) == null);
+    try testing.expect(candidate.term.srtpProfile(addr) == null);
+    try testing.expect(!candidate.term.peerVerified(addr));
+    // Reapproval of the SAME retained certificate may restore the verdict;
+    // changing the policy never substitutes a different presented certificate.
+    candidate.term.bindExpectedFingerprint(addr, actual);
+    try testing.expect(candidate.term.exportedKeys(addr) != null);
+    try testing.expectEqualDeep(old.term.find(addr).?.srtp_keys, candidate.term.exportedKeys(addr).?);
+}
+
+test "active media DTO DTLS13 legacy certificate hook rebind and allocation rollback" {
+    try testing.checkAllAllocationFailures(testing.allocator, dtls13RebindDtoSweep, .{});
+}
+
+test "active media dispatch causal actual DTLS13 supported negotiated profile uses owning engine" {
+    var old = try makeTerminator(0xCD);
+    defer old.deinit();
+    old.term.request_client_cert = true;
+    const addr = testAddr(8, 8913);
+    var cert: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth13(0x56, &cert);
+    const actual = peer_verify.certDigest(auth.cert_der);
+    old.term.bindExpectedFingerprint(addr, actual);
+    try driveFullHandshakeAuth(&old.term, addr, false, auth, .normal);
+    try testing.expectEqual(dtls_srtp.profile_aes128_cm_sha1_80, old.term.srtpProfile(addr).?);
+    var owner = try @import("../daemon/media_plane.zig").MediaPlane.initFallible(testing.allocator);
+    defer owner.deinit();
+    owner.dtls_enabled = true;
+    owner.dtls13_enabled = true;
+    owner.dtls13 = &old.term;
+    defer owner.dtls13 = null;
+    try testing.expectEqual(.ready, owner.testOnlyDtlsDisposition(addr));
+}
+
+test "active media dispatch packet DTLS13 real supported ingress denial and same-key replay" {
+    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var old = try makeTerminator(0xDE);
+    defer old.deinit();
+    old.term.request_client_cert = true;
+    const media = @import("../substrate/media_socket.zig");
+    var peer = try media.MediaSocket.bind(media.loopback_be, 0);
+    defer peer.deinit();
+    const addr = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, try peer.localPort());
+    var cert: [cert_der_cap]u8 = undefined;
+    const auth = try makeClientAuth13(0x56, &cert);
+    const actual = peer_verify.certDigest(auth.cert_der);
+    old.term.bindExpectedFingerprint(addr, actual);
+    try driveFullHandshakeAuth(&old.term, addr, false, auth, .normal);
+    try testing.expectEqual(dtls_srtp.profile_aes128_cm_sha1_80, old.term.srtpProfile(addr).?);
+    const material = old.term.exportedKeys(addr) orelse return error.TestUnexpectedResult;
+    var owner = try @import("../daemon/media_plane.zig").MediaPlane.initFallible(testing.allocator);
+    defer owner.deinit();
+    owner.dtls_enabled = true;
+    owner.dtls13_enabled = true;
+    owner.dtls13 = &old.term;
+    defer owner.dtls13 = null;
+    try owner.bindOfferedFingerprint("#packet-proof", "source", actual);
+    try owner.testOnlyPacketPath(addr, material, false, 10, true);
+    try owner.testOnlyPacketPath(addr, material, true, 10, true);
+    var changed = actual;
+    changed[0] ^= 1;
+    try owner.bindOfferedFingerprint("#packet-proof", "source", changed);
+    try owner.testOnlyPacketPath(addr, material, false, 11, false);
+    try owner.testOnlyPacketPath(addr, material, true, 11, false);
+    try owner.bindOfferedFingerprint("#packet-proof", "source", actual);
+    try owner.testOnlyPacketPath(addr, material, false, 10, false);
+    try owner.testOnlyPacketPath(addr, material, true, 10, false);
+    try owner.testOnlyPacketPath(addr, material, false, 11, true);
+    try owner.testOnlyPacketPath(addr, material, true, 11, true);
+    try owner.bindOfferedFingerprint("#egress-proof", "recipient", actual);
+    try owner.testOnlyEncryptedEgressPaths(&peer, material, 30, true);
+    try owner.bindOfferedFingerprint("#egress-proof", "recipient", changed);
+    try owner.testOnlyEncryptedEgressPaths(&peer, material, 32, false);
+    try owner.bindOfferedFingerprint("#egress-proof", "recipient", actual);
+    try owner.testOnlyEncryptedEgressPaths(&peer, material, 32, true);
+    old.term.verify_bindings.tick = std.math.maxInt(u64);
+    old.term.bindExpectedFingerprint(addr, actual);
+    try testing.expect(old.term.verify_bindings.exhausted);
+    try owner.testOnlyPacketPath(addr, material, false, 12, false);
+    try owner.testOnlyPacketPath(addr, material, true, 12, false);
+    try owner.testOnlyEncryptedEgressPaths(&peer, material, 34, false);
 }

@@ -1,0 +1,92 @@
+#!/bin/ksh
+# SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Identity, executable/config paths and limits come from the root-protected
+# NSCF policy. rcctl flags are only the normal enable/disable switch.
+daemon="/usr/local/libexec/onyx-server-helper"
+daemon_flags=""
+daemon_timeout=30
+
+# rcctl sources defaults with FUNCS_ONLY set and a no-op rc_cmd. Preserve that
+# introspection path instead of replacing its no-op or performing an action.
+[ -z "${FUNCS_ONLY}" ] || return
+
+# Import only configuration/output primitives. The full initialization evaluates
+# flags into pexp before validation and installs signal-based lifecycle fallbacks.
+FUNCS_ONLY=1
+. /etc/rc.d/rc.subr
+unset FUNCS_ONLY
+
+_rc_usage() { _rc_err "usage: $0 [-d | -q] [-f] check|configtest|start|stop|reload|restart"; }
+_rc_printname() { [ -n "${_RC_QUIET}" ] || printf '%s ' onyx_server; }
+_rc_exit() {
+    if [ "$1" = ok ]; then
+        [ -n "${_RC_QUIET}" ] || echo '(ok)'
+        exit 0
+    fi
+    echo 'onyx_server (failed)' >&2
+    exit 1
+}
+
+unset _RC_DEBUG _RC_QUIET _RC_FORCE
+while getopts dfq option; do
+    case "${option}" in
+        d) _RC_DEBUG=-d ;;
+        f) _RC_FORCE=-f ;;
+        q) _RC_QUIET=-q ;;
+        *) _rc_usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ -z "${_RC_DEBUG}" ] || [ -z "${_RC_QUIET}" ] || _rc_usage
+_rc_parse_conf
+daemon_flags=${onyx_server_flags-}
+daemon_timeout=${onyx_server_timeout-30}
+daemon_user=${onyx_server_user-root}
+daemon_rtable=${onyx_server_rtable-0}
+daemon_execdir=${onyx_server_execdir-}
+daemon_logger=${onyx_server_logger-}
+[ -z "${_RC_FORCE}" ] || [ "${daemon_flags}" != NO ] || daemon_flags=
+
+rc_usercheck=NO
+
+# Replace the complete dispatcher: stock rc_cmd has signal/timeout fallbacks
+# and implements restart as two invocations, outside the helper mutation lock.
+rc_cmd() {
+    [ "$#" -eq 1 ] || _rc_usage
+    case "$1" in
+        check|configtest|start|stop|reload|restart) ;;
+        *) _rc_usage ;;
+    esac
+    [ "$(id -u)" -eq 0 ] || _rc_err "$0: need root privileges"
+    if [ "$1" = start ] && [ "${daemon_flags}" = NO ]; then
+        _rc_err "$0: need -f to force start since onyx_server_flags=NO"
+    fi
+    case "${daemon_flags}" in
+        ""|NO) ;;
+        *) _rc_err "$0: configure service identity and paths in service.nscf, not flags" ;;
+    esac
+    [ "${daemon_user}" = root ] && [ "${daemon_rtable}" = 0 ] &&
+        [ -z "${daemon_execdir}" ] && [ -z "${daemon_logger}" ] ||
+        _rc_err "$0: service execution policy belongs in service.nscf"
+
+    case "${daemon_timeout}" in
+        ""|*[!0-9]*) _rc_err "$0: timeout must be a positive number of seconds" ;;
+    esac
+    local seconds="${daemon_timeout}"
+    while [ "${seconds#0}" != "${seconds}" ]; do seconds="${seconds#0}"; done
+    [ -n "${seconds}" ] && [ "${#seconds}" -le 7 ] ||
+        _rc_err "$0: timeout is out of range"
+    [ "${seconds}" -le 2147483 ] || _rc_err "$0: timeout is out of range"
+
+    _rc_printname
+    if _rc_do "${daemon}" "$1" --policy /etc/onyx-server/service.nscf \
+        --timeout-ms "$((seconds * 1000))"; then
+        _rc_exit ok
+    else
+        # Includes pending/ambiguous operations. Never signal or relaunch.
+        _rc_exit failed
+    fi
+}
+
+rc_cmd "$@"

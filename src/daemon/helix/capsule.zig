@@ -45,6 +45,7 @@ pub const CapsuleKind = enum(u8) {
     history = 15,
     webhook_store = 16,
     handoff_manifest = 17,
+    native_service = 18,
 
     pub fn fromByte(byte: u8) Error!CapsuleKind {
         return switch (byte) {
@@ -65,6 +66,7 @@ pub const CapsuleKind = enum(u8) {
             15 => .history,
             16 => .webhook_store,
             17 => .handoff_manifest,
+            18 => .native_service,
             else => error.UnknownKind,
         };
     }
@@ -93,6 +95,7 @@ pub const CapsuleKind = enum(u8) {
             .history,
             .webhook_store,
             .handoff_manifest,
+            .native_service,
             => false,
         };
     }
@@ -156,7 +159,7 @@ pub const registry = [_]Descriptor{
     // adopting both historical v1 shapes (a pre-bump predecessor's next USR2 into
     // this binary must not netsplit); `tls_snapshot.decode` is version-aware (the
     // v1 arm tolerates the flags being absent OR present, v2 requires them).
-    .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 2, .min_supported = 1, .max_supported = 2 },
+    .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 3, .min_supported = 3, .max_supported = 3 },
     .{ .kind = .mooring_ratchet, .schema_id = 0x4856_4549, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // v2 (2026-07) introduces exact property-state checkpoints. Ordinary
     // magic-discriminated mesh payloads retain the full 1..2 range so a v1
@@ -211,7 +214,12 @@ pub const registry = [_]Descriptor{
     .{ .kind = .webhook_store, .schema_id = 0x4857_484b, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // Canonical final capsule committing to every preceding capsule header,
     // field, byte, order, total count, and per-kind count in the arena.
-    .{ .kind = .handoff_manifest, .schema_id = 0x4848_4d46, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    // v2 commits the complete noncontiguous registry, including service kind 18.
+    // Current live adoption deliberately refuses the former v1 table.
+    .{ .kind = .handoff_manifest, .schema_id = 0x4848_4d46, .current_version = 2, .min_supported = 2, .max_supported = 2 },
+    // NSST v2 retains the original joined launch context and pending operation.
+    // Descriptor custody and actual successor readiness remain separate joins.
+    .{ .kind = .native_service, .schema_id = 0x484e_5356, .current_version = 2, .min_supported = 2, .max_supported = 2 },
 };
 
 pub fn descriptor(kind: CapsuleKind) Descriptor {
@@ -369,7 +377,10 @@ pub fn decodeReader(allocator: Allocator, r: *coilpack.Cbs) Error!Capsule {
 
     var fields: std.ArrayList(Field) = .empty;
     errdefer {
-        for (fields.items) |field| allocator.free(field.bytes);
+        for (fields.items) |field| {
+            if (header.kind.carriesSecrets()) std.crypto.secureZero(u8, @constCast(field.bytes));
+            allocator.free(field.bytes);
+        }
         fields.deinit(allocator);
     }
 
@@ -378,7 +389,10 @@ pub fn decodeReader(allocator: Allocator, r: *coilpack.Cbs) Error!Capsule {
         const ordinal = try r.readU32Le();
         const payload_view = try r.readBytes();
         const payload = try allocator.dupe(u8, payload_view);
-        errdefer allocator.free(payload);
+        errdefer {
+            if (header.kind.carriesSecrets()) std.crypto.secureZero(u8, payload);
+            allocator.free(payload);
+        }
         try fields.append(allocator, .{ .ordinal = ordinal, .bytes = payload });
     }
 
@@ -399,10 +413,35 @@ pub fn decodeStream(allocator: Allocator, bytes: []const u8) Error![]Capsule {
     }
     var r = coilpack.Cbs.init(bytes);
     while (!r.done()) {
-        const cap = try decodeReader(allocator, &r);
+        var cap = try decodeReader(allocator, &r);
+        // The decoded capsule owns fields before the list can grow. If append
+        // fails it has not entered the list's existing unwind custody.
+        errdefer cap.deinit(allocator);
         try list.append(allocator, cap);
     }
     return try list.toOwnedSlice(allocator);
+}
+
+test "native Helix service carry: stream allocation failure owns each decoded capsule before append" {
+    const allocator = std.testing.allocator;
+    var fields = [_]Field{.{ .ordinal = 1, .bytes = "owned capsule payload" }};
+    const encoded = try encode(allocator, make(.tls_session, &fields));
+    defer allocator.free(encoded);
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(allocator);
+    for (0..9) |_| try stream.appendSlice(allocator, encoded);
+    const Sweep = struct {
+        fn run(failing: Allocator, bytes: []const u8) !void {
+            const caps = try decodeStream(failing, bytes);
+            defer {
+                for (caps) |*cap| cap.deinit(failing);
+                failing.free(caps);
+            }
+            try std.testing.expectEqual(@as(usize, 9), caps.len);
+            for (caps) |cap| try std.testing.expectEqualStrings("owned capsule payload", cap.fields[0].bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Sweep.run, .{@as([]const u8, stream.items)});
 }
 
 fn validateHeader(header: Header) Error!void {
@@ -544,12 +583,23 @@ test "exact clients world history webhook and handoff descriptors fail closed" {
         negotiate(legacy_channels, Header.init(.channels)),
     );
 
-    inline for (.{ CapsuleKind.history, CapsuleKind.webhook_store, CapsuleKind.handoff_manifest }) |kind| {
+    inline for (.{ CapsuleKind.history, CapsuleKind.webhook_store }) |kind| {
         const exact = descriptor(kind);
         try std.testing.expectEqual(@as(u16, 1), exact.current_version);
         try std.testing.expectEqual(@as(u16, 1), exact.min_supported);
         try std.testing.expectEqual(@as(u16, 1), exact.max_supported);
         try std.testing.expectEqual(kind, try CapsuleKind.fromByte(@intFromEnum(kind)));
+    }
+    inline for (.{ CapsuleKind.handoff_manifest, CapsuleKind.native_service }) |kind| {
+        const exact = descriptor(kind);
+        try std.testing.expectEqual(@as(u16, 2), exact.current_version);
+        try std.testing.expectEqual(@as(u16, 2), exact.min_supported);
+        try std.testing.expectEqual(@as(u16, 2), exact.max_supported);
+        var legacy = exact;
+        legacy.current_version = 1;
+        legacy.min_supported = 1;
+        legacy.max_supported = 1;
+        try std.testing.expectError(error.VersionUnsupported, negotiate(legacy, Header.init(kind)));
     }
 }
 
@@ -590,18 +640,19 @@ test "mesh checkpoint v2 keeps ordinary pieces compatible and exact pieces fail 
     try std.testing.expectEqual(@as(u32, 1), exact_capsule.fields[0].ordinal);
 }
 
-test "tls_session is a rolling v1..2 descriptor that accepts a pre-bump v1 capsule" {
+test "tls_session requires exact canonical v3 and rejects predecessor descriptors" {
     const d = descriptor(.tls_session);
-    try std.testing.expectEqual(@as(u16, 2), d.current_version);
-    try std.testing.expectEqual(@as(u16, 1), d.min_supported);
-    try std.testing.expectEqual(@as(u16, 2), d.max_supported);
-    // A pre-bump predecessor sealed the flag-bearing blob while stamping v1; it
-    // must still negotiate against this binary (its next USR2 must not netsplit).
-    var legacy = Header.init(.tls_session);
-    legacy.version = 1;
-    legacy.min_supported = 1;
-    legacy.max_supported = 1;
-    try std.testing.expectEqual(@as(u16, 1), try negotiate(d, legacy));
+    try std.testing.expectEqual(@as(u16, 3), d.current_version);
+    try std.testing.expectEqual(@as(u16, 3), d.min_supported);
+    try std.testing.expectEqual(@as(u16, 3), d.max_supported);
+    for (1..3) |version| {
+        var legacy = Header.init(.tls_session);
+        legacy.version = @intCast(version);
+        legacy.min_supported = @intCast(version);
+        legacy.max_supported = @intCast(version);
+        try std.testing.expectError(error.VersionUnsupported, negotiate(d, legacy));
+    }
+    try std.testing.expectEqual(@as(u16, 3), try negotiate(d, Header.init(.tls_session)));
 }
 
 test "sessions is a rolling v1 through v4 descriptor" {

@@ -6,6 +6,9 @@
 //! route is GET /history over TLS 1.3. This is not an admin API.
 
 const std = @import("std");
+const runtime_pause = @import("runtime_pause.zig");
+pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
+const metrics_http = @import("metrics_http.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const sys = if (builtin.os.tag == .openbsd) std.posix.system else linux;
@@ -125,6 +128,7 @@ pub const BindError = error{
     BindFailed,
     ListenFailed,
     AddrLookupFailed,
+    TimeoutSetupFailed,
 };
 
 /// TLS 1.3 listener for GET /history. `open` refuses a public address before
@@ -136,6 +140,7 @@ pub const HttpsListener = struct {
     v6: bool = false,
     port: u16,
     thread: ?std.Thread = null,
+    runtime_worker: runtime_pause.WorkerState = .{},
     stop_flag: std.atomic.Value(bool) = .{ .raw = false },
     tls_config: tls_server.Config,
     reader: Reader,
@@ -176,9 +181,9 @@ pub const HttpsListener = struct {
         }
         if (posix.errno(sys.listen(fd, 16)) != .SUCCESS) return error.ListenFailed;
 
-        if (comptime builtin.os.tag == .openbsd) runtime.setNonblocking(fd) catch return error.SocketUnavailable;
+        runtime.setNonblocking(fd) catch return error.SocketUnavailable;
         const tv = sys.timeval{ .sec = 0, .usec = 200_000 };
-        _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+        if (posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval))) != .SUCCESS) return error.TimeoutSetupFailed;
         return .{
             .allocator = allocator,
             .listen_fd = fd,
@@ -191,36 +196,105 @@ pub const HttpsListener = struct {
     }
 
     pub fn spawn(self: *HttpsListener) std.Thread.SpawnError!void {
+        if (self.thread != null or self.runtime_worker.view != null) return error.SystemResources;
         self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     }
 
     pub fn shutdown(self: *HttpsListener) void {
+        self.runtime_worker.requireDetached() catch @panic("managed stop requires Runtime Control join and source detach");
         self.stop_flag.store(true, .release);
-        if (comptime builtin.os.tag == .openbsd) {
-            if (self.thread) |thread| {
-                thread.join();
-                self.thread = null;
-            }
-            if (self.listen_open) {
-                self.listen_open = false;
-                runtime.close(self.listen_fd);
-            }
-            return;
+        self.runtime_worker.wakeForStop();
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
         }
         if (self.listen_open) {
             self.listen_open = false;
             closeFd(self.listen_fd);
         }
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
-        }
+    }
+
+    pub fn prepareColdResources(self: *HttpsListener, io: std.Io) !void {
+        if (self.thread != null or self.runtime_worker.view != null) return error.AlreadyStarted;
+        try validateEndpoint(try metrics_http.observeListener(self.listen_fd), self.v6, self.port);
+        // Actual TLS constructor validation/allocation precedes worker readiness.
+        var check = try tls_server.Server.init(self.allocator, self.tls_config);
+        defer check.deinit();
+        try self.runtime_worker.pause.bindIo(io);
+    }
+    pub fn validateDormantRegistration(self: *HttpsListener, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime_worker.validateRegistration(control, view, slot, .history, @intFromBool(self.v6), self, dormant_spawn_options);
+    }
+    pub fn prepareDormantWorker(self: *HttpsListener, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
+        try self.runtime_worker.validatePreparation(control, view, slot, .history, @intFromBool(self.v6), self, dormant_spawn_options);
+        if (self.thread != null) return error.AlreadyStarted;
+        try validateEndpoint(try metrics_http.observeListener(self.listen_fd), self.v6, self.port);
+        self.stop_flag.store(false, .release);
+        try self.runtime_worker.prepare(control, view, slot, .history, @intFromBool(self.v6), HttpsListener, self, acceptLoop, dormant_spawn_options);
+    }
+    /// Signals this owner only. Runtime Control owns all actual joins.
+    pub fn requestStopAndWake(self: *HttpsListener) void {
+        self.stop_flag.store(true, .release);
+        self.runtime_worker.wakeForStop();
+    }
+    pub fn detachAfterJoined(self: *HttpsListener) !void {
+        try self.runtime_worker.detachAfterJoined();
+    }
+    pub fn requireParked(self: *HttpsListener) !void {
+        try self.runtime_worker.requireParked();
+    }
+    pub fn requireActivated(self: *HttpsListener) !void {
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+        try self.runtime_worker.requireActivated();
+    }
+    pub fn requestPause(self: *HttpsListener, epoch: u64) !runtime_pause.Token {
+        return self.runtime_worker.pause.request(epoch);
+    }
+    pub fn awaitPaused(self: *HttpsListener, token: runtime_pause.Token, deadline: std.Io.Clock.Timestamp) !void {
+        try self.runtime_worker.pause.awaitPaused(token, deadline);
+    }
+    pub fn resumePaused(self: *HttpsListener, token: runtime_pause.Token) !void {
+        try self.runtime_worker.pause.resumePaused(token);
+    }
+    pub fn capturePaused(self: *HttpsListener, token: runtime_pause.Token) !Snapshot {
+        if (self.thread == null and self.runtime_worker.view == null) return error.NotRunning;
+        try self.runtime_worker.pause.requirePaused(token);
+        return self.captureCut(.paused);
+    }
+    pub fn captureUnstarted(self: *HttpsListener) !Snapshot {
+        if (self.thread != null or self.runtime_worker.view != null) return error.NotQuiescent;
+        return self.captureCut(.unstarted);
+    }
+    fn captureCut(self: *HttpsListener, execution: Execution) !Snapshot {
+        // Shared anti-replay state requires its own source-owned carried graph;
+        // a pointer or an empty replacement cannot prove 0-RTT continuity.
+        if (self.tls_config.max_early_data_size != 0) return error.ActiveTlsContinuityUnsupported;
+        const observed = try metrics_http.observeListener(self.listen_fd);
+        try validateEndpoint(observed, self.v6, self.port);
+        return .{ .listener = observed, .tls_digest = try tlsConfigDigest(self.tls_config), .execution = execution };
+    }
+    /// Consumes received FD on entry; validation is read-only/close-only.
+    /// `tls_config` and Reader are real whole-owner reconstructed references,
+    /// never pointers decoded from this row. Server's reader authorization and
+    /// TLS material custody must remain live through the final worker join.
+    pub fn initInherited(allocator: std.mem.Allocator, configured: []const u8, fd: linux.fd_t, carry: *const Snapshot, tls_config: tls_server.Config, reader: Reader) !HttpsListener {
+        errdefer closeFd(fd);
+        const spec = try listenAddr(configured);
+        const v6 = std.mem.eql(u8, spec, loopback_v6);
+        try carry.validate(v6, tls_config);
+        const observed = try metrics_http.observeListener(fd);
+        if (!std.meta.eql(observed, carry.listener)) return error.ListenerMismatch;
+        return .{ .allocator = allocator, .listen_fd = fd, .listen_open = true, .v6 = v6, .port = observed.port, .tls_config = tls_config, .reader = reader };
     }
 
     fn acceptLoop(self: *HttpsListener) void {
+        self.runtime_worker.markEntered();
+        defer self.runtime_worker.markExited();
         while (!self.stop_flag.load(.acquire)) {
-            if (comptime builtin.os.tag == .openbsd) {
-                var polls = [_]posix.pollfd{.{ .fd = self.listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+            self.runtime_worker.pause.boundary();
+            if (self.stop_flag.load(.acquire)) break;
+            {
+                var polls = [_]sys_pollfd{.{ .fd = self.listen_fd, .events = posix.POLL.IN, .revents = 0 }};
                 const ready = sys.poll(&polls, 1, 50);
                 if (posix.errno(ready) == .INTR) continue;
                 if (posix.errno(ready) != .SUCCESS) return;
@@ -241,13 +315,10 @@ pub const HttpsListener = struct {
         defer closeFd(fd);
         const on: u32 = 1;
         _ = sys.setsockopt(fd, sys.IPPROTO.TCP, if (comptime builtin.os.tag == .openbsd) @as(u32, 1) else linux.TCP.NODELAY, std.mem.asBytes(&on), @sizeOf(u32));
-        if (comptime builtin.os.tag == .openbsd) {
-            native_network.setBlocking(fd) catch return;
-            native_network.setTimeout(fd, 5000) catch return;
-            self.request_deadline = platform.monotonicMillis() + 5000;
-        }
-        const tv = sys.timeval{ .sec = 5, .usec = 0 };
-        _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+        // This is a new accepted FD, never the inherited shared listener.
+        native_network.setBlocking(fd) catch return;
+        native_network.setTimeout(fd, 5000) catch return;
+        self.request_deadline = platform.monotonicMillis() + 5000;
 
         var tls = tls_server.Server.init(self.allocator, self.tls_config) catch return;
         defer tls.deinit();
@@ -289,9 +360,7 @@ pub const HttpsListener = struct {
 
         var body: [4096]u8 = undefined;
         var out: [8192]u8 = undefined;
-        if (comptime builtin.os.tag == .openbsd) {
-            if (self.stop_flag.load(.acquire) or platform.monotonicMillis() >= self.request_deadline) return;
-        }
+        if (self.stop_flag.load(.acquire) or platform.monotonicMillis() >= self.request_deadline) return;
         const resp = handleRequest(plain.items, self.reader, &body, &out);
         const sealed = tls.encrypt(resp) catch return;
         defer self.allocator.free(sealed);
@@ -299,12 +368,11 @@ pub const HttpsListener = struct {
     }
 
     fn writeConn(self: *HttpsListener, fd: linux.fd_t, bytes: []const u8) bool {
-        if (comptime builtin.os.tag != .openbsd) return writeAll(fd, bytes);
         var offset: usize = 0;
         while (offset < bytes.len) {
             const remaining = self.request_deadline - platform.monotonicMillis();
             if (self.stop_flag.load(.acquire) or remaining <= 0) return false;
-            const rc = sys.send(fd, bytes[offset..].ptr, bytes.len - offset, posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL);
+            const rc = sys.sendto(fd, bytes[offset..].ptr, bytes.len - offset, posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL, null, 0);
             switch (posix.errno(rc)) {
                 .SUCCESS => {
                     if (rc == 0) return false;
@@ -326,16 +394,14 @@ pub const HttpsListener = struct {
     fn readRecord(self: *HttpsListener, fd: linux.fd_t, raw: *std.ArrayList(u8)) ![]u8 {
         var scratch: [4096]u8 = undefined;
         while (true) {
-            if (comptime builtin.os.tag == .openbsd) {
-                if (self.stop_flag.load(.acquire) or platform.monotonicMillis() >= self.request_deadline) return error.Closed;
-            }
+            if (self.stop_flag.load(.acquire) or platform.monotonicMillis() >= self.request_deadline) return error.Closed;
             if (try framedRecordLen(raw.items)) |n| {
                 const rec = try self.allocator.dupe(u8, raw.items[0..n]);
                 dropPrefix(raw, n);
                 return rec;
             }
             if (raw.items.len > 64 * 1024) return error.Closed;
-            const rc = if (comptime builtin.os.tag == .openbsd) blk: {
+            const rc = blk: {
                 if (self.stop_flag.load(.acquire) or platform.monotonicMillis() >= self.request_deadline) return error.Closed;
                 var polls = [_]sys_pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
                 const ready = sys.poll(&polls, 1, 50);
@@ -343,8 +409,8 @@ pub const HttpsListener = struct {
                 if (posix.errno(ready) != .SUCCESS) return error.Closed;
                 if (ready == 0) continue;
                 if ((polls[0].revents & posix.POLL.IN) == 0) return error.Closed;
-                break :blk sys.recv(fd, &scratch, scratch.len, posix.MSG.DONTWAIT);
-            } else sys.read(fd, &scratch, scratch.len);
+                break :blk sys.recvfrom(fd, &scratch, scratch.len, posix.MSG.DONTWAIT, null, null);
+            };
             switch (posix.errno(rc)) {
                 .SUCCESS => {
                     const n: usize = @intCast(rc);
@@ -406,7 +472,8 @@ fn boundPort(fd: linux.fd_t, v6: bool) BindError!u16 {
 }
 
 fn closeFd(fd: linux.fd_t) void {
-    _ = sys.shutdown(fd, sys.SHUT.RDWR);
+    // Ownership is one reference. shutdown would mutate an inherited shared
+    // listener and destroy the predecessor's serving/backlog on rollback.
     _ = sys.close(fd);
 }
 
@@ -663,5 +730,120 @@ test "history native HTTPS: accepted stalled and dribbling TLS clients cannot ho
                 else => return error.TestUnexpectedResult,
             }
         }
+    }
+}
+
+pub const Execution = enum(u8) { unstarted = 0, paused = 1 };
+pub const Snapshot = struct {
+    listener: metrics_http.ListenerObservation,
+    tls_digest: [32]u8,
+    execution: Execution,
+    pub fn validate(self: *const Snapshot, v6: bool, config: tls_server.Config) !void {
+        if (config.max_early_data_size != 0) return error.ActiveTlsContinuityUnsupported;
+        try validateEndpoint(self.listener, v6, self.listener.port);
+        if (!std.mem.eql(u8, &self.tls_digest, &try tlsConfigDigest(config))) return error.ConfigMismatch;
+    }
+};
+fn validateEndpoint(observed: metrics_http.ListenerObservation, v6: bool, port: u16) !void {
+    var expected: [16]u8 = @splat(0);
+    if (v6) expected[15] = 1 else std.mem.writeInt(u32, expected[0..4], 0x7f000001, .big);
+    if (observed.family != @as(u16, if (v6) posix.AF.INET6 else posix.AF.INET) or observed.port != port or port == 0 or
+        observed.scope_id != 0 or observed.flow_info != 0 or !std.mem.eql(u8, &observed.address, &expected) or
+        observed.recv_timeout_us < 200_000 or observed.recv_timeout_us > 210_000) return error.ListenerMismatch;
+}
+/// Complete material/policy pin, with replay-guard presence only. Its actual
+/// mutable graph is not hashed without its owner; active 0-RTT carry refuses.
+pub fn tlsConfigDigest(config: tls_server.Config) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("onyx/companion/history/tls-config/1");
+    inline for (@typeInfo(tls_server.Config).@"struct".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "replay_guard")) {
+            try runtime_pause.hashConfigValue(&hash, config.replay_guard != null);
+        } else try hashTlsValue(&hash, @field(config, name));
+    }
+    return hash.finalResult();
+}
+fn hashTlsValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) !void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.size != .slice) @compileError("TLS pin refuses raw pointers");
+            if (p.child == u8) return runtime_pause.hashBytes(hash, value);
+            try runtime_pause.hashConfigValue(hash, std.math.cast(u32, value.len) orelse return error.Capacity);
+            for (value) |inner| try hashTlsValue(hash, inner);
+        },
+        .array => for (value) |inner| try hashTlsValue(hash, inner),
+        .optional => {
+            try runtime_pause.hashConfigValue(hash, value != null);
+            if (value) |inner| try hashTlsValue(hash, inner);
+        },
+        .@"struct" => |info| inline for (info.field_names) |name| try hashTlsValue(hash, @field(value, name)),
+        .@"union" => |info| {
+            const tag = std.meta.activeTag(value);
+            try runtime_pause.hashConfigValue(hash, @intFromEnum(tag));
+            inline for (info.field_names) |name| if (tag == @field(info.tag_type.?, name)) try hashTlsValue(hash, @field(value, name));
+        },
+        else => try runtime_pause.hashConfigValue(hash, value),
+    }
+}
+
+test "companion runtime history retained IPv4 IPv6 listener TLS pins and read-only adoption" {
+    // Live listeners plus dormant-worker adoption: linux/openbsd only (see above).
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    for ([_][]const u8{ loopback_v4, loopback_v6 }) |host| {
+        var fixture: NativeHistoryFixture = .{};
+        try fixture.init();
+        var listener = try fixture.open(host);
+        try listener.prepareColdResources(std.testing.io);
+        const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .history, .instance = @intFromBool(listener.v6), .owner_identity = &listener }};
+        const gate = runtime_pause.start_gate.create(std.testing.allocator, std.testing.io, &specs) catch |err| {
+            listener.shutdown();
+            return err;
+        };
+        defer {
+            listener.requestStopAndWake();
+            if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+            listener.detachAfterJoined() catch unreachable;
+            listener.shutdown();
+            gate.control.destroyJoined();
+        }
+        const token = try listener.requestPause(1);
+        try listener.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.history, @intFromBool(listener.v6), &listener));
+        try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+        gate.control.releaseAll();
+        try listener.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+        try listener.requireActivated();
+        var carry = try listener.capturePaused(token);
+        const original = try metrics_http.observeListener(listener.listen_fd);
+        const rc = sys.fcntl(listener.listen_fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
+        try std.testing.expect(posix.errno(rc) == .SUCCESS);
+        var adopted = try HttpsListener.initInherited(std.testing.allocator, host, @intCast(rc), &carry, listener.tls_config, listener.reader);
+        adopted.shutdown();
+        try std.testing.expectEqualDeep(original, try metrics_http.observeListener(listener.listen_fd));
+        const rejected = sys.fcntl(listener.listen_fd, (if (@import("builtin").os.tag == .openbsd) @as(c_int, 10) else std.posix.F.DUPFD_CLOEXEC), @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
+        try std.testing.expect(posix.errno(rejected) == .SUCCESS);
+        carry.listener.inode ^= 1;
+        try std.testing.expectError(error.ListenerMismatch, HttpsListener.initInherited(std.testing.allocator, host, @intCast(rejected), &carry, listener.tls_config, listener.reader));
+        carry.listener.inode ^= 1;
+        try std.testing.expect(posix.errno(sys.fcntl(@intCast(rejected), posix.F.GETFD, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0))) != .SUCCESS);
+        var changed = listener.tls_config;
+        changed.receive_record_size_limit -= 1;
+        try std.testing.expectError(error.ConfigMismatch, carry.validate(listener.v6, changed));
+        changed = listener.tls_config;
+        changed.max_early_data_size = 32;
+        try std.testing.expectError(error.ActiveTlsContinuityUnsupported, carry.validate(listener.v6, changed));
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls.load(.acquire));
+        try listener.resumePaused(token);
+        {
+            var client = try NativeHistoryClient.connect(host, listener.port, &fixture.chain);
+            defer client.deinit();
+            var out: [2048]u8 = undefined;
+            const response = try client.get("member", &out);
+            try std.testing.expect(std.mem.endsWith(u8, response, "visible history line\n"));
+        }
+        const next = try listener.requestPause(2);
+        try listener.awaitPaused(next, std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), gate.view.inspect().spawned);
     }
 }
