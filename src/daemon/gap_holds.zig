@@ -70,7 +70,12 @@ fn scanDaemonImports(io: std.Io, dir: std.Io.Dir, allocator: Allocator, hits: *u
 test "GAP-C5 FEC stays unwired and section 12 symbols stay absent" {
     const io = testing.io;
     for (fec_files) |path| {
-        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .limited(1 << 20));
+        // Repo-layout fixture: runners outside a checkout (e.g. a bare Windows
+        // guest executing a shipped test binary) have no tree to audit.
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .limited(1 << 20)) catch |err| {
+            if (err == error.FileNotFound) return error.SkipZigTest;
+            return err;
+        };
         testing.allocator.free(text);
     }
 

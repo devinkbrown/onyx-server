@@ -833,7 +833,12 @@ test "GAP-K6 unfinished TLS interop stays refused and the pinned BoGo lane stays
     }
     try std.testing.expectEqual(@as(usize, 3), share_count);
 
-    const baseline = try k6Read(allocator, "tools/bogo/expected-baseline.txt");
+    // Repo-layout fixture: runners outside a checkout (e.g. a bare Windows
+    // guest executing a shipped test binary) have no BoGo tree to read.
+    const baseline = k6Read(allocator, "tools/bogo/expected-baseline.txt") catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
     defer allocator.free(baseline);
     var pass: usize = 0;
     var skip: usize = 0;

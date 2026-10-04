@@ -275,7 +275,12 @@ test "GAP-P0c WHOIS 335 follows bot mode while the registry and board stay uncal
     try std.testing.expectEqualStrings(":irc.example 335 alice robodan :is a bot", line);
 
     const io = std.testing.io;
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, "src/daemon/server.zig", std.testing.allocator, .limited(20 << 20));
+    // Repo-layout fixture: runners outside a checkout (e.g. a bare Windows
+    // guest executing a shipped test binary) have no tree to audit.
+    const text = std.Io.Dir.cwd().readFileAlloc(io, "src/daemon/server.zig", std.testing.allocator, .limited(20 << 20)) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "const bot_registry_mod = @import(\"bot_registry.zig\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "const announce_board_mod = @import(\"announce_board.zig\");") != null);

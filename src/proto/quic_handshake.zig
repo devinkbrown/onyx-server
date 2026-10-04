@@ -911,19 +911,8 @@ const Cursor = struct {
 };
 
 fn osEntropy(buf: []u8) Error!void {
-    switch (builtin.os.tag) {
-        .linux => {
-            var filled: usize = 0;
-            while (filled < buf.len) {
-                const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
-                const signed: isize = @bitCast(rc);
-                if (signed < 0 or rc == 0) return error.Entropy;
-                filled += rc;
-            }
-        },
-        .openbsd => @import("../crypto/random.zig").fillOsEntropy(buf) catch return error.Entropy,
-        else => return error.Entropy,
-    }
+    // Central CSPRNG root covers every target (Linux, OpenBSD, Windows, macOS).
+    @import("../crypto/random.zig").fillOsEntropy(buf) catch return error.Entropy;
 }
 
 fn secureZero(buf: []u8) void {
