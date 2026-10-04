@@ -1605,13 +1605,17 @@ test "webpush failed managed spawn retains its row until coordinator cancellatio
     const slot = try gate.view.slot(.webpush, 0, &worker);
     try testing.expectError(error.SystemResources, worker.prepareDormantWorker(gate.control, gate.view, slot));
     try testing.expect(worker.runtime.view.? == gate.view);
+    try testing.expectEqual(start.Phase.canceled, gate.view.inspect().phase);
     try testing.expectEqual(@as(usize, 0), gate.view.inspect().spawned);
-    try testing.expectError(error.NotJoined, worker.detachAfterJoined());
+    try testing.expectEqual(@as(usize, 0), gate.view.inspect().joined);
     try testing.expectError(error.SharedGateOwned, worker.runtime.requireDetached());
     try expectRetainedSeed(&worker);
     try testing.expect(worker.queue.items[0].endpoint.ptr == endpoint);
+    // Failed spawn synchronously cancels and joins the gate. Its unspawned row
+    // no longer borrows the worker, so detachment is already safe here.
+    try worker.detachAfterJoined();
+    try worker.runtime.requireDetached();
     gate.control.cancelAllAndJoin();
-    try testing.expectError(error.SharedGateOwned, worker.runtime.requireDetached());
     try worker.detachAfterJoined();
     try worker.runtime.requireDetached();
     try testing.expect(!worker.runtime.entered.load(.acquire));

@@ -59263,20 +59263,51 @@ const PortableConn = struct {
     send_buf: [default_reply_bytes]u8 = undefined,
     send_len: usize = 0,
     send_off: usize = 0,
+    pending_output: std.ArrayList(u8) = .empty,
     recv_armed: bool = false,
     send_armed: bool = false,
     live: bool = true,
+    graceful_close: bool = false,
+    write_shutdown: bool = false,
+    peer_closed: bool = false,
+    close_deadline_ms: i64 = 0,
+    recv_cancel_queued: bool = false,
+    send_cancel_queued: bool = false,
+    drop_pending: bool = false,
 };
 
 const PortableSendSink = struct {
     conn: *PortableConn,
+    allocator: std.mem.Allocator,
 
     fn write(self: *PortableSendSink, bytes: []const u8) ServerError!void {
-        if (self.conn.send_len + bytes.len > self.conn.send_buf.len) return error.OutputTooSmall;
-        @memcpy(self.conn.send_buf[self.conn.send_len..][0..bytes.len], bytes);
-        self.conn.send_len += bytes.len;
+        try portableQueueBytes(self.conn, self.allocator, bytes);
     }
 };
+
+const max_portable_pending_output: usize = 1024 * 1024;
+
+fn portableQueueBytes(conn: *PortableConn, allocator: std.mem.Allocator, bytes: []const u8) ServerError!void {
+    if (conn.pending_output.items.len != 0 or bytes.len > conn.send_buf.len - conn.send_len) {
+        if (bytes.len > max_portable_pending_output -| conn.pending_output.items.len)
+            return error.OutputTooSmall;
+        try conn.pending_output.appendSlice(allocator, bytes);
+        return;
+    }
+    @memcpy(conn.send_buf[conn.send_len..][0..bytes.len], bytes);
+    conn.send_len += bytes.len;
+}
+
+fn portableMessageLine(buf: *[512]u8, nick: []const u8, username: []const u8, command: []const u8, target: []const u8, message: []const u8) ServerError![]const u8 {
+    const prefix = std.fmt.bufPrint(buf, ":{s}!{s}@localhost {s} {s} :", .{
+        nick, username, command, target,
+    }) catch return error.OutputTooSmall;
+    if (prefix.len + 2 > buf.len) return error.OutputTooSmall;
+    const text_len = @min(message.len, buf.len - prefix.len - 2);
+    @memcpy(buf[prefix.len..][0..text_len], message[0..text_len]);
+    @memcpy(buf[prefix.len + text_len ..][0..2], "\r\n");
+    return buf[0 .. prefix.len + text_len + 2];
+}
 
 const PortableServer = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
@@ -59285,12 +59316,16 @@ const PortableServer = struct {
     port: u16 = 0,
     max_clients: usize = 0,
     chanlimit: usize = 0,
+    channellen: usize = 0,
     conns: std.ArrayList(*PortableConn) = .empty,
     chans: std.ArrayList(PortableChan) = .empty,
     next_slot: u32 = 1,
     pending: bool = false,
     wake_armed: bool = false,
     wake: linux.kernel_timespec = .{ .sec = 0, .nsec = 200_000_000 },
+    runtime_failure: ?ServerError = null,
+    fanout_depth: usize = 0,
+    flushing_drops: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) ServerError!PortableServer {
         var backend = io_backend.IoBackend.openOwned(io_backend.familyFor(builtin.os.tag), config.ring_entries, .{}) catch return error.Unsupported;
@@ -59327,6 +59362,7 @@ const PortableServer = struct {
             .port = listener.port,
             .max_clients = config.max_clients,
             .chanlimit = config.chanlimit,
+            .channellen = config.channellen,
         };
     }
     /// Heap slot used by `main`. Same listener and backend as `init`.
@@ -59341,18 +59377,26 @@ const PortableServer = struct {
             if (conn.send_armed) self.backend.cancel(.send, conn.token) catch {};
         }
         _ = self.backend.submit() catch {};
-        var evs: [8]io_backend.Reaped = undefined;
-        var spins: u8 = 0;
-        while (spins < 8) : (spins += 1) {
-            // wait_ms 0 does not block. A positive wait on the ring asks for
-            // one CQE and will sit there after the last completion.
-            const n = self.backend.reap(&evs, 0) catch break;
-            if (n == 0) break;
+        if (comptime builtin.os.tag == .windows) {
+            // The kernel can still write into recv/send buffers after a
+            // cancellation request. Retire every IOCP slot before freeing
+            // any connection storage or the backend's status blocks.
+            self.backend.quiesce() catch @panic("IOCP requests could not be drained");
+        } else {
+            var evs: [8]io_backend.Reaped = undefined;
+            var spins: u8 = 0;
+            while (spins < 8) : (spins += 1) {
+                // wait_ms 0 does not block. A positive wait on the ring asks for
+                // one CQE and will sit there after the last completion.
+                const n = self.backend.reap(&evs, 0) catch break;
+                if (n == 0) break;
+            }
         }
         self.backend.deinit();
         self.freeChans();
         for (self.conns.items) |conn| {
             io_backend.closeSocket(conn.fd);
+            conn.pending_output.deinit(self.allocator);
             self.allocator.destroy(conn.state);
             self.allocator.destroy(conn);
         }
@@ -59393,7 +59437,16 @@ const PortableServer = struct {
     }
     /// Serve loop `main` runs after `init` returns a listener.
     pub fn runThreaded(self: *PortableServer, run: *std.atomic.Value(bool)) void {
-        while (run.load(.acquire)) self.runOnce() catch return;
+        while (run.load(.acquire)) {
+            self.runOnce() catch |err| {
+                std.debug.print("onyx-server: portable reactor failed ({s})\n", .{@errorName(err)});
+                self.runtime_failure = err;
+                return;
+            };
+        }
+    }
+    pub fn runtimeFailure(self: *const PortableServer) ?ServerError {
+        return self.runtime_failure;
     }
     /// Symbol parity for the services → world +r bridge (see LinuxServer).
     pub fn markChannelRegistered(_: *PortableServer, _: []const u8, _: bool) std.mem.Allocator.Error!void {}
@@ -59413,7 +59466,10 @@ const PortableServer = struct {
 
     fn onAccept(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
         if (ev.token.slot != 0 or ev.token.gen != 1) return;
-        if (!self.backend.levelTriggered()) try self.armAccept();
+        if (!self.backend.levelTriggered()) self.armAccept() catch |err| {
+            if (ev.result >= 0) io_backend.closeSocket(@intCast(ev.result));
+            return err;
+        };
         if (ev.result < 0) return;
         try self.adopt(@intCast(ev.result));
     }
@@ -59421,7 +59477,18 @@ const PortableServer = struct {
     fn onRecv(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
         const conn = self.findConn(ev.token) orelse return;
         if (!self.backend.levelTriggered()) conn.recv_armed = false;
-        if (!conn.live) return;
+        if (!conn.live) {
+            if (conn.graceful_close) {
+                if ((ev.result > 0 or portableAgain(ev.result)) and
+                    platform.monotonicMillis() < conn.close_deadline_ms)
+                {
+                    try self.armRecv(conn);
+                } else {
+                    conn.peer_closed = true;
+                }
+            }
+            return;
+        }
         if (ev.result < 0) {
             if (portableAgain(ev.result)) {
                 if (!self.backend.levelTriggered()) try self.armRecv(conn);
@@ -59441,17 +59508,19 @@ const PortableServer = struct {
     fn onSend(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
         const conn = self.findConn(ev.token) orelse return;
         conn.send_armed = false;
-        if (!conn.live) return;
+        if (!conn.live and !conn.graceful_close) return;
         if (ev.result < 0) {
             if (portableAgain(ev.result)) {
                 try self.armSend(conn);
                 return;
             }
+            conn.graceful_close = false;
             self.dropConn(conn);
             return;
         }
         const sent: usize = @intCast(ev.result);
         if (sent == 0 or conn.send_off + sent > conn.send_len) {
+            conn.graceful_close = false;
             self.dropConn(conn);
             return;
         }
@@ -59481,6 +59550,10 @@ const PortableServer = struct {
             return error.OutOfMemory;
         };
         state.* = .{};
+        // This local-only reactor implements no negotiated IRCv3 extensions.
+        // Keep registration and CAP advertising aligned with the commands
+        // actually handled by PortableServer.
+        state.session.setAvailableCapabilities(&.{});
         conn.* = .{
             .fd = fd,
             .token = .{ .slot = self.next_slot, .gen = 1 },
@@ -59500,6 +59573,7 @@ const PortableServer = struct {
     }
 
     fn takeBytes(self: *PortableServer, conn: *PortableConn, n: usize) ServerError!void {
+        if (n > conn.recv_buf.len) return error.Unexpected;
         var i: usize = 0;
         while (i < n) {
             if (!conn.live) return;
@@ -59524,33 +59598,114 @@ const PortableServer = struct {
     }
 
     fn armAccept(self: *PortableServer) ServerError!void {
-        self.backend.accept(.{ .slot = 0, .gen = 1 }, self.listener) catch return error.Unsupported;
+        self.backend.accept(.{ .slot = 0, .gen = 1 }, self.listener) catch |err| {
+            try self.flushIocpBatch(err);
+            self.backend.accept(.{ .slot = 0, .gen = 1 }, self.listener) catch return error.Unsupported;
+        };
         self.pending = true;
     }
 
     fn armRecv(self: *PortableServer, conn: *PortableConn) ServerError!void {
-        if (!conn.live or conn.recv_armed) return;
-        self.backend.recv(conn.token, conn.fd, &conn.recv_buf) catch return error.Unsupported;
+        if ((!conn.live and !conn.graceful_close) or conn.peer_closed or conn.recv_armed) return;
+        self.backend.recv(conn.token, conn.fd, &conn.recv_buf) catch |err| {
+            try self.flushIocpBatch(err);
+            self.backend.recv(conn.token, conn.fd, &conn.recv_buf) catch return error.Unsupported;
+        };
         conn.recv_armed = true;
         self.pending = true;
     }
 
+    fn flushIocpBatch(self: *PortableServer, err: anyerror) ServerError!void {
+        if (self.backend.family != .iocp or err != error.SubmissionQueueFull) return error.Unsupported;
+        _ = self.backend.submit() catch return error.Unsupported;
+        self.pending = false;
+    }
+
+    fn cancelWindows(self: *PortableServer, kind: ringlane.OpKind, token: RingFdToken) ServerError!void {
+        self.backend.cancel(kind, token) catch |err| {
+            if (err == error.MissingOp) return;
+            // A wave of disconnected clients can fill the bounded submission
+            // batch before the next reap. Submit this batch and retry the
+            // exact cancellation without dropping reactor liveness.
+            try self.flushIocpBatch(err);
+            self.backend.cancel(kind, token) catch |retry_err| {
+                if (retry_err == error.MissingOp) return;
+                return error.Unsupported;
+            };
+        };
+        self.pending = self.backend.queuedCount() != 0;
+    }
+
     fn armSend(self: *PortableServer, conn: *PortableConn) ServerError!void {
-        if (!conn.live or conn.send_armed) return;
+        if ((!conn.live and !conn.graceful_close) or conn.send_armed) return;
         if (conn.send_off >= conn.send_len) {
             conn.send_off = 0;
             conn.send_len = 0;
-            return;
+            if (conn.pending_output.items.len != 0) {
+                const n = @min(conn.pending_output.items.len, conn.send_buf.len);
+                @memcpy(conn.send_buf[0..n], conn.pending_output.items[0..n]);
+                const remaining = conn.pending_output.items.len - n;
+                std.mem.copyForwards(u8, conn.pending_output.items[0..remaining], conn.pending_output.items[n..]);
+                conn.pending_output.items.len = remaining;
+                conn.send_len = n;
+            } else return;
         }
-        self.backend.send(conn.token, conn.fd, conn.send_buf[conn.send_off..conn.send_len]) catch return error.Unsupported;
+        self.backend.send(conn.token, conn.fd, conn.send_buf[conn.send_off..conn.send_len]) catch |err| {
+            try self.flushIocpBatch(err);
+            self.backend.send(conn.token, conn.fd, conn.send_buf[conn.send_off..conn.send_len]) catch return error.Unsupported;
+        };
         conn.send_armed = true;
         self.pending = true;
     }
 
     fn dropConn(self: *PortableServer, conn: *PortableConn) void {
-        if (!conn.live) return;
-        self.detachChan(conn);
+        self.dropConnReason(conn, "Connection closed");
+    }
+
+    fn dropConnReason(self: *PortableServer, conn: *PortableConn, reason: []const u8) void {
+        if (!conn.live or conn.drop_pending) return;
+        if (self.fanout_depth != 0) {
+            // All recursive failures in a fanout use the generic reason.
+            // Finish delivering the original event before sending QUIT.
+            conn.drop_pending = true;
+            return;
+        }
+        self.dropConnNow(conn, reason);
+    }
+
+    fn dropConnNow(self: *PortableServer, conn: *PortableConn, reason: []const u8) void {
         conn.live = false;
+        if (conn.state.session.registered()) {
+            var buf: [1024]u8 = undefined;
+            const quit_line = std.fmt.bufPrint(&buf, ":{s}!{s}@localhost QUIT :{s}\r\n", .{
+                conn.state.session.displayName(), conn.state.session.username(), reason,
+            }) catch null;
+            if (quit_line) |line| self.broadcastShared(conn, line, false);
+        }
+        self.detachChan(conn);
+    }
+
+    fn endFanout(self: *PortableServer) void {
+        self.fanout_depth -= 1;
+        if (self.fanout_depth == 0) self.flushPendingDrops();
+    }
+
+    fn flushPendingDrops(self: *PortableServer) void {
+        if (self.fanout_depth != 0 or self.flushing_drops) return;
+        self.flushing_drops = true;
+        defer self.flushing_drops = false;
+        while (true) {
+            var next: ?*PortableConn = null;
+            for (self.conns.items) |conn| {
+                if (conn.drop_pending) {
+                    next = conn;
+                    break;
+                }
+            }
+            const conn = next orelse break;
+            conn.drop_pending = false;
+            if (conn.live) self.dropConnNow(conn, "Connection closed");
+        }
     }
 
     fn retireClosedConns(self: *PortableServer) ServerError!void {
@@ -59565,28 +59720,75 @@ const PortableServer = struct {
                 continue;
             }
             if (conn.fd >= 0) {
-                var cancelled = false;
-                if (conn.recv_armed) {
-                    self.backend.cancel(.recv, conn.token) catch return error.Unsupported;
-                    cancelled = true;
+                if (comptime builtin.os.tag == .windows) {
+                    // Bound the whole QUIT drain, including a send to a peer
+                    // that stopped reading. After the deadline, cancel exact
+                    // in-flight requests and retain buffers until completion.
+                    if (conn.graceful_close and platform.monotonicMillis() >= conn.close_deadline_ms)
+                        conn.graceful_close = false;
+                    // QUIT must finish replies already queued for this client.
+                    // Closing a socket with an overlapped send still pending
+                    // turns its final TCP bytes into a reset on Windows.
+                    if (conn.graceful_close and !conn.send_armed) try self.armSend(conn);
+                    if (conn.graceful_close and (conn.send_armed or conn.send_off < conn.send_len or
+                        conn.pending_output.items.len != 0))
+                    {
+                        i += 1;
+                        continue;
+                    }
+                    if (conn.graceful_close and !conn.write_shutdown) {
+                        io_backend.shutdownSocketWrite(conn.fd);
+                        conn.write_shutdown = true;
+                    }
+                    if (conn.graceful_close and !conn.peer_closed and
+                        platform.monotonicMillis() < conn.close_deadline_ms)
+                    {
+                        if (!conn.recv_armed) try self.armRecv(conn);
+                        i += 1;
+                        continue;
+                    }
+                    if (conn.recv_armed and !conn.recv_cancel_queued) {
+                        // MissingOp means the original completion is already
+                        // queued for a later batch. Keep buffer custody until
+                        // dispatch clears recv_armed.
+                        try self.cancelWindows(.recv, conn.token);
+                        conn.recv_cancel_queued = true;
+                    }
+                    if (conn.send_armed and !conn.send_cancel_queued) {
+                        try self.cancelWindows(.send, conn.token);
+                        conn.send_cancel_queued = true;
+                    }
+                    if (conn.recv_armed or conn.send_armed) {
+                        i += 1;
+                        continue;
+                    }
+                    io_backend.closeSocket(conn.fd);
+                    conn.fd = -1;
+                } else {
+                    var cancelled = false;
+                    if (conn.recv_armed) {
+                        self.backend.cancel(.recv, conn.token) catch return error.Unsupported;
+                        cancelled = true;
+                    }
+                    if (conn.send_armed) {
+                        self.backend.cancel(.send, conn.token) catch return error.Unsupported;
+                        cancelled = true;
+                    }
+                    if (cancelled) _ = self.backend.submit() catch return error.Unsupported;
+                    if (self.backend.levelTriggered()) {
+                        conn.recv_armed = false;
+                        conn.send_armed = false;
+                    }
+                    io_backend.closeSocket(conn.fd);
+                    conn.fd = -1;
                 }
-                if (conn.send_armed) {
-                    self.backend.cancel(.send, conn.token) catch return error.Unsupported;
-                    cancelled = true;
-                }
-                if (cancelled) _ = self.backend.submit() catch return error.Unsupported;
-                if (self.backend.levelTriggered()) {
-                    conn.recv_armed = false;
-                    conn.send_armed = false;
-                }
-                io_backend.closeSocket(conn.fd);
-                conn.fd = -1;
             }
             if (conn.recv_armed or conn.send_armed) {
                 i += 1;
                 continue;
             }
             _ = self.conns.swapRemove(i);
+            conn.pending_output.deinit(self.allocator);
             self.allocator.destroy(conn.state);
             self.allocator.destroy(conn);
         }
@@ -59609,25 +59811,48 @@ const PortableServer = struct {
             self.dropConn(conn);
             return;
         };
+        const was_registered = conn.state.session.registered();
         if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
-            self.dropConn(conn);
+            conn.graceful_close = true;
+            conn.close_deadline_ms = platform.monotonicMillis() + 5_000;
+            self.dropConnReason(conn, if (parsed.param_count > 0) parsed.paramSlice()[0] else "Client quit");
             return;
         }
-        if (std.ascii.eqlIgnoreCase(parsed.command, "NICK") and parsed.param_count != 0) {
+        if (std.ascii.eqlIgnoreCase(parsed.command, "NICK")) {
+            if (parsed.param_count == 0 or parsed.paramSlice()[0].len == 0)
+                return self.portableNumeric(conn, "431", "", "No nickname given");
             const requested = parsed.paramSlice()[0];
+            if (!isValidNick(requested))
+                return self.portableNumeric(conn, "432", requested, "Erroneous nickname");
             for (self.conns.items) |other| {
                 if (!other.live or other == conn or !other.state.session.registration.nick_seen) continue;
                 if (std.ascii.eqlIgnoreCase(other.state.session.displayName(), requested))
                     return self.portableNumeric(conn, "433", requested, "Nickname is already in use");
             }
         }
-        if (conn.state.session.registered() and
-            (std.ascii.eqlIgnoreCase(parsed.command, "JOIN") or std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")))
-        {
+        const portable_command = std.ascii.eqlIgnoreCase(parsed.command, "JOIN") or
+            std.ascii.eqlIgnoreCase(parsed.command, "PART") or
+            std.ascii.eqlIgnoreCase(parsed.command, "NAMES") or
+            std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG") or
+            std.ascii.eqlIgnoreCase(parsed.command, "NOTICE");
+        if (portable_command and !conn.state.session.registered()) {
+            if (!std.ascii.eqlIgnoreCase(parsed.command, "NOTICE"))
+                try self.portableNumeric(conn, "451", parsed.command, "You have not registered");
+            return;
+        }
+        if (portable_command) {
             self.handleChannel(conn, parsed) catch self.dropConn(conn);
             return;
         }
-        var sink = PortableSendSink{ .conn = conn };
+        var old_nick: [128]u8 = undefined;
+        var old_nick_len: usize = 0;
+        const nick_change = was_registered and std.ascii.eqlIgnoreCase(parsed.command, "NICK");
+        if (nick_change) {
+            const before = conn.state.session.displayName();
+            old_nick_len = @min(before.len, old_nick.len);
+            @memcpy(old_nick[0..old_nick_len], before[0..old_nick_len]);
+        }
+        var sink = PortableSendSink{ .conn = conn, .allocator = self.allocator };
         processLine(conn.state, line, &sink) catch {
             self.dropConn(conn);
             return;
@@ -59636,17 +59861,23 @@ const PortableServer = struct {
             self.dropConn(conn);
             return;
         }
+        if (nick_change and !std.mem.eql(u8, old_nick[0..old_nick_len], conn.state.session.displayName())) {
+            var buf: [512]u8 = undefined;
+            const nick_line = std.fmt.bufPrint(&buf, ":{s}!{s}@localhost NICK :{s}\r\n", .{
+                old_nick[0..old_nick_len], conn.state.session.username(), conn.state.session.displayName(),
+            }) catch return error.OutputTooSmall;
+            self.broadcastShared(conn, nick_line, true);
+        }
         try self.armSend(conn);
     }
 
-    /// Channel membership for the portable reactor. Linux shards keep their own
-    /// JOIN path. This one only has to register, answer 366, and deliver PRIVMSG
-    /// to the other members of the same channel.
+    /// Small shared-state IRC surface for the portable reactor. Linux/OpenBSD
+    /// use the full server path; these commands must work across live clients.
     fn handleChannel(self: *PortableServer, conn: *PortableConn, parsed: irc_line.LineView) ServerError!void {
         if (std.ascii.eqlIgnoreCase(parsed.command, "JOIN")) {
             if (parsed.param_count == 0) return self.portableNumeric(conn, "461", "JOIN", "Not enough parameters");
             const name = parsed.paramSlice()[0];
-            if (!portableChanName(name)) return self.portableNumeric(conn, "479", name, "Illegal channel name");
+            if (!portableChanName(name, self.channellen)) return self.portableNumeric(conn, "479", name, "Illegal channel name");
             if (self.findChan(name)) |existing| {
                 if (self.onChan(existing, conn)) return;
             }
@@ -59662,13 +59893,63 @@ const PortableServer = struct {
             try self.namesAndEnd(chan, conn);
             return;
         }
-        if (parsed.param_count < 2) return self.portableNumeric(conn, "461", "PRIVMSG", "Not enough parameters");
+        if (std.ascii.eqlIgnoreCase(parsed.command, "PART")) {
+            if (parsed.param_count == 0) return self.portableNumeric(conn, "461", "PART", "Not enough parameters");
+            const name = parsed.paramSlice()[0];
+            const chan = self.findChan(name) orelse return self.portableNumeric(conn, "403", name, "No such channel");
+            if (!self.onChan(chan, conn)) return self.portableNumeric(conn, "442", name, "You're not on that channel");
+            var buf: [1024]u8 = undefined;
+            const reason = if (parsed.param_count > 1) parsed.paramSlice()[1] else "Leaving";
+            const line = std.fmt.bufPrint(&buf, ":{s}!{s}@localhost PART {s} :{s}\r\n", .{
+                conn.state.session.displayName(), conn.state.session.username(), chan.name, reason,
+            }) catch return error.OutputTooSmall;
+            self.fanout_depth += 1;
+            defer self.endFanout();
+            var i: usize = 0;
+            while (i < chan.live) {
+                const dest = chan.members[i];
+                if (!dest.drop_pending) self.enqueueBytes(dest, line) catch self.dropConn(dest);
+                if (i < chan.live and chan.members[i] == dest) i += 1;
+            }
+            self.removeMember(chan, conn);
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(parsed.command, "NAMES")) {
+            if (parsed.param_count == 0) return self.portableNumeric(conn, "461", "NAMES", "Not enough parameters");
+            const name = parsed.paramSlice()[0];
+            if (self.findChan(name)) |chan| return self.namesAndEnd(chan, conn);
+            return self.portableNumeric(conn, "366", name, "End of /NAMES list");
+        }
+        const is_notice = std.ascii.eqlIgnoreCase(parsed.command, "NOTICE");
+        if (parsed.param_count < 2) {
+            if (!is_notice) return self.portableNumeric(conn, "461", "PRIVMSG", "Not enough parameters");
+            return;
+        }
         const target = parsed.paramSlice()[0];
         const text = parsed.paramSlice()[1];
-        if (!portableChanName(target)) return self.portableNumeric(conn, "401", target, "No such nick/channel");
-        const chan = self.findChan(target) orelse return self.portableNumeric(conn, "403", target, "No such channel");
-        if (!self.onChan(chan, conn)) return self.portableNumeric(conn, "442", target, "You're not on that channel");
-        try self.broadcastPrivmsg(chan, conn, text);
+        const command = if (is_notice) "NOTICE" else "PRIVMSG";
+        if (target.len != 0 and (target[0] == '#' or target[0] == '&')) {
+            if (!portableChanName(target, self.channellen)) {
+                if (!is_notice) return self.portableNumeric(conn, "403", target, "No such channel");
+                return;
+            }
+            const chan = self.findChan(target) orelse {
+                if (!is_notice) try self.portableNumeric(conn, "403", target, "No such channel");
+                return;
+            };
+            if (!self.onChan(chan, conn)) {
+                if (!is_notice) try self.portableNumeric(conn, "442", target, "You're not on that channel");
+                return;
+            }
+            return self.broadcastMessage(chan, conn, command, text);
+        }
+        const dest = self.findNick(target) orelse {
+            if (!is_notice) try self.portableNumeric(conn, "401", target, "No such nick/channel");
+            return;
+        };
+        var buf: [512]u8 = undefined;
+        const line = try portableMessageLine(&buf, conn.state.session.displayName(), conn.state.session.username(), command, dest.state.session.displayName(), text);
+        self.enqueueBytes(dest, line) catch self.dropConn(dest);
     }
 
     fn portableNumeric(self: *PortableServer, conn: *PortableConn, code: []const u8, target: []const u8, msg: []const u8) ServerError!void {
@@ -59693,10 +59974,12 @@ const PortableServer = struct {
             joiner.state.session.username(),
             chan.name,
         }) catch return error.OutputTooSmall;
+        self.fanout_depth += 1;
+        defer self.endFanout();
         var i: usize = 0;
         while (i < chan.live) {
             const dest = chan.members[i];
-            if (!dest.live) {
+            if (!dest.live or dest.drop_pending) {
                 i += 1;
                 continue;
             }
@@ -59706,30 +59989,38 @@ const PortableServer = struct {
     }
 
     fn namesAndEnd(self: *PortableServer, chan: *PortableChan, conn: *PortableConn) ServerError!void {
-        var names: [2048]u8 = undefined;
-        var n: usize = 0;
-        var i: usize = 0;
-        while (i < chan.live) : (i += 1) {
-            const member = chan.members[i];
-            if (!member.live) continue;
-            const nick = member.state.session.displayName();
-            if (n != 0) {
-                if (n >= names.len) break;
-                names[n] = ' ';
-                n += 1;
-            }
-            if (n + nick.len > names.len) break;
-            @memcpy(names[n..][0..nick.len], nick);
-            n += nick.len;
-        }
-        var buf: [2560]u8 = undefined;
-        const roster = std.fmt.bufPrint(&buf, ":{s} 353 {s} = {s} :{s}\r\n", .{
+        var buf: [512]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&buf, ":{s} 353 {s} = {s} :", .{
             protocol_inventory.currentServerName(),
             conn.state.session.displayName(),
             chan.name,
-            names[0..n],
         }) catch return error.OutputTooSmall;
-        try self.enqueueBytes(conn, roster);
+        const prefix_len = prefix.len;
+        if (prefix_len + 2 > buf.len) return error.OutputTooSmall;
+        var line_len = prefix_len;
+        var count: usize = 0;
+        for (chan.members[0..chan.live]) |member| {
+            if (!member.live) continue;
+            const nick = member.state.session.displayName();
+            const extra = nick.len + @intFromBool(count != 0);
+            if (line_len + extra + 2 > buf.len) {
+                if (count == 0) return error.OutputTooSmall;
+                @memcpy(buf[line_len..][0..2], "\r\n");
+                try self.enqueueBytes(conn, buf[0 .. line_len + 2]);
+                line_len = prefix_len;
+                count = 0;
+            }
+            if (line_len + nick.len + 2 > buf.len) return error.OutputTooSmall;
+            if (count != 0) {
+                buf[line_len] = ' ';
+                line_len += 1;
+            }
+            @memcpy(buf[line_len..][0..nick.len], nick);
+            line_len += nick.len;
+            count += 1;
+        }
+        @memcpy(buf[line_len..][0..2], "\r\n");
+        try self.enqueueBytes(conn, buf[0 .. line_len + 2]);
         const end = std.fmt.bufPrint(&buf, ":{s} 366 {s} {s} :End of /NAMES list\r\n", .{
             protocol_inventory.currentServerName(),
             conn.state.session.displayName(),
@@ -59738,18 +60029,15 @@ const PortableServer = struct {
         try self.enqueueBytes(conn, end);
     }
 
-    fn broadcastPrivmsg(self: *PortableServer, chan: *PortableChan, from: *PortableConn, text: []const u8) ServerError!void {
-        var buf: [2048]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s}!{s}@localhost PRIVMSG {s} :{s}\r\n", .{
-            from.state.session.displayName(),
-            from.state.session.username(),
-            chan.name,
-            text,
-        }) catch return error.OutputTooSmall;
+    fn broadcastMessage(self: *PortableServer, chan: *PortableChan, from: *PortableConn, command: []const u8, text: []const u8) ServerError!void {
+        var buf: [512]u8 = undefined;
+        const line = try portableMessageLine(&buf, from.state.session.displayName(), from.state.session.username(), command, chan.name, text);
+        self.fanout_depth += 1;
+        defer self.endFanout();
         var i: usize = 0;
         while (i < chan.live) {
             const dest = chan.members[i];
-            if (!dest.live or dest == from) {
+            if (!dest.live or dest.drop_pending or dest == from) {
                 i += 1;
                 continue;
             }
@@ -59759,10 +60047,8 @@ const PortableServer = struct {
     }
 
     fn enqueueBytes(self: *PortableServer, conn: *PortableConn, bytes: []const u8) ServerError!void {
-        if (!conn.live) return;
-        if (conn.send_len + bytes.len > conn.send_buf.len) return error.OutputTooSmall;
-        @memcpy(conn.send_buf[conn.send_len..][0..bytes.len], bytes);
-        conn.send_len += bytes.len;
+        if (!conn.live or conn.drop_pending) return;
+        try portableQueueBytes(conn, self.allocator, bytes);
         try self.armSend(conn);
     }
 
@@ -59807,6 +60093,44 @@ const PortableServer = struct {
             if (std.ascii.eqlIgnoreCase(chan.name, name)) return chan;
         }
         return null;
+    }
+
+    fn findNick(self: *PortableServer, name: []const u8) ?*PortableConn {
+        for (self.conns.items) |conn| {
+            if (conn.live and conn.state.session.registered() and
+                std.ascii.eqlIgnoreCase(conn.state.session.displayName(), name)) return conn;
+        }
+        return null;
+    }
+
+    fn broadcastShared(self: *PortableServer, from: *PortableConn, bytes: []const u8, include_self: bool) void {
+        self.fanout_depth += 1;
+        defer self.endFanout();
+        for (self.conns.items) |dest| {
+            if (!dest.live or dest.drop_pending) continue;
+            if (dest == from) {
+                if (include_self) self.enqueueBytes(dest, bytes) catch self.dropConn(dest);
+                continue;
+            }
+            var shared = false;
+            for (self.chans.items) |*chan| {
+                if (self.onChan(chan, from) and self.onChan(chan, dest)) {
+                    shared = true;
+                    break;
+                }
+            }
+            if (shared) self.enqueueBytes(dest, bytes) catch self.dropConn(dest);
+        }
+    }
+
+    fn removeMember(_: *PortableServer, chan: *PortableChan, conn: *PortableConn) void {
+        var w: usize = 0;
+        for (chan.members[0..chan.live]) |member| {
+            if (member == conn) continue;
+            chan.members[w] = member;
+            w += 1;
+        }
+        chan.live = w;
     }
 
     fn detachChan(self: *PortableServer, conn: *PortableConn) void {
@@ -59991,14 +60315,18 @@ test "GAP-X4 PortableServer joins and fans out PRIVMSG" {
     }
     if (live_nodelay != 3) return error.Unexpected;
 
-    // A full queue disconnects that receiver. Detaching its membership must
-    // not skip the following healthy receiver during the same fan-out.
+    // A full bounded queue disconnects that receiver. Detaching its
+    // membership must not skip the following healthy receiver in this fan-out.
     var slow_token: ?RingFdToken = null;
     for (server.conns.items) |conn| {
         if (!std.mem.eql(u8, conn.state.session.displayName(), "b1")) continue;
         try std.testing.expect(!conn.send_armed);
         slow_token = conn.token;
         conn.send_len = conn.send_buf.len;
+        const full = try std.testing.allocator.alloc(u8, max_portable_pending_output);
+        defer std.testing.allocator.free(full);
+        @memset(full, 'x');
+        try conn.pending_output.appendSlice(std.testing.allocator, full);
     }
     try std.testing.expect(slow_token != null);
     try writeAllFd(fds[0], "PRIVMSG #bench :after-slow-receiver\r\n");
@@ -60094,13 +60422,68 @@ test "PortableServer churn preserves nick ownership and ignores retired completi
     try std.testing.expect(try portableExpect(&server, reused_fd, " 001 "));
 }
 
-fn portableChanName(name: []const u8) bool {
-    if (name.len < 2 or name.len > 64) return false;
+fn portableChanName(name: []const u8, max_len: usize) bool {
+    if (name.len < 2 or name.len > max_len) return false;
     if (name[0] != '#' and name[0] != '&') return false;
     for (name) |byte| {
         if (byte <= 0x20 or byte == 0x7f or byte == ',' or byte == ':') return false;
     }
     return true;
+}
+
+test "PortableServer defers full-queue disconnect until fanout completes" {
+    var server = PortableServer{ .allocator = std.testing.allocator };
+    defer {
+        server.freeChans();
+        server.conns.deinit(std.testing.allocator);
+    }
+    var states: [3]ConnState = @splat(.{});
+    var conns = [_]PortableConn{
+        .{ .state = &states[0], .send_armed = true },
+        .{ .state = &states[1], .send_armed = true },
+        .{ .state = &states[2], .send_armed = true },
+    };
+    const nicks = [_][]const u8{ "alice", "bob", "cara" };
+    for (&conns, &states, nicks) |*conn, *state, nick| {
+        try state.session.setNick(nick);
+        state.session.registration.registered = true;
+        try server.conns.append(std.testing.allocator, conn);
+    }
+    defer conns[0].pending_output.deinit(std.testing.allocator);
+    const full = try std.testing.allocator.alloc(u8, max_portable_pending_output);
+    defer std.testing.allocator.free(full);
+    @memset(full, 'x');
+    try conns[0].pending_output.appendSlice(std.testing.allocator, full);
+    conns[0].send_len = conns[0].send_buf.len;
+
+    const nick_chan = try server.ensureChan("#nick");
+    for (&conns) |*conn| try server.addMember(nick_chan, conn);
+    try states[0].session.setNick("alice2");
+    server.broadcastShared(&conns[0], ":alice!user@localhost NICK :alice2\r\n", true);
+    const nick_peer = conns[1].send_buf[0..conns[1].send_len];
+    const nick_at = std.mem.indexOf(u8, nick_peer, " NICK :alice2") orelse return error.Unexpected;
+    const nick_quit_at = std.mem.indexOf(u8, nick_peer, " QUIT :Connection closed") orelse return error.Unexpected;
+    try std.testing.expect(nick_at < nick_quit_at);
+    try std.testing.expect(!conns[0].live);
+
+    conns[0].live = true;
+    conns[1].send_len = 0;
+    conns[2].send_len = 0;
+    _ = try server.ensureChan("#part");
+    _ = try server.ensureChan("#shared");
+    const part_chan = server.findChan("#part").?;
+    const shared_chan = server.findChan("#shared").?;
+    for (&conns) |*conn| {
+        try server.addMember(part_chan, conn);
+        try server.addMember(shared_chan, conn);
+    }
+    const part = try irc_line.parseLine("PART #part :bye");
+    try server.handleChannel(&conns[0], part);
+    const part_peer = conns[1].send_buf[0..conns[1].send_len];
+    const part_at = std.mem.indexOf(u8, part_peer, " PART #part :bye") orelse return error.Unexpected;
+    const part_quit_at = std.mem.indexOf(u8, part_peer, " QUIT :Connection closed") orelse return error.Unexpected;
+    try std.testing.expect(part_at < part_quit_at);
+    try std.testing.expect(!conns[0].live);
 }
 
 const portable_test_system = if (builtin.os.tag == .openbsd) posix.system else linux;
@@ -86175,7 +86558,7 @@ test "threaded server: +onyx/topic tag rides fanout + echo; untagged is unchange
     }
 
     const fd_a = connectLoopback(port) catch |err| switch (err) {
-        error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
         else => return err,
     };
     defer closeFd(fd_a);
@@ -86233,7 +86616,7 @@ test "threaded server: onyx/topics receives topic tags without generic message-t
     }
 
     const fd_a = connectLoopback(port) catch |err| switch (err) {
-        error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
         else => return err,
     };
     defer closeFd(fd_a);
@@ -90071,7 +90454,7 @@ test "threaded server: malformed pre-auth lines never kill the reactor" {
     // of these escaped processLiveLine and exited the reactor loop — one line of
     // garbage from an unauthenticated peer took down the whole daemon.
     const fd_evil = connectLoopback(port) catch |err| switch (err) {
-        error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
         else => return err,
     };
     defer closeFd(fd_evil);
@@ -90107,7 +90490,7 @@ test "threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)" {
     }
 
     const fd_a = connectLoopback(port) catch |err| switch (err) {
-        error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
         else => return err,
     };
     defer closeFd(fd_a);
@@ -95085,7 +95468,7 @@ test "threaded server: pre-registration REGISTER fails and CAP LS 302 advertises
     }
 
     const fd = connectLoopback(port) catch |err| switch (err) {
-        error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
         else => return err,
     };
     defer closeFd(fd);
@@ -95318,7 +95701,7 @@ test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {
         defer for (fds[0..connected]) |fd| closeFd(fd);
         for (0..n_clients) |i| {
             fds[i] = connectLoopback(port) catch |err| switch (err) {
-                error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+                error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
                 else => return err,
             };
             connected += 1;
@@ -95401,7 +95784,7 @@ test "threaded server: oper EVENT delivery + cross-shard fan-out under num_shard
         defer for (fds[0..connected]) |fd| closeFd(fd);
         for (0..n_opers) |i| {
             fds[i] = connectLoopback(port) catch |err| switch (err) {
-                error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+                error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
                 else => return err,
             };
             connected += 1;

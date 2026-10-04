@@ -525,7 +525,6 @@ pub const Sender = struct {
 
     /// Resolve, connect, and run the ESMTP conversation for one job (outside the lock).
     fn deliver(self: *Sender, job: Job) !void {
-        if (comptime @import("builtin").os.tag == .windows) return error.SocketUnavailable;
         const job_start = platform.monotonicMillis();
         const addr = try http_fetch.resolveHostA(self.config.relay_host, self.config.relay_port, io_timeout_ms);
 
@@ -534,6 +533,11 @@ pub const Sender = struct {
         const verified = self.config.trust_anchors.len != 0 or self.config.insecure_skip_verify;
         if (self.config.user != null and !isLoopback(addr) and !verified)
             return error.UnverifiedAuthRelay;
+
+        // Apply the AUTH policy before the platform transport gate. IP literal
+        // relays resolve on Windows, so a remote unverified relay is refused
+        // with the same durable reason even while SMTP sockets are unavailable.
+        if (comptime @import("builtin").os.tag == .windows) return error.SocketUnavailable;
 
         const fd = try connectAddr(addr, io_timeout_ms);
         defer closeFd(fd);
@@ -1108,6 +1112,9 @@ fn smtpPendingControlAllocationProof(failing: std.mem.Allocator) !void {
 }
 
 test "TLS client fatal transport: SMTP pending control allocation failures release plaintext" {
+    // This proof drives a Unix socketpair. The Windows mail transport remains
+    // excluded until it has a native socket fixture and implementation.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     // The real peers hold allocations from before the failure interval. Keep
     // their ownership intact and let the test allocator detect actual leaks;
     // aggregate FailingAllocator byte counters include those earlier frees.

@@ -17,7 +17,7 @@ voice/video), adds class-based connection policy with bounded growable SendQ/Rec
 nick-delay protection, and replaces the legacy TS6 server-to-server protocol with the
 native **Undertow + Mooring** cryptographic mesh.
 
-**Quick links:** [Download v0.5.6 (latest published)](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6) · source **0.7.0** (`build.zig.zon`) · [verified live fleet](docs/ops/onyx-server-paths.md) · [Quickstart](docs/guide/00-quickstart.md) ·
+**Quick links:** [Download v0.5.6 (latest published)](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6) · source **0.7.0** (`build.zig.zon`) · [verified live fleet](docs/ops/onyx-server-paths.md) · [Quickstart](docs/guide/00-quickstart.md) · [Windows build and smoke](docs/guide/windows.md) ·
 [Documentation](docs/README.md) · [Architecture](docs/architecture/00-overview.md) ·
 [Command reference](docs/reference/commands/_index.md) ·
 [Contributing](CONTRIBUTING.md) · [Runbook](docs/RUNBOOK.md) ·
@@ -62,7 +62,7 @@ chmod +x onyx-server-0.5.6-x86_64-linux-musl
 ./onyx-server-0.5.6-x86_64-linux-musl onyx-server.quickstart.toml
 ```
 
-Either way you get a working node — **`ws://localhost:8080`** for the Onyx browser
+Either way you get a working Linux node — **`ws://localhost:8080`** for the Onyx browser
 client and **`irc://localhost:6667`** for any IRC client. The node's sovereign
 identity key and account store self-generate in the data directory on first run;
 nothing to configure. For production, swap the quickstart config for a TLS config
@@ -146,6 +146,9 @@ flow, and a full source map.
 ## Build & run
 
 Onyx Server targets **Zig 0.17.0-dev.1282+c0f9b51d8** on 64-bit Linux (the reactor uses `io_uring`).
+The full daemon also has an OpenBSD reactor. Native Windows builds use IOCP
+for a local plaintext IPv4 IRC server with a narrower command and transport
+surface; see the [Windows build and verification guide](docs/guide/windows.md).
 
 ```sh
 zig build              # build the daemon (and the `armor` crypto CLI) into zig-out/bin

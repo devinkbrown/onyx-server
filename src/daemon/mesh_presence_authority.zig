@@ -636,6 +636,9 @@ test "mesh presence authority preserves local quarantine across cold epoch and d
 }
 
 test "mesh presence authority uses actual WAL limits and refuses partial enabled state" {
+    // Cold authority custody is POSIX-only; Windows cannot run this end-to-end
+    // lease/provisioning proof until native cold custody is implemented.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(137));

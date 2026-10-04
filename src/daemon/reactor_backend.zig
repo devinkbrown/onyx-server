@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Full-daemon reactor contract. Linux keeps the exact production Ringlane
-//! type; BSD translates native one-shot operations to its typed completions.
+//! type; BSD and Windows translate native one-shot operations to its typed
+//! completions.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
@@ -21,16 +22,20 @@ const PortableRing = struct {
     dispatch_index: usize = 0,
 
     pub fn init(entries: u16, features: ringlane.RingFeatures) !PortableRing {
-        if (comptime builtin.os.tag != .openbsd and builtin.os.tag != .freebsd and
-            builtin.os.tag != .netbsd and builtin.os.tag != .dragonfly) return error.Unsupported;
-        // Linux acceleration flags cannot silently claim support on kqueue.
+        const family: io_backend.Family = switch (builtin.os.tag) {
+            .openbsd, .freebsd, .netbsd, .dragonfly => .kqueue,
+            .windows => .iocp,
+            else => return error.Unsupported,
+        };
+        // Linux acceleration flags cannot silently claim support on another
+        // kernel. Both native backends provide one completion per operation.
         if (features.multishot_accept or features.multishot_recv or features.buf_ring or
             features.send_zc or features.fixed_files or features.defer_taskrun or features.sqpoll)
             return error.Unsupported;
-        var backend = try io_backend.IoBackend.openOwned(.kqueue, entries, .{});
+        var backend = try io_backend.IoBackend.openOwned(family, entries, .{});
         errdefer backend.deinit();
         try backend.requireAll();
-        try backend.useStreamCompletions();
+        if (family == .kqueue) try backend.useStreamCompletions();
         if (!backend.opImplemented(.connect)) return error.Unsupported;
         return .{ .backend = backend, .features = features };
     }
@@ -123,7 +128,8 @@ const PortableRing = struct {
     }
 
     /// Linux's MSG_RING handshake validates a Linux-specific acceleration.
-    /// Kqueue needs no ring-to-ring messages; cross-reactor wakes use socketpair.
+    /// Portable backends need no ring-to-ring messages; cross-reactor wakeups
+    /// are supplied by a separate platform primitive.
     pub fn bootMsgRing(_: *PortableRing, _: *PortableRing) !void {}
 };
 
@@ -143,6 +149,13 @@ fn opKind(op: io_backend.Op) ringlane.OpKind {
 /// as BSD EAGAIN=35 and ECANCELED=89 must never masquerade as Linux errno values.
 fn canonicalResult(result: i32) i32 {
     if (result >= 0 or builtin.os.tag == .linux) return result;
+    // IOCP reports exact cancellation using Linux ECANCELED and other failed
+    // requests as -1. The latter is not a POSIX errno: interpreting it as
+    // EPERM would turn socket failures into false authorization decisions.
+    if (builtin.os.tag == .windows) {
+        if (result == -@as(i32, @intFromEnum(linux.E.CANCELED))) return result;
+        return -@as(i32, @intFromEnum(linux.E.IO));
+    }
     const magnitude = -@as(i64, result);
     inline for (@typeInfo(linux.E).@"enum".field_names, @typeInfo(linux.E).@"enum".field_values) |name, value| {
         if (@hasField(std.posix.E, name)) {
@@ -168,21 +181,20 @@ fn toCompletion(done: io_backend.Reaped) ringlane.Completion {
 
 test "reactor facade preserves original cancellation identity and canonical errors" {
     const token = ringlane.FdToken{ .slot = 13, .gen = 7 };
-    const recv = toCompletion(.{ .op = .recv, .token = token, .result = -@as(i32, @intFromEnum(std.posix.E.CANCELED)) }).recv;
+    const canceled_result: i32 = if (builtin.os.tag == .windows)
+        -@as(i32, @intFromEnum(linux.E.CANCELED))
+    else
+        -@as(i32, @intFromEnum(std.posix.E.CANCELED));
+    const recv = toCompletion(.{ .op = .recv, .token = token, .result = canceled_result }).recv;
     try std.testing.expectEqual(token, recv.token);
     try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), recv.res);
     try std.testing.expect(!recv.more);
-    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.AGAIN)), canonicalResult(-@as(i32, @intFromEnum(std.posix.E.AGAIN))));
+    if (builtin.os.tag != .windows)
+        try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.AGAIN)), canonicalResult(-@as(i32, @intFromEnum(std.posix.E.AGAIN))));
     if (comptime builtin.os.tag == .linux) try std.testing.expect(Ring == ringlane.Ring);
 }
 
 test "reactor facade keeps later copied original completions in cancellation custody" {
-    var ring = PortableRing{ .backend = io_backend.IoBackend.closed(.kqueue, 8), .features = .{} };
-    defer ring.deinit();
-    const token = ringlane.FdToken{ .slot = 6, .gen = 3 };
-    ring.ready[0] = .{ .op = .recv, .token = token, .result = 0 };
-    ring.ready[1] = .{ .op = .send, .token = token, .result = 2 };
-    ring.ready_n = 2;
     const Sink = struct {
         ring: *PortableRing,
         token: ringlane.FdToken,
@@ -195,12 +207,45 @@ test "reactor facade keeps later copied original completions in cancellation cus
             self.n += 1;
         }
     };
-    var sink = Sink{ .ring = &ring, .token = token };
-    // This exercises the BSD implementation even on a Linux development host.
-    var scratch: [2]io_backend.Reaped = undefined;
-    try ring.reapPortableCompletions(&scratch, 0, &sink);
-    try std.testing.expectEqual(@as(usize, 2), sink.n);
-    try std.testing.expect(!sink.cancel_failed);
-    try std.testing.expect(ring.dispatching == null);
-    try std.testing.expectError(error.MissingOp, ring.submitExactCancel(.send, token));
+    for ([_]io_backend.Family{ .kqueue, .iocp }) |family| {
+        var ring = PortableRing{ .backend = io_backend.IoBackend.closed(family, 8), .features = .{} };
+        defer ring.deinit();
+        const token = ringlane.FdToken{ .slot = 6, .gen = 3 };
+        ring.ready[0] = .{ .op = .recv, .token = token, .result = 0 };
+        ring.ready[1] = .{ .op = .send, .token = token, .result = 2 };
+        ring.ready_n = 2;
+        var sink = Sink{ .ring = &ring, .token = token };
+        // Both portable backends must retain the already-copied SEND while a
+        // handler cancels that token from the same dispatch batch.
+        var scratch: [2]io_backend.Reaped = undefined;
+        try ring.reapPortableCompletions(&scratch, 0, &sink);
+        try std.testing.expectEqual(@as(usize, 2), sink.n);
+        try std.testing.expect(!sink.cancel_failed);
+        try std.testing.expect(ring.dispatching == null);
+        try std.testing.expectError(error.MissingOp, ring.submitExactCancel(.send, token));
+    }
+}
+
+test "reactor facade maps generic Windows IOCP failures without inventing permission errors" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const token = ringlane.FdToken{ .slot = 19, .gen = 8 };
+    const failed = io_backend.Reaped{ .op = .connect, .token = token, .result = -1 };
+    const completion = toCompletion(failed).connect;
+    try std.testing.expectEqual(token, completion.token);
+    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.IO)), completion.res);
+    try std.testing.expectEqual(@as(i32, 0), toCompletion(.{ .op = .connect, .token = token, .result = 0 }).connect.res);
+    try std.testing.expectEqual(
+        -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        toCompletion(.{ .op = .recv, .token = token, .result = -@as(i32, @intFromEnum(linux.E.CANCELED)) }).recv.res,
+    );
+}
+
+test "reactor facade opens Windows IOCP with the full one-shot operation contract" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    try std.testing.expectError(error.Unsupported, PortableRing.init(32, .{ .multishot_accept = true }));
+    var ring = try PortableRing.init(32, .{});
+    defer ring.deinit();
+    try std.testing.expectEqual(io_backend.Family.iocp, ring.backend.family);
+    try std.testing.expect(ring.backend.opImplemented(.connect));
+    try std.testing.expectEqual(@as(u32, 0), try ring.submit());
 }

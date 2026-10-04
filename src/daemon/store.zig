@@ -1510,7 +1510,15 @@ pub fn openColdExisting(io: std.Io, dir: std.Io.Dir, path: []const u8, mode: Col
 
 fn openExistingPersistenceFile(io: std.Io, dir: std.Io.Dir, path: []const u8, mode: ColdOpenMode) !std.Io.File {
     if (comptime cold_posix) return openColdExisting(io, dir, path, mode);
-    return dir.openFile(io, path, .{ .mode = if (mode == .read_write) .read_write else .read_only, .allow_directory = false, .follow_symlinks = false });
+    var file = try dir.openFile(io, path, .{ .mode = if (mode == .read_write) .read_write else .read_only, .allow_directory = false, .follow_symlinks = false });
+    if (comptime @import("builtin").os.tag == .windows) {
+        // The pinned Zig Threaded backend opens no-follow Windows files for
+        // asynchronous I/O, but reports them as blocking. Positional reads can
+        // then return PENDING and hit an unreachable in the backend. Keep the
+        // no-follow open and report the handle's actual I/O mode to Threaded.
+        file.flags.nonblocking = true;
+    }
+    return file;
 }
 
 fn coldIdentityBits(value: anytype) u64 {

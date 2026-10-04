@@ -596,6 +596,22 @@ pub fn portableTransportError(os: std.Target.Os.Tag, cfg: config_format.Config) 
         return "the portable reactor does not support media listeners yet";
     if (cfg.metrics.listen != 0) return "the portable reactor does not support a metrics listener yet";
     if (cfg.listen.proxy_protocol) return "the portable reactor does not support PROXY protocol headers yet";
+    if (cfg.webhook.enabled) return "the portable reactor does not support webhooks yet";
+    if (cfg.media.enabled) return "the portable reactor does not support media routing yet";
+    if (cfg.sasl.enabled or cfg.sasl.account_db != null) return "the portable reactor does not support account services yet";
+    if (cfg.webpush.enabled) return "the portable reactor does not support web push yet";
+    if (cfg.mail.enabled) return "the portable reactor does not support mail delivery yet";
+    if (cfg.dnsbl.enabled) return "the portable reactor does not support DNS blocklists yet";
+    if (cfg.acme.enabled) return "the portable reactor does not support ACME renewal yet";
+    if (cfg.ocsp.enabled) return "the portable reactor does not support OCSP stapling yet";
+    if (cfg.geo.enabled) return "the portable reactor does not support the weather/news bot yet";
+    if (cfg.wasm.plugin_dir != null) return "the portable reactor does not support WASM plugins yet";
+    if (cfg.stats.dir.len != 0 or cfg.stats.channel_dir.len != 0)
+        return "the portable reactor does not support stats publication yet";
+    if (cfg.backup.dir.len != 0) return "the portable reactor does not support backup publication yet";
+    if (cfg.geoip.database.len != 0 or cfg.geoip.asn_database.len != 0)
+        return "the portable reactor does not support GeoIP yet";
+    if (cfg.oper_ocg2.enabled) return "the portable reactor does not support OCG2 oper authority yet";
     return null;
 }
 
@@ -632,6 +648,19 @@ test "GAP-X1 portable preflight refuses unsupported listener intent" {
     cfg.metrics.listen = 0;
     cfg.listen.proxy_protocol = true;
     try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+    cfg.listen.proxy_protocol = false;
+    cfg.webhook.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.webhook.enabled = false;
+    cfg.sasl.account_db = "accounts.wal";
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.sasl.account_db = null;
+    cfg.wasm.plugin_dir = "plugins";
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.wasm.plugin_dir = null;
+    cfg.stats.dir = "stats";
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.stats.dir = "";
     try std.testing.expect(portableTransportError(.linux, cfg) == null);
     try std.testing.expect(portableTransportError(.openbsd, cfg) == null);
 }

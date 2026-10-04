@@ -277,12 +277,6 @@ fn winSocket() !usize {
     return sock;
 }
 
-fn socketFd(sock: usize) !std.os.linux.fd_t {
-    const limit: usize = @intCast(std.math.maxInt(std.os.linux.fd_t));
-    if (sock == 0 or sock > limit) return error.MissingOp;
-    return @intCast(sock);
-}
-
 fn windowsPair() !struct { listener: usize, client: usize, accepted: usize } {
     var startup: [408]u8 = @splat(0);
     if (WinSock.WSAStartup(0x0202, &startup) != 0) return error.MissingOp;
@@ -334,35 +328,51 @@ pub fn executeWindowsIocp() !void {
         com.write("GUEST_EXIT:1");
         return err;
     };
-    const listen_fd = socketFd(pair.listener) catch |err| {
-        com.write("GAP-X1 windows iocp submitted=missing stage=fd");
+    var listen_fd: ?std.os.linux.fd_t = null;
+    var peer_fd: ?std.os.linux.fd_t = null;
+    defer {
+        if (listen_fd) |fd| {
+            io_backend.closeSocket(fd);
+        } else {
+            _ = WinSock.closesocket(pair.listener);
+        }
+        // The client is never adopted by IoBackend.
+        _ = WinSock.closesocket(pair.client);
+        if (peer_fd) |fd| {
+            io_backend.closeSocket(fd);
+        } else {
+            _ = WinSock.closesocket(pair.accepted);
+        }
+    }
+    listen_fd = io_backend.adoptWindowsSocket(pair.listener) catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=adopt-listener");
         com.write("GUEST_EXIT:1");
         return err;
     };
-    const peer_fd = socketFd(pair.accepted) catch |err| {
-        com.write("GAP-X1 windows iocp submitted=missing stage=fd");
+    peer_fd = io_backend.adoptWindowsSocket(pair.accepted) catch |err| {
+        com.write("GAP-X1 windows iocp submitted=missing stage=adopt-peer");
         com.write("GUEST_EXIT:1");
         return err;
     };
     const token = ringlane.FdToken{ .slot = 1, .gen = 1 };
     const buf = std.heap.page_allocator.alloc(u8, 4) catch return error.OutOfMemory;
     @memset(buf, 0);
-    backend.accept(token, listen_fd) catch |err| {
+    backend.accept(token, listen_fd.?) catch |err| {
         com.write("GAP-X1 windows iocp submitted=missing stage=accept");
         com.write("GUEST_EXIT:1");
         return err;
     };
-    backend.recv(token, peer_fd, buf) catch |err| {
+    backend.recv(token, peer_fd.?, buf) catch |err| {
         com.write("GAP-X1 windows iocp submitted=missing stage=recv");
         com.write("GUEST_EXIT:1");
         return err;
     };
-    backend.send(token, peer_fd, "x") catch |err| {
+    backend.send(token, peer_fd.?, "x") catch |err| {
         com.write("GAP-X1 windows iocp submitted=missing stage=send");
         com.write("GUEST_EXIT:1");
         return err;
     };
-    backend.poll(token, peer_fd, std.os.linux.POLL.IN) catch |err| {
+    backend.poll(token, peer_fd.?, std.os.linux.POLL.IN) catch |err| {
         com.write("GAP-X1 windows iocp submitted=missing stage=poll");
         com.write("GUEST_EXIT:1");
         return err;
@@ -388,9 +398,6 @@ pub fn executeWindowsIocp() !void {
     } else |_| {
         com.write("GAP-X1 windows iocp submitted=fmt");
     }
-    _ = WinSock.closesocket(pair.listener);
-    _ = WinSock.closesocket(pair.client);
-    _ = WinSock.closesocket(pair.accepted);
     if (submitted == 0 or !dequeue_ok) {
         com.write("GUEST_EXIT:1");
         return error.MissingOp;

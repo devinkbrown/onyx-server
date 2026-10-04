@@ -677,6 +677,41 @@ pub fn build(b: *std.Build) void {
     check_exe.generated_bin = .none; // analyze only; do not codegen/link an artifact
     check_step.dependOn(&check_exe.step);
 
+    // Native Windows gate: exercise the socket/IOCP lifetime cases and the
+    // daemon entry point without compiling or running the full module suite.
+    const windows_io_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = &.{
+            "Windows socket descriptors preserve pointer-sized handles and retire stale ids",
+            "IOCP transfer completion cannot exceed the submitted buffer",
+            "IOCP cancellation identifies the original request",
+            "Windows IOCP associates each socket lifetime and drains cancellation",
+            "Windows IOCP quiesce drains more than 64 pending requests",
+            "Windows IOCP quiesce retains pending recv and send buffers",
+            "Windows IOCP delivers exact timeout tokens and cancels only the target",
+            "Windows IOCP reuses timer storage after repeated expiry",
+            "Windows AFD adopted sockets can half-close with a TCP FIN",
+            "Windows IOCP ConnectEx completes loopback and cancels exact outbound token",
+            "Windows IOCP AFD poll reports native loopback readiness masks",
+            "IOCP AFD poll decodes output events instead of IOSB byte count",
+            "Windows reactor wake reaches IOCP poll and drains without blocking",
+            "Windows IOCP keeps slab status addresses stable across 320 pending accepts",
+            "IOCP ready queue preserves order while growing past one submit batch",
+            "Windows IOCP quiesce releases never-posted token registrations",
+            "PortableServer defers full-queue disconnect until fanout completes",
+        },
+    });
+    const run_windows_io_tests = b.addRunArtifact(windows_io_tests);
+    const windows_exe_tests = b.addTest(.{
+        .root_module = exe.root_module,
+        .filters = &.{},
+    });
+    const run_windows_exe_tests = b.addRunArtifact(windows_exe_tests);
+    const test_windows_step = b.step("test-windows", "Run native Windows socket/IOCP and daemon entry-point tests");
+    test_windows_step.dependOn(&check_exe.step);
+    test_windows_step.dependOn(&run_windows_io_tests.step);
+    test_windows_step.dependOn(&run_windows_exe_tests.step);
+
     const test_smoke_step = b.step("test-smoke", "Run fast semantic + TLS/server/config smoke tests for roadmap iteration");
     test_smoke_step.dependOn(&check_exe.step);
     test_smoke_step.dependOn(&run_tls_tests.step);

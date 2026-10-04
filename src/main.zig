@@ -187,7 +187,10 @@ fn validateTlsChain(chain: []const []const u8) anyerror!void {
 /// keyfile, opening a WAL, binding a socket, or reparsing resolved config data.
 fn validateManagedBootPlan(allocator: std.mem.Allocator, io: std.Io, loaded: *const onyx_server.daemon.config_boot.Loaded, config_path: []const u8) !void {
     const boot = onyx_server.daemon.config_boot;
-    if (boot.portableTransportError(builtin.os.tag, loaded.parsed) != null) return error.UnsupportedManagedTransport;
+    if (boot.portableTransportError(builtin.os.tag, loaded.parsed)) |reason| {
+        std.debug.print("onyx-server: unsupported on {s}: {s}\n", .{ @tagName(builtin.os.tag), reason });
+        return error.UnsupportedManagedTransport;
+    }
     if (loaded.parsed.meshCloakSecretMissing()) return error.MissingMeshCloakSecret;
     if (boot.configCheckError(loaded.io, loaded.tls.ktls) != null) return error.InvalidManagedIoPolicy;
     if (boot.unsecuredMeshPeerError(loaded.parsed.mesh.connect.len, loaded.parsed.mesh.require_secured) != null) return error.UnsecuredManagedMesh;
@@ -257,7 +260,11 @@ test "managed boot: parsed preflight refuses mesh policy without creating state"
     defer loaded.deinit(std.testing.allocator);
     try validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml");
     loaded.parsed.listen.s2s = 7000;
-    try std.testing.expectError(error.MissingMeshCloakSecret, validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml"));
+    const mesh_error = if (builtin.os.tag == .linux or builtin.os.tag == .openbsd)
+        error.MissingMeshCloakSecret
+    else
+        error.UnsupportedManagedTransport;
+    try std.testing.expectError(mesh_error, validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml"));
     loaded.parsed.listen.s2s = 0;
     loaded.tls.ktls = .txrx;
     try std.testing.expectError(error.InvalidManagedIoPolicy, validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml"));
@@ -1997,16 +2004,14 @@ pub fn main(init: std.process.Init) !void {
         else => "Ringlane io_uring",
     };
     std.debug.print(
-        "onyx-server: listening on 127.0.0.1:{d} ({s}) — PING + registration live\n",
-        .{ try srv.boundPort(), reactor },
+        "onyx-server: listening on {s}:{d} ({s})\n",
+        .{ srv_cfg.host, try srv.boundPort(), reactor },
     );
     // Sharded multi-reactor run loop (one worker thread per shard, joined here).
     // runThreaded transparently runs a single in-line reactor when num_shards==1.
     var run = std.atomic.Value(bool).init(true);
     srv.runThreaded(&run);
-    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
-        if (srv.runtimeFailure()) |err| return err;
-    }
+    if (srv.runtimeFailure()) |err| return err;
 }
 
 // Public test vector shared with x509_selfsign's RSA certificate controls.

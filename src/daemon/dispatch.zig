@@ -531,6 +531,14 @@ const CapReplySink = struct {
 const CapSession = struct {
     state: CapState = .idle,
     negotiated: CapSet = .{},
+    /// Which capabilities this connection's runtime can actually serve. The
+    /// full daemon keeps the complete set; smaller runtimes narrow it before
+    /// the first CAP LS so advertised and requestable caps agree.
+    available: CapSet = .{ .bits = std.math.maxInt(u64) },
+    /// A runtime that narrows CAP also uses the conservative 004/005 welcome
+    /// profile. It must not advertise channel/user modes or query extensions
+    /// that are implemented only by the full daemon.
+    limited_runtime: bool = false,
     cap_302: bool = false,
     /// STS advertisement policy. Default-constructed = disabled (see StsPolicy).
     sts: StsPolicy = .{},
@@ -557,17 +565,17 @@ const CapSession = struct {
         if (std.ascii.eqlIgnoreCase(subcommand, "LS")) {
             self.state = .negotiating;
             self.cap_302 = self.cap_302 or (params.len != 0 and std.mem.eql(u8, params[0], "302"));
-            try emitCapLs(self.cap_302, self.sts.value(), sasl_value, self.multilineValue(), sink);
+            try emitCapLs(self.available, self.cap_302, self.sts.value(), sasl_value, self.multilineValue(), sink);
             return .ok;
         }
         if (std.ascii.eqlIgnoreCase(subcommand, "LIST")) {
-            try emitCapList(self.negotiated, sink);
+            try emitCapList(self.negotiated, self.available, sink);
             return .ok;
         }
         if (std.ascii.eqlIgnoreCase(subcommand, "REQ")) {
             if (params.len == 0) return .missing_parameter;
             self.state = .negotiating;
-            if (applyCapRequest(&self.negotiated, params[0], self.sts.value(), sasl_value, self.multilineValue())) {
+            if (applyCapRequest(&self.negotiated, self.available, params[0], self.sts.value(), sasl_value, self.multilineValue())) {
                 try sink.append(.ack, false, params[0]);
             } else {
                 try sink.append(.nak, false, params[0]);
@@ -597,11 +605,12 @@ fn capBit(id: CapId) u64 {
 /// flagged as a continuation (gets the trailing `*` parameter); the final chunk
 /// closes the list. A space is left for the `:<server> CAP <nick> LS * :` framing
 /// so each emitted line stays under the 512-byte wire limit.
-fn emitCapLs(cap_302: bool, sts_value: ?[]const u8, sasl_value: ?[]const u8, multiline_value: ?[]const u8, sink: *CapReplySink) DispatchError!void {
+fn emitCapLs(available: CapSet, cap_302: bool, sts_value: ?[]const u8, sasl_value: ?[]const u8, multiline_value: ?[]const u8, sink: *CapReplySink) DispatchError!void {
     const seg_max: usize = 400;
     var seg: [seg_max]u8 = undefined;
     var len: usize = 0;
     for (cap_specs) |spec| {
+        if (!available.contains(spec.id)) continue;
         // Policy-gated caps (sts) are omitted entirely until the session
         // supplies a runtime value. This is the default-off honesty guard:
         // no policy -> the cap never reaches CAP LS.
@@ -640,12 +649,12 @@ fn emitCapLs(cap_302: bool, sts_value: ?[]const u8, sasl_value: ?[]const u8, mul
     try sink.append(.ls, false, seg[0..len]);
 }
 
-fn emitCapList(negotiated: CapSet, sink: *CapReplySink) DispatchError!void {
+fn emitCapList(negotiated: CapSet, available: CapSet, sink: *CapReplySink) DispatchError!void {
     const seg_max: usize = 400;
     var seg: [seg_max]u8 = undefined;
     var len: usize = 0;
     for (cap_specs) |spec| {
-        if (!negotiated.contains(spec.id)) continue;
+        if (!negotiated.contains(spec.id) or !available.contains(spec.id)) continue;
 
         const space_len: usize = if (len == 0) 0 else 1;
         if (len != 0 and len + space_len + spec.name.len > seg.len) {
@@ -662,7 +671,7 @@ fn emitCapList(negotiated: CapSet, sink: *CapReplySink) DispatchError!void {
     try sink.append(.list, false, seg[0..len]);
 }
 
-fn applyCapRequest(negotiated: *CapSet, raw_list_in: []const u8, sts_value: ?[]const u8, sasl_value: ?[]const u8, multiline_value: ?[]const u8) bool {
+fn applyCapRequest(negotiated: *CapSet, available: CapSet, raw_list_in: []const u8, sts_value: ?[]const u8, sasl_value: ?[]const u8, multiline_value: ?[]const u8) bool {
     var raw_list = std.mem.trim(u8, raw_list_in, " ");
     if (raw_list.len != 0 and raw_list[0] == ':') raw_list = raw_list[1..];
     var cursor: usize = 0;
@@ -686,6 +695,7 @@ fn applyCapRequest(negotiated: *CapSet, raw_list_in: []const u8, sts_value: ?[]c
         if (name.len == 0) return false;
 
         const spec = findCap(name) orelse return false;
+        if (!available.contains(spec.id)) return false;
         if (!remove and !capRequestable(spec, sts_value, sasl_value)) return false;
         if (requested_value) |value| {
             if (value.len == 0) return false;
@@ -946,6 +956,18 @@ pub const ClientSession = struct {
 
     pub fn init() ClientSession {
         return .{};
+    }
+
+    /// Restrict CAP to behavior this connection's runtime actually provides.
+    /// Call before the first CAP LS. A later restriction also revokes caps that
+    /// were negotiated under a broader policy, including the client mirror.
+    pub fn setAvailableCapabilities(self: *ClientSession, ids: []const CapId) void {
+        var available = CapSet{};
+        for (ids) |id| available.add(id);
+        self.cap.available = available;
+        self.cap.limited_runtime = true;
+        self.cap.negotiated.bits &= available.bits;
+        syncCapState(self);
     }
 
     /// The client's AWAY message, or null when not marked away.
@@ -1430,13 +1452,13 @@ pub const ClientSession = struct {
     /// Whether this client negotiated `id` via CAP. Lets the message path apply
     /// per-recipient IRCv3 behavior (echo-message, extended-join, ...).
     pub fn hasCap(self: *const ClientSession, id: CapId) bool {
-        return self.cap.negotiated.contains(id);
+        return self.cap.available.contains(id) and self.cap.negotiated.contains(id);
     }
 
     /// Force-enable a negotiated cap (used by the server's internal SASL grant
     /// and by tests; normal clients arrive here via CAP REQ).
     pub fn addCap(self: *ClientSession, id: CapId) void {
-        self.cap.negotiated.add(id);
+        if (self.cap.available.contains(id)) self.cap.negotiated.add(id);
     }
 
     /// Render the negotiated CAP set into `buf` as a space-separated name list
@@ -1447,7 +1469,7 @@ pub const ClientSession = struct {
     pub fn renderNegotiatedCaps(self: *const ClientSession, buf: []u8) []const u8 {
         var w: usize = 0;
         for (cap_specs) |spec| {
-            if (!self.cap.negotiated.contains(spec.id)) continue;
+            if (!self.hasCap(spec.id)) continue;
             const sep: usize = if (w == 0) 0 else 1;
             if (w + sep + spec.name.len > buf.len) break;
             if (sep == 1) {
@@ -1467,7 +1489,7 @@ pub const ClientSession = struct {
     pub fn restoreNegotiatedCaps(self: *ClientSession, names: []const u8) void {
         var it = std.mem.tokenizeScalar(u8, names, ' ');
         while (it.next()) |name| {
-            if (capIdFromName(name)) |id| self.cap.negotiated.add(id);
+            if (capIdFromName(name)) |id| self.addCap(id);
         }
     }
 
@@ -2208,14 +2230,37 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
     ) catch "This node has been weaving the mesh since 01 Jan 1970 00:00 UTC";
     try replies.numeric(session, .RPL_CREATED, &.{}, created);
 
-    try replies.message(
-        replies.server_name,
-        "004",
-        &.{ nick, replies.server_name, SERVER_VERSION, usermode.default_mode_letters, chanmode.default_mode_letters, chanmode.default_param_mode_letters },
-        null,
-    );
-    try replies.numeric(session, .RPL_ISUPPORT, protocol_inventory.currentIsupport(), "are supported by this server");
+    if (session.cap.limited_runtime) {
+        // 004 requires both mode fields. A single '-' means this runtime offers
+        // no mode letters; omitting fields would make clients misparse 004.
+        try replies.message(replies.server_name, "004", &.{ nick, replies.server_name, SERVER_VERSION, "-", "-" }, null);
+        var tokens: [6][]const u8 = undefined;
+        var count: usize = 0;
+        for (protocol_inventory.currentIsupport()) |token| {
+            if (!portableIsupportToken(token)) continue;
+            if (count == tokens.len) return error.OutputTooSmall;
+            tokens[count] = token;
+            count += 1;
+        }
+        try replies.numeric(session, .RPL_ISUPPORT, tokens[0..count], "are supported by this server");
+    } else {
+        try replies.message(
+            replies.server_name,
+            "004",
+            &.{ nick, replies.server_name, SERVER_VERSION, usermode.default_mode_letters, chanmode.default_mode_letters, chanmode.default_param_mode_letters },
+            null,
+        );
+        try replies.numeric(session, .RPL_ISUPPORT, protocol_inventory.currentIsupport(), "are supported by this server");
+    }
     try emitWelcomeNotices(session, replies, host);
+}
+
+fn portableIsupportToken(token: []const u8) bool {
+    const key = token[0 .. std.mem.indexOfScalar(u8, token, '=') orelse token.len];
+    inline for (.{ "NETWORK", "CHANTYPES", "NICKLEN", "CHANNELLEN", "CHANLIMIT", "CASEMAPPING" }) |allowed| {
+        if (std.mem.eql(u8, key, allowed)) return true;
+    }
+    return false;
 }
 
 fn displayHost(session: *const ClientSession) []const u8 {
@@ -2273,6 +2318,11 @@ fn emitWelcomeNotices(session: *const ClientSession, replies: *ReplyCtx, host: [
             host,
             account_text,
         }) catch "secured | account state unavailable"
+    else if (session.cap.limited_runtime)
+        std.fmt.bufPrint(&security_buf, "plaintext | you are {s} | {s}", .{
+            host,
+            account_text,
+        }) catch "plaintext | account state unavailable"
     else
         std.fmt.bufPrint(&security_buf, "plaintext - consider connecting over TLS | you are {s} | {s}", .{
             host,
@@ -2283,7 +2333,9 @@ fn emitWelcomeNotices(session: *const ClientSession, replies: *ReplyCtx, host: [
     const peers = protocol_inventory.currentMeshPeerCount();
     const nodes: u32 = peers + 1;
     var mesh_buf: [128]u8 = undefined;
-    const mesh_text = if (peers == 0)
+    const mesh_text = if (session.cap.limited_runtime)
+        "local IRC service active"
+    else if (peers == 0)
         std.fmt.bufPrint(&mesh_buf, "mesh: 1 node active | /HELP to get started", .{}) catch "mesh: 1 node active"
     else
         std.fmt.bufPrint(&mesh_buf, "mesh: {d} {s} linked | /HELP to get started", .{
@@ -2601,6 +2653,92 @@ test "CAP negotiation holds registration until CAP END" {
     try dispatchText(&session, &replies, "CAP END");
     try std.testing.expect(session.registered());
     try expectCodesInOrder(replies.written(), &.{ " 001 ", " 002 ", " 003 ", " 004 ", " 005 " });
+}
+
+test "runtime capability policy keeps CAP LS REQ and LIST honest" {
+    var session = ClientSession.init();
+    session.setAvailableCapabilities(&.{ .server_time, .no_implicit_names });
+    var storage: [4096]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP LS 302");
+    try expectContains(replies.written(), "server-time");
+    // Both public names for one supported bit stay available.
+    try expectContains(replies.written(), "draft/no-implicit-names");
+    try expectNotContains(replies.written(), "draft/chathistory");
+    try expectNotContains(replies.written(), "message-tags");
+    replies.clear();
+
+    // REQ is atomic: an unsupported token prevents the allowed one from being
+    // negotiated, regardless of order.
+    try dispatchText(&session, &replies, "CAP REQ :server-time draft/chathistory");
+    try expectContains(replies.written(), " CAP * NAK :server-time draft/chathistory");
+    try std.testing.expect(!session.hasCap(.server_time));
+    replies.clear();
+
+    try dispatchText(&session, &replies, "CAP REQ :server-time draft/no-implicit-names");
+    try expectContains(replies.written(), " CAP * ACK :server-time draft/no-implicit-names");
+    try std.testing.expect(session.hasCap(.server_time));
+    try std.testing.expect(session.hasCap(.no_implicit_names));
+    replies.clear();
+
+    try dispatchText(&session, &replies, "CAP LIST");
+    try expectContains(replies.written(), "server-time");
+    try expectContains(replies.written(), "draft/no-implicit-names");
+    try expectNotContains(replies.written(), "draft/chathistory");
+}
+
+test "empty runtime capability policy revokes negotiated caps and rejects REQ" {
+    var session = ClientSession.init();
+    var storage: [4096]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+    try dispatchText(&session, &replies, "CAP REQ :server-time");
+    try std.testing.expect(session.hasCap(.server_time));
+    try std.testing.expect(session.client.protocol.negotiated_caps != 0);
+
+    session.setAvailableCapabilities(&.{});
+    try std.testing.expect(!session.hasCap(.server_time));
+    try std.testing.expectEqual(@as(u128, 0), session.client.protocol.negotiated_caps);
+    var names: [max_cap_names_len]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), session.renderNegotiatedCaps(&names).len);
+    session.restoreNegotiatedCaps("server-time draft/chathistory");
+    try std.testing.expect(!session.hasCap(.server_time));
+    replies.clear();
+
+    try dispatchText(&session, &replies, "CAP LS 302");
+    try expectContains(replies.written(), " CAP * LS :\r\n");
+    try expectNotContains(replies.written(), "server-time");
+    replies.clear();
+    try dispatchText(&session, &replies, "CAP REQ :server-time");
+    try expectContains(replies.written(), " CAP * NAK :server-time");
+    replies.clear();
+    try dispatchText(&session, &replies, "CAP LIST");
+    try expectContains(replies.written(), " CAP * LIST :\r\n");
+}
+
+test "limited runtime welcome advertises only implemented ISUPPORT and no mode letters" {
+    var session = ClientSession.init();
+    session.setAvailableCapabilities(&.{});
+    var storage: [2048]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+    try dispatchText(&session, &replies, "NICK portable");
+    try dispatchText(&session, &replies, "USER portable 0 * :Portable Client");
+    const welcome = replies.written();
+    try expectContains(welcome, " 004 portable ");
+    try expectContains(welcome, " - -\r\n");
+    try expectContains(welcome, " 005 portable NETWORK=");
+    try expectContains(welcome, "CHANTYPES=#&");
+    try expectContains(welcome, "NICKLEN=");
+    try expectContains(welcome, "CHANNELLEN=");
+    try expectContains(welcome, "CHANLIMIT=");
+    try expectContains(welcome, "CASEMAPPING=ascii");
+    try expectNotContains(welcome, "CHANMODES=");
+    try expectNotContains(welcome, "MONITOR=");
+    try expectNotContains(welcome, "IRCX");
+    try expectNotContains(welcome, "CHATHISTORY=");
+    try expectContains(welcome, "local IRC service active");
+    try expectNotContains(welcome, "consider connecting over TLS");
+    try expectNotContains(welcome, "/HELP");
 }
 
 test "default config never advertises the sts cap" {

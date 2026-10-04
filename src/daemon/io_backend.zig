@@ -6,14 +6,14 @@
 //! Linux keeps today's Ringlane ring (`ringlane.zig`). FreeBSD, OpenBSD,
 //! NetBSD, and Dragonfly implement the same operations on a kqueue fd.
 //! Windows implements them on an I/O completion port: AFD receive and send,
-//! AFD wait-for-listen and AFD poll, `NtCancelIoFileEx`, and an NT timer.
+//! AFD wait-for-listen and AFD poll, ConnectEx, `NtCancelIoFileEx`, and
+//! monotonic timers.
 //! `Iocp.open` loads the Winsock Registered I/O function table and returns
 //! `error.MissingOp` when that table is missing. `dequeueRegistered` is what
-//! calls those pointers. `reap` finishes accept, recv, and send: the ring
+//! calls those pointers. `reap` reports one-shot completions: the ring
 //! reports the completion, kqueue performs the syscall, and IOCP collects
-//! `NtRemoveIoCompletion` then `accept`s a waited listen. A missing op, a
-//! closed port or queue, or a kernel status other than success or pending
-//! returns `error.MissingOp` and is not reported as a finished transfer.
+//! `NtRemoveIoCompletion` then adopts a waited listen. A failed individual
+//! request has a negative result; an unusable port or queue fails closed.
 //! Helix USR2 adoption stays on `LinuxServer`.
 
 const std = @import("std");
@@ -30,7 +30,7 @@ pub const Op = enum { accept, recv, send, poll, cancel, timeout, connect };
 
 pub const required_ops = [_]Op{ .accept, .recv, .send, .poll, .cancel, .timeout };
 
-/// One finished accept, recv, send, poll, or timeout from `reap`.
+/// One finished accept, recv, send, poll, timeout, or connect from `reap`.
 /// `result` is the new socket for accept, the byte count for recv and send,
 /// or a negative errno. Timeout uses `0`.
 pub const Reaped = struct {
@@ -43,6 +43,629 @@ pub const Listener = struct {
     fd: linux.fd_t,
     port: u16,
 };
+
+/// The portable server still passes i32 descriptors, while Winsock SOCKET is a
+/// pointer-sized value. Keep an opaque descriptor at that boundary instead of
+/// narrowing a live SOCKET (or refusing every handle above INT_MAX).
+const WindowsSockets = struct {
+    const Entry = struct {
+        handle: usize,
+        associated_port: usize = 0,
+    };
+
+    lock: std.atomic.Mutex = .unlocked,
+    handles: std.AutoHashMapUnmanaged(linux.fd_t, Entry) = .empty,
+    allocator: Allocator = std.heap.page_allocator,
+    next_fd: linux.fd_t = 1,
+
+    fn lockSpin(self: *WindowsSockets) void {
+        while (!self.lock.tryLock()) std.Thread.yield() catch {};
+    }
+
+    fn register(self: *WindowsSockets, handle: usize) !linux.fd_t {
+        if (handle == std.math.maxInt(usize)) return error.InvalidSocket;
+        self.lockSpin();
+        defer self.lock.unlock();
+        if (self.next_fd <= 0) return error.SocketIdsExhausted;
+        const fd = self.next_fd;
+        try self.handles.put(self.allocator, fd, .{ .handle = handle });
+        self.next_fd = if (fd == std.math.maxInt(linux.fd_t)) -1 else fd + 1;
+        return fd;
+    }
+
+    fn get(self: *WindowsSockets, fd: linux.fd_t) ?usize {
+        if (fd <= 0) return null;
+        self.lockSpin();
+        defer self.lock.unlock();
+        const entry = self.handles.get(fd) orelse return null;
+        return entry.handle;
+    }
+
+    fn associatedPort(self: *WindowsSockets, fd: linux.fd_t) ?usize {
+        if (fd <= 0) return null;
+        self.lockSpin();
+        defer self.lock.unlock();
+        const entry = self.handles.get(fd) orelse return null;
+        return entry.associated_port;
+    }
+
+    fn associate(self: *WindowsSockets, fd: linux.fd_t, handle: usize, port: usize) !void {
+        if (comptime builtin.os.tag != .windows) return error.MissingOp;
+        if (port == 0) return error.MissingOp;
+        self.lockSpin();
+        defer self.lock.unlock();
+        const entry = self.handles.getPtr(fd) orelse return error.MissingOp;
+        if (entry.handle != handle) return error.MissingOp;
+        if (entry.associated_port == port) return;
+        if (entry.associated_port != 0) return error.MissingOp;
+        const w = std.os.windows;
+        var info = extern struct {
+            port: w.HANDLE,
+            key: ?*anyopaque,
+        }{
+            .port = @ptrFromInt(port),
+            .key = @ptrFromInt(handle),
+        };
+        var iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
+        const status = w.ntdll.NtSetInformationFile(
+            @ptrFromInt(handle),
+            &iosb,
+            @ptrCast(&info),
+            @sizeOf(@TypeOf(info)),
+            .Completion,
+        );
+        if (status != .SUCCESS) {
+            std.debug.print("GAP-X1 windows iocp status=0x{x} op=associate\n", .{@intFromEnum(status)});
+            return error.MissingOp;
+        }
+        // A synchronous success is returned inline. Suppress its otherwise
+        // duplicate port packet before the first AFD request is submitted.
+        if (SetFileCompletionNotificationModes(@ptrFromInt(handle), 0x1) == 0)
+            return error.MissingOp;
+        entry.associated_port = port;
+    }
+
+    fn take(self: *WindowsSockets, fd: linux.fd_t) ?usize {
+        if (fd <= 0) return null;
+        self.lockSpin();
+        defer self.lock.unlock();
+        const removed = self.handles.fetchRemove(fd) orelse return null;
+        return removed.value.handle;
+    }
+
+    fn deinit(self: *WindowsSockets) void {
+        self.handles.deinit(self.allocator);
+        self.handles = .empty;
+    }
+};
+
+var windows_sockets: WindowsSockets = .{};
+
+/// Transfer ownership of a Winsock SOCKET created by a caller into the
+/// portable descriptor namespace. On success, close it with `closeSocket`.
+pub fn adoptWindowsSocket(socket: usize) !linux.fd_t {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    return windows_sockets.register(socket);
+}
+
+test "Windows socket descriptors preserve pointer-sized handles and retire stale ids" {
+    var sockets = WindowsSockets{ .allocator = std.testing.allocator };
+    defer sockets.deinit();
+    const high: usize = @as(usize, std.math.maxInt(i32)) + 0x1_0000_0000;
+    const first = try sockets.register(high);
+    try std.testing.expect(first > 0);
+    try std.testing.expectEqual(@as(?usize, high), sockets.get(first));
+    try std.testing.expectEqual(@as(?usize, high), sockets.take(first));
+    try std.testing.expectEqual(@as(?usize, null), sockets.get(first));
+    const second = try sockets.register(high);
+    try std.testing.expect(second != first);
+    try std.testing.expectEqual(@as(?usize, null), sockets.take(first));
+    try std.testing.expectEqual(@as(?usize, high), sockets.take(second));
+    const zero = try sockets.register(0);
+    try std.testing.expectEqual(@as(?usize, 0), sockets.get(zero));
+    try std.testing.expectEqual(@as(?usize, 0), sockets.take(zero));
+    try std.testing.expectError(error.InvalidSocket, sockets.register(std.math.maxInt(usize)));
+}
+
+test "IOCP transfer completion cannot exceed the submitted buffer" {
+    var iosb = std.mem.zeroes(std.os.windows.IO_STATUS_BLOCK);
+    iosb.u.Status = .SUCCESS;
+    const token = ringlane.FdToken{ .slot = 9, .gen = 4 };
+    const token_key = Iocp.packToken(token);
+    inline for (.{ Iocp.op_recv, Iocp.op_send }) |op| {
+        const packet = Iocp.Packet{ .op = op, .length = 512, .token = token_key };
+        iosb.Information = 513;
+        const oversized = Iocp.finishPosted(packet, iosb, "", null);
+        try std.testing.expectEqual(@as(i32, -1), oversized.result);
+        try std.testing.expectEqual(token, oversized.token);
+        iosb.Information = 512;
+        try std.testing.expectEqual(@as(i32, 512), Iocp.finishPosted(packet, iosb, "", null).result);
+    }
+}
+
+test "IOCP cancellation identifies the original request" {
+    const token = Iocp.packToken(.{ .slot = 7, .gen = 2 });
+    const pending = Iocp.Packet{ .op = Iocp.op_recv, .handle = 0x1234, .token = token, .serial = 55 };
+    const cancel = Iocp.Packet{ .op = Iocp.op_cancel, .handle = 0x1234, .length = Iocp.op_recv, .token = token, .serial = 55 };
+    try std.testing.expect(Iocp.matchesCancel(cancel, pending));
+    try std.testing.expect(!Iocp.matchesCancel(cancel, .{ .op = Iocp.op_send, .handle = 0x1234, .token = token }));
+    try std.testing.expect(!Iocp.matchesCancel(cancel, .{ .op = Iocp.op_recv, .handle = 0x1235, .token = token }));
+    try std.testing.expect(!Iocp.matchesCancel(cancel, .{ .op = Iocp.op_recv, .handle = 0x1234, .token = token + 1 }));
+    try std.testing.expect(!Iocp.matchesCancel(cancel, .{ .op = Iocp.op_recv, .handle = 0x1234, .token = token, .serial = 56 }));
+
+    var backend = Iocp.unopened(4);
+    defer backend.deinit();
+    const original = try backend.remember(token, 0x1234, Iocp.op_recv);
+    try std.testing.expectError(error.MissingOp, backend.remember(token, 0x1234, Iocp.op_recv));
+    backend.forgetSerial(original);
+    const replacement = try backend.remember(token, 0x1234, Iocp.op_recv);
+    try std.testing.expect(replacement != original);
+    backend.forgetSerial(replacement);
+    try backend.pushReady(.{ .op = .recv, .token = .{ .slot = 7, .gen = 2 }, .result = 1 });
+    try backend.enqueueCancel(.recv, .{ .slot = 7, .gen = 2 });
+    try std.testing.expectEqual(@as(u16, 0), backend.n);
+
+    const connecting = Iocp.Packet{ .op = Iocp.op_connect, .handle = 0x1234, .token = token, .serial = 88 };
+    const cancel_connect = Iocp.Packet{ .op = Iocp.op_cancel, .handle = 0x1234, .length = Iocp.op_connect, .token = token, .serial = 88 };
+    try std.testing.expect(Iocp.matchesCancel(cancel_connect, connecting));
+    try std.testing.expect(!Iocp.matchesCancel(cancel_connect, .{ .op = Iocp.op_connect, .handle = 0x1234, .token = token, .serial = 89 }));
+
+    var cancelled_iosb = std.mem.zeroes(std.os.windows.IO_STATUS_BLOCK);
+    cancelled_iosb.u.Status = .CANCELLED;
+    const canceled_connect = Iocp.finishPosted(connecting, cancelled_iosb, "", null);
+    try std.testing.expectEqual(Op.connect, canceled_connect.op);
+    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), canceled_connect.result);
+}
+
+test "IOCP ready queue preserves order while growing past one submit batch" {
+    var backend = Iocp.unopened(32);
+    defer backend.deinit();
+    try backend.ensureReadyCapacity(320);
+    for (0..320) |i| {
+        try backend.pushReady(.{ .op = .send, .token = .{ .slot = @intCast(i + 1), .gen = 1 }, .result = @intCast(i) });
+    }
+    for (0..100) |i| {
+        const event = backend.popReady().?;
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), event.token.slot);
+    }
+    try backend.ensureReadyCapacity(100);
+    for (320..420) |i| {
+        try backend.pushReady(.{ .op = .send, .token = .{ .slot = @intCast(i + 1), .gen = 1 }, .result = @intCast(i) });
+    }
+    for (100..420) |i| {
+        const event = backend.popReady().?;
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), event.token.slot);
+        try std.testing.expectEqual(@as(i32, @intCast(i)), event.result);
+    }
+    try std.testing.expectEqual(@as(?Reaped, null), backend.popReady());
+}
+
+test "Windows IOCP keeps slab status addresses stable across 320 pending accepts" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.iocp, 32, .{});
+    defer backend.deinit();
+    var listeners: [320]linux.fd_t = @splat(-1);
+    defer for (listeners) |fd| closeSocket(fd);
+    defer backend.quiesce() catch @panic("IOCP slab test requests remained in use");
+    var first_iosb: usize = 0;
+    for (&listeners, 0..) |*fd, i| {
+        const listener = try listenTcp("127.0.0.1", 0);
+        fd.* = listener.fd;
+        try backend.accept(.{ .slot = @intCast(i + 1), .gen = 7 }, listener.fd);
+        if (backend.queuedCount() == 32) {
+            try std.testing.expectEqual(@as(u32, 32), try backend.submit());
+            if (i == 31) {
+                const slab = backend.iocp.?.slabs.items[0];
+                for (&slab.slots) |*slot| {
+                    if (slot.live and slot.packet.token == Iocp.packToken(.{ .slot = 1, .gen = 7 })) {
+                        first_iosb = @intFromPtr(&slot.iosb);
+                        break;
+                    }
+                }
+                try std.testing.expect(first_iosb != 0);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 320), backend.iocp.?.liveCount());
+    try std.testing.expect(backend.iocp.?.slabs.items.len >= 2);
+    try std.testing.expectEqual(first_iosb, @intFromPtr(&backend.iocp.?.findSlotByApc(first_iosb).?.iosb));
+
+    const first = ringlane.FdToken{ .slot = 1, .gen = 7 };
+    const last = ringlane.FdToken{ .slot = 320, .gen = 7 };
+    try backend.cancel(.accept, first);
+    try backend.cancel(.accept, last);
+    try std.testing.expectEqual(@as(u32, 2), try backend.submit());
+    var events: [2]Reaped = undefined;
+    var seen_first = false;
+    var seen_last = false;
+    for (0..20) |_| {
+        const count = try backend.reap(&events, 100);
+        for (events[0..count]) |event| {
+            try std.testing.expectEqual(Op.accept, event.op);
+            try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), event.result);
+            if (std.meta.eql(event.token, first)) seen_first = true else if (std.meta.eql(event.token, last)) seen_last = true else return error.UnexpectedToken;
+        }
+        if (seen_first and seen_last) break;
+    }
+    try std.testing.expect(seen_first and seen_last);
+    try std.testing.expectEqual(@as(usize, 318), backend.iocp.?.liveCount());
+    try backend.quiesce();
+    try std.testing.expectEqual(@as(usize, 0), backend.iocp.?.liveCount());
+
+    // A later failed post must not strand the first kernel request or leave
+    // the never-posted request registered for a token that cannot complete.
+    const posted = ringlane.FdToken{ .slot = 321, .gen = 7 };
+    const unposted = ringlane.FdToken{ .slot = 322, .gen = 7 };
+    try backend.accept(posted, listeners[0]);
+    backend.iocp.?.packets[backend.iocp.?.n] = .{ .op = 0xff };
+    backend.iocp.?.n += 1;
+    try backend.accept(unposted, listeners[1]);
+    try std.testing.expectError(error.MissingOp, backend.submit());
+    try std.testing.expect(backend.iocp.?.submit_failed);
+    try std.testing.expectEqual(@as(usize, 1), backend.iocp.?.liveCount());
+    try std.testing.expect(backend.iocp.?.lookup(Iocp.packToken(unposted), Iocp.op_accept) == null);
+    try std.testing.expectError(error.MissingOp, backend.accept(.{ .slot = 323, .gen = 7 }, listeners[2]));
+    try backend.quiesce();
+    try std.testing.expectEqual(@as(usize, 0), backend.iocp.?.liveCount());
+}
+
+test "Windows IOCP quiesce releases never-posted token registrations" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.iocp, 4, .{});
+    defer backend.deinit();
+    const listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(listener.fd);
+    defer backend.quiesce() catch @panic("IOCP queued-token test requests remained in use");
+
+    const token = ringlane.FdToken{ .slot = 451, .gen = 12 };
+    try backend.accept(token, listener.fd);
+    try std.testing.expectEqual(@as(usize, 1), backend.queuedCount());
+    try backend.quiesce();
+    try std.testing.expectEqual(@as(usize, 0), backend.queuedCount());
+    try backend.accept(token, listener.fd);
+    try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+    try backend.cancel(.accept, token);
+    try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+    var event: [1]Reaped = undefined;
+    try std.testing.expectEqual(@as(u32, 1), try backend.reap(&event, 1000));
+    try std.testing.expectEqual(Op.accept, event[0].op);
+    try std.testing.expectEqual(token, event[0].token);
+    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), event[0].result);
+}
+
+test "IOCP AFD poll decodes output events instead of IOSB byte count" {
+    try std.testing.expectEqual(
+        afd_poll_receive | afd_poll_accept | afd_poll_disconnect | afd_poll_abort | afd_poll_local_close,
+        Iocp.afdPollRequest(linux.POLL.IN),
+    );
+    try std.testing.expectEqual(
+        afd_poll_send | afd_poll_connect_fail | afd_poll_disconnect | afd_poll_abort | afd_poll_local_close,
+        Iocp.afdPollRequest(linux.POLL.OUT),
+    );
+    const token = ringlane.FdToken{ .slot = 33, .gen = 4 };
+    const packet = Iocp.Packet{ .op = Iocp.op_poll, .handle = 0x1234, .length = linux.POLL.IN | linux.POLL.OUT, .token = Iocp.packToken(token) };
+    var iosb = std.mem.zeroes(std.os.windows.IO_STATUS_BLOCK);
+    iosb.u.Status = .SUCCESS;
+    iosb.Information = @sizeOf(AfdPollInfo);
+    var output = AfdPollInfo{ .timeout = 0, .handle_count = 1, .exclusive = 0, .handles = .{ .handle = packet.handle, .events = afd_poll_send, .status = 0 } };
+    var done = Iocp.finishPosted(packet, iosb, "", &output);
+    try std.testing.expectEqual(Op.poll, done.op);
+    try std.testing.expectEqual(token, done.token);
+    try std.testing.expectEqual(@as(i32, linux.POLL.OUT), done.result);
+    output.handles.events = afd_poll_receive;
+    done = Iocp.finishPosted(packet, iosb, "", &output);
+    try std.testing.expectEqual(@as(i32, linux.POLL.IN), done.result);
+    output.handles.events = afd_poll_disconnect;
+    done = Iocp.finishPosted(packet, iosb, "", &output);
+    try std.testing.expectEqual(@as(i32, linux.POLL.IN | linux.POLL.HUP), done.result);
+    output.handle_count = 0;
+    try std.testing.expectEqual(@as(i32, -1), Iocp.finishPosted(packet, iosb, "", &output).result);
+    output.handle_count = 1;
+    output.handles.handle = 0x9999;
+    try std.testing.expectEqual(@as(i32, -1), Iocp.finishPosted(packet, iosb, "", &output).result);
+    iosb.u.Status = .CANCELLED;
+    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), Iocp.finishPosted(packet, iosb, "", &output).result);
+}
+
+test "Windows IOCP AFD poll reports native loopback readiness masks" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.iocp, 8, .{});
+    defer backend.deinit();
+    const listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(listener.fd);
+    const peer = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    if (!socketLive(peer)) return error.SocketUnavailable;
+    defer _ = closesocket(peer);
+    const addr = RioSockAddr{ .family = @intCast(wsa_af_inet), .port = std.mem.nativeToBig(u16, listener.port), .addr = std.mem.nativeToBig(u32, 0x7f000001), .zero = @splat(0) };
+    if (connect(peer, &addr, @sizeOf(RioSockAddr)) != 0) return error.SocketUnavailable;
+    const accepted = try pullAccept(listener.fd);
+    defer closeSocket(accepted);
+    defer backend.quiesce() catch @panic("AFD poll test request remained in use");
+    const writable_token = ringlane.FdToken{ .slot = 51, .gen = 1 };
+    try backend.poll(writable_token, accepted, linux.POLL.OUT);
+    try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+    var events: [1]Reaped = undefined;
+    try std.testing.expectEqual(@as(u32, 1), try backend.reap(&events, 1000));
+    try std.testing.expectEqual(Op.poll, events[0].op);
+    try std.testing.expectEqual(writable_token, events[0].token);
+    try std.testing.expectEqual(@as(i32, linux.POLL.OUT), events[0].result);
+
+    const readable_token = ringlane.FdToken{ .slot = 52, .gen = 1 };
+    try backend.poll(readable_token, accepted, linux.POLL.IN);
+    try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+    const payload: []const u8 = "p";
+    try std.testing.expectEqual(@as(i32, 1), send(peer, payload.ptr, 1, 0));
+    try std.testing.expectEqual(@as(u32, 1), try backend.reap(&events, 1000));
+    try std.testing.expectEqual(Op.poll, events[0].op);
+    try std.testing.expectEqual(readable_token, events[0].token);
+    try std.testing.expectEqual(@as(i32, linux.POLL.IN), events[0].result);
+}
+
+test "Windows IOCP ConnectEx completes loopback and cancels exact outbound token" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.iocp, 8, .{});
+    defer backend.deinit();
+    const canceled_listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(canceled_listener.fd);
+    const live_listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(live_listener.fd);
+    const canceled_socket = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    if (!socketLive(canceled_socket)) return error.SocketUnavailable;
+    const canceled_fd = adoptWindowsSocket(canceled_socket) catch |err| {
+        _ = closesocket(canceled_socket);
+        return err;
+    };
+    defer closeSocket(canceled_fd);
+    const live_socket = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    if (!socketLive(live_socket)) return error.SocketUnavailable;
+    const live_fd = adoptWindowsSocket(live_socket) catch |err| {
+        _ = closesocket(live_socket);
+        return err;
+    };
+    defer closeSocket(live_fd);
+    defer backend.quiesce() catch @panic("ConnectEx test requests remained in use");
+
+    var canceled_addr = RioSockAddr{ .family = @intCast(wsa_af_inet), .port = std.mem.nativeToBig(u16, canceled_listener.port), .addr = std.mem.nativeToBig(u32, 0x7f000001), .zero = @splat(0) };
+    var live_addr = RioSockAddr{ .family = @intCast(wsa_af_inet), .port = std.mem.nativeToBig(u16, live_listener.port), .addr = std.mem.nativeToBig(u32, 0x7f000001), .zero = @splat(0) };
+    const canceled_token = ringlane.FdToken{ .slot = 41, .gen = 5 };
+    const live_token = ringlane.FdToken{ .slot = 42, .gen = 5 };
+    try backend.connect(canceled_token, canceled_fd, @ptrCast(&canceled_addr), @sizeOf(RioSockAddr));
+    try backend.connect(live_token, live_fd, @ptrCast(&live_addr), @sizeOf(RioSockAddr));
+    // Enqueue copies the endpoint: these caller-owned addresses can change
+    // before submit without redirecting the pending request.
+    canceled_addr.port = 0;
+    live_addr.port = 0;
+    try backend.cancel(.connect, canceled_token);
+    try std.testing.expectEqual(@as(u32, 3), try backend.submit());
+
+    var events: [2]Reaped = undefined;
+    var seen_canceled = false;
+    var seen_live = false;
+    for (0..20) |_| {
+        const count = try backend.reap(&events, 100);
+        for (events[0..count]) |event| {
+            try std.testing.expectEqual(Op.connect, event.op);
+            if (std.meta.eql(event.token, canceled_token)) {
+                try std.testing.expect(!seen_canceled);
+                try std.testing.expect(event.result == 0 or event.result == -@as(i32, @intFromEnum(linux.E.CANCELED)));
+                seen_canceled = true;
+            } else {
+                try std.testing.expectEqual(live_token, event.token);
+                try std.testing.expect(!seen_live);
+                try std.testing.expectEqual(@as(i32, 0), event.result);
+                seen_live = true;
+            }
+        }
+        if (seen_canceled and seen_live) break;
+    }
+    try std.testing.expect(seen_canceled and seen_live);
+    const accepted = try pullAccept(live_listener.fd);
+    defer closeSocket(accepted);
+    var recv_timeout: i32 = 1000;
+    try std.testing.expectEqual(@as(i32, 0), setsockopt(windows_sockets.get(accepted).?, sol_socket, so_rcvtimeo, &recv_timeout, @sizeOf(i32)));
+    try std.testing.expectEqual(@as(i32, 0), shutdown(live_socket, 1));
+    var one: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), recv(windows_sockets.get(accepted).?, &one, 1, 0));
+}
+
+test "Windows IOCP associates each socket lifetime and drains cancellation" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.iocp, 8, .{});
+    defer backend.deinit();
+    var previous_fd: linux.fd_t = -1;
+    for (0..24) |iteration| {
+        const listener = try listenTcp("127.0.0.1", 0);
+        defer closeSocket(listener.fd);
+        try std.testing.expect(listener.fd != previous_fd);
+        try std.testing.expectEqual(@as(?usize, 0), windows_sockets.associatedPort(listener.fd));
+        const token = ringlane.FdToken{ .slot = @intCast(iteration + 1), .gen = 1 };
+        try backend.accept(token, listener.fd);
+        try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+        try std.testing.expectEqual(@as(usize, 1), backend.iocp.?.liveCount());
+        try std.testing.expectEqual(@as(?usize, backend.iocp.?.port), windows_sockets.associatedPort(listener.fd));
+        try backend.cancel(.accept, token);
+        _ = try backend.submit();
+        try backend.quiesce();
+        try std.testing.expectEqual(@as(usize, 0), backend.iocp.?.liveCount());
+        previous_fd = listener.fd;
+    }
+}
+
+test "Windows IOCP quiesce drains more than 64 pending requests" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.iocp, 128, .{});
+    defer backend.deinit();
+    var listeners: [96]linux.fd_t = @splat(-1);
+    defer for (listeners) |fd| closeSocket(fd);
+    for (&listeners, 0..) |*fd, i| {
+        const listener = try listenTcp("127.0.0.1", 0);
+        fd.* = listener.fd;
+        try backend.accept(.{ .slot = @intCast(i + 1), .gen = 1 }, listener.fd);
+    }
+    try std.testing.expectEqual(@as(u32, listeners.len), try backend.submit());
+    try std.testing.expectEqual(listeners.len, backend.iocp.?.liveCount());
+    try backend.quiesce();
+    try std.testing.expectEqual(@as(usize, 0), backend.iocp.?.liveCount());
+}
+
+test "Windows IOCP quiesce retains pending recv and send buffers" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.iocp, 8, .{});
+    defer backend.deinit();
+    const listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(listener.fd);
+    const peer = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    if (!socketLive(peer)) return error.SocketUnavailable;
+    defer _ = closesocket(peer);
+    const addr = RioSockAddr{
+        .family = @intCast(wsa_af_inet),
+        .port = std.mem.nativeToBig(u16, listener.port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        .zero = @splat(0),
+    };
+    if (connect(peer, &addr, @sizeOf(RioSockAddr)) != 0) return error.SocketUnavailable;
+    var accepted = try pullAccept(listener.fd);
+    defer if (accepted >= 0) closeSocket(accepted);
+    const accepted_handle = windows_sockets.get(accepted).?;
+    var sndbuf: i32 = 4096;
+    try std.testing.expectEqual(@as(i32, 0), setsockopt(accepted_handle, sol_socket, 0x1001, &sndbuf, @sizeOf(i32)));
+
+    var recv_buf: [64]u8 = undefined;
+    const send_buf = try std.testing.allocator.alloc(u8, 16 * 1024 * 1024);
+    defer std.testing.allocator.free(send_buf);
+    @memset(send_buf, 's');
+    // On any assertion failure, drain before either buffer's defer runs.
+    defer backend.quiesce() catch @panic("IOCP test buffers remained in use");
+    try backend.recv(.{ .slot = 1, .gen = 1 }, accepted, &recv_buf);
+    for (0..4) |i| {
+        try backend.send(.{ .slot = @intCast(i + 2), .gen = 1 }, accepted, send_buf);
+    }
+    try std.testing.expectEqual(@as(u32, 5), try backend.submit());
+    // Recv has no incoming data; repeated sends fill the small socket buffer
+    // and leave at least one send waiting for the unread peer.
+    try std.testing.expect(backend.iocp.?.liveCount() >= 2);
+    try backend.quiesce();
+    try std.testing.expectEqual(@as(usize, 0), backend.iocp.?.liveCount());
+
+    // A closed socket makes NtCancelIoFileEx report INVALID_HANDLE while the
+    // original completion can still be queued. The IOSB must survive until
+    // that queued completion is collected.
+    var late_recv: [32]u8 = undefined;
+    try backend.recv(.{ .slot = 12, .gen = 1 }, accepted, &late_recv);
+    try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+    closeSocket(accepted);
+    accepted = -1;
+    try backend.quiesce();
+    try std.testing.expectEqual(@as(usize, 0), backend.iocp.?.liveCount());
+}
+
+test "Windows IOCP delivers exact timeout tokens and cancels only the target" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.iocp, 8, .{});
+    defer backend.deinit();
+    const canceled = ringlane.FdToken{ .slot = 17, .gen = 3 };
+    const expired = ringlane.FdToken{ .slot = 18, .gen = 4 };
+    var long = linux.kernel_timespec{ .sec = 10, .nsec = 0 };
+    var short = linux.kernel_timespec{ .sec = 0, .nsec = 20_000_000 };
+    try backend.timeout(canceled, &long);
+    try backend.timeout(expired, &short);
+    try std.testing.expectEqual(@as(u32, 2), try backend.submit());
+    try backend.cancel(.timeout, canceled);
+    try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+    var events: [2]Reaped = undefined;
+    try std.testing.expectEqual(@as(u32, 1), try backend.reap(&events, 500));
+    try std.testing.expectEqual(Op.timeout, events[0].op);
+    try std.testing.expectEqual(expired, events[0].token);
+    try std.testing.expectEqual(@as(i32, 0), events[0].result);
+    try std.testing.expectEqual(@as(u32, 0), try backend.reap(&events, 0));
+    try std.testing.expectError(error.MissingOp, backend.cancel(.timeout, canceled));
+    try std.testing.expectError(error.MissingOp, backend.cancel(.timeout, expired));
+
+    // A canceled operation may be replaced under the same public token
+    // before the old completion is collected. Its serial keeps cancel exact.
+    try backend.timeout(canceled, &long);
+    _ = try backend.submit();
+    try backend.cancel(.timeout, canceled);
+    try backend.timeout(canceled, &short);
+    try std.testing.expectEqual(@as(u32, 2), try backend.submit());
+    try std.testing.expectEqual(@as(u32, 1), try backend.reap(&events, 500));
+    try std.testing.expectEqual(canceled, events[0].token);
+    try std.testing.expectEqual(@as(u32, 0), try backend.reap(&events, 0));
+}
+
+test "Windows IOCP reuses timer storage after repeated expiry" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.iocp, 8, .{});
+    defer backend.deinit();
+    var instant = linux.kernel_timespec{ .sec = 0, .nsec = 0 };
+    var events: [1]Reaped = undefined;
+    for (0..100) |i| {
+        const token = ringlane.FdToken{ .slot = @intCast(i + 1), .gen = 7 };
+        try backend.timeout(token, &instant);
+        try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+        try std.testing.expectEqual(@as(u32, 1), try backend.reap(&events, 0));
+        try std.testing.expectEqual(Op.timeout, events[0].op);
+        try std.testing.expectEqual(token, events[0].token);
+        try std.testing.expectEqual(@as(usize, 8), backend.iocp.?.timers.len);
+    }
+    const canceled = ringlane.FdToken{ .slot = 200, .gen = 8 };
+    try backend.timeout(canceled, &instant);
+    try backend.cancel(.timeout, canceled);
+    try std.testing.expectEqual(@as(u32, 2), try backend.submit());
+    try std.testing.expectEqual(@as(u32, 0), try backend.reap(&events, 0));
+}
+
+test "Windows AFD adopted sockets can half-close with a TCP FIN" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var backend = try IoBackend.openOwned(.iocp, 8, .{});
+    defer backend.deinit();
+    for (0..16) |i| {
+        const listener = try listenTcp("127.0.0.1", 0);
+        defer closeSocket(listener.fd);
+        try backend.accept(.{ .slot = @intCast(i + 1), .gen = 1 }, listener.fd);
+        try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+        const peer = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+        if (!socketLive(peer)) return error.SocketUnavailable;
+        defer _ = closesocket(peer);
+        var recv_timeout: i32 = 1000;
+        try std.testing.expectEqual(@as(i32, 0), setsockopt(peer, sol_socket, so_rcvtimeo, &recv_timeout, @sizeOf(i32)));
+        const addr = RioSockAddr{
+            .family = @intCast(wsa_af_inet),
+            .port = std.mem.nativeToBig(u16, listener.port),
+            .addr = std.mem.nativeToBig(u32, 0x7f000001),
+            .zero = @splat(0),
+        };
+        try std.testing.expectEqual(@as(i32, 0), connect(peer, &addr, @sizeOf(RioSockAddr)));
+        var events: [1]Reaped = undefined;
+        var n: u32 = 0;
+        for (0..10) |_| {
+            n = try backend.reap(&events, 100);
+            if (n != 0) break;
+        }
+        try std.testing.expectEqual(@as(u32, 1), n);
+        try std.testing.expectEqual(Op.accept, events[0].op);
+        try std.testing.expect(events[0].result >= 0);
+        const accepted = events[0].result;
+        defer closeSocket(accepted);
+        var recv_buf: [16]u8 = undefined;
+        const recv_token = ringlane.FdToken{ .slot = @intCast(i + 100), .gen = 2 };
+        try backend.recv(recv_token, accepted, &recv_buf);
+        _ = try backend.submit();
+        try backend.cancel(.recv, recv_token);
+        _ = try backend.submit();
+        n = 0;
+        for (0..10) |_| {
+            n = try backend.reap(&events, 100);
+            if (n != 0) break;
+        }
+        try std.testing.expectEqual(@as(u32, 1), n);
+        try std.testing.expectEqual(Op.recv, events[0].op);
+        try std.testing.expect(events[0].result < 0);
+        try std.testing.expectEqual(@as(i32, 0), shutdown(windows_sockets.get(accepted).?, 1));
+        var one: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(i32, 0), recv(peer, &one, 1, 0));
+    }
+}
 
 pub const ListenError = error{ InvalidAddress, SocketUnavailable, AddressInUse, PermissionDenied, Unsupported };
 
@@ -153,6 +776,15 @@ pub const IoBackend = struct {
         }
     }
 
+    /// Finish every posted Windows request before its caller-owned buffers or
+    /// the backend's IO_STATUS_BLOCK storage can be released.
+    pub fn quiesce(self: *IoBackend) !void {
+        if (comptime builtin.os.tag != .windows) return;
+        if (self.family != .iocp) return;
+        const iocp = self.iocp orelse return;
+        try iocp.quiesceWindows();
+    }
+
     /// Move the owned Linux ring out. The caller deinits that ring.
     /// IOCP and kqueue have nothing to move.
     pub fn detachOwned(self: *IoBackend) ?ringlane.Ring {
@@ -182,8 +814,7 @@ pub const IoBackend = struct {
                 const iocp = self.iocp orelse return false;
                 if (iocp.port == 0) return false;
                 return switch (op) {
-                    .accept, .recv, .send, .poll, .cancel, .timeout => true,
-                    .connect => false,
+                    .accept, .recv, .send, .poll, .cancel, .timeout, .connect => true,
                 };
             },
         }
@@ -281,13 +912,14 @@ pub const IoBackend = struct {
 
     pub fn queuedCount(self: *const IoBackend) u32 {
         if (self.kq) |kq| return kq.n;
+        if (self.iocp) |iocp| return iocp.n;
         return 0;
     }
 
     pub fn connect(self: *IoBackend, token: ringlane.FdToken, fd: linux.fd_t, addr: *const std.posix.sockaddr, addrlen: std.posix.socklen_t) !void {
         switch (self.family) {
             .kqueue => return (try self.kqueuePtr()).enqueueConnect(token, fd, addr, addrlen),
-            .iocp => return error.MissingOp,
+            .iocp => return (try self.iocpPtr()).enqueueConnect(token, fd, addr, addrlen),
             .ringlane => {
                 if (comptime builtin.os.tag != .linux) return error.MissingOp;
                 return (self.ringPtr() orelse return error.MissingOp).submitConnect(token, fd, addr, addrlen);
@@ -1267,7 +1899,8 @@ const Kqueue = struct {
 /// is `(FILE_DEVICE_NETWORK << 12) | (operation << 2) | method`. Recv and
 /// send are `IOCTL_AFD_RECEIVE` / `IOCTL_AFD_SEND` (`0x12017` / `0x1201F`).
 /// A raw `NtReadFile` on an AFD socket returns `STATUS_INVALID_PARAMETER`.
-/// Timeout arms an NT timer and does not synthesize a completion packet.
+/// Timeout uses a monotonic deadline and is returned by `reap` with its
+/// original token. A timer does not need an NT handle or completion packet.
 /// `STATUS_SUCCESS` is a finished AFD operation and `reap` returns it before
 /// waiting. `STATUS_PENDING` is reported only from `NtRemoveIoCompletion`.
 /// A duplicate port packet for that slot is discarded. Winsock `accept`
@@ -1296,6 +1929,14 @@ const AfdPollInfo = extern struct {
     exclusive: u32,
     handles: AfdPollHandle,
 };
+
+const afd_poll_receive: u32 = 0x0001;
+const afd_poll_send: u32 = 0x0004;
+const afd_poll_disconnect: u32 = 0x0008;
+const afd_poll_abort: u32 = 0x0010;
+const afd_poll_local_close: u32 = 0x0020;
+const afd_poll_accept: u32 = 0x0080;
+const afd_poll_connect_fail: u32 = 0x0100;
 
 /// `WSABUF` and `AFD_RECV_INFO` / `AFD_SEND_INFO`. The pointer inside the
 /// info struct must stay valid until the request completes.
@@ -1337,28 +1978,24 @@ const Iocp = struct {
     rio: RioTable = .{},
     packets: [submit_batch]Packet = @splat(.{}),
     regs: []Reg = &.{},
-    armed: []usize = &.{},
-    /// Handles already associated with `port`. A second association fails.
-    bound: []usize = &.{},
-    /// Live for the life of the port. A pending NT request writes these after
-    /// `postOne` returns; a stack copy would dangle.
-    iosbs: [submit_batch]std.os.windows.IO_STATUS_BLOCK = undefined,
-    /// In-flight AFD ops. A slot stays live until `reap` collects its IOSB.
-    /// `submit_batch` is the in-flight batch, not a connection ceiling.
-    slot_live: [submit_batch]bool = @splat(false),
-    slot_pkt: [submit_batch]Packet = @splat(.{}),
-    poll_infos: [submit_batch]AfdPollInfo = undefined,
-    wsa_bufs: [submit_batch]AfdWsaBuf = undefined,
-    data_infos: [submit_batch]AfdDataInfo = undefined,
-    /// `AFD_LISTEN_RESPONSE_INFO_TL` is a sequence plus a `SOCKADDR`.
-    accept_outs: [submit_batch][128]u8 = undefined,
-    /// Finished before the port wait. One slot, one result; this is not a
-    /// connection ceiling.
-    ready: [submit_batch]Reaped = undefined,
-    ready_head: u16 = 0,
-    ready_n: u16 = 0,
+    timers: []Timer = &.{},
+    next_serial: u64 = 1,
+    /// Every slab is separately allocated and never moves while the port is
+    /// live. The kernel may write any slot's IOSB, OVERLAPPED, AFD input or
+    /// output after submit returns. The pointer vectors themselves may grow.
+    slabs: std.ArrayList(*Slab) = .empty,
+    free_slots: std.ArrayList(*Slot) = .empty,
+    live_slots: usize = 0,
+    /// Inline completions are reserved before posting a batch, so a finished
+    /// kernel request never needs an allocation to publish its result.
+    ready: std.ArrayList(Reaped) = .empty,
+    ready_head: usize = 0,
+    /// A failed kernel post can follow successful posts from the same batch.
+    /// Only reaping and quiesce are safe after that partial submission.
+    submit_failed: bool = false,
 
     pub const submit_batch = 256;
+    const slab_size = 256;
 
     pub const op_accept: u8 = 1;
     pub const op_recv: u8 = 2;
@@ -1366,6 +2003,7 @@ const Iocp = struct {
     pub const op_timeout: u8 = 4;
     pub const op_poll: u8 = 6;
     pub const op_cancel: u8 = 7;
+    pub const op_connect: u8 = 8;
 
     /// FILE_DEVICE_NETWORK is 0x12. AFD wait-for-listen is operation 3,
     /// METHOD_BUFFERED. AFD receive is operation 5 and AFD send is operation
@@ -1379,16 +2017,48 @@ const Iocp = struct {
     pub const Packet = struct {
         op: u8 = 0,
         handle: usize = 0,
+        socket_fd: linux.fd_t = -1,
         length: u32 = 0,
         token: usize = 0,
         ioctl: u32 = 0,
         buf: usize = 0,
+        serial: u64 = 0,
+        connect_addr: [28]u8 = @splat(0),
+        connect_len: u8 = 0,
+    };
+
+    const Slot = struct {
+        live: bool = false,
+        packet: Packet = .{},
+        iosb: std.os.windows.IO_STATUS_BLOCK = undefined,
+        cancel_iosb: std.os.windows.IO_STATUS_BLOCK = undefined,
+        connect_overlapped: WsaOverlapped = undefined,
+        connect_addr: [28]u8 = undefined,
+        connect_sent: u32 = undefined,
+        poll_info: AfdPollInfo = undefined,
+        poll_out: AfdPollInfo = undefined,
+        wsa_buf: AfdWsaBuf = undefined,
+        data_info: AfdDataInfo = undefined,
+        /// `AFD_LISTEN_RESPONSE_INFO_TL` is a sequence plus a `SOCKADDR`.
+        accept_out: [128]u8 = undefined,
+    };
+
+    const Slab = struct {
+        slots: [slab_size]Slot = @splat(.{}),
     };
 
     const Reg = struct {
         token: usize = 0,
         handle: usize = 0,
         op: u8 = 0,
+        serial: u64 = 0,
+        live: bool = false,
+    };
+
+    const Timer = struct {
+        token: usize = 0,
+        serial: u64 = 0,
+        deadline_ms: u64 = 0,
         live: bool = false,
     };
 
@@ -1418,7 +2088,12 @@ const Iocp = struct {
     }
 
     pub fn deinit(self: *Iocp) void {
-        if (comptime builtin.os.tag == .windows) self.closeWindows();
+        if (comptime builtin.os.tag == .windows) {
+            // A caller may forget the explicit quiesce. Never free an IOSB
+            // while the kernel can still write to it.
+            self.quiesceWindows() catch @panic("IOCP requests could not be drained");
+            self.closeWindows();
+        }
         self.port = 0;
         self.n = 0;
         self.rio = .{};
@@ -1426,104 +2101,159 @@ const Iocp = struct {
             std.heap.page_allocator.free(self.regs);
             self.regs = &.{};
         }
-        if (self.armed.len != 0) {
-            std.heap.page_allocator.free(self.armed);
-            self.armed = &.{};
+        if (self.timers.len != 0) {
+            std.heap.page_allocator.free(self.timers);
+            self.timers = &.{};
         }
-        if (self.bound.len != 0) {
-            std.heap.page_allocator.free(self.bound);
-            self.bound = &.{};
-        }
+        for (self.slabs.items) |slab| std.heap.page_allocator.destroy(slab);
+        self.slabs.deinit(std.heap.page_allocator);
+        self.slabs = .empty;
+        self.free_slots.deinit(std.heap.page_allocator);
+        self.free_slots = .empty;
+        self.ready.deinit(std.heap.page_allocator);
+        self.ready = .empty;
+        self.ready_head = 0;
+        self.live_slots = 0;
     }
 
     pub fn enqueueAccept(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t) !void {
+        if (self.n >= self.cap) return error.SubmissionQueueFull;
         const handle = try handleOf(fd);
-        try self.remember(packToken(token), handle, op_accept);
+        const serial = try self.remember(packToken(token), handle, op_accept);
         return self.pushStored(.{
             .op = op_accept,
             .handle = handle,
+            .socket_fd = fd,
             .token = packToken(token),
+            .serial = serial,
             .ioctl = ioctl_afd_wait_for_listen,
         });
     }
 
     pub fn enqueueRecv(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t, buffer: []u8) !void {
+        if (self.n >= self.cap) return error.SubmissionQueueFull;
         if (buffer.len == 0 or buffer.len > std.math.maxInt(u32)) return error.MissingOp;
         const handle = try handleOf(fd);
-        try self.remember(packToken(token), handle, op_recv);
+        const serial = try self.remember(packToken(token), handle, op_recv);
         return self.pushStored(.{
             .op = op_recv,
             .handle = handle,
+            .socket_fd = fd,
             .length = @intCast(buffer.len),
             .token = packToken(token),
+            .serial = serial,
             .buf = @intFromPtr(buffer.ptr),
             .ioctl = ioctl_afd_receive,
         });
     }
 
     pub fn enqueueSend(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t, buffer: []const u8) !void {
+        if (self.n >= self.cap) return error.SubmissionQueueFull;
         if (buffer.len == 0 or buffer.len > std.math.maxInt(u32)) return error.MissingOp;
         const handle = try handleOf(fd);
-        try self.remember(packToken(token), handle, op_send);
+        const serial = try self.remember(packToken(token), handle, op_send);
         return self.pushStored(.{
             .op = op_send,
             .handle = handle,
+            .socket_fd = fd,
             .length = @intCast(buffer.len),
             .token = packToken(token),
+            .serial = serial,
             .buf = @intFromPtr(buffer.ptr),
             .ioctl = ioctl_afd_send,
         });
     }
 
     pub fn enqueuePoll(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t, poll_mask: u32) !void {
-        if (poll_mask == 0) return error.MissingOp;
+        if (self.n >= self.cap) return error.SubmissionQueueFull;
+        const supported = linux.POLL.IN | linux.POLL.OUT;
+        if (poll_mask == 0 or poll_mask & ~@as(u32, supported) != 0) return error.MissingOp;
         const handle = try handleOf(fd);
-        try self.remember(packToken(token), handle, op_poll);
+        const serial = try self.remember(packToken(token), handle, op_poll);
         return self.pushStored(.{
             .op = op_poll,
             .handle = handle,
+            .socket_fd = fd,
             .length = poll_mask,
             .token = packToken(token),
+            .serial = serial,
             .ioctl = ioctl_afd_poll,
         });
     }
 
+    pub fn enqueueConnect(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t, addr: *const std.posix.sockaddr, addrlen: std.posix.socklen_t) !void {
+        if (self.n >= self.cap) return error.SubmissionQueueFull;
+        const len: usize = @intCast(addrlen);
+        if (len != @sizeOf(RioSockAddr) and len != @sizeOf(RioSockAddr6)) return error.MissingOp;
+        const bytes = @as([*]const u8, @ptrCast(addr))[0..len];
+        const family = std.mem.readInt(u16, bytes[0..2], .native);
+        if ((family == wsa_af_inet and len != @sizeOf(RioSockAddr)) or
+            (family == wsa_af_inet6 and len != @sizeOf(RioSockAddr6)) or
+            (family != wsa_af_inet and family != wsa_af_inet6)) return error.MissingOp;
+        const handle = try handleOf(fd);
+        const serial = try self.remember(packToken(token), handle, op_connect);
+        var packet = Packet{
+            .op = op_connect,
+            .handle = handle,
+            .socket_fd = fd,
+            .token = packToken(token),
+            .serial = serial,
+            .connect_len = @intCast(len),
+        };
+        @memcpy(packet.connect_addr[0..len], bytes);
+        return self.pushStored(packet);
+    }
+
     pub fn enqueueCancel(self: *Iocp, kind: ringlane.OpKind, token: ringlane.FdToken) !void {
+        if (self.submit_failed) return error.MissingOp;
         const op: u8 = switch (kind) {
             .accept => op_accept,
             .recv => op_recv,
             .send => op_send,
             .timeout => op_timeout,
-            .poll, .other, .connect => return error.MissingOp,
+            .poll => op_poll,
+            .connect => op_connect,
+            .other => return error.MissingOp,
         };
         const token_key = packToken(token);
-        const handle = self.lookup(token_key, op) orelse return error.MissingOp;
+        const reg = self.lookup(token_key, op) orelse {
+            // An inline completion has already retired its registration but
+            // may still be in the ready queue. There is nothing left to
+            // cancel; keep its original result for the next reap.
+            if (self.readyHas(token_key, op)) return;
+            return error.MissingOp;
+        };
         const before = self.n;
         self.pushStored(.{
             .op = op_cancel,
-            .handle = handle,
+            .handle = reg.handle,
             .length = op,
             .token = token_key,
+            .serial = reg.serial,
         }) catch |err| {
-            if (self.n != before) self.forget(token_key, op);
+            if (self.n != before) self.forgetSerial(reg.serial);
             return err;
         };
-        self.forget(token_key, op);
+        self.forgetSerial(reg.serial);
     }
 
     pub fn enqueueTimeout(self: *Iocp, token: ringlane.FdToken, ts: *const linux.kernel_timespec) !void {
         const ms = timeoutMillis(ts) orelse return error.MissingOp;
         if (ms > std.math.maxInt(u32)) return error.MissingOp;
-        try self.remember(packToken(token), 0, op_timeout);
+        if (self.n >= self.cap or self.lookup(packToken(token), op_timeout) != null) return error.MissingOp;
+        const serial = try self.remember(packToken(token), 0, op_timeout);
         return self.pushStored(.{
             .op = op_timeout,
             .length = @intCast(ms),
             .token = packToken(token),
+            .serial = serial,
         });
     }
 
     pub fn submit(self: *Iocp) !u32 {
-        if (self.port == 0 or self.n == 0) return error.MissingOp;
+        if (self.submit_failed) return error.MissingOp;
+        if (self.port == 0) return error.MissingOp;
+        if (self.n == 0) return 0;
         if (comptime builtin.os.tag != .windows) return error.MissingOp;
         return self.submitWindows();
     }
@@ -1535,25 +2265,29 @@ const Iocp = struct {
     }
 
     fn pushStored(self: *Iocp, packet: Packet) !void {
-        if (self.n >= self.cap) return error.MissingOp;
+        if (self.submit_failed) return error.MissingOp;
+        if (self.n >= self.cap) return error.SubmissionQueueFull;
         self.packets[self.n] = packet;
         self.n += 1;
         if (self.port == 0) return error.MissingOp;
     }
 
-    fn remember(self: *Iocp, token_key: usize, handle: usize, op: u8) !void {
+    fn remember(self: *Iocp, token_key: usize, handle: usize, op: u8) !u64 {
+        if (self.submit_failed) return error.MissingOp;
+        if (self.next_serial == std.math.maxInt(u64)) return error.MissingOp;
+        const serial = self.next_serial;
         var i: usize = 0;
         while (i < self.regs.len) : (i += 1) {
             if (self.regs[i].live and self.regs[i].token == token_key and self.regs[i].op == op) {
-                self.regs[i].handle = handle;
-                return;
+                return error.MissingOp;
             }
         }
         i = 0;
         while (i < self.regs.len) : (i += 1) {
             if (!self.regs[i].live) {
-                self.regs[i] = .{ .token = token_key, .handle = handle, .op = op, .live = true };
-                return;
+                self.regs[i] = .{ .token = token_key, .handle = handle, .op = op, .serial = serial, .live = true };
+                self.next_serial += 1;
+                return serial;
             }
         }
         const old = self.regs;
@@ -1565,20 +2299,22 @@ const Iocp = struct {
         }
         var z: usize = old.len;
         while (z < grown.len) : (z += 1) grown[z] = .{};
-        grown[old.len] = .{ .token = token_key, .handle = handle, .op = op, .live = true };
+        grown[old.len] = .{ .token = token_key, .handle = handle, .op = op, .serial = serial, .live = true };
         self.regs = grown;
+        self.next_serial += 1;
+        return serial;
     }
 
-    fn lookup(self: *Iocp, token_key: usize, op: u8) ?usize {
+    fn lookup(self: *Iocp, token_key: usize, op: u8) ?Reg {
         for (self.regs) |reg| {
-            if (reg.live and reg.token == token_key and reg.op == op) return reg.handle;
+            if (reg.live and reg.token == token_key and reg.op == op) return reg;
         }
         return null;
     }
 
-    fn forget(self: *Iocp, token_key: usize, op: u8) void {
+    fn forgetSerial(self: *Iocp, serial: u64) void {
         for (self.regs) |*reg| {
-            if (reg.live and reg.token == token_key and reg.op == op) reg.live = false;
+            if (reg.live and reg.serial == serial) reg.live = false;
         }
     }
 
@@ -1593,13 +2329,38 @@ const Iocp = struct {
 
     fn handleOf(fd: linux.fd_t) !usize {
         if (fd < 0) return error.MissingOp;
+        if (comptime builtin.os.tag == .windows) return windows_sockets.get(fd) orelse error.MissingOp;
         return @intCast(fd);
     }
 
     fn timeoutMillis(ts: *const linux.kernel_timespec) ?i64 {
         if (ts.sec < 0 or ts.nsec < 0 or ts.nsec >= 1_000_000_000) return null;
         const sec_ms = std.math.mul(i64, ts.sec, 1000) catch return null;
-        return std.math.add(i64, sec_ms, @divTrunc(ts.nsec, 1_000_000)) catch null;
+        // Rounding down would expire a positive sub-millisecond timeout early.
+        return std.math.add(i64, sec_ms, @divTrunc(ts.nsec + 999_999, 1_000_000)) catch null;
+    }
+
+    fn afdPollRequest(mask: u32) u32 {
+        var events: u32 = afd_poll_disconnect | afd_poll_abort | afd_poll_local_close;
+        if (mask & linux.POLL.IN != 0) events |= afd_poll_receive | afd_poll_accept;
+        if (mask & linux.POLL.OUT != 0) events |= afd_poll_send | afd_poll_connect_fail;
+        return events;
+    }
+
+    fn afdPollResult(packet: Packet, info: *const AfdPollInfo) i32 {
+        if (info.handle_count != 1 or info.handles.handle != packet.handle or info.handles.status != 0)
+            return -1;
+        const events = info.handles.events;
+        var ready: u32 = 0;
+        if (packet.length & linux.POLL.IN != 0 and events & (afd_poll_receive | afd_poll_accept | afd_poll_disconnect | afd_poll_abort) != 0)
+            ready |= linux.POLL.IN;
+        if (packet.length & linux.POLL.OUT != 0 and events & afd_poll_send != 0)
+            ready |= linux.POLL.OUT;
+        if (events & afd_poll_disconnect != 0) ready |= linux.POLL.HUP;
+        if (events & afd_poll_abort != 0) ready |= linux.POLL.ERR | linux.POLL.HUP;
+        if (events & afd_poll_connect_fail != 0) ready |= linux.POLL.ERR | linux.POLL.HUP;
+        if (events & afd_poll_local_close != 0) ready |= linux.POLL.NVAL;
+        return if (ready == 0) -1 else @intCast(ready);
     }
 
     fn openHandle() !usize {
@@ -1615,74 +2376,201 @@ const Iocp = struct {
     fn closeWindows(self: *Iocp) void {
         const w = std.os.windows;
         while (self.popReady()) |ev| {
-            if (ev.op == .accept and ev.result >= 0) _ = closesocket(@intCast(ev.result));
+            if (ev.op == .accept and ev.result >= 0) closeSocket(ev.result);
         }
         if (self.port != 0) {
             _ = w.ntdll.NtClose(@ptrFromInt(self.port));
             self.port = 0;
         }
-        for (self.armed) |timer| {
-            if (timer != 0) _ = w.ntdll.NtClose(@ptrFromInt(timer));
+    }
+
+    fn liveCount(self: *const Iocp) usize {
+        return self.live_slots;
+    }
+
+    fn ensureFreeSlots(self: *Iocp, need: usize) !void {
+        const allocator = std.heap.page_allocator;
+        while (self.free_slots.items.len < need) {
+            const total_slots = std.math.mul(usize, self.slabs.items.len + 1, slab_size) catch return error.OutOfMemory;
+            try self.slabs.ensureUnusedCapacity(allocator, 1);
+            // Reserve for every slot, including those currently in flight.
+            // A completion only appends its pointer and must never allocate.
+            try self.free_slots.ensureTotalCapacity(allocator, total_slots);
+            const slab = try allocator.create(Slab);
+            slab.* = .{};
+            self.slabs.appendAssumeCapacity(slab);
+            for (&slab.slots) |*slot| self.free_slots.appendAssumeCapacity(slot);
         }
     }
 
-    fn rememberTimer(self: *Iocp, timer: usize) !void {
-        const old = self.armed;
-        const grown = std.heap.page_allocator.alloc(usize, old.len + 1) catch return error.OutOfMemory;
+    fn retireSlot(self: *Iocp, slot: *Slot) void {
+        std.debug.assert(slot.live and self.live_slots != 0);
+        slot.live = false;
+        self.live_slots -= 1;
+        self.free_slots.appendAssumeCapacity(slot);
+    }
+
+    fn findSlotByApc(self: *Iocp, apc_addr: usize) ?*Slot {
+        for (self.slabs.items) |slab| {
+            const start = @intFromPtr(&slab.slots);
+            if (apc_addr < start or apc_addr - start >= @sizeOf(Slab)) continue;
+            const index = (apc_addr - start) / @sizeOf(Slot);
+            const slot = &slab.slots[index];
+            if (!slot.live) return null;
+            const request_addr = if (slot.packet.op == op_connect)
+                @intFromPtr(&slot.connect_overlapped)
+            else
+                @intFromPtr(&slot.iosb);
+            return if (request_addr == apc_addr) slot else null;
+        }
+        return null;
+    }
+
+    fn ensureReadyCapacity(self: *Iocp, additional: usize) !void {
+        if (self.ready_head != 0) {
+            const count = self.ready.items.len - self.ready_head;
+            std.mem.copyForwards(Reaped, self.ready.items[0..count], self.ready.items[self.ready_head..]);
+            self.ready.items.len = count;
+            self.ready_head = 0;
+        }
+        try self.ready.ensureUnusedCapacity(std.heap.page_allocator, additional);
+    }
+
+    fn quiesceWindows(self: *Iocp) !void {
+        if (self.port == 0) return;
+        // The caller must stop posting while quiesce runs. Queued requests
+        // never reached the kernel and require no cancellation, but their
+        // token registrations must retire before this port can be reused.
+        for (self.packets[0..self.n]) |packet| self.forgetSerial(packet.serial);
+        self.n = 0;
+        for (self.timers) |*timer| {
+            if (!timer.live) continue;
+            timer.live = false;
+            self.forgetSerial(timer.serial);
+        }
+        while (self.popReady()) |ev| {
+            if (ev.op == .accept and ev.result >= 0) closeSocket(ev.result);
+        }
+        for (self.slabs.items) |slab| {
+            for (&slab.slots) |*slot| {
+                if (slot.live) try self.cancelSlot(slot);
+            }
+        }
+        const start_ms = GetTickCount64();
+        const drain_limit_ms: u64 = 10_000;
+        while (self.liveCount() != 0) {
+            const elapsed_ms = GetTickCount64() -% start_ms;
+            if (elapsed_ms >= drain_limit_ms) return error.DrainTimedOut;
+            const remaining_ms: u32 = @intCast(drain_limit_ms - elapsed_ms);
+            const ev = self.takeOne(@min(remaining_ms, 1000)) catch |err| switch (err) {
+                error.Unmatched => continue,
+                else => return err,
+            };
+            if (ev) |done| {
+                if (done.op == .accept and done.result >= 0) closeSocket(done.result);
+            }
+        }
+    }
+
+    fn rememberTimer(self: *Iocp, token: usize, serial: u64, deadline_ms: u64) !void {
+        for (self.timers) |*timer| {
+            if (timer.live) continue;
+            timer.* = .{ .token = token, .serial = serial, .deadline_ms = deadline_ms, .live = true };
+            return;
+        }
+        const old = self.timers;
+        const new_len = if (old.len == 0) @as(usize, 8) else std.math.mul(usize, old.len, 2) catch return error.OutOfMemory;
+        const grown = std.heap.page_allocator.alloc(Timer, new_len) catch return error.OutOfMemory;
         if (old.len != 0) {
             @memcpy(grown[0..old.len], old);
             std.heap.page_allocator.free(old);
         }
-        grown[old.len] = timer;
-        self.armed = grown;
+        @memset(grown[old.len..], .{});
+        grown[old.len] = .{ .token = token, .serial = serial, .deadline_ms = deadline_ms, .live = true };
+        self.timers = grown;
+    }
+
+    fn cancelTimer(self: *Iocp, serial: u64) !void {
+        for (self.timers) |*timer| {
+            if (!timer.live or timer.serial != serial) continue;
+            timer.live = false;
+            return;
+        }
+        // A zero-delay timer may already have been reaped. Its registration
+        // was valid when cancel was queued, so cancellation is then a no-op.
+    }
+
+    fn dueTimer(self: *Iocp, now_ms: u64) ?Reaped {
+        for (self.timers) |*timer| {
+            if (!timer.live or timer.deadline_ms > now_ms) continue;
+            timer.live = false;
+            self.forgetSerial(timer.serial);
+            return .{ .op = .timeout, .token = .{
+                .slot = @truncate(timer.token),
+                .gen = @truncate(timer.token >> 32),
+            }, .result = 0 };
+        }
+        return null;
+    }
+
+    fn nextTimerWait(self: *const Iocp, now_ms: u64) ?u32 {
+        var nearest: ?u64 = null;
+        for (self.timers) |timer| {
+            if (!timer.live) continue;
+            const left = timer.deadline_ms -| now_ms;
+            nearest = if (nearest) |prev| @min(prev, left) else left;
+        }
+        return if (nearest) |left| @intCast(@min(left, std.math.maxInt(u32))) else null;
     }
 
     fn submitWindows(self: *Iocp) !u32 {
         const n_packets = self.n;
         if (n_packets == 0 or n_packets > submit_batch) return error.MissingOp;
-        var queued: [submit_batch]Packet = undefined;
-        @memcpy(queued[0..n_packets], self.packets[0..n_packets]);
-        self.n = 0;
-        var need: u16 = 0;
-        var free_slots: u16 = 0;
-        var i: u16 = 0;
-        while (i < n_packets) : (i += 1) {
-            switch (queued[i].op) {
-                op_accept, op_recv, op_send, op_poll => need += 1,
+        var need: usize = 0;
+        for (self.packets[0..n_packets]) |packet| {
+            switch (packet.op) {
+                op_accept, op_recv, op_send, op_poll, op_connect => need += 1,
                 else => {},
             }
         }
-        i = 0;
-        while (i < submit_batch) : (i += 1) {
-            if (!self.slot_live[i]) free_slots += 1;
+        // Both allocations happen before the first kernel post. Already
+        // pending slots remain in immutable slabs, and an inline completion
+        // cannot be lost because the ready queue runs out of space.
+        try self.ensureReadyCapacity(need);
+        try self.ensureFreeSlots(need);
+        var queued: [submit_batch]Packet = undefined;
+        @memcpy(queued[0..n_packets], self.packets[0..n_packets]);
+        self.n = 0;
+        var i: u16 = 0;
+        while (i < n_packets) : (i += 1) {
+            self.postOne(queued[i]) catch |err| {
+                // Some earlier requests may already own kernel storage. Keep
+                // their slots live for reap/quiesce; reject further enqueue
+                // and submit calls, and retire registrations for requests
+                // that never reached the kernel.
+                self.submit_failed = true;
+                for (queued[i..n_packets]) |remaining| self.forgetSerial(remaining.serial);
+                return err;
+            };
         }
-        if (need > free_slots) {
-            @memcpy(self.packets[0..n_packets], queued[0..n_packets]);
-            self.n = n_packets;
-            return error.MissingOp;
-        }
-        i = 0;
-        while (i < n_packets) : (i += 1) try self.postOne(queued[i]);
         return n_packets;
     }
 
-    fn claimSlot(self: *Iocp, packet: Packet) !u16 {
-        var i: u16 = 0;
-        while (i < submit_batch) : (i += 1) {
-            if (self.slot_live[i]) continue;
-            self.slot_live[i] = true;
-            self.slot_pkt[i] = packet;
-            self.iosbs[i] = std.mem.zeroes(std.os.windows.IO_STATUS_BLOCK);
-            return i;
-        }
-        return error.MissingOp;
+    fn claimSlot(self: *Iocp, packet: Packet) !*Slot {
+        const slot = self.free_slots.pop() orelse return error.MissingOp;
+        std.debug.assert(!slot.live);
+        slot.live = true;
+        slot.packet = packet;
+        slot.iosb = std.mem.zeroes(std.os.windows.IO_STATUS_BLOCK);
+        self.live_slots += 1;
+        return slot;
     }
 
     fn postOne(self: *Iocp, packet: Packet) !void {
         switch (packet.op) {
             op_cancel => return self.cancelOne(packet),
             op_timeout => return self.armTimer(packet),
-            op_accept, op_recv, op_send, op_poll => {},
+            op_accept, op_recv, op_send, op_poll, op_connect => {},
             else => return error.MissingOp,
         }
         if ((packet.op == op_recv or packet.op == op_send) and
@@ -1690,23 +2578,26 @@ const Iocp = struct {
         {
             return error.MissingOp;
         }
-        const index = try self.claimSlot(packet);
-        errdefer self.slot_live[index] = false;
-        const iosb = &self.iosbs[index];
+        const slot = try self.claimSlot(packet);
+        errdefer {
+            if (slot.live) self.retireSlot(slot);
+            self.forgetSerial(packet.serial);
+        }
+        const iosb = &slot.iosb;
         const done = switch (packet.op) {
             op_accept => blk: {
-                const out = &self.accept_outs[index];
+                const out = &slot.accept_out;
                 @memset(out, 0);
                 break :blk try self.device(packet, iosb, "", out);
             },
             op_recv, op_send => blk: {
                 if (packet.buf == 0 or packet.length == 0 or packet.ioctl == 0) return error.MissingOp;
-                const wsa = &self.wsa_bufs[index];
+                const wsa = &slot.wsa_buf;
                 wsa.* = .{
                     .len = packet.length,
                     .buf = @ptrFromInt(packet.buf),
                 };
-                const info = &self.data_infos[index];
+                const info = &slot.data_info;
                 // AFD_OVERLAPPED is 0x2. TDI_RECEIVE_NORMAL is 0x20. Send uses
                 // no TDI flag; the kernel rejects a raw NtReadFile / NtWriteFile.
                 info.* = .{
@@ -1720,84 +2611,119 @@ const Iocp = struct {
             },
             op_poll => blk: {
                 // AFD poll is METHOD_BUFFERED and reads the handle list from
-                // the input. A null input is rejected by the kernel.
-                const info = &self.poll_infos[index];
+                // the input. The kernel reports readiness in the output
+                // handle's Events field, not in IOSB.Information (byte count).
+                const info = &slot.poll_info;
                 info.* = .{
-                    .timeout = -10_000_000,
+                    .timeout = std.math.maxInt(i64),
                     .handle_count = 1,
                     .exclusive = 0,
                     .handles = .{
                         .handle = packet.handle,
-                        .events = packet.length,
+                        .events = afdPollRequest(packet.length),
                         .status = 0,
                     },
                 };
-                const bytes = std.mem.asBytes(info);
-                break :blk try self.device(packet, iosb, bytes, bytes);
+                const out = &slot.poll_out;
+                out.* = std.mem.zeroes(AfdPollInfo);
+                break :blk try self.device(packet, iosb, std.mem.asBytes(info), std.mem.asBytes(out));
             },
+            op_connect => try self.postConnect(slot, packet),
             else => return error.MissingOp,
         };
-        if (done) try self.finishInline(index);
+        if (done) try self.finishInline(slot);
     }
 
-    fn finishInline(self: *Iocp, index: u16) !void {
-        const packet = self.slot_pkt[index];
-        const iosb = self.iosbs[index];
-        const ev = finishPosted(packet, iosb, &self.accept_outs[index]);
-        self.slot_live[index] = false;
+    fn postConnect(self: *Iocp, slot: *Slot, packet: Packet) !bool {
+        try self.associate(packet);
+        const family = std.mem.readInt(u16, packet.connect_addr[0..2], .native);
+        const bound = if (family == wsa_af_inet) blk: {
+            const addr = RioSockAddr{ .family = @intCast(wsa_af_inet), .port = 0, .addr = 0, .zero = @splat(0) };
+            break :blk bind(packet.handle, &addr, @sizeOf(RioSockAddr));
+        } else blk: {
+            const addr = RioSockAddr6{ .family = @intCast(wsa_af_inet6), .port = 0, .flowinfo = 0, .addr = @splat(0), .scope_id = 0 };
+            break :blk bind(packet.handle, &addr, @sizeOf(RioSockAddr6));
+        };
+        // ConnectEx requires a bound socket. WSAEINVAL means the caller had
+        // already bound it; ConnectEx will validate that state itself.
+        if (bound != 0 and WSAGetLastError() != 10022) {
+            slot.iosb.u.Status = .UNSUCCESSFUL;
+            return true;
+        }
+        const connect_ex = loadConnectEx(packet.handle) catch {
+            slot.iosb.u.Status = .UNSUCCESSFUL;
+            return true;
+        };
+        slot.connect_addr = packet.connect_addr;
+        slot.connect_sent = 0;
+        slot.connect_overlapped = std.mem.zeroes(WsaOverlapped);
+        const ok = connect_ex(
+            packet.handle,
+            @ptrCast(&slot.connect_addr),
+            packet.connect_len,
+            null,
+            0,
+            &slot.connect_sent,
+            &slot.connect_overlapped,
+        );
+        if (ok != 0) {
+            slot.iosb.u.Status = .SUCCESS;
+            return true;
+        }
+        if (WSAGetLastError() == 997) return false;
+        slot.iosb.u.Status = .UNSUCCESSFUL;
+        return true;
+    }
+
+    fn finishInline(self: *Iocp, slot: *Slot) !void {
+        const packet = slot.packet;
+        const iosb = slot.iosb;
+        const poll_out: ?*const AfdPollInfo = if (packet.op == op_poll) &slot.poll_out else null;
+        const ev = finishPosted(packet, iosb, &slot.accept_out, poll_out);
+        self.retireSlot(slot);
+        self.forgetSerial(packet.serial);
         self.pushReady(ev) catch |err| {
-            if (ev.op == .accept and ev.result >= 0) _ = closesocket(@intCast(ev.result));
+            if (ev.op == .accept and ev.result >= 0) closeSocket(ev.result);
             return err;
         };
     }
 
     fn pushReady(self: *Iocp, ev: Reaped) !void {
-        if (self.ready_n >= submit_batch) return error.MissingOp;
-        const idx = (self.ready_head + self.ready_n) % submit_batch;
-        self.ready[idx] = ev;
-        self.ready_n += 1;
+        try self.ready.append(std.heap.page_allocator, ev);
     }
 
     fn popReady(self: *Iocp) ?Reaped {
-        if (self.ready_n == 0) return null;
-        const ev = self.ready[self.ready_head];
-        self.ready_head = (self.ready_head + 1) % submit_batch;
-        self.ready_n -= 1;
+        if (self.ready_head == self.ready.items.len) return null;
+        const ev = self.ready.items[self.ready_head];
+        self.ready_head += 1;
+        if (self.ready_head == self.ready.items.len) {
+            self.ready.clearRetainingCapacity();
+            self.ready_head = 0;
+        }
         return ev;
     }
 
-    fn associate(self: *Iocp, handle: usize) !void {
-        for (self.bound) |known| {
-            if (known == handle) return;
-        }
-        const w = std.os.windows;
-        var info = extern struct {
-            port: w.HANDLE,
-            key: ?*anyopaque,
-        }{
-            .port = @ptrFromInt(self.port),
-            .key = @ptrFromInt(handle),
+    fn readyHas(self: *const Iocp, token_key: usize, op: u8) bool {
+        const result_op: Op = switch (op) {
+            op_accept => .accept,
+            op_recv => .recv,
+            op_send => .send,
+            op_poll => .poll,
+            op_timeout => .timeout,
+            op_connect => .connect,
+            else => return false,
         };
-        var iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
-        const status = w.ntdll.NtSetInformationFile(
-            @ptrFromInt(handle),
-            &iosb,
-            @ptrCast(&info),
-            @sizeOf(@TypeOf(info)),
-            .Completion,
-        );
-        if (status != .SUCCESS) {
-            std.debug.print("GAP-X1 windows iocp status=0x{x} op=associate\n", .{@intFromEnum(status)});
-            return error.MissingOp;
+        for (self.ready.items[self.ready_head..]) |ev| {
+            if (ev.op == result_op and packToken(ev.token) == token_key) return true;
         }
-        const old = self.bound;
-        const grown = std.heap.page_allocator.alloc(usize, old.len + 1) catch return error.OutOfMemory;
-        if (old.len != 0) {
-            @memcpy(grown[0..old.len], old);
-            std.heap.page_allocator.free(old);
-        }
-        grown[old.len] = handle;
-        self.bound = grown;
+        return false;
+    }
+
+    fn associate(self: *Iocp, packet: Packet) !void {
+        // The opaque descriptor identifies the socket's lifetime. A recycled
+        // raw SOCKET value belongs to a new descriptor and must be associated
+        // with the completion port and configured again.
+        return windows_sockets.associate(packet.socket_fd, packet.handle, self.port);
     }
 
     /// `true` means the ioctl finished inline. The bytes are already in the
@@ -1805,7 +2731,7 @@ const Iocp = struct {
     /// packet that may never arrive.
     fn device(self: *Iocp, packet: Packet, iosb: *std.os.windows.IO_STATUS_BLOCK, in_buf: []const u8, out: []u8) !bool {
         const w = std.os.windows;
-        try self.associate(packet.handle);
+        try self.associate(packet);
         iosb.* = std.mem.zeroes(w.IO_STATUS_BLOCK);
         const code: w.CTL_CODE = @bitCast(packet.ioctl);
         const status = w.ntdll.NtDeviceIoControlFile(
@@ -1826,7 +2752,6 @@ const Iocp = struct {
         // listen loop, which is what a reset of the accepted socket did.
         if (closedConnection(status)) {
             iosb.u.Status = status;
-            std.debug.print("GAP-X1 windows iocp closed status=0x{x} op={d}\n", .{ @intFromEnum(status), packet.op });
             return true;
         }
         std.debug.print("GAP-X1 windows iocp status=0x{x} op={d}\n", .{ @intFromEnum(status), packet.op });
@@ -1834,44 +2759,52 @@ const Iocp = struct {
     }
 
     fn cancelOne(self: *Iocp, packet: Packet) !void {
-        const w = std.os.windows;
         if (packet.length == op_timeout) {
-            // The timer object exists only after armTimer, which runs earlier
-            // in this submit. The enqueue-time registration stores no handle.
-            if (self.armed.len == 0) return error.MissingOp;
-            const timer = self.armed[self.armed.len - 1];
-            if (timer == 0) return error.MissingOp;
-            var state: w.BOOLEAN = .FALSE;
-            const status = NtCancelTimer(@ptrFromInt(timer), &state);
-            if (status != .SUCCESS) {
-                std.debug.print("GAP-X1 windows iocp status=0x{x} op={d}\n", .{ @intFromEnum(status), packet.op });
-                return error.MissingOp;
-            }
-            return;
+            return self.cancelTimer(packet.serial);
         }
-        var request = std.mem.zeroes(w.IO_STATUS_BLOCK);
-        var iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
-        const status = NtCancelIoFileEx(@ptrFromInt(packet.handle), &request, &iosb);
-        if (status != .SUCCESS and status != .PENDING) return error.MissingOp;
+        for (self.slabs.items) |slab| {
+            for (&slab.slots) |*slot| {
+                if (!slot.live or !matchesCancel(packet, slot.packet)) continue;
+                try self.cancelSlot(slot);
+            }
+        }
+        // The request may have completed inline or already queued a packet.
+        // Its slot then needs no cancellation, but its ready result still
+        // belongs to the normal reap/quiesce path.
+    }
+
+    fn matchesCancel(cancel: Packet, pending: Packet) bool {
+        return cancel.handle == pending.handle and
+            cancel.token == pending.token and
+            cancel.serial == pending.serial and
+            cancel.length == pending.op;
+    }
+
+    fn cancelSlot(self: *Iocp, slot: *Slot) !void {
+        const w = std.os.windows;
+        _ = self;
+        slot.cancel_iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
+        const status = NtCancelIoFileEx(
+            @ptrFromInt(slot.packet.handle),
+            if (slot.packet.op == op_connect) @ptrCast(&slot.connect_overlapped) else &slot.iosb,
+            &slot.cancel_iosb,
+        );
+        // NtCancelIoFileEx normally completes its own status synchronously.
+        // If that contract changes, do not recycle this slot or free its
+        // output status while the kernel can still write to it.
+        if (status == .PENDING) @panic("pending NtCancelIoFileEx result");
+        // A socket can close between dispatch and shutdown. Closing it
+        // cancels outstanding I/O, and its completion still owns the IOSB
+        // until the port delivers it. Continue draining that packet.
+        if (status != .SUCCESS and status != .NOT_FOUND and @intFromEnum(status) != 0xC0000008) {
+            std.debug.print("windows iocp cancel failed: status=0x{x} op={d}\n", .{ @intFromEnum(status), slot.packet.op });
+            return error.MissingOp;
+        }
     }
 
     fn armTimer(self: *Iocp, packet: Packet) !void {
-        const w = std.os.windows;
-        var timer: w.HANDLE = undefined;
-        const created = NtCreateTimer(&timer, w.ACCESS_MASK.Specific.Timer.ALL_ACCESS, null, .Notification);
-        if (created != .SUCCESS) return error.MissingOp;
-        const raw = @intFromPtr(timer);
-        const due: w.LARGE_INTEGER = -@as(w.LARGE_INTEGER, packet.length) * 10_000;
-        var previous: w.BOOLEAN = .FALSE;
-        const armed = NtSetTimer(timer, &due, null, null, .FALSE, 0, &previous);
-        if (armed != .SUCCESS) {
-            _ = w.ntdll.NtClose(timer);
-            return error.MissingOp;
-        }
-        self.rememberTimer(raw) catch {
-            _ = w.ntdll.NtClose(timer);
-            return error.OutOfMemory;
-        };
+        const deadline_ms = std.math.add(u64, GetTickCount64(), packet.length) catch return error.MissingOp;
+        try self.rememberTimer(packet.token, packet.serial, deadline_ms);
     }
 
     fn reapWindows(self: *Iocp, out: []Reaped, wait_ms: u32) !u32 {
@@ -1881,13 +2814,13 @@ const Iocp = struct {
             out[n] = ev;
             n += 1;
         }
-        var waited = false;
-        var skips: u16 = 0;
+        var waited = n != 0;
+        var skips: usize = 0;
         while (n < out.len) {
             const item = self.takeOne(if (waited) 0 else wait_ms) catch |err| switch (err) {
                 error.Unmatched => {
                     skips += 1;
-                    if (skips > submit_batch) return error.MissingOp;
+                    if (skips > self.slabs.items.len * slab_size + submit_batch) return error.MissingOp;
                     waited = true;
                     continue;
                 },
@@ -1904,28 +2837,42 @@ const Iocp = struct {
 
     fn takeOne(self: *Iocp, wait_ms: u32) !?Reaped {
         const w = std.os.windows;
-        var key: ?*anyopaque = null;
-        var apc: ?*anyopaque = null;
-        var iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
-        var due: w.LARGE_INTEGER = if (wait_ms == 0) 0 else -@as(w.LARGE_INTEGER, wait_ms) * 10_000;
-        const status = NtRemoveIoCompletion(@ptrFromInt(self.port), &key, &apc, &iosb, &due);
-        if (status == .TIMEOUT) return null;
-        if (status != .SUCCESS) return error.MissingOp;
-        const apc_addr = @intFromPtr(apc);
-        var i: usize = 0;
-        while (i < submit_batch) : (i += 1) {
-            if (!self.slot_live[i]) continue;
-            if (@intFromPtr(&self.iosbs[i]) != apc_addr) continue;
-            const packet = self.slot_pkt[i];
-            self.slot_live[i] = false;
-            return finishPosted(packet, iosb, &self.accept_outs[i]);
+        const end_ms = std.math.add(u64, GetTickCount64(), wait_ms) catch return error.MissingOp;
+        while (true) {
+            const now_ms = GetTickCount64();
+            if (self.dueTimer(now_ms)) |ev| return ev;
+            const remaining: u32 = @intCast(@min(end_ms -| now_ms, std.math.maxInt(u32)));
+            const timer_wait = self.nextTimerWait(now_ms) orelse remaining;
+            const period = @min(remaining, timer_wait);
+            var key: ?*anyopaque = null;
+            var apc: ?*anyopaque = null;
+            var iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
+            const due: w.LARGE_INTEGER = if (period == 0) 0 else -@as(w.LARGE_INTEGER, period) * 10_000;
+            const status = NtRemoveIoCompletion(@ptrFromInt(self.port), &key, &apc, &iosb, &due);
+            if (status == .TIMEOUT) {
+                if (period == 0 or GetTickCount64() >= end_ms) return self.dueTimer(GetTickCount64());
+                continue;
+            }
+            if (status != .SUCCESS) {
+                std.debug.print("windows iocp dequeue failed: status=0x{x}\n", .{@intFromEnum(status)});
+                return error.MissingOp;
+            }
+            const apc_addr = @intFromPtr(apc);
+            if (self.findSlotByApc(apc_addr)) |slot| {
+                const packet = slot.packet;
+                const poll_out: ?*const AfdPollInfo = if (packet.op == op_poll) &slot.poll_out else null;
+                const result = finishPosted(packet, iosb, &slot.accept_out, poll_out);
+                self.retireSlot(slot);
+                self.forgetSerial(packet.serial);
+                return result;
+            }
+            // A synchronous completion or AFD accept adoption can leave an
+            // extra packet. It has no live slot and is safe to discard.
+            return error.Unmatched;
         }
-        // The port packet was removed. A synchronous success already cleared
-        // its slot, so this copy must not stop the rest of the drain.
-        return error.Unmatched;
     }
 
-    fn finishPosted(packet: Packet, iosb: std.os.windows.IO_STATUS_BLOCK, accept_out: []const u8) Reaped {
+    fn finishPosted(packet: Packet, iosb: std.os.windows.IO_STATUS_BLOCK, accept_out: []const u8, poll_out: ?*const AfdPollInfo) Reaped {
         const token = ringlane.FdToken{
             .slot = @truncate(packet.token),
             .gen = @truncate(packet.token >> 32),
@@ -1935,14 +2882,33 @@ const Iocp = struct {
             op_recv => .recv,
             op_send => .send,
             op_poll => .poll,
+            op_connect => .connect,
             else => .cancel,
         };
+        if (iosb.u.Status == .CANCELLED) return .{ .op = op, .token = token, .result = -@as(i32, @intFromEnum(linux.E.CANCELED)) };
         if (iosb.u.Status != .SUCCESS) return .{ .op = op, .token = token, .result = -1 };
         if (packet.op == op_accept) {
             const sock = acceptSequence(packet.handle, accept_out) catch {
                 return .{ .op = .accept, .token = token, .result = -1 };
             };
             return .{ .op = .accept, .token = token, .result = sock };
+        }
+        if (packet.op == op_connect) {
+            if (comptime builtin.os.tag == .windows) {
+                if (setsockopt(packet.handle, sol_socket, so_update_connect_context, null, 0) != 0)
+                    return .{ .op = .connect, .token = token, .result = -1 };
+            }
+            return .{ .op = .connect, .token = token, .result = 0 };
+        }
+        if (packet.op == op_poll)
+            return .{ .op = .poll, .token = token, .result = if (poll_out) |info| afdPollResult(packet, info) else -1 };
+        // AFD completions must never grant access past the submitted buffer.
+        // Treat a larger count as a failed operation, including after an IOCP
+        // slot was reused and a late packet arrived for its former request.
+        if ((packet.op == op_recv or packet.op == op_send) and
+            iosb.Information > @as(usize, packet.length))
+        {
+            return .{ .op = op, .token = token, .result = -1 };
         }
         if (iosb.Information > std.math.maxInt(i32)) {
             return .{ .op = op, .token = token, .result = std.math.maxInt(i32) };
@@ -2015,28 +2981,6 @@ extern "ntdll" fn NtCancelIoFileEx(
     IoStatusBlock: *std.os.windows.IO_STATUS_BLOCK,
 ) callconv(.winapi) std.os.windows.NTSTATUS;
 
-extern "ntdll" fn NtCreateTimer(
-    TimerHandle: *std.os.windows.HANDLE,
-    DesiredAccess: std.os.windows.ACCESS_MASK,
-    ObjectAttributes: ?*const anyopaque,
-    TimerType: std.os.windows.TIMER_TYPE,
-) callconv(.winapi) std.os.windows.NTSTATUS;
-
-extern "ntdll" fn NtSetTimer(
-    TimerHandle: std.os.windows.HANDLE,
-    DueTime: *const std.os.windows.LARGE_INTEGER,
-    TimerApcRoutine: ?*anyopaque,
-    TimerContext: ?*anyopaque,
-    ResumeTimer: std.os.windows.BOOLEAN,
-    Period: std.os.windows.LONG,
-    PreviousState: ?*std.os.windows.BOOLEAN,
-) callconv(.winapi) std.os.windows.NTSTATUS;
-
-extern "ntdll" fn NtCancelTimer(
-    TimerHandle: std.os.windows.HANDLE,
-    CurrentState: ?*std.os.windows.BOOLEAN,
-) callconv(.winapi) std.os.windows.NTSTATUS;
-
 /// `WSAID_MULTIPLE_RIO` from `mswsock.h`: `8509e081-96dd-4005-b165-9e2ee8c79e3f`.
 pub const RioGuid = extern struct {
     data1: u32,
@@ -2054,9 +2998,17 @@ pub const rio_guid: RioGuid = .{
 
 /// `_WSAIORW(IOC_WS2, 36)` = `IOC_INOUT | IOC_WS2 | 36`.
 pub const sio_get_multiple_rio: u32 = 0xC8000024;
+const sio_get_extension_function_pointer: u32 = 0xC8000006;
+const connect_ex_guid = RioGuid{
+    .data1 = 0x25a207b9,
+    .data2 = 0xddf3,
+    .data3 = 0x4660,
+    .data4 = .{ 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e },
+};
 pub const wsa_flag_overlapped: u32 = 0x01;
 pub const wsa_flag_registered_io: u32 = 0x100;
 pub const wsa_af_inet: i32 = 2;
+pub const wsa_af_inet6: i32 = 23;
 pub const wsa_sock_stream: i32 = 1;
 pub const wsa_ipproto_tcp: i32 = 6;
 
@@ -2108,6 +3060,34 @@ const RioSockAddr = extern struct {
     zero: [8]u8,
 };
 
+const RioSockAddr6 = extern struct {
+    family: u16,
+    port: u16,
+    flowinfo: u32,
+    addr: [16]u8,
+    scope_id: u32,
+};
+
+/// Winsock OVERLAPPED begins with an IO_STATUS_BLOCK-compatible status and
+/// information pair. ConnectEx holds this storage until its port completion.
+const WsaOverlapped = extern struct {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: ?std.os.windows.HANDLE,
+};
+
+const ConnectExFn = *const fn (
+    socket: usize,
+    address: *const anyopaque,
+    address_len: i32,
+    send_buffer: ?*const anyopaque,
+    send_len: u32,
+    bytes_sent: *u32,
+    overlapped: *WsaOverlapped,
+) callconv(.winapi) i32;
+
 /// `(RIO_BUFFERID)(ULONG_PTR)0xFFFFFFFF` from the Windows SDK.
 const rio_invalid_buffer_id: usize = 0xFFFFFFFF;
 /// `RIO_CORRUPT_CQ`. A dequeue count of this value is a failed queue, not a transfer.
@@ -2127,6 +3107,8 @@ comptime {
     if (@sizeOf(usize) == 8 and @sizeOf(RioBuf) != 16) @compileError("RIO_BUF is 16 bytes");
     if (@sizeOf(usize) == 8 and @sizeOf(RioResult) != 24) @compileError("RIORESULT is 24 bytes");
     if (@sizeOf(RioSockAddr) != 16) @compileError("sockaddr_in is 16 bytes");
+    if (@sizeOf(RioSockAddr6) != 28) @compileError("sockaddr_in6 is 28 bytes");
+    if (@sizeOf(usize) == 8 and @sizeOf(WsaOverlapped) != 32) @compileError("OVERLAPPED is 32 bytes");
 }
 
 const rio_fields = [_][]const u8{
@@ -2155,10 +3137,10 @@ pub fn rioTableUsable(table: *const RioTable) bool {
     return true;
 }
 
-/// Loads the RIO table for an existing socket. Socket `0` and `INVALID_SOCKET`
-/// fail before `WSAIoctl`. Every non-Windows host fails before `WSAIoctl`.
+/// Loads the RIO table for an existing socket. `INVALID_SOCKET` fails before
+/// `WSAIoctl`. Every non-Windows host fails before `WSAIoctl`.
 pub fn loadRegisteredIo(socket: usize) !RioTable {
-    if (socket == 0 or socket == std.math.maxInt(usize)) return error.MissingOp;
+    if (socket == std.math.maxInt(usize)) return error.MissingOp;
     if (comptime builtin.os.tag != .windows) return error.MissingOp;
     return ioctlRegisteredIo(socket);
 }
@@ -2191,13 +3173,13 @@ fn openRegisteredSocket() !usize {
         0,
         wsa_flag_overlapped | wsa_flag_registered_io,
     );
-    if (sock == 0 or sock == std.math.maxInt(usize)) return error.MissingOp;
+    if (sock == std.math.maxInt(usize)) return error.MissingOp;
     return sock;
 }
 
 fn closeRegisteredSocket(socket: usize) void {
     if (comptime builtin.os.tag != .windows) return;
-    if (socket == 0 or socket == std.math.maxInt(usize)) return;
+    if (socket == std.math.maxInt(usize)) return;
     _ = closesocket(socket);
 }
 
@@ -2219,6 +3201,23 @@ fn ioctlRegisteredIo(socket: usize) !RioTable {
     if (bytes < @sizeOf(RioTable)) return error.MissingOp;
     if (!rioTableUsable(&table)) return error.MissingOp;
     return table;
+}
+
+fn loadConnectEx(socket: usize) !ConnectExFn {
+    var raw: ?*anyopaque = null;
+    var bytes: u32 = 0;
+    if (WSAIoctl(
+        socket,
+        sio_get_extension_function_pointer,
+        &connect_ex_guid,
+        @sizeOf(RioGuid),
+        @ptrCast(&raw),
+        @sizeOf(?*anyopaque),
+        &bytes,
+        null,
+        null,
+    ) != 0 or bytes != @sizeOf(?*anyopaque)) return error.MissingOp;
+    return rioPtr(ConnectExFn, raw) orelse error.MissingOp;
 }
 
 extern "ws2_32" fn WSAStartup(
@@ -2249,7 +3248,9 @@ extern "ws2_32" fn WSAIoctl(
 
 extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
 
-extern "ws2_32" fn bind(socket: usize, addr: *const RioSockAddr, namelen: i32) callconv(.winapi) i32;
+extern "ws2_32" fn shutdown(socket: usize, how: i32) callconv(.winapi) i32;
+
+extern "ws2_32" fn bind(socket: usize, addr: *const anyopaque, namelen: i32) callconv(.winapi) i32;
 
 extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
 
@@ -2261,7 +3262,9 @@ extern "ws2_32" fn accept(socket: usize, addr: ?*anyopaque, namelen: ?*i32) call
 
 extern "ws2_32" fn recv(socket: usize, buf: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
 
-extern "ws2_32" fn setsockopt(socket: usize, level: i32, name: i32, value: *const anyopaque, len: i32) callconv(.winapi) i32;
+extern "ws2_32" fn send(socket: usize, buf: [*]const u8, len: i32, flags: i32) callconv(.winapi) i32;
+
+extern "ws2_32" fn setsockopt(socket: usize, level: i32, name: i32, value: ?*const anyopaque, len: i32) callconv(.winapi) i32;
 
 extern "ws2_32" fn select(nfds: i32, readfds: ?*RioFdSet, writefds: ?*RioFdSet, exceptfds: ?*RioFdSet, timeout: ?*RioTimeval) callconv(.winapi) i32;
 
@@ -2269,13 +3272,14 @@ extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
 
 fn acceptOne(handle: usize) error{ WouldBlock, SocketFailed }!i32 {
     const sock = accept(handle, null, null);
-    const bad = sock == 0 or sock == std.math.maxInt(usize) or sock > std.math.maxInt(i32);
-    if (bad) {
-        if (sock != 0 and sock != std.math.maxInt(usize)) _ = closesocket(sock);
+    if (sock == std.math.maxInt(usize)) {
         if (WSAGetLastError() == 10035) return error.WouldBlock;
         return error.SocketFailed;
     }
-    return @intCast(sock);
+    return windows_sockets.register(sock) catch {
+        _ = closesocket(sock);
+        return error.SocketFailed;
+    };
 }
 
 fn closedConnection(status: std.os.windows.NTSTATUS) bool {
@@ -2290,20 +3294,26 @@ fn closedConnection(status: std.os.windows.NTSTATUS) bool {
 /// Move the connection named by the wait-for-listen sequence onto a new
 /// overlapped socket. The first four bytes of `out` are that sequence.
 fn acceptSequence(listener: usize, out: []const u8) error{SocketFailed}!i32 {
+    const w = std.os.windows;
     if (out.len < 4) return error.SocketFailed;
     const sequence = std.mem.readInt(i32, out[0..4], .little);
     const sock = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
-    if (sock == 0 or sock == std.math.maxInt(usize)) return error.SocketFailed;
+    if (sock == std.math.maxInt(usize)) return error.SocketFailed;
+    errdefer _ = closesocket(sock);
+    var event: w.HANDLE = undefined;
+    if (w.ntdll.NtCreateEvent(&event, w.ACCESS_MASK.Specific.Event.ALL_ACCESS, null, .Synchronization, .FALSE) != .SUCCESS)
+        return error.SocketFailed;
+    defer _ = w.ntdll.NtClose(event);
     const info = AfdAcceptInfo{
         .san_active = 0,
         .sequence = sequence,
         .accept_handle = sock,
     };
-    var iosb = std.mem.zeroes(std.os.windows.IO_STATUS_BLOCK);
-    const code: std.os.windows.CTL_CODE = @bitCast(Iocp.ioctl_afd_accept);
-    const status = std.os.windows.ntdll.NtDeviceIoControlFile(
+    var iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
+    const code: w.CTL_CODE = @bitCast(Iocp.ioctl_afd_accept);
+    const status = w.ntdll.NtDeviceIoControlFile(
         @ptrFromInt(listener),
-        null,
+        event,
         null,
         null,
         &iosb,
@@ -2313,27 +3323,52 @@ fn acceptSequence(listener: usize, out: []const u8) error{SocketFailed}!i32 {
         null,
         0,
     );
-    if (status != .SUCCESS) {
-        _ = closesocket(sock);
+    if (status == .PENDING) {
+        // AFD may finish adoption asynchronously. Keep the input, IOSB and
+        // socket alive until it signals completion; a pending request must
+        // never write back into a returned stack frame.
+        const wait_limit: w.LARGE_INTEGER = -50_000_000; // five seconds in 100 ns units
+        const first_wait = w.ntdll.NtWaitForSingleObject(event, .FALSE, &wait_limit);
+        if (first_wait == .TIMEOUT) {
+            // The wait-for-listen sequence is no longer allowed to stall the
+            // reactor forever. Cancel this exact IOSB and retain every stack
+            // input until the event confirms the kernel stopped using it.
+            var cancel_iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
+            const canceled = NtCancelIoFileEx(@ptrFromInt(listener), &iosb, &cancel_iosb);
+            if (canceled == .PENDING) @panic("pending AFD accept cancellation could not be drained");
+            if (canceled != .SUCCESS and canceled != .NOT_FOUND)
+                @panic("pending AFD accept cancellation failed");
+            if (w.ntdll.NtWaitForSingleObject(event, .FALSE, &wait_limit) != .SUCCESS)
+                @panic("pending AFD accept could not be drained after cancellation");
+        } else if (first_wait != .SUCCESS) {
+            @panic("pending AFD accept wait failed");
+        }
+    } else if (status != .SUCCESS) {
         std.debug.print("GAP-X1 windows afd accept status=0x{x} seq={d}\n", .{ @intFromEnum(status), sequence });
         return error.SocketFailed;
     }
-    if (sock > std.math.maxInt(i32)) {
-        _ = closesocket(sock);
+    if (iosb.u.Status != .SUCCESS) return error.SocketFailed;
+    // AFD adoption, like AcceptEx, must copy the listener's Winsock context
+    // before shutdown/getpeername/getsockopt may operate on the new socket.
+    if (setsockopt(sock, sol_socket, so_update_accept_context, &listener, @sizeOf(usize)) != 0) {
+        std.debug.print("windows AFD accept context failed: WSA {d}\n", .{WSAGetLastError()});
         return error.SocketFailed;
     }
-    return @intCast(sock);
+    return windows_sockets.register(sock) catch {
+        return error.SocketFailed;
+    };
 }
 
 /// One `accept` on a blocking listener. Off Windows this is `SocketFailed`
 /// and does not call the host `accept`.
 pub fn pullAccept(fd: linux.fd_t) error{ WouldBlock, SocketFailed }!linux.fd_t {
     if (comptime builtin.os.tag != .windows) return error.SocketFailed;
-    if (fd < 0) return error.SocketFailed;
-    return acceptOne(@intCast(fd));
+    return acceptOne(windows_sockets.get(fd) orelse return error.SocketFailed);
 }
 
 extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn SetFileCompletionNotificationModes(file: std.os.windows.HANDLE, flags: u8) callconv(.winapi) i32;
 
 fn rioPtr(comptime T: type, ptr: RioFn) ?T {
     const raw = ptr orelse return null;
@@ -2341,7 +3376,7 @@ fn rioPtr(comptime T: type, ptr: RioFn) ?T {
 }
 
 fn socketLive(socket: usize) bool {
-    return socket != 0 and socket != std.math.maxInt(usize);
+    return socket != std.math.maxInt(usize);
 }
 
 fn rioCloseCq(table: *const RioTable, cq: *anyopaque) void {
@@ -2358,6 +3393,8 @@ fn rioDeregister(table: *const RioTable, buffer_id: usize) void {
 
 /// `SOL_SOCKET` and `SO_RCVTIMEO`. Winsock takes milliseconds in a `DWORD`.
 const sol_socket: i32 = 0xFFFF;
+const so_update_accept_context: i32 = 0x700B;
+const so_update_connect_context: i32 = 0x7010;
 const so_rcvtimeo: i32 = 0x1006;
 
 /// Windows `fd_set` is a count plus sockets, not a POSIX bitmask.
@@ -2486,8 +3523,8 @@ fn dequeueLoadedRio(table: *const RioTable) RioWitness {
         .length = @intCast(payload.len),
     };
     const Send = *const fn (*anyopaque, *RioBuf, u32, u32, ?*anyopaque) callconv(.winapi) i32;
-    const send = rioPtr(Send, table.send) orelse return .{ .stage = "table" };
-    if (send(rq, &rio_buf, 1, 0, @ptrFromInt(@as(usize, rio_request_context))) == 0) {
+    const rio_send = rioPtr(Send, table.send) orelse return .{ .stage = "table" };
+    if (rio_send(rq, &rio_buf, 1, 0, @ptrFromInt(@as(usize, rio_request_context))) == 0) {
         return .{ .stage = "send", .errno = WSAGetLastError() };
     }
 
@@ -2581,7 +3618,8 @@ pub fn setTcpNoDelay(fd: linux.fd_t) void {
         return;
     }
     if (comptime builtin.os.tag == .windows) {
-        _ = setsockopt(@intCast(fd), 6, 1, &on, @intCast(@sizeOf(i32)));
+        const socket = windows_sockets.get(fd) orelse return;
+        _ = setsockopt(socket, 6, 1, &on, @intCast(@sizeOf(i32)));
         return;
     }
     if (comptime kqueueOs()) {
@@ -2596,10 +3634,22 @@ pub fn closeSocket(fd: linux.fd_t) void {
         return;
     }
     if (comptime builtin.os.tag == .windows) {
-        _ = closesocket(@intCast(fd));
+        if (windows_sockets.take(fd)) |socket| _ = closesocket(socket);
         return;
     }
     if (comptime kqueueOs()) _ = std.c.close(fd);
+}
+
+/// Best-effort TCP FIN after the final queued send has completed. The caller
+/// must keep receiving or otherwise drain outstanding I/O before closing the
+/// socket; closing with unread data may still reset the peer's connection.
+pub fn shutdownSocketWrite(fd: linux.fd_t) void {
+    if (fd < 0) return;
+    if (comptime builtin.os.tag == .windows) {
+        const socket = windows_sockets.get(fd) orelse return;
+        if (shutdown(socket, 1) != 0) // SD_SEND
+            std.debug.print("windows TCP write shutdown failed: WSA {d}\n", .{WSAGetLastError()});
+    }
 }
 
 fn listenLinux(host: []const u8, port: u16) ListenError!Listener {
@@ -2671,11 +3721,8 @@ fn listenWindows(host: []const u8, port: u16) ListenError!Listener {
     var startup: [408]u8 = @splat(0);
     if (WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
     const sock = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
-    if (sock == 0 or sock == std.math.maxInt(usize)) return error.SocketUnavailable;
+    if (sock == std.math.maxInt(usize)) return error.SocketUnavailable;
     errdefer _ = closesocket(sock);
-    const limit: usize = @intCast(std.math.maxInt(i32));
-    if (sock > limit) return error.SocketUnavailable;
-    const fd: linux.fd_t = @intCast(sock);
     var addr = RioSockAddr{
         .family = @intCast(wsa_af_inet),
         .port = std.mem.nativeToBig(u16, port),
@@ -2686,6 +3733,7 @@ fn listenWindows(host: []const u8, port: u16) ListenError!Listener {
     if (listen(sock, 128) != 0) return windowsListenError();
     var name_len: i32 = @sizeOf(RioSockAddr);
     if (getsockname(sock, &addr, &name_len) != 0) return error.SocketUnavailable;
+    const fd = windows_sockets.register(sock) catch return error.SocketUnavailable;
     return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
 }
 
@@ -3192,6 +4240,7 @@ test "BSD kqueue: accepted socket is nonblocking and close-on-exec" {
 }
 
 test "GAP-X3 Windows RIO fails closed off Windows" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const ioc_inout: u32 = 0x80000000 | 0x40000000;
     const ioc_ws2: u32 = 0x08000000;
     try std.testing.expectEqual(ioc_inout | ioc_ws2 | 36, sio_get_multiple_rio);

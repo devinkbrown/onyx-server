@@ -1,0 +1,4 @@
+# Embedded cryptographic vectors and literal baseline checks require LF bytes
+# even when a Windows checkout enables core.autocrlf.
+src/crypto/*_sigver_acvp.txt text eol=lf
+tools/bogo/expected-baseline.txt text eol=lf
