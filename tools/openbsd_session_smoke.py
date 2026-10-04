@@ -66,10 +66,10 @@ class Probe(Client):
         self.send(command + b"\r\n")
         return self.wait(lambda line: needle in line, start, operation, timeout)
 
-    def register(self, nick, account=None, password=None, opaque=None):
+    def register(self, nick, account=None, password=None, opaque=None, session_sync=True):
         self.label = nick
         self.command(b"CAP LS 302", b" LS ", "capability discovery")
-        caps = CAPS + (b" sasl" if account else b"")
+        caps = (CAPS if session_sync else b"message-tags server-time echo-message") + (b" sasl" if account else b"")
         response = self.command(b"CAP REQ :" + caps, b" CAP ", "capability negotiation")
         if b" ACK " not in response or not all(cap in response for cap in caps.split()):
             raise RuntimeError(f"{nick}: required capability refused")
@@ -101,8 +101,19 @@ class Probe(Client):
         while time.monotonic() < deadline:
             start = len(self.seen)
             self.send(b"WHOIS " + nick + b"\r\n")
-            self.wait(lambda line: b" 318 " in line, start, "nickname route convergence")
-            if any(b" 311 " in line for line in self.seen[start:]):
+            def matches(line, numeric):
+                words = line.split()
+                if words and words[0].startswith(b"@"):
+                    words = words[1:]
+                return (len(words) >= 4 and words[0].startswith(b":") and
+                        words[1] == numeric and words[3].lower() == nick.lower())
+
+            terminal = self.wait(lambda line: matches(line, b"318"), start, "nickname route convergence")
+            # Only results for this query, preceding its matching terminator,
+            # can establish presence. Unrelated asynchronous WHOIS is ignored.
+            replies = self.seen[start:]
+            terminal_index = replies.index(terminal)
+            if any(matches(line, b"311") for line in replies[:terminal_index]):
                 return
             time.sleep(.25)
         raise TimeoutError(f"{self.label}: independent recipient nickname route absent")
@@ -647,8 +658,50 @@ secret = "{mesh_pass}"
             raise RuntimeError("fixture cleanup incomplete: " + ", ".join(failures))
         print("CLEANUP fixture PIDs: zero; loopback/PF baseline restored; private configs/WAL/logs retained at " + self.directory, flush=True)
 
+    def ordinary_presence(self):
+        # No SASL, account registration, session-sync or token issuance. These
+        # physical guests must be discovered through original mesh presence.
+        guests = []
+        for node, nick in enumerate(("GuestNear", "GuestMiddle", "GuestFar")):
+            client = Probe(self.args.local_base + node * 10 + 1)
+            self.clients.append(client)
+            client.register(nick, session_sync=False)
+            guests.append(client)
+
+        def participation(phase):
+            for source in guests:
+                for target in guests:
+                    if source is not target:
+                        source.wait_nick(target.nick)
+            for source, target in ((guests[0], guests[2]), (guests[2], guests[0])):
+                marker = f"ordinary-{phase}-{source.label}".encode()
+                self.event(source, [source, target], target.nick, marker)
+                middle = guests[1]
+                middle.command(b"PING :ordinary-exclusion", b"ordinary-exclusion", "middle delivery barrier")
+                if any(marker in line for line in middle.seen):
+                    raise RuntimeError("ordinary direct message delivered to the intermediate guest")
+            for client in guests:
+                client.command(b"PING :ordinary-physical", b"ordinary-physical", "original guest socket")
+            print(f"PASS ordinary {phase}: unbound guests, far WHOIS, bidirectional exact direct delivery", flush=True)
+
+        participation("before-upgrade")
+        settled = self.stable_dials("ordinary before upgrades") if self.args.same_ip_reciprocal else None
+        for node in range(3):
+            self.upgrade(node)
+            if settled is not None and self.dial_counts() != settled:
+                raise RuntimeError("ordinary presence caused configured dial churn during Helix")
+            participation(f"after-node-{node + 1}")
+        if settled is not None:
+            self.stable_dials("ordinary after all upgrades", settled)
+        self.cumulative_events(guests)
+        if any(needle in line for needle, _, _ in self.expected_events for line in guests[1].seen):
+            raise RuntimeError("delayed ordinary direct delivery reached the intermediate guest")
+
     def run(self):
         self.setup()
+        if self.args.ordinary_presence_proof:
+            self.ordinary_presence()
+            return
         self.accounts()
         origin = self.client(0, "Origin")
         origin.join()
@@ -734,6 +787,8 @@ def main():
     parser.add_argument("--known-hosts", required=True)
     parser.add_argument("--ssh-port", type=int, default=2225)
     parser.add_argument("--local-base", type=int, default=43500)
+    parser.add_argument("--ordinary-presence-proof", action="store_true",
+                        help="independent unbound guests: far WHOIS/DM and three real execs; requires --skip-partition")
     parser.add_argument("--foreign-nick-proof", action="store_true",
                         help="add far-only nickname convergence and separate-recipient DM coverage")
     parser.add_argument("--skip-partition", action="store_true",
@@ -749,6 +804,8 @@ def main():
         parser.error("invalid loopback port range")
     if args.same_ip_reciprocal and not args.skip_partition:
         parser.error("--same-ip-reciprocal requires --skip-partition; PF cannot isolate shared-IP peers")
+    if args.ordinary_presence_proof and (not args.skip_partition or args.foreign_nick_proof):
+        parser.error("--ordinary-presence-proof requires --skip-partition and excludes --foreign-nick-proof")
     fixture = Fixture(args)
     try:
         fixture.run()
